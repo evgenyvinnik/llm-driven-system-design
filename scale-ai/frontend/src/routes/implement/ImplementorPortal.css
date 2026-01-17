@@ -1,0 +1,255 @@
+/* Implementor Portal Styles */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+.implementor-portal {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4c1d95 100%);
+  color: white;
+}
+
+/* Header */
+.portal-header {
+  text-align: center;
+  padding: 2rem;
+}
+
+.portal-header h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  margin: 0 0 0.5rem;
+}
+
+.portal-header p {
+  color: rgba(255, 255, 255, 0.7);
+  margin: 0 0 1rem;
+}
+
+.model-badge {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  font-size: 0.875rem;
+  color: #a5b4fc;
+}
+
+/* Content */
+.portal-content {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 2rem;
+  padding: 0 2rem 2rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.canvas-section {
+  flex: 0 0 auto;
+}
+
+.results-section {
+  flex: 1;
+  min-width: 300px;
+  max-width: 400px;
+}
+
+/* Result Card */
+.result-card {
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  border-radius: 16px;
+  padding: 2rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.result-card h2 {
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.6);
+  margin: 0 0 1rem;
+}
+
+.prediction {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.predicted-shape {
+  font-size: 4rem;
+  line-height: 1;
+}
+
+.predicted-label {
+  font-size: 2rem;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+/* Confidence Bar */
+.confidence {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.confidence-label {
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.confidence-bar {
+  flex: 1;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.confidence-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #4ade80);
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}
+
+.confidence-value {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #4ade80;
+}
+
+/* All Probabilities */
+.all-probabilities {
+  margin-top: 1.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.all-probabilities h3 {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: rgba(255, 255, 255, 0.5);
+  margin: 0 0 1rem;
+}
+
+.prob-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.prob-icon {
+  font-size: 1.25rem;
+  width: 30px;
+  text-align: center;
+}
+
+.prob-name {
+  width: 70px;
+  font-size: 0.875rem;
+  text-transform: capitalize;
+}
+
+.prob-bar {
+  flex: 1;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.prob-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #818cf8, #a78bfa);
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.prob-value {
+  width: 50px;
+  text-align: right;
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.inference-time {
+  margin-top: 1.5rem;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.4);
+  text-align: right;
+}
+
+/* States */
+.loading-state,
+.error-state,
+.empty-state {
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  border-radius: 16px;
+  padding: 3rem 2rem;
+  text-align: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.loading-state .spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(255, 255, 255, 0.2);
+  border-top-color: white;
+  border-radius: 50%;
+  margin: 0 auto 1rem;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-state p {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.error-state h3 {
+  color: #fca5a5;
+  margin: 0 0 0.5rem;
+}
+
+.error-state p {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.empty-state p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.empty-state .hint {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* Responsive */
+@media (max-width: 800px) {
+  .portal-content {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .results-section {
+    max-width: 100%;
+  }
+}
