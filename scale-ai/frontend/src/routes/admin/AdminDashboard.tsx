@@ -270,6 +270,7 @@ export function AdminDashboard() {
             trainingInProgress={trainingInProgress}
             onStartTraining={handleStartTraining}
             onActivateModel={handleActivateModel}
+            onRefresh={loadData}
           />
         )}
       </main>

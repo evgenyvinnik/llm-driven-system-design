@@ -391,6 +391,207 @@
   font-size: 0.875rem;
 }
 
+/* Training Jobs Section */
+.jobs-section {
+  margin-bottom: 2rem;
+}
+
+.jobs-section h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+  color: #334155;
+}
+
+.jobs-section .empty {
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.jobs-section .loading-text {
+  color: #64748b;
+  font-style: italic;
+}
+
+.jobs-section .error-text {
+  color: #ef4444;
+}
+
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.job-card {
+  background: white;
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border-left: 4px solid #94a3b8;
+}
+
+.job-card.status-pending {
+  border-left-color: #f59e0b;
+}
+
+.job-card.status-queued {
+  border-left-color: #3b82f6;
+}
+
+.job-card.status-running {
+  border-left-color: #8b5cf6;
+  background: linear-gradient(90deg, rgba(139, 92, 246, 0.05), white);
+}
+
+.job-card.status-completed {
+  border-left-color: #22c55e;
+}
+
+.job-card.status-failed {
+  border-left-color: #ef4444;
+}
+
+.job-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.job-status {
+  padding: 0.25rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.job-status.pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.job-status.queued {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.job-status.running {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.job-status.completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.job-status.failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.job-date {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.job-details {
+  margin-top: 0.5rem;
+}
+
+.job-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.progress-bar {
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill.running {
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(90deg, #8b5cf6, #a78bfa, #8b5cf6);
+  background-size: 200% 100%;
+  animation: progress-animation 1.5s linear infinite;
+  border-radius: 3px;
+}
+
+@keyframes progress-animation {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: 0 0;
+  }
+}
+
+.progress-text {
+  font-size: 0.75rem;
+  color: #6d28d9;
+  font-weight: 500;
+}
+
+.job-result {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.result-label {
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.result-value {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #22c55e;
+}
+
+.job-error {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.error-label {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #991b1b;
+}
+
+.error-message {
+  font-size: 0.75rem;
+  color: #64748b;
+}
+
+.job-waiting {
+  padding: 0.25rem 0;
+}
+
+.waiting-text {
+  font-size: 0.75rem;
+  color: #64748b;
+  font-style: italic;
+}
+
+.job-footer {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #f1f5f9;
+}
+
+.job-completed {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
 .models-list h3 {
   font-size: 1rem;
   font-weight: 600;

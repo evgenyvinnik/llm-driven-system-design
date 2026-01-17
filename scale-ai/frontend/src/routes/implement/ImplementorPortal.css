@@ -35,6 +35,38 @@
   color: #a5b4fc;
 }
 
+/* Tab Navigation */
+.portal-tabs {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 2rem;
+}
+
+.tab-btn {
+  padding: 0.75rem 1.5rem;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.tab-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: white;
+}
+
+.tab-btn.active {
+  background: rgba(139, 92, 246, 0.3);
+  border-color: rgba(139, 92, 246, 0.5);
+  color: white;
+}
+
 /* Content */
 .portal-content {
   display: flex;
@@ -240,6 +272,11 @@
   margin-top: 0.5rem;
   font-size: 0.875rem;
   color: rgba(255, 255, 255, 0.5);
+}
+
+/* Generate Mode Content */
+.generate-content {
+  justify-content: center;
 }
 
 /* Responsive */

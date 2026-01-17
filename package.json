@@ -11,7 +11,8 @@
     "screenshots:dry": "node scripts/screenshots.mjs --dry-run"
   },
   "devDependencies": {
-    "playwright": "^1.49.0"
+    "playwright": "^1.49.0",
+    "puppeteer": "^24.35.0"
   },
   "engines": {
     "node": ">=20.0.0"

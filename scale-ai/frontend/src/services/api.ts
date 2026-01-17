@@ -606,3 +606,41 @@ export async function classifyDrawing(
   }
   return response.json()
 }
+
+/**
+ * Result from generating a shape.
+ */
+export interface GenerationResult {
+  shape: string
+  strokes: Array<{
+    points: Array<{ x: number; y: number }>
+    color: string
+    width: number
+  }>
+  canvas: { width: number; height: number }
+  generation_time_ms: number
+  model_version: string
+}
+
+/**
+ * Generates a shape drawing using the active ML model.
+ * Returns stroke data that can be rendered on a canvas.
+ *
+ * @param shape - The shape class to generate (circle, heart, line, square, triangle)
+ * @returns Promise resolving to generation result with strokes
+ * @throws Error if no model is active or generation fails
+ */
+export async function generateShape(shape: string): Promise<GenerationResult> {
+  const response = await fetch(`${INFERENCE_API}/api/inference/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ shape }),
+  })
+  if (!response.ok) {
+    if (response.status === 503) {
+      throw new Error('No active model. Train and activate a model first.')
+    }
+    throw new Error('Failed to generate shape')
+  }
+  return response.json()
+}

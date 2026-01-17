@@ -124,6 +124,29 @@ export const inferenceLatency = new client.Histogram({
   registers: [register],
 })
 
+/**
+ * Counter for shape generation requests.
+ * Labels: model_version, shape
+ */
+export const generationRequestsTotal = new client.Counter({
+  name: 'generation_requests_total',
+  help: 'Total number of shape generation requests',
+  labelNames: ['model_version', 'shape'],
+  registers: [register],
+})
+
+/**
+ * Histogram for generation latency.
+ * Labels: model_version
+ */
+export const generationLatency = new client.Histogram({
+  name: 'generation_latency_seconds',
+  help: 'Shape generation latency in seconds',
+  labelNames: ['model_version'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+  registers: [register],
+})
+
 // ============================================================================
 // External Service Metrics
 // ============================================================================

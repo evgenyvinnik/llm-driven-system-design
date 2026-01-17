@@ -1,20 +1,32 @@
 /**
- * ImplementorPortal component - Test interface for ML model predictions.
- * Allows users to draw shapes and see how the trained model classifies them.
- * Displays prediction confidence, all class probabilities, and inference time.
+ * ImplementorPortal component - Test interface for ML model predictions and generation.
+ * Provides two modes:
+ * - Classify: Draw shapes and see how the trained model classifies them
+ * - Generate: Select a shape and watch the AI draw it
  * @module routes/implement/ImplementorPortal
  */
 
 import { useState, useCallback } from 'react'
 import { PostItCanvas } from '../../components/PostItCanvas'
+import { GenerateMode } from './GenerateMode'
 import { classifyDrawing, getModelInfo, type ClassificationResult, type ModelInfo } from '../../services/api'
 import './ImplementorPortal.css'
 
+/** Available modes for the portal */
+type PortalMode = 'classify' | 'generate'
+
+/** Tab configuration */
+const TABS: { id: PortalMode; label: string; description: string }[] = [
+  { id: 'classify', label: 'Classify', description: 'Draw a shape and see the AI guess what it is' },
+  { id: 'generate', label: 'Generate', description: 'Select a shape and watch the AI draw it' },
+]
+
 /**
  * The model tester portal for implementors.
- * Provides a canvas for drawing and displays classification results.
+ * Provides tabs for classification and generation modes.
  */
 export function ImplementorPortal() {
+  const [activeMode, setActiveMode] = useState<PortalMode>('classify')
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
   const [result, setResult] = useState<ClassificationResult | null>(null)
   const [loading, setLoading] = useState(false)
@@ -71,11 +83,20 @@ export function ImplementorPortal() {
     setResult(null)
   }
 
+  /**
+   * Handles tab change.
+   */
+  const handleTabChange = (mode: PortalMode) => {
+    setActiveMode(mode)
+    setResult(null)
+    setError(null)
+  }
+
   return (
     <div className="implementor-portal">
       <header className="portal-header">
         <h1>Model Tester</h1>
-        <p>Draw a shape and see how the AI classifies it</p>
+        <p>{TABS.find((t) => t.id === activeMode)?.description}</p>
         {modelInfo && (
           <div className="model-badge">
             Model: {modelInfo.version} ({(modelInfo.accuracy * 100).toFixed(1)}% accuracy)
@@ -83,85 +104,108 @@ export function ImplementorPortal() {
         )}
       </header>
 
-      <div className="portal-content">
-        <div className="canvas-section">
-          <PostItCanvas
-            shape="circle" // Placeholder, not used for prompt in this mode
-            onComplete={handleComplete}
-            onClear={handleClear}
-          />
-        </div>
+      {/* Tab Navigation */}
+      <nav className="portal-tabs">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            className={`tab-btn ${activeMode === tab.id ? 'active' : ''}`}
+            onClick={() => handleTabChange(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </nav>
 
-        <div className="results-section">
-          {loading && (
-            <div className="loading-state">
-              <div className="spinner" />
-              <p>Analyzing your drawing...</p>
-            </div>
-          )}
+      {/* Classify Mode */}
+      {activeMode === 'classify' && (
+        <div className="portal-content">
+          <div className="canvas-section">
+            <PostItCanvas
+              shape="circle" // Placeholder, not used for prompt in this mode
+              onComplete={handleComplete}
+              onClear={handleClear}
+            />
+          </div>
 
-          {error && (
-            <div className="error-state">
-              <h3>Error</h3>
-              <p>{error}</p>
-            </div>
-          )}
-
-          {!loading && !error && result && (
-            <div className="result-card">
-              <h2>Prediction</h2>
-              <div className="prediction">
-                <span className="predicted-shape">{getShapeIcon(result.prediction)}</span>
-                <span className="predicted-label">{result.prediction}</span>
+          <div className="results-section">
+            {loading && (
+              <div className="loading-state">
+                <div className="spinner" />
+                <p>Analyzing your drawing...</p>
               </div>
-              <div className="confidence">
-                <span className="confidence-label">Confidence:</span>
-                <div className="confidence-bar">
-                  <div
-                    className="confidence-fill"
-                    style={{ width: `${result.confidence * 100}%` }}
-                  />
+            )}
+
+            {error && (
+              <div className="error-state">
+                <h3>Error</h3>
+                <p>{error}</p>
+              </div>
+            )}
+
+            {!loading && !error && result && (
+              <div className="result-card">
+                <h2>Prediction</h2>
+                <div className="prediction">
+                  <span className="predicted-shape">{getShapeIcon(result.prediction)}</span>
+                  <span className="predicted-label">{result.prediction}</span>
                 </div>
-                <span className="confidence-value">
-                  {(result.confidence * 100).toFixed(1)}%
-                </span>
-              </div>
+                <div className="confidence">
+                  <span className="confidence-label">Confidence:</span>
+                  <div className="confidence-bar">
+                    <div
+                      className="confidence-fill"
+                      style={{ width: `${result.confidence * 100}%` }}
+                    />
+                  </div>
+                  <span className="confidence-value">
+                    {(result.confidence * 100).toFixed(1)}%
+                  </span>
+                </div>
 
-              <div className="all-probabilities">
-                <h3>All Probabilities</h3>
-                {result.all_probabilities
-                  .sort((a, b) => b.probability - a.probability)
-                  .map((prob) => (
-                    <div key={prob.class} className="prob-row">
-                      <span className="prob-icon">{getShapeIcon(prob.class)}</span>
-                      <span className="prob-name">{prob.class}</span>
-                      <div className="prob-bar">
-                        <div
-                          className="prob-fill"
-                          style={{ width: `${prob.probability * 100}%` }}
-                        />
+                <div className="all-probabilities">
+                  <h3>All Probabilities</h3>
+                  {result.all_probabilities
+                    .sort((a, b) => b.probability - a.probability)
+                    .map((prob) => (
+                      <div key={prob.class} className="prob-row">
+                        <span className="prob-icon">{getShapeIcon(prob.class)}</span>
+                        <span className="prob-name">{prob.class}</span>
+                        <div className="prob-bar">
+                          <div
+                            className="prob-fill"
+                            style={{ width: `${prob.probability * 100}%` }}
+                          />
+                        </div>
+                        <span className="prob-value">
+                          {(prob.probability * 100).toFixed(1)}%
+                        </span>
                       </div>
-                      <span className="prob-value">
-                        {(prob.probability * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                  ))}
-              </div>
+                    ))}
+                </div>
 
-              <div className="inference-time">
-                Inference time: {result.inference_time_ms}ms
+                <div className="inference-time">
+                  Inference time: {result.inference_time_ms}ms
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {!loading && !error && !result && (
-            <div className="empty-state">
-              <p>Draw something on the post-it note!</p>
-              <p className="hint">The AI will try to classify your drawing</p>
-            </div>
-          )}
+            {!loading && !error && !result && (
+              <div className="empty-state">
+                <p>Draw something on the post-it note!</p>
+                <p className="hint">The AI will try to classify your drawing</p>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* Generate Mode */}
+      {activeMode === 'generate' && (
+        <div className="portal-content generate-content">
+          <GenerateMode />
+        </div>
+      )}
     </div>
   )
 }
