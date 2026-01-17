@@ -1,0 +1,30 @@
+{
+  "name": "youtube-top-k-backend",
+  "version": "1.0.0",
+  "description": "Real-time trending video analytics backend",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "dev:server1": "PORT=3001 node --watch src/index.js",
+    "dev:server2": "PORT=3002 node --watch src/index.js",
+    "dev:server3": "PORT=3003 node --watch src/index.js",
+    "start": "node src/index.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.0.1",
+    "pg": "^8.13.1",
+    "redis": "^4.7.0",
+    "uuid": "^11.0.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0"
+  }
+}

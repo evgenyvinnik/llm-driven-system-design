@@ -2,107 +2,258 @@
 
 ## System Overview
 
-A collaborative design and prototyping platform with real-time multiplayer editing
+A collaborative design and prototyping platform with real-time multiplayer editing, featuring vector graphics creation, version history, and presence tracking.
 
 ## Requirements
 
 ### Functional Requirements
 
-- Real-time collaborative editing
-- Vector graphics editing
-- Component and design system management
-- Prototyping and interactions
+- Real-time collaborative editing with multiplayer cursors
+- Vector graphics editing (rectangles, ellipses, text)
+- Layers panel with visibility and lock controls
+- Properties panel for object manipulation
 - Version control and history
-- Comments and feedback
-- Asset management and export
+- File management (create, browse, delete)
 
 ### Non-Functional Requirements
 
-- Scalability: *To be defined*
-- Availability: *To be defined*
-- Latency: *To be defined*
-- Consistency: *To be defined*
+- **Scalability**: Designed for local development with 2-5 concurrent users per file
+- **Availability**: Handles server reconnection gracefully
+- **Latency**: < 100ms for local operations, < 200ms for sync to collaborators
+- **Consistency**: Last-Writer-Wins (LWW) for conflict resolution
 
 ## Capacity Estimation
 
-*To be calculated based on expected scale:*
+For local development:
 
-- Daily Active Users (DAU):
-- Concurrent editors per file:
-- Operations per second:
-- Storage requirements:
-- Bandwidth requirements:
+- Concurrent users: 2-5 per file
+- Operations per second: ~10-50 per active session
+- Storage: PostgreSQL with JSONB for canvas data
+- WebSocket connections: 1 per user per file
 
 ## High-Level Architecture
 
-*Architectural diagram and component description to be added*
+```
+                           ┌─────────────────────────────────┐
+                           │       Frontend (React 19)       │
+                           │   Canvas Editor + Zustand Store │
+                           └──────────────┬──────────────────┘
+                                          │
+                                          │ HTTP + WebSocket
+                                          ▼
+                           ┌─────────────────────────────────┐
+                           │    Backend (Express + WS)       │
+                           │                                 │
+                           │  ┌───────────┐ ┌─────────────┐ │
+                           │  │ REST API  │ │  WebSocket  │ │
+                           │  │ (Files,   │ │  (Real-time │ │
+                           │  │ Versions) │ │  sync)      │ │
+                           │  └───────────┘ └─────────────┘ │
+                           └──────────────┬──────────────────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    │                     │                     │
+           ┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+           │   PostgreSQL    │   │      Redis      │   │     Redis       │
+           │   (Files,       │   │    (Presence,   │   │   (Pub/Sub)     │
+           │    Versions)    │   │     Sessions)   │   │                 │
+           └─────────────────┘   └─────────────────┘   └─────────────────┘
+```
 
 ### Core Components
 
-*Components will be identified during design phase*
+1. **Frontend (React 19 + Vite + Zustand + Tailwind CSS)**
+   - Canvas-based editor with 2D rendering
+   - Zustand for state management
+   - WebSocket hook for real-time sync
+   - File browser and version history UI
+
+2. **Backend (Node.js + Express + WebSocket)**
+   - REST API for file and version management
+   - WebSocket server for real-time collaboration
+   - Operation processing and broadcasting
+
+3. **PostgreSQL**
+   - Files with JSONB canvas data
+   - Version history with snapshots
+   - Operations log for CRDT
+
+4. **Redis**
+   - Presence tracking (cursor positions, selections)
+   - Pub/Sub for cross-server coordination
 
 ## Data Model
 
 ### Database Schema
 
-*Schema design to be added*
+```sql
+-- Files
+CREATE TABLE files (
+  id UUID PRIMARY KEY,
+  name VARCHAR(255),
+  owner_id UUID,
+  project_id UUID,
+  team_id UUID,
+  thumbnail_url VARCHAR(500),
+  canvas_data JSONB,
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+);
 
-### Storage Strategy
+-- File versions
+CREATE TABLE file_versions (
+  id UUID PRIMARY KEY,
+  file_id UUID REFERENCES files(id),
+  version_number INTEGER,
+  name VARCHAR(255),
+  canvas_data JSONB,
+  created_by UUID,
+  created_at TIMESTAMP,
+  is_auto_save BOOLEAN
+);
 
-*Storage decisions to be documented*
+-- Operations log
+CREATE TABLE operations (
+  id UUID PRIMARY KEY,
+  file_id UUID REFERENCES files(id),
+  user_id UUID,
+  operation_type VARCHAR(100),
+  object_id VARCHAR(100),
+  property_path VARCHAR(255),
+  old_value JSONB,
+  new_value JSONB,
+  timestamp BIGINT,
+  client_id VARCHAR(100),
+  created_at TIMESTAMP
+);
+```
+
+### Canvas Data Structure
+
+```typescript
+interface CanvasData {
+  objects: DesignObject[];
+  pages: Page[];
+}
+
+interface DesignObject {
+  id: string;
+  type: 'rectangle' | 'ellipse' | 'text' | 'frame' | 'group' | 'image';
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number;
+  fill: string;
+  stroke: string;
+  strokeWidth: number;
+  opacity: number;
+  visible: boolean;
+  locked: boolean;
+  // Text-specific
+  text?: string;
+  fontSize?: number;
+  fontFamily?: string;
+}
+```
 
 ## API Design
 
-### Core Endpoints
+### REST Endpoints
 
-*API endpoints to be defined*
+```
+GET    /api/files                    - List all files
+POST   /api/files                    - Create new file
+GET    /api/files/:id                - Get file details
+PATCH  /api/files/:id                - Update file name
+DELETE /api/files/:id                - Delete file
+GET    /api/files/:id/versions       - List version history
+POST   /api/files/:id/versions       - Create named version
+POST   /api/files/:id/versions/:versionId/restore - Restore version
+```
+
+### WebSocket Protocol
+
+```typescript
+// Client -> Server
+{ type: "subscribe", payload: { fileId, userId, userName } }
+{ type: "operation", payload: { operations: [...] } }
+{ type: "presence", payload: { cursor: {x, y}, selection: [...] } }
+
+// Server -> Client
+{ type: "sync", payload: { file, presence, yourColor } }
+{ type: "operation", payload: { operations: [...] } }
+{ type: "presence", payload: { presence: [...], removed: [...] } }
+{ type: "ack", payload: { operationIds: [...] } }
+```
 
 ## Key Design Decisions
 
-### Real-time collaboration (CRDT/OT)
+### Real-time Collaboration (Simplified CRDT)
 
-*Analysis and solution to be added*
+Using Last-Writer-Wins (LWW) registers for object properties:
+- Each property update includes a timestamp
+- When merging, highest timestamp wins
+- Ties broken by client ID
 
-### Vector graphics storage
+### Vector Graphics Storage
 
-*Analysis and solution to be added*
+Canvas data stored as JSONB in PostgreSQL:
+- Allows for flexible schema evolution
+- Supports indexing for specific queries
+- Simple to serialize/deserialize
 
-### Version control and history
+### Version Control and History
 
-*Analysis and solution to be added*
+- Periodic snapshots stored as full JSONB documents
+- Operations logged for fine-grained history
+- Named versions for user bookmarks
 
-### Conflict resolution
+### Conflict Resolution
 
-*Analysis and solution to be added*
+- LWW for property updates
+- Server as authority for operation ordering
+- Clients optimistically apply changes, reconcile on sync
 
 ## Technology Stack
 
-*Technology choices to be documented with rationale*
-
-- **Application Layer**:
-- **Data Layer**:
-- **Caching Layer**:
-- **Message Queue**:
-- **WebSocket/Real-time**:
-- **File Storage**:
-- **Other Services**:
+- **Frontend**: React 19, Vite, Zustand, Tailwind CSS
+- **Backend**: Node.js, Express, ws (WebSocket)
+- **Data Layer**: PostgreSQL 16
+- **Caching/Presence**: Redis 7
+- **Real-time**: Native WebSocket
 
 ## Scalability Considerations
 
-*Scaling strategies to be defined*
+### Single Server (Current)
 
-## Trade-offs and Alternatives
+- All WebSocket connections to one server
+- Direct database access
+- In-memory operation batching
 
-*Design trade-offs and alternative approaches to be discussed*
+### Multi-Server (Future)
+
+- Sticky sessions by file_id
+- Redis pub/sub for presence synchronization
+- Consistent hashing for file assignment
 
 ## Monitoring and Observability
 
-*Monitoring strategy to be defined*
+- Health check endpoint at `/health`
+- Console logging for connections and operations
+- Redis key TTL for presence expiration
 
 ## Security Considerations
 
-*Security measures to be documented*
+- CORS configured for frontend origin
+- Input validation on API endpoints
+- Parameterized SQL queries (pg library)
 
 ## Future Optimizations
 
-*Potential improvements and optimizations to be listed*
+1. **WebGL Rendering**: For performance with thousands of objects
+2. **CRDT Library**: Yjs or Automerge for robust conflict resolution
+3. **Viewport Culling**: Only sync objects in view
+4. **Delta Compression**: Send only changed properties
+5. **Offline Support**: IndexedDB for local persistence

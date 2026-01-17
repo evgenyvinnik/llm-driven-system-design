@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background-color: #121212;
+  color: #fff;
+  overflow: hidden;
+}
+
+/* Hide scrollbar for Chrome, Safari and Opera */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Hide scrollbar for IE, Edge and Firefox */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Video container snap scrolling */
+.video-scroll {
+  scroll-snap-type: y mandatory;
+  overflow-y: scroll;
+  height: 100%;
+}
+
+.video-item {
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+/* Custom button styles */
+.btn-primary {
+  @apply bg-tiktok-red text-white font-semibold py-2 px-4 rounded-md hover:bg-red-600 transition-colors;
+}
+
+.btn-secondary {
+  @apply bg-gray-700 text-white font-semibold py-2 px-4 rounded-md hover:bg-gray-600 transition-colors;
+}
+
+.btn-outline {
+  @apply border border-gray-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-gray-800 transition-colors;
+}
+
+/* Input styles */
+.input {
+  @apply w-full bg-gray-800 border border-gray-700 rounded-md px-4 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-tiktok-red transition-colors;
+}
+
+/* Loading spinner */
+.spinner {
+  @apply animate-spin rounded-full h-8 w-8 border-2 border-gray-600 border-t-tiktok-red;
+}

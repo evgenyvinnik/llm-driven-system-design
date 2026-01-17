@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Netflix Sans', 'Helvetica Neue', 'Segoe UI', 'Roboto', 'Ubuntu', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-netflix-black text-white min-h-screen;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-netflix-gray rounded;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-netflix-light-gray;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-netflix-red text-white px-6 py-2 rounded font-semibold transition-colors hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-white/30 text-white px-6 py-2 rounded font-semibold transition-colors hover:bg-white/40;
+  }
+
+  .input-field {
+    @apply w-full px-4 py-3 bg-zinc-800 border border-zinc-700 rounded focus:outline-none focus:border-netflix-red text-white placeholder-zinc-400;
+  }
+
+  .card {
+    @apply bg-netflix-dark rounded-md overflow-hidden transition-transform hover:scale-105 cursor-pointer;
+  }
+
+  .row-title {
+    @apply text-xl font-semibold mb-4 px-4 md:px-12;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  .text-shadow {
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+  }
+
+  .gradient-overlay {
+    background: linear-gradient(to top, rgba(20, 20, 20, 1) 0%, rgba(20, 20, 20, 0.7) 50%, transparent 100%);
+  }
+}

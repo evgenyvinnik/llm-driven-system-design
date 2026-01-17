@@ -4,62 +4,215 @@
 
 A simplified Shopify-like platform demonstrating multi-tenant e-commerce, checkout flows, payment processing, and merchant customization. This educational project focuses on building a platform where merchants can create their own online stores.
 
-## Key Features
+## Features
 
-### 1. Store Management
-- Merchant store creation
-- Custom domain support
-- Theme customization
-- Store settings and branding
+### Store Admin
+- **Dashboard**: Analytics overview with revenue, orders, products, customers
+- **Products**: Full CRUD with variants, inventory tracking
+- **Orders**: Order listing, fulfillment status management
+- **Customers**: Customer listing with order history
+- **Settings**: Store configuration, branding
 
-### 2. Product Management
-- Product catalog per store
-- Variants (size, color, etc.)
-- Inventory tracking
-- Collections and categories
+### Customer Storefront
+- **Product Catalog**: Browse all active products
+- **Product Details**: Variant selection, inventory display
+- **Shopping Cart**: Add/remove items, quantity updates
+- **Checkout**: Complete order with shipping info
+- **Order Confirmation**: Success page after checkout
 
-### 3. Checkout Flow
-- Shopping cart
-- Guest vs registered checkout
-- Payment processing (Stripe integration)
-- Order confirmation
+### Multi-Tenant Architecture
+- PostgreSQL Row-Level Security (RLS) for tenant isolation
+- Subdomain-based store resolution
+- Session-based authentication with Redis
 
-### 4. Order Management
-- Order processing
-- Fulfillment tracking
-- Refunds and returns
-- Order notifications
+## Quick Start
 
-### 5. Admin Dashboard
-- Sales analytics
-- Customer management
-- Inventory reports
-- Store settings
+### Prerequisites
+- Docker and Docker Compose
+- Node.js 18+ and npm
 
-## Implementation Status
+### 1. Start Infrastructure
 
-- [ ] Initial architecture design
-- [ ] Multi-tenant store creation
-- [ ] Product and inventory management
-- [ ] Checkout workflow
-- [ ] Payment integration
-- [ ] Order management
-- [ ] Merchant dashboard
-- [ ] Custom domain routing
-- [ ] Documentation
+```bash
+cd shopify
+docker-compose up -d
+```
 
-## Key Technical Challenges
+This starts:
+- **PostgreSQL** on port 5432 (with RLS enabled)
+- **Redis** on port 6379
 
-1. **Multi-Tenancy**: Isolating data between merchants
-2. **Custom Domains**: Routing requests to correct store
-3. **Checkout Flow**: Secure, reliable payment processing
-4. **Theme System**: Customizable storefronts
-5. **Inventory Sync**: Real-time stock across channels
+### 2. Start Backend
+
+```bash
+cd backend
+npm install
+npm run dev
+```
+
+Backend runs on http://localhost:3001
+
+### 3. Start Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend runs on http://localhost:5173
+
+## Demo Credentials
+
+### Platform Access
+- **Email**: `merchant@example.com`
+- **Password**: `merchant123`
+
+### Demo Store
+- **Subdomain**: `demo`
+- Pre-loaded with sample products
+
+## API Endpoints
+
+### Authentication
+```
+POST /api/auth/login      - Login
+POST /api/auth/register   - Register
+POST /api/auth/logout     - Logout
+GET  /api/auth/me         - Current user
+```
+
+### Store Admin (Authenticated)
+```
+GET    /api/stores                         - List user's stores
+POST   /api/stores                         - Create store
+GET    /api/stores/:storeId                - Get store
+PUT    /api/stores/:storeId                - Update store
+GET    /api/stores/:storeId/analytics      - Store analytics
+
+GET    /api/stores/:storeId/products       - List products
+POST   /api/stores/:storeId/products       - Create product
+GET    /api/stores/:storeId/products/:id   - Get product
+PUT    /api/stores/:storeId/products/:id   - Update product
+DELETE /api/stores/:storeId/products/:id   - Delete product
+
+GET    /api/stores/:storeId/orders         - List orders
+GET    /api/stores/:storeId/orders/:id     - Get order
+PUT    /api/stores/:storeId/orders/:id     - Update order status
+
+GET    /api/stores/:storeId/customers      - List customers
+GET    /api/stores/:storeId/customers/:id  - Get customer
+```
+
+### Storefront (Public)
+```
+GET  /api/storefront/:subdomain              - Get store info
+GET  /api/storefront/:subdomain/products     - List products
+GET  /api/storefront/:subdomain/products/:h  - Get product by handle
+GET  /api/storefront/:subdomain/collections  - List collections
+GET  /api/storefront/:subdomain/cart         - Get cart
+POST /api/storefront/:subdomain/cart/add     - Add to cart
+PUT  /api/storefront/:subdomain/cart/update  - Update cart
+POST /api/storefront/:subdomain/checkout     - Process checkout
+```
+
+## Project Structure
+
+```
+shopify/
+├── docker-compose.yml        # PostgreSQL + Redis
+├── backend/
+│   ├── package.json
+│   ├── scripts/
+│   │   └── init.sql          # Database schema with RLS
+│   └── src/
+│       ├── index.js          # Express server
+│       ├── config/           # Configuration
+│       ├── middleware/       # Auth middleware
+│       ├── routes/           # API routes
+│       └── services/         # DB and Redis clients
+└── frontend/
+    ├── package.json
+    ├── index.html
+    └── src/
+        ├── main.tsx          # App entry
+        ├── routes/           # TanStack Router routes
+        ├── stores/           # Zustand stores
+        ├── services/         # API client
+        └── types/            # TypeScript types
+```
+
+## Key Technical Features
+
+### Row-Level Security (RLS)
+Every tenant table has RLS enabled with policies that automatically filter queries:
+
+```sql
+ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+CREATE POLICY store_isolation_products ON products
+  FOR ALL
+  USING (store_id = NULLIF(current_setting('app.current_store_id', true), '')::integer);
+```
+
+### Multi-Tenant Query Pattern
+```javascript
+async function queryWithTenant(storeId, query, params) {
+  const client = await pool.connect();
+  await client.query(`SET app.current_store_id = '${storeId}'`);
+  return client.query(query, params);
+}
+```
+
+### Session-Based Auth
+```javascript
+// Redis stores session data
+await redis.set(`session:${sessionId}`, JSON.stringify({ user }));
+
+// Cookie sent to client
+res.cookie('session', sessionId, { httpOnly: true, sameSite: 'lax' });
+```
+
+## Development
+
+### Running Multiple Backend Instances
+```bash
+npm run dev:server1  # Port 3001
+npm run dev:server2  # Port 3002
+npm run dev:server3  # Port 3003
+```
+
+### Database Reset
+```bash
+docker-compose down -v
+docker-compose up -d
+```
+
+### Viewing Database
+```bash
+docker exec -it shopify-postgres psql -U shopify -d shopify
+```
 
 ## Architecture
 
 See [architecture.md](./architecture.md) for detailed system design documentation.
 
-## Development Notes
+## Key Design Decisions
 
-See [claude.md](./claude.md) for development insights and design decisions.
+| Decision | Chosen | Alternative | Reason |
+|----------|--------|-------------|--------|
+| Multi-tenancy | Shared DB + RLS | Schema per tenant | Operational simplicity |
+| Session Storage | Redis | JWT | Simpler revocation |
+| State Management | Zustand | Redux | Less boilerplate |
+| Routing | TanStack Router | React Router | Type-safe routing |
+
+## What's Not Included
+
+For simplicity, this learning project omits:
+- Real payment processing (Stripe integration mocked)
+- Custom domain SSL provisioning
+- Email notifications
+- File upload/image hosting
+- Full theme customization
+- Real-time inventory sync
+
+See [architecture.md](./architecture.md) for how these would be implemented in production.

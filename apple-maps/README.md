@@ -4,56 +4,235 @@
 
 A simplified Apple Maps-like platform demonstrating mapping, routing, real-time traffic, and turn-by-turn navigation. This educational project focuses on building a navigation system with live traffic updates and ETA prediction.
 
-## Key Features
+## Features
 
-### 1. Map Rendering
-- Vector tile rendering
-- Satellite imagery
-- 3D buildings
-- Indoor maps
+### Implemented
 
-### 2. Routing Engine
-- Multi-modal routing
-- Real-time traffic
-- Turn-by-turn directions
-- Alternative routes
+- **Map Rendering**: Interactive map with Leaflet and OpenStreetMap tiles
+- **Place Search**: Search for places by name with autocomplete
+- **Geocoding**: Convert addresses to coordinates
+- **Routing Engine**: A* pathfinding algorithm with traffic-aware weights
+- **Turn-by-Turn Navigation**: Maneuver generation with directions
+- **Real-Time Traffic**: Simulated traffic conditions with congestion levels
+- **POI Display**: Points of interest with categories and ratings
+- **Incident Reporting**: Traffic incidents display and reporting
 
-### 3. Traffic System
-- Live traffic data
-- Incident reports
-- Predictive traffic
-- Rerouting
+### Key Technical Features
 
-### 4. Location Services
-- GPS tracking
-- Dead reckoning
-- Map matching
-- Arrival prediction
+1. **A* Routing Algorithm**
+   - Priority queue implementation with binary min-heap
+   - Traffic-aware edge weights
+   - Support for avoiding tolls and highways
 
-### 5. Points of Interest
-- Business search
-- Reviews and ratings
-- Operating hours
-- Siri integration
+2. **Traffic Simulation**
+   - Simulated rush hour patterns
+   - Congestion level calculation (free, light, moderate, heavy)
+   - Real-time updates every 10 seconds
 
-## Implementation Status
+3. **Navigation**
+   - Turn angle calculation and classification
+   - Maneuver instruction generation
+   - ETA calculation based on traffic
 
-- [ ] Initial architecture design
-- [ ] Tile serving
-- [ ] Routing engine
-- [ ] Traffic aggregation
-- [ ] Turn-by-turn navigation
-- [ ] ETA prediction
-- [ ] Offline maps
-- [ ] Documentation
+## Tech Stack
 
-## Key Technical Challenges
+- **Frontend**: TypeScript, Vite, React 19, Zustand, Tailwind CSS, Leaflet
+- **Backend**: Node.js, Express
+- **Database**: PostgreSQL with PostGIS extension
+- **Cache**: Redis
 
-1. **Routing Scale**: Computing routes for millions of concurrent users
-2. **Real-Time Traffic**: Processing billions of GPS probes
-3. **Map Freshness**: Keeping maps up-to-date
-4. **ETA Accuracy**: Predicting arrival times with traffic
-5. **Offline Navigation**: Functioning without connectivity
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- Docker and Docker Compose
+- npm or yarn
+
+### Quick Start with Docker
+
+1. **Start infrastructure services**:
+
+```bash
+cd apple-maps
+docker-compose up -d
+```
+
+This starts:
+- PostgreSQL with PostGIS on port 5432
+- Redis on port 6379
+
+2. **Install backend dependencies and seed database**:
+
+```bash
+cd backend
+npm install
+npm run seed
+```
+
+3. **Start the backend**:
+
+```bash
+npm run dev
+```
+
+The backend runs on http://localhost:3001
+
+4. **Install frontend dependencies and start**:
+
+```bash
+cd ../frontend
+npm install
+npm run dev
+```
+
+The frontend runs on http://localhost:5173
+
+### Native Setup (without Docker)
+
+If you prefer to run PostgreSQL and Redis natively:
+
+1. **Install PostgreSQL with PostGIS**:
+
+```bash
+# macOS with Homebrew
+brew install postgresql@16 postgis
+
+# Start PostgreSQL
+brew services start postgresql@16
+
+# Create database
+createdb apple_maps
+psql apple_maps -c "CREATE EXTENSION postgis;"
+```
+
+2. **Install Redis**:
+
+```bash
+# macOS with Homebrew
+brew install redis
+brew services start redis
+```
+
+3. **Set environment variables** (optional, defaults are provided):
+
+```bash
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_USER=your_username
+export DB_PASSWORD=your_password
+export DB_NAME=apple_maps
+export REDIS_HOST=localhost
+export REDIS_PORT=6379
+```
+
+4. **Initialize the database schema**:
+
+```bash
+psql apple_maps -f backend/db/init.sql
+```
+
+5. **Continue with steps 2-4 from Quick Start**
+
+## API Endpoints
+
+### Routing
+
+```
+POST /api/routes
+{
+  "origin": { "lat": 37.77, "lng": -122.42 },
+  "destination": { "lat": 37.78, "lng": -122.41 },
+  "options": { "avoidTolls": false, "avoidHighways": false }
+}
+```
+
+### Search
+
+```
+GET /api/search?q=coffee&lat=37.77&lng=-122.42&radius=5000
+GET /api/search/geocode?address=Market%20Street
+GET /api/search/reverse?lat=37.77&lng=-122.42
+GET /api/search/places/:id
+GET /api/search/categories
+```
+
+### Traffic
+
+```
+GET /api/traffic?minLat=37.76&minLng=-122.43&maxLat=37.79&maxLng=-122.40
+GET /api/traffic/incidents?minLat=37.76&minLng=-122.43&maxLat=37.79&maxLng=-122.40
+POST /api/traffic/incidents
+DELETE /api/traffic/incidents/:id
+```
+
+### Map Data
+
+```
+GET /api/map/nodes?minLat=&minLng=&maxLat=&maxLng=
+GET /api/map/segments?minLat=&minLng=&maxLat=&maxLng=
+GET /api/map/pois?minLat=&minLng=&maxLat=&maxLng=&category=
+```
+
+### Health Check
+
+```
+GET /health
+```
+
+## Usage
+
+1. **View Map**: The application displays an interactive map centered on San Francisco
+2. **Search**: Use the search bar to find places and addresses
+3. **Set Route**: Click on the map to set origin (first click) and destination (second click)
+4. **Get Directions**: Click "Get Directions" to calculate a route
+5. **Start Navigation**: Click "Start" to begin turn-by-turn navigation
+6. **Toggle Layers**: Use the controls on the right to toggle traffic, POIs, and incidents
+
+## Project Structure
+
+```
+apple-maps/
+├── docker-compose.yml       # PostgreSQL and Redis services
+├── backend/
+│   ├── package.json
+│   ├── db/
+│   │   ├── init.sql         # Database schema
+│   │   └── seed.js          # Sample data seeder
+│   └── src/
+│       ├── index.js         # Express server
+│       ├── db.js            # PostgreSQL connection
+│       ├── redis.js         # Redis connection
+│       ├── routes/
+│       │   ├── routes.js    # Routing API
+│       │   ├── search.js    # Search/geocoding API
+│       │   └── traffic.js   # Traffic API
+│       ├── services/
+│       │   ├── routingService.js   # A* algorithm
+│       │   ├── searchService.js    # Search/geocoding
+│       │   └── trafficService.js   # Traffic simulation
+│       └── utils/
+│           └── geo.js       # Geographic utilities
+└── frontend/
+    ├── package.json
+    ├── vite.config.ts
+    ├── tailwind.config.js
+    └── src/
+        ├── main.tsx
+        ├── App.tsx
+        ├── index.css
+        ├── components/
+        │   ├── MapView.tsx      # Leaflet map
+        │   ├── SearchBar.tsx    # Search component
+        │   ├── RoutePanel.tsx   # Route/navigation panel
+        │   └── MapControls.tsx  # Layer toggles
+        ├── stores/
+        │   └── mapStore.ts      # Zustand state
+        ├── services/
+        │   └── api.ts           # API client
+        └── types/
+            └── index.ts         # TypeScript types
+```
 
 ## Architecture
 
@@ -61,4 +240,27 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and design decisions.
+See [claude.md](./CLAUDE.md) for development insights and design decisions.
+
+## Running Multiple Backend Instances
+
+For load testing or distributed development:
+
+```bash
+# Terminal 1
+npm run dev:server1  # Port 3001
+
+# Terminal 2
+npm run dev:server2  # Port 3002
+
+# Terminal 3
+npm run dev:server3  # Port 3003
+```
+
+## Key Technical Challenges
+
+1. **Routing Scale**: Computing routes efficiently using A* with priority queue
+2. **Real-Time Traffic**: Simulating and aggregating traffic conditions
+3. **Map Matching**: Snapping GPS coordinates to road network
+4. **ETA Accuracy**: Predicting arrival times with traffic
+5. **Offline Navigation**: (Future) Functioning without connectivity

@@ -182,6 +182,25 @@ export async function flagDrawing(id: string, flagged = true): Promise<void> {
   if (!response.ok) throw new Error('Failed to flag drawing')
 }
 
+export interface StrokeData {
+  id: string
+  shape: string
+  canvas: { width: number; height: number }
+  strokes: Array<{
+    points: Array<{ x: number; y: number; pressure: number; timestamp: number }>
+    color: string
+    width: number
+  }>
+  duration_ms: number
+  device: string
+}
+
+export async function getDrawingStrokes(id: string): Promise<StrokeData> {
+  const response = await adminFetch(`/api/admin/drawings/${id}/strokes`)
+  if (!response.ok) throw new Error('Failed to fetch stroke data')
+  return response.json()
+}
+
 export async function startTraining(
   config: Record<string, unknown> = {}
 ): Promise<{ id: string; status: string }> {

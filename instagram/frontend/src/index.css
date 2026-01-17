@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #fafafa;
+  color: #262626;
+}
+
+/* CSS Filters for Instagram-style effects */
+.filter-none {
+  filter: none;
+}
+
+.filter-clarendon {
+  filter: contrast(1.2) saturate(1.35);
+}
+
+.filter-gingham {
+  filter: brightness(1.05) sepia(0.05);
+}
+
+.filter-moon {
+  filter: grayscale(1) brightness(1.1);
+}
+
+.filter-lark {
+  filter: brightness(1.1) saturate(0.9);
+}
+
+.filter-reyes {
+  filter: sepia(0.22) brightness(1.1) contrast(0.85) saturate(0.75);
+}
+
+.filter-juno {
+  filter: saturate(1.4) contrast(1.1);
+}
+
+.filter-slumber {
+  filter: saturate(0.66) brightness(1.05);
+}
+
+.filter-crema {
+  filter: sepia(0.2) saturate(0.8);
+}
+
+.filter-ludwig {
+  filter: brightness(1.05) saturate(0.9);
+}
+
+.filter-aden {
+  filter: sepia(0.2) brightness(1.15) saturate(1.4);
+}
+
+.filter-perpetua {
+  filter: contrast(1.1) brightness(1.25);
+}
+
+/* Story ring gradient */
+.story-ring {
+  background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+  padding: 3px;
+  border-radius: 50%;
+}
+
+.story-ring-seen {
+  background: #dbdbdb;
+  padding: 2px;
+  border-radius: 50%;
+}
+
+/* Hide scrollbar for story tray */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Modal overlay */
+.modal-overlay {
+  background-color: rgba(0, 0, 0, 0.65);
+}
+
+/* Skeleton loading */
+.skeleton {
+  animation: skeleton-loading 1s linear infinite alternate;
+}
+
+@keyframes skeleton-loading {
+  0% {
+    background-color: #e2e2e2;
+  }
+  100% {
+    background-color: #f3f3f3;
+  }
+}
+
+/* Heart animation on double click */
+@keyframes like-heart {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+
+.like-animation {
+  animation: like-heart 0.8s ease-in-out forwards;
+}

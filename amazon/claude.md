@@ -43,30 +43,57 @@ Building an e-commerce platform to understand inventory management, product sear
 
 ## Development Phases
 
-### Phase 1: Product Catalog
-- [ ] Categories and products
-- [ ] Basic product pages
-- [ ] PostgreSQL full-text search
+### Phase 1: Product Catalog - COMPLETED
+- [x] Categories and products
+- [x] Basic product pages
+- [x] PostgreSQL full-text search
 
-### Phase 2: Inventory
-- [ ] Stock tracking
-- [ ] Reserved quantity model
-- [ ] Availability checking
+### Phase 2: Inventory - IN PROGRESS
+- [x] Stock tracking
+- [x] Reserved quantity model
+- [x] Availability checking
 
-### Phase 3: Cart & Checkout
-- [ ] Cart CRUD operations
-- [ ] Inventory reservation
-- [ ] Checkout workflow
+### Phase 3: Cart & Checkout - COMPLETED
+- [x] Cart CRUD operations
+- [x] Inventory reservation
+- [x] Checkout workflow
 
-### Phase 4: Search
-- [ ] Elasticsearch indexing
-- [ ] Faceted filtering
-- [ ] Search relevance tuning
+### Phase 4: Search - COMPLETED
+- [x] Elasticsearch indexing
+- [x] Faceted filtering
+- [x] Search relevance tuning
 
-### Phase 5: Recommendations
-- [ ] Also bought computation
-- [ ] Personalized homepage
-- [ ] Recently viewed
+### Phase 5: Recommendations - PARTIAL
+- [x] Also bought computation
+- [ ] Personalized homepage (basic implementation done)
+- [ ] Recently viewed (not implemented)
+
+---
+
+## Implementation Summary
+
+### What was built:
+
+**Backend (Express + Node.js)**
+- RESTful API with authentication (session-based)
+- Products, categories, cart, orders, reviews endpoints
+- Reserved inventory model preventing overselling
+- Background jobs for reservation cleanup
+- Elasticsearch integration for search
+- Redis for sessions and recommendation caching
+
+**Frontend (React + TypeScript + Vite)**
+- Product browsing and search
+- Category navigation
+- Shopping cart with real-time inventory
+- Checkout flow
+- Order history
+- Product reviews
+
+**Infrastructure**
+- PostgreSQL for primary data
+- Redis for caching and sessions
+- Elasticsearch for product search
 
 ---
 

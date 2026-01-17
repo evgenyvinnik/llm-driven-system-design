@@ -1,51 +1,199 @@
 # r/place - Collaborative Real-time Pixel Canvas
 
-## Overview
+A collaborative real-time pixel art canvas where users can place colored pixels with rate limiting. Inspired by Reddit's r/place.
 
-A collaborative real-time pixel art canvas where users can place colored pixels with rate limiting
+## Features
 
-## Key Features
+- 500x500 pixel shared canvas
+- Real-time updates via WebSocket
+- 16-color palette
+- 30-second cooldown between pixel placements
+- User authentication (or anonymous guest access)
+- Canvas history and snapshots for timelapse generation
+- Zoom and pan navigation
 
-- Shared pixel canvas
-- Real-time pixel placement
-- Rate limiting per user
-- Live canvas updates
-- Canvas history and timelapse
-- Collaborative art creation
+## Tech Stack
 
-## Implementation Status
+- **Frontend:** TypeScript, React 19, Vite, Zustand, Tailwind CSS
+- **Backend:** Node.js, Express, WebSocket (ws)
+- **Database:** PostgreSQL (pixel history, users, sessions)
+- **Cache/State:** Redis (canvas state, rate limiting, pub/sub)
 
-- [ ] Initial architecture design
-- [ ] Core functionality implementation
-- [ ] Database/Storage layer
-- [ ] API endpoints
-- [ ] Testing
-- [ ] Performance optimization
-- [ ] Documentation
+## Prerequisites
+
+- Node.js 20+
+- Docker and Docker Compose (for Redis and PostgreSQL)
+- npm or yarn
 
 ## Getting Started
 
-*Instructions will be added as the implementation progresses*
+### Option 1: Using Docker (Recommended)
 
-### Prerequisites
+1. **Clone and navigate to the project:**
+   ```bash
+   cd r-place
+   ```
 
-*To be determined*
+2. **Start infrastructure services:**
+   ```bash
+   docker-compose up -d
+   ```
 
-### Installation
+3. **Install backend dependencies and start:**
+   ```bash
+   cd backend
+   npm install
+   npm run dev
+   ```
+
+4. **In a new terminal, install frontend dependencies and start:**
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
+
+5. **Open your browser:**
+   - Frontend: http://localhost:5173
+   - Backend API: http://localhost:3000/api
+
+### Option 2: Native Services
+
+If you have Redis and PostgreSQL installed locally:
+
+1. **Configure environment (optional):**
+   ```bash
+   # Backend environment variables
+   export REDIS_HOST=localhost
+   export REDIS_PORT=6379
+   export POSTGRES_HOST=localhost
+   export POSTGRES_PORT=5432
+   export POSTGRES_USER=your_user
+   export POSTGRES_PASSWORD=your_password
+   export POSTGRES_DB=rplace
+   ```
+
+2. **Initialize the database:**
+   ```bash
+   psql -U your_user -d rplace -f backend/init.sql
+   ```
+
+3. **Follow steps 3-5 from Option 1.**
+
+## Running Multiple Backend Instances
+
+For testing distributed scenarios:
 
 ```bash
-# Instructions coming soon
+# Terminal 1
+npm run dev:server1  # Port 3001
+
+# Terminal 2
+npm run dev:server2  # Port 3002
+
+# Terminal 3
+npm run dev:server3  # Port 3003
 ```
 
-### Running the Service
+Each instance shares state through Redis pub/sub.
 
-```bash
-# Instructions coming soon
+## Project Structure
+
+```
+r-place/
+├── docker-compose.yml     # Redis and PostgreSQL configuration
+├── backend/
+│   ├── init.sql           # Database schema
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       ├── index.ts       # Express server entry point
+│       ├── config.ts      # Canvas and rate limit configuration
+│       ├── websocket.ts   # WebSocket server
+│       ├── middleware/
+│       │   └── auth.ts    # Authentication middleware
+│       ├── routes/
+│       │   ├── auth.ts    # Auth endpoints
+│       │   └── canvas.ts  # Canvas endpoints
+│       ├── services/
+│       │   ├── auth.ts    # User authentication
+│       │   ├── canvas.ts  # Canvas operations
+│       │   ├── database.ts # PostgreSQL client
+│       │   └── redis.ts   # Redis clients
+│       └── types/
+│           └── index.ts
+└── frontend/
+    ├── package.json
+    ├── vite.config.ts
+    ├── tailwind.config.js
+    └── src/
+        ├── main.tsx
+        ├── App.tsx
+        ├── components/
+        │   ├── AuthPanel.tsx
+        │   ├── Canvas.tsx
+        │   ├── ColorPalette.tsx
+        │   ├── CooldownTimer.tsx
+        │   └── Toolbar.tsx
+        ├── services/
+        │   ├── api.ts
+        │   └── websocket.ts
+        ├── stores/
+        │   └── appStore.ts
+        └── types/
+            └── index.ts
 ```
 
-## Testing
+## API Endpoints
 
-*Testing instructions will be added*
+### Authentication
+
+- `POST /api/auth/register` - Register a new user
+- `POST /api/auth/login` - Log in
+- `POST /api/auth/logout` - Log out
+- `GET /api/auth/me` - Get current user
+- `POST /api/auth/anonymous` - Create anonymous session
+
+### Canvas
+
+- `GET /api/canvas/config` - Get canvas configuration
+- `GET /api/canvas` - Get current canvas state (base64)
+- `POST /api/canvas/pixel` - Place a pixel
+- `GET /api/canvas/cooldown` - Get cooldown status
+- `GET /api/canvas/pixel/:x/:y/history` - Get pixel history
+- `GET /api/canvas/events` - Get recent events
+- `GET /api/canvas/timelapse` - Get timelapse frames
+
+### WebSocket
+
+Connect to `ws://localhost:3000/ws` for real-time updates:
+
+- **Receive:** `canvas`, `pixel`, `cooldown`, `connected`
+- **Send:** `ping` (for keepalive)
+
+## Configuration
+
+Edit `backend/src/config.ts` to change:
+
+- `CANVAS_WIDTH` / `CANVAS_HEIGHT` - Canvas dimensions (default: 500x500)
+- `COOLDOWN_SECONDS` - Time between pixel placements (default: 30s)
+- `COLOR_PALETTE` - Available colors
+- `SNAPSHOT_INTERVAL_MS` - How often to save snapshots (default: 60s)
+
+## How It Works
+
+1. **Canvas State:** Stored as a byte array in Redis where each byte represents a pixel's color index.
+
+2. **Pixel Placement:**
+   - Validate coordinates and color
+   - Check Redis for cooldown
+   - Update canvas in Redis
+   - Log to PostgreSQL for history
+   - Publish via Redis pub/sub
+
+3. **Real-time Updates:** WebSocket servers subscribe to Redis pub/sub and broadcast pixel changes to all connected clients.
+
+4. **Rate Limiting:** Redis keys with TTL track per-user cooldowns.
 
 ## Architecture
 
@@ -55,6 +203,15 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 See [claude.md](./claude.md) for development insights and iteration history.
 
+## Testing
+
+Open multiple browser tabs to simulate multiple users. Each anonymous session gets a unique user ID.
+
 ## Future Enhancements
 
-*To be determined based on initial implementation*
+- [ ] Admin interface for moderation
+- [ ] Timelapse video generation
+- [ ] Pixel attribution display
+- [ ] Mobile-optimized interface
+- [ ] WebSocket message batching
+- [ ] CDN for canvas snapshots

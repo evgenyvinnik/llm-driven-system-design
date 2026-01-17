@@ -60,27 +60,59 @@ function selectVideo(candidates) {
 
 ## Development Phases
 
-### Phase 1: Video Upload & Storage
-- [ ] Upload endpoint
-- [ ] Object storage integration
-- [ ] Basic transcoding
+### Phase 1: Video Upload & Storage (Completed)
+- [x] Upload endpoint
+- [x] Object storage integration (MinIO)
+- [x] Basic transcoding
 - [ ] CDN setup
 
-### Phase 2: Basic Feed
-- [ ] Chronological feed
-- [ ] View tracking
-- [ ] Engagement (likes, comments)
+### Phase 2: Basic Feed (In Progress)
+- [x] Chronological feed
+- [x] View tracking
+- [x] Engagement (likes, comments)
 
-### Phase 3: Recommendation Engine
-- [ ] User embeddings
-- [ ] Video embeddings
-- [ ] Candidate generation
-- [ ] Ranking model
+### Phase 3: Recommendation Engine (Completed)
+- [x] User embeddings (hashtag preferences)
+- [x] Video embeddings (via hashtag similarity)
+- [x] Candidate generation (multi-source)
+- [x] Ranking model (engagement-based scoring)
 
-### Phase 4: Cold Start
-- [ ] New user handling
-- [ ] New video boost
-- [ ] Exploration strategy
+### Phase 4: Cold Start (Completed)
+- [x] New user handling (trending content)
+- [x] New video boost (exploration rate)
+- [x] Exploration strategy (20% exploration)
+
+---
+
+## Implementation Notes
+
+### Backend Architecture
+- **Express.js** API with session-based auth (Redis store)
+- **PostgreSQL** for users, videos, comments, follows, likes
+- **MinIO** for S3-compatible video storage
+- **Redis** for session management and view counting
+
+### Frontend Architecture
+- **React 19** with TypeScript
+- **TanStack Router** for file-based routing
+- **Zustand** for state management
+- **Tailwind CSS** for styling
+
+### Recommendation Algorithm
+
+The recommendation engine uses a two-phase approach:
+
+1. **Candidate Generation**: Pull videos from multiple sources
+   - 40% from followed creators
+   - 30% from liked hashtags
+   - 30% from trending pool
+
+2. **Ranking**: Score each candidate based on:
+   - Hashtag preference match
+   - Engagement metrics (likes, views, comments)
+   - Freshness boost for recent content
+   - Source boost (followed > hashtag > trending)
+   - Random exploration factor (20%)
 
 ---
 

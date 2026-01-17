@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light;
+  color: #1a1a1a;
+  background-color: #f4f5f7;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* Issue type icons */
+.issue-type-bug { color: #e53e3e; }
+.issue-type-story { color: #38a169; }
+.issue-type-task { color: #3182ce; }
+.issue-type-epic { color: #805ad5; }
+.issue-type-subtask { color: #718096; }
+
+/* Priority colors */
+.priority-highest { color: #e53e3e; }
+.priority-high { color: #ed8936; }
+.priority-medium { color: #ecc94b; }
+.priority-low { color: #48bb78; }
+.priority-lowest { color: #38b2ac; }
+
+/* Status category colors */
+.status-todo { background-color: #e2e8f0; color: #4a5568; }
+.status-in-progress { background-color: #3b82f6; color: white; }
+.status-done { background-color: #10b981; color: white; }

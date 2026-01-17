@@ -44,25 +44,88 @@ Building a food delivery platform to understand real-time logistics, three-sided
 
 ## Development Phases
 
-### Phase 1: Core Ordering
-- [ ] Restaurant and menu management
-- [ ] Order placement
-- [ ] Basic status tracking
+### Phase 1: Core Ordering (Completed)
+- [x] Restaurant and menu management
+- [x] Order placement
+- [x] Basic status tracking
 
-### Phase 2: Driver System
-- [ ] Driver onboarding
-- [ ] Location tracking
-- [ ] Order assignment
+### Phase 2: Driver System (In Progress)
+- [x] Driver onboarding
+- [x] Location tracking
+- [x] Order assignment
+- [ ] Advanced matching algorithm improvements
+- [ ] Driver batching for multiple orders
 
 ### Phase 3: Real-Time
-- [ ] Live location updates
-- [ ] WebSocket connections
-- [ ] Push notifications
+- [x] Live location updates via WebSocket
+- [x] WebSocket connections for all parties
+- [ ] Push notifications (browser notifications)
 
 ### Phase 4: Optimization
-- [ ] ETA calculation
+- [x] Basic ETA calculation
+- [ ] ML-based ETA improvements
 - [ ] Route optimization
-- [ ] Batching logic
+- [ ] Advanced batching logic
+
+---
+
+## Implementation Notes
+
+### Order-Driver Matching Algorithm
+
+The current implementation uses a score-based matching system:
+
+```javascript
+function calculateMatchScore(driver, order, distance) {
+  let score = 0;
+
+  // Distance to restaurant (most important) - closer is better
+  score += 100 - distance * 10;
+
+  // Driver rating
+  score += parseFloat(driver.rating || 5) * 5;
+
+  // Experience (more deliveries = more reliable)
+  score += Math.min(driver.total_deliveries / 10, 20);
+
+  return score;
+}
+```
+
+### ETA Calculation
+
+Multi-factor ETA with traffic adjustments:
+
+1. **Time to restaurant**: Based on driver location and traffic
+2. **Preparation time**: Restaurant's estimated prep time
+3. **Delivery time**: Route from restaurant to customer
+4. **Buffer**: Pickup and dropoff handling time
+
+Traffic multipliers:
+- Rush hours (7-9 AM, 5-7 PM): 1.5x
+- Lunch rush (11 AM - 1 PM): 1.3x
+- Normal hours: 1.0x
+
+### Redis Geo Commands
+
+Using Redis for real-time driver location:
+
+```javascript
+// Store driver location
+await redisClient.geoAdd('driver_locations', {
+  longitude: lon,
+  latitude: lat,
+  member: driverId.toString(),
+});
+
+// Find nearby drivers
+const results = await redisClient.geoSearch(
+  'driver_locations',
+  { longitude: lon, latitude: lat },
+  { radius: radiusKm, unit: 'km' },
+  { WITHDIST: true, SORT: 'ASC', COUNT: 20 }
+);
+```
 
 ---
 

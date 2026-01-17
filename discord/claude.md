@@ -273,57 +273,69 @@ function sendMessage(msg) {
 4. Use in-memory ring buffer (teach caching)
 5. Support local multi-instance (teach distribution)
 
-### Phase 2: Initial Implementation
-**Status**: *Not started*
+### Phase 2: Initial Implementation ✅
+**Status**: *Complete*
 
-**Focus Areas**:
-1. **TCP Server** (`src/adapters/tcp-server.ts`)
-   - Accept socket connections
+**Implemented**:
+1. **TCP Server** (`backend/src/adapters/tcp-server.ts`)
+   - Accept socket connections via Node.js `net` module
    - Parse line-based commands
+   - Nickname-based authentication on connect
    - Send responses to socket
 
-2. **HTTP Server** (`src/adapters/http-server.ts`)
-   - REST endpoints (POST /connect, POST /command, POST /message)
-   - SSE endpoint (GET /messages/:room)
+2. **HTTP Server** (`backend/src/adapters/http-server.ts`)
+   - REST endpoints (POST /connect, POST /command, POST /message, GET /rooms)
+   - SSE endpoint (GET /messages/:room) for real-time updates
+   - Session management via UUID tokens
 
-3. **Chat Core** (`src/core/`)
-   - ConnectionManager: Track sessions
-   - RoomManager: Create/join/leave rooms
-   - CommandParser: Parse slash commands
-   - MessageRouter: Route messages to room members
-   - HistoryBuffer: Ring buffer for last 10 messages
+3. **Chat Core** (`backend/src/core/`)
+   - ConnectionManager: Track sessions by sessionId and userId
+   - RoomManager: Create/join/leave rooms with in-memory and DB state
+   - CommandParser: Parse all slash commands
+   - MessageRouter: Route messages to room members, handle pub/sub
+   - HistoryBuffer: Ring buffer for last 10 messages per room
+   - ChatHandler: Orchestrates all command handling
 
-4. **Database Layer** (`src/db/`)
-   - PostgreSQL client setup
-   - Schema migrations (users, rooms, room_members, messages)
-   - CRUD operations
+4. **Database Layer** (`backend/src/db/`)
+   - PostgreSQL connection pool with health checks
+   - Schema (users, rooms, room_members, messages)
+   - Full CRUD operations for all entities
+   - Migration script for schema initialization
 
-5. **Integration**:
-   - Wire TCP server → Chat Core
-   - Wire HTTP server → Chat Core
-   - Test end-to-end (netcat client + browser client)
+5. **Frontend** (`frontend/`)
+   - React 19 + Vite + TypeScript
+   - Zustand for state management
+   - Tailwind CSS with Discord-like styling
+   - Components: LoginForm, ServerList, ChannelSidebar, MessageList, MessageInput
+   - SSE integration for real-time messages
+
+6. **Multi-Instance Support**:
+   - Redis/Valkey pub/sub for cross-instance messaging
+   - Configuration via environment variables
+   - npm scripts for running 3 instances
 
 **Success Criteria**:
-- [ ] Can connect via `nc localhost 9001`
-- [ ] Can connect via browser `http://localhost:3001`
-- [ ] Both clients can join same room and chat
-- [ ] Message history shows last 10 messages
-- [ ] Data persists across server restart
+- [x] Can connect via `nc localhost 9001`
+- [x] Can connect via browser `http://localhost:5173`
+- [x] Both clients can join same room and chat
+- [x] Message history shows last 10 messages
+- [x] Data persists across server restart
+- [x] Multi-instance support with Redis pub/sub
 
 ### Phase 3: Scaling and Optimization
-**Status**: *Not started*
+**Status**: *Partially Complete (pub/sub implemented)*
 
 **Focus Areas**:
 
-1. **Multi-Instance Support**
-   - Add configuration (instance ID, ports)
-   - Implement database polling for cross-instance messages
-   - Test 3 instances locally (different ports)
+1. **Multi-Instance Support** ✅
+   - Add configuration (instance ID, ports) - DONE
+   - Implement Redis pub/sub for cross-instance messages - DONE
+   - Test 3 instances locally (different ports) - DONE
 
-2. **Migrate to Pub/Sub**
-   - Add Valkey/Redis
-   - Replace polling with pub/sub
-   - Measure latency improvement (100ms → 1ms)
+2. **Migrate to Pub/Sub** ✅
+   - Add Valkey/Redis - DONE
+   - Replace polling with pub/sub - DONE (skipped polling phase)
+   - Measure latency improvement - Ready to test
 
 3. **Load Testing**
    - Spawn 50 concurrent netcat clients
@@ -331,13 +343,13 @@ function sendMessage(msg) {
    - Identify bottlenecks (DB connection pool, etc.)
 
 4. **Monitoring**
-   - Add logging (Winston or Pino)
+   - Add logging (Winston) - DONE
    - Track metrics (connections, messages, latency)
    - Optional: Prometheus + Grafana
 
 **Success Criteria**:
-- [ ] 3 instances running locally
-- [ ] Users on different instances can chat
+- [x] 3 instances running locally
+- [x] Users on different instances can chat
 - [ ] Latency < 10ms (with pub/sub)
 - [ ] Can handle 50 concurrent connections
 - [ ] Graceful degradation on failures
@@ -410,6 +422,22 @@ function sendMessage(msg) {
 **Rationale**: I/O-bound workload, familiarity, fast iteration
 **Trade-off**: Lower max concurrency than Go/Rust, but sufficient
 
+### Decision 7: Direct Pub/Sub Implementation (Skipping Polling)
+**Date**: Phase 2 Implementation
+**Context**: Original plan was to start with DB polling, then migrate to pub/sub
+**Options**: Implement polling first, or go directly to pub/sub
+**Decision**: Went directly to Redis pub/sub
+**Rationale**: Polling would add unnecessary complexity; pub/sub pattern is well-understood; educational value is in understanding the pattern, not the migration path
+**Trade-off**: Missed opportunity to show "before/after" comparison, but saved implementation time
+
+### Decision 8: Frontend with SSE Integration
+**Date**: Phase 2 Implementation
+**Context**: Need real-time updates in browser
+**Options**: Poll API, WebSocket, SSE with EventSource
+**Decision**: SSE with native EventSource API
+**Rationale**: Matches backend SSE implementation; simpler than WebSocket; auto-reconnect built-in
+**Trade-off**: Unidirectional only, but sufficient for receiving messages (sending uses POST)
+
 ---
 
 ## Iterations and Learnings
@@ -428,6 +456,23 @@ function sendMessage(msg) {
 **What we'd do differently**:
 - Could consider WebSocket for future phase (after mastering SSE)
 - Might add rate limiting earlier (teaches backpressure)
+
+### Iteration 2: Full Implementation
+**What we learned**:
+- Protocol adapters (TCP/HTTP) truly decouple transport from business logic - the ChatHandler never knows which protocol the user is using
+- Zustand with persist middleware provides excellent DX for session management
+- SSE EventSource API is remarkably simple compared to WebSocket
+- Docker Compose makes multi-service local development trivial
+
+**What surprised us**:
+- The in-memory ring buffer + async DB persist pattern is elegant and fast
+- Redis pub/sub setup was simpler than expected (separate connections for pub/sub required)
+- TypeScript's strict mode caught several potential runtime errors during development
+
+**What we'd do differently**:
+- Add unit tests from the start (TDD approach)
+- Consider message deduplication for pub/sub (currently no safeguard against duplicate delivery)
+- Add proper error boundaries in React frontend
 
 ---
 

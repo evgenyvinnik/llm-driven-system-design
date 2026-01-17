@@ -1,0 +1,169 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'San Francisco', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Leaflet customizations */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  z-index: 0;
+}
+
+.leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1) !important;
+}
+
+.leaflet-control-zoom a {
+  border: none !important;
+  background-color: white !important;
+}
+
+.leaflet-control-zoom a:first-child {
+  border-radius: 8px 8px 0 0 !important;
+}
+
+.leaflet-control-zoom a:last-child {
+  border-radius: 0 0 8px 8px !important;
+}
+
+/* Custom marker styles */
+.custom-marker {
+  background-color: #007AFF;
+  border-radius: 50%;
+  width: 12px;
+  height: 12px;
+  border: 2px solid white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.destination-marker {
+  background-color: #FF3B30;
+}
+
+.poi-marker {
+  background-color: #34C759;
+}
+
+/* Traffic colors */
+.traffic-free {
+  stroke: #34C759;
+}
+
+.traffic-light {
+  stroke: #FFCC00;
+}
+
+.traffic-moderate {
+  stroke: #FF9500;
+}
+
+.traffic-heavy {
+  stroke: #FF3B30;
+}
+
+/* Route styling */
+.route-primary {
+  stroke: #007AFF;
+  stroke-width: 6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.route-alternative {
+  stroke: #86868B;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 8, 8;
+}
+
+/* Search input */
+.search-input {
+  @apply w-full px-4 py-3 bg-white rounded-xl shadow-lg border-0 outline-none;
+  @apply text-apple-gray-600 placeholder:text-apple-gray-400;
+  @apply focus:ring-2 focus:ring-apple-blue/30;
+}
+
+/* Card styles */
+.card {
+  @apply bg-white rounded-2xl shadow-lg p-4;
+}
+
+/* Button styles */
+.btn-primary {
+  @apply bg-apple-blue text-white px-4 py-2 rounded-xl font-medium;
+  @apply hover:bg-blue-600 transition-colors;
+  @apply disabled:opacity-50 disabled:cursor-not-allowed;
+}
+
+.btn-secondary {
+  @apply bg-apple-gray-100 text-apple-gray-600 px-4 py-2 rounded-xl font-medium;
+  @apply hover:bg-apple-gray-200 transition-colors;
+}
+
+/* Navigation panel */
+.nav-panel {
+  @apply fixed bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-2xl p-6;
+  @apply transform transition-transform duration-300 ease-out;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.nav-panel.minimized {
+  @apply translate-y-[calc(100%-80px)];
+}
+
+/* Maneuver icons */
+.maneuver-icon {
+  @apply w-10 h-10 flex items-center justify-center rounded-full bg-apple-blue text-white;
+}
+
+/* Loading spinner */
+.spinner {
+  @apply w-6 h-6 border-2 border-apple-blue border-t-transparent rounded-full animate-spin;
+}
+
+/* Incident markers */
+.incident-marker {
+  @apply w-8 h-8 flex items-center justify-center rounded-full text-white text-sm font-bold;
+}
+
+.incident-accident {
+  @apply bg-apple-red;
+}
+
+.incident-construction {
+  @apply bg-apple-orange;
+}
+
+.incident-hazard {
+  @apply bg-apple-yellow text-apple-gray-600;
+}
+
+/* POI category colors */
+.poi-restaurant { background-color: #FF9500; }
+.poi-coffee { background-color: #8B4513; }
+.poi-gas_station { background-color: #FF3B30; }
+.poi-hotel { background-color: #5856D6; }
+.poi-park { background-color: #34C759; }
+.poi-shopping { background-color: #FF2D55; }
+.poi-hospital { background-color: #FF3B30; }
+.poi-default { background-color: #007AFF; }

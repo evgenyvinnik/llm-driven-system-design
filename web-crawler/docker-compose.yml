@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for URL frontier and crawled pages metadata
+  postgres:
+    image: postgres:16-alpine
+    container_name: webcrawler-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: webcrawler
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for deduplication, rate limiting, and caching
+  redis:
+    image: redis:7-alpine
+    container_name: webcrawler-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # API Server (main backend)
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webcrawler-api
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: webcrawler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Crawler Worker 1
+  crawler-worker-1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: webcrawler-worker-1
+    environment:
+      NODE_ENV: production
+      WORKER_ID: "1"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: webcrawler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CRAWLER_DELAY: 1000
+      MAX_CONCURRENT: 5
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Crawler Worker 2
+  crawler-worker-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: webcrawler-worker-2
+    environment:
+      NODE_ENV: production
+      WORKER_ID: "2"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: webcrawler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CRAWLER_DELAY: 1000
+      MAX_CONCURRENT: 5
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Crawler Worker 3
+  crawler-worker-3:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: webcrawler-worker-3
+    environment:
+      NODE_ENV: production
+      WORKER_ID: "3"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: webcrawler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CRAWLER_DELAY: 1000
+      MAX_CONCURRENT: 5
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: webcrawler-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

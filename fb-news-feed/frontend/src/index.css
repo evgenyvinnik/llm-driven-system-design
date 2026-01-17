@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f0f2f5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --facebook-blue: #1877f2;
+  --facebook-light-blue: #e7f3ff;
+  --facebook-gray: #f0f2f5;
+  --facebook-dark-gray: #65676b;
+  --facebook-text: #050505;
+}

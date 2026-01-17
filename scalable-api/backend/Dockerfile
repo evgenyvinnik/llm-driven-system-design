@@ -1,0 +1,24 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install curl for health checks
+RUN apk add --no-cache curl
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Create .env file if not exists
+RUN cp .env.example .env 2>/dev/null || true
+
+# Expose port (default for API server)
+EXPOSE 3001
+
+# Start the API server
+CMD ["node", "api-server/src/index.js"]

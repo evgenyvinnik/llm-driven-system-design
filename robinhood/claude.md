@@ -14,15 +14,24 @@ This document tracks the development journey of implementing A stock trading pla
 ## Development Phases
 
 ### Phase 1: Requirements and Design
-*Not started*
+*Completed*
 
-**Questions to explore:**
-- What are the core vs. nice-to-have features?
-- What scale are we targeting?
-- What are the key technical constraints?
+**Decisions made:**
+- Core features: real-time quotes, order placement, portfolio tracking, watchlists, price alerts
+- Scale: learning project, local development with simulated data
+- Tech stack: Node.js + Express + WebSocket (backend), React + Vite + Tanstack Router + Zustand (frontend), PostgreSQL + Redis (storage)
 
 ### Phase 2: Initial Implementation
-*Not started*
+*In progress*
+
+**Completed:**
+- Backend API with Express and WebSocket
+- Real-time quote simulation with configurable volatility
+- Order placement and execution simulation
+- Portfolio tracking with P&L calculations
+- Watchlists and price alerts
+- Frontend with portfolio, stock detail, orders, and watchlist views
+- Session-based authentication
 
 **Focus areas:**
 - Implement core functionality

@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  @apply bg-apple-gray-100 text-apple-gray-900;
+  margin: 0;
+  min-height: 100vh;
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-apple-blue text-white font-semibold py-3 px-6 rounded-xl
+           hover:bg-blue-600 active:bg-blue-700 transition-colors
+           disabled:bg-apple-gray-300 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-apple-gray-200 text-apple-gray-900 font-semibold py-3 px-6 rounded-xl
+           hover:bg-apple-gray-300 active:bg-apple-gray-400 transition-colors;
+  }
+
+  .btn-danger {
+    @apply bg-apple-red text-white font-semibold py-3 px-6 rounded-xl
+           hover:bg-red-600 active:bg-red-700 transition-colors;
+  }
+
+  .card {
+    @apply bg-white rounded-card shadow-card p-4;
+  }
+
+  .input {
+    @apply w-full px-4 py-3 rounded-xl border border-apple-gray-300
+           focus:border-apple-blue focus:ring-2 focus:ring-apple-blue/20
+           outline-none transition-all;
+  }
+}
+
+/* Credit card styles */
+.credit-card {
+  aspect-ratio: 1.586 / 1;
+  perspective: 1000px;
+}
+
+.credit-card-inner {
+  transition: transform 0.6s;
+  transform-style: preserve-3d;
+}
+
+.credit-card:hover .credit-card-inner {
+  transform: rotateY(10deg) rotateX(5deg);
+}
+
+/* Shimmer effect for loading */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    #f0f0f0 25%,
+    #e0e0e0 50%,
+    #f0f0f0 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* Face ID animation */
+.face-id-scanning {
+  animation: scan 2s ease-in-out infinite;
+}
+
+@keyframes scan {
+  0%, 100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}

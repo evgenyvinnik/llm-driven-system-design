@@ -4,56 +4,190 @@
 
 A simplified Airbnb-like platform demonstrating two-sided marketplace dynamics, availability calendars, search ranking, and trust & safety systems. This educational project focuses on building a property rental marketplace with complex booking workflows.
 
+## Tech Stack
+
+- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
+- **Backend:** Node.js + Express
+- **Database:** PostgreSQL with PostGIS extension
+- **Cache:** Redis
+- **Containerization:** Docker Compose
+
+## Quick Start
+
+### Prerequisites
+
+- Node.js 20+
+- Docker and Docker Compose
+- npm or yarn
+
+### 1. Start Infrastructure
+
+```bash
+# Start PostgreSQL (with PostGIS) and Redis
+docker-compose up -d
+
+# Verify containers are running
+docker-compose ps
+```
+
+### 2. Start Backend
+
+```bash
+cd backend
+npm install
+npm run seed  # Seed database with sample data
+npm run dev   # Start on port 3000
+```
+
+### 3. Start Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev   # Start on port 5173
+```
+
+### 4. Access the Application
+
+- **Frontend:** http://localhost:5173
+- **Backend API:** http://localhost:3000/api
+
+### Sample Login Credentials
+
+| Role   | Email                  | Password     |
+|--------|------------------------|--------------|
+| Host   | host1@example.com      | password123  |
+| Host   | host2@example.com      | password123  |
+| Guest  | guest1@example.com     | password123  |
+| Guest  | guest2@example.com     | password123  |
+| Admin  | admin@example.com      | password123  |
+
 ## Key Features
 
 ### 1. Property Listings
-- Host property management
-- Photos and descriptions
+- Host property management with photos
 - Amenities and house rules
-- Pricing and availability
+- Custom pricing per night
+- Availability calendar management
 
 ### 2. Search & Discovery
-- Location-based search
+- Location-based search using PostGIS
 - Date availability filtering
-- Price range filtering
-- Ranking algorithm
+- Price range and amenity filters
+- Property type filtering
 
 ### 3. Booking System
-- Availability calendar
+- Availability calendar with date ranges
 - Instant book vs request-to-book
-- Payment processing
-- Cancellation policies
+- Double-booking prevention with database transactions
+- Cancellation handling
 
 ### 4. Trust & Safety
-- Identity verification
-- Reviews (two-way)
-- Host/guest ratings
-- Fraud detection
+- Two-sided reviews (hidden until both submit)
+- Rating aggregation
+- Host verification status
 
 ### 5. Messaging
 - Host-guest communication
 - Pre-booking inquiries
-- Booking-related messages
+- Conversation threading
 
-## Implementation Status
+## Project Structure
 
-- [ ] Initial architecture design
-- [ ] Property listing management
-- [ ] Availability calendar system
-- [ ] Location-based search
-- [ ] Booking workflow
-- [ ] Review system
-- [ ] Messaging system
-- [ ] Local multi-instance testing
-- [ ] Documentation
+```
+airbnb/
+├── docker-compose.yml      # PostgreSQL + Redis
+├── backend/
+│   ├── src/
+│   │   ├── index.js        # Express server
+│   │   ├── db.js           # PostgreSQL connection
+│   │   ├── redis.js        # Redis connection
+│   │   ├── routes/         # API endpoints
+│   │   │   ├── auth.js
+│   │   │   ├── listings.js
+│   │   │   ├── search.js
+│   │   │   ├── bookings.js
+│   │   │   ├── reviews.js
+│   │   │   └── messages.js
+│   │   ├── services/       # Business logic
+│   │   └── middleware/     # Auth middleware
+│   └── migrations/
+│       └── init.sql        # Database schema
+├── frontend/
+│   ├── src/
+│   │   ├── routes/         # Tanstack Router pages
+│   │   ├── components/     # React components
+│   │   ├── stores/         # Zustand stores
+│   │   ├── services/       # API client
+│   │   └── types/          # TypeScript types
+│   └── index.html
+├── architecture.md
+├── claude.md
+└── README.md
+```
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Register new user
+- `POST /api/auth/login` - Login
+- `POST /api/auth/logout` - Logout
+- `GET /api/auth/me` - Get current user
+- `POST /api/auth/become-host` - Become a host
+
+### Listings
+- `GET /api/listings` - Get all listings
+- `GET /api/listings/:id` - Get listing by ID
+- `POST /api/listings` - Create listing (host only)
+- `PUT /api/listings/:id` - Update listing
+- `GET /api/listings/:id/availability` - Get availability
+- `PUT /api/listings/:id/availability` - Update availability
+
+### Search
+- `GET /api/search` - Search listings with filters
+- `GET /api/search/suggest` - Location suggestions
+- `GET /api/search/popular-destinations` - Popular destinations
+
+### Bookings
+- `GET /api/bookings/check-availability` - Check dates
+- `POST /api/bookings` - Create booking
+- `GET /api/bookings/my-trips` - Guest's bookings
+- `GET /api/bookings/host-reservations` - Host's reservations
+- `PUT /api/bookings/:id/respond` - Accept/decline
+- `PUT /api/bookings/:id/cancel` - Cancel booking
+
+### Reviews
+- `POST /api/reviews` - Create review
+- `GET /api/reviews/listing/:id` - Get listing reviews
+
+### Messages
+- `POST /api/messages/start` - Start conversation
+- `GET /api/messages` - Get conversations
+- `GET /api/messages/:id` - Get messages
+- `POST /api/messages/:id/messages` - Send message
+
+## Multi-Instance Testing
+
+Run multiple backend instances for load testing:
+
+```bash
+# Terminal 1
+PORT=3001 npm run dev
+
+# Terminal 2
+PORT=3002 npm run dev
+
+# Terminal 3
+PORT=3003 npm run dev
+```
 
 ## Key Technical Challenges
 
-1. **Availability Calendar**: Efficiently storing and querying date ranges
-2. **Search Ranking**: Balancing relevance, price, and host quality
-3. **Double-Booking Prevention**: Concurrent booking attempts
-4. **Two-Sided Reviews**: Revealing after both parties submit
-5. **Geographic Search**: Searching within radius efficiently
+1. **Availability Calendar**: Date ranges stored as blocks with overlap detection
+2. **Search Ranking**: PostGIS for geographic queries with availability filtering
+3. **Double-Booking Prevention**: Database transactions with row-level locking
+4. **Two-Sided Reviews**: Visibility triggered when both parties submit
+5. **Geographic Search**: GIST index on PostGIS geography column
 
 ## Architecture
 

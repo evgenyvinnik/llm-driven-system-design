@@ -19,6 +19,21 @@ services:
       timeout: 5s
       retries: 5
 
+  # Redis for session storage and caching
+  redis:
+    image: redis:7-alpine
+    container_name: scale-ai-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   # MinIO Object Storage (S3-compatible)
   minio:
     image: minio/minio:latest
@@ -73,5 +88,6 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   minio_data:
   rabbitmq_data:

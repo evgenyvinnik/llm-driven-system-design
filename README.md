@@ -117,6 +117,18 @@ Each folder contains an independent implementation of a system design problem:
 - [Design iCloud Sync](./icloud/) - File and photo synchronization
 - [Design Scalable API](./scalable-api/) - API serving millions of users
 
+### Standalone Design Documents
+Comprehensive design documents covering specific system design topics:
+- [Design a Web Crawler](./design-web-crawler.md) - Distributed web crawling with URL frontier, politeness policies
+- [Design a Plugin Platform](./design-plugin-platform.md) - VS Code-like extension system with sandboxing
+- [Design Kindle Community Highlights](./design-kindle-community-highlights.md) - Social reading platform with real-time sync
+
+### Personal Projects & Experiments
+External projects demonstrating system design concepts in practice:
+- [MDReader](https://github.com/evgenyvinnik/mdreader) - "The Markdown Maestro" - Elegant markdown rendering and reading experience
+- [MCPlator](https://github.com/evgenyvinnik/MCPlator) - "The Protocol Polyglot" - MCP (Model Context Protocol) integration toolkit
+- [20 Forms, 20 Designs](https://github.com/evgenyvinnik/20forms-20designs) - "The Form Factory" - Showcase of 20 unique form UI/UX patterns
+
 ## 🏗️ Project Structure
 
 Each project folder contains:

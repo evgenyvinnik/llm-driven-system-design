@@ -41,6 +41,7 @@ docker-compose up -d
 
 This starts:
 - PostgreSQL (port 5432) - metadata storage
+- Redis (port 6379) - session storage and caching
 - MinIO (ports 9000, 9001) - object storage (auto-creates buckets)
 - RabbitMQ (ports 5672, 15672) - message queue
 
@@ -117,6 +118,17 @@ rabbitmqctl set_permissions -p / scaleai ".*" ".*" ".*"
 
 **Access management UI:** http://localhost:15672 (guest/guest)
 
+#### 4. Redis
+
+```bash
+# macOS
+brew install redis
+brew services start redis
+
+# Verify it's running
+redis-cli ping  # Should return PONG
+```
+
 ---
 
 ## Running the Application
@@ -175,7 +187,14 @@ The backend uses these defaults (override via `.env` file or environment):
 
 ```bash
 # Database
-DATABASE_URL=postgresql://scaleai:scaleai123@localhost:5432/scaleai
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=scaleai
+DB_USER=scaleai
+DB_PASSWORD=scaleai123
+
+# Redis
+REDIS_URL=redis://localhost:6379
 
 # MinIO
 MINIO_ENDPOINT=localhost

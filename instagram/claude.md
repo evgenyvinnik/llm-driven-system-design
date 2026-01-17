@@ -22,7 +22,7 @@ This document tracks the development journey of implementing A photo and video s
 - What are the key technical constraints?
 
 ### Phase 2: Initial Implementation
-*Not started*
+*In progress*
 
 **Focus areas:**
 - Implement core functionality

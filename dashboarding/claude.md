@@ -17,15 +17,27 @@ This document tracks the development journey of implementing a metrics monitorin
 ## Development Phases
 
 ### Phase 1: Requirements and Design
-*Not started*
+*Completed*
 
-**Questions to explore:**
-- What are the core vs. nice-to-have features?
-- What scale are we targeting?
-- What are the key technical constraints?
+**Decisions made:**
+- Core features: metrics ingestion, time-series storage, dashboards, alerting
+- Scale target: ~100K metrics/second ingestion, sub-500ms queries
+- Technology stack: TimescaleDB, Redis, Node.js/Express, React
 
 ### Phase 2: Initial Implementation
-*Not started*
+*In progress*
+
+**Completed:**
+- Backend API with Express
+- Database schema with TimescaleDB hypertables
+- Metrics ingestion and query service
+- Dashboard and panel CRUD
+- Alert rules and evaluation engine
+- Frontend with React, TanStack Router, Recharts
+- Multiple chart types (line, area, bar, gauge, stat)
+- Time range selector
+- Alert management UI
+- Metrics explorer
 
 **Focus areas:**
 - Implement core functionality
@@ -52,27 +64,54 @@ This document tracks the development journey of implementing a metrics monitorin
 
 ## Design Decisions Log
 
-*Decisions and their rationale will be documented here*
+### TimescaleDB over InfluxDB
+- **Decision**: Use TimescaleDB as the time-series database
+- **Rationale**: SQL interface provides flexibility, PostgreSQL ecosystem is mature, hypertables handle partitioning automatically, can colocate metadata with time-series data
+
+### Session-based Auth over JWT
+- **Decision**: Use session-based authentication with Redis
+- **Rationale**: Simpler for learning projects, sessions can be invalidated immediately, no token rotation complexity
+
+### Polling over WebSocket for Dashboard Updates
+- **Decision**: Use HTTP polling (10s interval) instead of WebSocket
+- **Rationale**: Simpler to implement, works well with result caching, sufficient for monitoring use case
+
+### Metric ID Caching
+- **Decision**: Cache metric definition IDs in-memory and Redis
+- **Rationale**: Reduces database lookups during high-throughput ingestion
 
 ## Iterations and Learnings
 
-*Development iterations and key learnings will be tracked here*
+### Iteration 1: Initial Implementation
+- Created the full stack implementation with backend and frontend
+- Implemented metrics ingestion, querying, dashboards, and alerts
+- Used TimescaleDB hypertables for efficient time-series storage
+- Added Redis caching for query results
 
 ## Questions and Discussions
 
-*Open questions and architectural discussions*
+### Open Questions
+- Should we add WebSocket support for sub-second updates?
+- How to handle metric cardinality explosion?
+- What's the right balance between raw data retention and downsampled data?
 
 ## Resources and References
 
-*Relevant articles, papers, and documentation*
+- TimescaleDB documentation: https://docs.timescale.com/
+- Grafana data model: https://grafana.com/docs/grafana/latest/fundamentals/timeseries/
+- Prometheus data model: https://prometheus.io/docs/concepts/data_model/
 
 ## Next Steps
 
-- [ ] Define detailed requirements
-- [ ] Sketch initial architecture
-- [ ] Choose technology stack
-- [ ] Implement MVP
-- [ ] Test and iterate
+- [x] Define detailed requirements
+- [x] Sketch initial architecture
+- [x] Choose technology stack
+- [x] Implement MVP
+- [ ] Add continuous aggregates for automatic rollups
+- [ ] Implement retention policies
+- [ ] Add user authentication
+- [ ] Write tests
+- [ ] Performance optimization
 
 ---
 

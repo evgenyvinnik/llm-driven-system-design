@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: facetime-postgres
+    environment:
+      POSTGRES_USER: facetime
+      POSTGRES_PASSWORD: facetime_dev_password
+      POSTGRES_DB: facetime
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/src/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U facetime"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: facetime-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: facetime-coturn
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      - "49152-49200:49152-49200/udp"
+    environment:
+      - DETECT_EXTERNAL_IP=yes
+      - DETECT_RELAY_IP=yes
+    command: >
+      turnserver
+      --log-file=stdout
+      --min-port=49152
+      --max-port=49200
+      --no-cli
+      --no-tls
+      --no-dtls
+      --realm=facetime.local
+      --user=facetime:facetime123
+      --lt-cred-mech
+      --fingerprint
+      --verbose
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

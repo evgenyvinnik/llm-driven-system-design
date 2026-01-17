@@ -54,11 +54,11 @@ Building an encrypted messaging system to understand E2E encryption, multi-devic
 - [ ] Message encryption
 - [ ] Prekey management
 
-### Phase 2: Direct Messages
-- [ ] Send/receive
-- [ ] Delivery receipts
-- [ ] Read receipts
-- [ ] Typing indicators
+### Phase 2: Direct Messages (In Progress)
+- [x] Send/receive
+- [x] Delivery receipts
+- [x] Read receipts
+- [x] Typing indicators
 
 ### Phase 3: Multi-Device
 - [ ] Device registration

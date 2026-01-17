@@ -81,32 +81,32 @@ This document tracks the development of a Reddit-like content platform focusing 
 ## Development Phases
 
 ### Phase 1: Core Data Model
-- [ ] Users, subreddits, posts schema
-- [ ] Comment tree with materialized path
-- [ ] Vote table design
-- [ ] Basic CRUD operations
+- [x] Users, subreddits, posts schema
+- [x] Comment tree with materialized path
+- [x] Vote table design
+- [x] Basic CRUD operations
 
-### Phase 2: Voting System
-- [ ] Vote submission endpoint
-- [ ] Duplicate vote handling (change/remove)
-- [ ] Background aggregation worker
-- [ ] Karma calculation
+### Phase 2: Voting System (In Progress)
+- [x] Vote submission endpoint
+- [x] Duplicate vote handling (change/remove)
+- [x] Background aggregation worker
+- [x] Karma calculation
 
 ### Phase 3: Ranking Algorithms
-- [ ] Implement hot, top, new, controversial
-- [ ] Precomputation strategy
+- [x] Implement hot, top, new, controversial
+- [x] Precomputation strategy
 - [ ] Valkey sorted sets for fast retrieval
 - [ ] Compare algorithm behaviors
 
 ### Phase 4: Comment Threading
-- [ ] Materialized path implementation
-- [ ] Subtree fetching and pagination
-- [ ] Comment sorting (best, top, new)
+- [x] Materialized path implementation
+- [x] Subtree fetching and pagination
+- [x] Comment sorting (best, top, new)
 - [ ] "Load more" for deep threads
 
 ### Phase 5: Subreddit Features
-- [ ] Community creation and settings
-- [ ] Subscription management
+- [x] Community creation and settings
+- [x] Subscription management
 - [ ] Home feed (aggregated subscriptions)
 - [ ] Basic moderation tools
 

@@ -6,54 +6,252 @@ A simplified Spotlight-like platform demonstrating local and cloud search, index
 
 ## Key Features
 
-### 1. Local Search
-- File content indexing
-- App search
-- Contacts and emails
-- Messages and notes
+### 1. Multi-Source Search
+- Search across files, applications, contacts, and web bookmarks
+- Fast prefix matching with Elasticsearch edge n-gram analyzer
+- Ranking by recency and usage frequency
 
-### 2. Cloud Search
-- iCloud Drive
-- Mail attachments
-- Safari history
-- Third-party apps
+### 2. Special Queries
+- Math calculations (e.g., `2+2*3`, `sqrt(16)`)
+- Unit conversions (e.g., `100 km to miles`, `32 f to c`)
+- Web search fallback for unmatched queries
 
 ### 3. Siri Suggestions
-- App suggestions
-- Contact suggestions
-- Recent activity
-- Proactive intelligence
+- Time-based app suggestions
+- Recently accessed items
+- Frequently contacted people
+- Pattern learning from usage
 
-### 4. Natural Language
-- Date queries ("photos from last week")
-- Calculations
-- Unit conversions
-- Web queries
+### 4. Modern UI
+- macOS Spotlight-inspired design
+- Keyboard navigation (arrows, Enter, Escape)
+- Cmd+K shortcut to open
+- Dark theme with blur effects
 
-### 5. Privacy
-- On-device indexing
-- No search logs to Apple
-- Private browsing exclusion
-- Encryption at rest
+## Tech Stack
+
+- **Frontend:** TypeScript, Vite, React 19, Zustand, Tailwind CSS
+- **Backend:** Node.js, Express
+- **Search:** Elasticsearch 8.11
+- **Database:** PostgreSQL 16
+- **Containerization:** Docker Compose
+
+## Quick Start
+
+### Prerequisites
+
+- Node.js 18+
+- Docker and Docker Compose
+- npm or yarn
+
+### 1. Start Infrastructure
+
+```bash
+cd spotlight
+
+# Start PostgreSQL and Elasticsearch
+docker-compose up -d
+
+# Wait for services to be healthy (about 30 seconds)
+docker-compose ps
+```
+
+### 2. Start Backend
+
+```bash
+cd backend
+
+# Install dependencies
+npm install
+
+# Start the server
+npm run dev
+```
+
+The backend runs on http://localhost:3001
+
+### 3. Seed Sample Data
+
+In a new terminal:
+
+```bash
+cd spotlight/backend
+
+# Seed sample files, apps, contacts, and web items
+npm run seed
+```
+
+### 4. Start Frontend
+
+```bash
+cd spotlight/frontend
+
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+```
+
+The frontend runs on http://localhost:5173
+
+### 5. Open Spotlight
+
+- Visit http://localhost:5173
+- Press `Cmd+K` (or `Ctrl+K` on Windows/Linux) to open Spotlight
+- Or click the search button on the page
+
+## Usage
+
+### Search Examples
+
+| Query | Result |
+|-------|--------|
+| `Safari` | Find Safari app |
+| `meeting notes` | Find files with "meeting notes" |
+| `alice` | Find contact named Alice |
+| `github` | Find GitHub bookmark |
+| `2+2*3` | Calculate: 8 |
+| `100 km to miles` | Convert: 62.137 miles |
+| `32 f to c` | Convert: 0 C |
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd+K` | Open/close Spotlight |
+| `Escape` | Close Spotlight |
+| `Arrow Up/Down` | Navigate results |
+| `Enter` | Execute selected result |
+
+## API Endpoints
+
+### Search
+
+```
+GET /api/search?q=query
+GET /api/search?q=query&types=files,apps
+GET /api/search/suggest?q=prefix
+```
+
+### Indexing
+
+```
+POST /api/index/files
+POST /api/index/apps
+POST /api/index/contacts
+POST /api/index/web
+POST /api/index/bulk/files
+```
+
+### Suggestions
+
+```
+GET /api/suggestions
+POST /api/suggestions/app-launch
+POST /api/suggestions/activity
+```
+
+### Health Check
+
+```
+GET /health
+```
+
+## Project Structure
+
+```
+spotlight/
+├── docker-compose.yml     # PostgreSQL and Elasticsearch
+├── backend/
+│   ├── package.json
+│   ├── init.sql          # Database schema
+│   └── src/
+│       ├── index.js      # Express server
+│       ├── seed.js       # Sample data seeder
+│       ├── routes/
+│       │   ├── search.js
+│       │   ├── index.js
+│       │   └── suggestions.js
+│       └── services/
+│           ├── elasticsearch.js
+│           ├── queryParser.js
+│           └── suggestions.js
+└── frontend/
+    ├── package.json
+    └── src/
+        ├── App.tsx
+        ├── main.tsx
+        ├── index.css
+        ├── components/
+        │   ├── SpotlightModal.tsx
+        │   ├── SearchInput.tsx
+        │   ├── SearchResults.tsx
+        │   ├── SearchResultItem.tsx
+        │   ├── Suggestions.tsx
+        │   └── Icons.tsx
+        ├── stores/
+        │   └── spotlightStore.ts
+        ├── services/
+        │   └── api.ts
+        ├── hooks/
+        │   ├── useKeyboardShortcut.ts
+        │   └── useDebounce.ts
+        └── types/
+            └── search.ts
+```
+
+## Running Multiple Backend Instances
+
+For testing load balancing:
+
+```bash
+# Terminal 1
+npm run dev:server1  # Port 3001
+
+# Terminal 2
+npm run dev:server2  # Port 3002
+
+# Terminal 3
+npm run dev:server3  # Port 3003
+```
+
+## Environment Variables
+
+### Backend
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | 3001 | Server port |
+| `PG_HOST` | localhost | PostgreSQL host |
+| `PG_PORT` | 5432 | PostgreSQL port |
+| `PG_DATABASE` | spotlight | Database name |
+| `PG_USER` | spotlight | Database user |
+| `PG_PASSWORD` | spotlight_password | Database password |
+| `ES_URL` | http://localhost:9200 | Elasticsearch URL |
 
 ## Implementation Status
 
-- [ ] Initial architecture design
-- [ ] File system indexing
-- [ ] Content extraction
-- [ ] Search ranking
+- [x] Docker Compose setup (PostgreSQL, Elasticsearch)
+- [x] Backend API with Express
+- [x] Elasticsearch indexing with prefix matching
+- [x] Multi-source search (files, apps, contacts, web)
+- [x] Math calculations and unit conversions
+- [x] Siri-style suggestions
+- [x] Frontend with React + Tailwind
+- [x] Keyboard navigation
+- [x] Sample data seeding
+- [ ] File system watcher for real indexing
+- [ ] Content extraction (PDF, DOCX, etc.)
+- [ ] Natural language date parsing
 - [ ] Cloud integration
-- [ ] Natural language processing
-- [ ] Siri Suggestions
-- [ ] Documentation
 
 ## Key Technical Challenges
 
-1. **Indexing Performance**: Real-time indexing without battery drain
-2. **Content Extraction**: Parse diverse file formats
-3. **Ranking**: Relevance across heterogeneous content
-4. **Privacy**: Powerful search without cloud dependencies
-5. **Latency**: Instant results as user types
+1. **Fast Prefix Matching**: Elasticsearch edge n-gram tokenizer for instant results
+2. **Multi-Source Ranking**: Combine scores from different index types
+3. **Usage Pattern Learning**: PostgreSQL aggregations for time-based suggestions
+4. **Real-time Updates**: Designed for incremental indexing (watcher not implemented)
 
 ## Architecture
 

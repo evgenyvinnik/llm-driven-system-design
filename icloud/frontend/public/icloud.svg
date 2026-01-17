@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50" fill="none">
+  <defs>
+    <linearGradient id="cloudGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#5AC8FA;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#007AFF;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <path fill="url(#cloudGradient)" d="M40.5 22.5c0-0.3 0-0.5 0-0.8 0-5.5-4.5-10-10-10-3.3 0-6.3 1.6-8.1 4.1C21.3 14.7 19.7 14 18 14c-3.9 0-7 3.1-7 7 0 0.3 0 0.7 0.1 1C7.3 22.8 4.5 26 4.5 30c0 4.4 3.6 8 8 8h27c4.4 0 8-3.6 8-8 0-3.6-2.4-6.6-5.7-7.5z"/>
+</svg>

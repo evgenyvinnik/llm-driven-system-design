@@ -1,0 +1,30 @@
+{
+  "name": "twitter-backend",
+  "version": "1.0.0",
+  "description": "Twitter-like microblogging platform backend",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "dev:server1": "PORT=3001 node --watch src/index.js",
+    "dev:server2": "PORT=3002 node --watch src/index.js",
+    "dev:server3": "PORT=3003 node --watch src/index.js",
+    "start": "node src/index.js",
+    "db:migrate": "node src/db/migrate.js",
+    "db:seed": "node src/db/seed.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "connect-redis": "^7.1.0",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

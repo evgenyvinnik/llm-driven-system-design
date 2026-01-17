@@ -1,0 +1,46 @@
+{
+  "name": "baby-discord-backend",
+  "version": "1.0.0",
+  "description": "Baby Discord - A simplified real-time chat server with TCP and HTTP support",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "INSTANCE_ID=1 TCP_PORT=9001 HTTP_PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "INSTANCE_ID=2 TCP_PORT=9002 HTTP_PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "INSTANCE_ID=3 TCP_PORT=9003 HTTP_PORT=3003 tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write src/**/*.ts",
+    "db:migrate": "tsx src/db/migrate.ts"
+  },
+  "keywords": ["chat", "discord", "tcp", "http", "sse", "real-time"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1",
+    "uuid": "^11.0.4",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.6",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.19.1",
+    "@typescript-eslint/parser": "^8.19.1",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

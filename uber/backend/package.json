@@ -1,0 +1,31 @@
+{
+  "name": "uber-backend",
+  "version": "1.0.0",
+  "description": "Uber ride-hailing backend service",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon --experimental-specifier-resolution=node src/index.js",
+    "dev:server1": "PORT=3001 npm run dev",
+    "dev:server2": "PORT=3002 npm run dev",
+    "dev:server3": "PORT=3003 npm run dev",
+    "start": "node --experimental-specifier-resolution=node src/index.js",
+    "lint": "eslint src/**/*.js",
+    "format": "prettier --write src/**/*.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.11.0",
+    "nodemon": "^3.1.5",
+    "prettier": "^3.3.3"
+  }
+}

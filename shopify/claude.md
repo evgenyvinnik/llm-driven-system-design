@@ -47,20 +47,20 @@ CREATE POLICY store_isolation ON products
 
 ## Development Phases
 
-### Phase 1: Store Setup
-- [ ] Merchant registration
-- [ ] Store creation
-- [ ] Subdomain routing
+### Phase 1: Store Setup (Complete)
+- [x] Merchant registration
+- [x] Store creation
+- [x] Subdomain routing
 
-### Phase 2: Products
-- [ ] Product CRUD
-- [ ] Variants and inventory
-- [ ] Collections
+### Phase 2: Products (In Progress)
+- [x] Product CRUD
+- [x] Variants and inventory
+- [ ] Collections (backend done, UI pending)
 
-### Phase 3: Checkout
-- [ ] Cart management
-- [ ] Stripe integration
-- [ ] Order creation
+### Phase 3: Checkout (Complete)
+- [x] Cart management
+- [x] Stripe integration (mocked for demo)
+- [x] Order creation
 
 ### Phase 4: Custom Domains
 - [ ] Domain verification

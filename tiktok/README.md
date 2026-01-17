@@ -4,6 +4,73 @@
 
 A simplified TikTok-like platform demonstrating short video recommendations, content discovery algorithms, and creator monetization. This educational project focuses on building a recommendation-driven video platform with infinite scroll experiences.
 
+## Quick Start
+
+### Prerequisites
+
+- Node.js 20+
+- Docker and Docker Compose
+- npm or yarn
+
+### 1. Start Infrastructure
+
+```bash
+# Start PostgreSQL, Redis, and MinIO
+docker-compose up -d
+
+# Wait for services to be healthy (about 30 seconds)
+docker-compose ps
+```
+
+### 2. Start Backend
+
+```bash
+cd backend
+
+# Copy environment file
+cp .env.example .env
+
+# Install dependencies
+npm install
+
+# Start the server
+npm run dev
+```
+
+The API will be available at http://localhost:3001
+
+### 3. Start Frontend
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start the development server
+npm run dev
+```
+
+The application will be available at http://localhost:5173
+
+## Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Frontend | 5173 | React app with Vite |
+| Backend API | 3001 | Express.js REST API |
+| PostgreSQL | 5432 | Main database |
+| Redis | 6379 | Session store & caching |
+| MinIO | 9000 | S3-compatible object storage |
+| MinIO Console | 9001 | MinIO web interface |
+
+### MinIO Console
+
+Access the MinIO console at http://localhost:9001
+
+- Username: `minioadmin`
+- Password: `minioadmin`
+
 ## Key Features
 
 ### 1. Short Video Content
@@ -38,15 +105,66 @@ A simplified TikTok-like platform demonstrating short video recommendations, con
 
 ## Implementation Status
 
-- [ ] Initial architecture design
-- [ ] Video upload and storage
-- [ ] Video transcoding pipeline
-- [ ] Recommendation engine
-- [ ] Feed generation
-- [ ] Engagement tracking
+- [x] Initial architecture design
+- [x] Video upload and storage
+- [x] Basic transcoding (MinIO storage)
+- [x] Recommendation engine (two-phase approach)
+- [x] Feed generation (FYP, Following, Trending)
+- [x] Engagement tracking (views, likes, comments)
 - [ ] Creator analytics
 - [ ] Local multi-instance testing
-- [ ] Documentation
+- [x] Documentation
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Register new user
+- `POST /api/auth/login` - Login
+- `POST /api/auth/logout` - Logout
+- `GET /api/auth/me` - Get current user
+
+### Users
+- `GET /api/users/:username` - Get user profile
+- `PATCH /api/users/me` - Update profile
+- `POST /api/users/:username/follow` - Follow user
+- `DELETE /api/users/:username/follow` - Unfollow user
+
+### Videos
+- `POST /api/videos` - Upload video (multipart form)
+- `GET /api/videos/:id` - Get video details
+- `DELETE /api/videos/:id` - Delete video
+- `POST /api/videos/:id/view` - Record view
+- `POST /api/videos/:id/like` - Like video
+- `DELETE /api/videos/:id/like` - Unlike video
+
+### Feed
+- `GET /api/feed/fyp` - For You Page feed
+- `GET /api/feed/following` - Following feed
+- `GET /api/feed/trending` - Trending videos
+- `GET /api/feed/hashtag/:tag` - Videos by hashtag
+- `GET /api/feed/search?q=query` - Search videos
+
+### Comments
+- `GET /api/comments/video/:videoId` - Get comments
+- `POST /api/comments/video/:videoId` - Create comment
+- `DELETE /api/comments/:id` - Delete comment
+
+## Technology Stack
+
+### Frontend
+- React 19
+- TypeScript
+- Vite
+- TanStack Router
+- Zustand (state management)
+- Tailwind CSS
+
+### Backend
+- Node.js
+- Express.js
+- PostgreSQL
+- Redis (sessions, caching)
+- MinIO (S3-compatible storage)
 
 ## Key Technical Challenges
 
@@ -66,25 +184,75 @@ See [claude.md](./claude.md) for development insights and design decisions.
 
 ## Recommendation Approach
 
-**Multi-Armed Bandit for Exploration:**
-```javascript
-function selectNextVideo(userId, candidateVideos) {
-  const epsilon = 0.1 // 10% exploration
+The recommendation engine uses a two-phase approach:
 
-  if (Math.random() < epsilon) {
-    // Explore: random video from pool
-    return randomChoice(candidateVideos)
-  } else {
-    // Exploit: highest predicted engagement
-    return candidateVideos.reduce((best, video) =>
-      predictEngagement(userId, video) > predictEngagement(userId, best)
-        ? video : best
-    )
-  }
+### Phase 1: Candidate Generation
+Quickly narrow from millions of videos to ~1000 candidates from multiple sources:
+- Videos from followed creators (40%)
+- Videos with engaged hashtags (30%)
+- Trending videos for exploration (30%)
+
+### Phase 2: Ranking
+Score each candidate based on:
+- User-video embedding similarity
+- Engagement metrics (likes, comments, shares)
+- Creator quality score
+- Freshness (recency boost)
+- Exploration factor (multi-armed bandit)
+
+### Engagement Prediction
+
+```javascript
+function predictEngagement(userId, video) {
+  const userVector = getUserEmbedding(userId)
+  const videoVector = getVideoEmbedding(video.id)
+
+  let score = cosineSimilarity(userVector, videoVector)
+  score *= videoQualityScore(video)
+  score *= creatorScore(video.creatorId)
+  score *= freshnessScore(video.createdAt)
+
+  return score
 }
 ```
 
-**Engagement Prediction:**
-- User features: watch history, likes, follows
-- Video features: hashtags, sounds, creator, duration
-- Context: time of day, device, session depth
+## Running Multiple Instances
+
+For distributed testing:
+
+```bash
+# Terminal 1
+npm run dev:server1  # Port 3001
+
+# Terminal 2
+npm run dev:server2  # Port 3002
+
+# Terminal 3
+npm run dev:server3  # Port 3003
+```
+
+## Troubleshooting
+
+### MinIO buckets not created
+```bash
+# Restart the minio-init container
+docker-compose up minio-init
+```
+
+### Database connection failed
+```bash
+# Check if PostgreSQL is running
+docker-compose ps postgres
+
+# View logs
+docker-compose logs postgres
+```
+
+### Redis connection failed
+```bash
+# Check if Redis is running
+docker-compose ps redis
+
+# Test connection
+docker-compose exec redis redis-cli ping
+```

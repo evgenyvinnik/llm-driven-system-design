@@ -1,0 +1,27 @@
+{
+  "name": "venmo-backend",
+  "version": "1.0.0",
+  "description": "Venmo P2P Payment Platform Backend",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "dev:server1": "PORT=3001 nodemon src/index.js",
+    "dev:server2": "PORT=3002 nodemon src/index.js",
+    "dev:server3": "PORT=3003 nodemon src/index.js",
+    "start": "node src/index.js",
+    "migrate": "node src/db/migrate.js",
+    "seed": "node src/db/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

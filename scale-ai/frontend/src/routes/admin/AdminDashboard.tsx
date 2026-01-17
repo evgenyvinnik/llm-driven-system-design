@@ -10,6 +10,7 @@ import {
   type Drawing,
   type Model,
 } from '../../services/api'
+import { DrawingCard } from '../../components/DrawingCard'
 import './AdminDashboard.css'
 
 export function AdminDashboard() {
@@ -200,23 +201,14 @@ export function AdminDashboard() {
             </div>
             <div className="drawings-grid">
               {drawings.map((drawing) => (
-                <div key={drawing.id} className={`drawing-card ${drawing.is_flagged ? 'flagged' : ''}`}>
-                  <div className="drawing-preview">
-                    <span className="shape-icon">{getShapeIcon(drawing.shape)}</span>
-                  </div>
-                  <div className="drawing-info">
-                    <span className="shape-label">{drawing.shape}</span>
-                    <span className="drawing-date">
-                      {new Date(drawing.created_at).toLocaleDateString()}
-                    </span>
-                  </div>
-                  <button
-                    className={`flag-btn ${drawing.is_flagged ? 'unflag' : ''}`}
-                    onClick={() => handleFlagDrawing(drawing.id, !drawing.is_flagged)}
-                  >
-                    {drawing.is_flagged ? 'Unflag' : 'Flag'}
-                  </button>
-                </div>
+                <DrawingCard
+                  key={drawing.id}
+                  id={drawing.id}
+                  shape={drawing.shape}
+                  createdAt={drawing.created_at}
+                  isFlagged={drawing.is_flagged}
+                  onFlag={handleFlagDrawing}
+                />
               ))}
             </div>
           </div>
@@ -304,17 +296,6 @@ function StatCard({
       {subtitle && <div className="stat-subtitle">{subtitle}</div>}
     </div>
   )
-}
-
-function getShapeIcon(shape: string): string {
-  const icons: Record<string, string> = {
-    line: '—',
-    circle: '○',
-    square: '□',
-    triangle: '△',
-    heart: '♡',
-  }
-  return icons[shape] || '?'
 }
 
 export default AdminDashboard

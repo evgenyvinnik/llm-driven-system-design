@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # Cache Node 1
+  cache-node-1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cache-node-1
+    environment:
+      - PORT=3001
+      - NODE_ID=node-1
+      - MAX_SIZE=10000
+      - MAX_MEMORY_MB=100
+      - DEFAULT_TTL=0
+    ports:
+      - "3001:3001"
+    networks:
+      - cache-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Cache Node 2
+  cache-node-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cache-node-2
+    environment:
+      - PORT=3002
+      - NODE_ID=node-2
+      - MAX_SIZE=10000
+      - MAX_MEMORY_MB=100
+      - DEFAULT_TTL=0
+    ports:
+      - "3002:3002"
+    networks:
+      - cache-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Cache Node 3
+  cache-node-3:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cache-node-3
+    environment:
+      - PORT=3003
+      - NODE_ID=node-3
+      - MAX_SIZE=10000
+      - MAX_MEMORY_MB=100
+      - DEFAULT_TTL=0
+    ports:
+      - "3003:3003"
+    networks:
+      - cache-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Coordinator (Load Balancer / Router)
+  coordinator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.coordinator
+    container_name: cache-coordinator
+    environment:
+      - PORT=3000
+      - CACHE_NODES=http://cache-node-1:3001,http://cache-node-2:3002,http://cache-node-3:3003
+      - HEALTH_CHECK_INTERVAL=5000
+      - VIRTUAL_NODES=150
+    ports:
+      - "3000:3000"
+    depends_on:
+      - cache-node-1
+      - cache-node-2
+      - cache-node-3
+    networks:
+      - cache-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Frontend Dashboard
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cache-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - coordinator
+    networks:
+      - cache-network
+
+networks:
+  cache-network:
+    driver: bridge

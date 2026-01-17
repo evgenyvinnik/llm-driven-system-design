@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import { pool } from '../shared/db.js'
 import { publishTrainingJob } from '../shared/queue.js'
+import { getDrawing } from '../shared/storage.js'
 import { v4 as uuidv4 } from 'uuid'
 
 const app = express()
@@ -164,6 +165,33 @@ app.post('/api/admin/drawings/:id/flag', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Error flagging drawing:', error)
     res.status(500).json({ error: 'Failed to flag drawing' })
+  }
+})
+
+// Get stroke data for a drawing
+app.get('/api/admin/drawings/:id/strokes', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+
+    // Get the stroke data path from the database
+    const result = await pool.query(
+      'SELECT stroke_data_path FROM drawings WHERE id = $1',
+      [id]
+    )
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Drawing not found' })
+    }
+
+    const strokeDataPath = result.rows[0].stroke_data_path
+
+    // Fetch from MinIO
+    const strokeData = await getDrawing(strokeDataPath)
+
+    res.json(strokeData)
+  } catch (error) {
+    console.error('Error fetching stroke data:', error)
+    res.status(500).json({ error: 'Failed to fetch stroke data' })
   }
 })
 

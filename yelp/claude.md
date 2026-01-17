@@ -2,7 +2,7 @@
 
 ## Project Context
 
-This document tracks the development journey of implementing A local business review and discovery platform.
+This document tracks the development journey of implementing a local business review and discovery platform.
 
 ## Key Challenges to Explore
 
@@ -14,15 +14,25 @@ This document tracks the development journey of implementing A local business re
 ## Development Phases
 
 ### Phase 1: Requirements and Design
-*Not started*
+*Completed*
 
-**Questions to explore:**
-- What are the core vs. nice-to-have features?
-- What scale are we targeting?
-- What are the key technical constraints?
+**Key decisions made:**
+- PostgreSQL with PostGIS for geo-spatial queries
+- Elasticsearch for full-text search and geo filtering
+- Redis for session management and caching
+- React 19 with TanStack Router for frontend
 
 ### Phase 2: Initial Implementation
-*Not started*
+*In progress*
+
+**Completed features:**
+- Database schema with PostGIS support
+- User authentication with session-based auth
+- Business CRUD with geo-spatial queries
+- Review system with rating aggregation
+- Elasticsearch integration for search
+- Frontend with home, search, business detail, and dashboard pages
+- Admin panel for user/business/review management
 
 **Focus areas:**
 - Implement core functionality
@@ -49,27 +59,66 @@ This document tracks the development journey of implementing A local business re
 
 ## Design Decisions Log
 
-*Decisions and their rationale will be documented here*
+### Database Design
+- **PostGIS for geo-spatial**: Using `GEOGRAPHY(POINT, 4326)` type for accurate distance calculations
+- **Rating aggregation**: Storing `rating_sum` and `review_count` for incremental updates via database triggers
+- **Unique constraint**: One review per user per business enforced at database level
+
+### Search Architecture
+- **Elasticsearch for search**: Better full-text search and built-in geo queries compared to PostgreSQL
+- **PostgreSQL as source of truth**: All writes go to PostgreSQL, then synced to Elasticsearch
+- **Cache layer with Redis**: Search results cached for 2 minutes, business details for 5 minutes
+
+### Authentication
+- **Session-based with Redis**: Simple, secure, easy to manage
+- **Cookie-based tokens**: HttpOnly cookies for security
+- **Role-based access**: user, business_owner, admin roles
 
 ## Iterations and Learnings
 
-*Development iterations and key learnings will be tracked here*
+### Iteration 1: Basic Structure
+- Set up backend with Express and PostgreSQL
+- Created database schema with PostGIS extensions
+- Implemented basic CRUD operations
+
+### Iteration 2: Search Integration
+- Added Elasticsearch for full-text search
+- Implemented geo-distance filtering
+- Added autocomplete suggestions
+
+### Iteration 3: Frontend Development
+- Created React frontend with TanStack Router
+- Implemented search, business detail, and review pages
+- Added user dashboard and admin panel
 
 ## Questions and Discussions
 
-*Open questions and architectural discussions*
+### Open Questions
+1. How to handle rating recalculation at scale? (Currently using triggers)
+2. Best approach for review spam detection?
+3. How to implement real-time updates for reviews?
+
+### Potential Improvements
+1. Add Bayesian rating for fairer rankings
+2. Implement review photo uploads with S3
+3. Add real-time notifications with WebSockets
+4. Implement map-based browsing with clustering
 
 ## Resources and References
 
-*Relevant articles, papers, and documentation*
+- PostGIS documentation for geo-spatial queries
+- Elasticsearch geo_distance query documentation
+- Yelp's engineering blog for architecture insights
 
 ## Next Steps
 
-- [ ] Define detailed requirements
-- [ ] Sketch initial architecture
-- [ ] Choose technology stack
-- [ ] Implement MVP
-- [ ] Test and iterate
+- [x] Define detailed requirements
+- [x] Sketch initial architecture
+- [x] Choose technology stack
+- [x] Implement MVP
+- [ ] Add comprehensive tests
+- [ ] Performance optimization
+- [ ] Deploy and iterate
 
 ---
 

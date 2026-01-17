@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gray-50 text-gray-900;
+}
+
+.card {
+  @apply bg-white rounded-lg shadow-md p-6;
+}
+
+.btn {
+  @apply px-4 py-2 rounded-md font-medium transition-colors duration-200;
+}
+
+.btn-primary {
+  @apply bg-primary-600 text-white hover:bg-primary-700;
+}
+
+.btn-secondary {
+  @apply bg-gray-200 text-gray-800 hover:bg-gray-300;
+}
+
+.btn-danger {
+  @apply bg-red-600 text-white hover:bg-red-700;
+}
+
+.input {
+  @apply w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent;
+}
+
+.status-healthy {
+  @apply text-green-600 bg-green-100 px-2 py-1 rounded-full text-sm font-medium;
+}
+
+.status-degraded {
+  @apply text-yellow-600 bg-yellow-100 px-2 py-1 rounded-full text-sm font-medium;
+}
+
+.status-unhealthy {
+  @apply text-red-600 bg-red-100 px-2 py-1 rounded-full text-sm font-medium;
+}
+
+.circuit-closed {
+  @apply text-green-600 bg-green-100;
+}
+
+.circuit-open {
+  @apply text-red-600 bg-red-100;
+}
+
+.circuit-half-open {
+  @apply text-yellow-600 bg-yellow-100;
+}

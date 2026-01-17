@@ -1,0 +1,190 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: scalable-api-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: scalable_api
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scalable-api-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: scalable-api-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scalable-api-network
+
+  # API Server Instance 1
+  api-server-1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scalable-api-server-1
+    environment:
+      - PORT=3001
+      - INSTANCE_ID=api-1
+      - NODE_ENV=production
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - scalable-api-network
+
+  # API Server Instance 2
+  api-server-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scalable-api-server-2
+    environment:
+      - PORT=3002
+      - INSTANCE_ID=api-2
+      - NODE_ENV=production
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - scalable-api-network
+
+  # API Server Instance 3
+  api-server-3:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scalable-api-server-3
+    environment:
+      - PORT=3003
+      - INSTANCE_ID=api-3
+      - NODE_ENV=production
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    ports:
+      - "3003:3003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - scalable-api-network
+
+  # Load Balancer
+  load-balancer:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.lb
+    container_name: scalable-api-load-balancer
+    environment:
+      - LB_PORT=3000
+      - API_SERVERS=http://api-server-1:3001,http://api-server-2:3002,http://api-server-3:3003
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-server-1
+      - api-server-2
+      - api-server-3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - scalable-api-network
+
+  # API Gateway
+  gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gateway
+    container_name: scalable-api-gateway
+    environment:
+      - GATEWAY_PORT=8080
+      - REDIS_HOST=redis
+      - POSTGRES_HOST=postgres
+      - NODE_ENV=production
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - scalable-api-network
+
+  # Frontend (for production)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: scalable-api-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - gateway
+    networks:
+      - scalable-api-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  scalable-api-network:
+    driver: bridge

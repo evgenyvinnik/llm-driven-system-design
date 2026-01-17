@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+}
+
+/* PDF viewer styles */
+.react-pdf__Page__canvas {
+  margin: 0 auto;
+  display: block !important;
+}
+
+.react-pdf__Page__textContent {
+  display: none !important;
+}
+
+.react-pdf__Page__annotations {
+  display: none !important;
+}
+
+/* Signature pad styles */
+.signature-pad-container {
+  position: relative;
+  border: 2px dashed #d1d5db;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.signature-pad-container.signing {
+  border-color: #2563eb;
+  border-style: solid;
+}
+
+/* Field highlight */
+.field-highlight {
+  position: absolute;
+  border: 2px solid;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.field-highlight:hover {
+  transform: scale(1.02);
+}
+
+.field-highlight.signature {
+  border-color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.1);
+}
+
+.field-highlight.initial {
+  border-color: #8b5cf6;
+  background-color: rgba(139, 92, 246, 0.1);
+}
+
+.field-highlight.date {
+  border-color: #10b981;
+  background-color: rgba(16, 185, 129, 0.1);
+}
+
+.field-highlight.text {
+  border-color: #3b82f6;
+  background-color: rgba(59, 130, 246, 0.1);
+}
+
+.field-highlight.checkbox {
+  border-color: #6366f1;
+  background-color: rgba(99, 102, 241, 0.1);
+}
+
+.field-highlight.completed {
+  background-color: rgba(34, 197, 94, 0.2);
+  border-color: #22c55e;
+}
+
+/* Loading spinner */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}

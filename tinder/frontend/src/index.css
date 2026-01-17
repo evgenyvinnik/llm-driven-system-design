@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-gray-50 text-gray-900;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-full font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply bg-tinder-gradient text-white hover:shadow-lg active:scale-95;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-200 text-gray-700 hover:bg-gray-300 active:scale-95;
+  }
+
+  .btn-outline {
+    @apply border-2 border-gradient-start text-gradient-start hover:bg-gradient-start hover:text-white;
+  }
+
+  .card {
+    @apply bg-white rounded-2xl shadow-lg overflow-hidden;
+  }
+
+  .input {
+    @apply w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-gradient-start focus:ring-1 focus:ring-gradient-start;
+  }
+
+  .swipe-card {
+    @apply absolute inset-0 rounded-2xl overflow-hidden shadow-2xl;
+    touch-action: none;
+  }
+
+  .swipe-button {
+    @apply w-16 h-16 rounded-full flex items-center justify-center shadow-lg transition-transform active:scale-90;
+  }
+
+  .match-modal {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-black/80;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-100;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400;
+}
+
+/* Animation for card swiping */
+@keyframes swipe-right {
+  to {
+    transform: translateX(150%) rotate(30deg);
+    opacity: 0;
+  }
+}
+
+@keyframes swipe-left {
+  to {
+    transform: translateX(-150%) rotate(-30deg);
+    opacity: 0;
+  }
+}
+
+.animate-swipe-right {
+  animation: swipe-right 0.3s forwards;
+}
+
+.animate-swipe-left {
+  animation: swipe-left 0.3s forwards;
+}
+
+/* Match animation */
+@keyframes match-pop {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.1);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-match-pop {
+  animation: match-pop 0.5s ease-out forwards;
+}

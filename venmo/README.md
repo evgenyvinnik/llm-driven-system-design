@@ -1,59 +1,203 @@
 # Design Venmo - P2P Payment Platform
 
-## Overview
-
 A simplified Venmo-like platform demonstrating peer-to-peer payments, social feeds, and instant money transfers. This educational project focuses on building a social payment network with balance management and multi-source funding.
 
-## Key Features
+## Features
 
-### 1. P2P Payments
-- Send money to friends
-- Request payments
-- Split bills
-- Instant transfers
+### Core Functionality
+- **P2P Payments**: Send money to friends with atomic balance transfers
+- **Payment Requests**: Request money from others with pay/decline flow
+- **Social Feed**: View transaction activity with fan-out-on-write architecture
+- **Wallet Management**: Track balance, link bank accounts, cash out
 
-### 2. Social Feed
-- Public/private transactions
-- Comments and likes
-- Friend activity
-- Transaction notes
+### Technical Highlights
+- Atomic transfers with PostgreSQL transactions and row-level locking
+- Fan-out-on-write social feed for fast reads
+- Multi-source funding waterfall (Balance -> Bank -> Card)
+- Session-based authentication with Redis
+- Real-time balance cache invalidation
 
-### 3. Wallet Management
-- Venmo balance
-- Bank account linking
-- Debit card linking
-- Instant cashout
+## Tech Stack
 
-### 4. Payment Methods
-- Balance priority
-- Bank transfer (ACH)
-- Card payments
-- Automatic funding
+- **Frontend**: React 19, TypeScript, Vite, Tanstack Router, Zustand, Tailwind CSS
+- **Backend**: Node.js, Express
+- **Database**: PostgreSQL (primary data), Redis (sessions, caching)
+- **Infrastructure**: Docker Compose
 
-### 5. Security
-- PIN verification
-- Biometric auth
-- Fraud detection
-- Transaction limits
+## Quick Start
 
-## Implementation Status
+### Prerequisites
+- Node.js 18+
+- Docker and Docker Compose
+- npm or yarn
 
-- [ ] Initial architecture design
-- [ ] User wallet system
-- [ ] P2P transfer flow
-- [ ] Social feed
-- [ ] Bank linking
-- [ ] Instant cashout
-- [ ] Bill splitting
-- [ ] Documentation
+### 1. Start Infrastructure
 
-## Key Technical Challenges
+```bash
+cd venmo
+docker-compose up -d
+```
 
-1. **Balance Consistency**: Accurate wallet balances across concurrent transfers
-2. **Social Feed**: Real-time feed updates for millions of users
-3. **Instant Transfers**: Sub-second P2P payments
-4. **Funding Waterfall**: Automatic source selection for payments
-5. **Fraud Prevention**: Detecting account takeover and money laundering
+This starts:
+- PostgreSQL on port 5432
+- Redis on port 6379
+
+### 2. Setup Backend
+
+```bash
+cd backend
+cp .env.example .env
+npm install
+npm run migrate
+npm run seed
+npm run dev
+```
+
+The API server runs on http://localhost:3000
+
+### 3. Setup Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend runs on http://localhost:5173
+
+### 4. Login
+
+Demo users are created by the seed script:
+- **alice** / password123 (Balance: $500)
+- **bob** / password123 (Balance: $250)
+- **charlie** / password123 (Balance: $100)
+- **diana** / password123 (Balance: $100)
+- **admin** / password123 (Admin user)
+
+All demo users are already friends with each other and have some sample transactions.
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Create account
+- `POST /api/auth/login` - Login
+- `POST /api/auth/logout` - Logout
+- `GET /api/auth/me` - Get current user
+- `GET /api/auth/search?q=` - Search users
+
+### Transfers
+- `POST /api/transfers/send` - Send money
+- `GET /api/transfers/:id` - Get transfer details
+- `POST /api/transfers/:id/like` - Like a transfer
+- `DELETE /api/transfers/:id/like` - Unlike a transfer
+- `POST /api/transfers/:id/comments` - Add comment
+
+### Requests
+- `POST /api/requests` - Create payment request
+- `GET /api/requests/sent` - Get sent requests
+- `GET /api/requests/received` - Get received requests
+- `POST /api/requests/:id/pay` - Pay a request
+- `POST /api/requests/:id/decline` - Decline a request
+- `POST /api/requests/:id/cancel` - Cancel a request
+
+### Wallet
+- `GET /api/wallet` - Get wallet details
+- `GET /api/wallet/balance` - Get balance
+- `GET /api/wallet/history` - Transaction history
+- `POST /api/wallet/deposit` - Add money (demo)
+
+### Payment Methods
+- `GET /api/payment-methods` - List payment methods
+- `POST /api/payment-methods/bank` - Link bank account
+- `POST /api/payment-methods/card` - Add card
+- `POST /api/payment-methods/:id/default` - Set default
+- `DELETE /api/payment-methods/:id` - Remove method
+- `POST /api/payment-methods/cashout` - Cash out
+
+### Feed
+- `GET /api/feed` - Friends feed
+- `GET /api/feed/global` - Global public feed
+- `GET /api/feed/user/:username` - User's transactions
+
+### Friends
+- `GET /api/friends` - List friends
+- `GET /api/friends/requests` - Pending requests
+- `POST /api/friends/request/:username` - Send request
+- `POST /api/friends/accept/:username` - Accept request
+- `POST /api/friends/decline/:username` - Decline request
+- `DELETE /api/friends/:username` - Remove friend
+
+## Project Structure
+
+```
+venmo/
+├── docker-compose.yml      # PostgreSQL + Redis
+├── backend/
+│   ├── src/
+│   │   ├── index.js        # Express server entry
+│   │   ├── routes/         # API routes
+│   │   │   ├── auth.js
+│   │   │   ├── wallet.js
+│   │   │   ├── transfers.js
+│   │   │   ├── requests.js
+│   │   │   ├── feed.js
+│   │   │   ├── friends.js
+│   │   │   └── paymentMethods.js
+│   │   ├── services/       # Business logic
+│   │   │   └── transfer.js # Atomic transfer service
+│   │   ├── middleware/     # Auth middleware
+│   │   └── db/             # Database connections
+│   │       ├── pool.js     # PostgreSQL pool
+│   │       ├── redis.js    # Redis client
+│   │       ├── migrate.js  # Schema migrations
+│   │       └── seed.js     # Demo data
+│   └── package.json
+├── frontend/
+│   ├── src/
+│   │   ├── main.tsx        # React entry
+│   │   ├── routes/         # Tanstack Router pages
+│   │   │   ├── __root.tsx
+│   │   │   ├── index.tsx   # Feed page
+│   │   │   ├── pay.tsx     # Send money
+│   │   │   ├── request.tsx # Request money
+│   │   │   ├── wallet.tsx  # Wallet management
+│   │   │   ├── profile.tsx # User profile
+│   │   │   ├── login.tsx
+│   │   │   └── register.tsx
+│   │   ├── components/     # Reusable UI
+│   │   ├── stores/         # Zustand state
+│   │   ├── services/       # API client
+│   │   ├── types/          # TypeScript types
+│   │   └── utils/          # Helpers
+│   └── package.json
+├── architecture.md         # System design docs
+├── CLAUDE.md               # Development notes
+└── README.md               # This file
+```
+
+## Key Design Decisions
+
+### 1. Atomic Balance Transfers
+Uses PostgreSQL transactions with `SELECT FOR UPDATE` to lock wallet rows during transfers, preventing race conditions and ensuring balance consistency.
+
+### 2. Fan-Out-On-Write Feed
+When a transaction occurs, it's pre-computed into all relevant users' feeds. This trades write amplification for fast reads.
+
+### 3. Funding Waterfall
+Automatic payment source selection: Venmo Balance -> Bank Account -> Card. Best UX without requiring user to choose each time.
+
+### 4. Session-Based Auth
+Simple Redis-backed sessions instead of JWT complexity. Appropriate for learning project scope.
+
+## Running Multiple Backend Instances
+
+For testing load balancing scenarios:
+
+```bash
+npm run dev:server1  # Port 3001
+npm run dev:server2  # Port 3002
+npm run dev:server3  # Port 3003
+```
 
 ## Architecture
 
@@ -61,4 +205,8 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and design decisions.
+See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
+
+## License
+
+Educational project - MIT License

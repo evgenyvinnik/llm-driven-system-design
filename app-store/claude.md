@@ -48,16 +48,16 @@ Building an application marketplace to understand ranking algorithms, review sys
 
 ## Development Phases
 
-### Phase 1: Catalog
-- [ ] App metadata
-- [ ] Search index
-- [ ] Categories
-- [ ] Screenshots/videos
+### Phase 1: Catalog - COMPLETE
+- [x] App metadata
+- [x] Search index
+- [x] Categories
+- [x] Screenshots/videos
 
-### Phase 2: Discovery
-- [ ] Ranking algorithm
-- [ ] Charts generation
-- [ ] Recommendations
+### Phase 2: Discovery - IN PROGRESS
+- [x] Ranking algorithm (basic multi-signal)
+- [x] Charts generation (Top Free, Paid, New)
+- [x] Recommendations (similar apps via Elasticsearch MLT)
 - [ ] Editorial content
 
 ### Phase 3: Commerce
@@ -66,11 +66,51 @@ Building an application marketplace to understand ranking algorithms, review sys
 - [ ] Subscriptions
 - [ ] Developer payouts
 
-### Phase 4: Quality
-- [ ] Review system
-- [ ] Integrity scoring
-- [ ] Moderation
-- [ ] Developer responses
+### Phase 4: Quality - PARTIAL
+- [x] Review system
+- [x] Integrity scoring
+- [ ] Moderation (admin interface)
+- [x] Developer responses
+
+---
+
+## Implementation Notes
+
+### Current Implementation
+
+The following has been implemented:
+
+**Backend (Node.js + Express + TypeScript)**
+- PostgreSQL database with full schema (users, developers, apps, reviews, etc.)
+- Redis for session management and caching
+- Elasticsearch for full-text search and app indexing
+- MinIO for file storage (icons, screenshots, packages)
+- Review integrity scoring system
+- Developer app management API
+- Authentication with role-based access
+
+**Frontend (React 19 + TypeScript + Tailwind)**
+- Home page with top charts
+- Category browsing
+- App search with filters
+- App detail pages with reviews
+- Developer dashboard for app management
+- User authentication (login/register)
+
+### Key Technical Decisions
+
+1. **Elasticsearch for Search**: Provides full-text search with fuzzy matching, suggestions, and more_like_this for similar apps.
+
+2. **Review Integrity Scoring**: Implemented a multi-signal scoring system that considers:
+   - Review velocity (spam detection)
+   - Content quality (generic phrase detection)
+   - Account age
+   - Verified purchase status
+   - Coordination detection (review bombing)
+
+3. **Session-based Auth**: Simple Redis-based sessions instead of JWT for learning purposes.
+
+4. **MinIO for Storage**: S3-compatible storage for app packages and media.
 
 ---
 

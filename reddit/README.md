@@ -8,122 +8,237 @@ A simplified Reddit-like platform demonstrating voting systems, nested comments,
 
 ### 1. Subreddit Management
 - Create and manage communities (subreddits)
-- Subreddit-specific rules and moderation
-- Public, private, and restricted community types
-- Subscription and membership tracking
+- Subscribe/unsubscribe to communities
+- Community-specific content feeds
+- Subscriber counts and community info
 
 ### 2. Post & Voting System
-- Submit text posts, links, and media
-- Upvote/downvote with score aggregation
-- Karma calculation per user
-- Vote fraud prevention (rate limiting, detection)
+- Submit text posts and links
+- Upvote/downvote with immediate score updates
+- Karma calculation per user (post karma + comment karma)
+- Vote state persistence across sessions
 
 ### 3. Nested Comments
 - Threaded comment trees with arbitrary depth
 - Comment voting and sorting (best, top, new, controversial)
-- Collapsed threads and "load more" pagination
-- Parent-child relationship management
+- Collapsible comment threads
+- Reply to any comment in the tree
 
 ### 4. Content Ranking Algorithms
-- Hot: Time-decay weighted by votes
-- Top: Highest score within time range
-- New: Chronological ordering
-- Controversial: High engagement, balanced votes
-- Rising: Rapid vote acceleration
+- **Hot**: Time-decay weighted by votes (Reddit's algorithm)
+- **Top**: Highest score within time range
+- **New**: Chronological ordering
+- **Controversial**: High engagement, balanced votes
+- **Best** (for comments): Wilson score confidence interval
 
-### 5. Moderation Tools
-- Remove/approve posts and comments
-- Ban users from subreddits
-- Automod rules (keyword filtering, spam detection)
-- Mod queue and action logs
+## Tech Stack
 
-## Implementation Status
+- **Frontend**: TypeScript + Vite + React 19 + TanStack Router + Zustand + Tailwind CSS
+- **Backend**: Node.js + Express
+- **Database**: PostgreSQL (primary data store)
+- **Cache**: Redis (sessions, vote caching, hot scores)
 
-- [ ] Initial architecture design
-- [ ] Database schema (users, subreddits, posts, comments, votes)
-- [ ] Voting system with score aggregation
-- [ ] Nested comment tree implementation
-- [ ] Ranking algorithm implementations
-- [ ] Subreddit creation and management
-- [ ] Basic moderation features
-- [ ] Local multi-instance testing
-- [ ] Documentation
+## Prerequisites
+
+- Node.js 18+
+- Docker and Docker Compose
+- Modern web browser
 
 ## Getting Started
 
-*Instructions will be added as the implementation progresses*
+### Option 1: Using Docker (Recommended)
 
-### Prerequisites
+1. **Start the infrastructure services**:
+   ```bash
+   cd reddit
+   docker-compose up -d
+   ```
 
-- Node.js 18+
-- Docker and Docker Compose (for PostgreSQL, Valkey)
-- Modern web browser
+2. **Install backend dependencies and set up database**:
+   ```bash
+   cd backend
+   cp .env.example .env
+   npm install
+   npm run db:migrate
+   npm run db:seed
+   ```
 
-### Installation
+3. **Start the backend server**:
+   ```bash
+   npm run dev
+   ```
+
+4. **Install frontend dependencies and start dev server** (in a new terminal):
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
+
+5. **Access the application**:
+   - Frontend: http://localhost:5173
+   - Backend API: http://localhost:3001
+   - Health check: http://localhost:3001/health
+
+### Option 2: Native Services
+
+If you prefer to run PostgreSQL and Redis natively:
+
+1. **Install and start PostgreSQL**:
+   ```bash
+   # macOS with Homebrew
+   brew install postgresql@16
+   brew services start postgresql@16
+
+   # Create database and user
+   createdb reddit
+   psql -d reddit -c "CREATE USER reddit WITH PASSWORD 'reddit_password';"
+   psql -d reddit -c "GRANT ALL PRIVILEGES ON DATABASE reddit TO reddit;"
+   psql -d reddit -c "GRANT ALL PRIVILEGES ON SCHEMA public TO reddit;"
+   ```
+
+2. **Install and start Redis**:
+   ```bash
+   # macOS with Homebrew
+   brew install redis
+   brew services start redis
+   ```
+
+3. **Continue with backend setup** (same as Docker option, steps 2-5)
+
+### Demo Accounts
+
+After seeding, these accounts are available:
+
+| Username | Password     | Role  |
+|----------|--------------|-------|
+| admin    | password123  | admin |
+| alice    | password123  | user  |
+| bob      | password123  | user  |
+| charlie  | password123  | user  |
+| diana    | password123  | user  |
+
+## Running Multiple Instances
+
+For testing distributed scenarios:
 
 ```bash
-cd reddit
-npm install
-docker-compose up -d  # Start PostgreSQL, Valkey
-npm run db:migrate    # Initialize database schema
+# Terminal 1: API Server on port 3001
+npm run dev:server1
+
+# Terminal 2: API Server on port 3002
+npm run dev:server2
+
+# Terminal 3: API Server on port 3003
+npm run dev:server3
+
+# Terminal 4: Vote Aggregation Worker
+npm run dev:worker
+
+# Terminal 5: Hot Score Calculator
+npm run dev:ranking
 ```
 
-### Running the Service
+## API Endpoints
 
-```bash
-# Run single instance (development)
-npm run dev
+### Authentication
+- `POST /api/auth/register` - Create new account
+- `POST /api/auth/login` - Log in
+- `POST /api/auth/logout` - Log out
+- `GET /api/auth/me` - Get current user
 
-# Run multiple instances (simulates distribution)
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-npm run dev:server3  # Port 3003
+### Subreddits
+- `GET /api/subreddits` - List all subreddits
+- `POST /api/subreddits` - Create subreddit
+- `GET /api/subreddits/:name` - Get subreddit info
+- `POST /api/subreddits/:name/subscribe` - Subscribe
+- `POST /api/subreddits/:name/unsubscribe` - Unsubscribe
+
+### Posts
+- `GET /api/posts` - List all posts (home feed)
+- `GET /api/r/:subreddit/:sort` - List posts by subreddit
+- `POST /api/posts/r/:subreddit` - Create post
+- `GET /api/posts/:id` - Get single post
+- `GET /api/posts/:id/comments` - Get post with comments
+
+### Comments
+- `POST /api/posts/:postId/comments` - Create comment
+- `GET /api/comments/:id` - Get comment subtree
+
+### Voting
+- `POST /api/vote` - Cast vote
+  ```json
+  { "type": "post|comment", "id": 123, "direction": 1|-1|0 }
+  ```
+
+## Project Structure
+
+```
+reddit/
+├── docker-compose.yml        # PostgreSQL + Redis
+├── backend/
+│   ├── src/
+│   │   ├── index.js          # Express server entry
+│   │   ├── db/               # Database connection & migrations
+│   │   ├── models/           # Data access layer
+│   │   ├── routes/           # API route handlers
+│   │   ├── middleware/       # Auth middleware
+│   │   ├── utils/            # Ranking algorithms
+│   │   └── workers/          # Background jobs
+│   └── package.json
+├── frontend/
+│   ├── src/
+│   │   ├── main.tsx          # React entry
+│   │   ├── routes/           # TanStack Router pages
+│   │   ├── components/       # Reusable UI components
+│   │   ├── stores/           # Zustand state management
+│   │   ├── services/         # API client
+│   │   ├── types/            # TypeScript types
+│   │   └── utils/            # Helper functions
+│   └── package.json
+├── architecture.md           # System design documentation
+├── CLAUDE.md                 # Development notes
+└── README.md                 # This file
 ```
 
-## Key Technical Challenges
+## Key Technical Implementations
 
-1. **Vote Counting at Scale**: How to aggregate millions of votes efficiently without locking?
-2. **Nested Comment Trees**: How to fetch and render deeply nested threads efficiently?
-3. **Hot Algorithm**: Implementing time-decay ranking that balances freshness with quality
-4. **Vote Manipulation**: Detecting and preventing coordinated voting attacks
-5. **Subreddit Isolation**: Keeping communities separate while enabling cross-posting
+### 1. Voting System
+- Votes stored in dedicated table with unique constraints
+- Immediate score aggregation for responsive UI
+- Background worker for bulk aggregation
+- Redis caching for user vote lookups
 
-## Architecture
+### 2. Nested Comments (Materialized Path)
+- Path column stores ancestry: "1.5.23.102"
+- Single query fetches entire subtree: `WHERE path LIKE '1.5.%'`
+- Efficient depth-based sorting
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+### 3. Hot Score Algorithm
+```javascript
+function hotScore(ups, downs, createdAt) {
+  const score = ups - downs;
+  const order = Math.log10(Math.max(Math.abs(score), 1));
+  const sign = score > 0 ? 1 : score < 0 ? -1 : 0;
+  const seconds = (createdAt - epoch) / 1000;
+  return sign * order + seconds / 45000;
+}
+```
+
+### 4. Wilson Score (for "Best" comment sorting)
+Provides confidence-adjusted ranking that accounts for sample size, preventing "1 upvote, 0 downvotes = 100%" from ranking highest.
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and design decisions.
-
-## Example Ranking Algorithms
-
-**Hot Score (simplified Reddit formula):**
-```javascript
-function hotScore(ups, downs, createdAt) {
-  const score = ups - downs
-  const order = Math.log10(Math.max(Math.abs(score), 1))
-  const sign = score > 0 ? 1 : score < 0 ? -1 : 0
-  const seconds = (createdAt - epoch) / 1000
-  return sign * order + seconds / 45000
-}
-```
-
-**Controversial Score:**
-```javascript
-function controversialScore(ups, downs) {
-  const total = ups + downs
-  if (total === 0) return 0
-  const balance = Math.min(ups, downs) / Math.max(ups, downs)
-  return total * balance
-}
-```
+See [architecture.md](./architecture.md) for detailed system design documentation.
+See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 
 ## Future Enhancements
 
 - [ ] User profiles and post history
-- [ ] Awards and premium features
 - [ ] Real-time notifications
 - [ ] Search within subreddits
 - [ ] Cross-posting between communities
 - [ ] Flair system for posts and users
+- [ ] Basic moderation tools
+- [ ] Awards and premium features

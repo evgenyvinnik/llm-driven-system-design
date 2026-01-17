@@ -1,0 +1,34 @@
+{
+  "name": "github-backend",
+  "version": "1.0.0",
+  "description": "GitHub clone - code hosting platform backend",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_ENV=development node --watch src/index.js",
+    "dev:server1": "PORT=3001 npm run dev",
+    "dev:server2": "PORT=3002 npm run dev",
+    "dev:server3": "PORT=3003 npm run dev",
+    "start": "NODE_ENV=production node src/index.js",
+    "db:migrate": "node src/db/migrate.js",
+    "db:seed": "node src/db/seed.js"
+  },
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.12.0",
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "diff": "^5.2.0",
+    "express": "^4.18.3",
+    "express-session": "^1.18.0",
+    "isomorphic-git": "^1.25.6",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.3",
+    "redis": "^4.6.13",
+    "simple-git": "^3.22.0",
+    "uuid": "^9.0.1",
+    "zlib": "^1.0.5"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  }
+}

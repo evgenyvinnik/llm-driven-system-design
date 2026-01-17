@@ -48,26 +48,65 @@ Building a code hosting platform to understand Git internals, code search, and c
 
 ## Development Phases
 
-### Phase 1: Repository Basics
-- [ ] Create/delete repos
-- [ ] Git clone support
-- [ ] Push/pull basics
+### Phase 1: Repository Basics (Completed)
+- [x] Create/delete repos
+- [x] Git init with bare repositories
+- [x] File tree browsing
+- [x] File content viewing
+- [x] Commit history
 
-### Phase 2: Pull Requests
-- [ ] PR creation
-- [ ] Diff computation
-- [ ] Review comments
-- [ ] Merge strategies
+### Phase 2: Pull Requests (In Progress)
+- [x] PR creation
+- [x] Diff computation
+- [x] Review comments
+- [x] Merge strategies (merge, squash, rebase)
+- [ ] Conflict detection and resolution
+- [ ] Branch protection rules
 
-### Phase 3: Search
-- [ ] File indexing
-- [ ] Full-text search
-- [ ] Symbol extraction
+### Phase 3: Search (Completed)
+- [x] File indexing with Elasticsearch
+- [x] Full-text code search
+- [x] Symbol extraction (functions, classes)
+- [x] Language detection
 
-### Phase 4: Automation
-- [ ] Webhook system
+### Phase 4: Automation (Pending)
+- [ ] Webhook system with retry
 - [ ] Basic CI runner
-- [ ] Status checks
+- [ ] Status checks on PRs
+- [ ] Notification system
+
+---
+
+## Implementation Notes
+
+### Git Storage Strategy
+Using bare Git repositories with `simple-git` library:
+- Repositories stored in `/repositories/{owner}/{repo}.git`
+- Using `git ls-tree` for file listing
+- Using `git show` for file content
+- Using `git diff` for PR diffs
+
+### Database Design
+PostgreSQL with comprehensive schema:
+- Users and organizations
+- Repositories with owner/org relationship
+- Pull requests with state machine
+- Issues with labels and comments
+- Discussions with threaded comments
+- Webhooks with delivery tracking
+
+### Authentication
+Session-based auth with Redis:
+- 7-day session TTL
+- Session ID in header (`X-Session-Id`)
+- Role-based access (user/admin)
+
+### Code Search
+Elasticsearch with custom analyzer:
+- Code tokenizer for identifiers
+- Camel case splitting
+- Language detection from file extension
+- Symbol extraction for functions/classes
 
 ---
 

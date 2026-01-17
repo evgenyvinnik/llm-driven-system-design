@@ -10,51 +10,275 @@ A simplified Amazon-like platform demonstrating product catalog management, inve
 - Hierarchical category system
 - Product attributes and variants (size, color)
 - Seller marketplace integration
-- Product search and filtering
+- Product search and filtering with Elasticsearch
 
 ### 2. Inventory Management
 - Real-time stock tracking
-- Warehouse distribution
-- Reserved inventory for carts
+- Reserved inventory for carts (prevents overselling)
+- Automatic reservation expiration
 - Low stock alerts
 
-### 3. Recommendations
-- "Customers who bought also bought"
-- Personalized homepage
-- Recently viewed products
-- Category-based recommendations
+### 3. Shopping Cart & Checkout
+- Cart with inventory reservation
+- Multi-step checkout flow
+- Order confirmation
 
 ### 4. Order Processing
-- Shopping cart management
-- Checkout workflow
-- Payment processing
 - Order status tracking
+- Order history
+- Order cancellation
 
-### 5. Fulfillment
-- Warehouse selection
-- Shipping estimation
-- Delivery tracking
-- Returns processing
+### 5. Reviews & Ratings
+- Product reviews with star ratings
+- Verified purchase badges
+- Helpful vote system
+- Rating summaries
 
-## Implementation Status
+### 6. Recommendations
+- "Customers also bought" suggestions
+- Batch-computed collaborative filtering
+- Redis-cached for fast retrieval
 
-- [ ] Initial architecture design
-- [ ] Product catalog with categories
-- [ ] Inventory tracking system
-- [ ] Search with Elasticsearch
-- [ ] Shopping cart and checkout
-- [ ] Recommendation engine
-- [ ] Order management
-- [ ] Local multi-instance testing
-- [ ] Documentation
+## Tech Stack
 
-## Key Technical Challenges
+- **Frontend:** TypeScript, React 19, Vite, TanStack Router, Zustand, Tailwind CSS
+- **Backend:** Node.js, Express
+- **Database:** PostgreSQL
+- **Cache:** Redis
+- **Search:** Elasticsearch
 
-1. **Inventory Consistency**: Preventing overselling during flash sales
-2. **Product Search**: Full-text search with faceted filtering
-3. **Cart Persistence**: Handling abandoned carts and inventory holds
-4. **Recommendation Scale**: Computing "also bought" for millions of products
-5. **Order State Machine**: Managing complex order lifecycle
+## Quick Start
+
+### Prerequisites
+
+- Node.js 18+
+- Docker and Docker Compose
+- npm or yarn
+
+### 1. Start Infrastructure
+
+```bash
+cd amazon
+docker-compose up -d
+```
+
+This starts:
+- PostgreSQL on port 5432
+- Redis on port 6379
+- Elasticsearch on port 9200
+
+Wait for Elasticsearch to be ready (may take 30-60 seconds):
+```bash
+curl http://localhost:9200/_cluster/health
+```
+
+### 2. Setup Backend
+
+```bash
+cd backend
+
+# Copy environment file
+cp .env.example .env
+
+# Install dependencies
+npm install
+
+# Seed the database with sample data
+npm run seed
+
+# Sync products to Elasticsearch
+npm run sync-es
+
+# Start the server
+npm run dev
+```
+
+Backend runs on http://localhost:3000
+
+### 3. Setup Frontend
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+```
+
+Frontend runs on http://localhost:5173
+
+### 4. Access the Application
+
+- **Frontend:** http://localhost:5173
+- **API:** http://localhost:3000/api
+- **API Health Check:** http://localhost:3000/api/health
+
+## Demo Accounts
+
+| Role | Email | Password |
+|------|-------|----------|
+| Admin | admin@amazon.local | admin123 |
+| Seller | seller@amazon.local | admin123 |
+
+Note: Create a new account to test as a regular user.
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Register new user
+- `POST /api/auth/login` - Login
+- `POST /api/auth/logout` - Logout
+- `GET /api/auth/me` - Get current user
+
+### Products
+- `GET /api/products` - List products (with pagination/filters)
+- `GET /api/products/:id` - Get product details
+- `GET /api/products/:id/recommendations` - Get product recommendations
+- `POST /api/products` - Create product (seller/admin)
+- `PUT /api/products/:id` - Update product (seller/admin)
+- `PUT /api/products/:id/inventory` - Update inventory (seller/admin)
+
+### Categories
+- `GET /api/categories` - List all categories (tree structure)
+- `GET /api/categories/:slug` - Get category with subcategories
+
+### Search
+- `GET /api/search?q=query` - Search products with facets
+- `GET /api/search/suggestions?q=query` - Autocomplete suggestions
+
+### Cart
+- `GET /api/cart` - Get cart
+- `POST /api/cart` - Add to cart
+- `PUT /api/cart/:productId` - Update quantity
+- `DELETE /api/cart/:productId` - Remove item
+- `DELETE /api/cart` - Clear cart
+
+### Orders
+- `GET /api/orders` - List user's orders
+- `GET /api/orders/:id` - Get order details
+- `POST /api/orders` - Create order (checkout)
+- `POST /api/orders/:id/cancel` - Cancel order
+
+### Reviews
+- `GET /api/reviews/product/:productId` - Get product reviews
+- `POST /api/reviews` - Create review
+- `POST /api/reviews/:id/helpful` - Mark review as helpful
+
+### Admin
+- `GET /api/admin/stats` - Dashboard statistics
+- `GET /api/admin/orders` - List all orders
+- `GET /api/admin/users` - List all users
+- `GET /api/admin/inventory` - Inventory report
+- `POST /api/admin/sync-elasticsearch` - Sync products to ES
+
+## Project Structure
+
+```
+amazon/
+├── docker-compose.yml     # Infrastructure services
+├── backend/
+│   ├── src/
+│   │   ├── index.js       # Express app entry
+│   │   ├── routes/        # API routes
+│   │   ├── services/      # Database, Redis, ES services
+│   │   ├── middleware/    # Auth, error handling
+│   │   └── utils/         # Seed, sync scripts
+│   └── db/
+│       └── init.sql       # Database schema
+└── frontend/
+    └── src/
+        ├── routes/        # Page components (TanStack Router)
+        ├── components/    # Reusable UI components
+        ├── stores/        # Zustand state management
+        ├── services/      # API client
+        └── types/         # TypeScript definitions
+```
+
+## Key Technical Challenges Demonstrated
+
+### 1. Inventory Consistency
+The reserved inventory model prevents overselling:
+- When adding to cart, inventory is reserved (not decremented)
+- Reservations expire after 30 minutes
+- Background job releases expired reservations
+- Checkout atomically decrements both quantity and reserved
+
+### 2. Product Search
+Elasticsearch provides:
+- Full-text search with fuzzy matching
+- Faceted filtering (categories, price ranges, ratings)
+- Relevance scoring
+- PostgreSQL fallback if ES unavailable
+
+### 3. Cart Persistence
+- Cart items stored in PostgreSQL (durable)
+- Inventory reservations prevent overselling
+- Automatic cleanup of expired reservations
+
+### 4. Recommendations
+- Collaborative filtering based on co-purchase data
+- Batch computed (not real-time) for performance
+- Cached in Redis for fast retrieval
+
+## Development
+
+### Running Multiple Backend Instances
+
+```bash
+# Terminal 1
+npm run dev:server1  # Port 3001
+
+# Terminal 2
+npm run dev:server2  # Port 3002
+
+# Terminal 3
+npm run dev:server3  # Port 3003
+```
+
+### Database Reset
+
+```bash
+# Stop containers
+docker-compose down -v
+
+# Start fresh
+docker-compose up -d
+
+# Re-seed data
+cd backend && npm run seed && npm run sync-es
+```
+
+## Native Installation (Without Docker)
+
+If you prefer to run services natively:
+
+### PostgreSQL
+```bash
+# macOS with Homebrew
+brew install postgresql@16
+brew services start postgresql@16
+createdb amazon_ecommerce
+psql amazon_ecommerce < backend/db/init.sql
+```
+
+### Redis
+```bash
+# macOS with Homebrew
+brew install redis
+brew services start redis
+```
+
+### Elasticsearch
+```bash
+# macOS with Homebrew
+brew tap elastic/tap
+brew install elastic/tap/elasticsearch-full
+brew services start elastic/tap/elasticsearch-full
+```
+
+Update `.env` with appropriate connection strings if using non-default ports.
 
 ## Architecture
 

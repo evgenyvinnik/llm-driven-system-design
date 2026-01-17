@@ -8,87 +8,170 @@ A simplified Twitter-like platform demonstrating timeline fanout, real-time upda
 
 ### 1. Tweet Publishing
 - Post short-form content (280 characters)
-- Attach media (images, videos, links)
 - Mention users with @username
 - Hashtag support for topic discovery
+- Retweets and quote tweets
 
 ### 2. Timeline Generation
 - Home timeline (posts from followed users)
 - User profile timeline (user's own posts)
-- Fanout strategies (push vs pull)
-- Algorithmic vs chronological ordering
+- Explore timeline (public tweets)
+- Hashtag timeline
+- Hybrid fanout strategy (push for normal users, pull for celebrities)
 
 ### 3. Social Graph
 - Follow/unfollow users
-- Follower/following counts
-- Mutual followers detection
-- Follow recommendations
+- Follower/following counts (denormalized)
+- Celebrity detection (auto-flagged at 10K followers)
 
-### 4. Real-Time Features
-- Live timeline updates
-- Notifications (mentions, likes, retweets)
-- Typing indicators (for DMs)
-- Live engagement counts
+### 4. Engagement
+- Like/unlike tweets
+- Retweet/unretweet
+- Reply threads
 
 ### 5. Trending Topics
 - Hashtag frequency tracking
-- Geographic trend detection
-- Time-windowed analysis
-- Trend velocity calculation
+- Time-windowed analysis (1-hour sliding window)
+- Trend velocity calculation with exponential decay
+- Rising trends detection
 
 ## Implementation Status
 
-- [ ] Initial architecture design
-- [ ] Database schema (users, tweets, follows, likes)
-- [ ] Tweet creation and storage
-- [ ] Timeline fanout implementation
-- [ ] Follow graph management
-- [ ] Trend detection system
-- [ ] Real-time notifications
+- [x] Initial architecture design
+- [x] Database schema (users, tweets, follows, likes, retweets)
+- [x] Tweet creation and storage
+- [x] Timeline fanout implementation (hybrid push/pull)
+- [x] Follow graph management
+- [x] Trend detection system
+- [x] Frontend with React + TypeScript
+- [ ] Real-time notifications (SSE/WebSocket)
 - [ ] Local multi-instance testing
-- [ ] Documentation
 
 ## Getting Started
-
-*Instructions will be added as the implementation progresses*
 
 ### Prerequisites
 
 - Node.js 18+
-- Docker and Docker Compose (for PostgreSQL, Valkey, Kafka)
+- Docker and Docker Compose (for PostgreSQL and Redis)
 - Modern web browser
 
-### Installation
+### Quick Start with Docker
 
 ```bash
 cd twitter
+
+# Start infrastructure (PostgreSQL + Redis)
+docker-compose up -d
+
+# Setup backend
+cd backend
 npm install
-docker-compose up -d  # Start PostgreSQL, Valkey, Kafka
-npm run db:migrate    # Initialize database schema
+cp .env.example .env  # Already configured for Docker defaults
+npm run db:migrate
+npm run db:seed  # Optional: adds demo data
+
+# Start backend server
+npm run dev  # Runs on port 3001
+
+# In a new terminal, setup frontend
+cd ../frontend
+npm install
+npm run dev  # Runs on port 5173
 ```
 
-### Running the Service
+Open http://localhost:5173 in your browser.
+
+### Native Services Setup (without Docker)
+
+If you prefer to run PostgreSQL and Redis natively:
+
+#### PostgreSQL
+```bash
+# macOS with Homebrew
+brew install postgresql@16
+brew services start postgresql@16
+createdb twitter_db
+psql twitter_db -c "CREATE USER twitter WITH PASSWORD 'twitter_secret';"
+psql twitter_db -c "GRANT ALL PRIVILEGES ON DATABASE twitter_db TO twitter;"
+```
+
+#### Redis
+```bash
+# macOS with Homebrew
+brew install redis
+brew services start redis
+```
+
+Then update `backend/.env` with your connection strings if different from defaults.
+
+### Running Multiple Instances
 
 ```bash
-# Run single instance (development)
-npm run dev
-
-# Run multiple instances (simulates distribution)
+# Run multiple API server instances (for load testing)
 npm run dev:server1  # Port 3001
 npm run dev:server2  # Port 3002
 npm run dev:server3  # Port 3003
+```
 
-# Run fanout workers
-npm run dev:fanout
+### Demo Accounts
+
+After running `npm run db:seed`, you can log in with:
+- **Usernames**: alice, bob, charlie, diana, eve, frank, grace, admin
+- **Password**: password123
+
+## API Endpoints
+
+### Authentication
+```
+POST   /api/auth/register     - Register new user
+POST   /api/auth/login        - Log in
+POST   /api/auth/logout       - Log out
+GET    /api/auth/me           - Get current user
+```
+
+### Tweets
+```
+POST   /api/tweets            - Create tweet
+GET    /api/tweets/:id        - Get single tweet
+DELETE /api/tweets/:id        - Delete tweet
+POST   /api/tweets/:id/like   - Like tweet
+DELETE /api/tweets/:id/like   - Unlike tweet
+POST   /api/tweets/:id/retweet  - Retweet
+DELETE /api/tweets/:id/retweet  - Undo retweet
+GET    /api/tweets/:id/replies  - Get replies
+```
+
+### Timeline
+```
+GET    /api/timeline/home           - Home timeline (authenticated)
+GET    /api/timeline/user/:username - User's tweets
+GET    /api/timeline/explore        - Public timeline
+GET    /api/timeline/hashtag/:tag   - Tweets with hashtag
+```
+
+### Users
+```
+GET    /api/users/:username         - Get user profile
+POST   /api/users/:id/follow        - Follow user
+DELETE /api/users/:id/follow        - Unfollow user
+GET    /api/users/:id/followers     - List followers
+GET    /api/users/:id/following     - List following
+GET    /api/users?q=query           - Search users
+```
+
+### Trends
+```
+GET    /api/trends            - Get trending hashtags
+GET    /api/trends/all-time   - All-time popular hashtags
 ```
 
 ## Key Technical Challenges
 
-1. **Fanout at Scale**: How to deliver tweets to millions of followers efficiently?
-2. **Celebrity Problem**: Users with 50M followers vs users with 50 followers
-3. **Timeline Consistency**: Ensuring users see tweets in correct order
-4. **Trend Detection**: Real-time analysis of hashtag velocity
-5. **Graph Queries**: Efficient follower/following lookups
+1. **Fanout at Scale**: Hybrid push/pull strategy - push for users with < 10K followers, pull for celebrities
+2. **Celebrity Problem**: Celebrities are auto-detected and their tweets are pulled at read time
+3. **Timeline Consistency**: Merge cached timeline with celebrity tweets, sort by timestamp
+4. **Trend Detection**: Sliding window with exponential decay for real-time trend scoring
+5. **Graph Queries**: Denormalized counts with Redis cache for fast lookups
 
 ## Architecture
 
@@ -100,39 +183,47 @@ See [claude.md](./claude.md) for development insights and design decisions.
 
 ## Fanout Strategies
 
-**Push (Fanout on Write):**
+**Hybrid (Implemented):**
 ```javascript
-// When user tweets, write to all follower timelines
-async function tweet(userId, content) {
-  const tweetId = await db.createTweet(userId, content)
-  const followers = await db.getFollowers(userId)
+// On tweet creation (push for non-celebrities)
+async function fanoutTweet(tweetId, authorId) {
+  const author = await getUser(authorId);
+  if (author.is_celebrity) return; // Skip push for celebrities
 
+  const followers = await getFollowers(authorId);
+  const pipeline = redis.pipeline();
   for (const followerId of followers) {
-    await cache.lpush(`timeline:${followerId}`, tweetId)
+    pipeline.lpush(`timeline:${followerId}`, tweetId);
+    pipeline.ltrim(`timeline:${followerId}`, 0, 799);
   }
+  await pipeline.exec();
+}
+
+// On timeline read (merge push + pull)
+async function getHomeTimeline(userId) {
+  const cachedIds = await redis.lrange(`timeline:${userId}`, 0, 100);
+  const cachedTweets = await getTweetsByIds(cachedIds);
+
+  const celebrities = await getFollowedCelebrities(userId);
+  const celebrityTweets = await getRecentTweetsByAuthors(celebrities);
+
+  return merge(cachedTweets, celebrityTweets);
 }
 ```
 
-**Pull (Fanout on Read):**
-```javascript
-// When user views timeline, fetch from followed users
-async function getTimeline(userId) {
-  const following = await db.getFollowing(userId)
-  const tweets = await db.getTweetsByUsers(following, { limit: 100 })
-  return tweets.sort((a, b) => b.createdAt - a.createdAt)
-}
-```
+## Tech Stack
 
-**Hybrid (Twitter's Approach):**
-- Push for normal users (< 1000 followers)
-- Pull for celebrities (> 1M followers)
-- Merge at read time
+- **Frontend**: TypeScript, Vite, React 19, Tanstack Router, Zustand, Tailwind CSS
+- **Backend**: Node.js, Express
+- **Database**: PostgreSQL (primary), Redis (cache + timelines)
+- **Session**: Redis-backed sessions
 
 ## Future Enhancements
 
-- [ ] Retweets and quote tweets
+- [ ] Media upload support
 - [ ] Direct messages
 - [ ] Lists and bookmarks
 - [ ] Advanced search
 - [ ] Algorithmic timeline ranking
-- [ ] Spaces (audio rooms)
+- [ ] Real-time updates via SSE/WebSocket
+- [ ] Multi-instance load balancing

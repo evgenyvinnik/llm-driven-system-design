@@ -1,0 +1,195 @@
+import { Router, Request, Response } from 'express';
+import {
+  createSharedLink,
+  validateSharedLink,
+  incrementDownloadCount,
+  getUserSharedLinks,
+  deleteSharedLink,
+  shareFolderWithUser,
+  getSharedWithMe,
+  getFolderShares,
+  removeFolderShare,
+} from '../services/sharingService.js';
+import { downloadFile, getFileChunks } from '../services/fileService.js';
+import { authMiddleware, optionalAuthMiddleware, AuthRequest } from '../middleware/auth.js';
+import { getDownloadPresignedUrl } from '../utils/storage.js';
+import { queryOne } from '../utils/database.js';
+import { FileItem } from '../types/index.js';
+
+const router = Router();
+
+// Create shared link (requires auth)
+router.post('/link', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { fileId, accessLevel, password, expiresInHours, maxDownloads } = req.body;
+
+    if (!fileId) {
+      res.status(400).json({ error: 'fileId is required' });
+      return;
+    }
+
+    const link = await createSharedLink(req.user!.id, fileId, {
+      accessLevel,
+      password,
+      expiresInHours,
+      maxDownloads,
+    });
+
+    res.status(201).json({
+      ...link,
+      url: `${req.protocol}://${req.get('host')}/api/share/${link.urlToken}`,
+    });
+  } catch (error) {
+    console.error('Create share link error:', error);
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+// Get user's shared links
+router.get('/links', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const links = await getUserSharedLinks(req.user!.id);
+    res.json(links);
+  } catch (error) {
+    console.error('Get share links error:', error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// Delete shared link
+router.delete('/link/:linkId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    await deleteSharedLink(req.user!.id, req.params.linkId);
+    res.json({ message: 'Link deleted' });
+  } catch (error) {
+    console.error('Delete share link error:', error);
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+// Access shared link - get file info
+router.get('/:token', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { password } = req.query;
+    const result = await validateSharedLink(req.params.token, password as string | undefined);
+
+    if (!result.valid) {
+      res.status(result.error === 'Password required' ? 401 : 400).json({
+        error: result.error,
+        requiresPassword: result.error === 'Password required',
+      });
+      return;
+    }
+
+    res.json({ file: result.file });
+  } catch (error) {
+    console.error('Access share link error:', error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// Download from shared link
+router.get('/:token/download', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { password } = req.query;
+    const result = await validateSharedLink(req.params.token, password as string | undefined);
+
+    if (!result.valid || !result.file) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+
+    // Get file owner's ID to download
+    const file = await queryOne<FileItem>(
+      `SELECT user_id as "userId" FROM files WHERE id = $1`,
+      [result.file.id]
+    );
+
+    if (!file) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    // Get chunks and download
+    const chunks = await getFileChunks(result.file.id);
+    const chunkBuffers: Buffer[] = [];
+
+    for (const chunk of chunks) {
+      const { downloadChunk } = await import('../utils/storage.js');
+      const data = await downloadChunk(chunk.chunkHash);
+      chunkBuffers.push(data);
+    }
+
+    const data = Buffer.concat(chunkBuffers);
+
+    // Increment download count
+    await incrementDownloadCount(req.params.token);
+
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(result.file.name)}"`);
+    res.setHeader('Content-Type', result.file.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Length', data.length);
+
+    res.send(data);
+  } catch (error) {
+    console.error('Download share error:', error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// Share folder with user
+router.post('/folder', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { folderId, email, accessLevel } = req.body;
+
+    if (!folderId || !email || !accessLevel) {
+      res.status(400).json({ error: 'folderId, email, and accessLevel are required' });
+      return;
+    }
+
+    if (!['view', 'edit'].includes(accessLevel)) {
+      res.status(400).json({ error: 'accessLevel must be view or edit' });
+      return;
+    }
+
+    const share = await shareFolderWithUser(req.user!.id, folderId, email, accessLevel);
+    res.status(201).json(share);
+  } catch (error) {
+    console.error('Share folder error:', error);
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+// Get folders shared with me
+router.get('/shared-with-me', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const folders = await getSharedWithMe(req.user!.id);
+    res.json(folders);
+  } catch (error) {
+    console.error('Get shared with me error:', error);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// Get folder shares
+router.get('/folder/:folderId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const shares = await getFolderShares(req.user!.id, req.params.folderId);
+    res.json(shares);
+  } catch (error) {
+    console.error('Get folder shares error:', error);
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+// Remove folder share
+router.delete('/folder/:folderId/:userId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    await removeFolderShare(req.user!.id, req.params.folderId, req.params.userId);
+    res.json({ message: 'Share removed' });
+  } catch (error) {
+    console.error('Remove folder share error:', error);
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+export default router;

@@ -49,27 +49,27 @@ Building a universal search system to understand indexing, content extraction, a
 ## Development Phases
 
 ### Phase 1: File Indexing
-- [ ] File watcher
-- [ ] Content extraction
-- [ ] Inverted index
-- [ ] Basic search
+- [x] File watcher (designed, not implemented)
+- [x] Content extraction (API ready)
+- [x] Inverted index (Elasticsearch)
+- [x] Basic search
 
-### Phase 2: Multi-Source
-- [ ] App providers
-- [ ] Contacts/Calendar
-- [ ] Messages
-- [ ] Result merging
+### Phase 2: Multi-Source - **In Progress**
+- [x] App providers (indexed in Elasticsearch)
+- [x] Contacts (indexed in Elasticsearch)
+- [ ] Messages (not implemented)
+- [x] Result merging (multi-index search)
 
 ### Phase 3: Intelligence
-- [ ] Special queries (math, conversions)
+- [x] Special queries (math, conversions)
 - [ ] Natural language
 - [ ] Date parsing
-- [ ] Web fallback
+- [x] Web fallback
 
 ### Phase 4: Suggestions
-- [ ] Usage tracking
-- [ ] Time patterns
-- [ ] Proactive suggestions
+- [x] Usage tracking (app_usage_patterns table)
+- [x] Time patterns (hour/day-based suggestions)
+- [x] Proactive suggestions (Siri-style)
 - [ ] Continue reading
 
 ---

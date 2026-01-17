@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+/* Sidebar scrollbar */
+.sidebar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Message content formatting */
+.message-content {
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.message-content code {
+  background-color: rgba(29, 28, 29, 0.04);
+  border: 1px solid rgba(29, 28, 29, 0.13);
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-family: Monaco, Menlo, Consolas, 'Courier New', monospace;
+  font-size: 0.85em;
+}
+
+/* Hover effects */
+.message-item:hover {
+  background-color: rgba(29, 28, 29, 0.04);
+}
+
+/* Thread panel transition */
+.thread-panel {
+  transition: width 0.2s ease-in-out;
+}

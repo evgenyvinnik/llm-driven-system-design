@@ -1,0 +1,25 @@
+{
+  "name": "spotlight-backend",
+  "version": "1.0.0",
+  "description": "Spotlight universal search backend",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "dev:server1": "PORT=3001 nodemon src/index.js",
+    "dev:server2": "PORT=3002 nodemon src/index.js",
+    "dev:server3": "PORT=3003 nodemon src/index.js",
+    "start": "node src/index.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.11.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "mathjs": "^12.2.1",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

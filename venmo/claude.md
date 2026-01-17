@@ -24,6 +24,8 @@ Building a peer-to-peer payment platform to understand wallet systems, social fe
 - Serializable transactions
 - Event sourcing with projections
 
+**Implemented**: Row-level locking with PostgreSQL transactions. The `transfer.js` service uses `SELECT FOR UPDATE` to lock wallet rows during transfers.
+
 ### 2. Feed Performance
 
 **Problem**: Generating feeds for millions of users
@@ -33,6 +35,8 @@ Building a peer-to-peer payment platform to understand wallet systems, social fe
 - Fan-in on read (query on demand)
 - Hybrid (hot users fan-out, cold users fan-in)
 - Time-windowed caching
+
+**Implemented**: Fan-out on write. When a transaction occurs, feed items are inserted for the sender, receiver, and all their friends.
 
 ### 3. Fraud Detection
 
@@ -44,33 +48,55 @@ Building a peer-to-peer payment platform to understand wallet systems, social fe
 - Social graph analysis
 - Device fingerprinting
 
+**Status**: Not yet implemented - future enhancement.
+
 ---
 
 ## Development Phases
 
-### Phase 1: Core Transfers
-- [ ] User wallets
-- [ ] P2P transfer flow
-- [ ] Transaction history
-- [ ] Basic notifications
+### Phase 1: Core Transfers - COMPLETED
+- [x] User wallets
+- [x] P2P transfer flow
+- [x] Transaction history
+- [x] Basic notifications (in-app)
 
-### Phase 2: Social Features
-- [ ] Friend connections
-- [ ] Social feed
-- [ ] Privacy settings
-- [ ] Comments/likes
+### Phase 2: Social Features - IN PROGRESS
+- [x] Friend connections
+- [x] Social feed
+- [x] Privacy settings (public/friends/private)
+- [x] Comments/likes
 
-### Phase 3: Funding Sources
-- [ ] Bank account linking
-- [ ] Card payments
-- [ ] Funding waterfall
-- [ ] Instant cashout
+### Phase 3: Funding Sources - COMPLETED
+- [x] Bank account linking (simulated)
+- [x] Card payments (simulated)
+- [x] Funding waterfall
+- [x] Instant/standard cashout
 
-### Phase 4: Advanced Features
-- [ ] Payment requests
+### Phase 4: Advanced Features - PARTIAL
+- [x] Payment requests
 - [ ] Bill splitting
 - [ ] Recurring payments
 - [ ] QR code payments
+
+---
+
+## Implementation Notes
+
+### Transfer Service (`backend/src/services/transfer.js`)
+- Uses PostgreSQL transactions with `SELECT FOR UPDATE` locking
+- Implements funding waterfall: Balance -> Bank -> Card
+- Fan-out to social feed after commit
+- Balance cache invalidation via Redis
+
+### Feed System
+- Fan-out on write to `feed_items` table
+- Visibility filtering: public, friends, private
+- Hydrated with user data on read
+
+### Authentication
+- Session-based auth stored in Redis
+- 24-hour session TTL
+- Simple role-based access (user/admin)
 
 ---
 

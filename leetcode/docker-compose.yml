@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: leetcode-postgres
+    environment:
+      POSTGRES_USER: leetcode
+      POSTGRES_PASSWORD: leetcode_pass
+      POSTGRES_DB: leetcode
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/src/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leetcode"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: leetcode-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Code execution sandbox - lightweight Python/Node container
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    container_name: leetcode-sandbox
+    # Security restrictions for code execution
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 50
+    # No network access for sandboxed code
+    network_mode: none
+    tmpfs:
+      - /tmp:size=100m,mode=1777
+      - /code:size=50m,mode=1777
+    volumes:
+      - sandbox_shared:/shared:ro
+    profiles:
+      - sandbox
+
+volumes:
+  postgres_data:
+  redis_data:
+  sandbox_shared:

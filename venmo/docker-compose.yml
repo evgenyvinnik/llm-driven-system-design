@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: venmo-postgres
+    environment:
+      POSTGRES_USER: venmo
+      POSTGRES_PASSWORD: venmo_password
+      POSTGRES_DB: venmo
+    ports:
+      - "5432:5432"
+    volumes:
+      - venmo_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U venmo -d venmo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: venmo-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - venmo_redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  venmo_postgres_data:
+  venmo_redis_data:

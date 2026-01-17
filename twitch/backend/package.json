@@ -1,0 +1,32 @@
+{
+  "name": "twitch-backend",
+  "version": "1.0.0",
+  "description": "Twitch clone backend with streaming and chat",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "dev:server1": "PORT=3001 nodemon src/index.js",
+    "dev:server2": "PORT=3002 nodemon src/index.js",
+    "dev:server3": "PORT=3003 nodemon src/index.js",
+    "start": "node src/index.js",
+    "test": "jest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "redis": "^4.6.12",
+    "uuid": "^9.0.1",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.3"
+  }
+}

@@ -14,15 +14,24 @@ This document tracks the development journey of implementing A ride-hailing plat
 ## Development Phases
 
 ### Phase 1: Requirements and Design
-*Not started*
+*Completed*
 
-**Questions to explore:**
-- What are the core vs. nice-to-have features?
-- What scale are we targeting?
-- What are the key technical constraints?
+**Decisions made:**
+- Core features: ride requests, driver matching, real-time tracking, surge pricing
+- Target scale: local development with 3-5 service instances
+- Key constraints: must run locally, simple auth, both rider and driver personas
 
 ### Phase 2: Initial Implementation
-*Not started*
+*In progress*
+
+**Completed:**
+- Backend with Express + WebSocket server
+- Location service with Redis geo commands (GEOADD, GEORADIUS)
+- Matching algorithm with driver scoring (ETA + rating weighted)
+- Surge pricing based on supply/demand ratio per geohash cell
+- Authentication service with session-based auth
+- Frontend with Rider and Driver apps using React + Zustand
+- Docker Compose for PostgreSQL and Redis
 
 **Focus areas:**
 - Implement core functionality
@@ -49,7 +58,39 @@ This document tracks the development journey of implementing A ride-hailing plat
 
 ## Design Decisions Log
 
-*Decisions and their rationale will be documented here*
+### Redis for Geospatial Indexing
+**Decision:** Use Redis Geo commands (GEOADD, GEORADIUS) for driver location tracking
+**Rationale:**
+- Sub-millisecond query times for finding nearby drivers
+- Built-in distance calculation
+- Handles millions of updates per minute
+- Simple operational model vs. specialized geo databases like Tile38
+**Trade-off:** Memory-bound storage, but acceptable for active driver locations (hot data)
+
+### Greedy Matching Algorithm
+**Decision:** Use simple first-match approach with scoring
+**Rationale:**
+- Fast matching (< 100ms)
+- Good enough for learning/demo purposes
+- Easy to understand and debug
+**Trade-off:** Suboptimal global assignment vs. batch Hungarian algorithm
+**Future:** Can add batch matching for high-demand zones
+
+### Surge Pricing by Geohash
+**Decision:** Calculate surge per ~5km geohash cell
+**Rationale:**
+- Natural geographic partitioning
+- O(1) lookup for surge multiplier
+- Smooth degradation at boundaries
+**Trade-off:** Less granular than hexagonal (H3) zones
+
+### WebSocket for Real-time Updates
+**Decision:** Persistent WebSocket connections for drivers and riders
+**Rationale:**
+- Instant ride offers to drivers
+- Real-time location tracking
+- Lower latency than polling
+**Trade-off:** More complex connection management
 
 ## Iterations and Learnings
 
