@@ -4,6 +4,17 @@ import { Product, ProductWithTracking, UserProduct, PriceHistory, DailyPriceSumm
 import { extractDomain } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
+/**
+ * Creates a new product or subscribes a user to an existing product.
+ * Uses a transaction to ensure atomic product creation and subscription.
+ * Automatically adjusts scrape priority based on watcher count.
+ * @param url - The product URL to track
+ * @param userId - The user subscribing to the product
+ * @param targetPrice - Optional target price for price-drop alerts
+ * @param notifyAnyDrop - Whether to notify on any price decrease
+ * @returns The product with user-specific tracking settings
+ * @throws Error if user is already tracking this product
+ */
 export async function createProduct(url: string, userId: string, targetPrice?: number, notifyAnyDrop: boolean = false): Promise<ProductWithTracking> {
   const domain = extractDomain(url);
 
@@ -59,6 +70,12 @@ export async function createProduct(url: string, userId: string, targetPrice?: n
   });
 }
 
+/**
+ * Retrieves a product by its unique ID.
+ * Uses Redis caching to reduce database load for frequently accessed products.
+ * @param productId - The UUID of the product
+ * @returns The product or null if not found
+ */
 export async function getProductById(productId: string): Promise<Product | null> {
   const cached = await cacheGet<Product>(`product:${productId}`);
   if (cached) return cached;
@@ -70,10 +87,23 @@ export async function getProductById(productId: string): Promise<Product | null>
   return product;
 }
 
+/**
+ * Finds a product by its URL.
+ * Used to check if a product already exists before creating a new one.
+ * @param url - The full product URL
+ * @returns The product or null if not found
+ */
 export async function getProductByUrl(url: string): Promise<Product | null> {
   return queryOne<Product>('SELECT * FROM products WHERE url = $1', [url]);
 }
 
+/**
+ * Retrieves all products a user is tracking with their alert settings.
+ * Includes watcher count for social proof display.
+ * Results are cached for 60 seconds to improve dashboard performance.
+ * @param userId - The user ID
+ * @returns Array of products with user-specific tracking configuration
+ */
 export async function getUserProducts(userId: string): Promise<ProductWithTracking[]> {
   const cached = await cacheGet<ProductWithTracking[]>(`user:${userId}:products`);
   if (cached) return cached;
@@ -92,6 +122,14 @@ export async function getUserProducts(userId: string): Promise<ProductWithTracki
   return products;
 }
 
+/**
+ * Updates a user's tracking settings for a product.
+ * Allows changing target price and notification preferences.
+ * @param userId - The user ID
+ * @param productId - The product ID
+ * @param updates - Object containing optional target_price and/or notify_any_drop
+ * @returns The updated subscription or null if not found
+ */
 export async function updateUserProduct(
   userId: string,
   productId: string,
@@ -113,6 +151,13 @@ export async function updateUserProduct(
   return null;
 }
 
+/**
+ * Removes a user's subscription to a product.
+ * Automatically updates the product's scrape priority based on remaining watchers.
+ * @param userId - The user ID
+ * @param productId - The product ID
+ * @returns True if the subscription was deleted, false if not found
+ */
 export async function deleteUserProduct(userId: string, productId: string): Promise<boolean> {
   const result = await query(
     'DELETE FROM user_products WHERE user_id = $1 AND product_id = $2 RETURNING id',
@@ -127,6 +172,17 @@ export async function deleteUserProduct(userId: string, productId: string): Prom
   return false;
 }
 
+/**
+ * Updates a product with new scraped price data.
+ * Atomically records price history and updates the product in a transaction.
+ * Invalidates cache to ensure fresh data on next read.
+ * @param productId - The product ID to update
+ * @param price - The new price value
+ * @param title - Optional product title from scraping
+ * @param imageUrl - Optional product image URL from scraping
+ * @param availability - Whether the product is in stock (default: true)
+ * @returns The updated product or null if not found
+ */
 export async function updateProductPrice(
   productId: string,
   price: number,
@@ -171,6 +227,15 @@ export async function updateProductPrice(
   });
 }
 
+/**
+ * Retrieves detailed price history for a product within a date range.
+ * Used for displaying full-resolution price charts.
+ * @param productId - The product ID
+ * @param startDate - Optional start date filter
+ * @param endDate - Optional end date filter
+ * @param limit - Maximum number of records (default: 1000)
+ * @returns Array of price history records ordered by time ascending
+ */
 export async function getPriceHistory(
   productId: string,
   startDate?: Date,
@@ -198,6 +263,14 @@ export async function getPriceHistory(
   return query<PriceHistory>(sql, params);
 }
 
+/**
+ * Retrieves aggregated daily price statistics using TimescaleDB time_bucket.
+ * Returns min, max, and average prices per day for efficient charting.
+ * Results are cached for 1 hour since historical data doesn't change.
+ * @param productId - The product ID
+ * @param days - Number of days of history to retrieve (default: 90)
+ * @returns Array of daily price summaries ordered by date ascending
+ */
 export async function getDailyPrices(
   productId: string,
   days: number = 90
@@ -225,6 +298,13 @@ export async function getDailyPrices(
   return result;
 }
 
+/**
+ * Retrieves products that are due for scraping based on their priority schedule.
+ * Higher priority products (more watchers) have shorter refresh intervals.
+ * Used by the scraper worker to determine what to scrape next.
+ * @param limit - Maximum number of products to return (default: 100)
+ * @returns Array of products needing a price update
+ */
 export async function getProductsToScrape(limit: number = 100): Promise<Product[]> {
   // Get products that need scraping based on their priority
   return query<Product>(
@@ -254,6 +334,12 @@ export async function getProductsToScrape(limit: number = 100): Promise<Product[
   );
 }
 
+/**
+ * Recalculates and updates a product's scrape priority based on watcher count.
+ * More popular products (more watchers) get higher priority (lower number).
+ * Called automatically when users subscribe or unsubscribe from products.
+ * @param productId - The product ID to update
+ */
 export async function updateProductPriority(productId: string): Promise<void> {
   // Calculate priority based on watcher count
   await query(
@@ -273,6 +359,12 @@ export async function updateProductPriority(productId: string): Promise<void> {
   );
 }
 
+/**
+ * Marks a product as having an error during scraping.
+ * Updates status and records the last scrape attempt time.
+ * @param productId - The product ID
+ * @param error - Error message for logging
+ */
 export async function setProductError(productId: string, error: string): Promise<void> {
   await query(
     `UPDATE products
@@ -285,6 +377,14 @@ export async function setProductError(productId: string, error: string): Promise
   logger.error(`Product ${productId} scrape error: ${error}`);
 }
 
+/**
+ * Retrieves all products with pagination and optional status filtering.
+ * Used for admin dashboard to monitor system health and scrape status.
+ * @param page - Page number (1-indexed)
+ * @param limit - Products per page (default: 50)
+ * @param status - Optional status filter (active, paused, error, unavailable)
+ * @returns Object with products array and total count for pagination
+ */
 export async function getAllProducts(
   page: number = 1,
   limit: number = 50,

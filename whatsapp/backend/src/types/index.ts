@@ -1,4 +1,6 @@
-// User types
+/**
+ * Represents a user in the messaging system.
+ */
 export interface User {
   id: string;
   username: string;
@@ -7,7 +9,10 @@ export interface User {
   created_at: Date;
 }
 
-// Conversation types
+/**
+ * Represents a conversation (1:1 chat or group).
+ * Core entity for organizing messages between participants.
+ */
 export interface Conversation {
   id: string;
   name?: string;
@@ -20,6 +25,10 @@ export interface Conversation {
   unread_count?: number;
 }
 
+/**
+ * Represents a user's participation in a conversation.
+ * Tracks role (admin/member) for group permission management.
+ */
 export interface ConversationParticipant {
   id: string;
   conversation_id: string;
@@ -29,9 +38,15 @@ export interface ConversationParticipant {
   user?: User;
 }
 
-// Message types
+/**
+ * Message delivery status progression: sent -> delivered -> read.
+ */
 export type MessageStatus = 'sent' | 'delivered' | 'read';
 
+/**
+ * Represents a chat message in a conversation.
+ * Supports text and media content types.
+ */
 export interface Message {
   id: string;
   conversation_id: string;
@@ -44,6 +59,10 @@ export interface Message {
   sender?: User;
 }
 
+/**
+ * Tracks delivery status per recipient for a message.
+ * Enables read receipts in 1:1 and group chats.
+ */
 export interface MessageStatusUpdate {
   message_id: string;
   recipient_id: string;
@@ -52,16 +71,24 @@ export interface MessageStatusUpdate {
   read_at?: Date;
 }
 
-// Presence types
+/**
+ * User online/offline status.
+ */
 export type PresenceStatus = 'online' | 'offline';
 
+/**
+ * Presence information stored in Redis for fast access.
+ * Tracks which server a user is connected to for message routing.
+ */
 export interface PresenceInfo {
   status: PresenceStatus;
   server?: string;
   last_seen: number;
 }
 
-// WebSocket message types
+/**
+ * Types of WebSocket messages exchanged between client and server.
+ */
 export type WSMessageType =
   | 'message'
   | 'message_ack'
@@ -74,12 +101,20 @@ export type WSMessageType =
   | 'conversation_update'
   | 'group_message';
 
+/**
+ * Base WebSocket message structure.
+ * All WS messages follow this format with type-specific payloads.
+ */
 export interface WSMessage {
   type: WSMessageType;
   payload: unknown;
   clientMessageId?: string;
 }
 
+/**
+ * WebSocket message for sending a chat message.
+ * clientMessageId enables optimistic updates and deduplication.
+ */
 export interface WSChatMessage {
   type: 'message';
   payload: {
@@ -91,6 +126,9 @@ export interface WSChatMessage {
   clientMessageId: string;
 }
 
+/**
+ * WebSocket message for typing indicator events.
+ */
 export interface WSTypingMessage {
   type: 'typing' | 'stop_typing';
   payload: {
@@ -98,6 +136,9 @@ export interface WSTypingMessage {
   };
 }
 
+/**
+ * WebSocket message for marking messages as read.
+ */
 export interface WSReadReceiptMessage {
   type: 'read_receipt';
   payload: {
@@ -106,7 +147,10 @@ export interface WSReadReceiptMessage {
   };
 }
 
-// Session types
+/**
+ * Express session data extension for TypeScript.
+ * Adds userId to the session for authentication.
+ */
 declare module 'express-session' {
   interface SessionData {
     userId?: string;

@@ -1,8 +1,20 @@
+/**
+ * @fileoverview Post indexing service for Elasticsearch.
+ * Handles indexing, updating, and deleting posts in the search index.
+ * Provides utilities for extracting hashtags, mentions, and generating visibility fingerprints.
+ */
+
 import { esClient, POSTS_INDEX } from '../config/elasticsearch.js';
 import { query } from '../config/database.js';
 import type { Post, PostDocument, Visibility, PostType } from '../types/index.js';
 
-// Generate visibility fingerprints for a post
+/**
+ * Generates visibility fingerprints for privacy-aware search filtering.
+ * Fingerprints are matched against user visibility sets during search.
+ * @param authorId - The post author's user ID
+ * @param visibility - The post's visibility setting
+ * @returns Array of fingerprint strings (e.g., ['PUBLIC'], ['FRIENDS:userId'])
+ */
 export function generateVisibilityFingerprints(
   authorId: string,
   visibility: Visibility,
@@ -24,21 +36,36 @@ export function generateVisibilityFingerprints(
   return fingerprints;
 }
 
-// Extract hashtags from content
+/**
+ * Extracts hashtags from post content using regex.
+ * @param content - Post content text
+ * @returns Array of lowercase hashtags including the # prefix
+ */
 export function extractHashtags(content: string): string[] {
   const regex = /#(\w+)/g;
   const matches = content.match(regex);
   return matches ? matches.map((m) => m.toLowerCase()) : [];
 }
 
-// Extract mentions from content
+/**
+ * Extracts user mentions from post content using regex.
+ * @param content - Post content text
+ * @returns Array of lowercase mentions including the @ prefix
+ */
 export function extractMentions(content: string): string[] {
   const regex = /@(\w+)/g;
   const matches = content.match(regex);
   return matches ? matches.map((m) => m.toLowerCase()) : [];
 }
 
-// Calculate engagement score
+/**
+ * Calculates an engagement score for ranking posts.
+ * Weights: likes (1x), comments (2x), shares (3x).
+ * @param likeCount - Number of likes
+ * @param commentCount - Number of comments
+ * @param shareCount - Number of shares
+ * @returns Weighted engagement score
+ */
 export function calculateEngagementScore(
   likeCount: number,
   commentCount: number,
@@ -47,7 +74,13 @@ export function calculateEngagementScore(
   return likeCount * 1 + commentCount * 2 + shareCount * 3;
 }
 
-// Index a single post in Elasticsearch
+/**
+ * Indexes a single post in Elasticsearch.
+ * Transforms the Post model into a PostDocument with denormalized data.
+ * @param post - The post to index
+ * @param authorName - The author's display name (denormalized for search results)
+ * @returns Promise that resolves when indexing is complete
+ */
 export async function indexPost(
   post: Post,
   authorName: string
@@ -79,7 +112,13 @@ export async function indexPost(
   });
 }
 
-// Update post in Elasticsearch
+/**
+ * Updates an existing post in the Elasticsearch index.
+ * Fetches fresh data from PostgreSQL and re-indexes.
+ * If the post no longer exists, removes it from the index.
+ * @param postId - The ID of the post to update
+ * @returns Promise that resolves when update is complete
+ */
 export async function updatePostIndex(postId: string): Promise<void> {
   interface PostRow {
     id: string;
@@ -134,7 +173,12 @@ export async function updatePostIndex(postId: string): Promise<void> {
   await indexPost(post, postRow.author_name);
 }
 
-// Delete post from Elasticsearch
+/**
+ * Removes a post from the Elasticsearch index.
+ * Silently succeeds if the document doesn't exist.
+ * @param postId - The ID of the post to delete
+ * @returns Promise that resolves when deletion is complete
+ */
 export async function deletePostFromIndex(postId: string): Promise<void> {
   try {
     await esClient.delete({
@@ -147,7 +191,13 @@ export async function deletePostFromIndex(postId: string): Promise<void> {
   }
 }
 
-// Bulk index posts
+/**
+ * Bulk indexes multiple posts in Elasticsearch.
+ * More efficient than individual indexing for batch operations.
+ * Used during seeding and reindexing operations.
+ * @param postIds - Array of post IDs to index
+ * @returns Promise that resolves when all posts are indexed
+ */
 export async function bulkIndexPosts(postIds: string[]): Promise<void> {
   interface PostRow {
     id: string;

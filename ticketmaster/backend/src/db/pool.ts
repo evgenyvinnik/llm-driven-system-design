@@ -1,5 +1,14 @@
+/**
+ * PostgreSQL connection pool for the Ticketmaster backend.
+ * Provides database connectivity with connection pooling and transaction support.
+ * PostgreSQL is used as the primary data store for ACID compliance in ticket transactions.
+ */
 import { Pool, PoolClient } from 'pg';
 
+/**
+ * PostgreSQL connection pool instance.
+ * Configured with sensible defaults for connection management.
+ */
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '5432'),
@@ -15,6 +24,15 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
 });
 
+/**
+ * Executes a SQL query with optional parameters and logs slow queries.
+ * This is the primary method for database operations throughout the application.
+ * Queries exceeding 100ms are logged for performance monitoring.
+ *
+ * @param text - The SQL query string
+ * @param params - Optional array of parameter values for parameterized queries
+ * @returns The query result with rows and metadata
+ */
 export const query = async (text: string, params?: unknown[]) => {
   const start = Date.now();
   const result = await pool.query(text, params);
@@ -25,11 +43,28 @@ export const query = async (text: string, params?: unknown[]) => {
   return result;
 };
 
+/**
+ * Acquires a client from the connection pool for direct use.
+ * The caller is responsible for releasing the client back to the pool.
+ * Use withTransaction for most use cases requiring a dedicated client.
+ *
+ * @returns A connected PoolClient instance
+ */
 export const getClient = async (): Promise<PoolClient> => {
   const client = await pool.connect();
   return client;
 };
 
+/**
+ * Executes a callback function within a database transaction.
+ * Automatically handles BEGIN, COMMIT, and ROLLBACK based on success/failure.
+ * This ensures atomicity for operations like seat reservation and checkout.
+ *
+ * @template T - The return type of the callback function
+ * @param callback - Async function that receives a PoolClient and performs database operations
+ * @returns The result of the callback function
+ * @throws Re-throws any error after rolling back the transaction
+ */
 export const withTransaction = async <T>(
   callback: (client: PoolClient) => Promise<T>
 ): Promise<T> => {

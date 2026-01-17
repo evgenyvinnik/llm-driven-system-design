@@ -1,8 +1,17 @@
 import { pool, redis, elasticsearch } from '../db/index.js';
 import type { User, UserPreferences, Photo, UserProfile, DiscoveryCard } from '../types/index.js';
 
+/**
+ * Service responsible for user account management and profile operations.
+ * Handles CRUD operations for users, preferences, photos, and location updates.
+ * Maintains data consistency across PostgreSQL, Redis cache, and Elasticsearch.
+ */
 export class UserService {
-  // Get user by ID
+  /**
+   * Retrieves a user by their unique identifier.
+   * @param userId - The UUID of the user to find
+   * @returns The user object or null if not found
+   */
   async getUserById(userId: string): Promise<User | null> {
     const result = await pool.query(
       'SELECT * FROM users WHERE id = $1',
@@ -11,7 +20,12 @@ export class UserService {
     return result.rows[0] || null;
   }
 
-  // Get user by email
+  /**
+   * Retrieves a user by their email address.
+   * Used during login to verify credentials.
+   * @param email - The email address to search for
+   * @returns The user object or null if not found
+   */
   async getUserByEmail(email: string): Promise<User | null> {
     const result = await pool.query(
       'SELECT * FROM users WHERE email = $1',
@@ -20,7 +34,12 @@ export class UserService {
     return result.rows[0] || null;
   }
 
-  // Create new user
+  /**
+   * Creates a new user account with default preferences.
+   * Also indexes the user in Elasticsearch for discovery.
+   * @param userData - Registration data including email, password hash, name, birthdate, gender
+   * @returns The newly created user object
+   */
   async createUser(userData: {
     email: string;
     password_hash: string;
@@ -51,7 +70,14 @@ export class UserService {
     return user;
   }
 
-  // Update user profile
+  /**
+   * Updates user profile fields with validation.
+   * Only allows modification of safe fields (name, bio, job_title, company, school, location).
+   * Re-indexes user in Elasticsearch after update.
+   * @param userId - The user's UUID
+   * @param updates - Object containing fields to update
+   * @returns The updated user object or null if not found
+   */
   async updateUser(userId: string, updates: Partial<User>): Promise<User | null> {
     const allowedFields = ['name', 'bio', 'job_title', 'company', 'school', 'latitude', 'longitude'];
     const updateFields: string[] = [];
@@ -86,7 +112,11 @@ export class UserService {
     return user;
   }
 
-  // Get user preferences
+  /**
+   * Retrieves a user's discovery preferences.
+   * @param userId - The user's UUID
+   * @returns The preferences object or null if not found
+   */
   async getPreferences(userId: string): Promise<UserPreferences | null> {
     const result = await pool.query(
       'SELECT * FROM user_preferences WHERE user_id = $1',
@@ -95,7 +125,14 @@ export class UserService {
     return result.rows[0] || null;
   }
 
-  // Update user preferences
+  /**
+   * Updates discovery preferences for a user.
+   * Controls who appears in their swipe deck (gender, age range, distance, visibility).
+   * Re-indexes user in Elasticsearch to reflect new preferences.
+   * @param userId - The user's UUID
+   * @param updates - Partial preferences object with fields to update
+   * @returns The updated preferences or null if not found
+   */
   async updatePreferences(userId: string, updates: Partial<UserPreferences>): Promise<UserPreferences | null> {
     const allowedFields = ['interested_in', 'age_min', 'age_max', 'distance_km', 'show_me'];
     const updateFields: string[] = [];
@@ -131,7 +168,11 @@ export class UserService {
     return result.rows[0];
   }
 
-  // Get user photos
+  /**
+   * Retrieves all photos for a user, ordered by position.
+   * @param userId - The user's UUID
+   * @returns Array of photo objects
+   */
   async getPhotos(userId: string): Promise<Photo[]> {
     const result = await pool.query(
       'SELECT * FROM photos WHERE user_id = $1 ORDER BY position',
@@ -140,7 +181,14 @@ export class UserService {
     return result.rows;
   }
 
-  // Add photo
+  /**
+   * Adds a new photo to a user's profile.
+   * First photo added becomes the primary profile photo.
+   * @param userId - The user's UUID
+   * @param url - URL path to the uploaded photo
+   * @param position - Display order position (0-based)
+   * @returns The newly created photo object
+   */
   async addPhoto(userId: string, url: string, position: number): Promise<Photo> {
     // Check if this should be primary (first photo)
     const existingPhotos = await this.getPhotos(userId);
@@ -155,7 +203,13 @@ export class UserService {
     return result.rows[0];
   }
 
-  // Delete photo
+  /**
+   * Deletes a photo from a user's profile.
+   * Only allows deletion of photos owned by the specified user.
+   * @param userId - The user's UUID
+   * @param photoId - The photo's UUID
+   * @returns True if deleted, false if not found
+   */
   async deletePhoto(userId: string, photoId: string): Promise<boolean> {
     const result = await pool.query(
       'DELETE FROM photos WHERE id = $1 AND user_id = $2 RETURNING id',
@@ -164,7 +218,12 @@ export class UserService {
     return result.rowCount !== null && result.rowCount > 0;
   }
 
-  // Get full user profile
+  /**
+   * Retrieves a complete user profile with photos, preferences, and computed age.
+   * Aggregates data from multiple tables for full profile display.
+   * @param userId - The user's UUID
+   * @returns Complete user profile or null if not found
+   */
   async getUserProfile(userId: string): Promise<UserProfile | null> {
     const user = await this.getUserById(userId);
     if (!user) return null;
@@ -184,7 +243,12 @@ export class UserService {
     };
   }
 
-  // Calculate age from birthdate
+  /**
+   * Calculates age in years from a birthdate.
+   * Accounts for month/day to determine if birthday has occurred this year.
+   * @param birthdate - Date of birth
+   * @returns Age in whole years
+   */
   private calculateAge(birthdate: Date): number {
     const today = new Date();
     const birth = new Date(birthdate);
@@ -196,7 +260,13 @@ export class UserService {
     return age;
   }
 
-  // Index user in Elasticsearch
+  /**
+   * Indexes or updates a user document in Elasticsearch for discovery queries.
+   * Includes location for geo queries, preferences for bidirectional matching.
+   * Silently handles errors to prevent blocking user operations.
+   * @param user - User data to index
+   * @param preferences - Optional preferences to include (fetched if not provided)
+   */
   private async indexUserInElasticsearch(user: User, preferences?: UserPreferences): Promise<void> {
     try {
       if (!preferences) {
@@ -230,7 +300,12 @@ export class UserService {
     }
   }
 
-  // Update last active timestamp
+  /**
+   * Updates the user's last_active timestamp.
+   * Called during login and activity to track user engagement.
+   * Updates both PostgreSQL and Elasticsearch.
+   * @param userId - The user's UUID
+   */
   async updateLastActive(userId: string): Promise<void> {
     await pool.query(
       'UPDATE users SET last_active = NOW() WHERE id = $1',
@@ -251,7 +326,13 @@ export class UserService {
     }
   }
 
-  // Update user location
+  /**
+   * Updates the user's geographic location for geo-based discovery.
+   * Stores in PostgreSQL for persistence, Elasticsearch for queries, and Redis for fast access.
+   * @param userId - The user's UUID
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   */
   async updateLocation(userId: string, latitude: number, longitude: number): Promise<void> {
     await pool.query(
       'UPDATE users SET latitude = $2, longitude = $3, last_active = NOW() WHERE id = $1',

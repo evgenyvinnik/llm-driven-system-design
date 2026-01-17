@@ -1,4 +1,13 @@
-// Block types
+/**
+ * @fileoverview Type definitions for the Notion-like collaborative editing system.
+ * These types define the core data structures used across the backend for pages,
+ * blocks, databases, workspaces, and real-time collaboration features.
+ */
+
+/**
+ * Supported block types in the editor.
+ * Each type determines how the block is rendered and what interactions are available.
+ */
 export type BlockType =
   | 'text'
   | 'heading_1'
@@ -17,7 +26,10 @@ export type BlockType =
   | 'table'
   | 'database';
 
-// Rich text annotation
+/**
+ * Text styling annotations for rich text content.
+ * Allows inline formatting within text segments.
+ */
 export interface Annotation {
   bold?: boolean;
   italic?: boolean;
@@ -27,14 +39,21 @@ export interface Annotation {
   color?: string;
 }
 
-// Rich text segment
+/**
+ * A segment of rich text content with optional formatting and links.
+ * Multiple RichText segments combine to form block content.
+ */
 export interface RichText {
   text: string;
   annotations?: Annotation;
   link?: string;
 }
 
-// Block structure
+/**
+ * The fundamental unit of content in a page.
+ * Blocks form a tree structure where each block can have children.
+ * Uses fractional indexing for position to enable O(1) insertions.
+ */
 export interface Block {
   id: string;
   page_id: string;
@@ -50,7 +69,10 @@ export interface Block {
   updated_at: Date;
 }
 
-// Page structure
+/**
+ * A page within a workspace that can contain blocks or act as a database.
+ * Pages form a hierarchical structure via parent_id for nested organization.
+ */
 export interface Page {
   id: string;
   workspace_id: string;
@@ -67,7 +89,10 @@ export interface Page {
   updated_at: Date;
 }
 
-// Property types for databases
+/**
+ * Supported property types for database columns.
+ * Each type has specific rendering and validation behavior.
+ */
 export type PropertyType =
   | 'title'
   | 'text'
@@ -81,14 +106,20 @@ export type PropertyType =
   | 'phone'
   | 'relation';
 
-// Property option (for select types)
+/**
+ * An option choice for select and multi_select property types.
+ * Used in database columns that offer predefined choices.
+ */
 export interface PropertyOption {
   id: string;
   name: string;
   color: string;
 }
 
-// Property schema definition
+/**
+ * Defines the structure of a database column/property.
+ * The schema determines what data can be stored and how it's displayed.
+ */
 export interface PropertySchema {
   id: string;
   name: string;
@@ -96,7 +127,11 @@ export interface PropertySchema {
   options?: PropertyOption[];
 }
 
-// Database view
+/**
+ * A saved view configuration for a database.
+ * Views determine how data is displayed (table, board, list, etc.) and
+ * include filters, sorts, and column visibility settings.
+ */
 export interface DatabaseView {
   id: string;
   page_id: string;
@@ -111,27 +146,39 @@ export interface DatabaseView {
   updated_at: Date;
 }
 
-// Filter definition
+/**
+ * A filter condition applied to database views.
+ * Used to show only rows matching specific criteria.
+ */
 export interface Filter {
   property: string;
   operator: string;
   value: unknown;
 }
 
-// Sort definition
+/**
+ * Sort configuration for database views.
+ * Determines the order in which rows are displayed.
+ */
 export interface Sort {
   property: string;
   direction: 'asc' | 'desc';
 }
 
-// Property visibility
+/**
+ * Controls visibility and sizing of properties in database views.
+ * Allows users to customize which columns are shown.
+ */
 export interface PropertyVisibility {
   property: string;
   visible: boolean;
   width?: number;
 }
 
-// Database row
+/**
+ * A single row/entry in a database.
+ * Property values are stored as a key-value map matching the database schema.
+ */
 export interface DatabaseRow {
   id: string;
   database_id: string;
@@ -143,7 +190,10 @@ export interface DatabaseRow {
   updated_at: Date;
 }
 
-// Workspace
+/**
+ * A workspace container that groups users and their pages.
+ * Workspaces provide the top-level organizational unit for collaboration.
+ */
 export interface Workspace {
   id: string;
   name: string;
@@ -154,7 +204,10 @@ export interface Workspace {
   updated_at: Date;
 }
 
-// User
+/**
+ * An authenticated user in the system.
+ * Users can belong to multiple workspaces and have roles for access control.
+ */
 export interface User {
   id: string;
   email: string;
@@ -166,7 +219,10 @@ export interface User {
   updated_at: Date;
 }
 
-// Session
+/**
+ * An active user session stored in Redis.
+ * Sessions enable stateless authentication across requests.
+ */
 export interface Session {
   id: string;
   user_id: string;
@@ -175,10 +231,16 @@ export interface Session {
   created_at: Date;
 }
 
-// Operation types for CRDT sync
+/**
+ * Operation types for CRDT-based real-time synchronization.
+ * Each operation type is commutative to ensure consistency.
+ */
 export type OperationType = 'insert' | 'update' | 'delete' | 'move';
 
-// Operation structure
+/**
+ * A single operation in the collaborative editing system.
+ * Operations are logged for syncing and conflict resolution via CRDT.
+ */
 export interface Operation {
   id: string;
   page_id: string;
@@ -190,13 +252,19 @@ export interface Operation {
   created_at: Date;
 }
 
-// WebSocket message types
+/**
+ * WebSocket message envelope for real-time communication.
+ * All WebSocket messages follow this structure with type-specific payloads.
+ */
 export interface WSMessage {
   type: 'subscribe' | 'unsubscribe' | 'operation' | 'presence' | 'ack' | 'error' | 'sync';
   payload: unknown;
 }
 
-// Presence data
+/**
+ * User presence information for real-time collaboration.
+ * Shows who is viewing a page and their cursor position.
+ */
 export interface Presence {
   user_id: string;
   user_name: string;

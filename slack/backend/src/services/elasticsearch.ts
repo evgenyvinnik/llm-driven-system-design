@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Elasticsearch service for message search functionality.
+ * Provides full-text search with stemming, highlighting, and filtering.
+ * Designed to be non-blocking - search failures do not affect core messaging.
+ */
+
 import { Client } from '@elastic/elasticsearch';
 import dotenv from 'dotenv';
 
@@ -5,12 +11,20 @@ dotenv.config();
 
 const esUrl = process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
 
+/**
+ * Elasticsearch client instance for search operations.
+ */
 export const esClient = new Client({ node: esUrl });
 
-// Index name
+/** Name of the Elasticsearch index for storing messages */
 const MESSAGES_INDEX = 'slack_messages';
 
-// Initialize Elasticsearch index
+/**
+ * Initializes the Elasticsearch messages index with proper mappings.
+ * Creates the index if it doesn't exist with custom analyzer settings
+ * for message content (lowercase + Porter stemming).
+ * Silently fails if Elasticsearch is unavailable - app continues without search.
+ */
 export async function initializeElasticsearch(): Promise<void> {
   try {
     const indexExists = await esClient.indices.exists({ index: MESSAGES_INDEX });
@@ -55,7 +69,12 @@ export async function initializeElasticsearch(): Promise<void> {
   }
 }
 
-// Index a message
+/**
+ * Indexes a message in Elasticsearch for full-text search.
+ * Called asynchronously after a message is saved to PostgreSQL.
+ * Failures are logged but do not affect message delivery.
+ * @param message - Message object containing id, workspace_id, channel_id, user_id, content, and created_at
+ */
 export async function indexMessage(message: {
   id: number;
   workspace_id: string;
@@ -82,7 +101,12 @@ export async function indexMessage(message: {
   }
 }
 
-// Update message in index
+/**
+ * Updates a message's content in the Elasticsearch index.
+ * Called when a user edits their message.
+ * @param id - The message's unique identifier
+ * @param content - The updated message content
+ */
 export async function updateMessageIndex(id: number, content: string): Promise<void> {
   try {
     await esClient.update({
@@ -95,7 +119,11 @@ export async function updateMessageIndex(id: number, content: string): Promise<v
   }
 }
 
-// Delete message from index
+/**
+ * Removes a message from the Elasticsearch index.
+ * Called when a user deletes their message.
+ * @param id - The message's unique identifier
+ */
 export async function deleteMessageIndex(id: number): Promise<void> {
   try {
     await esClient.delete({
@@ -107,14 +135,23 @@ export async function deleteMessageIndex(id: number): Promise<void> {
   }
 }
 
-// Search messages
+/**
+ * Optional filters for narrowing search results.
+ */
 export interface SearchFilters {
+  /** Restrict to a specific channel */
   channel_id?: string;
+  /** Restrict to messages from a specific user */
   user_id?: string;
+  /** Messages created on or after this date (ISO format) */
   from_date?: string;
+  /** Messages created on or before this date (ISO format) */
   to_date?: string;
 }
 
+/**
+ * Search result item returned from Elasticsearch.
+ */
 export interface SearchResult {
   id: number;
   workspace_id: string;
@@ -122,9 +159,20 @@ export interface SearchResult {
   user_id: string;
   content: string;
   created_at: Date;
+  /** HTML fragments with matching terms highlighted */
   highlight?: string[];
 }
 
+/**
+ * Searches messages in a workspace using Elasticsearch full-text search.
+ * Returns results with highlighted matching terms, sorted by date descending.
+ * Returns empty array on search failure (graceful degradation).
+ * @param workspaceId - The workspace to search within
+ * @param query - The search query string
+ * @param filters - Optional filters for channel, user, or date range
+ * @param limit - Maximum number of results to return (default: 50)
+ * @returns Array of search results with highlights
+ */
 export async function searchMessages(
   workspaceId: string,
   query: string,

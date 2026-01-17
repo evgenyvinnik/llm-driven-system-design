@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   # PostgreSQL database for URL frontier and crawled pages metadata

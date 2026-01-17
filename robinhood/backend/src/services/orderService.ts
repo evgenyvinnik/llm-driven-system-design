@@ -2,6 +2,9 @@ import { pool } from '../database.js';
 import { quoteService } from './quoteService.js';
 import type { Position, Order, Execution } from '../types/index.js';
 
+/**
+ * Request payload for placing a new order.
+ */
 export interface PlaceOrderRequest {
   symbol: string;
   side: 'buy' | 'sell';
@@ -12,15 +15,33 @@ export interface PlaceOrderRequest {
   time_in_force?: 'day' | 'gtc' | 'ioc' | 'fok';
 }
 
+/**
+ * Result returned after placing or executing an order.
+ */
 export interface OrderResult {
   order: Order;
   execution?: Execution;
   message: string;
 }
 
+/**
+ * Service for managing stock orders.
+ * Handles order placement, validation, execution, and cancellation.
+ * Implements fund/share reservation to ensure transaction integrity.
+ * Includes a background limit order matcher for non-market orders.
+ */
 export class OrderService {
   private executionInterval: NodeJS.Timeout | null = null;
 
+  /**
+   * Places a new order for a user.
+   * Validates the order, reserves funds or shares, and executes
+   * market orders immediately. Limit/stop orders are queued.
+   * @param userId - ID of the user placing the order
+   * @param request - Order details including symbol, side, type, and quantity
+   * @returns Promise resolving to order result with execution details
+   * @throws Error if validation fails (insufficient funds, invalid symbol, etc.)
+   */
   async placeOrder(userId: string, request: PlaceOrderRequest): Promise<OrderResult> {
     const client = await pool.connect();
 
@@ -84,6 +105,16 @@ export class OrderService {
     }
   }
 
+  /**
+   * Validates an order before placement.
+   * Checks symbol validity, quantity, required prices for order type,
+   * and sufficient funds (buy) or shares (sell).
+   * Uses FOR UPDATE locks to prevent race conditions.
+   * @param client - Database client within transaction
+   * @param userId - ID of the user placing the order
+   * @param request - Order details to validate
+   * @throws Error with descriptive message if validation fails
+   */
   private async validateOrder(
     client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
     userId: string,
@@ -147,6 +178,12 @@ export class OrderService {
     }
   }
 
+  /**
+   * Executes a market order immediately at current market price.
+   * @param order - Order to execute
+   * @returns Promise resolving to order result with execution
+   * @throws Error if quote is not available
+   */
   private async executeOrderImmediately(order: Order): Promise<OrderResult> {
     const quote = quoteService.getQuote(order.symbol);
     if (!quote) {
@@ -158,6 +195,15 @@ export class OrderService {
     return await this.fillOrder(order, fillPrice, order.quantity);
   }
 
+  /**
+   * Fills an order (or partial order) at the specified price.
+   * Creates execution record, updates order status, modifies positions,
+   * and adjusts buying power. Handles both full and partial fills.
+   * @param order - Order to fill
+   * @param price - Execution price per share
+   * @param quantity - Number of shares to fill
+   * @returns Promise resolving to order result with execution details
+   */
   async fillOrder(order: Order, price: number, quantity: number): Promise<OrderResult> {
     const client = await pool.connect();
 
@@ -244,6 +290,15 @@ export class OrderService {
     }
   }
 
+  /**
+   * Updates or creates a position after a buy order fill.
+   * Calculates new average cost basis when adding to existing position.
+   * @param client - Database client within transaction
+   * @param userId - ID of the position owner
+   * @param symbol - Stock ticker symbol
+   * @param quantity - Number of shares purchased
+   * @param price - Purchase price per share
+   */
   private async updatePositionForBuy(
     client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
     userId: string,
@@ -280,6 +335,15 @@ export class OrderService {
     }
   }
 
+  /**
+   * Updates a position after a sell order fill.
+   * Decreases quantity and reserved shares; removes position if fully sold.
+   * @param client - Database client within transaction
+   * @param userId - ID of the position owner
+   * @param symbol - Stock ticker symbol
+   * @param quantity - Number of shares sold
+   * @param _price - Sale price per share (unused, for signature consistency)
+   */
   private async updatePositionForSell(
     client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
     userId: string,
@@ -312,6 +376,14 @@ export class OrderService {
     }
   }
 
+  /**
+   * Cancels a pending, submitted, or partially filled order.
+   * Releases reserved funds (buy) or shares (sell) back to the user.
+   * @param userId - ID of the order owner
+   * @param orderId - ID of the order to cancel
+   * @returns Promise resolving to the cancelled order
+   * @throws Error if order not found or cannot be cancelled
+   */
   async cancelOrder(userId: string, orderId: string): Promise<Order> {
     const client = await pool.connect();
 
@@ -376,6 +448,12 @@ export class OrderService {
     }
   }
 
+  /**
+   * Retrieves all orders for a user, optionally filtered by status.
+   * @param userId - ID of the order owner
+   * @param status - Optional status filter (pending, filled, cancelled, etc.)
+   * @returns Promise resolving to array of orders, newest first
+   */
   async getOrders(userId: string, status?: string): Promise<Order[]> {
     let query = 'SELECT * FROM orders WHERE user_id = $1';
     const params: (string | undefined)[] = [userId];
@@ -391,6 +469,12 @@ export class OrderService {
     return result.rows;
   }
 
+  /**
+   * Retrieves a specific order for a user.
+   * @param userId - ID of the order owner
+   * @param orderId - ID of the order to retrieve
+   * @returns Promise resolving to the order or null if not found
+   */
   async getOrder(userId: string, orderId: string): Promise<Order | null> {
     const result = await pool.query<Order>(
       'SELECT * FROM orders WHERE id = $1 AND user_id = $2',
@@ -399,6 +483,11 @@ export class OrderService {
     return result.rows[0] || null;
   }
 
+  /**
+   * Retrieves all executions for an order.
+   * @param orderId - ID of the order
+   * @returns Promise resolving to array of executions, newest first
+   */
   async getExecutions(orderId: string): Promise<Execution[]> {
     const result = await pool.query<Execution>(
       'SELECT * FROM executions WHERE order_id = $1 ORDER BY executed_at DESC',
@@ -407,7 +496,11 @@ export class OrderService {
     return result.rows;
   }
 
-  // Background process to fill limit orders when price matches
+  /**
+   * Starts the background limit order matcher.
+   * Periodically checks pending limit/stop orders against current prices
+   * and executes them when conditions are met.
+   */
   startLimitOrderMatcher(): void {
     if (this.executionInterval) return;
 

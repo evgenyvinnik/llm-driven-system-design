@@ -3,6 +3,17 @@ import { query, queryOne, execute } from '../utils/db.js';
 import { indexUser } from '../utils/elasticsearch.js';
 import type { User, Experience, Education, UserSkill } from '../types/index.js';
 
+/**
+ * Creates a new user account with hashed password.
+ * Indexes the user in Elasticsearch for search functionality.
+ *
+ * @param email - User's email address (must be unique)
+ * @param password - Plain text password (will be hashed with bcrypt)
+ * @param firstName - User's first name
+ * @param lastName - User's last name
+ * @param headline - Optional professional headline
+ * @returns The newly created user object (without password hash)
+ */
 export async function createUser(
   email: string,
   password: string,
@@ -32,6 +43,14 @@ export async function createUser(
   return user!;
 }
 
+/**
+ * Authenticates a user by email and password.
+ * Compares the provided password against the stored bcrypt hash.
+ *
+ * @param email - User's email address
+ * @param password - Plain text password to verify
+ * @returns The user object if credentials are valid, null otherwise
+ */
 export async function authenticateUser(email: string, password: string): Promise<User | null> {
   const row = await queryOne<User & { password_hash: string }>(
     `SELECT id, email, password_hash, first_name, last_name, headline, summary, location, industry,
@@ -49,6 +68,12 @@ export async function authenticateUser(email: string, password: string): Promise
   return user;
 }
 
+/**
+ * Retrieves a user by their unique ID.
+ *
+ * @param id - The user's unique identifier
+ * @returns The user object if found, null otherwise
+ */
 export async function getUserById(id: number): Promise<User | null> {
   return queryOne<User>(
     `SELECT id, email, first_name, last_name, headline, summary, location, industry,
@@ -58,6 +83,13 @@ export async function getUserById(id: number): Promise<User | null> {
   );
 }
 
+/**
+ * Retrieves multiple users by their IDs in a single query.
+ * Efficiently fetches user data for connection lists and search results.
+ *
+ * @param ids - Array of user IDs to fetch
+ * @returns Array of user objects (order not guaranteed to match input)
+ */
 export async function getUsersByIds(ids: number[]): Promise<User[]> {
   if (ids.length === 0) return [];
   const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
@@ -69,6 +101,15 @@ export async function getUsersByIds(ids: number[]): Promise<User[]> {
   );
 }
 
+/**
+ * Updates a user's profile information.
+ * Only updates fields that are provided, leaving others unchanged.
+ * Re-indexes the user in Elasticsearch after successful update.
+ *
+ * @param id - The user's unique identifier
+ * @param data - Partial user data to update (only provided fields will change)
+ * @returns The updated user object, or null if user not found
+ */
 export async function updateUser(
   id: number,
   data: Partial<{
@@ -125,7 +166,14 @@ export async function updateUser(
   return user;
 }
 
-// Experience functions
+/**
+ * Adds a work experience entry to a user's profile.
+ * Links to a company if company_id is provided for richer display.
+ *
+ * @param userId - The user's unique identifier
+ * @param data - Experience details including company, title, dates, and description
+ * @returns The newly created experience record
+ */
 export async function addExperience(
   userId: number,
   data: {

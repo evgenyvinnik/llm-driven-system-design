@@ -1,4 +1,8 @@
-// Database configuration
+/**
+ * Database connection configuration.
+ * Provides PostgreSQL connection settings for the video metadata, user accounts,
+ * profiles, and viewing history storage.
+ */
 export const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '5432'),
@@ -7,13 +11,21 @@ export const DB_CONFIG = {
   password: process.env.DB_PASSWORD || 'netflix_secret',
 };
 
-// Redis configuration
+/**
+ * Redis connection configuration.
+ * Used for session storage, caching personalized homepage data,
+ * and storing viewing progress for quick access.
+ */
 export const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
 };
 
-// MinIO/S3 configuration
+/**
+ * MinIO/S3 object storage configuration.
+ * Stores video files (encoded at multiple quality levels) and thumbnails.
+ * Uses presigned URLs to enable direct client-to-storage streaming.
+ */
 export const MINIO_CONFIG = {
   endpoint: process.env.MINIO_ENDPOINT || 'http://localhost:9000',
   accessKeyId: process.env.MINIO_ACCESS_KEY || 'minioadmin',
@@ -23,7 +35,10 @@ export const MINIO_CONFIG = {
   thumbnailBucket: process.env.MINIO_THUMBNAIL_BUCKET || 'thumbnails',
 };
 
-// Server configuration
+/**
+ * Express server configuration.
+ * Controls port, CORS settings, and session parameters for the API server.
+ */
 export const SERVER_CONFIG = {
   port: parseInt(process.env.PORT || '3001'),
   corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
@@ -31,7 +46,11 @@ export const SERVER_CONFIG = {
   sessionMaxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
 };
 
-// Video streaming configuration
+/**
+ * Video streaming configuration.
+ * Defines segment duration for adaptive streaming and available quality profiles
+ * with their corresponding resolution and bitrate settings.
+ */
 export const STREAMING_CONFIG = {
   segmentDuration: 4, // seconds
   qualities: [

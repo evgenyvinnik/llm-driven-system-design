@@ -1,6 +1,11 @@
 import { Pool } from 'pg';
 import { config } from './config.js';
 
+/**
+ * PostgreSQL connection pool for the trading platform.
+ * Manages database connections efficiently by reusing connections
+ * across multiple queries, essential for high-throughput order processing.
+ */
 export const pool = new Pool({
   host: config.database.host,
   port: config.database.port,
@@ -16,6 +21,12 @@ pool.on('error', (err) => {
   console.error('Unexpected database error:', err);
 });
 
+/**
+ * Tests the database connection by executing a simple query.
+ * Used during server startup to verify database availability
+ * and for health check endpoints.
+ * @returns Promise resolving to true if connection succeeds, false otherwise
+ */
 export async function testDatabaseConnection(): Promise<boolean> {
   try {
     const client = await pool.connect();

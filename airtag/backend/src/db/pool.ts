@@ -1,5 +1,10 @@
 import { Pool } from 'pg';
 
+/**
+ * PostgreSQL connection pool for the Find My backend.
+ * Provides persistent database connections for all services.
+ * Configured via environment variables with sensible defaults for local development.
+ */
 const pool = new Pool({
   host: process.env.POSTGRES_HOST || 'localhost',
   port: parseInt(process.env.POSTGRES_PORT || '5432'),

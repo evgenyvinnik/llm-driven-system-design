@@ -1,4 +1,7 @@
-// Transaction statuses
+/**
+ * Represents the lifecycle state of a payment transaction.
+ * Tracks progression from initial creation through final settlement or failure.
+ */
 export type TransactionStatus =
   | 'pending'
   | 'authorized'
@@ -8,22 +11,25 @@ export type TransactionStatus =
   | 'voided'
   | 'partially_refunded';
 
-// Refund statuses
+/** Represents the processing state of a refund request. */
 export type RefundStatus = 'pending' | 'completed' | 'failed';
 
-// Chargeback statuses
+/** Represents the state of a customer-disputed charge. */
 export type ChargebackStatus = 'open' | 'won' | 'lost' | 'pending_response';
 
-// Ledger entry types
+/** Indicates whether a ledger entry increases or decreases an account. */
 export type EntryType = 'debit' | 'credit';
 
-// Account types
+/** Classification of accounts in the double-entry ledger system. */
 export type AccountType = 'asset' | 'liability' | 'revenue' | 'expense' | 'merchant';
 
-// Merchant status
+/** Represents the operational state of a merchant account. */
 export type MerchantStatus = 'active' | 'suspended' | 'closed';
 
-// Core entities
+/**
+ * Represents a ledger account used for double-entry bookkeeping.
+ * Accounts track balances for assets, liabilities, revenue, and merchant payouts.
+ */
 export interface Account {
   id: string;
   name: string;
@@ -34,6 +40,10 @@ export interface Account {
   updated_at: Date;
 }
 
+/**
+ * Represents a business entity that processes payments through the platform.
+ * Stores authentication credentials, webhook configuration, and account linkage.
+ */
 export interface Merchant {
   id: string;
   account_id: string;
@@ -48,6 +58,10 @@ export interface Merchant {
   updated_at: Date;
 }
 
+/**
+ * Describes how a customer is paying (card or bank transfer).
+ * Contains masked card details for display and fraud analysis.
+ */
 export interface PaymentMethod {
   type: 'card' | 'bank_transfer';
   card_brand?: string;
@@ -56,6 +70,11 @@ export interface PaymentMethod {
   exp_year?: number;
 }
 
+/**
+ * Core payment transaction record.
+ * Contains all details of a payment including status, amounts, fees, and metadata.
+ * Amounts are stored in cents to avoid floating-point precision issues.
+ */
 export interface Transaction {
   id: string;
   idempotency_key?: string;
@@ -77,6 +96,11 @@ export interface Transaction {
   version: number;
 }
 
+/**
+ * Single entry in the double-entry ledger.
+ * Every financial operation creates balanced debit/credit pairs.
+ * Links to the originating transaction for audit trail.
+ */
 export interface LedgerEntry {
   id: string;
   transaction_id: string;
@@ -89,6 +113,10 @@ export interface LedgerEntry {
   created_at: Date;
 }
 
+/**
+ * Represents a partial or full refund of a captured payment.
+ * Links to the original transaction for amount validation.
+ */
 export interface Refund {
   id: string;
   idempotency_key?: string;
@@ -102,6 +130,11 @@ export interface Refund {
   updated_at: Date;
 }
 
+/**
+ * Represents a customer-initiated dispute with their card issuer.
+ * Merchants must respond with evidence before the due date.
+ * Includes additional fees charged to the merchant.
+ */
 export interface Chargeback {
   id: string;
   transaction_id: string;
@@ -116,6 +149,10 @@ export interface Chargeback {
   updated_at: Date;
 }
 
+/**
+ * Tracks webhook delivery attempts to merchant endpoints.
+ * Supports retry logic for failed deliveries.
+ */
 export interface WebhookDelivery {
   id: string;
   merchant_id: string;
@@ -129,7 +166,14 @@ export interface WebhookDelivery {
   created_at: Date;
 }
 
-// API Request/Response types
+// ============================================================================
+// API Request/Response Types
+// ============================================================================
+
+/**
+ * Request body for creating a new payment.
+ * Amount is in cents; capture defaults to true for immediate settlement.
+ */
 export interface CreatePaymentRequest {
   amount: number;
   currency: string;
@@ -141,6 +185,7 @@ export interface CreatePaymentRequest {
   capture?: boolean; // If false, only authorize
 }
 
+/** Response returned after creating a payment. */
 export interface CreatePaymentResponse {
   id: string;
   status: TransactionStatus;
@@ -151,12 +196,14 @@ export interface CreatePaymentResponse {
   created_at: Date;
 }
 
+/** Request body for creating a refund on a captured payment. */
 export interface RefundRequest {
   amount?: number; // If not provided, full refund
   reason?: string;
   idempotency_key?: string;
 }
 
+/** Query parameters for filtering and paginating transaction lists. */
 export interface TransactionListParams {
   limit?: number;
   offset?: number;
@@ -165,6 +212,7 @@ export interface TransactionListParams {
   to_date?: Date;
 }
 
+/** Aggregated metrics for the merchant dashboard. */
 export interface DashboardStats {
   total_volume: number;
   total_transactions: number;
@@ -174,7 +222,11 @@ export interface DashboardStats {
   average_transaction: number;
 }
 
-// Webhook event types
+// ============================================================================
+// Webhook Types
+// ============================================================================
+
+/** Event types that trigger webhook notifications to merchants. */
 export type WebhookEventType =
   | 'payment.authorized'
   | 'payment.captured'
@@ -184,6 +236,7 @@ export type WebhookEventType =
   | 'chargeback.created'
   | 'chargeback.updated';
 
+/** Webhook payload sent to merchant endpoints. */
 export interface WebhookEvent {
   id: string;
   type: WebhookEventType;

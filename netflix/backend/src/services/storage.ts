@@ -2,7 +2,11 @@ import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } fr
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { MINIO_CONFIG } from '../config.js';
 
-// Create S3 client configured for MinIO
+/**
+ * S3-compatible storage client configured for MinIO.
+ * Used for storing and serving video files and thumbnails.
+ * The forcePathStyle option is required for MinIO compatibility.
+ */
 export const s3Client = new S3Client({
   endpoint: MINIO_CONFIG.endpoint,
   region: MINIO_CONFIG.region,
@@ -14,7 +18,12 @@ export const s3Client = new S3Client({
 });
 
 /**
- * Generate a presigned URL for video streaming
+ * Generates a presigned URL for streaming a video file.
+ * Enables direct client-to-storage streaming without proxying through the API server.
+ *
+ * @param videoKey - S3 object key for the video file (e.g., "videos/{id}/720p/video.mp4")
+ * @param expiresIn - URL validity duration in seconds (default: 1 hour)
+ * @returns Promise resolving to a presigned URL for video playback
  */
 export async function getVideoStreamUrl(videoKey: string, expiresIn = 3600): Promise<string> {
   const command = new GetObjectCommand({
@@ -26,7 +35,13 @@ export async function getVideoStreamUrl(videoKey: string, expiresIn = 3600): Pro
 }
 
 /**
- * Get a presigned URL for uploading a video
+ * Generates a presigned URL for uploading a video file.
+ * Used by admin tools to upload new video content directly to storage.
+ *
+ * @param videoKey - Destination S3 object key for the upload
+ * @param contentType - MIME type of the video (e.g., "video/mp4")
+ * @param expiresIn - URL validity duration in seconds (default: 1 hour)
+ * @returns Promise resolving to a presigned upload URL
  */
 export async function getUploadUrl(videoKey: string, contentType: string, expiresIn = 3600): Promise<string> {
   const command = new PutObjectCommand({
@@ -39,7 +54,11 @@ export async function getUploadUrl(videoKey: string, contentType: string, expire
 }
 
 /**
- * List available quality variants for a video
+ * Lists available quality variants for a video.
+ * Scans the storage bucket to find all encoded quality levels for adaptive streaming.
+ *
+ * @param videoId - The video's unique identifier
+ * @returns Promise resolving to an array of quality names (e.g., ["720p", "1080p"])
  */
 export async function listVideoQualities(videoId: string): Promise<string[]> {
   const command = new ListObjectsV2Command({
@@ -69,7 +88,11 @@ export async function listVideoQualities(videoId: string): Promise<string[]> {
 }
 
 /**
- * Get thumbnail URL
+ * Constructs a public URL for a video thumbnail.
+ * Thumbnails are served directly from storage without presigning.
+ *
+ * @param thumbnailKey - S3 object key for the thumbnail image
+ * @returns Direct URL to the thumbnail
  */
 export async function getThumbnailUrl(thumbnailKey: string): Promise<string> {
   // For public thumbnails, return direct URL
@@ -77,7 +100,14 @@ export async function getThumbnailUrl(thumbnailKey: string): Promise<string> {
 }
 
 /**
- * Generate a DASH manifest for adaptive streaming
+ * Generates a DASH (Dynamic Adaptive Streaming over HTTP) manifest.
+ * Creates an MPD file for adaptive bitrate streaming, allowing the player
+ * to switch between quality levels based on network conditions.
+ *
+ * @param videoId - The video's unique identifier
+ * @param qualities - Array of available quality profiles with bitrate and resolution
+ * @param durationSeconds - Total video duration in seconds
+ * @returns DASH MPD manifest as XML string
  */
 export function generateDashManifest(
   videoId: string,
@@ -125,8 +155,14 @@ export function generateDashManifest(
 }
 
 /**
- * For demo purposes: generate a simple HLS-like manifest pointing to MP4 files
- * This is a simplified version that works with regular MP4 files
+ * Generates a simplified streaming manifest for demo purposes.
+ * Returns a JSON structure that the frontend can use to select quality levels.
+ * This is a simplified alternative to DASH/HLS for the demo implementation.
+ *
+ * @param videoId - The video's unique identifier
+ * @param qualities - Array of available quality profiles
+ * @param baseUrl - Base URL of the API server for constructing stream URLs
+ * @returns JSON string with video ID and quality options with URLs
  */
 export function generateSimpleManifest(
   videoId: string,

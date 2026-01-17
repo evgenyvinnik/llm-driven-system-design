@@ -3,6 +3,9 @@ import { indexIssue, deleteIssueFromIndex } from '../config/elasticsearch.js';
 import { cacheDel } from '../config/redis.js';
 import { Issue, IssueWithDetails, IssueType, Priority, User, Comment, CommentWithAuthor, IssueHistory, IssueHistoryWithUser } from '../types/index.js';
 
+/**
+ * Data required to create a new issue.
+ */
 export interface CreateIssueData {
   projectId: string;
   summary: string;
@@ -20,6 +23,10 @@ export interface CreateIssueData {
   customFields?: Record<string, unknown>;
 }
 
+/**
+ * Data for updating an existing issue.
+ * All fields are optional to allow partial updates.
+ */
 export interface UpdateIssueData {
   summary?: string;
   description?: string;
@@ -34,7 +41,15 @@ export interface UpdateIssueData {
   customFields?: Record<string, unknown>;
 }
 
-// Create a new issue
+/**
+ * Creates a new issue within a project.
+ * Generates a unique issue key (e.g., PROJ-123), sets initial status from workflow,
+ * records creation history, and indexes the issue for search.
+ *
+ * @param data - Issue creation data
+ * @param user - User creating the issue (for history tracking)
+ * @returns Newly created issue
+ */
 export async function createIssue(data: CreateIssueData, user: User): Promise<Issue> {
   return withTransaction(async (client) => {
     // Get project and increment counter
@@ -114,7 +129,13 @@ export async function createIssue(data: CreateIssueData, user: User): Promise<Is
   });
 }
 
-// Get issue by ID with full details
+/**
+ * Retrieves an issue by its database ID with full details.
+ * Joins related data including status, assignee, reporter, project, epic, and sprint.
+ *
+ * @param issueId - Numeric ID of the issue
+ * @returns Issue with all related entities, or null if not found
+ */
 export async function getIssueById(issueId: number): Promise<IssueWithDetails | null> {
   const { rows } = await query<IssueWithDetails>(
     `SELECT
@@ -139,7 +160,12 @@ export async function getIssueById(issueId: number): Promise<IssueWithDetails | 
   return rows[0] || null;
 }
 
-// Get issue by key
+/**
+ * Retrieves an issue by its human-readable key (e.g., "PROJ-123").
+ *
+ * @param key - Issue key string
+ * @returns Issue with full details, or null if not found
+ */
 export async function getIssueByKey(key: string): Promise<IssueWithDetails | null> {
   const { rows } = await query<{ id: number }>(
     'SELECT id FROM issues WHERE key = $1',
@@ -150,7 +176,16 @@ export async function getIssueByKey(key: string): Promise<IssueWithDetails | nul
   return getIssueById(rows[0].id);
 }
 
-// Update an issue
+/**
+ * Updates an existing issue with partial data.
+ * Records all field changes in issue history for audit trail.
+ * Updates the Elasticsearch index after modification.
+ *
+ * @param issueId - ID of the issue to update
+ * @param data - Partial issue data to update
+ * @param user - User making the update (for history tracking)
+ * @returns Updated issue, or null if not found
+ */
 export async function updateIssue(
   issueId: number,
   data: UpdateIssueData,
@@ -220,7 +255,12 @@ export async function updateIssue(
   return rows[0];
 }
 
-// Delete an issue
+/**
+ * Deletes an issue from the database and search index.
+ *
+ * @param issueId - ID of the issue to delete
+ * @returns True if issue was deleted, false if not found
+ */
 export async function deleteIssue(issueId: number): Promise<boolean> {
   const { rowCount } = await query('DELETE FROM issues WHERE id = $1', [issueId]);
 
@@ -236,7 +276,14 @@ export async function deleteIssue(issueId: number): Promise<boolean> {
   return false;
 }
 
-// Get issues for a project
+/**
+ * Retrieves paginated issues for a project with optional filters.
+ * Supports filtering by status, assignee, sprint, epic, and issue type.
+ *
+ * @param projectId - UUID of the project
+ * @param options - Filter and pagination options
+ * @returns Object containing issues array and total count
+ */
 export async function getIssuesByProject(
   projectId: string,
   options: {
@@ -315,7 +362,13 @@ export async function getIssuesByProject(
   return { issues: rows, total };
 }
 
-// Get issues for a sprint
+/**
+ * Retrieves all issues assigned to a specific sprint.
+ * Used for sprint board views.
+ *
+ * @param sprintId - ID of the sprint
+ * @returns Array of issues with full details
+ */
 export async function getIssuesBySprint(sprintId: number): Promise<IssueWithDetails[]> {
   const { rows } = await query<IssueWithDetails>(
     `SELECT
@@ -341,13 +394,23 @@ export async function getIssuesBySprint(sprintId: number): Promise<IssueWithDeta
   return rows;
 }
 
-// Get backlog issues (no sprint assigned)
+/**
+ * Retrieves issues not assigned to any sprint (backlog).
+ *
+ * @param projectId - UUID of the project
+ * @returns Array of backlog issues
+ */
 export async function getBacklogIssues(projectId: string): Promise<IssueWithDetails[]> {
   const { issues } = await getIssuesByProject(projectId, { sprintId: 0 });
   return issues;
 }
 
-// Get issue comments
+/**
+ * Retrieves all comments for an issue with author details.
+ *
+ * @param issueId - ID of the issue
+ * @returns Array of comments with author information
+ */
 export async function getIssueComments(issueId: number): Promise<CommentWithAuthor[]> {
   const { rows } = await query<CommentWithAuthor>(
     `SELECT
@@ -363,7 +426,15 @@ export async function getIssueComments(issueId: number): Promise<CommentWithAuth
   return rows;
 }
 
-// Add a comment
+/**
+ * Adds a comment to an issue.
+ * Also updates the issue's updated_at timestamp.
+ *
+ * @param issueId - ID of the issue to comment on
+ * @param authorId - UUID of the comment author
+ * @param body - Comment text content
+ * @returns Newly created comment
+ */
 export async function addComment(
   issueId: number,
   authorId: string,
@@ -381,7 +452,15 @@ export async function addComment(
   return rows[0];
 }
 
-// Update a comment
+/**
+ * Updates an existing comment.
+ * Only the original author can update their comment.
+ *
+ * @param commentId - ID of the comment to update
+ * @param body - New comment text
+ * @param userId - ID of user attempting the update (must match author)
+ * @returns Updated comment, or null if not found or unauthorized
+ */
 export async function updateComment(
   commentId: number,
   body: string,
@@ -397,7 +476,14 @@ export async function updateComment(
   return rows[0] || null;
 }
 
-// Delete a comment
+/**
+ * Deletes a comment.
+ * Only the original author can delete their comment.
+ *
+ * @param commentId - ID of the comment to delete
+ * @param userId - ID of user attempting deletion (must match author)
+ * @returns True if deleted, false if not found or unauthorized
+ */
 export async function deleteComment(commentId: number, userId: string): Promise<boolean> {
   const { rowCount } = await query(
     'DELETE FROM comments WHERE id = $1 AND author_id = $2',
@@ -407,7 +493,13 @@ export async function deleteComment(commentId: number, userId: string): Promise<
   return (rowCount ?? 0) > 0;
 }
 
-// Get issue history
+/**
+ * Retrieves the change history for an issue.
+ * Includes user details for each history entry, ordered newest first.
+ *
+ * @param issueId - ID of the issue
+ * @returns Array of history entries with user information
+ */
 export async function getIssueHistory(issueId: number): Promise<IssueHistoryWithUser[]> {
   const { rows } = await query<IssueHistoryWithUser>(
     `SELECT
@@ -423,7 +515,12 @@ export async function getIssueHistory(issueId: number): Promise<IssueHistoryWith
   return rows;
 }
 
-// Helper to index issue for search
+/**
+ * Indexes an issue document in Elasticsearch for search.
+ * Denormalizes related data (status name, assignee name, etc.) for efficient search.
+ *
+ * @param issue - Issue to index
+ */
 async function indexIssueForSearch(issue: Issue): Promise<void> {
   // Get additional data for search
   const { rows: details } = await query<{

@@ -1,7 +1,11 @@
 import { redis } from '../redis.js';
 import type { Quote } from '../types/index.js';
 
-// Mock stock data for simulation
+/**
+ * Mock stock data for price simulation.
+ * Contains base prices and volatility factors for realistic market behavior.
+ * In production, this would be replaced by real market data feeds.
+ */
 const STOCKS: Record<string, { name: string; basePrice: number; volatility: number }> = {
   AAPL: { name: 'Apple Inc.', basePrice: 178.50, volatility: 0.015 },
   GOOGL: { name: 'Alphabet Inc.', basePrice: 141.80, volatility: 0.018 },
@@ -25,10 +29,14 @@ const STOCKS: Record<string, { name: string; basePrice: number; volatility: numb
   AMD: { name: 'Advanced Micro Devices', basePrice: 147.65, volatility: 0.028 },
 };
 
-// Store current simulated prices
+/** In-memory cache for current simulated stock prices */
 const currentPrices: Map<string, Quote> = new Map();
 
-// Initialize prices
+/**
+ * Initializes stock prices with realistic market data.
+ * Sets up bid/ask spreads, open/high/low values, and volume.
+ * Called once when the QuoteService is instantiated.
+ */
 function initializePrices(): void {
   const now = Date.now();
   for (const [symbol, data] of Object.entries(STOCKS)) {
@@ -52,7 +60,13 @@ function initializePrices(): void {
   }
 }
 
-// Simulate price movement
+/**
+ * Simulates realistic price movement using random walk with volatility.
+ * Updates bid/ask spread, tracks high/low, and accumulates volume.
+ * @param quote - Current quote to update
+ * @param volatility - Stock-specific volatility factor (0-1)
+ * @returns New quote with updated prices
+ */
 function simulatePriceMovement(quote: Quote, volatility: number): Quote {
   const now = Date.now();
   const change = (Math.random() - 0.5) * 2 * volatility * quote.last;
@@ -73,14 +87,28 @@ function simulatePriceMovement(quote: Quote, volatility: number): Quote {
   };
 }
 
+/**
+ * Service for managing real-time stock quotes.
+ * Simulates market data with configurable update intervals and
+ * supports pub/sub for distributing quotes to WebSocket clients.
+ * In a production system, this would integrate with real market data providers.
+ */
 export class QuoteService {
   private updateInterval: NodeJS.Timeout | null = null;
   private subscribers: Map<string, Set<(quotes: Quote[]) => void>> = new Map();
 
+  /**
+   * Creates a new QuoteService instance and initializes stock prices.
+   */
   constructor() {
     initializePrices();
   }
 
+  /**
+   * Starts the quote simulation with periodic price updates.
+   * Updates are stored in Redis and published to all subscribers.
+   * @param intervalMs - Update interval in milliseconds (default: 1000)
+   */
   start(intervalMs: number = 1000): void {
     if (this.updateInterval) return;
 
@@ -113,6 +141,9 @@ export class QuoteService {
     console.log(`Quote service started with ${intervalMs}ms interval`);
   }
 
+  /**
+   * Stops the quote simulation and clears the update interval.
+   */
   stop(): void {
     if (this.updateInterval) {
       clearInterval(this.updateInterval);
@@ -120,30 +151,57 @@ export class QuoteService {
     }
   }
 
+  /**
+   * Gets the current quote for a single stock symbol.
+   * @param symbol - Stock ticker symbol (case-insensitive)
+   * @returns Quote object or null if symbol not found
+   */
   getQuote(symbol: string): Quote | null {
     return currentPrices.get(symbol.toUpperCase()) || null;
   }
 
+  /**
+   * Gets quotes for multiple stock symbols.
+   * @param symbols - Array of stock ticker symbols
+   * @returns Array of Quote objects (excludes symbols not found)
+   */
   getQuotes(symbols: string[]): Quote[] {
     return symbols
       .map((s) => currentPrices.get(s.toUpperCase()))
       .filter((q): q is Quote => q !== null);
   }
 
+  /**
+   * Gets all available stock quotes.
+   * @returns Array of all Quote objects
+   */
   getAllQuotes(): Quote[] {
     return Array.from(currentPrices.values());
   }
 
+  /**
+   * Gets all available stock ticker symbols.
+   * @returns Array of symbol strings
+   */
   getAllSymbols(): string[] {
     return Object.keys(STOCKS);
   }
 
+  /**
+   * Gets stock information (name and symbol) for a ticker.
+   * @param symbol - Stock ticker symbol (case-insensitive)
+   * @returns Stock info object or null if not found
+   */
   getStockInfo(symbol: string): { name: string; symbol: string } | null {
     const stock = STOCKS[symbol.toUpperCase()];
     if (!stock) return null;
     return { name: stock.name, symbol: symbol.toUpperCase() };
   }
 
+  /**
+   * Gets information for all available stocks.
+   * @returns Array of stock info objects with name and symbol
+   */
   getAllStocks(): Array<{ name: string; symbol: string }> {
     return Object.entries(STOCKS).map(([symbol, data]) => ({
       symbol,
@@ -151,6 +209,11 @@ export class QuoteService {
     }));
   }
 
+  /**
+   * Subscribes to quote updates with a callback function.
+   * @param id - Unique identifier for the subscription (e.g., connection ID)
+   * @param callback - Function called with updated quotes array
+   */
   subscribe(id: string, callback: (quotes: Quote[]) => void): void {
     if (!this.subscribers.has(id)) {
       this.subscribers.set(id, new Set());
@@ -158,6 +221,11 @@ export class QuoteService {
     this.subscribers.get(id)!.add(callback);
   }
 
+  /**
+   * Unsubscribes from quote updates.
+   * @param id - Subscription identifier
+   * @param callback - Optional specific callback to remove; if omitted, removes all callbacks for id
+   */
   unsubscribe(id: string, callback?: (quotes: Quote[]) => void): void {
     if (callback) {
       this.subscribers.get(id)?.delete(callback);
@@ -166,6 +234,11 @@ export class QuoteService {
     }
   }
 
+  /**
+   * Notifies all subscribers with updated quote data.
+   * Called internally after each price simulation cycle.
+   * @param quotes - Array of updated quotes to broadcast
+   */
   private notifySubscribers(quotes: Quote[]): void {
     for (const callbacks of this.subscribers.values()) {
       for (const callback of callbacks) {
@@ -179,4 +252,8 @@ export class QuoteService {
   }
 }
 
+/**
+ * Singleton instance of the QuoteService.
+ * Shared across the application for consistent quote data.
+ */
 export const quoteService = new QuoteService();

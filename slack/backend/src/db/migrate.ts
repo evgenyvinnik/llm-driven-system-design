@@ -1,8 +1,20 @@
+/**
+ * @fileoverview Database migration script for initializing the Slack schema.
+ * Creates all required tables, relationships, and indexes for the messaging platform.
+ * Safe to run multiple times due to IF NOT EXISTS clauses.
+ */
+
 import { pool } from './index.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
+/**
+ * SQL migration containing the complete database schema.
+ * Includes tables for users, workspaces, channels, messages, reactions, and DMs.
+ * Creates indexes optimized for common query patterns like message retrieval
+ * and full-text search.
+ */
 const migrations = `
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -112,7 +124,13 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_content_fts ON messages USING gin(to_tsvector('english', content));
 `;
 
-async function migrate() {
+/**
+ * Runs the database migrations to set up the schema.
+ * Executes all CREATE TABLE and CREATE INDEX statements,
+ * then closes the connection pool.
+ * @throws Error if migration fails, with details logged to console
+ */
+async function migrate(): Promise<void> {
   console.log('Running migrations...');
 
   try {

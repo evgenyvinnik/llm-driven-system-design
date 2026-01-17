@@ -6,11 +6,23 @@ import redis from '../utils/redis.js';
 import { authenticate } from '../middleware/auth.js';
 import type { UserPublic } from '../types/index.js';
 
+/**
+ * Authentication router handling user registration, login, logout, and session management.
+ * Uses bcrypt for password hashing and Redis for session caching.
+ * Sessions are stored in both PostgreSQL (persistent) and Redis (fast access).
+ */
 const router = Router();
 
 /**
  * POST /api/auth/register
- * Register a new user
+ * Creates a new user account with email, name, and password.
+ * Generates a random avatar color and creates an initial session.
+ * Returns user data and session token in both cookie and response body.
+ *
+ * @param req.body.email - User's email address (must be unique)
+ * @param req.body.name - User's display name
+ * @param req.body.password - Plain text password (hashed before storage)
+ * @returns {ApiResponse<{user: UserPublic, token: string}>} Created user and session token
  */
 router.post('/register', async (req: Request, res: Response) => {
   try {
@@ -81,7 +93,13 @@ router.post('/register', async (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/login
- * Login with email and password
+ * Authenticates user with email and password credentials.
+ * Creates a new 7-day session on successful authentication.
+ * Returns user data and session token in both cookie and response body.
+ *
+ * @param req.body.email - User's email address
+ * @param req.body.password - Plain text password to verify
+ * @returns {ApiResponse<{user: UserPublic, token: string}>} Authenticated user and session token
  */
 router.post('/login', async (req: Request, res: Response) => {
   try {
@@ -153,7 +171,11 @@ router.post('/login', async (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/logout
- * Logout current session
+ * Terminates the current user session.
+ * Removes session from both Redis cache and PostgreSQL database.
+ * Clears the session cookie from the client.
+ *
+ * @returns {ApiResponse<void>} Success message
  */
 router.post('/logout', authenticate, async (req: Request, res: Response) => {
   try {
@@ -177,7 +199,10 @@ router.post('/logout', authenticate, async (req: Request, res: Response) => {
 
 /**
  * GET /api/auth/me
- * Get current user info
+ * Returns the currently authenticated user's information.
+ * Used by frontend to verify session validity and get user data on page load.
+ *
+ * @returns {ApiResponse<{user: UserPublic}>} Current user's public information
  */
 router.get('/me', authenticate, async (req: Request, res: Response) => {
   res.json({
@@ -186,4 +211,5 @@ router.get('/me', authenticate, async (req: Request, res: Response) => {
   });
 });
 
+/** Exports the authentication router for mounting in the main application */
 export default router;

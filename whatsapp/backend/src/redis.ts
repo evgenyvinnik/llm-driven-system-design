@@ -1,7 +1,10 @@
 import Redis from 'ioredis';
 import { config } from './config.js';
 
-// Main Redis client for general operations
+/**
+ * Main Redis client for general operations.
+ * Used for session storage, presence tracking, and caching.
+ */
 export const redis = new Redis({
   host: config.redis.host,
   port: config.redis.port,
@@ -9,13 +12,20 @@ export const redis = new Redis({
   retryDelayOnFailover: 100,
 });
 
-// Subscriber client for pub/sub (cannot use same client for both)
+/**
+ * Redis subscriber client for pub/sub messaging.
+ * Separate client required because Redis pub/sub mode prevents other operations.
+ * Receives cross-server messages for distributed WebSocket delivery.
+ */
 export const redisSub = new Redis({
   host: config.redis.host,
   port: config.redis.port,
 });
 
-// Publisher client for pub/sub
+/**
+ * Redis publisher client for pub/sub messaging.
+ * Sends messages to other server instances for cross-server WebSocket delivery.
+ */
 export const redisPub = new Redis({
   host: config.redis.host,
   port: config.redis.port,
@@ -29,12 +39,21 @@ redis.on('error', (err) => {
   console.error('Redis error:', err);
 });
 
-// Session/Presence keys
+/**
+ * Redis key generators for consistent key naming across the application.
+ * Centralizes key format to prevent naming collisions and enable easy debugging.
+ */
 export const KEYS = {
+  /** Session key mapping user to their connected server */
   session: (userId: string) => `session:${userId}`,
+  /** User presence information (online/offline status) */
   presence: (userId: string) => `presence:${userId}`,
+  /** Typing indicator with auto-expiry */
   typing: (conversationId: string, userId: string) => `typing:${conversationId}:${userId}`,
+  /** Pending messages queue for offline users */
   pending: (userId: string) => `pending:${userId}`,
+  /** Pub/sub channel for cross-server message routing */
   serverChannel: (serverId: string) => `server:${serverId}`,
+  /** Set of members in a group conversation for fast lookups */
   groupMembers: (groupId: string) => `group:${groupId}:members`,
 };

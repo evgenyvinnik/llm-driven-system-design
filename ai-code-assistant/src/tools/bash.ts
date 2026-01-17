@@ -1,14 +1,25 @@
 /**
- * Bash Tool - Execute shell commands
+ * Bash Tool - Execute shell commands.
+ *
+ * This tool enables the AI assistant to run shell commands for tasks like
+ * running tests, building projects, installing dependencies, and querying
+ * the development environment. It includes safety features to prevent
+ * dangerous operations while allowing common development tasks.
+ *
+ * @module tools/bash
  */
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import type { Tool, ToolContext, ToolResult } from '../types/index.js';
 
+/** Promisified exec for async/await usage */
 const execAsync = promisify(exec);
 
-// Safe command patterns that don't require approval
+/**
+ * Patterns for commands that are auto-approved without user confirmation.
+ * These are read-only or common development commands that don't modify state.
+ */
 const SAFE_PATTERNS = [
   /^ls\b/,
   /^pwd$/,
@@ -26,7 +37,10 @@ const SAFE_PATTERNS = [
   /^file\b/,
 ];
 
-// Dangerous patterns that are always blocked
+/**
+ * Patterns for commands that are always blocked for safety.
+ * These commands can cause system damage and should never be executed.
+ */
 const BLOCKED_PATTERNS = [
   /rm\s+-rf?\s+[\/~]/,  // Recursive delete from root or home
   />\s*\/dev\/sd/,       // Write to block devices
@@ -37,6 +51,19 @@ const BLOCKED_PATTERNS = [
   /chmod\s+777/,         // Insecure permissions
 ];
 
+/**
+ * BashTool implementation for executing shell commands.
+ *
+ * Features:
+ * - Executes commands with configurable timeout (default: 2 minutes)
+ * - Auto-approves safe commands (ls, git status, npm run, etc.)
+ * - Blocks dangerous commands (rm -rf /, sudo, fork bombs, etc.)
+ * - Captures both stdout and stderr
+ * - Truncates very large output to prevent memory issues
+ *
+ * Approval is dynamic: safe patterns are auto-approved, while other
+ * commands require user confirmation.
+ */
 export const BashTool: Tool = {
   name: 'Bash',
   description: 'Execute a shell command. Safe commands (ls, git status, npm run) are auto-approved.',

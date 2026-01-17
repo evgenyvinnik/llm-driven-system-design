@@ -3,7 +3,10 @@ import redis from '../utils/redis.js';
 import pool from '../utils/db.js';
 import type { User, UserPublic } from '../types/index.js';
 
-// Extend Express Request to include user
+/**
+ * Extends Express Request interface to include authenticated user information.
+ * Allows type-safe access to user data in route handlers after authentication.
+ */
 declare global {
   namespace Express {
     interface Request {
@@ -14,8 +17,15 @@ declare global {
 }
 
 /**
- * Authentication middleware
- * Validates session token from cookie or Authorization header
+ * Authentication middleware that validates session tokens.
+ * Checks tokens from cookies (session_token) or Authorization header (Bearer token).
+ * First checks Redis cache, falls back to database for cache misses.
+ * On successful validation, attaches user info to request object.
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @param next - Express next function to continue middleware chain
+ * @returns Responds with 401 if no token or invalid session, otherwise calls next()
  */
 export async function authenticate(
   req: Request,
@@ -84,7 +94,14 @@ export async function authenticate(
 }
 
 /**
- * Optional authentication - doesn't fail if no token
+ * Optional authentication middleware that does not require a valid session.
+ * Attaches user info to request if token is valid, otherwise continues without error.
+ * Useful for routes that have different behavior for authenticated vs anonymous users.
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @param next - Express next function to continue middleware chain
+ * @returns Always calls next(), never returns an error response
  */
 export async function optionalAuth(
   req: Request,
@@ -116,7 +133,13 @@ export async function optionalAuth(
 }
 
 /**
- * Admin-only middleware
+ * Admin authorization middleware that restricts access to admin users only.
+ * Must be used after authenticate middleware to ensure req.user is populated.
+ *
+ * @param req - Express request object with authenticated user
+ * @param res - Express response object
+ * @param next - Express next function to continue middleware chain
+ * @returns Responds with 401/403 if not authenticated or not admin, otherwise calls next()
  */
 export async function requireAdmin(
   req: Request,

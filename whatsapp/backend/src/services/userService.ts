@@ -3,6 +3,12 @@ import { redis, KEYS } from '../redis.js';
 import { User, PresenceInfo } from '../types/index.js';
 import bcrypt from 'bcrypt';
 
+/**
+ * Finds a user by their username.
+ * Used during login and to check for existing usernames during registration.
+ * @param username - The username to search for
+ * @returns The user if found, null otherwise
+ */
 export async function findUserByUsername(username: string): Promise<User | null> {
   const result = await pool.query(
     'SELECT id, username, display_name, profile_picture_url, created_at FROM users WHERE username = $1',
@@ -11,6 +17,12 @@ export async function findUserByUsername(username: string): Promise<User | null>
   return result.rows[0] || null;
 }
 
+/**
+ * Finds a user by their unique ID.
+ * Used to retrieve user details for session validation and profile display.
+ * @param id - The user's UUID
+ * @returns The user if found, null otherwise
+ */
 export async function findUserById(id: string): Promise<User | null> {
   const result = await pool.query(
     'SELECT id, username, display_name, profile_picture_url, created_at FROM users WHERE id = $1',
@@ -19,6 +31,13 @@ export async function findUserById(id: string): Promise<User | null> {
   return result.rows[0] || null;
 }
 
+/**
+ * Validates a user's password during login.
+ * Compares the provided password against the stored bcrypt hash.
+ * @param username - The username attempting to log in
+ * @param password - The plain-text password to validate
+ * @returns The user (without password) if credentials are valid, null otherwise
+ */
 export async function validatePassword(username: string, password: string): Promise<User | null> {
   const result = await pool.query(
     'SELECT id, username, display_name, profile_picture_url, password_hash, created_at FROM users WHERE username = $1',
@@ -41,6 +60,14 @@ export async function validatePassword(username: string, password: string): Prom
   return userWithoutPassword;
 }
 
+/**
+ * Creates a new user account.
+ * Hashes the password with bcrypt before storing.
+ * @param username - Unique username for the new account
+ * @param displayName - Human-readable display name
+ * @param password - Plain-text password to be hashed
+ * @returns The newly created user
+ */
 export async function createUser(
   username: string,
   displayName: string,
@@ -58,6 +85,13 @@ export async function createUser(
   return result.rows[0];
 }
 
+/**
+ * Searches for users by username or display name.
+ * Used for finding users to start new conversations with.
+ * @param query - Search string to match against username and display_name
+ * @param excludeUserId - Optional user ID to exclude from results (typically the current user)
+ * @returns Array of matching users (max 20)
+ */
 export async function searchUsers(query: string, excludeUserId?: string): Promise<User[]> {
   const result = await pool.query(
     `SELECT id, username, display_name, profile_picture_url, created_at
@@ -70,6 +104,12 @@ export async function searchUsers(query: string, excludeUserId?: string): Promis
   return result.rows;
 }
 
+/**
+ * Retrieves all users in the system.
+ * Used for displaying a user directory when no search query is provided.
+ * @param excludeUserId - Optional user ID to exclude (typically the current user)
+ * @returns Array of all users (max 100), ordered by display name
+ */
 export async function getAllUsers(excludeUserId?: string): Promise<User[]> {
   const result = await pool.query(
     `SELECT id, username, display_name, profile_picture_url, created_at
@@ -82,7 +122,14 @@ export async function getAllUsers(excludeUserId?: string): Promise<User[]> {
   return result.rows;
 }
 
-// Presence functions
+/**
+ * Updates a user's presence status in Redis.
+ * Called when WebSocket connects (online) or disconnects (offline).
+ * Also manages the session-to-server mapping for message routing.
+ * @param userId - The user whose presence is being updated
+ * @param status - 'online' or 'offline'
+ * @param serverId - The server instance handling this user's WebSocket (for online status)
+ */
 export async function setUserPresence(
   userId: string,
   status: 'online' | 'offline',
@@ -105,6 +152,12 @@ export async function setUserPresence(
   }
 }
 
+/**
+ * Retrieves a user's current presence information from Redis.
+ * Used to display online/offline status and last seen time.
+ * @param userId - The user whose presence to retrieve
+ * @returns Presence info if available, null if user has never connected
+ */
 export async function getUserPresence(userId: string): Promise<PresenceInfo | null> {
   const presence = await redis.hgetall(KEYS.presence(userId));
 
@@ -119,6 +172,12 @@ export async function getUserPresence(userId: string): Promise<PresenceInfo | nu
   };
 }
 
+/**
+ * Gets the server instance where a user is currently connected.
+ * Essential for cross-server message routing in distributed deployments.
+ * @param userId - The user to look up
+ * @returns Server ID if user is online, null if offline
+ */
 export async function getUserServer(userId: string): Promise<string | null> {
   return redis.get(KEYS.session(userId));
 }

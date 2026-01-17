@@ -1,3 +1,13 @@
+/**
+ * API Service for Stripe Clone
+ *
+ * This module provides a centralized API client for communicating with the
+ * Stripe-like payment processing backend. It handles authentication via
+ * merchant API keys and provides typed methods for all payment operations.
+ *
+ * @module services/api
+ */
+
 import { useMerchantStore } from '@/stores/merchantStore';
 import type {
   PaymentIntent,
@@ -15,8 +25,20 @@ import type {
   ApiError,
 } from '@/types';
 
+/** Base URL for all API endpoints */
 const API_BASE = '/v1';
 
+/**
+ * Generic fetch wrapper for API requests.
+ * Handles authentication by injecting the merchant API key from the store,
+ * and provides consistent error handling across all API calls.
+ *
+ * @template T - The expected response type
+ * @param endpoint - The API endpoint path (will be prefixed with API_BASE)
+ * @param options - Standard fetch options (method, body, headers, etc.)
+ * @returns Promise resolving to the typed response data
+ * @throws Error if the API returns a non-OK response
+ */
 async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -47,7 +69,20 @@ async function fetchApi<T>(
   return data as T;
 }
 
-// Payment Intents
+// ============================================================================
+// Payment Intents API
+// ============================================================================
+
+/**
+ * Retrieves a paginated list of payment intents for the authenticated merchant.
+ * Payment intents track the lifecycle of a payment from creation to completion.
+ *
+ * @param params - Query parameters for filtering and pagination
+ * @param params.limit - Maximum number of results to return
+ * @param params.offset - Number of results to skip for pagination
+ * @param params.status - Filter by payment intent status (e.g., 'succeeded', 'failed')
+ * @returns Paginated list of payment intents
+ */
 export async function listPaymentIntents(
   params: { limit?: number; offset?: number; status?: string } = {}
 ): Promise<ListResponse<PaymentIntent>> {
@@ -61,10 +96,32 @@ export async function listPaymentIntents(
   );
 }
 
+/**
+ * Retrieves a single payment intent by its ID.
+ * Use this to get detailed information about a specific payment.
+ *
+ * @param id - The payment intent ID (prefixed with 'pi_')
+ * @returns The payment intent object with full details
+ */
 export async function getPaymentIntent(id: string): Promise<PaymentIntent> {
   return fetchApi<PaymentIntent>(`/payment_intents/${id}`);
 }
 
+/**
+ * Creates a new payment intent to initiate a payment flow.
+ * This is the first step in collecting a payment - the intent must then
+ * be confirmed with a payment method to complete the transaction.
+ *
+ * @param data - Payment intent creation parameters
+ * @param data.amount - Amount in smallest currency unit (e.g., cents for USD)
+ * @param data.currency - Three-letter ISO currency code (defaults to 'usd')
+ * @param data.customer - Optional customer ID to associate with this payment
+ * @param data.payment_method - Optional payment method ID for immediate use
+ * @param data.capture_method - 'automatic' to charge immediately, 'manual' for auth-only
+ * @param data.description - Optional description for the payment
+ * @param data.metadata - Optional key-value pairs for storing additional data
+ * @returns The newly created payment intent
+ */
 export async function createPaymentIntent(data: {
   amount: number;
   currency?: string;
@@ -80,6 +137,14 @@ export async function createPaymentIntent(data: {
   });
 }
 
+/**
+ * Confirms a payment intent with a payment method.
+ * This triggers the actual payment processing and card network authorization.
+ *
+ * @param id - The payment intent ID to confirm
+ * @param paymentMethodId - The payment method ID to charge
+ * @returns The updated payment intent with new status
+ */
 export async function confirmPaymentIntent(
   id: string,
   paymentMethodId: string
@@ -90,6 +155,14 @@ export async function confirmPaymentIntent(
   });
 }
 
+/**
+ * Captures funds from an authorized payment intent.
+ * Only applicable when capture_method was set to 'manual' during creation.
+ *
+ * @param id - The payment intent ID with status 'requires_capture'
+ * @param amountToCapture - Optional partial amount to capture (must be <= authorized amount)
+ * @returns The updated payment intent with 'succeeded' status
+ */
 export async function capturePaymentIntent(
   id: string,
   amountToCapture?: number
@@ -100,6 +173,14 @@ export async function capturePaymentIntent(
   });
 }
 
+/**
+ * Cancels a payment intent that has not yet been captured.
+ * Releases any authorized funds back to the customer.
+ *
+ * @param id - The payment intent ID to cancel
+ * @param reason - Optional cancellation reason for tracking purposes
+ * @returns The updated payment intent with 'canceled' status
+ */
 export async function cancelPaymentIntent(
   id: string,
   reason?: string
@@ -110,7 +191,20 @@ export async function cancelPaymentIntent(
   });
 }
 
-// Customers
+// ============================================================================
+// Customers API
+// ============================================================================
+
+/**
+ * Retrieves a paginated list of customers for the authenticated merchant.
+ * Customers store payment methods and can be associated with multiple payments.
+ *
+ * @param params - Query parameters for filtering and pagination
+ * @param params.limit - Maximum number of results to return
+ * @param params.offset - Number of results to skip for pagination
+ * @param params.email - Filter customers by email address
+ * @returns Paginated list of customer objects
+ */
 export async function listCustomers(
   params: { limit?: number; offset?: number; email?: string } = {}
 ): Promise<ListResponse<Customer>> {
@@ -122,10 +216,28 @@ export async function listCustomers(
   return fetchApi<ListResponse<Customer>>(`/customers?${query.toString()}`);
 }
 
+/**
+ * Retrieves a single customer by their ID.
+ *
+ * @param id - The customer ID (prefixed with 'cus_')
+ * @returns The customer object with full details
+ */
 export async function getCustomer(id: string): Promise<Customer> {
   return fetchApi<Customer>(`/customers/${id}`);
 }
 
+/**
+ * Creates a new customer record.
+ * Customers are useful for storing payment methods for recurring payments
+ * and tracking payment history.
+ *
+ * @param data - Customer creation parameters
+ * @param data.email - Customer's email address
+ * @param data.name - Customer's full name
+ * @param data.phone - Customer's phone number
+ * @param data.metadata - Optional key-value pairs for additional data
+ * @returns The newly created customer object (includes generated ID)
+ */
 export async function createCustomer(data: {
   email?: string;
   name?: string;
@@ -138,6 +250,17 @@ export async function createCustomer(data: {
   });
 }
 
+/**
+ * Updates an existing customer's information.
+ *
+ * @param id - The customer ID to update
+ * @param data - Fields to update (only provided fields are changed)
+ * @param data.email - Updated email address
+ * @param data.name - Updated name
+ * @param data.phone - Updated phone number
+ * @param data.metadata - Updated metadata (replaces existing metadata)
+ * @returns The updated customer object
+ */
 export async function updateCustomer(
   id: string,
   data: {
@@ -153,6 +276,13 @@ export async function updateCustomer(
   });
 }
 
+/**
+ * Permanently deletes a customer and all associated data.
+ * This action cannot be undone.
+ *
+ * @param id - The customer ID to delete
+ * @returns Confirmation object indicating deletion success
+ */
 export async function deleteCustomer(id: string): Promise<{ deleted: boolean }> {
   return fetchApi<{ deleted: boolean }>(`/customers/${id}`, {
     method: 'DELETE',

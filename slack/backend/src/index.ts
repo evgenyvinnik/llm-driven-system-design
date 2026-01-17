@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Main entry point for the Slack backend server.
+ * Sets up Express with middleware, REST API routes, WebSocket connections,
+ * and initializes connections to Redis and Elasticsearch services.
+ */
+
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
@@ -65,8 +71,14 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 // Setup WebSocket
 setupWebSocket(server);
 
-// Initialize services and start server
-async function start() {
+/**
+ * Initializes all services and starts the HTTP server.
+ * Verifies Redis connectivity, initializes Elasticsearch index creation
+ * (non-blocking), and begins listening for HTTP/WebSocket connections.
+ * Exits the process if critical services (Redis) fail to connect.
+ * @returns Promise that resolves when server is listening
+ */
+async function start(): Promise<void> {
   try {
     // Test Redis connection
     await redis.ping();

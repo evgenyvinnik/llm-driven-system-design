@@ -1,3 +1,7 @@
+/**
+ * Represents a user account in the Find My system.
+ * Users can register devices and receive notifications about their tracked items.
+ */
 export interface User {
   id: string;
   email: string;
@@ -8,6 +12,10 @@ export interface User {
   updated_at: Date;
 }
 
+/**
+ * A device registered in the Find My network (AirTag, iPhone, MacBook, etc.).
+ * Contains the master secret used for end-to-end encryption and key derivation.
+ */
 export interface RegisteredDevice {
   id: string;
   user_id: string;
@@ -21,6 +29,10 @@ export interface RegisteredDevice {
   updated_at: Date;
 }
 
+/**
+ * An encrypted location report submitted by devices in the Find My network.
+ * The server stores only encrypted data - it cannot read the actual location.
+ */
 export interface LocationReport {
   id: number;
   identifier_hash: string;
@@ -29,6 +41,10 @@ export interface LocationReport {
   created_at: Date;
 }
 
+/**
+ * ECIES-like encrypted payload structure for location data.
+ * Uses AES-256-GCM for authenticated encryption.
+ */
 export interface EncryptedPayload {
   ephemeralPublicKey: string;
   iv: string;
@@ -36,6 +52,10 @@ export interface EncryptedPayload {
   authTag: string;
 }
 
+/**
+ * Decrypted location data after owner retrieves and decrypts a report.
+ * Only the device owner can decrypt location data using their master secret.
+ */
 export interface DecryptedLocation {
   id: number;
   device_id: string;
@@ -47,6 +67,10 @@ export interface DecryptedLocation {
   created_at: Date;
 }
 
+/**
+ * Lost mode configuration for a device.
+ * When enabled, the owner receives notifications when the device is found.
+ */
 export interface LostMode {
   device_id: string;
   enabled: boolean;
@@ -59,6 +83,10 @@ export interface LostMode {
   updated_at: Date;
 }
 
+/**
+ * A notification sent to a user about their devices or security alerts.
+ * Supports various types including device found, unknown tracker detection, and system alerts.
+ */
 export interface Notification {
   id: string;
   user_id: string;
@@ -71,6 +99,10 @@ export interface Notification {
   created_at: Date;
 }
 
+/**
+ * A sighting of a nearby tracker detected by the anti-stalking system.
+ * Used to track unknown trackers traveling with a user.
+ */
 export interface TrackerSighting {
   id: number;
   user_id: string;
@@ -80,25 +112,36 @@ export interface TrackerSighting {
   seen_at: Date;
 }
 
-// API Request/Response types
+/**
+ * Request payload for creating a new device.
+ */
 export interface CreateDeviceRequest {
   device_type: RegisteredDevice['device_type'];
   name: string;
   emoji?: string;
 }
 
+/**
+ * Request payload for updating device properties.
+ */
 export interface UpdateDeviceRequest {
   name?: string;
   emoji?: string;
   is_active?: boolean;
 }
 
+/**
+ * Request payload for submitting a location report from the finder network.
+ */
 export interface LocationReportRequest {
   identifier_hash: string;
   encrypted_payload: EncryptedPayload;
   reporter_region?: string;
 }
 
+/**
+ * Request payload for enabling or updating lost mode settings.
+ */
 export interface LostModeRequest {
   enabled: boolean;
   contact_phone?: string;
@@ -107,13 +150,19 @@ export interface LostModeRequest {
   notify_when_found?: boolean;
 }
 
+/**
+ * Location data for simulating device reports (demo/testing only).
+ */
 export interface SimulatedLocation {
   latitude: number;
   longitude: number;
   accuracy?: number;
 }
 
-// Session types
+/**
+ * Session data extension for express-session.
+ * Stores authenticated user ID and role for access control.
+ */
 declare module 'express-session' {
   interface SessionData {
     userId: string;

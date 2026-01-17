@@ -1,6 +1,25 @@
+/**
+ * @fileoverview Core type definitions for the post search system.
+ * Defines domain models, API request/response types, and shared interfaces
+ * used across backend services.
+ */
+
+/**
+ * Post visibility levels determining who can see a post.
+ * Used for privacy-aware search filtering via visibility fingerprints.
+ */
 export type Visibility = 'public' | 'friends' | 'friends_of_friends' | 'private';
+
+/**
+ * Content type classification for posts.
+ * Enables filtering search results by media type.
+ */
 export type PostType = 'text' | 'photo' | 'video' | 'link';
 
+/**
+ * User account model stored in PostgreSQL.
+ * Contains authentication data and profile information.
+ */
 export interface User {
   id: string;
   username: string;
@@ -13,6 +32,10 @@ export interface User {
   updated_at: Date;
 }
 
+/**
+ * Post model stored in PostgreSQL.
+ * Represents a user-created content item with engagement metrics.
+ */
 export interface Post {
   id: string;
   author_id: string;
@@ -27,6 +50,10 @@ export interface Post {
   updated_at: Date;
 }
 
+/**
+ * Friendship relationship stored in PostgreSQL.
+ * Represents a directional friend connection between two users.
+ */
 export interface Friendship {
   id: string;
   user_id: string;
@@ -35,6 +62,10 @@ export interface Friendship {
   created_at: Date;
 }
 
+/**
+ * Search history record stored in PostgreSQL.
+ * Tracks user search queries for analytics and personalization.
+ */
 export interface SearchHistory {
   id: string;
   user_id: string;
@@ -44,6 +75,11 @@ export interface SearchHistory {
   created_at: Date;
 }
 
+/**
+ * Elasticsearch document format for indexed posts.
+ * Contains denormalized data for efficient search without database joins.
+ * Includes visibility fingerprints for privacy-aware filtering.
+ */
 export interface PostDocument {
   post_id: string;
   author_id: string;
@@ -63,6 +99,10 @@ export interface PostDocument {
   language: string;
 }
 
+/**
+ * Individual search result returned to the client.
+ * Contains post data with highlighted snippet and relevance score.
+ */
 export interface SearchResult {
   post_id: string;
   author_id: string;
@@ -79,6 +119,10 @@ export interface SearchResult {
   relevance_score: number;
 }
 
+/**
+ * Filter criteria for narrowing search results.
+ * Supports date range, post type, author, and visibility filtering.
+ */
 export interface SearchFilters {
   date_range?: {
     start?: string;
@@ -89,6 +133,10 @@ export interface SearchFilters {
   visibility?: Visibility[];
 }
 
+/**
+ * Search API request payload.
+ * Contains query text, optional filters, pagination cursor, and user context.
+ */
 export interface SearchRequest {
   query: string;
   filters?: SearchFilters;
@@ -99,6 +147,10 @@ export interface SearchRequest {
   user_id?: string;
 }
 
+/**
+ * Search API response payload.
+ * Contains paginated results with metadata about total matches and timing.
+ */
 export interface SearchResponse {
   results: SearchResult[];
   next_cursor?: string;
@@ -106,6 +158,10 @@ export interface SearchResponse {
   took_ms: number;
 }
 
+/**
+ * Typeahead/autocomplete suggestion item.
+ * Can represent a previous query, hashtag, or user mention.
+ */
 export interface SearchSuggestion {
   text: string;
   type: 'query' | 'hashtag' | 'user';

@@ -1,5 +1,16 @@
+/**
+ * @fileoverview Redis client and caching utilities for the Ad Click Aggregator.
+ * Provides deduplication, rate limiting, fraud detection tracking,
+ * HyperLogLog-based unique user counting, and real-time click counters.
+ * Redis is critical for sub-millisecond operations in the click ingestion path.
+ */
+
 import Redis from 'ioredis';
 
+/**
+ * Redis client configured from environment variables.
+ * Uses lazy connection to avoid blocking startup.
+ */
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
@@ -16,15 +27,18 @@ redis.on('connect', () => {
   console.log('Connected to Redis');
 });
 
-// Deduplication TTL in seconds (5 minutes)
+/** Deduplication TTL in seconds (5 minutes) - prevents duplicate click processing */
 const DEDUP_TTL = 300;
 
-// Rate limiting window in seconds (1 minute)
+/** Rate limiting window in seconds (1 minute) - for fraud detection thresholds */
 const RATE_LIMIT_WINDOW = 60;
 
 /**
- * Check if a click has already been processed (for deduplication)
- * Returns true if click is a duplicate
+ * Checks if a click has already been processed within the deduplication window.
+ * Essential for exactly-once semantics in distributed click ingestion.
+ *
+ * @param clickId - Unique identifier for the click event
+ * @returns True if click is a duplicate, false if new
  */
 export async function isDuplicateClick(clickId: string): Promise<boolean> {
   const key = `click:dedup:${clickId}`;
@@ -33,7 +47,10 @@ export async function isDuplicateClick(clickId: string): Promise<boolean> {
 }
 
 /**
- * Mark a click as processed (for deduplication)
+ * Marks a click as processed in Redis with TTL for deduplication.
+ * Called after successful click ingestion to prevent reprocessing.
+ *
+ * @param clickId - Unique identifier for the click event
  */
 export async function markClickProcessed(clickId: string): Promise<void> {
   const key = `click:dedup:${clickId}`;
@@ -41,8 +58,12 @@ export async function markClickProcessed(clickId: string): Promise<void> {
 }
 
 /**
- * Check and increment rate limit for IP or user
- * Returns current count
+ * Implements sliding window rate limiting using Redis INCR.
+ * Used to throttle requests and detect suspicious activity patterns.
+ *
+ * @param key - Unique identifier for the rate limit bucket (e.g., IP hash or user ID)
+ * @param maxRequests - Maximum allowed requests within the window
+ * @returns Object containing whether request is allowed and current count
  */
 export async function checkRateLimit(key: string, maxRequests: number): Promise<{ allowed: boolean; count: number }> {
   const redisKey = `ratelimit:${key}`;
@@ -59,7 +80,11 @@ export async function checkRateLimit(key: string, maxRequests: number): Promise<
 }
 
 /**
- * Track clicks per IP for fraud detection
+ * Tracks click count per IP address for fraud detection velocity checks.
+ * High click counts from a single IP indicate potential bot activity.
+ *
+ * @param ipHash - Hashed IP address (for privacy)
+ * @returns Current click count for this IP in the current window
  */
 export async function trackIpClicks(ipHash: string): Promise<number> {
   const key = `fraud:ip:${ipHash}`;
@@ -73,7 +98,11 @@ export async function trackIpClicks(ipHash: string): Promise<number> {
 }
 
 /**
- * Track clicks per user for fraud detection
+ * Tracks click count per user ID for fraud detection velocity checks.
+ * High click counts from a single user indicate potential fraud or abuse.
+ *
+ * @param userId - Unique user identifier
+ * @returns Current click count for this user in the current window
  */
 export async function trackUserClicks(userId: string): Promise<number> {
   const key = `fraud:user:${userId}`;
@@ -87,7 +116,12 @@ export async function trackUserClicks(userId: string): Promise<number> {
 }
 
 /**
- * Track unique users per ad for HyperLogLog estimation
+ * Tracks unique users per ad using Redis HyperLogLog for memory-efficient cardinality estimation.
+ * Provides approximate unique user counts with ~0.81% standard error.
+ *
+ * @param adId - Advertisement identifier
+ * @param userId - User to track
+ * @param timeBucket - Time bucket string for the aggregation period
  */
 export async function trackUniqueUser(adId: string, userId: string, timeBucket: string): Promise<void> {
   const key = `hll:ad:${adId}:${timeBucket}`;
@@ -97,7 +131,12 @@ export async function trackUniqueUser(adId: string, userId: string, timeBucket: 
 }
 
 /**
- * Get estimated unique users for an ad in a time bucket
+ * Retrieves estimated unique user count for an ad in a specific time bucket.
+ * Uses HyperLogLog PFCOUNT for O(1) cardinality estimation.
+ *
+ * @param adId - Advertisement identifier
+ * @param timeBucket - Time bucket string for the aggregation period
+ * @returns Estimated count of unique users
  */
 export async function getUniqueUserCount(adId: string, timeBucket: string): Promise<number> {
   const key = `hll:ad:${adId}:${timeBucket}`;
@@ -105,7 +144,13 @@ export async function getUniqueUserCount(adId: string, timeBucket: string): Prom
 }
 
 /**
- * Store real-time click counts in Redis for fast dashboard access
+ * Atomically increments real-time click counters for dashboard display.
+ * Updates counters at ad, campaign, and global levels using Redis pipelines.
+ * Counters expire after 2 hours to prevent unbounded memory growth.
+ *
+ * @param adId - Advertisement identifier
+ * @param campaignId - Campaign identifier
+ * @param timeBucket - Time bucket string (minute granularity)
  */
 export async function incrementRealTimeCounter(
   adId: string,
@@ -130,7 +175,11 @@ export async function incrementRealTimeCounter(
 }
 
 /**
- * Get real-time click counts for an ad
+ * Retrieves real-time click counts for a specific ad across time buckets.
+ * Returns a map of time bucket to click count.
+ *
+ * @param adId - Advertisement identifier
+ * @returns Map of time bucket strings to click counts
  */
 export async function getRealTimeAdClicks(adId: string): Promise<Record<string, number>> {
   const data = await redis.hgetall(`realtime:ad:${adId}`);

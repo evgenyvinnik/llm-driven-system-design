@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Database seeding script for development and testing.
+ * Creates demo users, a sample workspace with channels, and example messages.
+ * Provides ready-to-use test credentials for local development.
+ */
+
 import { pool } from './index.js';
 import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
@@ -5,7 +11,15 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-async function seed() {
+/**
+ * Seeds the database with demo data for development.
+ * Creates four demo users (alice, bob, charlie, diana) with a shared password,
+ * a workspace called "Acme Corp", three channels (general, random, engineering),
+ * and sample messages with threading and reactions.
+ * Outputs demo credentials to console upon completion.
+ * @throws Error if seeding fails, with details logged to console
+ */
+async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   try {

@@ -1,11 +1,29 @@
 /**
- * Edit Tool - Modify existing files using string replacement
+ * Edit Tool - Modify existing files using string replacement.
+ *
+ * This tool enables the AI assistant to make targeted modifications to existing files.
+ * Unlike line-number based editing, string replacement is more robust because it doesn't
+ * break when line numbers change during a session. The LLM must provide enough context
+ * in the old_string to make it unique within the file.
+ *
+ * @module tools/edit
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Tool, ToolContext, ToolResult } from '../types/index.js';
 
+/**
+ * EditTool implementation for modifying files via string replacement.
+ *
+ * Features:
+ * - Replaces exact string matches in files
+ * - Requires unique matches by default (prevents accidental multi-replacements)
+ * - Supports replace_all flag for intentional multiple replacements
+ * - Reports the number of replacements made
+ *
+ * This tool requires user approval as file modifications are potentially destructive.
+ */
 export const EditTool: Tool = {
   name: 'Edit',
   description: 'Edit an existing file by replacing a string. The old_string must be unique in the file unless replace_all is true.',

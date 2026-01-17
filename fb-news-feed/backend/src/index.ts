@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Main entry point for the Facebook News Feed backend server.
+ * Sets up Express HTTP server with WebSocket support for real-time feed updates.
+ * Implements a hybrid push/pull notification system using Redis pub/sub.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
@@ -10,10 +16,16 @@ import userRoutes from './routes/users.js';
 import postRoutes from './routes/posts.js';
 import feedRoutes from './routes/feed.js';
 
+/** Express application instance */
 const app = express();
+
+/** HTTP server wrapping the Express app to support WebSocket upgrades */
 const server = createServer(app);
+
+/** WebSocket server for real-time feed updates */
 const wss = new WebSocketServer({ server });
 
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || '3000');
 
 // Middleware
@@ -34,7 +46,11 @@ app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/posts', postRoutes);
 app.use('/api/v1/feed', feedRoutes);
 
-// WebSocket connections for real-time updates
+/**
+ * Map of user IDs to their active WebSocket connections.
+ * Enables targeting specific users for real-time notifications.
+ * Multiple connections per user are supported (e.g., multiple browser tabs).
+ */
 const userConnections = new Map<string, Set<WebSocket>>();
 
 wss.on('connection', async (ws, req) => {
@@ -90,7 +106,15 @@ wss.on('connection', async (ws, req) => {
   ws.send(JSON.stringify({ type: 'connected', userId }));
 });
 
-// Broadcast new post to followers (called from fanout service)
+/**
+ * Broadcasts a new post notification to a specific user via Redis pub/sub.
+ * This enables real-time feed updates in a distributed system where
+ * WebSocket connections may be spread across multiple server instances.
+ *
+ * @param userId - The target user's ID to receive the notification
+ * @param postData - The post data to broadcast (serialized to JSON)
+ * @returns Promise that resolves when the message is published
+ */
 export async function broadcastNewPost(userId: string, postData: object): Promise<void> {
   const message = JSON.stringify({ type: 'new_post', data: postData });
 
@@ -104,7 +128,12 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
+/**
+ * Initializes and starts the server after verifying database connections.
+ * Tests PostgreSQL and Redis connectivity before accepting traffic.
+ *
+ * @returns Promise that resolves when server is listening
+ */
 async function start() {
   try {
     await testConnections();

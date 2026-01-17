@@ -1,13 +1,33 @@
+/**
+ * Authentication service for user registration, login, and session management.
+ * Uses bcrypt for password hashing and Redis for fast session validation.
+ */
 import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../db/pool.js';
 import redis from '../db/redis.js';
 import type { User, Session } from '../types/index.js';
 
-const SESSION_TTL = 24 * 60 * 60; // 24 hours in seconds
+/** Session time-to-live in seconds (24 hours) */
+const SESSION_TTL = 24 * 60 * 60;
+/** Number of bcrypt salt rounds for password hashing */
 const SALT_ROUNDS = 10;
 
+/**
+ * Service class handling all authentication-related operations.
+ * Manages user registration, login, logout, and session validation.
+ */
 export class AuthService {
+  /**
+   * Registers a new user with the provided credentials.
+   * Passwords are hashed using bcrypt before storage.
+   *
+   * @param email - User's email address (must be unique)
+   * @param password - Plain text password to be hashed
+   * @param name - User's display name
+   * @returns The newly created user (without password_hash)
+   * @throws Error if email is already registered
+   */
   async register(email: string, password: string, name: string): Promise<User> {
     // Check if user exists
     const existing = await query('SELECT id FROM users WHERE email = $1', [email]);
@@ -26,6 +46,15 @@ export class AuthService {
     return result.rows[0];
   }
 
+  /**
+   * Authenticates a user and creates a new session.
+   * The session is stored in both PostgreSQL (for durability) and Redis (for fast lookup).
+   *
+   * @param email - User's email address
+   * @param password - Plain text password to verify
+   * @returns Object containing the authenticated user and session details
+   * @throws Error if credentials are invalid
+   */
   async login(email: string, password: string): Promise<{ user: User; session: Session }> {
     const result = await query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
@@ -64,11 +93,23 @@ export class AuthService {
     return { user, session };
   }
 
+  /**
+   * Invalidates a user session by removing it from both database and Redis.
+   *
+   * @param sessionId - The session ID to invalidate
+   */
   async logout(sessionId: string): Promise<void> {
     await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
     await redis.del(`session:${sessionId}`);
   }
 
+  /**
+   * Validates a session and returns the associated user info.
+   * First checks Redis cache for fast lookup, falls back to database if not cached.
+   *
+   * @param sessionId - The session ID to validate
+   * @returns User ID and role if valid, null if invalid or expired
+   */
   async validateSession(sessionId: string): Promise<{ userId: string; role: string } | null> {
     // Try Redis first
     const cached = await redis.get(`session:${sessionId}`);
@@ -100,6 +141,12 @@ export class AuthService {
     return { userId: user_id, role };
   }
 
+  /**
+   * Retrieves a user by their ID.
+   *
+   * @param userId - The user's unique identifier
+   * @returns The user object or null if not found
+   */
   async getUserById(userId: string): Promise<User | null> {
     const result = await query(
       'SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = $1',
@@ -109,4 +156,5 @@ export class AuthService {
   }
 }
 
+/** Singleton instance of AuthService for use throughout the application */
 export const authService = new AuthService();

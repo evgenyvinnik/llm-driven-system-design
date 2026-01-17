@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Authentication middleware for protecting API routes.
+ * Implements session-based authentication with Redis caching for performance.
+ * Sessions are validated against both Redis cache and PostgreSQL database.
+ */
+
 import { Request, Response, NextFunction } from 'express';
 import { pool, redis } from '../db/connection.js';
 import type { User } from '../types/index.js';
@@ -12,6 +18,16 @@ declare global {
   }
 }
 
+/**
+ * Express middleware that validates Bearer tokens and attaches user to request.
+ * First checks Redis cache for fast session lookup, falls back to PostgreSQL.
+ * Caches valid sessions in Redis for 1 hour to reduce database load.
+ *
+ * @param req - Express request object (will have user and sessionToken attached on success)
+ * @param res - Express response object
+ * @param next - Express next function
+ * @returns Promise that resolves when authentication check completes
+ */
 export async function authMiddleware(
   req: Request,
   res: Response,
@@ -91,6 +107,16 @@ export async function authMiddleware(
   }
 }
 
+/**
+ * Optional authentication middleware for routes that work with or without auth.
+ * Attempts to authenticate if token is present, but continues without user if not.
+ * Useful for routes like viewing posts where logged-in users see extra features.
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @param next - Express next function
+ * @returns Promise that resolves when authentication check completes
+ */
 export async function optionalAuthMiddleware(
   req: Request,
   res: Response,
@@ -109,6 +135,15 @@ export async function optionalAuthMiddleware(
   });
 }
 
+/**
+ * Middleware that restricts access to admin users only.
+ * Must be used after authMiddleware to ensure user is authenticated.
+ * Returns 403 Forbidden if authenticated user is not an admin.
+ *
+ * @param req - Express request object (must have user from authMiddleware)
+ * @param res - Express response object
+ * @param next - Express next function
+ */
 export function adminMiddleware(
   req: Request,
   res: Response,

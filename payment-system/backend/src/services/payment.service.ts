@@ -18,12 +18,19 @@ import { redis } from '../db/connection.js';
 import { LedgerService } from './ledger.service.js';
 import { FraudService } from './fraud.service.js';
 
+/**
+ * Core payment processing service.
+ * Handles the full lifecycle of payments: creation, authorization, capture, and void.
+ * Coordinates with fraud detection, ledger recording, and idempotency handling.
+ */
 export class PaymentService {
   private ledgerService: LedgerService;
   private fraudService: FraudService;
 
   // Fee configuration (from env or defaults)
+  /** Percentage fee charged on each transaction (e.g., 2.9 = 2.9%) */
   private feePercent = parseFloat(process.env.TRANSACTION_FEE_PERCENT || '2.9');
+  /** Fixed fee in cents added to each transaction (e.g., 30 = $0.30) */
   private feeFixed = parseInt(process.env.TRANSACTION_FEE_FIXED || '30', 10);
 
   constructor() {
@@ -32,14 +39,21 @@ export class PaymentService {
   }
 
   /**
-   * Calculate platform fee for a transaction
+   * Calculates the platform fee for a given transaction amount.
+   * Uses percentage + fixed fee model (e.g., 2.9% + $0.30).
+   * @param amount - Transaction amount in cents
+   * @returns Fee amount in cents, rounded to nearest cent
    */
   calculateFee(amount: number): number {
     return Math.round(amount * (this.feePercent / 100) + this.feeFixed);
   }
 
   /**
-   * Check idempotency key - returns existing response if found
+   * Checks if a payment request has already been processed using its idempotency key.
+   * Prevents duplicate charges when clients retry failed network requests.
+   * Checks Redis cache first, then falls back to database lookup.
+   * @param key - Unique idempotency key provided by the client
+   * @returns Existing transaction if found, null if this is a new request
    */
   async checkIdempotency(key: string): Promise<Transaction | null> {
     // First check Redis cache

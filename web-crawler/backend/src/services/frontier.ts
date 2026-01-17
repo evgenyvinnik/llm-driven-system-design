@@ -1,3 +1,20 @@
+/**
+ * @fileoverview URL Frontier Service for the distributed web crawler.
+ *
+ * The URL frontier is the heart of any web crawler - it manages the queue of URLs
+ * to be crawled with priority-based scheduling. This implementation uses a hybrid
+ * approach with PostgreSQL for durability and Redis for fast access patterns.
+ *
+ * Key responsibilities:
+ * - Adding new URLs with deduplication (via Redis visited set)
+ * - Priority-based URL scheduling (high/medium/low queues)
+ * - Per-domain rate limiting (via Redis distributed locks)
+ * - Status tracking (pending, in_progress, completed, failed)
+ * - Recovery of stale in-progress URLs after worker crashes
+ *
+ * @module services/frontier
+ */
+
 import { pool } from '../models/database.js';
 import { redis, REDIS_KEYS } from '../models/redis.js';
 import {
@@ -10,30 +27,85 @@ import {
 } from '../utils/url.js';
 import { config } from '../config.js';
 
+/**
+ * Represents a URL entry in the frontier queue.
+ */
 export interface FrontierUrl {
+  /** Unique database ID */
   id: number;
+  /** The normalized URL string */
   url: string;
+  /** SHA-256 hash of the normalized URL for fast lookup */
   urlHash: string;
+  /** Domain hostname extracted from the URL */
   domain: string;
+  /** Priority level: 3 (high), 2 (medium), 1 (low) */
   priority: number;
+  /** Depth from seed URL (0 = seed, 1 = one hop, etc.) */
   depth: number;
+  /** Current status: pending, in_progress, completed, failed */
   status: string;
+  /** When this URL was scheduled for crawling */
   scheduledAt: Date;
 }
 
+/**
+ * Options for adding URLs to the frontier.
+ */
 export interface AddUrlOptions {
+  /** Override the calculated priority (1-3) */
   priority?: number;
+  /** Override the calculated depth */
   depth?: number;
+  /** URL of the page where this link was found */
   parentUrl?: string;
 }
 
 /**
- * URL Frontier Service
- * Manages the queue of URLs to be crawled with priority-based scheduling
+ * URL Frontier Service - manages the queue of URLs to be crawled.
+ *
+ * This service provides the core scheduling logic for the distributed crawler.
+ * It ensures URLs are crawled in priority order while respecting rate limits
+ * and avoiding duplicate work.
+ *
+ * @example
+ * ```typescript
+ * import { frontierService } from './services/frontier';
+ *
+ * // Add seed URLs with high priority
+ * await frontierService.addUrls(['https://example.com'], { priority: 3, depth: 0 });
+ *
+ * // Get next URL to crawl
+ * const url = await frontierService.getNextUrl('worker-1');
+ * if (url) {
+ *   // Crawl the URL...
+ *   await frontierService.markCompleted(url.urlHash);
+ * }
+ * ```
  */
 export class FrontierService {
   /**
-   * Add a URL to the frontier (if not already visited/queued)
+   * Adds a single URL to the frontier if not already visited or queued.
+   *
+   * This method performs several checks before adding:
+   * 1. Normalizes the URL for consistent deduplication
+   * 2. Checks if URL should be crawled (HTTP/HTTPS, not a binary file)
+   * 3. Checks Redis visited set for duplicates (O(1) lookup)
+   * 4. Inserts into PostgreSQL with ON CONFLICT DO NOTHING
+   * 5. Adds to Redis priority queue for fast retrieval
+   *
+   * @param url - The URL to add to the frontier
+   * @param options - Optional priority, depth, and parent URL
+   * @returns true if URL was added, false if skipped (duplicate or filtered)
+   *
+   * @example
+   * ```typescript
+   * const added = await frontierService.addUrl('https://example.com/page', {
+   *   priority: 2,
+   *   depth: 1,
+   * });
+   * console.log(added ? 'URL queued' : 'URL skipped');
+   * ```
    */
   async addUrl(url: string, options: AddUrlOptions = {}): Promise<boolean> {
     const normalized = normalizeUrl(url);
@@ -86,7 +158,22 @@ export class FrontierService {
   }
 
   /**
-   * Add multiple URLs to the frontier in batch
+   * Adds multiple URLs to the frontier in batch.
+   *
+   * Processes URLs sequentially to ensure proper deduplication.
+   * For better performance with large batches, consider parallel processing
+   * with a controlled concurrency limit.
+   *
+   * @param urls - Array of URLs to add
+   * @param options - Options applied to all URLs
+   * @returns Number of URLs successfully added (excluding duplicates)
+   *
+   * @example
+   * ```typescript
+   * const extractedLinks = ['https://example.com/a', 'https://example.com/b'];
+   * const added = await frontierService.addUrls(extractedLinks, { depth: 2 });
+   * console.log(`Added ${added} of ${extractedLinks.length} links`);
+   * ```
    */
   async addUrls(urls: string[], options: AddUrlOptions = {}): Promise<number> {
     let added = 0;
@@ -98,7 +185,29 @@ export class FrontierService {
   }
 
   /**
-   * Get next URL to crawl for a specific domain (respecting rate limits)
+   * Gets the next URL to crawl for a worker.
+   *
+   * This method implements the core scheduling logic:
+   * 1. Checks priority queues in order (high -> medium -> low)
+   * 2. For each URL, attempts to acquire a domain lock for rate limiting
+   * 3. Marks the URL as in_progress and removes from Redis queue
+   * 4. Returns the URL if lock acquired, continues to next if not
+   *
+   * The domain lock ensures only one worker crawls a domain at a time,
+   * respecting the crawl delay from robots.txt or the default delay.
+   *
+   * @param workerId - Unique identifier of the requesting worker
+   * @returns The next URL to crawl, or null if no URLs available
+   *
+   * @example
+   * ```typescript
+   * const frontierUrl = await frontierService.getNextUrl('worker-1');
+   * if (frontierUrl) {
+   *   console.log(`Crawling: ${frontierUrl.url} (priority: ${frontierUrl.priority})`);
+   * } else {
+   *   console.log('No URLs available');
+   * }
+   * ```
    */
   async getNextUrl(workerId: string): Promise<FrontierUrl | null> {
     // Try to get from high priority first, then medium, then low
@@ -162,7 +271,17 @@ export class FrontierService {
   }
 
   /**
-   * Acquire lock for a domain to enforce rate limiting
+   * Acquires a distributed lock for a domain to enforce rate limiting.
+   *
+   * Uses Redis SET with NX (only if not exists) and EX (expiry) to create
+   * an atomic, self-expiring lock. This ensures:
+   * - Only one worker can crawl a domain at any time
+   * - Lock auto-releases after the crawl delay period
+   * - No deadlocks even if worker crashes
+   *
+   * @param domain - The domain to acquire lock for
+   * @param workerId - ID of the worker requesting the lock
+   * @returns true if lock acquired, false if domain is locked by another worker
    */
   async acquireDomainLock(domain: string, workerId: string): Promise<boolean> {
     const lockKey = REDIS_KEYS.DOMAIN_LOCK(domain);
@@ -180,7 +299,12 @@ export class FrontierService {
   }
 
   /**
-   * Mark a URL as completed
+   * Marks a URL as successfully completed.
+   *
+   * Updates the frontier status to 'completed' and adds the URL hash
+   * to the visited set to prevent re-crawling.
+   *
+   * @param urlHash - SHA-256 hash of the URL to mark complete
    */
   async markCompleted(urlHash: string): Promise<void> {
     await pool.query(
@@ -193,7 +317,14 @@ export class FrontierService {
   }
 
   /**
-   * Mark a URL as failed
+   * Marks a URL as failed.
+   *
+   * Updates the frontier status to 'failed' and adds to visited set
+   * to prevent immediate retry. Future enhancement: implement retry logic
+   * with exponential backoff.
+   *
+   * @param urlHash - SHA-256 hash of the URL that failed
+   * @param error - Optional error message for debugging
    */
   async markFailed(urlHash: string, error?: string): Promise<void> {
     await pool.query(
@@ -206,7 +337,12 @@ export class FrontierService {
   }
 
   /**
-   * Get frontier statistics
+   * Gets aggregated statistics about the frontier.
+   *
+   * Queries the database to count URLs by status and total unique domains.
+   * Used by the dashboard to display crawler progress.
+   *
+   * @returns Object containing counts for each status and total domains
    */
   async getStats(): Promise<{
     pending: number;
@@ -248,7 +384,14 @@ export class FrontierService {
   }
 
   /**
-   * Get recent frontier entries
+   * Gets recently updated URLs from the frontier.
+   *
+   * Useful for the dashboard to show current crawl activity.
+   * Can be filtered by status to show only pending, in_progress, etc.
+   *
+   * @param limit - Maximum number of URLs to return (default: 50)
+   * @param status - Optional status filter
+   * @returns Array of recent frontier URLs sorted by update time
    */
   async getRecentUrls(
     limit: number = 50,
@@ -283,7 +426,23 @@ export class FrontierService {
   }
 
   /**
-   * Clear all stale in-progress URLs (for recovery after worker crash)
+   * Recovers stale in-progress URLs after worker crashes.
+   *
+   * When a worker crashes, URLs it was processing remain in 'in_progress'
+   * state forever. This method resets them to 'pending' so they can be
+   * picked up by other workers.
+   *
+   * Should be called periodically by a cleanup job or on server startup.
+   *
+   * @param olderThanMinutes - Reset URLs that have been in_progress longer than this
+   * @returns Number of URLs recovered
+   *
+   * @example
+   * ```typescript
+   * // Recover URLs stuck for more than 10 minutes
+   * const recovered = await frontierService.recoverStaleUrls(10);
+   * console.log(`Recovered ${recovered} stale URLs`);
+   * ```
    */
   async recoverStaleUrls(olderThanMinutes: number = 10): Promise<number> {
     const result = await pool.query(
@@ -298,4 +457,8 @@ export class FrontierService {
   }
 }
 
+/**
+ * Singleton instance of the FrontierService.
+ * Use this export for all frontier operations to ensure consistent state.
+ */
 export const frontierService = new FrontierService();

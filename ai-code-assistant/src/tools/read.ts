@@ -1,11 +1,28 @@
 /**
- * Read Tool - Read file contents
+ * Read Tool - Read file contents.
+ *
+ * This tool allows the AI assistant to read file contents from the filesystem.
+ * It's a core capability for code understanding, debugging, and modification workflows.
+ * Files are returned with line numbers for easy reference in subsequent edit operations.
+ *
+ * @module tools/read
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Tool, ToolContext, ToolResult } from '../types/index.js';
 
+/**
+ * ReadTool implementation for reading file contents.
+ *
+ * Features:
+ * - Reads files with 1-indexed line numbers for easy reference
+ * - Supports offset and limit for reading large files in chunks
+ * - Resolves relative paths against the working directory
+ * - Checks read permissions before accessing files
+ *
+ * This tool does not require user approval as reading is considered safe.
+ */
 export const ReadTool: Tool = {
   name: 'Read',
   description: 'Read contents of a file. Returns file content with line numbers.',

@@ -1,6 +1,13 @@
 import type { Location } from '../types/index.js';
 
-// Haversine formula to calculate distance between two points in km
+/**
+ * Calculates the great-circle distance between two geographic points using the Haversine formula.
+ * Essential for delivery distance calculations and driver proximity searches.
+ *
+ * @param point1 - First geographic location
+ * @param point2 - Second geographic location
+ * @returns Distance between the points in kilometers
+ */
 export function haversineDistance(point1: Location, point2: Location): number {
   const R = 6371; // Earth's radius in kilometers
 
@@ -19,11 +26,25 @@ export function haversineDistance(point1: Location, point2: Location): number {
   return R * c;
 }
 
+/**
+ * Converts degrees to radians for trigonometric calculations.
+ *
+ * @param deg - Angle in degrees
+ * @returns Angle in radians
+ */
 function toRad(deg: number): number {
   return deg * (Math.PI / 180);
 }
 
-// Calculate estimated time based on distance and vehicle type
+/**
+ * Estimates travel time based on distance and vehicle type.
+ * Uses realistic average speeds accounting for urban traffic, stops, and navigation.
+ * Critical for providing customers with accurate delivery ETAs.
+ *
+ * @param distanceKm - Distance to travel in kilometers
+ * @param vehicleType - Type of delivery vehicle (affects speed assumptions)
+ * @returns Estimated travel time in seconds
+ */
 export function calculateETA(
   distanceKm: number,
   vehicleType: 'bicycle' | 'motorcycle' | 'car' | 'van' = 'car'
@@ -43,7 +64,15 @@ export function calculateETA(
   return Math.round(hours * 3600);
 }
 
-// Calculate delivery fee based on distance
+/**
+ * Calculates delivery fee based on distance from merchant to customer.
+ * Uses a base fee plus per-kilometer charge model common in delivery platforms.
+ *
+ * @param distanceKm - Delivery distance in kilometers
+ * @param baseFee - Minimum fee charged regardless of distance (default $2.99)
+ * @param perKmFee - Additional charge per kilometer (default $0.50)
+ * @returns Total delivery fee rounded to 2 decimal places
+ */
 export function calculateDeliveryFee(
   distanceKm: number,
   baseFee: number = 2.99,
@@ -53,7 +82,15 @@ export function calculateDeliveryFee(
   return Math.round(fee * 100) / 100; // Round to 2 decimal places
 }
 
-// Check if a point is within a radius of a center point
+/**
+ * Checks if a point falls within a circular delivery zone.
+ * Used to determine if a merchant can deliver to a given address.
+ *
+ * @param point - Location to check
+ * @param center - Center of the delivery zone
+ * @param radiusKm - Radius of the delivery zone in kilometers
+ * @returns True if the point is within the radius
+ */
 export function isWithinRadius(
   point: Location,
   center: Location,
@@ -62,7 +99,16 @@ export function isWithinRadius(
   return haversineDistance(point, center) <= radiusKm;
 }
 
-// Get geohash prefix for a location (simplified version)
+/**
+ * Generates a simplified geohash prefix for a location.
+ * Geohashes enable efficient spatial indexing by converting 2D coordinates to a 1D string.
+ * Note: This is a demonstration implementation; use a proper geohash library in production.
+ *
+ * @param lat - Latitude in decimal degrees
+ * @param lng - Longitude in decimal degrees
+ * @param precision - Length of the geohash prefix (default 5, ~2.4km precision)
+ * @returns Geohash string prefix
+ */
 export function getGeohashPrefix(lat: number, lng: number, precision: number = 5): string {
   // Simplified geohash encoding for demonstration
   // In production, use a proper geohash library
@@ -111,7 +157,13 @@ export function getGeohashPrefix(lat: number, lng: number, precision: number = 5
   return result;
 }
 
-// Format address for display
+/**
+ * Normalizes an address string for consistent display.
+ * Trims whitespace, removes empty parts, and ensures proper comma separation.
+ *
+ * @param address - Raw address string
+ * @returns Formatted address string
+ */
 export function formatAddress(address: string): string {
   return address
     .split(',')
@@ -120,7 +172,14 @@ export function formatAddress(address: string): string {
     .join(', ');
 }
 
-// Generate random location within radius (for testing)
+/**
+ * Generates a random location within a specified radius of a center point.
+ * Useful for testing and simulating driver movements in development.
+ *
+ * @param center - Center point of the area
+ * @param radiusKm - Maximum distance from center in kilometers
+ * @returns Random location within the specified radius
+ */
 export function randomLocationInRadius(
   center: Location,
   radiusKm: number

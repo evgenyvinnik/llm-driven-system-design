@@ -1,11 +1,28 @@
 /**
- * Write Tool - Create new files
+ * Write Tool - Create new files.
+ *
+ * This tool enables the AI assistant to create new files or overwrite existing ones.
+ * It's essential for code generation, configuration creation, and scaffolding workflows.
+ * The tool automatically creates parent directories if they don't exist.
+ *
+ * @module tools/write
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Tool, ToolContext, ToolResult } from '../types/index.js';
 
+/**
+ * WriteTool implementation for creating files.
+ *
+ * Features:
+ * - Creates new files with specified content
+ * - Automatically creates parent directories
+ * - Returns file size and line count on success
+ * - Resolves relative paths against the working directory
+ *
+ * This tool requires user approval as file writes are potentially destructive.
+ */
 export const WriteTool: Tool = {
   name: 'Write',
   description: 'Write content to a new file. Will overwrite if file exists.',

@@ -1,15 +1,33 @@
+/**
+ * @fileoverview Database seeding script for development and testing.
+ * Populates the database with sample users, friendships, and posts.
+ * Also indexes all posts in Elasticsearch for immediate searchability.
+ */
+
 import { pool } from '../config/database.js';
 import { esClient, POSTS_INDEX, initializeElasticsearch } from '../config/elasticsearch.js';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import type { Visibility, PostType, PostDocument } from '../types/index.js';
 
-// Simple password hashing (for demo purposes - use bcrypt in production)
+/**
+ * Hashes a password using SHA-256.
+ * Note: Use bcrypt in production for secure password hashing.
+ * @param password - Plain text password to hash
+ * @returns Hexadecimal hash string
+ */
 function hashPassword(password: string): string {
   return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-// Generate visibility fingerprints for a post
+/**
+ * Generates visibility fingerprints for privacy-aware search filtering.
+ * These fingerprints are stored in Elasticsearch and matched against user visibility sets.
+ * @param authorId - The post author's user ID
+ * @param visibility - The post's visibility setting
+ * @param friendIds - Array of the author's friend IDs (used for friends_of_friends)
+ * @returns Array of fingerprint strings (e.g., ['PUBLIC'], ['FRIENDS:userId'])
+ */
 function generateVisibilityFingerprints(
   authorId: string,
   visibility: Visibility,
@@ -34,20 +52,32 @@ function generateVisibilityFingerprints(
   return fingerprints;
 }
 
-// Extract hashtags from content
+/**
+ * Extracts hashtags from post content.
+ * @param content - Post content text
+ * @returns Array of lowercase hashtags including the # prefix
+ */
 function extractHashtags(content: string): string[] {
   const regex = /#(\w+)/g;
   const matches = content.match(regex);
   return matches ? matches.map((m) => m.toLowerCase()) : [];
 }
 
-// Extract mentions from content
+/**
+ * Extracts user mentions from post content.
+ * @param content - Post content text
+ * @returns Array of lowercase mentions including the @ prefix
+ */
 function extractMentions(content: string): string[] {
   const regex = /@(\w+)/g;
   const matches = content.match(regex);
   return matches ? matches.map((m) => m.toLowerCase()) : [];
 }
 
+/**
+ * Sample user data for seeding the database.
+ * Includes regular users and one admin account.
+ */
 const sampleUsers = [
   { username: 'alice', email: 'alice@example.com', display_name: 'Alice Johnson', password: 'password123' },
   { username: 'bob', email: 'bob@example.com', display_name: 'Bob Smith', password: 'password123' },
@@ -60,6 +90,10 @@ const sampleUsers = [
   { username: 'admin', email: 'admin@example.com', display_name: 'System Admin', password: 'admin123', role: 'admin' },
 ];
 
+/**
+ * Sample posts with varied content, visibility settings, and post types.
+ * Contains hashtags for testing hashtag search and filtering.
+ */
 const samplePosts: { content: string; visibility: Visibility; post_type: PostType }[] = [
   { content: 'Just had an amazing birthday party! Thanks everyone for coming! #birthday #party #celebration', visibility: 'public', post_type: 'text' },
   { content: 'Working on a new machine learning project. The results are promising! #ml #ai #tech', visibility: 'public', post_type: 'text' },
@@ -88,6 +122,15 @@ const samplePosts: { content: string; visibility: Visibility; post_type: PostTyp
   { content: 'Happy Friday everyone! What are your weekend plans? #friday #weekend #tgif', visibility: 'public', post_type: 'text' },
 ];
 
+/**
+ * Main seeding function that populates the database with sample data.
+ * - Initializes Elasticsearch index
+ * - Clears existing data from all tables
+ * - Creates sample users with hashed passwords
+ * - Creates bidirectional friendships (Alice and Bob are friends with everyone)
+ * - Creates sample posts with randomized authors and engagement metrics
+ * - Bulk indexes all posts in Elasticsearch
+ */
 async function seed() {
   console.log('Seeding database...');
 

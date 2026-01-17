@@ -4,9 +4,20 @@ import { query, queryOne, execute } from '../utils/db.js';
 import { redis } from '../utils/redis.js';
 import type { User, CreateUserInput, Session } from '../types/index.js';
 
+/** Number of bcrypt salt rounds for password hashing. Higher = more secure but slower. */
 const SALT_ROUNDS = 10;
+
+/** Session validity period in hours before requiring re-authentication. */
 const SESSION_EXPIRY_HOURS = 24;
 
+/**
+ * Creates a new user account with hashed password.
+ * Core registration function for customers, drivers, and merchants.
+ *
+ * @param input - User registration data including email, password, and role
+ * @returns The newly created user (without password hash)
+ * @throws Error if user creation fails (e.g., duplicate email)
+ */
 export async function createUser(input: CreateUserInput): Promise<User> {
   const passwordHash = await bcrypt.hash(input.password, SALT_ROUNDS);
 
@@ -24,6 +35,13 @@ export async function createUser(input: CreateUserInput): Promise<User> {
   return result;
 }
 
+/**
+ * Retrieves a user by their unique identifier.
+ * Returns user data without the password hash for security.
+ *
+ * @param id - The user's UUID
+ * @returns User object or null if not found
+ */
 export async function getUserById(id: string): Promise<User | null> {
   return queryOne<User>(
     `SELECT id, email, name, phone, role, created_at, updated_at
@@ -32,6 +50,13 @@ export async function getUserById(id: string): Promise<User | null> {
   );
 }
 
+/**
+ * Retrieves a user by their email address.
+ * Includes password hash for authentication purposes.
+ *
+ * @param email - The user's email address
+ * @returns User object with password hash, or null if not found
+ */
 export async function getUserByEmail(email: string): Promise<User | null> {
   return queryOne<User & { password_hash: string }>(
     `SELECT id, email, password_hash, name, phone, role, created_at, updated_at
@@ -40,6 +65,14 @@ export async function getUserByEmail(email: string): Promise<User | null> {
   );
 }
 
+/**
+ * Validates user credentials for login.
+ * Compares provided password against stored bcrypt hash.
+ *
+ * @param email - User's email address
+ * @param password - Plain text password to verify
+ * @returns User object (without password) if valid, null otherwise
+ */
 export async function validatePassword(
   email: string,
   password: string
@@ -55,6 +88,15 @@ export async function validatePassword(
   return userWithoutPassword as User;
 }
 
+/**
+ * Creates a new authenticated session for a user.
+ * Stores session in both PostgreSQL (durability) and Redis (fast lookups).
+ * Uses UUID tokens for security instead of predictable identifiers.
+ *
+ * @param userId - The user's unique identifier
+ * @returns Session object containing token and expiry
+ * @throws Error if session creation fails
+ */
 export async function createSession(userId: string): Promise<Session> {
   const token = uuidv4();
   const expiresAt = new Date();
@@ -81,6 +123,14 @@ export async function createSession(userId: string): Promise<Session> {
   return session;
 }
 
+/**
+ * Validates a session token and returns the associated user ID.
+ * Checks Redis cache first for performance, falls back to database.
+ * Automatically removes expired sessions.
+ *
+ * @param token - The session token to validate
+ * @returns Object with userId if valid, null if expired or invalid
+ */
 export async function getSessionByToken(token: string): Promise<{ userId: string } | null> {
   // Try Redis first
   const cached = await redis.get(`session:${token}`);
@@ -117,11 +167,23 @@ export async function getSessionByToken(token: string): Promise<{ userId: string
   return { userId: session.user_id };
 }
 
+/**
+ * Invalidates a session token (logout).
+ * Removes from both database and Redis cache.
+ *
+ * @param token - The session token to invalidate
+ */
 export async function deleteSession(token: string): Promise<void> {
   await execute(`DELETE FROM sessions WHERE token = $1`, [token]);
   await redis.del(`session:${token}`);
 }
 
+/**
+ * Invalidates all sessions for a user (force logout everywhere).
+ * Useful for password changes or security concerns.
+ *
+ * @param userId - The user whose sessions should be invalidated
+ */
 export async function deleteUserSessions(userId: string): Promise<void> {
   const sessions = await query<{ token: string }>(
     `SELECT token FROM sessions WHERE user_id = $1`,
@@ -137,6 +199,14 @@ export async function deleteUserSessions(userId: string): Promise<void> {
   }
 }
 
+/**
+ * Updates a user's profile information.
+ * Only allows updating name and phone (not email or role).
+ *
+ * @param id - The user's unique identifier
+ * @param updates - Partial user data to update
+ * @returns Updated user object or null if not found
+ */
 export async function updateUser(
   id: string,
   updates: Partial<Pick<User, 'name' | 'phone'>>
@@ -168,6 +238,15 @@ export async function updateUser(
   );
 }
 
+/**
+ * Changes a user's password after verifying the old password.
+ * Requires knowledge of current password for security.
+ *
+ * @param userId - The user's unique identifier
+ * @param oldPassword - Current password for verification
+ * @param newPassword - New password to set
+ * @returns True if password changed successfully, false if old password invalid
+ */
 export async function changePassword(
   userId: string,
   oldPassword: string,

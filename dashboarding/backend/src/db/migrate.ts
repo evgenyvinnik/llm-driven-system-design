@@ -1,5 +1,23 @@
+/**
+ * @fileoverview Database migration script for TimescaleDB schema setup.
+ *
+ * This module creates all necessary tables, indexes, and hypertables for
+ * the metrics monitoring system. It enables TimescaleDB extension and sets up:
+ * - User authentication tables
+ * - Metric definitions and time-series data storage
+ * - Hourly and daily rollup tables for efficient historical queries
+ * - Dashboard and panel configuration
+ * - Alert rules and instances
+ *
+ * Run with: npm run db:migrate
+ */
+
 import pool from './pool.js';
 
+/**
+ * Array of SQL migration statements to be executed in order.
+ * Each statement is idempotent (uses IF NOT EXISTS) for safe re-runs.
+ */
 const migrations = [
   // Enable TimescaleDB extension
   `CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;`,
@@ -120,6 +138,16 @@ const migrations = [
    ON alert_instances (rule_id, status);`,
 ];
 
+/**
+ * Executes all database migrations sequentially.
+ *
+ * Acquires a single database connection and runs each migration statement
+ * in order. If any migration fails, the error is logged and re-thrown.
+ * The connection pool is properly closed after migration completes.
+ *
+ * @returns Promise that resolves when all migrations complete successfully
+ * @throws Error if any migration statement fails
+ */
 async function migrate() {
   console.log('Running database migrations...');
   const client = await pool.connect();

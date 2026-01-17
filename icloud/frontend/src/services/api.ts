@@ -1,6 +1,31 @@
+/**
+ * Base URL for all API requests.
+ * Points to the versioned API endpoint to ensure backward compatibility.
+ */
 const API_BASE = '/api/v1';
 
+/**
+ * Centralized HTTP client for all iCloud API interactions.
+ *
+ * This class provides a unified interface for communicating with the backend,
+ * handling authentication, error parsing, and consistent request formatting.
+ * It abstracts away fetch boilerplate and ensures all requests include proper
+ * credentials and headers for session-based authentication.
+ */
 class ApiClient {
+  /**
+   * Executes an HTTP request to the API with standardized error handling.
+   *
+   * All requests automatically include JSON content type headers and credentials
+   * for cookie-based session authentication. Errors from the server are parsed
+   * and thrown as Error objects for consistent handling upstream.
+   *
+   * @template T - The expected response type
+   * @param endpoint - API endpoint path (appended to API_BASE)
+   * @param options - Standard fetch RequestInit options
+   * @returns Promise resolving to the parsed JSON response
+   * @throws Error with server error message or generic failure message
+   */
   private async request<T>(
     endpoint: string,
     options: RequestInit = {}
@@ -23,6 +48,18 @@ class ApiClient {
   }
 
   // Auth
+
+  /**
+   * Authenticates a user with email and password credentials.
+   *
+   * Creates a new session and optionally registers the current browser as a device.
+   * The device registration enables multi-device sync tracking for conflict detection.
+   *
+   * @param email - User's email address
+   * @param password - User's password
+   * @param deviceName - Optional friendly name for this device (defaults to browser info)
+   * @returns User info, device ID, and session token for WebSocket authentication
+   */
   async login(email: string, password: string, deviceName?: string) {
     return this.request<{
       user: { id: string; email: string; role: string; storageQuota: number; storageUsed: number };
@@ -34,6 +71,17 @@ class ApiClient {
     });
   }
 
+  /**
+   * Creates a new user account and establishes a session.
+   *
+   * Registers the user with the provided credentials and automatically logs them in.
+   * Also registers the current browser as the user's first device for sync tracking.
+   *
+   * @param email - Email address for the new account
+   * @param password - Password for the new account
+   * @param deviceName - Optional friendly name for this device
+   * @returns User info, device ID, and session token
+   */
   async register(email: string, password: string, deviceName?: string) {
     return this.request<{
       user: { id: string; email: string; role: string; storageQuota: number; storageUsed: number };
@@ -45,10 +93,26 @@ class ApiClient {
     });
   }
 
+  /**
+   * Terminates the current user session.
+   *
+   * Invalidates the session cookie and cleans up server-side session data.
+   * The WebSocket connection should be closed separately.
+   *
+   * @returns Confirmation of logout
+   */
   async logout() {
     return this.request('/auth/logout', { method: 'POST' });
   }
 
+  /**
+   * Retrieves the currently authenticated user's information.
+   *
+   * Used to restore session state on page reload by checking if a valid
+   * session cookie exists. Returns user profile and current device ID.
+   *
+   * @returns Current user info and device ID, or throws if not authenticated
+   */
   async getCurrentUser() {
     return this.request<{
       user: { id: string; email: string; role: string; storageQuota: number; storageUsed: number };
@@ -57,6 +121,17 @@ class ApiClient {
   }
 
   // Files
+
+  /**
+   * Lists files and folders in a specified directory.
+   *
+   * Returns the contents of a directory in the user's iCloud Drive.
+   * Optionally includes soft-deleted files for recovery purposes.
+   *
+   * @param path - Directory path to list (defaults to root '/')
+   * @param includeDeleted - Whether to include soft-deleted files
+   * @returns The path and array of file/folder items
+   */
   async listFiles(path: string = '/', includeDeleted: boolean = false) {
     const params = new URLSearchParams({ path, includeDeleted: String(includeDeleted) });
     return this.request<{ path: string; files: import('../types').FileItem[] }>(
@@ -64,10 +139,23 @@ class ApiClient {
     );
   }
 
+  /**
+   * Retrieves metadata for a specific file.
+   *
+   * @param fileId - Unique identifier of the file
+   * @returns File metadata including sync status and version info
+   */
   async getFile(fileId: string) {
     return this.request<import('../types').FileItem>(`/files/${fileId}`);
   }
 
+  /**
+   * Creates a new folder in the user's iCloud Drive.
+   *
+   * @param name - Name of the new folder
+   * @param parentPath - Path where the folder should be created (defaults to root)
+   * @returns The created folder's metadata
+   */
   async createFolder(name: string, parentPath: string = '/') {
     return this.request<import('../types').FileItem>('/files/folder', {
       method: 'POST',
@@ -75,6 +163,16 @@ class ApiClient {
     });
   }
 
+  /**
+   * Uploads a file to iCloud Drive.
+   *
+   * Uses multipart form data for file upload. The file is chunked and
+   * deduplicated on the server for efficient storage and delta sync.
+   *
+   * @param file - File object to upload
+   * @param parentPath - Directory path where the file should be stored
+   * @returns The created file's metadata
+   */
   async uploadFile(file: File, parentPath: string = '/') {
     const formData = new FormData();
     formData.append('file', file);
@@ -94,6 +192,16 @@ class ApiClient {
     return response.json();
   }
 
+  /**
+   * Downloads a file's content as a binary blob.
+   *
+   * Reconstructs the file from its stored chunks and returns the complete
+   * file content for saving to the local filesystem.
+   *
+   * @param fileId - Unique identifier of the file to download
+   * @returns Binary blob of the file content
+   * @throws Error if download fails
+   */
   async downloadFile(fileId: string): Promise<Blob> {
     const response = await fetch(`${API_BASE}/files/${fileId}/download`, {
       credentials: 'include',
@@ -106,12 +214,30 @@ class ApiClient {
     return response.blob();
   }
 
+  /**
+   * Soft-deletes a file or folder.
+   *
+   * Marks the file as deleted but retains it for recovery. Files are
+   * permanently purged after a retention period (typically 30 days).
+   *
+   * @param fileId - Unique identifier of the file to delete
+   * @returns Confirmation message and file ID
+   */
   async deleteFile(fileId: string) {
     return this.request<{ message: string; id: string }>(`/files/${fileId}`, {
       method: 'DELETE',
     });
   }
 
+  /**
+   * Renames a file or folder.
+   *
+   * Updates the file's name while preserving its location and version history.
+   *
+   * @param fileId - Unique identifier of the file
+   * @param name - New name for the file
+   * @returns Updated file metadata
+   */
   async renameFile(fileId: string, name: string) {
     return this.request<import('../types').FileItem>(`/files/${fileId}`, {
       method: 'PATCH',
@@ -119,6 +245,13 @@ class ApiClient {
     });
   }
 
+  /**
+   * Moves a file or folder to a new location.
+   *
+   * @param fileId - Unique identifier of the file
+   * @param newPath - Destination directory path
+   * @returns Updated file metadata with new path
+   */
   async moveFile(fileId: string, newPath: string) {
     return this.request<import('../types').FileItem>(`/files/${fileId}`, {
       method: 'PATCH',
@@ -126,6 +259,15 @@ class ApiClient {
     });
   }
 
+  /**
+   * Retrieves the version history of a file.
+   *
+   * Returns all stored versions of the file, including conflict copies.
+   * Useful for reviewing changes or restoring previous versions.
+   *
+   * @param fileId - Unique identifier of the file
+   * @returns File ID and array of version metadata
+   */
   async getFileVersions(fileId: string) {
     return this.request<{ fileId: string; versions: import('../types').FileVersion[] }>(
       `/files/${fileId}/versions`
@@ -133,10 +275,29 @@ class ApiClient {
   }
 
   // Sync
+
+  /**
+   * Retrieves the current sync state for this device.
+   *
+   * Returns the device's sync cursor and last sync timestamp, which are
+   * used to determine what changes need to be fetched from the server.
+   *
+   * @returns Current device sync state including cursor position
+   */
   async getSyncState() {
     return this.request<import('../types').SyncState>('/sync/state');
   }
 
+  /**
+   * Fetches changes from the server since a given cursor.
+   *
+   * Used for incremental sync to efficiently download only changes that
+   * occurred since the last sync. Returns categorized changes (created,
+   * updated, deleted) for easy processing.
+   *
+   * @param since - Cursor from previous sync (omit for full sync)
+   * @returns Categorized changes, new cursor, and hasMore flag for pagination
+   */
   async getChanges(since?: string) {
     const params = since ? `?since=${encodeURIComponent(since)}` : '';
     return this.request<{

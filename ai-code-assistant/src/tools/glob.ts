@@ -1,11 +1,29 @@
 /**
- * Glob Tool - Find files by pattern
+ * Glob Tool - Find files by pattern.
+ *
+ * This tool enables the AI assistant to discover files in the codebase using
+ * glob patterns. It's essential for understanding project structure, finding
+ * related files, and navigating large codebases. Results are sorted alphabetically
+ * and exclude common non-code directories like node_modules and .git.
+ *
+ * @module tools/glob
  */
 
 import { glob as globAsync } from 'glob';
 import * as path from 'path';
 import type { Tool, ToolContext, ToolResult } from '../types/index.js';
 
+/**
+ * GlobTool implementation for finding files by pattern.
+ *
+ * Features:
+ * - Supports standard glob patterns (*, **, ?, etc.)
+ * - Returns absolute paths sorted alphabetically
+ * - Excludes node_modules and .git directories by default
+ * - Truncates results if more than 500 files match
+ *
+ * This tool does not require user approval as it only reads directory structure.
+ */
 export const GlobTool: Tool = {
   name: 'Glob',
   description: 'Find files matching a glob pattern. Returns list of matching file paths.',

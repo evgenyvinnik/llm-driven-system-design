@@ -1,13 +1,34 @@
+/**
+ * @fileoverview Metric query service with intelligent table selection and caching.
+ *
+ * Provides optimized time-series queries by automatically selecting the
+ * appropriate data table (raw, hourly rollup, or daily rollup) based on
+ * the requested time range. Implements Redis caching for query results
+ * to reduce database load.
+ */
+
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import type { MetricQueryParams, QueryResult, DataPoint } from '../types/index.js';
 
+/**
+ * Represents a time range with start and end dates.
+ */
 interface TimeRange {
   start: Date;
   end: Date;
 }
 
-// Parse interval string (e.g., '1m', '5m', '1h', '1d') to PostgreSQL interval
+/**
+ * Parses a human-readable interval string to PostgreSQL interval format.
+ *
+ * @param interval - Interval string like '1m', '5m', '1h', '1d'
+ * @returns PostgreSQL-compatible interval string
+ *
+ * @example
+ * parseInterval('5m') // Returns '5 minute'
+ * parseInterval('1h') // Returns '1 hour'
+ */
 function parseInterval(interval: string): string {
   const match = interval.match(/^(\d+)(s|m|h|d)$/);
   if (!match) return '1 minute';
@@ -22,7 +43,17 @@ function parseInterval(interval: string): string {
   return `${num} ${units[unit]}`;
 }
 
-// Select the appropriate table based on time range
+/**
+ * Selects the optimal data table based on the query time range.
+ *
+ * Uses a tiered approach to balance query performance with data granularity:
+ * - Raw metrics table for ranges up to 6 hours (full resolution)
+ * - Hourly rollups for ranges up to 7 days (reduced storage scan)
+ * - Daily rollups for longer ranges (maximum efficiency)
+ *
+ * @param timeRange - The query time range
+ * @returns The table name to query
+ */
 function selectTable(timeRange: TimeRange): string {
   const diffHours =
     (timeRange.end.getTime() - timeRange.start.getTime()) / (1000 * 60 * 60);
@@ -36,11 +67,27 @@ function selectTable(timeRange: TimeRange): string {
   }
 }
 
-// Generate cache key for query
+/**
+ * Generates a unique cache key for a query based on its parameters.
+ *
+ * @param params - The query parameters
+ * @returns A JSON string representing the query for cache lookup
+ */
 function getCacheKey(params: MetricQueryParams): string {
   return `query:${JSON.stringify(params)}`;
 }
 
+/**
+ * Executes a time-series query for metrics matching the specified criteria.
+ *
+ * Automatically selects the optimal data source (raw or rollup tables),
+ * applies time bucketing for aggregation, and caches results in Redis.
+ * Historical queries (end time > 1 hour ago) are cached for 1 hour,
+ * while recent queries have a 10-second cache for near-real-time updates.
+ *
+ * @param params - Query parameters including metric name, time range, and aggregation
+ * @returns Array of query results, grouped by metric series
+ */
 export async function queryMetrics(params: MetricQueryParams): Promise<QueryResult[]> {
   const {
     metric_name,
@@ -169,7 +216,15 @@ export async function queryMetrics(params: MetricQueryParams): Promise<QueryResu
   return results;
 }
 
-// Get the latest value for a metric
+/**
+ * Retrieves the most recent value for a metric.
+ *
+ * Useful for stat panels and gauges that display current values.
+ *
+ * @param metricName - The metric name to query
+ * @param tags - Optional tags to filter by
+ * @returns The latest value and timestamp, or null if no data exists
+ */
 export async function getLatestValue(
   metricName: string,
   tags?: Record<string, string>
@@ -199,7 +254,18 @@ export async function getLatestValue(
   return result.rows[0] || null;
 }
 
-// Get statistics for a metric over a time range
+/**
+ * Calculates aggregate statistics for a metric over a time range.
+ *
+ * Computes min, max, avg, and count across all matching data points.
+ * Useful for summary panels and alert evaluation.
+ *
+ * @param metricName - The metric name to analyze
+ * @param startTime - Start of the time range
+ * @param endTime - End of the time range
+ * @param tags - Optional tags to filter by
+ * @returns Aggregated statistics, or null if no matching data
+ */
 export async function getMetricStats(
   metricName: string,
   startTime: Date,

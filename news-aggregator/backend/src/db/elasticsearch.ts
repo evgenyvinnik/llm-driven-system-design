@@ -1,10 +1,19 @@
 import { Client } from '@elastic/elasticsearch';
 
+/**
+ * Elasticsearch client for full-text search capabilities.
+ * Enables fast, relevance-ranked searching across articles and stories.
+ */
 export const esClient = new Client({
   node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200',
 });
 
-// Initialize Elasticsearch indexes
+/**
+ * Initialize Elasticsearch indexes for articles and stories.
+ * Creates indexes with appropriate mappings if they don't exist.
+ * Should be called once during application startup.
+ * @returns Promise that resolves when initialization is complete
+ */
 export async function initElasticsearch(): Promise<void> {
   const articlesIndexExists = await esClient.indices.exists({ index: 'articles' });
 
@@ -77,7 +86,21 @@ export async function initElasticsearch(): Promise<void> {
   }
 }
 
-// Index an article
+/**
+ * Index an article for full-text search.
+ * Allows the article to be found through search queries on title, summary, and body.
+ * @param article - The article data to index
+ * @param article.id - Unique article identifier (used as document ID)
+ * @param article.title - Article headline
+ * @param article.summary - Brief description of the article
+ * @param article.body - Full article text content
+ * @param article.topics - Array of topic classifications
+ * @param article.entities - Named entities extracted from the article
+ * @param article.published_at - Publication timestamp
+ * @param article.source_id - ID of the news source
+ * @param article.story_id - ID of the story cluster (if assigned)
+ * @param article.fingerprint - SimHash fingerprint for deduplication
+ */
 export async function indexArticle(article: {
   id: string;
   title: string;
@@ -100,7 +123,21 @@ export async function indexArticle(article: {
   });
 }
 
-// Index a story
+/**
+ * Index a story for full-text search.
+ * Stories represent clusters of related articles about the same topic.
+ * @param story - The story data to index
+ * @param story.id - Unique story identifier (used as document ID)
+ * @param story.title - Representative headline for the story
+ * @param story.summary - Brief summary of the story
+ * @param story.primary_topic - Main topic classification
+ * @param story.topics - All topic classifications
+ * @param story.velocity - Rate of new articles being added
+ * @param story.is_breaking - Whether this is breaking news
+ * @param story.article_count - Number of articles in this story
+ * @param story.created_at - When the story was first detected
+ * @param story.updated_at - Last update timestamp
+ */
 export async function indexStory(story: {
   id: string;
   title: string;
@@ -120,7 +157,17 @@ export async function indexStory(story: {
   });
 }
 
-// Search articles
+/**
+ * Search articles using full-text search with optional filters.
+ * Returns articles ranked by relevance, with title matches weighted highest.
+ * @param query - The search query string
+ * @param options - Search options for filtering
+ * @param options.topics - Filter to articles matching any of these topics
+ * @param options.dateFrom - Filter to articles published on or after this date
+ * @param options.dateTo - Filter to articles published on or before this date
+ * @param options.limit - Maximum number of results to return (default: 20)
+ * @returns Array of article IDs with their relevance scores
+ */
 export async function searchArticles(
   query: string,
   options: {

@@ -1,11 +1,24 @@
 import { Client } from '@elastic/elasticsearch';
 
+/**
+ * Elasticsearch client configuration.
+ * Elasticsearch powers full-text search for users and jobs with fuzzy matching.
+ */
 const elasticConfig = {
   node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200',
 };
 
+/**
+ * Elasticsearch client singleton for search operations.
+ * Provides full-text search with relevance ranking for user and job discovery.
+ */
 export const esClient = new Client(elasticConfig);
 
+/**
+ * Initializes Elasticsearch indices for users and jobs if they do not exist.
+ * Creates optimized mappings for text search with appropriate analyzers.
+ * Called once at server startup to ensure search infrastructure is ready.
+ */
 export async function initializeElasticsearch(): Promise<void> {
   try {
     // Create users index
@@ -63,6 +76,13 @@ export async function initializeElasticsearch(): Promise<void> {
   }
 }
 
+/**
+ * Indexes a user document for search.
+ * Called when users register or update their profiles to keep search data fresh.
+ * Fields are weighted by importance for relevance scoring.
+ *
+ * @param user - User data to index including name, headline, skills, and companies
+ */
 export async function indexUser(user: {
   id: number;
   first_name: string;
@@ -81,6 +101,13 @@ export async function indexUser(user: {
   });
 }
 
+/**
+ * Indexes a job document for search.
+ * Called when jobs are created or updated to enable job discovery.
+ * Includes company info and skills for comprehensive matching.
+ *
+ * @param job - Job data to index including title, description, and required skills
+ */
 export async function indexJob(job: {
   id: number;
   title: string;
@@ -100,6 +127,15 @@ export async function indexJob(job: {
   });
 }
 
+/**
+ * Searches for users matching a query string.
+ * Uses multi-match across name, headline, summary, skills, and companies.
+ * Names are boosted 2x for higher relevance in people search.
+ *
+ * @param query - The search query string
+ * @param limit - Maximum number of results to return (default: 20)
+ * @returns Array of matching user IDs, ordered by relevance
+ */
 export async function searchUsers(query: string, limit = 20): Promise<number[]> {
   const result = await esClient.search({
     index: 'users',
@@ -116,6 +152,17 @@ export async function searchUsers(query: string, limit = 20): Promise<number[]> 
   return result.hits.hits.map((hit) => parseInt(hit._id!));
 }
 
+/**
+ * Searches for jobs matching a query string with optional filters.
+ * Uses multi-match across title, description, company, and skills.
+ * Job title is boosted 3x, skills 2x for relevance in job search.
+ * Only returns active jobs by default.
+ *
+ * @param query - The search query string
+ * @param filters - Optional filters for location, remote, employment type, and experience level
+ * @param limit - Maximum number of results to return (default: 20)
+ * @returns Array of matching job IDs, ordered by relevance
+ */
 export async function searchJobs(
   query: string,
   filters?: {

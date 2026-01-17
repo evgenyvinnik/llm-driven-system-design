@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   # Redis for distributed rate limit state

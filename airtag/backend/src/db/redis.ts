@@ -1,5 +1,11 @@
 import Redis from 'ioredis';
 
+/**
+ * Redis client for session storage and real-time pub/sub notifications.
+ * Used by express-session for distributed session management and by
+ * NotificationService to broadcast notifications to connected clients.
+ * Includes exponential backoff retry strategy for connection resilience.
+ */
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),

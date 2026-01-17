@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Authentication routes for user registration, login, and logout.
+ * Handles session creation with UUID tokens stored in both PostgreSQL and Redis.
+ * Sessions expire after 7 days and are cached in Redis for fast validation.
+ */
+
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
@@ -5,9 +11,14 @@ import { pool, redis } from '../db/connection.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { RegisterRequest, LoginRequest, UserPublic } from '../types/index.js';
 
+/** Express router for authentication endpoints */
 const router = Router();
 
-// Register
+/**
+ * POST /register - Creates a new user account with hashed password.
+ * Validates uniqueness of email and username before creating user.
+ * Automatically creates session and returns token for immediate login.
+ */
 router.post('/register', async (req: Request, res: Response) => {
   try {
     const { username, email, password, display_name } = req.body as RegisterRequest;
@@ -73,7 +84,11 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 });
 
-// Login
+/**
+ * POST /login - Authenticates user with email and password.
+ * Verifies password against bcrypt hash and creates new session.
+ * Returns user profile and session token on success.
+ */
 router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body as LoginRequest;
@@ -135,7 +150,11 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
-// Logout
+/**
+ * POST /logout - Invalidates the current session.
+ * Removes session from both PostgreSQL and Redis cache.
+ * Requires valid authentication token.
+ */
 router.post('/logout', authMiddleware, async (req: Request, res: Response) => {
   try {
     const token = req.sessionToken;
@@ -153,7 +172,11 @@ router.post('/logout', authMiddleware, async (req: Request, res: Response) => {
   }
 });
 
-// Get current user
+/**
+ * GET /me - Returns the authenticated user's profile.
+ * Used by frontend to validate session and get current user data.
+ * Requires valid authentication token.
+ */
 router.get('/me', authMiddleware, async (req: Request, res: Response) => {
   try {
     const user = req.user!;

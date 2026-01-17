@@ -1,3 +1,12 @@
+/**
+ * @fileoverview Main entry point for the Dashboarding API server.
+ *
+ * This module initializes and starts the Express server with all middleware,
+ * routes, and background services needed for the metrics monitoring and
+ * visualization system. It sets up session management with Redis, security
+ * headers, request compression, and structured logging.
+ */
+
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -13,6 +22,10 @@ import dashboardsRoutes from './routes/dashboards.js';
 import alertsRoutes from './routes/alerts.js';
 import { startAlertEvaluator } from './services/alertService.js';
 
+/**
+ * Pino logger instance configured with pretty printing for development.
+ * Log level is controlled via LOG_LEVEL environment variable.
+ */
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: {

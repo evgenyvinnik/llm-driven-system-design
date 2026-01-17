@@ -1,5 +1,14 @@
+/**
+ * Redis client configuration for the Ticketmaster backend.
+ * Redis is used for session storage, distributed locks, seat reservation holds,
+ * and the virtual waiting room queue management.
+ */
 import Redis from 'ioredis';
 
+/**
+ * Redis client instance configured with exponential backoff retry strategy.
+ * The connection is shared across the application for efficient resource usage.
+ */
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),

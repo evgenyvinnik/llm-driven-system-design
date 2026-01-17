@@ -1,4 +1,7 @@
-// Job status enum
+/**
+ * Job status enum representing the lifecycle state of a job.
+ * Jobs transition through these states as they are scheduled, executed, and completed.
+ */
 export enum JobStatus {
   SCHEDULED = 'SCHEDULED',
   QUEUED = 'QUEUED',
@@ -8,7 +11,10 @@ export enum JobStatus {
   FAILED = 'FAILED',
 }
 
-// Execution status enum
+/**
+ * Execution status enum representing the state of a single job execution attempt.
+ * An execution is one run of a job, which may be retried multiple times.
+ */
 export enum ExecutionStatus {
   PENDING = 'PENDING',
   RUNNING = 'RUNNING',
@@ -19,7 +25,10 @@ export enum ExecutionStatus {
   DEDUPLICATED = 'DEDUPLICATED',
 }
 
-// Priority levels
+/**
+ * Priority levels for job scheduling.
+ * Higher priority jobs are dequeued and executed before lower priority ones.
+ */
 export enum Priority {
   LOW = 25,
   NORMAL = 50,
@@ -27,7 +36,10 @@ export enum Priority {
   CRITICAL = 100,
 }
 
-// Job definition
+/**
+ * Job definition representing a schedulable unit of work.
+ * Jobs can be one-time or recurring (via cron schedule).
+ */
 export interface Job {
   id: string;
   name: string;
@@ -46,7 +58,10 @@ export interface Job {
   updated_at: Date;
 }
 
-// Job creation input
+/**
+ * Input for creating a new job.
+ * Only name and handler are required; other fields have sensible defaults.
+ */
 export interface CreateJobInput {
   name: string;
   description?: string;
@@ -61,7 +76,10 @@ export interface CreateJobInput {
   timeout_ms?: number;
 }
 
-// Job update input
+/**
+ * Input for updating an existing job.
+ * All fields are optional; only provided fields will be updated.
+ */
 export interface UpdateJobInput {
   name?: string;
   description?: string;
@@ -75,7 +93,10 @@ export interface UpdateJobInput {
   timeout_ms?: number;
 }
 
-// Job execution record
+/**
+ * Record of a single job execution attempt.
+ * Tracks timing, status, results, and the worker that processed it.
+ */
 export interface JobExecution {
   id: string;
   job_id: string;
@@ -91,7 +112,10 @@ export interface JobExecution {
   created_at: Date;
 }
 
-// Queue item
+/**
+ * Item in the Redis priority queue awaiting worker pickup.
+ * Used internally by the reliable queue implementation.
+ */
 export interface QueueItem {
   execution_id: string;
   job_id: string;
@@ -99,7 +123,10 @@ export interface QueueItem {
   enqueued_at: number;
 }
 
-// Worker info
+/**
+ * Information about a worker process.
+ * Workers poll the queue and execute jobs; this tracks their health and stats.
+ */
 export interface WorkerInfo {
   id: string;
   status: 'idle' | 'busy';
@@ -109,7 +136,10 @@ export interface WorkerInfo {
   jobs_failed: number;
 }
 
-// System metrics
+/**
+ * Aggregated system metrics for monitoring and dashboard display.
+ * Combines job, execution, queue, and worker statistics.
+ */
 export interface SystemMetrics {
   total_jobs: number;
   active_jobs: number;
@@ -121,7 +151,11 @@ export interface SystemMetrics {
   scheduler_is_leader: boolean;
 }
 
-// API response wrapper
+/**
+ * Standard API response wrapper for consistent frontend handling.
+ * All API endpoints return data in this format.
+ * @template T - The type of data in the response
+ */
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
@@ -129,7 +163,11 @@ export interface ApiResponse<T> {
   message?: string;
 }
 
-// Pagination
+/**
+ * Paginated response for list endpoints.
+ * Includes metadata for client-side pagination controls.
+ * @template T - The type of items in the list
+ */
 export interface PaginatedResponse<T> {
   items: T[];
   total: number;
@@ -138,7 +176,10 @@ export interface PaginatedResponse<T> {
   total_pages: number;
 }
 
-// Job with execution stats
+/**
+ * Job with aggregated execution statistics.
+ * Used in job list views to show success/failure rates without extra queries.
+ */
 export interface JobWithStats extends Job {
   total_executions: number;
   successful_executions: number;
@@ -147,7 +188,10 @@ export interface JobWithStats extends Job {
   avg_duration_ms: number | null;
 }
 
-// Execution log entry
+/**
+ * Log entry from a job execution.
+ * Handlers can emit logs that are stored and displayed in the execution detail view.
+ */
 export interface ExecutionLog {
   id: string;
   execution_id: string;

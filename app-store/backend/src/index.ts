@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Main entry point for the App Store backend server.
+ * Initializes Express with security middleware, API routes, and external services.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -9,6 +14,7 @@ import { errorHandler, notFound } from './middleware/errorHandler.js';
 import { initializeElasticsearch } from './config/elasticsearch.js';
 import { ensureBuckets } from './config/minio.js';
 
+/** Express application instance configured with middleware stack */
 const app = express();
 
 // Middleware
@@ -29,7 +35,11 @@ app.use(`/api/${config.api.version}`, routes);
 app.use(notFound);
 app.use(errorHandler);
 
-// Start server
+/**
+ * Initializes external services and starts the HTTP server.
+ * Connects to Elasticsearch and ensures MinIO buckets exist before accepting requests.
+ * @returns Promise that resolves when server is running or rejects on failure
+ */
 async function start() {
   try {
     // Initialize services

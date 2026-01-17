@@ -1,4 +1,8 @@
-// Database configuration
+/**
+ * PostgreSQL database connection configuration.
+ * Provides connection parameters for the main data store where URLs, users,
+ * sessions, and click events are persisted.
+ */
 export const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '5432', 10),
@@ -7,13 +11,20 @@ export const DB_CONFIG = {
   password: process.env.DB_PASSWORD || 'bitly_password',
 };
 
-// Redis configuration
+/**
+ * Redis/Valkey cache connection configuration.
+ * Used for URL lookup caching and session storage to reduce database load.
+ */
 export const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379', 10),
 };
 
-// Server configuration
+/**
+ * Express server configuration.
+ * Defines the HTTP server settings including port, host, and CORS origin
+ * for frontend communication.
+ */
 export const SERVER_CONFIG = {
   port: parseInt(process.env.PORT || '3000', 10),
   host: process.env.HOST || '0.0.0.0',
@@ -21,7 +32,10 @@ export const SERVER_CONFIG = {
   corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
 };
 
-// URL shortening configuration
+/**
+ * URL shortening service configuration.
+ * Controls short code generation, key pool management, and URL validation rules.
+ */
 export const URL_CONFIG = {
   shortCodeLength: 7,
   keyPoolBatchSize: 100,
@@ -31,13 +45,19 @@ export const URL_CONFIG = {
   reservedWords: ['admin', 'api', 'login', 'signup', 'logout', 'health', 'status'],
 };
 
-// Cache configuration
+/**
+ * Cache TTL configuration for different data types.
+ * Balances freshness vs performance for URL lookups and sessions.
+ */
 export const CACHE_CONFIG = {
   urlTTL: 86400, // 24 hours in seconds
   sessionTTL: 86400 * 7, // 7 days in seconds
 };
 
-// Rate limiting configuration
+/**
+ * Rate limiting configuration for API endpoints.
+ * Protects against abuse and ensures fair usage across users.
+ */
 export const RATE_LIMIT_CONFIG = {
   createUrl: {
     windowMs: 60 * 60 * 1000, // 1 hour
@@ -53,12 +73,18 @@ export const RATE_LIMIT_CONFIG = {
   },
 };
 
-// Authentication configuration
+/**
+ * Authentication and session configuration.
+ * Defines password hashing strength, session duration, and cookie settings.
+ */
 export const AUTH_CONFIG = {
   bcryptRounds: 10,
   sessionDuration: 7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
   cookieName: 'bitly_session',
 };
 
-// Server identifier for key allocation
+/**
+ * Unique identifier for this server instance.
+ * Used for key pool allocation to prevent multiple servers from using the same keys.
+ */
 export const SERVER_ID = process.env.SERVER_ID || `server-${process.pid}`;

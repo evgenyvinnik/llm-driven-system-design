@@ -1,13 +1,26 @@
+/**
+ * @fileoverview Elasticsearch client and index configuration for app search.
+ * Provides full-text search, fuzzy matching, and autocomplete suggestions.
+ */
+
 import { Client } from '@elastic/elasticsearch';
 import { config } from './index.js';
 
+/**
+ * Elasticsearch client instance for search operations.
+ */
 export const esClient = new Client({
   node: config.elasticsearch.url,
 });
 
-// Index configuration for apps
+/** Index name for app documents in Elasticsearch */
 export const APP_INDEX = 'apps';
 
+/**
+ * Elasticsearch index mapping for app documents.
+ * Defines field types, analyzers, and search configurations.
+ * Includes completion suggester for autocomplete functionality.
+ */
 export const appIndexMapping = {
   mappings: {
     properties: {
@@ -61,6 +74,11 @@ export const appIndexMapping = {
   },
 };
 
+/**
+ * Creates the apps index if it does not exist.
+ * Called during server startup to ensure search infrastructure is ready.
+ * @throws Error if Elasticsearch is unreachable or index creation fails
+ */
 export async function initializeElasticsearch(): Promise<void> {
   try {
     const indexExists = await esClient.indices.exists({ index: APP_INDEX });

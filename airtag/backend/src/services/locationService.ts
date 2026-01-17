@@ -9,9 +9,19 @@ import { KeyManager, decryptLocation, encryptLocation } from '../utils/crypto.js
 import { deviceService } from './deviceService.js';
 import { notificationService } from './notificationService.js';
 
+/**
+ * Service for managing location reports in the Find My network.
+ * Handles the privacy-preserving crowd-sourced location system where
+ * the server stores only encrypted location data that only device owners can decrypt.
+ */
 export class LocationService {
   /**
-   * Submit a location report (from a finder device in the network)
+   * Submit an encrypted location report from a finder device.
+   * This simulates what happens when an iPhone detects a nearby AirTag
+   * and reports its location to Apple's servers.
+   *
+   * @param data - The location report containing identifier hash and encrypted payload
+   * @returns The stored location report
    */
   async submitReport(data: LocationReportRequest): Promise<LocationReport> {
     const result = await pool.query(
@@ -28,7 +38,11 @@ export class LocationService {
   }
 
   /**
-   * Query location reports by identifier hashes
+   * Query location reports by identifier hashes.
+   * Used internally to fetch encrypted reports for a device.
+   *
+   * @param identifierHashes - Array of identifier hashes to search for
+   * @returns Matching encrypted location reports
    */
   async queryReports(identifierHashes: string[]): Promise<LocationReport[]> {
     if (identifierHashes.length === 0) return [];
@@ -44,7 +58,14 @@ export class LocationService {
   }
 
   /**
-   * Get locations for a device (decrypted)
+   * Get decrypted location history for a device.
+   * Fetches encrypted reports, decrypts them using the master secret,
+   * and returns a list of plaintext locations.
+   *
+   * @param deviceId - The UUID of the device
+   * @param userId - The ID of the user who should own the device
+   * @param options - Query options for time range and limit
+   * @returns Array of decrypted location data, sorted by timestamp descending
    */
   async getDeviceLocations(
     deviceId: string,
@@ -87,7 +108,11 @@ export class LocationService {
   }
 
   /**
-   * Get the latest location for a device
+   * Get the most recent location for a device.
+   *
+   * @param deviceId - The UUID of the device
+   * @param userId - The ID of the user who should own the device
+   * @returns The most recent decrypted location, or null if none found
    */
   async getLatestLocation(
     deviceId: string,
@@ -98,7 +123,13 @@ export class LocationService {
   }
 
   /**
-   * Simulate a location report (for testing/demo purposes)
+   * Simulate a location report for testing/demo purposes.
+   * Creates an encrypted location report as if a finder device detected the AirTag.
+   *
+   * @param deviceId - The UUID of the device to report location for
+   * @param userId - The ID of the user who should own the device
+   * @param location - The simulated GPS coordinates
+   * @returns The created location report, or null if device not found
    */
   async simulateLocationReport(
     deviceId: string,
@@ -123,7 +154,10 @@ export class LocationService {
   }
 
   /**
-   * Check if a device is in lost mode and notify owner
+   * Check if a reported device is in lost mode and notify its owner.
+   * Called automatically when a new location report is submitted.
+   *
+   * @param identifierHash - The identifier hash from the location report
    */
   private async checkLostModeAndNotify(identifierHash: string): Promise<void> {
     // Find devices that might match this identifier
@@ -154,7 +188,10 @@ export class LocationService {
   }
 
   /**
-   * Get location report statistics (for admin)
+   * Get location report statistics for the admin dashboard.
+   * Provides total count, recent counts, and regional breakdown.
+   *
+   * @returns Statistics object with totals and breakdowns
    */
   async getReportStats(): Promise<{
     total: number;

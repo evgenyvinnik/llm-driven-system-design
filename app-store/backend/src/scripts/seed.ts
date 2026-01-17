@@ -1,8 +1,18 @@
+/**
+ * @fileoverview Database seeding script for the App Store.
+ * Creates demo users, categories, sample apps, and reviews.
+ * Run with: npm run db:seed
+ */
+
 import { pool } from '../config/database.js';
 import { v4 as uuid } from 'uuid';
 import bcrypt from 'bcryptjs';
 import { esClient, APP_INDEX, initializeElasticsearch } from '../config/elasticsearch.js';
 
+/**
+ * Category definitions with subcategories for the app store.
+ * Each category has a name, URL-safe slug, icon, and list of subcategories.
+ */
 const categories = [
   { name: 'Games', slug: 'games', icon: 'gamepad', subcategories: ['Action', 'Puzzle', 'Strategy', 'Adventure', 'Simulation', 'Racing'] },
   { name: 'Productivity', slug: 'productivity', icon: 'briefcase', subcategories: ['Documents', 'Notes', 'Task Management', 'Calendar'] },
@@ -16,6 +26,10 @@ const categories = [
   { name: 'Travel', slug: 'travel', icon: 'map', subcategories: ['Navigation', 'Booking', 'Guides'] },
 ];
 
+/**
+ * Sample app definitions for seeding the catalog.
+ * Each app has metadata, pricing, and category assignment.
+ */
 const sampleApps = [
   {
     bundleId: 'com.example.photomagic',
@@ -149,6 +163,11 @@ const sampleApps = [
   },
 ];
 
+/**
+ * Seeds the database with demo data for development and testing.
+ * Creates users (admin, developer, regular), categories, apps, and sample reviews.
+ * Also indexes apps in Elasticsearch for search functionality.
+ */
 async function seed() {
   console.log('Starting seed...');
 

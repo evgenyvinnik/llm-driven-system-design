@@ -1,5 +1,18 @@
+/**
+ * Base URL for all API requests.
+ * Uses relative path to work with the Vite proxy in development.
+ */
 const API_BASE = '/api';
 
+/**
+ * Handles API response parsing and error handling.
+ * Provides consistent error extraction from JSON responses.
+ *
+ * @template T - The expected response body type
+ * @param response - The fetch Response object
+ * @returns Promise resolving to the parsed JSON body
+ * @throws Error with message from API or generic failure message
+ */
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Request failed' }));
@@ -8,8 +21,25 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+/**
+ * API client for the online auction system.
+ * Provides methods for authentication, auction management, bidding,
+ * notifications, and admin operations.
+ *
+ * All methods include credentials for session-based authentication
+ * and use the handleResponse helper for consistent error handling.
+ */
 export const api = {
-  // Auth
+  // ============ Authentication ============
+
+  /**
+   * Registers a new user account.
+   *
+   * @param username - Display name for the user
+   * @param email - Email address for login
+   * @param password - Account password
+   * @returns User data and session token
+   */
   async register(username: string, email: string, password: string) {
     const response = await fetch(`${API_BASE}/auth/register`, {
       method: 'POST',
@@ -20,6 +50,13 @@ export const api = {
     return handleResponse<{ user: import('../types').User; token: string }>(response);
   },
 
+  /**
+   * Authenticates user with email and password.
+   *
+   * @param email - User's email address
+   * @param password - User's password
+   * @returns User data and session token
+   */
   async login(email: string, password: string) {
     const response = await fetch(`${API_BASE}/auth/login`, {
       method: 'POST',
@@ -30,6 +67,11 @@ export const api = {
     return handleResponse<{ user: import('../types').User; token: string }>(response);
   },
 
+  /**
+   * Logs out the current user and invalidates their session.
+   *
+   * @returns Confirmation message
+   */
   async logout() {
     const response = await fetch(`${API_BASE}/auth/logout`, {
       method: 'POST',
@@ -38,6 +80,12 @@ export const api = {
     return handleResponse<{ message: string }>(response);
   },
 
+  /**
+   * Retrieves current authenticated user's profile.
+   * Used to validate session on app load.
+   *
+   * @returns Current user data
+   */
   async getMe() {
     const response = await fetch(`${API_BASE}/auth/me`, {
       credentials: 'include',
@@ -45,7 +93,20 @@ export const api = {
     return handleResponse<{ user: import('../types').User }>(response);
   },
 
-  // Auctions
+  // ============ Auctions ============
+
+  /**
+   * Fetches paginated list of auctions with optional filters.
+   *
+   * @param params - Optional filter and pagination parameters
+   * @param params.status - Filter by auction status (active, ended, etc.)
+   * @param params.sort - Field to sort by
+   * @param params.order - Sort order (asc/desc)
+   * @param params.page - Page number for pagination
+   * @param params.limit - Items per page
+   * @param params.search - Search term for title/description
+   * @returns Paginated auction list
+   */
   async getAuctions(params?: {
     status?: string;
     sort?: string;
@@ -68,6 +129,13 @@ export const api = {
     );
   },
 
+  /**
+   * Fetches detailed information for a single auction.
+   * Includes bid history, user's auto-bid settings, and watch status.
+   *
+   * @param id - Auction ID
+   * @returns Full auction details with bids and user context
+   */
   async getAuction(id: string) {
     const response = await fetch(`${API_BASE}/auctions/${id}`, {
       credentials: 'include',
@@ -75,6 +143,13 @@ export const api = {
     return handleResponse<import('../types').AuctionDetail>(response);
   },
 
+  /**
+   * Creates a new auction listing.
+   * Supports image upload via FormData.
+   *
+   * @param data - FormData containing auction details and optional image
+   * @returns Created auction data
+   */
   async createAuction(data: FormData) {
     const response = await fetch(`${API_BASE}/auctions`, {
       method: 'POST',
@@ -84,6 +159,13 @@ export const api = {
     return handleResponse<{ auction: import('../types').Auction }>(response);
   },
 
+  /**
+   * Updates an existing auction (before bidding starts).
+   *
+   * @param id - Auction ID to update
+   * @param data - FormData containing updated fields
+   * @returns Updated auction data
+   */
   async updateAuction(id: string, data: FormData) {
     const response = await fetch(`${API_BASE}/auctions/${id}`, {
       method: 'PUT',

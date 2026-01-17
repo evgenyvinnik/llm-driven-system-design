@@ -1,4 +1,7 @@
-// URL model types
+/**
+ * URL database model representing a shortened URL record.
+ * Stores the mapping between short codes and destination URLs along with metadata.
+ */
 export interface Url {
   short_code: string;
   long_url: string;
@@ -10,6 +13,9 @@ export interface Url {
   is_custom: boolean;
 }
 
+/**
+ * Input data for creating a new shortened URL.
+ */
 export interface CreateUrlInput {
   long_url: string;
   custom_code?: string;
@@ -17,6 +23,9 @@ export interface CreateUrlInput {
   user_id?: string;
 }
 
+/**
+ * API response format for a URL, including the full short URL.
+ */
 export interface UrlResponse {
   short_url: string;
   short_code: string;
@@ -27,7 +36,10 @@ export interface UrlResponse {
   is_custom: boolean;
 }
 
-// Click event types
+/**
+ * Click event database model tracking individual URL visits.
+ * Used for analytics and traffic analysis.
+ */
 export interface ClickEvent {
   id: number;
   short_code: string;
@@ -40,6 +52,9 @@ export interface ClickEvent {
   device_type: string | null;
 }
 
+/**
+ * Input data for recording a click event.
+ */
 export interface ClickEventInput {
   short_code: string;
   referrer?: string;
@@ -47,7 +62,10 @@ export interface ClickEventInput {
   ip_address?: string;
 }
 
-// Analytics types
+/**
+ * Aggregated analytics data for a single URL.
+ * Includes click trends, referrer sources, and device breakdowns.
+ */
 export interface UrlAnalytics {
   short_code: string;
   total_clicks: number;
@@ -56,7 +74,10 @@ export interface UrlAnalytics {
   devices: { device: string; count: number }[];
 }
 
-// Key pool types
+/**
+ * Key pool entry representing a pre-generated short code.
+ * Keys are allocated to server instances to avoid collisions in distributed deployments.
+ */
 export interface KeyPoolEntry {
   short_code: string;
   is_used: boolean;
@@ -64,7 +85,9 @@ export interface KeyPoolEntry {
   allocated_at: Date | null;
 }
 
-// User types
+/**
+ * User database model with authentication credentials.
+ */
 export interface User {
   id: string;
   email: string;
@@ -74,6 +97,9 @@ export interface User {
   is_active: boolean;
 }
 
+/**
+ * Public user data safe to expose in API responses (no password hash).
+ */
 export interface UserPublic {
   id: string;
   email: string;
@@ -81,18 +107,26 @@ export interface UserPublic {
   created_at: string;
 }
 
+/**
+ * Input data for user registration.
+ */
 export interface CreateUserInput {
   email: string;
   password: string;
   role?: 'user' | 'admin';
 }
 
+/**
+ * Input data for user login.
+ */
 export interface LoginInput {
   email: string;
   password: string;
 }
 
-// Session types
+/**
+ * Session database model for user authentication.
+ */
 export interface Session {
   id: string;
   user_id: string;
@@ -101,7 +135,10 @@ export interface Session {
   expires_at: Date;
 }
 
-// System stats types
+/**
+ * System-wide statistics for the admin dashboard.
+ * Aggregates URL, click, and key pool metrics.
+ */
 export interface SystemStats {
   total_urls: number;
   total_clicks: number;

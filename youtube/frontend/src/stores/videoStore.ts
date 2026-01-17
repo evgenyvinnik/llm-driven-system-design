@@ -2,34 +2,64 @@ import { create } from 'zustand';
 import { Video, RecommendedVideo, PaginatedResponse, SearchResponse } from '../types';
 import { api } from '../services/api';
 
+/**
+ * Video state interface for the video store.
+ * Manages all video-related data including listings, search results,
+ * recommendations, trending content, and the currently playing video.
+ */
 interface VideoState {
+  /** List of videos for general browsing */
   videos: Video[];
+  /** Currently selected video for the watch page */
   currentVideo: Video | null;
+  /** Personalized video recommendations for the homepage */
   recommendations: RecommendedVideo[];
+  /** List of trending/popular videos */
   trending: Video[];
+  /** Videos matching the current search query */
   searchResults: Video[];
+  /** Current active search query */
   searchQuery: string;
+  /** Pagination info for paginated responses */
   pagination: {
     page: number;
     limit: number;
     total: number;
     totalPages: number;
   } | null;
+  /** Whether a video operation is in progress */
   isLoading: boolean;
+  /** Error message from the last failed operation */
   error: string | null;
 
+  /** Fetch paginated list of videos, optionally filtered by channel */
   fetchVideos: (options?: { page?: number; limit?: number; channelId?: string }) => Promise<void>;
+  /** Fetch a single video by ID for the watch page */
   fetchVideo: (videoId: string) => Promise<void>;
+  /** Fetch personalized video recommendations */
   fetchRecommendations: () => Promise<void>;
+  /** Fetch trending/popular videos */
   fetchTrending: () => Promise<void>;
+  /** Search videos by query string */
   searchVideos: (query: string, page?: number) => Promise<void>;
+  /** Clear search results and query */
   clearSearch: () => void;
+  /** Update video metadata (title, description, etc.) */
   updateVideo: (videoId: string, updates: Partial<Video>) => Promise<void>;
+  /** Delete a video by ID */
   deleteVideo: (videoId: string) => Promise<boolean>;
+  /** Like or dislike a video */
   reactToVideo: (videoId: string, reaction: 'like' | 'dislike') => Promise<void>;
+  /** Record a view for analytics */
   recordView: (videoId: string) => Promise<void>;
 }
 
+/**
+ * Global video store for managing all video-related state.
+ * Centralizes video data fetching and manipulation, providing a single
+ * source of truth for video listings, search, recommendations, and
+ * user interactions like likes and views.
+ */
 export const useVideoStore = create<VideoState>((set, get) => ({
   videos: [],
   currentVideo: null,

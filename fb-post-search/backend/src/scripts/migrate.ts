@@ -1,5 +1,16 @@
+/**
+ * @fileoverview Database migration script for PostgreSQL schema setup.
+ * Creates all required tables, indexes, and triggers for the post search system.
+ * Run this script once to initialize the database schema.
+ */
+
 import { pool } from '../config/database.js';
 
+/**
+ * SQL migration statements executed in order.
+ * Creates users, posts, friendships, search_history, and sessions tables
+ * along with necessary indexes and the updated_at trigger.
+ */
 const migrations = [
   // Users table
   `CREATE TABLE IF NOT EXISTS users (
@@ -91,6 +102,11 @@ const migrations = [
    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`,
 ];
 
+/**
+ * Executes all migration statements sequentially.
+ * Exits with code 1 on failure, 0 on success.
+ * Closes the database connection pool after completion.
+ */
 async function migrate() {
   console.log('Running database migrations...');
 

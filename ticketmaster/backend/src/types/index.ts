@@ -1,5 +1,12 @@
-// Type definitions for Ticketmaster backend
+/**
+ * Type definitions for Ticketmaster backend.
+ * These types define the core domain entities for the event ticketing system.
+ */
 
+/**
+ * Represents a registered user in the system.
+ * Users can browse events, purchase tickets, and view their order history.
+ */
 export interface User {
   id: string;
   email: string;
@@ -10,6 +17,10 @@ export interface User {
   updated_at: Date;
 }
 
+/**
+ * Represents a physical venue where events take place.
+ * Venues contain sections with seats that can be sold for events.
+ */
 export interface Venue {
   id: string;
   name: string;
@@ -23,6 +34,10 @@ export interface Venue {
   updated_at: Date;
 }
 
+/**
+ * Represents a section within a venue (e.g., VIP, Orchestra, Balcony).
+ * Each section has a specific layout and pricing tier.
+ */
 export interface VenueSection {
   id: string;
   venue_id: string;
@@ -36,6 +51,10 @@ export interface VenueSection {
   created_at: Date;
 }
 
+/**
+ * Represents a scheduled event (concert, sports game, theater show, etc.).
+ * Events are associated with venues and have configurable ticket sale settings.
+ */
 export interface Event {
   id: string;
   name: string;
@@ -56,10 +75,19 @@ export interface Event {
   updated_at: Date;
 }
 
+/**
+ * Extended Event interface that includes the full venue details.
+ * Used in API responses to provide complete event information.
+ */
 export interface EventWithVenue extends Event {
   venue: Venue;
 }
 
+/**
+ * Represents an individual seat for a specific event.
+ * Seats can be available, held (temporarily reserved), or sold.
+ * The held state is used during checkout to prevent double-booking.
+ */
 export interface EventSeat {
   id: string;
   event_id: string;
@@ -76,6 +104,10 @@ export interface EventSeat {
   updated_at: Date;
 }
 
+/**
+ * Represents a completed or pending ticket purchase.
+ * Orders track the payment status and link users to their purchased seats.
+ */
 export interface Order {
   id: string;
   user_id: string;
@@ -88,6 +120,10 @@ export interface Order {
   updated_at: Date;
 }
 
+/**
+ * Represents a single seat within an order.
+ * Each order can contain multiple seats (order items).
+ */
 export interface OrderItem {
   id: string;
   order_id: string;
@@ -96,6 +132,10 @@ export interface OrderItem {
   created_at: Date;
 }
 
+/**
+ * Represents an authenticated user session.
+ * Sessions are stored in both PostgreSQL (persistence) and Redis (fast lookup).
+ */
 export interface Session {
   id: string;
   user_id: string;
@@ -103,13 +143,21 @@ export interface Session {
   expires_at: Date;
 }
 
-// API Response types
+/**
+ * Standard API response wrapper for single-item responses.
+ * @template T - The type of data being returned
+ */
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
 }
 
+/**
+ * API response wrapper for paginated list responses.
+ * Includes pagination metadata for client-side navigation.
+ * @template T - The type of items in the data array
+ */
 export interface PaginatedResponse<T> {
   success: boolean;
   data: T[];
@@ -119,14 +167,20 @@ export interface PaginatedResponse<T> {
   totalPages: number;
 }
 
-// Queue types
+/**
+ * Represents a user's position in the virtual waiting room queue.
+ * Used to manage traffic during high-demand event sales.
+ */
 export interface QueueStatus {
   position: number;
   status: 'waiting' | 'active' | 'not_in_queue';
   estimated_wait_seconds: number;
 }
 
-// Reservation types
+/**
+ * Represents a temporary seat reservation during checkout.
+ * Seats are held for a limited time (typically 10 minutes) before expiring.
+ */
 export interface Reservation {
   session_id: string;
   event_id: string;
@@ -135,6 +189,10 @@ export interface Reservation {
   expires_at: Date;
 }
 
+/**
+ * Aggregated availability information for a venue section.
+ * Includes pricing range and list of individual seats.
+ */
 export interface SeatAvailability {
   section: string;
   available: number;
@@ -144,6 +202,9 @@ export interface SeatAvailability {
   seats: SeatInfo[];
 }
 
+/**
+ * Minimal seat information for display in the seat map UI.
+ */
 export interface SeatInfo {
   id: string;
   row: string;
@@ -153,23 +214,34 @@ export interface SeatInfo {
   status: 'available' | 'held' | 'sold';
 }
 
-// Request types
+/**
+ * Request payload for user login.
+ */
 export interface LoginRequest {
   email: string;
   password: string;
 }
 
+/**
+ * Request payload for new user registration.
+ */
 export interface RegisterRequest {
   email: string;
   password: string;
   name: string;
 }
 
+/**
+ * Request payload for reserving seats during checkout.
+ */
 export interface ReserveSeatsRequest {
   event_id: string;
   seat_ids: string[];
 }
 
+/**
+ * Request payload for completing a purchase.
+ */
 export interface CheckoutRequest {
   payment_method: string;
   card_last_four?: string;

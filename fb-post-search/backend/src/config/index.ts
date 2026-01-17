@@ -1,8 +1,18 @@
+/**
+ * @fileoverview Application configuration module that validates and exports environment variables.
+ * Uses Zod for runtime validation to ensure all required config values are present and correctly typed.
+ * This centralized config approach prevents scattered process.env access throughout the codebase.
+ */
+
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
 dotenv.config();
 
+/**
+ * Zod schema defining the expected environment variables and their defaults.
+ * Validates all required configuration at startup to fail fast if misconfigured.
+ */
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().default('3000'),
@@ -32,6 +42,12 @@ if (!parsed.success) {
   process.exit(1);
 }
 
+/**
+ * Validated application configuration object.
+ * Provides typed access to all environment-based settings including database connections,
+ * Elasticsearch, Redis, and session configuration.
+ * @constant
+ */
 export const config = {
   env: parsed.data.NODE_ENV,
   port: parseInt(parsed.data.PORT, 10),

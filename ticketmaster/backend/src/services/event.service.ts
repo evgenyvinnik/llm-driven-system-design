@@ -1,10 +1,32 @@
+/**
+ * Event service for managing events, venues, and venue sections.
+ * Provides event listing, details, and administrative operations.
+ * Uses Redis caching to reduce database load for frequently accessed events.
+ */
 import { query } from '../db/pool.js';
 import redis from '../db/redis.js';
 import type { Event, EventWithVenue, Venue, VenueSection } from '../types/index.js';
 
-const CACHE_TTL = 300; // 5 minutes
+/** Cache time-to-live in seconds for event details (5 minutes) */
+const CACHE_TTL = 300;
 
+/**
+ * Service class for event-related operations.
+ * Handles event listing, venue management, and seat generation.
+ */
 export class EventService {
+  /**
+   * Retrieves a paginated list of events with optional filtering.
+   * Supports filtering by category, status, and search term.
+   *
+   * @param options - Query options for filtering and pagination
+   * @param options.category - Filter by event category (concert, sports, etc.)
+   * @param options.status - Filter by event status (on_sale, upcoming, etc.)
+   * @param options.search - Search term for event name, artist, or venue
+   * @param options.page - Page number (1-indexed, defaults to 1)
+   * @param options.limit - Number of items per page (defaults to 10)
+   * @returns Object containing events array and total count
+   */
   async getEvents(options: {
     category?: string;
     status?: string;
@@ -61,6 +83,13 @@ export class EventService {
     return { events, total };
   }
 
+  /**
+   * Retrieves a single event by ID with venue details.
+   * Results are cached in Redis for performance.
+   *
+   * @param eventId - The unique event identifier
+   * @returns The event with venue details, or null if not found
+   */
   async getEventById(eventId: string): Promise<EventWithVenue | null> {
     // Try cache first
     const cacheKey = `event:${eventId}`;
@@ -92,16 +121,33 @@ export class EventService {
     return event;
   }
 
+  /**
+   * Retrieves all venues ordered by name.
+   *
+   * @returns Array of all venues
+   */
   async getVenues(): Promise<Venue[]> {
     const result = await query('SELECT * FROM venues ORDER BY name');
     return result.rows;
   }
 
+  /**
+   * Retrieves a single venue by ID.
+   *
+   * @param venueId - The unique venue identifier
+   * @returns The venue or null if not found
+   */
   async getVenueById(venueId: string): Promise<Venue | null> {
     const result = await query('SELECT * FROM venues WHERE id = $1', [venueId]);
     return result.rows.length > 0 ? result.rows[0] : null;
   }
 
+  /**
+   * Retrieves all sections for a venue ordered by position.
+   *
+   * @param venueId - The venue ID to get sections for
+   * @returns Array of venue sections
+   */
   async getVenueSections(venueId: string): Promise<VenueSection[]> {
     const result = await query(
       'SELECT * FROM venue_sections WHERE venue_id = $1 ORDER BY position_y, position_x, name',
@@ -110,6 +156,13 @@ export class EventService {
     return result.rows;
   }
 
+  /**
+   * Generates seats for an event based on the venue's section configuration.
+   * Calls a PostgreSQL function to create seat records and updates capacity counts.
+   *
+   * @param eventId - The event ID to generate seats for
+   * @returns The total number of seats generated
+   */
   async generateEventSeats(eventId: string): Promise<number> {
     const result = await query('SELECT generate_event_seats($1)', [eventId]);
 
@@ -129,6 +182,13 @@ export class EventService {
     return parseInt(countResult.rows[0].count);
   }
 
+  /**
+   * Updates an event's status and invalidates the cache.
+   * Used for transitioning events between states (upcoming -> on_sale, etc.).
+   *
+   * @param eventId - The event ID to update
+   * @param status - The new event status
+   */
   async updateEventStatus(eventId: string, status: Event['status']): Promise<void> {
     await query('UPDATE events SET status = $1, updated_at = NOW() WHERE id = $2', [
       status,
@@ -139,6 +199,12 @@ export class EventService {
     await redis.del(`event:${eventId}`);
   }
 
+  /**
+   * Finds events that are scheduled to go on sale now.
+   * Used by background job to automatically transition event status.
+   *
+   * @returns Array of events ready to go on sale
+   */
   async getUpcomingOnSales(): Promise<Event[]> {
     const result = await query(
       `SELECT * FROM events
@@ -149,6 +215,13 @@ export class EventService {
     return result.rows;
   }
 
+  /**
+   * Maps a database row to an EventWithVenue object.
+   * Transforms flat query results into nested object structure.
+   *
+   * @param row - The database row with joined event and venue data
+   * @returns Properly typed EventWithVenue object
+   */
   private mapEventWithVenue(row: Record<string, unknown>): EventWithVenue {
     return {
       id: row.id as string,
@@ -184,4 +257,5 @@ export class EventService {
   }
 }
 
+/** Singleton instance of EventService for use throughout the application */
 export const eventService = new EventService();

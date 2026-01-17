@@ -1,5 +1,19 @@
+/**
+ * Base URL for all API requests.
+ * Used as prefix for all endpoints to ensure consistent routing.
+ */
 const API_BASE = '/api';
 
+/**
+ * Generic fetch wrapper that handles API requests with consistent error handling and JSON parsing.
+ * Provides session-based authentication via cookies and standardized request/response handling.
+ *
+ * @template T - The expected response type
+ * @param endpoint - The API endpoint path (will be prefixed with API_BASE)
+ * @param options - Standard fetch RequestInit options (method, body, headers, etc.)
+ * @returns Promise resolving to the parsed JSON response of type T
+ * @throws Error with message from API response or 'Request failed' as fallback
+ */
 async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -21,7 +35,10 @@ async function fetchApi<T>(
   return response.json();
 }
 
-// Auth API
+/**
+ * Authentication API methods for user session management.
+ * Handles login, registration, logout, and profile management in a multi-profile streaming service.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     fetchApi('/auth/login', {
@@ -54,7 +71,11 @@ export const authApi = {
     fetchApi(`/auth/profiles/${profileId}`, { method: 'DELETE' }),
 };
 
-// Content API
+/**
+ * Content catalog API methods.
+ * Provides access to the content library including movies, series, and episodes.
+ * Supports filtering, pagination, and featured content retrieval.
+ */
 export const contentApi = {
   getAll: (params?: { type?: string; genre?: string; search?: string; limit?: number; offset?: number }) => {
     const searchParams = new URLSearchParams();
@@ -82,13 +103,20 @@ export const contentApi = {
     fetchApi(`/content/${id}/view`, { method: 'POST' }),
 };
 
-// Streaming API
+/**
+ * Streaming API methods for video playback.
+ * Retrieves playback information including HLS manifest URLs and DRM tokens.
+ */
 export const streamingApi = {
   getPlaybackInfo: (contentId: string) =>
     fetchApi<import('../types').PlaybackInfo>(`/stream/${contentId}/playback`),
 };
 
-// Watch Progress API
+/**
+ * Watch progress API methods for tracking viewing history.
+ * Enables "Continue Watching" functionality and cross-device sync.
+ * Progress is stored per-profile to support multiple users on one account.
+ */
 export const watchProgressApi = {
   getProgress: () =>
     fetchApi<import('../types').WatchProgress[]>('/watch/progress'),
@@ -116,7 +144,11 @@ export const watchProgressApi = {
     fetchApi('/watch/history', { method: 'DELETE' }),
 };
 
-// Watchlist API
+/**
+ * Watchlist (My List) API methods for managing saved content.
+ * Allows users to save content for later viewing, similar to Netflix's "My List".
+ * Watchlist is profile-specific for personalized recommendations.
+ */
 export const watchlistApi = {
   getAll: () =>
     fetchApi<import('../types').WatchlistItem[]>('/watchlist'),
@@ -131,7 +163,11 @@ export const watchlistApi = {
     fetchApi<{ inWatchlist: boolean }>(`/watchlist/check/${contentId}`),
 };
 
-// Subscription API
+/**
+ * Subscription API methods for managing user plans.
+ * Handles subscription status checks, plan upgrades/downgrades, and cancellation.
+ * Subscription tier determines content access and streaming quality.
+ */
 export const subscriptionApi = {
   getStatus: () =>
     fetchApi<{ tier: string; expiresAt: string | null; isActive: boolean }>('/subscription/status'),
@@ -149,7 +185,11 @@ export const subscriptionApi = {
     fetchApi('/subscription/cancel', { method: 'POST' }),
 };
 
-// Recommendations API
+/**
+ * Recommendations API methods for personalized content discovery.
+ * Provides trending content, genre-based suggestions, and "Because You Watched" recommendations.
+ * Recommendations are generated based on watch history and user ratings.
+ */
 export const recommendationsApi = {
   getAll: (limit?: number) => {
     const params = limit ? `?limit=${limit}` : '';
@@ -186,7 +226,11 @@ export const recommendationsApi = {
     fetchApi<{ rating: number | null }>(`/recommendations/rating/${contentId}`),
 };
 
-// Admin API
+/**
+ * Admin API methods for platform administration.
+ * Provides access to platform statistics, user management, and content moderation.
+ * Requires admin role authentication.
+ */
 export const adminApi = {
   getStats: () =>
     fetchApi('/admin/stats'),

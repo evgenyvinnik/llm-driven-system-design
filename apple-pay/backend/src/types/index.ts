@@ -1,3 +1,7 @@
+/**
+ * Represents a registered user in the Apple Pay system.
+ * Users can have multiple devices and provisioned cards.
+ */
 export interface User {
   id: string;
   email: string;
@@ -8,6 +12,10 @@ export interface User {
   updated_at: Date;
 }
 
+/**
+ * Represents a user's Apple device that can be used for payments.
+ * Each device has a unique Secure Element for storing payment tokens.
+ */
 export interface Device {
   id: string;
   user_id: string;
@@ -19,6 +27,11 @@ export interface Device {
   created_at: Date;
 }
 
+/**
+ * Represents a payment card that has been tokenized and provisioned to a device.
+ * Contains the device-specific token (DPAN) instead of the actual card number.
+ * The actual PAN is never stored - only the last 4 digits for display.
+ */
 export interface ProvisionedCard {
   id: string;
   user_id: string;
@@ -40,6 +53,10 @@ export interface ProvisionedCard {
   updated_at: Date;
 }
 
+/**
+ * Represents a merchant that can accept Apple Pay payments.
+ * Merchants are registered with a unique ID and category code.
+ */
 export interface Merchant {
   id: string;
   name: string;
@@ -51,6 +68,10 @@ export interface Merchant {
   created_at: Date;
 }
 
+/**
+ * Represents a payment transaction processed through the system.
+ * Records all details including cryptogram for audit and reconciliation.
+ */
 export interface Transaction {
   id: string;
   card_id: string;
@@ -69,6 +90,10 @@ export interface Transaction {
   created_at: Date;
 }
 
+/**
+ * Represents a biometric authentication session for payment authorization.
+ * Sessions are short-lived (5 minutes) and tied to a specific device.
+ */
 export interface BiometricSession {
   id: string;
   user_id: string;
@@ -81,6 +106,10 @@ export interface BiometricSession {
   expires_at: Date;
 }
 
+/**
+ * Request payload for provisioning a new card to a device.
+ * The PAN and CVV are only used during provisioning and never stored.
+ */
 export interface CardProvisioningRequest {
   pan: string;
   expiry_month: number;
@@ -90,6 +119,10 @@ export interface CardProvisioningRequest {
   device_id: string;
 }
 
+/**
+ * Request payload for processing a payment transaction.
+ * Requires biometric session verification before processing.
+ */
 export interface PaymentRequest {
   card_id: string;
   amount: number;
@@ -99,6 +132,10 @@ export interface PaymentRequest {
   biometric_session_id?: string;
 }
 
+/**
+ * Response payload after attempting to process a payment.
+ * Contains transaction details on success or error message on failure.
+ */
 export interface PaymentResult {
   success: boolean;
   transaction_id?: string;

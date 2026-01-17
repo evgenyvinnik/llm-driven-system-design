@@ -1,4 +1,9 @@
-// Environment configuration
+/**
+ * Application configuration object.
+ * Centralizes all environment-based settings for the WhatsApp backend service.
+ * Enables horizontal scaling by allowing each server instance to have unique identifiers
+ * while sharing database and cache connections.
+ */
 export const config = {
   port: parseInt(process.env.PORT || '3001', 10),
   serverId: process.env.SERVER_ID || `server-${process.env.PORT || '3001'}`,

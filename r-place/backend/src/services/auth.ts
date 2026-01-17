@@ -1,13 +1,32 @@
+/**
+ * Authentication service for user registration, login, and session management.
+ *
+ * Provides secure password hashing with bcrypt and session-based authentication
+ * stored in PostgreSQL. Supports both registered users and anonymous guests.
+ */
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { query, queryOne } from './database.js';
 import type { User, Session } from '../types/index.js';
 
+/** Number of bcrypt hashing rounds for password security. */
 const SALT_ROUNDS = 10;
+
+/** Session validity duration in milliseconds (24 hours). */
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+/**
+ * Service class handling all authentication operations.
+ * Uses PostgreSQL for persistent storage of users and sessions.
+ */
 export class AuthService {
-  // Register a new user
+  /**
+   * Registers a new user with a username and password.
+   *
+   * @param username - The desired username (must be unique).
+   * @param password - The plaintext password to hash and store.
+   * @returns Object containing success status and either the new user or an error message.
+   */
   async register(
     username: string,
     password: string
@@ -44,7 +63,13 @@ export class AuthService {
     }
   }
 
-  // Login user
+  /**
+   * Authenticates a user and creates a new session.
+   *
+   * @param username - The user's username.
+   * @param password - The user's plaintext password to verify.
+   * @returns Object containing success status, session, user data, or an error message.
+   */
   async login(
     username: string,
     password: string
@@ -89,7 +114,13 @@ export class AuthService {
     }
   }
 
-  // Validate session
+  /**
+   * Validates a session and returns the associated user.
+   * Automatically deletes expired sessions.
+   *
+   * @param sessionId - The session UUID to validate.
+   * @returns The authenticated user or null if the session is invalid/expired.
+   */
   async validateSession(sessionId: string): Promise<User | null> {
     try {
       const result = await queryOne<{
@@ -126,12 +157,21 @@ export class AuthService {
     }
   }
 
-  // Logout (delete session)
+  /**
+   * Logs out a user by deleting their session.
+   *
+   * @param sessionId - The session UUID to invalidate.
+   */
   async logout(sessionId: string): Promise<void> {
     await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
   }
 
-  // Create anonymous user (for quick access without registration)
+  /**
+   * Creates an anonymous guest user for quick access without registration.
+   * Anonymous users get a random username and can place pixels like regular users.
+   *
+   * @returns Object containing the new anonymous user and their session.
+   */
   async createAnonymousUser(): Promise<{ user: User; session: Session }> {
     const userId = uuidv4();
     const username = `anon_${userId.substring(0, 8)}`;
@@ -159,4 +199,5 @@ export class AuthService {
   }
 }
 
+/** Singleton instance of the authentication service. */
 export const authService = new AuthService();

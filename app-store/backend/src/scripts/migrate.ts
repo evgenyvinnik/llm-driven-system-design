@@ -1,5 +1,16 @@
+/**
+ * @fileoverview Database migration script for the App Store.
+ * Creates all required PostgreSQL tables and indexes.
+ * Run with: npm run db:migrate
+ */
+
 import { pool } from '../config/database.js';
 
+/**
+ * SQL statements for creating the database schema.
+ * Includes tables for users, developers, apps, reviews, purchases, and analytics.
+ * Executed sequentially; each statement is idempotent (IF NOT EXISTS).
+ */
 const migrations = [
   // Users table
   `CREATE TABLE IF NOT EXISTS users (
@@ -192,6 +203,10 @@ const migrations = [
   `CREATE INDEX IF NOT EXISTS idx_download_events_app ON download_events(app_id, downloaded_at)`,
 ];
 
+/**
+ * Runs all migrations sequentially against the database.
+ * Logs progress and handles errors gracefully.
+ */
 async function migrate() {
   console.log('Running migrations...');
 

@@ -5,8 +5,17 @@ import { User, Session } from '../types/index.js';
 import { generateToken } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
+/** Number of bcrypt salt rounds for password hashing */
 const SALT_ROUNDS = 10;
 
+/**
+ * Registers a new user account with email and password.
+ * Hashes the password with bcrypt and creates an initial session.
+ * @param email - User's email address
+ * @param password - Plain text password (will be hashed)
+ * @returns Object containing the user (without password_hash) and session token
+ * @throws Error if email is already registered
+ */
 export async function register(email: string, password: string): Promise<{ user: Omit<User, 'password_hash'>; token: string }> {
   // Check if user exists
   const existing = await queryOne<User>('SELECT id FROM users WHERE email = $1', [email]);
@@ -38,6 +47,14 @@ export async function register(email: string, password: string): Promise<{ user:
   return { user, token };
 }
 
+/**
+ * Authenticates a user with email and password credentials.
+ * Verifies password against stored bcrypt hash and creates a new session.
+ * @param email - User's email address
+ * @param password - Plain text password to verify
+ * @returns Object containing the user (without password_hash) and session token
+ * @throws Error if credentials are invalid
+ */
 export async function login(email: string, password: string): Promise<{ user: Omit<User, 'password_hash'>; token: string }> {
   // Get user
   const user = await queryOne<User>(
@@ -66,11 +83,23 @@ export async function login(email: string, password: string): Promise<{ user: Om
   return { user: userWithoutPassword, token };
 }
 
+/**
+ * Logs out a user by invalidating their session token.
+ * Removes the session from both Redis and the database.
+ * @param token - The session token to invalidate
+ */
 export async function logout(token: string): Promise<void> {
   await deleteSession(token);
   await query('DELETE FROM sessions WHERE token = $1', [token]);
 }
 
+/**
+ * Validates a session token and returns the associated user.
+ * First checks Redis cache, then falls back to database lookup.
+ * Refreshes the Redis cache on successful database validation.
+ * @param token - The session token to validate
+ * @returns The user if session is valid, null otherwise
+ */
 export async function validateSession(token: string): Promise<User | null> {
   // Check Redis cache first
   const cachedUserId = await getSession(token);
@@ -94,6 +123,12 @@ export async function validateSession(token: string): Promise<User | null> {
   return getUserById(session.user_id);
 }
 
+/**
+ * Retrieves a user by their unique ID.
+ * Excludes password_hash from the result for security.
+ * @param userId - The UUID of the user
+ * @returns The user or null if not found
+ */
 export async function getUserById(userId: string): Promise<User | null> {
   return queryOne<User>(
     'SELECT id, email, role, email_notifications, created_at, updated_at FROM users WHERE id = $1',
@@ -101,6 +136,12 @@ export async function getUserById(userId: string): Promise<User | null> {
   );
 }
 
+/**
+ * Updates a user's settings such as email notification preferences.
+ * @param userId - The user ID to update
+ * @param updates - Object containing optional email_notifications preference
+ * @returns The updated user or null if not found
+ */
 export async function updateUser(
   userId: string,
   updates: { email_notifications?: boolean }
@@ -116,6 +157,12 @@ export async function updateUser(
   return result[0] || null;
 }
 
+/**
+ * Creates a new session for a user in both database and Redis.
+ * Sessions expire after 7 days.
+ * @param userId - The user ID to create a session for
+ * @param token - The generated session token
+ */
 async function createSession(userId: string, token: string): Promise<void> {
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
@@ -129,7 +176,12 @@ async function createSession(userId: string, token: string): Promise<void> {
   await setSession(token, userId);
 }
 
-// Clean up expired sessions
+/**
+ * Removes expired sessions from the database.
+ * Should be called periodically (e.g., via cron) to clean up old sessions.
+ * Redis sessions auto-expire via TTL.
+ * @returns The number of sessions deleted
+ */
 export async function cleanupExpiredSessions(): Promise<number> {
   const result = await query<{ id: string }>(
     'DELETE FROM sessions WHERE expires_at < NOW() RETURNING id',

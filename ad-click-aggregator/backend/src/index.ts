@@ -1,3 +1,10 @@
+/**
+ * @fileoverview Main entry point for the Ad Click Aggregator backend service.
+ * Sets up Express server with middleware, routes, and health checks.
+ * This service handles high-volume ad click ingestion, real-time aggregation,
+ * fraud detection, and analytics queries.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import clicksRouter from './routes/clicks.js';
@@ -6,7 +13,10 @@ import adminRouter from './routes/admin.js';
 import { testConnection as testDbConnection } from './services/database.js';
 import { testConnection as testRedisConnection } from './services/redis.js';
 
+/** Express application instance */
 const app = express();
+
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // Middleware

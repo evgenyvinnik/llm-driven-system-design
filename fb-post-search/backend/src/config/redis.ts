@@ -1,6 +1,17 @@
+/**
+ * @fileoverview Redis client and caching utilities.
+ * Provides Redis connection, typed cache helpers, and standardized cache key generators.
+ * Used for session storage, visibility set caching, and search suggestions.
+ */
+
 import Redis from 'ioredis';
 import { config } from '../config/index.js';
 
+/**
+ * Redis client instance configured from environment settings.
+ * Used for all caching and session storage operations.
+ * @constant
+ */
 export const redis = new Redis(config.redis.url);
 
 redis.on('error', (err) => {
@@ -11,7 +22,13 @@ redis.on('connect', () => {
   console.log('Connected to Redis');
 });
 
-// Cache helpers
+/**
+ * Retrieves and deserializes a cached value from Redis.
+ * Automatically parses JSON values; returns raw string if parsing fails.
+ * @template T - The expected type of the cached value
+ * @param key - The cache key to retrieve
+ * @returns Promise resolving to the cached value or null if not found
+ */
 export async function getCache<T>(key: string): Promise<T | null> {
   const value = await redis.get(key);
   if (!value) return null;
@@ -22,6 +39,14 @@ export async function getCache<T>(key: string): Promise<T | null> {
   }
 }
 
+/**
+ * Stores a value in Redis cache with optional TTL.
+ * Automatically serializes objects to JSON; strings are stored as-is.
+ * @param key - The cache key to store under
+ * @param value - The value to cache (will be JSON serialized if object)
+ * @param ttlSeconds - Optional time-to-live in seconds; if omitted, key never expires
+ * @returns Promise that resolves when the value is stored
+ */
 export async function setCache(
   key: string,
   value: unknown,
@@ -35,11 +60,20 @@ export async function setCache(
   }
 }
 
+/**
+ * Removes a value from Redis cache.
+ * @param key - The cache key to delete
+ * @returns Promise that resolves when the key is deleted
+ */
 export async function deleteCache(key: string): Promise<void> {
   await redis.del(key);
 }
 
-// Visibility cache keys
+/**
+ * Factory functions for generating standardized cache keys.
+ * Ensures consistent key naming across the application.
+ * @constant
+ */
 export const cacheKeys = {
   userVisibility: (userId: string) => `visibility:${userId}`,
   searchSuggestions: (prefix: string) => `suggestions:${prefix}`,

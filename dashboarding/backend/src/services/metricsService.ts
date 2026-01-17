@@ -1,10 +1,28 @@
+/**
+ * @fileoverview Metrics ingestion and definition management service.
+ *
+ * Handles high-throughput metric data ingestion into TimescaleDB with
+ * multi-layer caching for metric IDs. Provides functions to query and
+ * explore metric definitions and their tags.
+ */
+
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import type { MetricDataPoint, MetricDefinition } from '../types/index.js';
 
-// Cache for metric definitions (metric_name + tags -> id)
+/**
+ * In-memory cache for metric definition IDs.
+ * Used as first-level cache before Redis for maximum ingestion throughput.
+ */
 const metricIdCache = new Map<string, number>();
 
+/**
+ * Generates a unique cache key for a metric name and tag combination.
+ *
+ * @param name - The metric name (e.g., "cpu.usage")
+ * @param tags - Key-value pairs of metric tags (e.g., { host: "server1" })
+ * @returns A deterministic cache key string with sorted tags
+ */
 function getCacheKey(name: string, tags: Record<string, string>): string {
   const sortedTags = Object.keys(tags)
     .sort()
@@ -13,6 +31,21 @@ function getCacheKey(name: string, tags: Record<string, string>): string {
   return `${name}:{${sortedTags}}`;
 }
 
+/**
+ * Retrieves or creates a metric definition ID for a given metric name and tags.
+ *
+ * Uses a three-tier caching strategy:
+ * 1. In-memory Map cache (fastest, per-process)
+ * 2. Redis cache (shared across instances, 1 hour TTL)
+ * 3. Database upsert with ON CONFLICT (source of truth)
+ *
+ * This function is critical for high-throughput ingestion as it avoids
+ * repeated database lookups for the same metric definitions.
+ *
+ * @param name - The metric name
+ * @param tags - The metric's tag key-value pairs
+ * @returns The numeric metric definition ID
+ */
 export async function getOrCreateMetricId(
   name: string,
   tags: Record<string, string>
@@ -50,6 +83,16 @@ export async function getOrCreateMetricId(
   return id;
 }
 
+/**
+ * Ingests an array of metric data points into TimescaleDB.
+ *
+ * Efficiently batch-inserts metrics using PostgreSQL's unnest function.
+ * Each data point is first resolved to a metric_id via getOrCreateMetricId,
+ * then all points are inserted in a single query for optimal performance.
+ *
+ * @param dataPoints - Array of metric data points to ingest
+ * @returns The number of data points successfully ingested
+ */
 export async function ingestMetrics(dataPoints: MetricDataPoint[]): Promise<number> {
   if (dataPoints.length === 0) return 0;
 
@@ -75,6 +118,13 @@ export async function ingestMetrics(dataPoints: MetricDataPoint[]): Promise<numb
   return enrichedPoints.length;
 }
 
+/**
+ * Retrieves metric definitions matching the specified criteria.
+ *
+ * @param name - Optional metric name to filter by (exact match)
+ * @param tags - Optional tags to filter by (uses JSONB containment)
+ * @returns Array of matching metric definitions
+ */
 export async function getMetricDefinitions(
   name?: string,
   tags?: Record<string, string>
@@ -98,6 +148,11 @@ export async function getMetricDefinitions(
   return result.rows;
 }
 
+/**
+ * Retrieves all unique metric names in the system.
+ *
+ * @returns Array of distinct metric names, sorted alphabetically
+ */
 export async function getMetricNames(): Promise<string[]> {
   const result = await pool.query<{ name: string }>(
     'SELECT DISTINCT name FROM metric_definitions ORDER BY name'
@@ -105,6 +160,12 @@ export async function getMetricNames(): Promise<string[]> {
   return result.rows.map((r) => r.name);
 }
 
+/**
+ * Retrieves all unique tag keys used across metric definitions.
+ *
+ * @param metricName - Optional metric name to filter tag keys by
+ * @returns Array of unique tag key names
+ */
 export async function getTagKeys(metricName?: string): Promise<string[]> {
   let query = `
     SELECT DISTINCT jsonb_object_keys(tags) as key
@@ -123,6 +184,13 @@ export async function getTagKeys(metricName?: string): Promise<string[]> {
   return result.rows.map((r) => r.key);
 }
 
+/**
+ * Retrieves all unique values for a specific tag key.
+ *
+ * @param tagKey - The tag key to get values for
+ * @param metricName - Optional metric name to filter by
+ * @returns Array of unique tag values for the specified key
+ */
 export async function getTagValues(
   tagKey: string,
   metricName?: string

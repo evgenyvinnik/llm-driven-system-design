@@ -1,8 +1,29 @@
+/**
+ * @fileoverview Database seeding script for development and demo purposes.
+ *
+ * Generates realistic sample data for the dashboarding system including:
+ * - One hour of simulated server metrics (CPU, memory, disk, network)
+ * - A pre-configured Infrastructure Overview dashboard with panels
+ * - Sample alert rules for common monitoring scenarios
+ *
+ * Run with: npm run db:seed
+ */
+
 import pool from './pool.js';
 import { ingestMetrics } from '../services/metricsService.js';
 import { createDashboard, createPanel } from '../services/dashboardService.js';
 import { createAlertRule } from '../services/alertService.js';
 
+/**
+ * Seeds the database with sample metrics, dashboards, and alerts.
+ *
+ * Generates metrics for 3 simulated servers across 2 environments over
+ * the past hour at 10-second intervals. Creates a comprehensive dashboard
+ * with various visualization types and sets up example alert rules.
+ *
+ * @returns Promise that resolves when seeding completes
+ * @throws Error if any database operation fails
+ */
 async function seed() {
   console.log('Seeding database...');
 

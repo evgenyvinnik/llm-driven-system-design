@@ -2,10 +2,23 @@ import { Request, Response, NextFunction } from 'express';
 import { pool } from '../database.js';
 import type { User } from '../types/index.js';
 
+/**
+ * Extended Express Request with authenticated user information.
+ * Populated by authMiddleware after successful token validation.
+ */
 export interface AuthenticatedRequest extends Request {
   user?: User;
 }
 
+/**
+ * Express middleware that validates Bearer token authentication.
+ * Verifies the token against active sessions in the database and
+ * attaches the authenticated user to the request object.
+ * Returns 401 if token is missing, invalid, or expired.
+ * @param req - Express request with authorization header
+ * @param res - Express response for sending error responses
+ * @param next - Express next function to continue middleware chain
+ */
 export async function authMiddleware(
   req: AuthenticatedRequest,
   res: Response,
@@ -41,6 +54,14 @@ export async function authMiddleware(
   }
 }
 
+/**
+ * Express middleware that restricts access to admin users only.
+ * Must be used after authMiddleware to ensure user is authenticated.
+ * Returns 403 if the authenticated user does not have admin role.
+ * @param req - Authenticated request with user object
+ * @param res - Express response for sending error responses
+ * @param next - Express next function to continue middleware chain
+ */
 export function adminMiddleware(
   req: AuthenticatedRequest,
   res: Response,

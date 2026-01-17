@@ -1,13 +1,25 @@
 import { Client } from '@elastic/elasticsearch';
 import { config } from './index.js';
 
+/**
+ * Elasticsearch client instance for full-text issue search.
+ * Powers JQL queries and quick search functionality.
+ */
 export const esClient = new Client({
   node: config.elasticsearch.url,
 });
 
-// Issue index mapping
+/**
+ * Name of the Elasticsearch index storing issue documents.
+ */
 export const ISSUE_INDEX = 'issues';
 
+/**
+ * Initializes the Elasticsearch issues index with appropriate mappings.
+ * Creates a custom analyzer for issue text fields and defines field types
+ * optimized for issue search (keyword fields for filtering, text for full-text).
+ * Called on server startup to ensure the index exists.
+ */
 export async function initializeElasticsearch(): Promise<void> {
   try {
     const indexExists = await esClient.indices.exists({ index: ISSUE_INDEX });
@@ -74,6 +86,12 @@ export async function initializeElasticsearch(): Promise<void> {
   }
 }
 
+/**
+ * Indexes an issue document in Elasticsearch for search.
+ * Called when issues are created or updated to keep the search index in sync.
+ *
+ * @param issue - Issue data to index (denormalized for search)
+ */
 export async function indexIssue(issue: Record<string, unknown>): Promise<void> {
   await esClient.index({
     index: ISSUE_INDEX,
@@ -83,6 +101,12 @@ export async function indexIssue(issue: Record<string, unknown>): Promise<void> 
   });
 }
 
+/**
+ * Removes an issue document from the Elasticsearch index.
+ * Called when issues are deleted.
+ *
+ * @param issueId - ID of the issue to remove from the index
+ */
 export async function deleteIssueFromIndex(issueId: number): Promise<void> {
   await esClient.delete({
     index: ISSUE_INDEX,
@@ -91,6 +115,13 @@ export async function deleteIssueFromIndex(issueId: number): Promise<void> {
   });
 }
 
+/**
+ * Executes a search query against the issues index.
+ * Used by the search service to find issues matching JQL or text queries.
+ *
+ * @param query - Elasticsearch query DSL object
+ * @returns Array of issue documents with relevance scores
+ */
 export async function searchIssues(query: Record<string, unknown>): Promise<unknown[]> {
   const result = await esClient.search({
     index: ISSUE_INDEX,

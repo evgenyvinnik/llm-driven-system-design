@@ -1,6 +1,15 @@
+/**
+ * @fileoverview Central configuration module for the App Store backend.
+ * Loads environment variables and provides typed access to all configuration values.
+ */
+
 import dotenv from 'dotenv';
 dotenv.config();
 
+/**
+ * Application configuration object containing all environment-specific settings.
+ * Provides sensible defaults for local development while allowing override via environment variables.
+ */
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   nodeEnv: process.env.NODE_ENV || 'development',

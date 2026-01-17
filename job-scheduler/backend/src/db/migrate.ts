@@ -1,6 +1,18 @@
+/**
+ * Database migration module for the job scheduler.
+ * Handles schema creation and versioning to ensure the database structure
+ * matches the application requirements. Migrations are idempotent and tracked
+ * in a migrations table.
+ * @module db/migrate
+ */
+
 import { pool } from './pool';
 import { logger } from '../utils/logger';
 
+/**
+ * Migration definitions containing up and down SQL scripts.
+ * Each migration is applied in order and tracked to prevent re-application.
+ */
 const migrations = [
   {
     name: '001_initial_schema',
@@ -127,6 +139,11 @@ const migrations = [
   },
 ];
 
+/**
+ * Retrieves the set of already-applied migration names.
+ * Queries the migrations table to determine which migrations have been run.
+ * @returns Set of migration names that have been applied
+ */
 async function getMigrationStatus(): Promise<Set<string>> {
   try {
     const result = await pool.query('SELECT name FROM migrations');
@@ -137,6 +154,13 @@ async function getMigrationStatus(): Promise<Set<string>> {
   }
 }
 
+/**
+ * Applies all pending database migrations.
+ * Runs each migration in a transaction for atomicity. Skips already-applied
+ * migrations based on the migrations tracking table.
+ * Called automatically on service startup.
+ * @throws Re-throws any migration errors after logging
+ */
 export async function migrate(): Promise<void> {
   logger.info('Starting database migrations...');
 
@@ -172,6 +196,13 @@ export async function migrate(): Promise<void> {
   logger.info('All migrations completed');
 }
 
+/**
+ * Rolls back one or more migrations.
+ * Executes the down script for the specified migration or the most recent one.
+ * Useful for development and testing; use with caution in production.
+ * @param migrationName - Optional specific migration to rollback; defaults to latest
+ * @throws Re-throws any rollback errors after logging
+ */
 export async function rollback(migrationName?: string): Promise<void> {
   const client = await pool.connect();
   const targetMigrations = migrationName
@@ -197,6 +228,10 @@ export async function rollback(migrationName?: string): Promise<void> {
   client.release();
 }
 
+/**
+ * CLI entry point for running migrations directly.
+ * Allows running `npx ts-node src/db/migrate.ts` to apply migrations.
+ */
 // Run migrations if executed directly
 if (require.main === module) {
   require('dotenv').config();
