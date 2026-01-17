@@ -55,6 +55,7 @@ Each folder contains an independent implementation of a system design problem:
 ### Ticketing, Events & Reservations
 - [Design Ticketmaster](./ticketmaster/) - Event ticketing and inventory management
 - [Design Hotel Booking](./hotel-booking/) - Hotel reservation and management system
+- [Design Calendly](./calendly/) - Meeting scheduling and calendar coordination platform
 
 ### Developer Tools & Platforms
 - [Design LeetCode](./leetcode/) - Online coding judge and practice platform
