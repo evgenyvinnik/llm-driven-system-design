@@ -64,3 +64,10 @@ pnpm-lock.yaml
 # Docker
 # ===================
 *.pid
+
+# ===================
+# Playwright
+# ===================
+playwright-report/
+test-results/
+.playwright/

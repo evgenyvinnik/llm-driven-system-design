@@ -27,10 +27,13 @@
     "db:seed": "npm run db:seed -w backend",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
-    "docker:reset": "docker-compose down -v && docker-compose up -d"
+    "docker:reset": "docker-compose down -v && docker-compose up -d",
+    "plugin-cli": "tsx scripts/plugin-cli.ts"
   },
   "devDependencies": {
-    "concurrently": "^9.0.1"
+    "concurrently": "^9.0.1",
+    "tsx": "^4.19.2",
+    "undici": "^7.2.0"
   },
   "engines": {
     "node": ">=20"
