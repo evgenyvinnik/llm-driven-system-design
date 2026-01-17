@@ -9,7 +9,7 @@ import { ContentLoadingSpinner } from '../common';
 interface ProductFormData {
   title: string;
   description: string;
-  status: 'draft' | 'active';
+  status: Product['status'];
   price: string;
   inventory: string;
 }
@@ -78,6 +78,8 @@ export function ProductsTab({ storeId }: ProductsTabProps) {
           status: formData.status,
         });
       } else {
+        // Cast to any for API call since the API accepts partial variant data
+        // that doesn't include server-generated fields like id, product_id, etc.
         await productsApi.create(storeId, {
           title: formData.title,
           description: formData.description,
@@ -86,7 +88,7 @@ export function ProductsTab({ storeId }: ProductsTabProps) {
             title: 'Default',
             price: parseFloat(formData.price) || 0,
             inventory_quantity: parseInt(formData.inventory) || 0,
-          }],
+          }] as unknown as Product['variants'],
         });
       }
       closeModal();
@@ -358,11 +360,12 @@ function ProductModal({ isEditing, formData, setFormData, onSubmit, onClose }: P
             <label className="block text-sm font-medium text-gray-700 mb-1">Status</label>
             <select
               value={formData.status}
-              onChange={(e) => setFormData({ ...formData, status: e.target.value as 'draft' | 'active' })}
+              onChange={(e) => setFormData({ ...formData, status: e.target.value as Product['status'] })}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
             >
               <option value="draft">Draft</option>
               <option value="active">Active</option>
+              <option value="archived">Archived</option>
             </select>
           </div>
           <div className="flex gap-3 pt-4">

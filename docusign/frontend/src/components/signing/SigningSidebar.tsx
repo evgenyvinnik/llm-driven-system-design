@@ -58,7 +58,6 @@ export function SigningSidebar({
       />
 
       <FieldsChecklist
-        documents={documents}
         fields={fields}
         completedFields={completedFields}
         onFieldClick={onFieldClick}
@@ -145,14 +144,12 @@ function PageNavigation({ currentPage, numPages, onPageChange }: PageNavigationP
  * Checklist of fields to complete.
  */
 interface FieldsChecklistProps {
-  documents: Document[];
   fields: DocumentField[];
   completedFields: Set<string>;
   onFieldClick: (field: DocumentField) => void;
 }
 
 function FieldsChecklist({
-  documents,
   fields,
   completedFields,
   onFieldClick,

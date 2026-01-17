@@ -1585,3 +1585,127 @@ sum(rate(cache_hits_total{cache_type="swipe_history"}[5m])) /
 5. Repeat
 
 This data-driven approach transforms matching from "hope it works" to "measure and optimize."
+
+---
+
+## Frontend Architecture
+
+### Technology Stack
+
+- **React 19** - UI framework with hooks and concurrent features
+- **TypeScript** - Type safety across the entire frontend
+- **Vite** - Fast development server and optimized builds
+- **Tanstack Router** - File-based routing with type-safe navigation
+- **Zustand** - Lightweight state management
+- **Tailwind CSS** - Utility-first styling
+
+### Component Organization
+
+```
+frontend/src/
+├── components/                    # Reusable UI components
+│   ├── ReignsAvatar/             # Procedural avatar generation (modular)
+│   │   ├── index.ts              # Barrel exports
+│   │   ├── ReignsAvatar.tsx      # Main component (140 lines)
+│   │   ├── constants.ts          # Color palettes and configuration
+│   │   ├── types.ts              # TypeScript interfaces
+│   │   ├── utils.ts              # Seeded random and feature generation
+│   │   ├── AvatarDefs.tsx        # SVG filters and gradients
+│   │   ├── Hair.tsx              # Back and top hair rendering
+│   │   ├── Face.tsx              # Face shape, neck, cheekbones, beard
+│   │   ├── FacialFeatures.tsx    # Eyes, eyebrows, nose, lips
+│   │   ├── Accessories.tsx       # Crown, earrings, necklace
+│   │   └── Clothing.tsx          # Shoulders, frame, background
+│   ├── BottomNav.tsx             # Navigation bar
+│   ├── MatchModal.tsx            # Match celebration modal
+│   ├── SwipeCard.tsx             # Draggable profile card
+│   └── ReignsAvatar.tsx          # Re-export for backward compatibility
+├── routes/                        # File-based routing
+│   ├── __root.tsx                # Root layout
+│   ├── index.tsx                 # Discovery/swiping (home)
+│   ├── login.tsx                 # Authentication
+│   ├── register.tsx              # User registration
+│   ├── profile.tsx               # User profile management
+│   ├── preferences.tsx           # Discovery preferences
+│   ├── matches.tsx               # Match list
+│   ├── chat.$matchId.tsx         # Conversation view
+│   └── admin/                    # Admin routes
+│       └── users.tsx             # User management
+├── types/                        # Shared TypeScript types
+└── main.tsx                      # Application entry point
+```
+
+### ReignsAvatar Component System
+
+The ReignsAvatar is a procedural avatar generator inspired by the "Reigns: Her Majesty" art style. It generates deterministic, medieval-portrait-styled avatars from a seed string, providing unique profile pictures for users without uploaded photos.
+
+#### Design Principles
+
+1. **Deterministic Generation**: Same seed always produces same avatar
+2. **Modular Rendering**: Each avatar element (hair, face, eyes, etc.) is a separate component
+3. **Render Context Pattern**: Shared context object passed to all sub-components
+4. **Painterly Aesthetic**: SVG filters create artistic brush-stroke effects
+
+#### Component Breakdown
+
+| Component | Lines | Responsibility |
+|-----------|-------|----------------|
+| `ReignsAvatar.tsx` | ~140 | Main orchestrator, creates render context |
+| `constants.ts` | ~100 | Color palettes (skin, hair, clothing, accessories) |
+| `types.ts` | ~70 | TypeScript interfaces for features and context |
+| `utils.ts` | ~130 | Seeded random generator, feature generation, face shapes |
+| `AvatarDefs.tsx` | ~80 | SVG filter and gradient definitions |
+| `Hair.tsx` | ~130 | Back hair and top hair with style variations |
+| `Face.tsx` | ~110 | Neck, face shape, cheekbones, beard |
+| `FacialFeatures.tsx` | ~170 | Eyes (with eyelashes), eyebrows, nose, lips |
+| `Accessories.tsx` | ~110 | Crown, earrings, necklace |
+| `Clothing.tsx` | ~90 | Shoulders, collar, decorative frame |
+
+#### Usage Example
+
+```tsx
+import ReignsAvatar from './components/ReignsAvatar';
+
+// Basic usage - generates deterministic avatar
+<ReignsAvatar seed="user-123" />
+
+// Custom size
+<ReignsAvatar seed="user-123" size={200} />
+
+// With styling
+<ReignsAvatar
+  seed={`${user.id}-${user.name}`}
+  size={128}
+  className="rounded-full shadow-lg"
+/>
+```
+
+#### Feature Generation
+
+Features are generated deterministically from the seed:
+
+- **Gender** (masculine/feminine) - affects hair styles, makeup, accessories
+- **Skin Palette** - 6 diverse skin tones with shadow/highlight
+- **Hair Color** - 8 options from black to silver
+- **Hair Style** - short, medium, long, wavy, braided, bald
+- **Eye Color** - 8 natural variations
+- **Face Shape** - oval, round, angular, square
+- **Accessories** - crown (30%), necklace (50%), earrings (60% feminine)
+- **Facial Features** - variable eye size, nose size, lip size, brow thickness
+
+### Component Guidelines
+
+Following the project's coding standards:
+
+1. **Size Limit**: Components under 200 lines (complex components split into sub-components)
+2. **SVG Icons**: Never inline SVG code; create separate icon components
+3. **JSDoc Comments**: All public components and functions documented
+4. **TypeScript**: Strict typing with interfaces for all props
+5. **Barrel Exports**: Use `index.ts` for clean imports
+
+### Styling Approach
+
+- **Tailwind CSS** for layout and common styling
+- **Inline styles** for dynamic SVG attributes (colors, transforms)
+- **CSS classes** in `index.css` for animations (`animate-match-pop`, etc.)
+- **Gradient classes** for branded elements (`bg-tinder-gradient`)

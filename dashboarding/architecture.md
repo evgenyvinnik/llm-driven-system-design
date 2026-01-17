@@ -977,3 +977,186 @@ backend/src/shared/
 - Consistent behavior across all routes and services
 - Easy to test and modify independently
 - Clear separation between business logic and infrastructure
+
+## Frontend Architecture
+
+The frontend is built with React 19, TypeScript, Vite, TanStack Router, and Tailwind CSS. It follows a modular component architecture that promotes reusability, testability, and maintainability.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── alerts/           # Alert-specific components
+│   │   ├── index.ts      # Barrel export
+│   │   ├── AlertRuleForm.tsx
+│   │   ├── AlertRuleCard.tsx
+│   │   ├── AlertRuleList.tsx
+│   │   ├── AlertHistoryTable.tsx
+│   │   └── alertUtils.ts
+│   ├── AlertBanner.tsx   # Global alert notification banner
+│   ├── DashboardGrid.tsx # Dashboard panel layout grid
+│   ├── DashboardPanel.tsx # Panel wrapper with type routing
+│   ├── GaugePanel.tsx    # Gauge visualization
+│   ├── Navbar.tsx        # Main navigation
+│   ├── PanelChart.tsx    # Line/area/bar chart panels
+│   ├── StatPanel.tsx     # Single stat display
+│   └── TimeRangeSelector.tsx # Time range picker
+├── hooks/                # Custom React hooks
+│   └── useAlerts.ts      # Alert data fetching and state
+├── routes/               # TanStack Router page components
+│   ├── __root.tsx        # Root layout
+│   ├── index.tsx         # Dashboard list page
+│   ├── dashboard.$dashboardId.tsx # Dashboard view page
+│   ├── alerts.tsx        # Alerts management page
+│   └── metrics.tsx       # Metrics explorer page
+├── services/             # API client functions
+│   └── api.ts            # Typed API calls
+├── stores/               # Zustand state management
+│   ├── dashboardStore.ts
+│   └── alertStore.ts
+├── types/                # TypeScript type definitions
+│   └── index.ts          # Shared types and interfaces
+└── utils/                # Helper utilities
+```
+
+### Component Design Principles
+
+#### 1. Feature-based Organization
+
+Components are grouped by feature domain (e.g., `components/alerts/`) rather than by component type. This keeps related code together and makes it easier to find and modify.
+
+```
+components/
+├── alerts/              # All alert-related components
+│   ├── AlertRuleForm.tsx
+│   ├── AlertRuleCard.tsx
+│   └── ...
+├── dashboards/          # Dashboard-related components (future)
+└── metrics/             # Metrics-related components (future)
+```
+
+#### 2. Component Composition
+
+Large page components are decomposed into smaller, focused sub-components:
+
+- **Page components** (in `routes/`) orchestrate state and compose sub-components
+- **Container components** handle data fetching and business logic
+- **Presentational components** focus purely on rendering UI
+
+Example decomposition of the Alerts page:
+
+```
+AlertsPage (routes/alerts.tsx)
+├── AlertsHeader         # Page header with create button
+├── ErrorBanner          # Error message display
+├── AlertRuleForm        # Create form (components/alerts/)
+├── AlertTabs            # Tab navigation
+├── AlertRuleList        # Rules list container
+│   └── AlertRuleCard    # Individual rule card
+└── AlertHistoryTable    # History table
+```
+
+#### 3. Custom Hooks for Data Logic
+
+Data fetching and state management are extracted into custom hooks to:
+- Keep components focused on UI rendering
+- Enable reuse across multiple components
+- Simplify testing (mock the hook, not the API)
+
+```typescript
+// hooks/useAlerts.ts
+export function useAlerts(): UseAlertsReturn {
+  // Handles: fetching, polling, CRUD operations, error state
+  return { rules, instances, loading, error, createRule, deleteRule, ... };
+}
+
+// Usage in component
+function AlertsPage() {
+  const { rules, loading, createRule } = useAlerts();
+  // Component only handles rendering
+}
+```
+
+#### 4. Barrel Exports
+
+Each component directory includes an `index.ts` that re-exports all public components and types:
+
+```typescript
+// components/alerts/index.ts
+export { AlertRuleForm } from './AlertRuleForm';
+export type { AlertRuleFormData } from './AlertRuleForm';
+export { AlertRuleCard } from './AlertRuleCard';
+export { AlertRuleList } from './AlertRuleList';
+export { AlertHistoryTable } from './AlertHistoryTable';
+```
+
+This enables clean imports:
+```typescript
+import { AlertRuleForm, AlertRuleList, AlertHistoryTable } from '../components/alerts';
+```
+
+#### 5. JSDoc Documentation
+
+All components and significant functions include JSDoc comments:
+
+```typescript
+/**
+ * Renders a card displaying alert rule details and actions.
+ *
+ * Displays:
+ * - Severity badge with color coding
+ * - Rule name and description
+ * - Condition expression
+ * - Toggle, test, and delete action buttons
+ *
+ * @param props - Component props
+ * @returns The rendered alert rule card
+ */
+export function AlertRuleCard({ rule, onToggle, onEvaluate, onDelete }: AlertRuleCardProps) {
+  // ...
+}
+```
+
+### Component Size Guidelines
+
+- **Target**: Keep components under 200 lines
+- **Maximum**: 250 lines before considering extraction
+- **Signals to split**:
+  - Multiple distinct visual sections
+  - Complex conditional rendering logic
+  - Repeated patterns that could be generalized
+  - Independent data fetching for sections
+
+### State Management Strategy
+
+| State Type | Solution | Example |
+|------------|----------|---------|
+| Server state | Custom hooks + API calls | `useAlerts()` for alert data |
+| UI state (local) | `useState` | Form visibility, active tab |
+| UI state (shared) | Zustand stores | Selected time range |
+| Form state | `useState` + form components | Alert creation form |
+
+### Styling Conventions
+
+All styling uses Tailwind CSS with custom theme colors defined in `tailwind.config.js`:
+
+- `dashboard-bg`: Dark background (#0f1419)
+- `dashboard-card`: Card background (#1a1f2e)
+- `dashboard-accent`: Border/divider color (#2d3748)
+- `dashboard-text`: Primary text (#e2e8f0)
+- `dashboard-muted`: Secondary text (#718096)
+- `dashboard-highlight`: Accent color (#3b82f6)
+
+Components use semantic color utilities for consistency:
+
+```typescript
+// alertUtils.ts
+export function getSeverityColor(severity: string): string {
+  switch (severity) {
+    case 'critical': return 'bg-red-600 text-white';
+    case 'warning': return 'bg-yellow-600 text-white';
+    default: return 'bg-blue-600 text-white';
+  }
+}
+```

@@ -1136,7 +1136,9 @@ frontend/src/
 │       ├── IssueDetailHeader.tsx
 │       ├── IssueDetailSidebar.tsx
 │       ├── IssueDetailTabs.tsx
-│       └── IssueSummaryEditor.tsx
+│       ├── IssueSummaryEditor.tsx
+│       ├── CommentsTab.tsx
+│       └── HistoryTab.tsx
 ├── hooks/
 │   └── useIssueDetail.ts         # Custom hook for issue detail state management
 ├── routes/                       # TanStack Router file-based routing
@@ -1172,12 +1174,12 @@ The `IssueDetail` component demonstrates the pattern for complex views:
 IssueDetail (container)
 ├── IssueDetailHeader     # Issue type icon, key, close button
 ├── IssueSummaryEditor    # Inline editing for summary and description
-├── IssueDetailTabs       # Comments and history tabs
-│   ├── TabNavigation
-│   ├── CommentsTab
-│   │   └── CommentItem
-│   └── HistoryTab
-│       └── HistoryItem
+├── IssueDetailTabs       # Tab navigation component
+│   ├── TabNavigation     # Tab buttons
+│   ├── CommentsTab       # Comment form and list
+│   │   └── CommentItem   # Individual comment display
+│   └── HistoryTab        # History entries list
+│       └── HistoryItem   # Individual history entry
 └── IssueDetailSidebar    # Status, assignee, priority, story points
 ```
 

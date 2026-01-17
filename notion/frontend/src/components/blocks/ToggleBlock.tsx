@@ -49,11 +49,11 @@ function ChildBlockRenderer({ block }: { block: Block }) {
  * ```
  */
 export function ToggleBlock({
-  block,
+  block: _block,
   isExpanded,
   onToggle,
   childBlocks,
-  allBlocks,
+  allBlocks: _allBlocks,
   contentRef,
   textContent,
   placeholder,

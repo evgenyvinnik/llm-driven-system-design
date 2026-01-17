@@ -1,8 +1,8 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
-import { useAuthStore } from '../../stores/authStore';
-import api from '../../services/api';
-import type { Category } from '../../types';
+import { useAuthStore } from '../stores/authStore';
+import api from '../services/api';
+import type { Category } from '../types';
 
 export const Route = createFileRoute('/dashboard/business/new')({
   component: NewBusinessPage,

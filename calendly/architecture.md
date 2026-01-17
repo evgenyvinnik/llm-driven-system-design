@@ -859,6 +859,199 @@ Uses Tanstack Router with file-based routing. Route files define:
 
 ---
 
+## Guest Booking Experience
+
+The public booking page is the primary interface for invitees to schedule meetings. This section documents the guest-facing booking flow design.
+
+### User Flow
+
+```
+Guest clicks booking link → views event details → selects date →
+selects time slot → fills form → confirms booking → receives confirmation
+```
+
+### Booking Page Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     BOOKING PAGE                             │
+├─────────────────────────────────────────────────────────────┤
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Event Header                                     │  │
+│  │  - Host name, avatar                                  │  │
+│  │  - Event title, duration                              │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Timezone Selector                                │  │
+│  │  - Auto-detected: "Local time (EST)"                  │  │
+│  │  - Quick options: Eastern, Pacific, Central, GMT      │  │
+│  │  - Instant re-render on change (no loading spinner)   │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Calendar Selector                                │  │
+│  │  - Month navigation                                   │  │
+│  │  - Date grid with availability indicators             │  │
+│  │  - Pre-select next available date                     │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Time Slot List                                   │  │
+│  │  - Available times for selected date                  │  │
+│  │  - Displayed in guest's timezone                      │  │
+│  │  - Late night/early morning warnings                  │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Booking Form (appears after slot selection)      │  │
+│  │  - Name, Email (required)                             │  │
+│  │  - Optional notes                                     │  │
+│  │  - Confirm button                                     │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │      Confirmation Screen                              │  │
+│  │  - Booking details in both timezones                  │  │
+│  │  - Add to calendar link (Google, Outlook, iCal)       │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Progressive Disclosure
+
+The booking page uses progressive disclosure to reduce cognitive load:
+
+1. **Step 1**: Show calendar (low commitment)
+2. **Step 2**: After date selection → Show time slots
+3. **Step 3**: After time selection → Show booking form
+4. **Step 4**: After form submission → Show confirmation
+
+### Client-Side Caching Strategy
+
+Guest availability is cached with a 3-5 minute TTL to balance performance and freshness:
+
+```typescript
+const CACHE_DURATION = 3 * 60 * 1000; // 3 minutes
+const availabilityCache = new Map();
+
+async function getAvailability(eventId, startDate, endDate) {
+  const cacheKey = `${eventId}-${startDate}-${endDate}`;
+  const cached = availabilityCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.data;
+  }
+
+  const data = await api.getAvailability(eventId, startDate, endDate);
+  availabilityCache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+}
+
+// Clear cache after booking to force fresh data
+function onBookingCreated() {
+  availabilityCache.clear();
+}
+```
+
+**Trade-off**: 3-5 minute cache means there's a small window where a guest might see a slot as available that was just booked. This is mitigated by:
+1. Pre-submit slot verification
+2. Server-side 409 Conflict response with alternative slot suggestions
+
+### Double-Booking Prevention (Client Side)
+
+The client implements a pre-check before form submission:
+
+```typescript
+async function handleBooking(formData) {
+  setIsSubmitting(true);
+
+  try {
+    // Pre-check availability (catches most conflicts early)
+    const stillAvailable = await checkSlotAvailability(formData.selected_slot);
+
+    if (!stillAvailable) {
+      showError("This slot was just booked. Here are alternatives:");
+      refreshAvailability();
+      showAlternativeSlots();
+      return;
+    }
+
+    // Server validates again (race condition could still happen)
+    const booking = await createBooking(formData);
+    showConfirmation(booking);
+
+  } catch (error) {
+    if (error.status === 409) {
+      showError("Someone just booked this slot");
+      refreshAvailability();
+      showAlternativeSlots();
+    }
+  } finally {
+    setIsSubmitting(false);
+  }
+}
+```
+
+### Timezone Handling (Client Side)
+
+All times are stored and transmitted in UTC. The client handles timezone display:
+
+```typescript
+// Auto-detect guest timezone
+const guestTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Display conversion
+import { utcToZonedTime, format } from 'date-fns-tz';
+
+function displayTime(utcTimestamp, guestTimezone) {
+  const zonedTime = utcToZonedTime(utcTimestamp, guestTimezone);
+  return format(zonedTime, 'h:mm a zzz', { timeZone: guestTimezone });
+}
+
+// Late night/early morning warning
+const hour = utcToZonedTime(slotTime, guestTimezone).getHours();
+if (hour < 6 || hour > 22) {
+  showWarning("Note: This is outside typical working hours in your timezone");
+}
+```
+
+### Mobile UX Optimization
+
+- **Touch targets**: Min 44x44px for date/time buttons
+- **Swipe gestures**: Swipe to change months
+- **Vertical layout**: Stack calendar above form
+- **Bottom sheet**: Booking form slides up on mobile
+- **Sticky elements**: Timezone selector and confirm button stay visible
+
+### Guest Booking Component Structure
+
+```
+frontend/src/
+├── routes/
+│   └── book.$meetingTypeId.tsx    # Main booking page route
+├── components/
+│   └── booking/                   # Guest booking components
+│       ├── index.ts               # Barrel export
+│       ├── EventHeader.tsx        # Host info + event details
+│       ├── TimezoneSelector.tsx   # Timezone dropdown with auto-detect
+│       ├── BookingCalendar.tsx    # Month calendar with availability
+│       ├── TimeSlotList.tsx       # Available times for selected date
+│       ├── BookingForm.tsx        # Guest info collection form
+│       ├── ConfirmationScreen.tsx # Success state with calendar links
+│       └── SlotUnavailable.tsx    # 409 error state with alternatives
+```
+
+### Security Considerations
+
+1. **URL token validation**: All three parts (username, slug, token) validated together
+2. **Rate limiting**: Max 20 availability checks per IP per minute
+3. **Bot detection**: CAPTCHA for suspicious booking patterns
+4. **Honeypot fields**: Hidden fields to catch automated submissions
+5. **Email verification** (optional): Confirmation link before finalizing booking
+
+---
+
 ## Scalability Considerations
 
 ### Database Scaling

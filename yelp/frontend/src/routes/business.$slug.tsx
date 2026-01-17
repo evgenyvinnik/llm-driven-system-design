@@ -34,7 +34,7 @@ export const Route = createFileRoute('/business/$slug')({
  */
 function BusinessDetailPage() {
   const { slug } = Route.useParams();
-  const { user, isAuthenticated } = useAuthStore();
+  const { isAuthenticated } = useAuthStore();
   const [business, setBusiness] = useState<Business | null>(null);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [pagination, setPagination] = useState<Pagination | null>(null);

@@ -1082,6 +1082,122 @@ These patterns work together to create a resilient system:
 
 Each pattern addresses a specific failure mode, and together they provide defense in depth against the inevitable failures of distributed systems.
 
+## Frontend Architecture
+
+The frontend is built with React 18 + TypeScript + Vite, following a feature-based organization pattern. Components are organized by domain and reusability.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Shared, reusable components
+│   ├── DrawingCard/     # Drawing thumbnail with actions (flag, delete, restore)
+│   ├── PostItCanvas/    # Skeuomorphic drawing canvas
+│   └── StrokeThumbnail/ # Renders stroke data as SVG thumbnail
+├── routes/              # Feature-based pages
+│   ├── admin/           # Admin dashboard (data management)
+│   │   ├── AdminDashboard.tsx    # Main container with auth and state management
+│   │   ├── AdminDashboard.css    # Dashboard-specific styles
+│   │   └── components/           # Dashboard-specific components
+│   │       ├── index.ts          # Barrel exports
+│   │       ├── AdminLogin.tsx    # Authentication form
+│   │       ├── StatCard.tsx      # Metric display card
+│   │       ├── OverviewTab.tsx   # Dashboard overview with stats
+│   │       ├── DrawingsTab.tsx   # Drawing gallery with filters
+│   │       ├── QualityTab.tsx    # Batch quality analysis
+│   │       └── TrainingTab.tsx   # Model training management
+│   └── implement/       # Implementor portal (model testing)
+│       └── ImplementorPortal.tsx
+├── services/            # API clients
+│   └── api.ts           # Typed API functions for all backend services
+├── App.tsx              # Root component with routing
+└── main.tsx             # Application entry point
+```
+
+### Component Organization Principles
+
+**1. Feature Encapsulation**
+Each major feature (admin, implement) has its own directory under `routes/`. Complex pages like AdminDashboard have a nested `components/` directory for page-specific sub-components that are not reused elsewhere.
+
+**2. Shared vs. Local Components**
+- `src/components/`: Reusable across multiple features (e.g., DrawingCard is used in both admin gallery and could be used in user history)
+- `routes/<feature>/components/`: Specific to that feature, not exported globally
+
+**3. Barrel Exports**
+Each component directory has an `index.ts` for clean imports:
+```typescript
+// Clean import from barrel
+import { AdminLogin, StatCard, OverviewTab } from './components'
+
+// Instead of multiple individual imports
+import { AdminLogin } from './components/AdminLogin'
+import { StatCard } from './components/StatCard'
+```
+
+**4. Component Size Guidelines**
+- Target: Under 200 lines per component
+- Complex components are split into logical sub-components
+- Each component has a single responsibility
+
+### Admin Dashboard Architecture
+
+The AdminDashboard is the most complex page, organized as follows:
+
+```
+AdminDashboard (Container Component)
+├── Manages: auth state, data fetching, global error state
+├── Provides: callbacks to child components for mutations
+│
+├── AdminLogin         # Shown when not authenticated
+├── DashboardHeader    # Title and user menu
+├── DashboardNav       # Tab navigation
+└── Tab Components (conditional rendering)
+    ├── OverviewTab    # Stats cards + charts
+    ├── DrawingsTab    # Gallery + filters
+    ├── QualityTab     # Analysis controls + results
+    └── TrainingTab    # Model list + training controls
+```
+
+**State Management**
+- Container (AdminDashboard) owns all shared state
+- Tab components receive data via props
+- Mutations trigger callbacks that update container state
+- Local UI state (filters, form inputs) managed within tab components
+
+**Data Flow**
+```
+API → AdminDashboard (fetches, caches) → Tab Components (display, user actions)
+                    ↑                                      │
+                    └──────────────────────────────────────┘
+                          (callbacks trigger refetch)
+```
+
+### Styling Approach
+
+- **CSS Modules**: Each component has a co-located `.css` file
+- **Class naming**: BEM-like conventions (`.admin-header`, `.stat-card`, `.filter-group`)
+- **No global styles**: Except for base resets in `index.css`
+
+### JSDoc Documentation
+
+All components and significant functions have JSDoc comments:
+
+```typescript
+/**
+ * StatCard component - Displays a single statistic with title and value.
+ * Used in the admin dashboard overview to show key metrics.
+ * @module routes/admin/components/StatCard
+ */
+
+/**
+ * @param props - Component props
+ * @param props.title - Label for the statistic
+ * @param props.value - The statistic value
+ * @param props.color - Color theme (blue, green, red, purple)
+ */
+export function StatCard({ title, value, color }: StatCardProps) { ... }
+```
+
 ## Future Enhancements
 
 1. **Active Learning:** Prioritize collecting drawings for underperforming classes

@@ -1094,6 +1094,156 @@ HALF_OPEN (testing) -> OPEN (if test requests fail)
 - **Security**: Sensitive fields (passwords, tokens) are automatically redacted
 - **Performance**: Pino is the fastest Node.js logger, critical for high-throughput APIs
 
+## Frontend Architecture
+
+The frontend is built with React 19, TypeScript, TanStack Router, and Tailwind CSS. The codebase follows a modular component architecture to ensure maintainability, reusability, and clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── business/         # Business detail page components
+│   │   ├── index.ts            # Barrel export
+│   │   ├── PhotoGallery.tsx    # Image carousel with navigation
+│   │   ├── BusinessHeader.tsx  # Name, rating, categories display
+│   │   ├── BusinessSidebar.tsx # Contact info and hours
+│   │   ├── ReviewForm.tsx      # Review submission form
+│   │   └── ReviewsList.tsx     # Paginated reviews display
+│   ├── admin/            # Admin dashboard components
+│   │   ├── index.ts            # Barrel export
+│   │   ├── AdminTabs.tsx       # Tab navigation
+│   │   ├── OverviewTab.tsx     # Stats cards and top cities
+│   │   ├── UsersTab.tsx        # User management table
+│   │   ├── BusinessesTab.tsx   # Business management table
+│   │   └── ReviewsTab.tsx      # Review moderation list
+│   ├── dashboard/        # Business owner dashboard components
+│   │   ├── index.ts            # Barrel export
+│   │   ├── BusinessManageHeader.tsx  # Header with back button
+│   │   ├── BusinessInfoForm.tsx      # Business editing form
+│   │   └── BusinessReviewsManagement.tsx # Review response UI
+│   ├── BusinessCard.tsx  # Business listing card
+│   ├── Header.tsx        # Global navigation header
+│   ├── ReviewCard.tsx    # Individual review display
+│   └── StarRating.tsx    # Star rating components
+├── routes/               # TanStack Router file-based routes
+│   ├── __root.tsx        # Root layout with Header
+│   ├── index.tsx         # Home page
+│   ├── search.tsx        # Search results page
+│   ├── business.$slug.tsx      # Business detail page
+│   ├── login.tsx         # Login form
+│   ├── register.tsx      # Registration form
+│   ├── dashboard.tsx     # Business owner dashboard
+│   ├── dashboard.business.$id.tsx  # Business management
+│   ├── dashboard.business.new.tsx  # New business form
+│   ├── admin.tsx         # Admin dashboard
+│   └── profile.tsx       # User profile page
+├── services/             # API client and services
+│   └── api.ts            # Axios-based API client
+├── stores/               # Zustand state management
+│   └── authStore.ts      # Authentication state
+└── types/                # TypeScript type definitions
+    └── index.ts          # Shared type interfaces
+```
+
+### Component Organization Principles
+
+1. **Feature-based grouping**: Components are organized by feature/page (business, admin, dashboard) rather than by type (buttons, forms, modals).
+
+2. **Barrel exports**: Each component directory has an `index.ts` that exports all public components, enabling clean imports:
+   ```typescript
+   import { PhotoGallery, BusinessHeader, BusinessSidebar } from '../components/business';
+   ```
+
+3. **Component size limits**: Route components are kept under 250 lines by extracting logical sections into sub-components. Individual components aim for under 150 lines.
+
+4. **Props interfaces**: All components define explicit TypeScript interfaces for their props, with JSDoc comments explaining each property.
+
+5. **Colocation**: Helper functions and sub-components that are only used by a single component are colocated in the same file rather than extracted.
+
+### Component Patterns
+
+#### Route Components
+Route components (in `routes/`) handle:
+- Data fetching via the API service
+- State management (loading, error, success states)
+- Authentication/authorization checks
+- Composition of feature components
+
+```typescript
+function BusinessDetailPage() {
+  // 1. Route params and auth
+  const { slug } = Route.useParams();
+  const { isAuthenticated } = useAuthStore();
+
+  // 2. State management
+  const [business, setBusiness] = useState<Business | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // 3. Data fetching
+  useEffect(() => { loadBusiness(); }, [slug]);
+
+  // 4. Render composition
+  return (
+    <div>
+      <PhotoGallery photos={photos} businessName={business.name} />
+      <BusinessHeader business={business} />
+      <BusinessSidebar business={business} />
+      <ReviewsList reviews={reviews} onVote={handleVote} />
+    </div>
+  );
+}
+```
+
+#### Presentational Components
+Feature components are primarily presentational:
+- Receive data via props
+- Emit events via callback props
+- No direct API calls
+- Minimal internal state (UI-only state like form inputs)
+
+```typescript
+interface BusinessHeaderProps {
+  business: Business;
+}
+
+export function BusinessHeader({ business }: BusinessHeaderProps) {
+  return (
+    <div className="mb-8">
+      <h1 className="text-3xl font-bold">{business.name}</h1>
+      <StarRating rating={business.rating} />
+    </div>
+  );
+}
+```
+
+### State Management
+
+- **Global state**: Zustand store for authentication (`authStore.ts`)
+- **Server state**: Local component state with `useState` for API data
+- **UI state**: Local component state for form inputs, toggles, etc.
+
+### API Integration
+
+All API calls go through the centralized `api.ts` service which:
+- Configures base URL from environment
+- Handles authentication headers
+- Provides typed request/response methods
+- Manages error handling
+
+```typescript
+import api from '../services/api';
+
+const response = await api.get<{ business: Business }>(`/businesses/${slug}`);
+```
+
+### Styling Approach
+
+- **Tailwind CSS**: Utility-first styling
+- **No CSS-in-JS**: All styles via Tailwind classes
+- **Responsive design**: Mobile-first with `md:` and `lg:` breakpoints
+- **Color palette**: Uses custom `yelp-red` and `yelp-blue` theme colors
+
 ---
 
 *Architecture document for local development learning project. Production deployment would require additional considerations for multi-region, compliance, and operational runbooks.*

@@ -1,81 +1,111 @@
-# Design Plugin Platform - Development with Claude
+# Pluggable Text Editor - Development Notes
 
 ## Project Context
 
-Building a web-based extension platform to understand plugin sandboxing, API design, and marketplace architecture.
+Building a pluggable text editor where **everything is a plugin** to explore plugin architecture patterns.
 
 **Key Learning Goals:**
-- Design secure plugin sandboxing with Web Workers
-- Build versioned extension APIs
-- Implement marketplace at scale
-- Handle extension lifecycle management
+- Design a slot-based contribution system
+- Build loosely-coupled plugin communication
+- Implement plugin lifecycle management
+- Create composable UI from independent plugins
 
 ---
 
-## Key Challenges to Explore
+## Design Decisions
 
-### 1. Secure Sandboxing
+### 1. In-Process Plugins (No Web Workers)
 
-**Challenge**: Run untrusted JavaScript code safely
+**Decision**: Plugins run in the main thread, not Web Workers.
 
-**Approaches:**
-- Web Workers for isolation
-- iframe sandboxing
-- WebAssembly isolation
-- Message-passing API
+**Rationale**:
+- Plugins need direct DOM access for UI rendering
+- React components can't easily run in workers
+- This is a learning project with bundled plugins (no untrusted code)
+- Simpler development and debugging
 
-### 2. API Design
+**Trade-off**: Less isolation, but acceptable for this use case.
 
-**Problem**: Stable, versioned API for extensions
+### 2. Slot System
 
-**Solutions:**
-- Semantic versioning
-- Deprecation periods
-- Compatibility layers
-- Feature detection
+**Decision**: Named slots with declarative contributions.
 
-### 3. Marketplace Scale
+**Rationale**:
+- Plugins don't need to know about each other
+- Order can be controlled via manifest
+- Familiar pattern (Vue slots, Web Components)
 
-**Challenge**: Handle thousands of extensions efficiently
+### 3. Event Bus + Shared State
 
-**Solutions:**
-- Elasticsearch for search
-- CDN for bundle hosting
-- Caching for metadata
-- Async security scanning
+**Decision**: Use both mechanisms.
+
+**Rationale**:
+- **State**: For persistent values (font, theme, content)
+- **Events**: For transient notifications (content changed)
+- Plugins choose the appropriate mechanism
 
 ---
 
-## Development Phases
+## Implementation History
 
-### Phase 1: Core Platform
-- [ ] Extension API design
-- [ ] Web Worker sandboxing
-- [ ] Message passing layer
-- [ ] Permission system
+### Phase 1: Architecture Pivot
+- Transformed from VS Code-style extension marketplace to pluggable text editor
+- Designed slot system with toolbar, canvas, sidebar, statusbar, modal slots
+- Created plugin context API with events, state, storage, commands
 
-### Phase 2: Marketplace
-- [ ] Extension registry
-- [ ] Search and browse
-- [ ] Reviews and ratings
-- [ ] Download tracking
+### Phase 2: Core Infrastructure
+- Implemented `EventBus` class for pub/sub communication
+- Implemented `StateManager` class for reactive shared state
+- Created `PluginHost` React context for plugin loading
+- Created `Slot` component for rendering contributions
 
-### Phase 3: Developer Tools
-- [ ] CLI for publishing
-- [ ] Extension SDK
-- [ ] Documentation
-- [ ] Debugging tools
+### Phase 3: Plugins
+Implemented 5 bundled plugins:
 
-### Phase 4: Security
-- [ ] Code scanning
-- [ ] Review process
-- [ ] Malware detection
-- [ ] Update revocation
+1. **paper-background**: 6 paper styles (plain, ruled, checkered, dotted, graph, legal)
+2. **font-selector**: 7 font families + size selector
+3. **text-editor**: Actual textarea with auto-save to localStorage
+4. **word-count**: Real-time word/character/line counts
+5. **theme**: Light/dark mode with system preference detection
+
+---
+
+## Plugin Communication Examples
+
+### Font Plugin → Editor Plugin
+```
+Font Selector                    Text Editor
+    │                                │
+    ├── state.set('format.font')────▶│
+    │                                │ subscribe('format.font')
+    │                                │     └── Update textarea style
+```
+
+### Editor Plugin → Word Count Plugin
+```
+Text Editor                      Word Count
+    │                                │
+    ├── state.set('editor.content')─▶│
+    │                                │ subscribe('editor.content')
+    │                                │     └── Recalculate counts
+```
+
+---
+
+## Future Ideas
+
+- **Markdown Preview Plugin**: Split view with rendered markdown
+- **Export Plugin**: Download as .txt, .md, .html
+- **Auto-save Plugin**: Periodic save to server/cloud
+- **Focus Mode Plugin**: Dim everything except current paragraph
+- **Typewriter Sounds Plugin**: Audio feedback while typing
+- **Spell Check Plugin**: Highlight misspelled words
+- **Find & Replace Plugin**: Search functionality in sidebar
 
 ---
 
 ## Resources
 
-- [VS Code Extension API](https://code.visualstudio.com/api)
-- [Web Workers API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API)
-- [Chrome Extensions Architecture](https://developer.chrome.com/docs/extensions/mv3/architecture-overview/)
+- [VS Code Extension API](https://code.visualstudio.com/api) - Inspiration for contribution system
+- [Zustand](https://github.com/pmndrs/zustand) - State management patterns
+- [Web Components Slots](https://developer.mozilla.org/en-US/docs/Web/Web_Components/Using_templates_and_slots) - Slot concept

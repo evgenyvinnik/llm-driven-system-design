@@ -1,11 +1,37 @@
+/**
+ * Star Rating Components
+ *
+ * This module provides components for displaying and selecting star ratings.
+ * Used throughout the application for business ratings and review submissions.
+ *
+ * @module components/StarRating
+ */
 import { Star, StarHalf } from 'lucide-react';
 
+/**
+ * Props for the StarRating component.
+ */
 interface StarRatingProps {
+  /** The rating value to display (0-5, supports decimals) */
   rating: number;
+  /** Size variant for the stars */
   size?: 'sm' | 'md' | 'lg';
+  /** Whether to show the numeric rating value */
   showValue?: boolean;
 }
 
+/**
+ * StarRating displays a read-only star rating with support for half stars.
+ * Renders filled, half-filled, and empty stars based on the rating value.
+ *
+ * @param props - Component properties
+ * @returns Star rating display component
+ *
+ * @example
+ * ```tsx
+ * <StarRating rating={4.5} size="lg" showValue />
+ * ```
+ */
 export function StarRating({ rating, size = 'md', showValue = false }: StarRatingProps) {
   const sizeClasses = {
     sm: 'w-3 h-3',
@@ -60,12 +86,31 @@ export function StarRating({ rating, size = 'md', showValue = false }: StarRatin
   );
 }
 
+/**
+ * Props for the InteractiveStarRating component.
+ */
 interface InteractiveStarRatingProps {
+  /** Current selected rating value (1-5) */
   value: number;
+  /** Callback when a star is clicked */
   onChange: (value: number) => void;
+  /** Size variant for the stars */
   size?: 'sm' | 'md' | 'lg';
 }
 
+/**
+ * InteractiveStarRating provides a clickable star rating input.
+ * Users can click on any star to set the rating value.
+ *
+ * @param props - Component properties
+ * @returns Interactive star rating input component
+ *
+ * @example
+ * ```tsx
+ * const [rating, setRating] = useState(0);
+ * <InteractiveStarRating value={rating} onChange={setRating} />
+ * ```
+ */
 export function InteractiveStarRating({ value, onChange, size = 'lg' }: InteractiveStarRatingProps) {
   const sizeClasses = {
     sm: 'w-6 h-6',
@@ -74,13 +119,15 @@ export function InteractiveStarRating({ value, onChange, size = 'lg' }: Interact
   };
 
   return (
-    <div className="flex gap-1">
+    <div className="flex gap-1" role="radiogroup" aria-label="Rating selection">
       {[1, 2, 3, 4, 5].map((star) => (
         <button
           key={star}
           type="button"
           onClick={() => onChange(star)}
           className="focus:outline-none"
+          aria-label={`${star} star${star > 1 ? 's' : ''}`}
+          aria-pressed={value >= star}
         >
           <Star
             className={`${sizeClasses[size]} cursor-pointer transition-colors ${

@@ -1165,3 +1165,138 @@ URL: http://localhost:15672
 User: shopify
 Pass: shopify_dev
 ```
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React, TypeScript, and Vite, following a modular component architecture designed for maintainability and reusability.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/
+│   ├── admin/                    # Admin dashboard components
+│   │   ├── index.ts              # Barrel export
+│   │   ├── AdminLayout.tsx       # Sidebar and header layout
+│   │   ├── DashboardTab.tsx      # Analytics dashboard
+│   │   ├── ProductsTab.tsx       # Product CRUD management
+│   │   ├── OrdersTab.tsx         # Order list and fulfillment
+│   │   ├── CustomersTab.tsx      # Customer list
+│   │   └── SettingsTab.tsx       # Store settings form
+│   ├── common/                   # Shared UI components
+│   │   ├── index.ts              # Barrel export
+│   │   ├── LoadingSpinner.tsx    # Loading indicators
+│   │   └── EmptyState.tsx        # Empty/error state displays
+│   ├── icons/                    # SVG icon components
+│   │   ├── index.ts              # Barrel export
+│   │   ├── CartIcon.tsx
+│   │   ├── BackArrowIcon.tsx
+│   │   ├── ImagePlaceholderIcon.tsx
+│   │   └── CheckIcon.tsx
+│   └── storefront/               # Customer-facing components
+│       ├── index.ts              # Barrel export
+│       ├── StorefrontLayout.tsx  # Header and footer
+│       ├── ProductsView.tsx      # Product grid display
+│       ├── ProductDetailView.tsx # Single product view
+│       ├── CartView.tsx          # Shopping cart
+│       ├── CheckoutView.tsx      # Checkout form
+│       └── SuccessView.tsx       # Order confirmation
+├── routes/                       # Tanstack Router pages
+│   ├── admin/
+│   │   └── $storeId.tsx          # Admin dashboard (127 lines)
+│   └── store/
+│       └── $subdomain.tsx        # Storefront (239 lines)
+├── services/
+│   └── api.ts                    # API client functions
+├── stores/
+│   ├── auth.ts                   # Authentication state (Zustand)
+│   └── storefront.ts             # Storefront state (Zustand)
+└── types/
+    └── index.ts                  # TypeScript interfaces
+```
+
+### Component Design Principles
+
+**1. Single Responsibility**
+Each component handles one concern. For example, `ProductCard` only displays a single product; `ProductsView` orchestrates the grid layout.
+
+**2. Composition Over Inheritance**
+Complex UIs are built by composing smaller components:
+```tsx
+<CartView>
+  <CartItem />      {/* Individual item row */}
+  <CartSummary />   {/* Subtotal and actions */}
+</CartView>
+```
+
+**3. Props Down, Callbacks Up**
+Components receive data via props and communicate changes via callback functions:
+```tsx
+<ProductsTab storeId={123} />  // Data flows down
+<CartItem onUpdateQuantity={(id, qty) => {...}} />  // Events flow up
+```
+
+**4. Colocation of Related Code**
+Helper components (like `StatusBadge`, `QuantityControls`) are defined in the same file as their parent when they're not reused elsewhere.
+
+### State Management
+
+**Global State (Zustand)**
+- `useAuthStore` - User authentication, login/logout
+- `useStorefrontStore` - Store data, products, cart for customer view
+- `useStoreStore` - Current store for admin context
+
+**Local State (React useState)**
+- Form inputs and validation
+- UI state (modals, active tabs)
+- Loading/processing indicators
+
+### Component Size Guidelines
+
+| Component Type | Target Lines | Example |
+|---------------|--------------|---------|
+| Page/Route | < 200 | `$storeId.tsx` (127 lines) |
+| Container | < 150 | `ProductsTab.tsx` (145 lines) |
+| Presentational | < 100 | `CartView.tsx` (95 lines) |
+| Helper | < 50 | `StatusBadge` (15 lines) |
+
+### Import Conventions
+
+Components are exported via barrel files for clean imports:
+
+```tsx
+// Clean imports via barrel exports
+import { ProductsView, CartView, CheckoutView } from '../../components/storefront';
+import { AdminSidebar, DashboardTab } from '../../components/admin';
+import { LoadingSpinner, EmptyState } from '../../components/common';
+import { CartIcon, BackArrowIcon } from '../../components/icons';
+```
+
+### JSDoc Documentation
+
+All components include JSDoc comments describing their purpose and props:
+
+```tsx
+/**
+ * Product card component for grid display.
+ * Shows product image, title, price, and add to cart button.
+ *
+ * @param props - Product card configuration
+ * @returns Product card element with image, details, and actions
+ */
+export function ProductCard({ product, primaryColor, onSelectProduct, onAddToCart }: ProductCardProps) {
+  // ...
+}
+```
+
+### Key Design Decisions
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Routing | Tanstack Router | React Router | Type-safe routing, file-based routes |
+| State | Zustand | Redux | Simpler API, less boilerplate |
+| Styling | Tailwind CSS | CSS Modules | Utility-first, rapid development |
+| Icons | SVG components | Icon library | Full control, tree-shaking |
+| Forms | Controlled inputs | React Hook Form | Simpler for current scale |

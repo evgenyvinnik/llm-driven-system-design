@@ -1095,3 +1095,236 @@ logger.info({
 - Sensitive data redaction (passwords, card numbers)
 - Consistent format for alerting rules
 
+## Frontend Architecture
+
+This section documents the frontend component organization and design patterns used in the React application.
+
+### Technology Stack
+
+| Technology | Purpose |
+|------------|---------|
+| React 19 | UI library with modern features |
+| TypeScript | Static typing for maintainability |
+| Vite | Fast build tooling and dev server |
+| TanStack Router | Type-safe file-based routing |
+| Zustand | Lightweight state management |
+| Tailwind CSS | Utility-first CSS framework |
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── admin/           # Admin-specific components
+│   │   ├── index.ts     # Barrel export for admin components
+│   │   ├── AdminRoomTypeCard.tsx
+│   │   ├── BookingsTable.tsx
+│   │   ├── CreateHotelModal.tsx
+│   │   ├── DashboardHotelCard.tsx
+│   │   ├── HotelHeader.tsx
+│   │   ├── HotelSelector.tsx
+│   │   ├── PricingModal.tsx
+│   │   ├── RoomTypeModal.tsx
+│   │   └── StatsGrid.tsx
+│   ├── icons/           # SVG icon components
+│   │   ├── index.ts     # Barrel export for icons
+│   │   ├── ChevronLeftIcon.tsx
+│   │   └── CloseIcon.tsx
+│   ├── AvailabilityCalendar.tsx
+│   ├── BookingCard.tsx
+│   ├── Header.tsx
+│   ├── HotelCard.tsx
+│   ├── RoomTypeCard.tsx
+│   └── SearchBar.tsx
+├── hooks/               # Custom React hooks
+├── routes/              # TanStack Router file-based routes
+│   ├── admin.hotels.$hotelId.tsx  # Hotel management page
+│   ├── admin.index.tsx            # Admin dashboard
+│   ├── hotels.$hotelId.tsx        # Hotel detail page
+│   ├── index.tsx                  # Home page
+│   └── ...
+├── services/            # API client and external services
+│   └── api.ts           # Centralized API calls
+├── stores/              # Zustand state stores
+│   └── authStore.ts     # Authentication state
+├── types/               # TypeScript type definitions
+│   └── index.ts         # Shared interfaces
+└── utils/               # Utility functions
+    └── index.ts         # Formatting, helpers
+```
+
+### Component Design Principles
+
+#### 1. Single Responsibility
+
+Each component should do one thing well. Large components are decomposed into smaller, focused sub-components:
+
+```tsx
+// Bad: Monolithic component with 500+ lines
+function AdminDashboard() {
+  // All logic, state, and rendering in one file
+}
+
+// Good: Composed from smaller components
+function AdminDashboard() {
+  return (
+    <div>
+      <DashboardHeader />
+      <HotelSelector />
+      <StatsGrid />
+      <BookingsTable />
+    </div>
+  );
+}
+```
+
+#### 2. Component Size Guidelines
+
+| Component Type | Target Lines | Maximum Lines |
+|---------------|--------------|---------------|
+| Route pages | 150-250 | 300 |
+| Feature components | 100-150 | 200 |
+| UI primitives | 30-50 | 100 |
+| Icons | 15-30 | 50 |
+
+When a component exceeds these limits, consider extracting sub-components.
+
+#### 3. JSDoc Documentation
+
+All exported components and significant functions include JSDoc comments:
+
+```tsx
+/**
+ * Modal component for creating and editing hotel room types.
+ * Provides a form for room details including name, capacity, pricing, and amenities.
+ *
+ * @param props - Component props
+ * @returns A modal dialog for room type management
+ *
+ * @example
+ * ```tsx
+ * <RoomTypeModal
+ *   hotelId="hotel-123"
+ *   room={null}
+ *   onClose={() => setShowModal(false)}
+ *   onSuccess={() => refreshData()}
+ * />
+ * ```
+ */
+export function RoomTypeModal({ hotelId, room, onClose, onSuccess }: RoomTypeModalProps) {
+  // ...
+}
+```
+
+#### 4. Icon Components
+
+SVG icons are extracted into dedicated components, never inlined:
+
+```tsx
+// components/icons/ChevronLeftIcon.tsx
+export function ChevronLeftIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" {...props}>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+    </svg>
+  );
+}
+
+// Usage in components
+import { ChevronLeftIcon } from '@/components/icons';
+<ChevronLeftIcon className="w-4 h-4" />
+```
+
+#### 5. Barrel Exports
+
+Component directories use `index.ts` files for clean imports:
+
+```tsx
+// components/admin/index.ts
+export { RoomTypeModal } from './RoomTypeModal';
+export { PricingModal } from './PricingModal';
+export { CreateHotelModal } from './CreateHotelModal';
+// ...
+
+// Usage in route files
+import { RoomTypeModal, PricingModal, CreateHotelModal } from '@/components/admin';
+```
+
+### Admin Components
+
+The admin section uses a modular component architecture:
+
+| Component | Purpose | Lines |
+|-----------|---------|-------|
+| `CreateHotelModal` | Form modal for adding new hotels | ~250 |
+| `RoomTypeModal` | Form modal for room type CRUD | ~250 |
+| `PricingModal` | Form modal for dynamic pricing | ~160 |
+| `HotelHeader` | Hotel summary in management view | ~110 |
+| `AdminRoomTypeCard` | Room type card with actions | ~150 |
+| `HotelSelector` | Sidebar hotel picker | ~75 |
+| `DashboardHotelCard` | Hotel summary on dashboard | ~95 |
+| `StatsGrid` | Booking statistics display | ~85 |
+| `BookingsTable` | Recent bookings table | ~165 |
+
+### State Management
+
+**Zustand** is used for global state (authentication), while component-local state handles UI concerns:
+
+```tsx
+// Global state with Zustand
+const { user, isAuthenticated } = useAuthStore();
+
+// Local state for UI
+const [showModal, setShowModal] = useState(false);
+const [formData, setFormData] = useState({ name: '', ... });
+```
+
+### API Service Layer
+
+All API calls are centralized in `services/api.ts`:
+
+```tsx
+// services/api.ts
+export const api = {
+  getHotel: (id: string) => fetch(`/api/hotels/${id}`).then(r => r.json()),
+  createHotel: (data: CreateHotelInput) => fetch('/api/hotels', { method: 'POST', body: JSON.stringify(data) }),
+  // ...
+};
+
+// Usage in components
+import { api } from '@/services/api';
+const hotel = await api.getHotel(hotelId);
+```
+
+### Route Organization
+
+Routes follow TanStack Router's file-based conventions:
+
+| File | URL | Description |
+|------|-----|-------------|
+| `index.tsx` | `/` | Home page with search |
+| `login.tsx` | `/login` | Authentication page |
+| `admin.tsx` | `/admin` | Admin layout wrapper |
+| `admin.index.tsx` | `/admin/` | Admin dashboard |
+| `admin.hotels.$hotelId.tsx` | `/admin/hotels/:hotelId` | Hotel management |
+| `hotels.$hotelId.tsx` | `/hotels/:hotelId` | Public hotel details |
+
+### Type Safety
+
+All components use TypeScript interfaces for props:
+
+```tsx
+interface RoomTypeModalProps {
+  /** The hotel ID this room type belongs to */
+  hotelId: string;
+  /** Existing room type to edit, or null for creating a new one */
+  room: RoomType | null;
+  /** Callback when the modal is closed without saving */
+  onClose: () => void;
+  /** Callback when the room type is successfully saved */
+  onSuccess: () => void;
+}
+```
+
+Shared types are defined in `types/index.ts` and imported throughout the application.
+

@@ -83,7 +83,7 @@ export default function BlockComponent({
   onFocus,
   onUpdate,
   onChangeType,
-  onDelete,
+  onDelete: _onDelete,
   onAddBlock,
   onKeyDown,
   onSlashCommand,

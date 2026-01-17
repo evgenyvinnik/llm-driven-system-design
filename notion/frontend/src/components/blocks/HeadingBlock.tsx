@@ -3,7 +3,6 @@
  * Renders heading_1, heading_2, and heading_3 block types with appropriate styling.
  */
 
-import type { BlockType } from '@/types';
 import type { BlockRendererProps } from './types';
 
 /**

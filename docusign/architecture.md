@@ -1722,3 +1722,180 @@ All application logs use structured JSON format via pino, enabling:
   "msg": "Signature captured successfully"
 }
 ```
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React, TypeScript, Vite, and Tailwind CSS. It follows a modular component architecture designed for maintainability and reusability.
+
+### Component Organization
+
+```
+frontend/src/
+├── components/
+│   ├── common/           # Reusable UI components
+│   │   ├── StatusBadge.tsx      # Status indicator badges
+│   │   ├── LoadingSpinner.tsx   # Loading states
+│   │   ├── MessageBanner.tsx    # Error/success messages
+│   │   └── index.ts             # Barrel export
+│   │
+│   ├── envelope/         # Envelope management components
+│   │   ├── DocumentsTab.tsx     # Document upload/management
+│   │   ├── RecipientsTab.tsx    # Recipient management
+│   │   ├── FieldsTab.tsx        # Field placement orchestrator
+│   │   ├── FieldsSidebar.tsx    # Field placement controls
+│   │   ├── PdfViewer.tsx        # PDF rendering with overlays
+│   │   ├── AuditTab.tsx         # Audit trail display
+│   │   └── index.ts
+│   │
+│   ├── signing/          # Signing ceremony components
+│   │   ├── SigningHeader.tsx    # Header with actions
+│   │   ├── SigningSidebar.tsx   # Navigation and field list
+│   │   ├── SigningPdfViewer.tsx # Interactive PDF viewer
+│   │   ├── SignatureModal.tsx   # Signature capture modal
+│   │   ├── SigningLoadingState.tsx
+│   │   ├── SigningErrorState.tsx
+│   │   └── index.ts
+│   │
+│   └── icons/            # SVG icon components
+│       ├── PdfIcon.tsx
+│       ├── CheckIcon.tsx
+│       ├── CloseIcon.tsx
+│       ├── WarningIcon.tsx
+│       └── index.ts
+│
+├── routes/               # Page components (TanStack Router)
+│   ├── envelopes/
+│   │   ├── index.tsx            # Envelope list
+│   │   ├── new.tsx              # Create envelope
+│   │   └── $envelopeId.tsx      # Envelope detail (~440 lines)
+│   ├── sign/
+│   │   └── $accessToken.tsx     # Signing ceremony (~300 lines)
+│   └── ...
+│
+├── stores/               # Zustand state management
+│   ├── authStore.ts             # Authentication state
+│   └── envelopeStore.ts         # Envelope data and actions
+│
+├── services/             # API client
+│   └── api.ts                   # HTTP client with typed endpoints
+│
+└── types/                # TypeScript definitions
+    └── index.ts
+```
+
+### Component Design Principles
+
+1. **Single Responsibility**: Each component has one clear purpose
+2. **Composition over Inheritance**: Small components composed into larger features
+3. **Props-Down, Events-Up**: Parent components manage state, children receive data via props
+4. **JSDoc Documentation**: All exported components and functions have JSDoc comments
+5. **Barrel Exports**: Each component directory has an `index.ts` for clean imports
+
+### Key Components
+
+#### Common Components
+
+| Component | Purpose | Props |
+|-----------|---------|-------|
+| `StatusBadge` | Display status with color coding | `status: string` |
+| `LoadingSpinner` | Loading indicator | `size`, `centered`, `message` |
+| `MessageBanner` | Error/success/info messages | `type`, `message`, `className` |
+
+#### Envelope Components
+
+| Component | Purpose | Lines |
+|-----------|---------|-------|
+| `DocumentsTab` | Document upload and list | ~100 |
+| `RecipientsTab` | Add/remove recipients | ~130 |
+| `FieldsTab` | Orchestrates field placement | ~120 |
+| `FieldsSidebar` | Controls for field placement | ~210 |
+| `PdfViewer` | PDF rendering with field overlays | ~95 |
+| `AuditTab` | Hash-chain verified audit trail | ~100 |
+
+#### Signing Components
+
+| Component | Purpose | Lines |
+|-----------|---------|-------|
+| `SigningHeader` | Header with progress and actions | ~70 |
+| `SigningSidebar` | Field navigation checklist | ~180 |
+| `SigningPdfViewer` | Interactive PDF with clickable fields | ~95 |
+| `SignatureModal` | Draw/type signature capture | ~230 |
+| `SigningLoadingState` | Loading state display | ~15 |
+| `SigningErrorState` | Error state display | ~25 |
+
+### State Management
+
+**Global State (Zustand)**:
+- `authStore`: User authentication, session management
+- `envelopeStore`: Current envelope data, CRUD operations
+
+**Local State (React useState)**:
+- UI state: active tab, modal visibility, form inputs
+- Derived data: current page fields, completion status
+
+### PDF Handling
+
+The application uses `react-pdf` (PDF.js wrapper) for document rendering:
+
+```typescript
+// PDF.js worker configuration (required)
+pdfjs.GlobalWorkerOptions.workerSrc =
+  `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+
+// Document rendering with page navigation
+<Document file={documentUrl} onLoadSuccess={({ numPages }) => setNumPages(numPages)}>
+  <Page pageNumber={currentPage} width={700} />
+</Document>
+```
+
+Field overlays are positioned absolutely over the PDF using CSS:
+
+```css
+.field-highlight {
+  position: absolute;
+  border: 2px dashed;
+  background: rgba(255, 193, 7, 0.2);
+  cursor: pointer;
+}
+```
+
+### Signature Capture
+
+The `SignatureModal` component supports two input modes:
+
+1. **Draw Mode**: Uses `signature_pad` library for canvas-based drawing
+2. **Type Mode**: Renders typed text to canvas with cursive font
+
+Both modes output base64-encoded PNG images for storage.
+
+### Route Structure
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | Landing | Home page |
+| `/login` | Login | User authentication |
+| `/register` | Register | User registration |
+| `/envelopes` | EnvelopeList | List all envelopes |
+| `/envelopes/new` | NewEnvelope | Create envelope |
+| `/envelopes/:id` | EnvelopeDetail | Manage envelope |
+| `/sign/:token` | SigningPage | Signing ceremony |
+| `/admin` | Admin | Admin dashboard |
+
+### Import Conventions
+
+```typescript
+// Barrel imports for cleaner code
+import { StatusBadge, LoadingSpinner, MessageBanner } from '../../components/common';
+import { DocumentsTab, RecipientsTab, FieldsTab, AuditTab } from '../../components/envelope';
+import { SigningHeader, SigningSidebar, SignatureModal } from '../../components/signing';
+import { PdfIcon, CheckIcon } from '../../components/icons';
+```
+
+### Performance Considerations
+
+1. **Code Splitting**: Route-based splitting via TanStack Router
+2. **PDF Worker**: Loaded asynchronously from CDN
+3. **Memoization**: Consider `React.memo` for frequently re-rendered components
+4. **Lazy Loading**: PDF pages loaded on demand

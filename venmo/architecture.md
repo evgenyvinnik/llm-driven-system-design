@@ -1459,3 +1459,114 @@ Without archival: ~3 TB PostgreSQL = ~$1000/month
 - `pino` - Fast structured JSON logging
 - `prom-client` - Prometheus metrics client
 
+---
+
+## Frontend Architecture
+
+The frontend is built with TypeScript, React, and TanStack Router. Components are organized into a modular structure that promotes reusability and maintainability.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/
+│   ├── icons/                 # SVG icon components
+│   │   ├── index.ts          # Barrel export
+│   │   ├── ArrowIcon.tsx     # Transaction direction arrows
+│   │   ├── BankIcon.tsx      # Bank account icon
+│   │   ├── CardIcon.tsx      # Credit/debit card icon
+│   │   ├── CloseIcon.tsx     # Close/dismiss button icon
+│   │   └── SpinnerIcon.tsx   # Loading spinner
+│   ├── wallet/               # Wallet feature components
+│   │   ├── index.ts          # Barrel export
+│   │   ├── WalletOverview.tsx    # Quick actions (deposit, cashout)
+│   │   ├── TransactionHistory.tsx # Transaction list
+│   │   ├── PaymentMethodsTab.tsx  # Payment methods management
+│   │   ├── DepositForm.tsx        # Add money form
+│   │   ├── CashoutForm.tsx        # Withdraw money form
+│   │   ├── RecentCashouts.tsx     # Cashout history list
+│   │   ├── PaymentMethodItem.tsx  # Single payment method display
+│   │   └── AddBankForm.tsx        # Bank linking form
+│   ├── request/              # Payment request components
+│   │   ├── index.ts          # Barrel export
+│   │   ├── CreateRequestForm.tsx  # New request form
+│   │   ├── ReceivedRequests.tsx   # Incoming requests list
+│   │   ├── SentRequests.tsx       # Outgoing requests list
+│   │   ├── RequestCard.tsx        # Single request display
+│   │   ├── RequestStatusBadge.tsx # Status indicator badge
+│   │   ├── UserSearchDropdown.tsx # User autocomplete search
+│   │   └── AmountInput.tsx        # Currency input field
+│   ├── Avatar.tsx            # User avatar with fallback
+│   ├── Button.tsx            # Reusable button component
+│   ├── Input.tsx             # Form input components
+│   ├── Layout.tsx            # App shell/navigation
+│   ├── LoadingSpinner.tsx    # Loading state indicator
+│   └── TransactionCard.tsx   # Feed transaction display
+├── routes/                   # TanStack Router page components
+│   ├── __root.tsx           # Root layout
+│   ├── index.tsx            # Home/feed page
+│   ├── login.tsx            # Login page
+│   ├── register.tsx         # Registration page
+│   ├── pay.tsx              # Send payment page
+│   ├── request.tsx          # Request money page
+│   ├── wallet.tsx           # Wallet management page
+│   └── profile.tsx          # User profile page
+├── services/
+│   └── api.ts               # API client functions
+├── stores/
+│   └── index.ts             # Zustand state stores
+├── types/
+│   └── index.ts             # TypeScript type definitions
+└── utils/
+    └── index.ts             # Utility functions (formatCurrency, formatDate, etc.)
+```
+
+### Component Design Principles
+
+1. **Feature-Based Organization**: Components are grouped by feature (wallet, request) rather than by type. This keeps related code together and makes it easier to understand the full feature.
+
+2. **Barrel Exports**: Each feature directory has an `index.ts` that re-exports all public components. This provides clean imports:
+   ```typescript
+   import { WalletOverview, TransactionHistory } from '../components/wallet';
+   ```
+
+3. **Icon Components**: SVG icons are extracted into separate components rather than inlined. This improves readability and enables reuse across the application.
+
+4. **Single Responsibility**: Each component handles one concern:
+   - `DepositForm` handles deposit logic and UI
+   - `CashoutForm` handles cashout logic and UI
+   - `WalletOverview` orchestrates the quick actions section
+
+5. **Props for Configuration**: Components use props for all configuration:
+   - `onSuccess` callbacks for parent notification
+   - `isLoading` for loading states
+   - `variant` for styling variations
+
+6. **JSDoc Documentation**: All components include JSDoc comments describing:
+   - Component purpose
+   - Props documentation
+   - Important implementation notes
+
+### Route Components
+
+Route components (`/routes/*.tsx`) serve as page-level orchestrators:
+
+- They manage tab state and navigation
+- They connect to Zustand stores for data
+- They compose feature components to build the page
+- They remain lean by delegating to sub-components
+
+### State Management
+
+- **Zustand Stores**: Global state for auth, wallet, and requests
+- **Local State**: Component-specific UI state (forms, tabs, loading)
+- **Props Drilling**: Limited to 1-2 levels; deeper needs trigger extraction
+
+### Styling
+
+- **Tailwind CSS**: Utility-first styling for rapid development
+- **Consistent Patterns**:
+  - `rounded-lg shadow-sm` for cards
+  - `bg-venmo-blue text-white` for primary actions
+  - `text-gray-500` for secondary text
+

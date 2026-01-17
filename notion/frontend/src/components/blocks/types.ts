@@ -42,10 +42,21 @@ export interface ToggleBlockRendererProps extends BlockRendererProps {
 
 /**
  * Extended props for code blocks with special key handling.
+ * Note: Code blocks use an HTMLElement ref for the <code> element.
  */
-export interface CodeBlockRendererProps extends BlockRendererProps {
-  /** Reference to the code element (overrides contentRef type) */
+export interface CodeBlockRendererProps {
+  /** Reference to the code element */
   contentRef: React.RefObject<HTMLElement | null>;
+  /** The text content extracted from the block's RichText array */
+  textContent: string;
+  /** Placeholder text shown when the block is empty */
+  placeholder: string;
+  /** Handler called when the content is modified */
+  onInput: () => void;
+  /** Handler for keyboard events (navigation, shortcuts) */
+  onKeyDown: (e: React.KeyboardEvent) => void;
+  /** Handler called when the block gains focus */
+  onFocus: () => void;
 }
 
 /**

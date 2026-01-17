@@ -10,3 +10,5 @@ export { IssueDetailHeader } from './IssueDetailHeader';
 export { IssueDetailSidebar } from './IssueDetailSidebar';
 export { IssueDetailTabs, type IssueDetailTabType } from './IssueDetailTabs';
 export { IssueSummaryEditor } from './IssueSummaryEditor';
+export { CommentsTab } from './CommentsTab';
+export { HistoryTab } from './HistoryTab';

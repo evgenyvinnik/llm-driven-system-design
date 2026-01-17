@@ -1838,3 +1838,128 @@ async function shutdown(signal) {
   "opossum": "^8.x"          // Circuit breaker
 }
 ```
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React 19, TypeScript, Vite, Tanstack Router, and Zustand for state management. Components follow a modular architecture with clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/              # Shared UI components
+│   ├── index.ts             # Barrel exports for all components
+│   ├── Header.tsx           # App header with navigation
+│   ├── ContentCard.tsx      # Movie/series thumbnail cards
+│   ├── ContentRow.tsx       # Horizontal scrolling content rows
+│   ├── HeroBanner.tsx       # Featured content hero section
+│   ├── VideoPlayer.tsx      # Main video player component
+│   ├── admin/               # Admin dashboard sub-components
+│   │   ├── index.ts         # Admin barrel exports
+│   │   ├── types.ts         # Admin-specific type definitions
+│   │   ├── AdminTabs.tsx    # Tab navigation component
+│   │   ├── StatCard.tsx     # Metric display cards
+│   │   ├── OverviewTab.tsx  # Platform statistics overview
+│   │   ├── ContentTab.tsx   # Content management table
+│   │   └── UsersTab.tsx     # User listing table
+│   └── player/              # Video player sub-components
+│       ├── index.ts         # Player barrel exports
+│       ├── types.ts         # Player-specific type definitions
+│       ├── PlayerTopBar.tsx # Back button and title display
+│       ├── ProgressBar.tsx  # Interactive seek bar
+│       ├── PlayerControls.tsx # Play/pause, volume, settings
+│       ├── QualitySettings.tsx # Quality selection dropdown
+│       └── VideoOverlay.tsx # Video area with play indicator
+├── routes/                  # Tanstack Router file-based routes
+│   ├── __root.tsx           # Root layout component
+│   ├── index.tsx            # Home page (/)
+│   ├── admin.tsx            # Admin dashboard (/admin)
+│   ├── watch.$contentId.tsx # Video player (/watch/:contentId)
+│   └── ...                  # Other pages
+├── stores/                  # Zustand state stores
+│   ├── authStore.ts         # Authentication and profile state
+│   ├── playerStore.ts       # Video playback state
+│   └── contentStore.ts      # Content catalog state
+├── services/                # API client functions
+│   └── api.ts               # REST API wrapper
+├── types/                   # Shared TypeScript types
+│   └── index.ts             # Content, User, Profile types
+└── utils/                   # Utility functions
+    └── index.ts             # Formatters and helpers
+```
+
+### Component Design Principles
+
+1. **Modular Sub-components**: Large components are split into focused sub-components:
+   - Admin dashboard (409 lines) -> 6 sub-components (~60-150 lines each)
+   - Video player (409 lines) -> 5 sub-components (~50-100 lines each)
+
+2. **Barrel Exports**: Each component directory has an `index.ts` for clean imports:
+   ```typescript
+   // Direct imports
+   import { AdminTabs, StatCard } from '../components/admin';
+   import { PlayerControls, ProgressBar } from '../components/player';
+
+   // Or via main barrel
+   import { VideoPlayer, AdminTabs } from '../components';
+   ```
+
+3. **Type Colocation**: Types specific to a component group live in that directory's `types.ts`:
+   - `components/admin/types.ts` - AdminStats, AdminContent, AdminUser
+   - `components/player/types.ts` - PlayerStateProps, PlayerControlCallbacks
+
+4. **Custom Hooks**: Complex logic is extracted into custom hooks:
+   - `useAutoHideControls` - Auto-hide player controls after 3 seconds
+   - `useKeyboardControls` - Keyboard shortcut handling
+   - `usePlaybackSimulation` - Simulated video playback
+   - `useProgressAutoSave` - Periodic progress persistence
+
+5. **JSDoc Documentation**: All components and significant functions include JSDoc comments:
+   ```typescript
+   /**
+    * Statistic card component for displaying key metrics.
+    * Shows an icon, label, and value with a colored gradient background.
+    *
+    * @param props - StatCardProps with icon, label, value, and color
+    * @returns Colored stat card component with gradient background
+    */
+   export function StatCard({ icon, label, value, color }: StatCardProps) { ... }
+   ```
+
+### Key Components
+
+| Component | Lines | Purpose |
+|-----------|-------|---------|
+| `VideoPlayer.tsx` | ~356 | Main player with 4 custom hooks for controls, keyboard, progress |
+| `PlayerControls.tsx` | ~447 | Bottom control bar with 7 button sub-components |
+| `admin.tsx` (route) | ~183 | Admin page orchestrating sub-components |
+| `OverviewTab.tsx` | ~173 | Stats cards and subscription breakdown |
+| `ContentTab.tsx` | ~188 | Content management table with featured toggle |
+| `UsersTab.tsx` | ~151 | User listing table with role badges |
+
+Note: `PlayerControls.tsx` contains 7 small button components (15-35 lines each) that are
+logically related and kept together for easier navigation. Each has JSDoc documentation.
+
+### State Management
+
+**Zustand stores** provide centralized state:
+
+- **authStore**: User authentication, profile selection, logout
+- **playerStore**: Playback state (isPlaying, currentTime, volume), quality selection, progress save
+- **contentStore**: Cached content catalog data
+
+Components subscribe to specific slices to avoid unnecessary re-renders:
+```typescript
+const { isPlaying } = usePlayerStore((state) => ({ isPlaying: state.isPlaying }));
+```
+
+### Styling
+
+- **Tailwind CSS** for utility-first styling
+- Custom colors defined in `tailwind.config.js`:
+  - `apple-blue`, `apple-green`, `apple-red`, `apple-gray-*`
+- Gradient backgrounds for visual depth
+- Hover transitions for interactive elements
+

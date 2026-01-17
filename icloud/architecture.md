@@ -1577,6 +1577,124 @@ mc mirror ./backup-chunks/ minio/icloud-chunks
 
 ---
 
+## Frontend Architecture
+
+The frontend is built with React, TypeScript, and Tailwind CSS. Components are organized into logical modules with clear separation of concerns.
+
+### Component Directory Structure
+
+```
+frontend/src/components/
+├── admin/                    # Admin dashboard components
+│   ├── index.ts              # Barrel exports
+│   ├── OverviewTab.tsx       # System statistics display
+│   ├── OperationsTab.tsx     # Sync operations table
+│   ├── ConflictsTab.tsx      # Conflict management
+│   └── UsersTab.tsx          # User administration
+│
+├── common/                   # Shared UI components
+│   ├── index.ts              # Barrel exports
+│   ├── StatCard.tsx          # Colored statistic cards
+│   ├── LoadingSpinner.tsx    # Loading indicators
+│   └── Modal.tsx             # Modal dialog wrapper
+│
+├── files/                    # File browser components
+│   ├── index.ts              # Barrel exports
+│   ├── FileItemComponent.tsx # Single file/folder row
+│   ├── FileToolbar.tsx       # Breadcrumb and actions
+│   ├── FileList.tsx          # File listing container
+│   ├── FileStatusBanners.tsx # Error/conflict/upload banners
+│   ├── NewFolderModal.tsx    # New folder creation
+│   ├── SelectionBar.tsx      # Selection count and clear
+│   └── DragOverlay.tsx       # Drop zone indicator
+│
+├── photos/                   # Photo gallery components
+│   ├── index.ts              # Barrel exports
+│   ├── PhotoItem.tsx         # Single photo thumbnail
+│   ├── PhotoViewer.tsx       # Full-screen lightbox
+│   ├── PhotoToolbar.tsx      # Filter and upload controls
+│   ├── PhotoGrid.tsx         # Thumbnail grid container
+│   └── CreateAlbumModal.tsx  # Album creation dialog
+│
+├── Icons.tsx                 # Shared icon components
+├── AdminDashboard.tsx        # Main admin page (orchestrator)
+├── FileBrowser.tsx           # Main file browser (orchestrator)
+└── PhotoGallery.tsx          # Main photo gallery (orchestrator)
+```
+
+### Design Principles
+
+**1. Component Size Guidelines**
+
+Each component follows a ~150-200 line maximum. Larger components are split into:
+- **Orchestrator components** (e.g., `AdminDashboard.tsx`): Handle state, effects, and compose sub-components
+- **Presentation components** (e.g., `StatCard.tsx`): Pure UI rendering with props
+
+**2. Module Organization**
+
+Related components are grouped into feature directories with barrel exports:
+```typescript
+// Import from feature module
+import { PhotoItem, PhotoViewer, PhotoGrid } from './photos';
+
+// Not individual files
+import { PhotoItem } from './photos/PhotoItem';
+```
+
+**3. JSDoc Documentation**
+
+All exported components and significant functions include JSDoc comments:
+```typescript
+/**
+ * Displays a single statistic in a colored card.
+ *
+ * @param props - Component props
+ * @returns Styled statistic card element
+ */
+export const StatCard: React.FC<StatCardProps> = ({ ... }) => { ... }
+```
+
+**4. Type Safety**
+
+Props interfaces are defined and exported alongside components:
+```typescript
+export interface StatCardProps {
+  title: string;
+  value: string | number;
+  subtitle?: string;
+  color?: StatCardColor;
+}
+```
+
+### State Management
+
+- **Zustand stores** for global application state (`fileStore`, `photoStore`)
+- **React state** for local UI state (modals, selections, form inputs)
+- **Store subscriptions** for WebSocket real-time updates
+
+### Component Communication Patterns
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| Props down | Parent to child data | `<PhotoGrid photos={photos} />` |
+| Callbacks up | Child to parent events | `onToggleSelection={(id) => ...}` |
+| Store | Cross-component state | `useFileStore()`, `usePhotoStore()` |
+| Context | Theme, auth (not yet used) | Future enhancement |
+
+### Common Components
+
+The `common/` directory contains reusable UI primitives:
+
+| Component | Purpose |
+|-----------|---------|
+| `StatCard` | Colored metric card for dashboards |
+| `LoadingSpinner` | Animated loading indicator |
+| `CenteredSpinner` | Spinner centered in a container |
+| `Modal` | Dialog overlay with title and content |
+| `ModalActions` | Standard cancel/confirm button row |
+
+---
+
 ## Implementation Notes
 
 This section documents the actual implementation of the observability, caching, and failure handling patterns described above. Each implementation addresses specific production concerns.
