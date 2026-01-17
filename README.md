@@ -66,6 +66,9 @@ Each folder contains an independent implementation of a system design problem:
 - [Design Robinhood](./robinhood/) - Stock trading platform
 - [Design a Payment System](./payment-system/) - Transaction processing system
 
+### ML/AI & Data Platforms
+- [Design Scale AI](./scale-ai/) - Data labeling platform with crowdsourced drawing collection and ML training
+
 ### Infrastructure & System Components
 - [Design a Rate Limiter](./rate-limiter/) - API rate limiting service
 - [Design a Job Scheduler](./job-scheduler/) - Distributed task scheduling
