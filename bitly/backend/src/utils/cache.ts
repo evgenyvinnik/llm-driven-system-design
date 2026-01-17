@@ -1,5 +1,7 @@
 import Redis from 'ioredis';
 import { REDIS_CONFIG, CACHE_CONFIG } from '../config.js';
+import logger from './logger.js';
+import { cacheHitsTotal, cacheMissesTotal } from './metrics.js';
 
 /**
  * Redis client instance for caching operations.
@@ -14,15 +16,42 @@ export const redis = new Redis({
     return delay;
   },
   maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  lazyConnect: false,
 });
 
+/**
+ * Track Redis connection state for health checks.
+ */
+let redisConnected = false;
+
 redis.on('connect', () => {
-  console.log('Redis connected');
+  redisConnected = true;
+  logger.info('Redis connected');
+});
+
+redis.on('ready', () => {
+  redisConnected = true;
+  logger.info('Redis ready');
 });
 
 redis.on('error', (error) => {
-  console.error('Redis error:', error);
+  redisConnected = false;
+  logger.error({ err: error }, 'Redis error');
 });
+
+redis.on('close', () => {
+  redisConnected = false;
+  logger.warn('Redis connection closed');
+});
+
+/**
+ * Returns the current Redis connection state.
+ * Used by health check endpoints.
+ */
+export function isRedisConnected(): boolean {
+  return redisConnected && redis.status === 'ready';
+}
 
 /**
  * Cache operations for URL short code to long URL mappings.
@@ -32,11 +61,26 @@ redis.on('error', (error) => {
 export const urlCache = {
   /**
    * Retrieves the long URL for a short code from cache.
+   * Tracks cache hits and misses in Prometheus metrics.
    * @param shortCode - The short code to look up
    * @returns Promise resolving to the long URL or null if not cached
    */
   async get(shortCode: string): Promise<string | null> {
-    return redis.get(`url:${shortCode}`);
+    try {
+      const result = await redis.get(`url:${shortCode}`);
+      if (result) {
+        cacheHitsTotal.inc();
+        logger.debug({ short_code: shortCode }, 'Cache hit');
+      } else {
+        cacheMissesTotal.inc();
+        logger.debug({ short_code: shortCode }, 'Cache miss');
+      }
+      return result;
+    } catch (error) {
+      logger.error({ err: error, short_code: shortCode }, 'Cache get failed');
+      cacheMissesTotal.inc();
+      return null;
+    }
   },
 
   /**
@@ -46,7 +90,12 @@ export const urlCache = {
    * @param ttl - Optional TTL in seconds, defaults to CACHE_CONFIG.urlTTL
    */
   async set(shortCode: string, longUrl: string, ttl?: number): Promise<void> {
-    await redis.setex(`url:${shortCode}`, ttl || CACHE_CONFIG.urlTTL, longUrl);
+    try {
+      await redis.setex(`url:${shortCode}`, ttl || CACHE_CONFIG.urlTTL, longUrl);
+      logger.debug({ short_code: shortCode, ttl: ttl || CACHE_CONFIG.urlTTL }, 'URL cached');
+    } catch (error) {
+      logger.error({ err: error, short_code: shortCode }, 'Cache set failed');
+    }
   },
 
   /**
@@ -54,7 +103,12 @@ export const urlCache = {
    * @param shortCode - The short code to remove from cache
    */
   async delete(shortCode: string): Promise<void> {
-    await redis.del(`url:${shortCode}`);
+    try {
+      await redis.del(`url:${shortCode}`);
+      logger.debug({ short_code: shortCode }, 'URL removed from cache');
+    } catch (error) {
+      logger.error({ err: error, short_code: shortCode }, 'Cache delete failed');
+    }
   },
 
   /**
@@ -63,8 +117,13 @@ export const urlCache = {
    * @returns Promise resolving to true if cached, false otherwise
    */
   async exists(shortCode: string): Promise<boolean> {
-    const result = await redis.exists(`url:${shortCode}`);
-    return result === 1;
+    try {
+      const result = await redis.exists(`url:${shortCode}`);
+      return result === 1;
+    } catch (error) {
+      logger.error({ err: error, short_code: shortCode }, 'Cache exists check failed');
+      return false;
+    }
   },
 };
 
@@ -117,5 +176,5 @@ export const keyPoolCache = {
  */
 export async function closeRedis(): Promise<void> {
   await redis.quit();
-  console.log('Redis connection closed');
+  logger.info('Redis connection closed');
 }

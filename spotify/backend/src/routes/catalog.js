@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import catalogService from '../services/catalogService.js';
+import { rateLimiters } from '../shared/rateLimit.js';
+import { searchOperationsTotal } from '../shared/metrics.js';
 
 const router = Router();
 
@@ -102,8 +104,8 @@ router.get('/featured', async (req, res) => {
   }
 });
 
-// Search
-router.get('/search', async (req, res) => {
+// Search (with rate limiting)
+router.get('/search', rateLimiters.search, async (req, res) => {
   try {
     const { q, limit = 20, type } = req.query;
 
@@ -117,9 +119,15 @@ router.get('/search', async (req, res) => {
       types,
     });
 
+    // Track search metrics
+    types.forEach((searchType) => {
+      searchOperationsTotal.inc({ type: searchType });
+    });
+
     res.json(results);
   } catch (error) {
-    console.error('Search error:', error);
+    const log = req.log || console;
+    log.error({ error: error.message }, 'Search error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

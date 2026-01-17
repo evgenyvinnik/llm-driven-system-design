@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import morgan from 'morgan';
 import session from 'express-session';
 import RedisStore from 'connect-redis';
 import path from 'path';
@@ -9,7 +8,13 @@ import { fileURLToPath } from 'url';
 
 import config from './config.js';
 import redis from './services/redis.js';
+import db from './db/index.js';
 import { initializeIndex } from './services/elasticsearch.js';
+
+// Shared modules
+import logger, { httpLogger } from './shared/logger.js';
+import { metricsMiddleware, getMetrics, getMetricsContentType, dbConnectionsActive } from './shared/metrics.js';
+import { getCircuitBreakerStatus } from './shared/circuit-breaker.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -40,8 +45,11 @@ app.use(cors({
   credentials: true,
 }));
 
-// Request logging
-app.use(morgan('dev'));
+// Structured JSON logging (replaces morgan)
+app.use(httpLogger);
+
+// Prometheus metrics middleware
+app.use(metricsMiddleware);
 
 // Body parsing
 app.use(express.json());
@@ -64,6 +72,92 @@ app.use(session({
   },
 }));
 
+// Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    // Update database connection gauge
+    const poolInfo = db.pool;
+    dbConnectionsActive.set(poolInfo.totalCount - poolInfo.idleCount);
+
+    res.set('Content-Type', getMetricsContentType());
+    res.end(await getMetrics());
+  } catch (error) {
+    logger.error({ error }, 'Error generating metrics');
+    res.status(500).end('Error generating metrics');
+  }
+});
+
+// Comprehensive health check endpoint
+app.get('/api/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: process.env.npm_package_version || '1.0.0',
+    uptime: process.uptime(),
+    services: {},
+  };
+
+  // Check PostgreSQL
+  try {
+    const dbStart = Date.now();
+    await db.query('SELECT 1');
+    health.services.postgres = {
+      status: 'healthy',
+      latencyMs: Date.now() - dbStart,
+      connections: {
+        total: db.pool.totalCount,
+        idle: db.pool.idleCount,
+        waiting: db.pool.waitingCount,
+      },
+    };
+  } catch (error) {
+    health.status = 'degraded';
+    health.services.postgres = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+  }
+
+  // Check Redis
+  try {
+    const redisStart = Date.now();
+    await redis.ping();
+    health.services.redis = {
+      status: 'healthy',
+      latencyMs: Date.now() - redisStart,
+    };
+  } catch (error) {
+    health.status = 'degraded';
+    health.services.redis = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+  }
+
+  // Get circuit breaker status
+  health.circuitBreakers = getCircuitBreakerStatus();
+
+  // Return appropriate status code
+  const statusCode = health.status === 'ok' ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+// Readiness probe (for Kubernetes)
+app.get('/api/ready', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    await redis.ping();
+    res.json({ ready: true });
+  } catch (error) {
+    res.status(503).json({ ready: false, error: error.message });
+  }
+});
+
+// Liveness probe (for Kubernetes)
+app.get('/api/live', (req, res) => {
+  res.json({ alive: true });
+});
+
 // API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/shops', shopsRoutes);
@@ -74,31 +168,68 @@ app.use('/api/favorites', favoritesRoutes);
 app.use('/api/reviews', reviewsRoutes);
 app.use('/api/categories', categoriesRoutes);
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  logger.error({
+    error: err.message,
+    stack: err.stack,
+    url: req.url,
+    method: req.method,
+    userId: req.session?.userId,
+  }, 'Unhandled error');
+
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// Graceful shutdown
+function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Received shutdown signal');
+
+  // Close server
+  server.close(() => {
+    logger.info('HTTP server closed');
+
+    // Close database pool
+    db.pool.end(() => {
+      logger.info('Database pool closed');
+
+      // Close Redis connection
+      redis.quit(() => {
+        logger.info('Redis connection closed');
+        process.exit(0);
+      });
+    });
+  });
+
+  // Force exit after 30 seconds
+  setTimeout(() => {
+    logger.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 30000);
+}
+
 // Start server
 const PORT = config.port;
+let server;
 
 async function startServer() {
   try {
     // Initialize Elasticsearch index
     await initializeIndex();
 
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log(`Environment: ${config.nodeEnv}`);
+    server = app.listen(PORT, () => {
+      logger.info({
+        port: PORT,
+        environment: config.nodeEnv,
+      }, 'Server started');
     });
+
+    // Handle graceful shutdown
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.error({ error }, 'Failed to start server');
     process.exit(1);
   }
 }

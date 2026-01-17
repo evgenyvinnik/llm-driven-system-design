@@ -127,6 +127,19 @@ CREATE TABLE sessions (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Audit logs for tracking critical business events
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  event_type VARCHAR(50) NOT NULL,
+  entity_type VARCHAR(50) NOT NULL,
+  entity_id INTEGER NOT NULL,
+  actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('customer', 'driver', 'restaurant', 'admin', 'system')),
+  actor_id INTEGER,
+  changes JSONB,
+  metadata JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Indexes for performance
 CREATE INDEX idx_restaurants_location ON restaurants(lat, lon);
 CREATE INDEX idx_restaurants_cuisine ON restaurants(cuisine_type);
@@ -141,6 +154,9 @@ CREATE INDEX idx_orders_driver ON orders(driver_id);
 CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX idx_audit_entity ON audit_logs(entity_type, entity_id);
+CREATE INDEX idx_audit_created ON audit_logs(created_at);
+CREATE INDEX idx_audit_actor ON audit_logs(actor_type, actor_id);
 
 -- Seed data for development
 -- Password is 'password123' hashed with bcrypt

@@ -2,12 +2,15 @@
  * @fileoverview Authentication routes for user registration, login, and profile management.
  * Handles session-based authentication using express-session.
  * All passwords are hashed with bcrypt before storage.
+ * Includes cache invalidation on profile updates.
  */
 
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
+import { invalidateUserCache } from '../services/cache.js';
+import { logger } from '../services/logger.js';
 import type { User } from '../types/index.js';
 
 const router = Router();
@@ -154,6 +157,7 @@ router.get('/me', requireAuth, async (req: Request, res: Response): Promise<void
 /**
  * PUT /auth/me - Update the authenticated user's profile.
  * Allows updating display_name and avatar_url.
+ * Invalidates user cache after update.
  */
 router.put('/me', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -167,9 +171,14 @@ router.put('/me', requireAuth, async (req: Request, res: Response): Promise<void
       [display_name, avatar_url, req.session.userId]
     );
 
+    // Invalidate cache after profile update
+    await invalidateUserCache(req.session.userId!);
+
+    logger.info({ msg: 'Profile updated', userId: req.session.userId });
+
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Update profile error:', error);
+    logger.error({ err: error, msg: 'Update profile error' });
     res.status(500).json({ error: 'Failed to update profile' });
   }
 });

@@ -51,6 +51,37 @@ const config = {
   cache: {
     ttl: parseInt(process.env.CACHE_TTL, 10) || 300,
     localTtl: 5000, // 5 seconds for local cache
+    maxMemory: process.env.CACHE_MAX_MEMORY || '256mb',
+    evictionPolicy: process.env.CACHE_EVICTION_POLICY || 'allkeys-lru',
+    // TTL configuration per cache type (in seconds)
+    ttlConfig: {
+      session: parseInt(process.env.SESSION_TTL, 10) || 86400, // 24 hours
+      rateLimit: parseInt(process.env.RATE_LIMIT_TTL, 10) || 60, // 1 minute
+      apiResponse: parseInt(process.env.API_RESPONSE_TTL, 10) || 300, // 5 minutes
+      userProfile: parseInt(process.env.USER_PROFILE_TTL, 10) || 600, // 10 minutes
+    },
+  },
+
+  // Data retention configuration
+  // WHY: Balances debugging/compliance needs against storage costs
+  retention: {
+    // Request logs retention in days
+    requestLogs: {
+      hot: parseInt(process.env.RETENTION_LOGS_HOT_DAYS, 10) || 7, // PostgreSQL
+      warm: parseInt(process.env.RETENTION_LOGS_WARM_DAYS, 10) || 30, // Archived/compressed
+      cold: parseInt(process.env.RETENTION_LOGS_COLD_DAYS, 10) || 90, // Before deletion
+    },
+    // Metrics retention
+    metrics: {
+      memory: parseInt(process.env.RETENTION_METRICS_MEMORY_HOURS, 10) || 24, // In-memory
+      persistent: parseInt(process.env.RETENTION_METRICS_PERSISTENT_DAYS, 10) || 30, // Prometheus
+    },
+    // Session data
+    sessions: parseInt(process.env.RETENTION_SESSIONS_HOURS, 10) || 24,
+    // API keys (soft delete)
+    apiKeys: {
+      softDeleteDays: 365, // Keep soft-deleted keys for 1 year
+    },
   },
 
   circuitBreaker: {

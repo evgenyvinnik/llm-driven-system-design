@@ -18,13 +18,33 @@ import {
 } from './services/messageService.js';
 import { WSMessage, WSChatMessage, WSTypingMessage, WSReadReceiptMessage } from './types/index.js';
 
+// Shared modules for observability and resilience
+import { createServiceLogger, LogEvents, logEvent } from './shared/logger.js';
+import {
+  websocketConnections,
+  websocketEvents,
+  recordMessage,
+  recordDeliveryDuration,
+} from './shared/metrics.js';
+import { checkWebSocketRateLimit } from './shared/rateLimiter.js';
+import { withRedisCircuit } from './shared/circuitBreaker.js';
+import { retryMessageDelivery } from './shared/retry.js';
+import {
+  startDeliveryTracking,
+  recordDelivery,
+  idempotentStatusUpdate,
+} from './shared/deliveryTracker.js';
+
+const wsLogger = createServiceLogger('websocket');
+
 /**
  * Extended WebSocket interface with user-specific properties.
- * Tracks the authenticated user and connection health.
+ * Tracks the authenticated user, connection health, and timing for metrics.
  */
 interface AuthenticatedSocket extends WebSocket {
   userId: string;
   isAlive: boolean;
+  connectedAt: number;
 }
 
 /**
@@ -37,6 +57,14 @@ const connections = new Map<string, AuthenticatedSocket>();
  * Sets up the WebSocket server for real-time messaging.
  * Handles authentication, message routing, typing indicators, and presence.
  * Supports horizontal scaling via Redis pub/sub for cross-server communication.
+ *
+ * Now includes:
+ * - Prometheus metrics for connections and messages
+ * - Rate limiting to prevent spam
+ * - Circuit breakers for Redis operations
+ * - Retry logic for reliable delivery
+ * - Idempotent status updates
+ *
  * @param server - HTTP server to attach WebSocket to
  * @param sessionMiddleware - Express session middleware for authentication
  * @returns The configured WebSocketServer instance
@@ -45,7 +73,13 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   // Subscribe to this server's Redis channel for cross-server messaging
-  redisSub.subscribe(KEYS.serverChannel(config.serverId));
+  // Wrapped in circuit breaker for resilience
+  withRedisCircuit(async () => {
+    await redisSub.subscribe(KEYS.serverChannel(config.serverId));
+    wsLogger.info({ channel: KEYS.serverChannel(config.serverId) }, 'Subscribed to Redis channel');
+  }).catch((error) => {
+    wsLogger.error({ error }, 'Failed to subscribe to Redis channel');
+  });
 
   redisSub.on('message', async (channel, message) => {
     if (channel === KEYS.serverChannel(config.serverId)) {
@@ -53,13 +87,14 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
         const data = JSON.parse(message);
         await handleRedisMessage(data);
       } catch (error) {
-        console.error('Error handling Redis message:', error);
+        wsLogger.error({ error, channel }, 'Error handling Redis message');
       }
     }
   });
 
   wss.on('connection', async (ws: WebSocket, req) => {
     const socket = ws as AuthenticatedSocket;
+    socket.connectedAt = Date.now();
 
     try {
       // Parse session from cookie
@@ -67,6 +102,7 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       const sessionId = cookies['connect.sid'];
 
       if (!sessionId) {
+        websocketEvents.inc({ event: 'auth_failed' });
         socket.close(4001, 'No session');
         return;
       }
@@ -76,6 +112,7 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       const sessionData = await redis.get(sessionKey);
 
       if (!sessionData) {
+        websocketEvents.inc({ event: 'auth_failed' });
         socket.close(4001, 'Invalid session');
         return;
       }
@@ -84,6 +121,7 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       const userId = session.userId;
 
       if (!userId) {
+        websocketEvents.inc({ event: 'auth_failed' });
         socket.close(4001, 'Not authenticated');
         return;
       }
@@ -94,24 +132,49 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       // Store connection
       connections.set(userId, socket);
 
+      // Update metrics
+      websocketConnections.inc();
+      websocketEvents.inc({ event: 'connect' });
+
       // Set presence to online
       await setUserPresence(userId, 'online', config.serverId);
 
-      console.log(`User ${userId} connected on ${config.serverId}`);
+      logEvent(LogEvents.WS_CONNECTED, {
+        user_id: userId,
+        server_id: config.serverId,
+      });
 
-      // Send pending messages
-      const pendingMessages = await getPendingMessagesForUser(userId);
-      for (const msg of pendingMessages) {
-        sendToSocket(socket, {
-          type: 'message',
-          payload: msg,
-        });
+      wsLogger.info({ userId, serverId: config.serverId }, 'User connected');
 
-        // Mark as delivered
-        await updateMessageStatus(msg.id, userId, 'delivered');
+      // Send pending messages with retry logic
+      try {
+        const pendingMessages = await getPendingMessagesForUser(userId);
+        for (const msg of pendingMessages) {
+          sendToSocket(socket, {
+            type: 'message',
+            payload: msg,
+          });
 
-        // Notify sender of delivery
-        await notifyDeliveryReceipt(msg.sender_id, msg.id, userId, 'delivered');
+          // Use idempotent status update
+          const wasUpdated = await idempotentStatusUpdate(msg.id, userId, 'delivered');
+
+          if (wasUpdated) {
+            // Record delivery metrics for pending messages
+            await recordDelivery(msg.id, userId, 'pending');
+
+            // Notify sender of delivery
+            await notifyDeliveryReceipt(msg.sender_id, msg.id, userId, 'delivered');
+          }
+        }
+
+        if (pendingMessages.length > 0) {
+          wsLogger.info(
+            { userId, count: pendingMessages.length },
+            'Delivered pending messages'
+          );
+        }
+      } catch (error) {
+        wsLogger.error({ error, userId }, 'Error delivering pending messages');
       }
 
       // Broadcast presence to relevant users
@@ -128,7 +191,7 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
           const message: WSMessage = JSON.parse(data.toString());
           await handleWebSocketMessage(socket, message);
         } catch (error) {
-          console.error('Error handling WebSocket message:', error);
+          wsLogger.error({ error, userId }, 'Error handling WebSocket message');
           sendToSocket(socket, {
             type: 'error',
             payload: { message: 'Invalid message format' },
@@ -139,16 +202,40 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       // Handle disconnect
       socket.on('close', async () => {
         connections.delete(userId);
+
+        // Update metrics
+        websocketConnections.dec();
+        websocketEvents.inc({ event: 'disconnect' });
+
+        // Calculate connection duration for logging
+        const connectionDuration = (Date.now() - socket.connectedAt) / 1000;
+
         await setUserPresence(userId, 'offline');
         await broadcastPresence(userId, 'offline');
-        console.log(`User ${userId} disconnected from ${config.serverId}`);
+
+        logEvent(LogEvents.WS_DISCONNECTED, {
+          user_id: userId,
+          server_id: config.serverId,
+          duration_seconds: connectionDuration,
+        });
+
+        wsLogger.info(
+          { userId, duration: connectionDuration },
+          'User disconnected'
+        );
       });
 
       socket.on('error', (error) => {
-        console.error(`WebSocket error for user ${userId}:`, error);
+        websocketEvents.inc({ event: 'error' });
+        logEvent(LogEvents.WS_ERROR, {
+          user_id: userId,
+          error: error.message,
+        });
+        wsLogger.error({ error, userId }, 'WebSocket error');
       });
     } catch (error) {
-      console.error('WebSocket connection error:', error);
+      websocketEvents.inc({ event: 'error' });
+      wsLogger.error({ error }, 'WebSocket connection error');
       socket.close(4000, 'Internal error');
     }
   });
@@ -159,6 +246,8 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
       const socket = ws as AuthenticatedSocket;
       if (!socket.isAlive) {
         connections.delete(socket.userId);
+        websocketConnections.dec();
+        websocketEvents.inc({ event: 'timeout' });
         return socket.terminate();
       }
       socket.isAlive = false;
@@ -176,7 +265,8 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
 
 /**
  * Routes incoming WebSocket messages to appropriate handlers.
- * Supports message, typing, and read receipt events.
+ * Applies rate limiting to prevent spam.
+ *
  * @param socket - The authenticated WebSocket connection
  * @param message - The parsed WebSocket message
  */
@@ -184,14 +274,34 @@ async function handleWebSocketMessage(socket: AuthenticatedSocket, message: WSMe
   const userId = socket.userId;
 
   switch (message.type) {
-    case 'message':
+    case 'message': {
+      // Apply rate limiting
+      const rateCheck = await checkWebSocketRateLimit(userId, 'message');
+      if (!rateCheck.allowed) {
+        sendToSocket(socket, {
+          type: 'error',
+          payload: {
+            code: 'RATE_LIMITED',
+            message: `Too many messages. Please wait ${Math.ceil(rateCheck.resetIn / 1000)} seconds.`,
+            remaining: rateCheck.remaining,
+          },
+        });
+        return;
+      }
       await handleChatMessage(socket, message as WSChatMessage);
       break;
+    }
 
     case 'typing':
-    case 'stop_typing':
+    case 'stop_typing': {
+      // Apply rate limiting for typing events
+      const rateCheck = await checkWebSocketRateLimit(userId, 'typing');
+      if (!rateCheck.allowed) {
+        return; // Silently drop typing events when rate limited
+      }
       await handleTyping(socket, message as WSTypingMessage);
       break;
+    }
 
     case 'read_receipt':
       await handleReadReceipt(socket, message as WSReadReceiptMessage);
@@ -209,6 +319,12 @@ async function handleWebSocketMessage(socket: AuthenticatedSocket, message: WSMe
  * Handles sending a chat message.
  * Persists to database, sends acknowledgment, and routes to all participants.
  * Uses local delivery for same-server recipients, Redis pub/sub for others.
+ *
+ * Now includes:
+ * - Delivery tracking for metrics
+ * - Circuit breaker for Redis operations
+ * - Retry logic for reliable delivery
+ *
  * @param socket - The sender's WebSocket connection
  * @param message - The message payload with conversation and content
  */
@@ -216,6 +332,7 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
   const userId = socket.userId;
   const { conversationId, content, contentType, mediaUrl } = message.payload;
   const clientMessageId = message.clientMessageId || uuidv4();
+  const sendStartTime = Date.now();
 
   try {
     // Validate user is in conversation
@@ -225,17 +342,26 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
         type: 'error',
         payload: { message: 'Not a participant in this conversation', clientMessageId },
       });
+      recordMessage('failed', contentType || 'text');
       return;
     }
 
-    // Create message in database
-    const savedMessage = await createMessage(
-      conversationId,
-      userId,
-      content,
-      contentType || 'text',
-      mediaUrl
+    // Create message in database with retry logic
+    const savedMessage = await retryMessageDelivery(
+      () =>
+        createMessage(
+          conversationId,
+          userId,
+          content,
+          contentType || 'text',
+          mediaUrl
+        ),
+      clientMessageId,
+      userId
     );
+
+    // Start delivery tracking for metrics
+    await startDeliveryTracking(savedMessage.id, userId);
 
     // Send acknowledgment to sender
     sendToSocket(socket, {
@@ -246,6 +372,13 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
         status: 'sent',
         createdAt: savedMessage.created_at,
       },
+    });
+
+    logEvent(LogEvents.MESSAGE_SENT, {
+      message_id: savedMessage.id,
+      conversation_id: conversationId,
+      sender_id: userId,
+      content_type: contentType || 'text',
     });
 
     // Get conversation info
@@ -260,7 +393,7 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
 
       const messagePayload = {
         ...savedMessage,
-        sender: participant.user, // Will be filled with sender info
+        sender: participant.user,
         conversation: {
           id: conversationId,
           name: conversation?.name,
@@ -277,38 +410,57 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
             payload: messagePayload,
           });
 
-          // Mark as delivered
-          await updateMessageStatus(savedMessage.id, participant.user_id, 'delivered');
+          // Use idempotent status update
+          const wasUpdated = await idempotentStatusUpdate(
+            savedMessage.id,
+            participant.user_id,
+            'delivered'
+          );
 
-          // Notify sender of delivery
-          sendToSocket(socket, {
-            type: 'delivery_receipt',
-            payload: {
-              messageId: savedMessage.id,
-              recipientId: participant.user_id,
-              status: 'delivered',
-              timestamp: new Date(),
-            },
-          });
+          if (wasUpdated) {
+            // Calculate delivery duration
+            const deliveryDuration = (Date.now() - sendStartTime) / 1000;
+            recordDeliveryDuration(deliveryDuration, 'local');
+
+            await recordDelivery(savedMessage.id, participant.user_id, 'local');
+
+            // Notify sender of delivery
+            sendToSocket(socket, {
+              type: 'delivery_receipt',
+              payload: {
+                messageId: savedMessage.id,
+                recipientId: participant.user_id,
+                status: 'delivered',
+                timestamp: new Date(),
+              },
+            });
+          }
         }
       } else if (recipientServer) {
-        // Route through Redis pub/sub to other server
-        await redisPub.publish(
-          KEYS.serverChannel(recipientServer),
-          JSON.stringify({
-            type: 'deliver_message',
-            recipientId: participant.user_id,
-            senderId: userId,
-            senderServer: config.serverId,
-            messageId: savedMessage.id,
-            payload: messagePayload,
-          })
+        // Route through Redis pub/sub to other server with circuit breaker
+        await withRedisCircuit(
+          async () => {
+            await redisPub.publish(
+              KEYS.serverChannel(recipientServer),
+              JSON.stringify({
+                type: 'deliver_message',
+                recipientId: participant.user_id,
+                senderId: userId,
+                senderServer: config.serverId,
+                messageId: savedMessage.id,
+                sendStartTime,
+                payload: messagePayload,
+              })
+            );
+          },
+          undefined // No fallback - message stays in DB for later delivery
         );
       }
       // If recipientServer is null, user is offline - message is stored for later
     }
   } catch (error) {
-    console.error('Error handling chat message:', error);
+    wsLogger.error({ error, conversationId, userId }, 'Error handling chat message');
+    recordMessage('failed', contentType || 'text');
     sendToSocket(socket, {
       type: 'error',
       payload: { message: 'Failed to send message', clientMessageId },
@@ -319,6 +471,7 @@ async function handleChatMessage(socket: AuthenticatedSocket, message: WSChatMes
 /**
  * Handles typing indicator events.
  * Stores typing state in Redis with auto-expiry and broadcasts to participants.
+ *
  * @param socket - The typing user's WebSocket connection
  * @param message - The typing event payload
  */
@@ -328,12 +481,14 @@ async function handleTyping(socket: AuthenticatedSocket, message: WSTypingMessag
   const isTyping = message.type === 'typing';
 
   try {
-    // Store typing state briefly
-    if (isTyping) {
-      await redis.setex(KEYS.typing(conversationId, userId), 5, '1');
-    } else {
-      await redis.del(KEYS.typing(conversationId, userId));
-    }
+    // Store typing state briefly with circuit breaker
+    await withRedisCircuit(async () => {
+      if (isTyping) {
+        await redis.setex(KEYS.typing(conversationId, userId), 5, '1');
+      } else {
+        await redis.del(KEYS.typing(conversationId, userId));
+      }
+    });
 
     // Get participants and notify them
     const participants = await getConversationParticipants(conversationId);
@@ -357,24 +512,28 @@ async function handleTyping(socket: AuthenticatedSocket, message: WSTypingMessag
           sendToSocket(recipientSocket, typingPayload);
         }
       } else if (recipientServer) {
-        await redisPub.publish(
-          KEYS.serverChannel(recipientServer),
-          JSON.stringify({
-            type: 'forward_typing',
-            recipientId: participant.user_id,
-            payload: typingPayload,
-          })
-        );
+        await withRedisCircuit(async () => {
+          await redisPub.publish(
+            KEYS.serverChannel(recipientServer),
+            JSON.stringify({
+              type: 'forward_typing',
+              recipientId: participant.user_id,
+              payload: typingPayload,
+            })
+          );
+        });
       }
     }
   } catch (error) {
-    console.error('Error handling typing:', error);
+    wsLogger.error({ error, conversationId, userId }, 'Error handling typing');
   }
 }
 
 /**
  * Handles read receipt events.
  * Marks messages as read in database and notifies senders.
+ * Uses idempotent updates to prevent duplicate processing.
+ *
  * @param socket - The reader's WebSocket connection
  * @param message - The read receipt payload with conversation and message IDs
  */
@@ -383,29 +542,34 @@ async function handleReadReceipt(socket: AuthenticatedSocket, message: WSReadRec
   const { conversationId, messageIds } = message.payload;
 
   try {
-    // Mark messages as read
+    // Mark messages as read with idempotent updates
     const markedIds = await markConversationAsRead(conversationId, userId);
 
     if (markedIds.length === 0) return;
 
+    // Record read metrics
+    for (const id of markedIds) {
+      recordMessage('read', 'text');
+    }
+
     // Get participants to notify senders
     const participants = await getConversationParticipants(conversationId);
 
-    // We need to notify the senders of the read messages
-    // For simplicity, notify all other participants
+    // Notify the senders of the read messages
     for (const participant of participants) {
       if (participant.user_id === userId) continue;
 
       await notifyDeliveryReceipt(participant.user_id, markedIds[0], userId, 'read', markedIds);
     }
   } catch (error) {
-    console.error('Error handling read receipt:', error);
+    wsLogger.error({ error, conversationId, userId }, 'Error handling read receipt');
   }
 }
 
 /**
  * Sends a delivery or read receipt to a message sender.
  * Routes through local connection or Redis pub/sub based on recipient's server.
+ *
  * @param recipientUserId - The message sender to notify
  * @param messageId - The message that was delivered/read
  * @param readerId - The user who received/read the message
@@ -438,28 +602,26 @@ async function notifyDeliveryReceipt(
       sendToSocket(recipientSocket, receiptPayload);
     }
   } else if (recipientServer) {
-    await redisPub.publish(
-      KEYS.serverChannel(recipientServer),
-      JSON.stringify({
-        type: 'forward_receipt',
-        recipientId: recipientUserId,
-        payload: receiptPayload,
-      })
-    );
+    await withRedisCircuit(async () => {
+      await redisPub.publish(
+        KEYS.serverChannel(recipientServer),
+        JSON.stringify({
+          type: 'forward_receipt',
+          recipientId: recipientUserId,
+          payload: receiptPayload,
+        })
+      );
+    });
   }
 }
 
 /**
  * Broadcasts a user's presence change to all connected users.
- * In production, this would be more selective based on contact lists.
+ *
  * @param userId - The user whose presence changed
  * @param status - The new presence status ('online' or 'offline')
  */
 async function broadcastPresence(userId: string, status: 'online' | 'offline') {
-  // Get user's recent conversations and notify participants
-  // For simplicity, we'll broadcast to users who have active connections
-  // In production, you'd track who's "watching" this user's presence
-
   const presencePayload = {
     type: 'presence',
     payload: {
@@ -470,20 +632,17 @@ async function broadcastPresence(userId: string, status: 'online' | 'offline') {
   };
 
   // Broadcast to all connected users on this server
-  // (In production, you'd be more selective)
   for (const [connectedUserId, socket] of connections) {
     if (connectedUserId !== userId) {
       sendToSocket(socket, presencePayload);
     }
   }
-
-  // Broadcast to other servers via Redis
-  // This is simplified - in production you'd track interested users
 }
 
 /**
  * Handles messages received from Redis pub/sub.
  * Processes cross-server message delivery, typing events, and receipts.
+ *
  * @param data - The parsed message from Redis
  */
 async function handleRedisMessage(data: any) {
@@ -496,26 +655,40 @@ async function handleRedisMessage(data: any) {
           payload: data.payload,
         });
 
-        // Mark as delivered and notify sender's server
-        await updateMessageStatus(data.messageId, data.recipientId, 'delivered');
-
-        // Send delivery receipt back to sender's server
-        await redisPub.publish(
-          KEYS.serverChannel(data.senderServer),
-          JSON.stringify({
-            type: 'forward_receipt',
-            recipientId: data.senderId,
-            payload: {
-              type: 'delivery_receipt',
-              payload: {
-                messageId: data.messageId,
-                recipientId: data.recipientId,
-                status: 'delivered',
-                timestamp: new Date(),
-              },
-            },
-          })
+        // Use idempotent status update
+        const wasUpdated = await idempotentStatusUpdate(
+          data.messageId,
+          data.recipientId,
+          'delivered'
         );
+
+        if (wasUpdated) {
+          // Calculate cross-server delivery duration
+          const deliveryDuration = (Date.now() - data.sendStartTime) / 1000;
+          recordDeliveryDuration(deliveryDuration, 'cross_server');
+
+          await recordDelivery(data.messageId, data.recipientId, 'cross_server');
+
+          // Send delivery receipt back to sender's server
+          await withRedisCircuit(async () => {
+            await redisPub.publish(
+              KEYS.serverChannel(data.senderServer),
+              JSON.stringify({
+                type: 'forward_receipt',
+                recipientId: data.senderId,
+                payload: {
+                  type: 'delivery_receipt',
+                  payload: {
+                    messageId: data.messageId,
+                    recipientId: data.recipientId,
+                    status: 'delivered',
+                    timestamp: new Date(),
+                  },
+                },
+              })
+            );
+          });
+        }
       }
       break;
     }
@@ -534,6 +707,7 @@ async function handleRedisMessage(data: any) {
 /**
  * Safely sends a message to a WebSocket connection.
  * Checks connection state before sending to avoid errors.
+ *
  * @param socket - The WebSocket to send to
  * @param message - The message object to serialize and send
  */
@@ -546,6 +720,7 @@ function sendToSocket(socket: WebSocket, message: any) {
 /**
  * Returns the number of active WebSocket connections on this server.
  * Used for health checks and load monitoring.
+ *
  * @returns The count of connected users
  */
 export function getConnectionCount(): number {

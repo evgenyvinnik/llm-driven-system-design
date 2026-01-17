@@ -2,14 +2,21 @@
  * @fileoverview Message routes for sending, receiving, and managing messages.
  * Handles message CRUD, threading, reactions, and real-time delivery via WebSocket.
  * Messages are indexed in Elasticsearch for search functionality.
+ * Includes idempotency protection, rate limiting, and cache integration.
  */
 
 import { Router, Request, Response } from 'express';
-import { query } from '../db/index.js';
+import { query, withTransaction } from '../db/index.js';
 import { requireAuth, requireWorkspace } from '../middleware/auth.js';
+import { idempotencyMiddleware } from '../middleware/idempotency.js';
+import { rateLimit } from '../middleware/rateLimit.js';
+import { loadMembership, hasPermission } from '../middleware/rbac.js';
 import { publishToUser } from '../services/redis.js';
 import { indexMessage, updateMessageIndex, deleteMessageIndex } from '../services/elasticsearch.js';
-import type { Message } from '../types/index.js';
+import { getCachedChannelMembers, getCachedUser, invalidateChannelCache } from '../services/cache.js';
+import { logger } from '../services/logger.js';
+import { messagesSentCounter } from '../services/metrics.js';
+import type { Message, Channel } from '../types/index.js';
 
 const router = Router();
 
@@ -75,7 +82,7 @@ router.get('/channel/:channelId', requireAuth, requireWorkspace, async (req: Req
     // Reverse to get chronological order
     res.json(result.rows.reverse());
   } catch (error) {
-    console.error('Get messages error:', error);
+    logger.error({ err: error, msg: 'Get messages error' });
     res.status(500).json({ error: 'Failed to get messages' });
   }
 });
@@ -121,7 +128,7 @@ router.get('/:messageId/thread', requireAuth, requireWorkspace, async (req: Requ
       replies: repliesResult.rows,
     });
   } catch (error) {
-    console.error('Get thread error:', error);
+    logger.error({ err: error, msg: 'Get thread error' });
     res.status(500).json({ error: 'Failed to get thread' });
   }
 });
@@ -130,271 +137,327 @@ router.get('/:messageId/thread', requireAuth, requireWorkspace, async (req: Requ
  * POST /messages/channel/:channelId - Send a new message to a channel.
  * Publishes the message to all channel members via Redis pub/sub.
  * Indexes the message in Elasticsearch for search.
+ *
+ * Protected by:
+ * - Authentication (requireAuth)
+ * - Workspace context (requireWorkspace)
+ * - Rate limiting (60 messages/minute)
+ * - Idempotency (X-Idempotency-Key header)
  */
-router.post('/channel/:channelId', requireAuth, requireWorkspace, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { channelId } = req.params;
-    const { content, thread_ts, attachments } = req.body;
-    const workspaceId = req.session.workspaceId!;
-    const userId = req.session.userId!;
+router.post(
+  '/channel/:channelId',
+  requireAuth,
+  requireWorkspace,
+  loadMembership(),
+  rateLimit('SEND_MESSAGE'),
+  idempotencyMiddleware(),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { channelId } = req.params;
+      const { content, thread_ts, attachments } = req.body;
+      const workspaceId = req.session.workspaceId!;
+      const userId = req.session.userId!;
 
-    if (!content || content.trim() === '') {
-      res.status(400).json({ error: 'Message content is required' });
-      return;
-    }
+      if (!content || content.trim() === '') {
+        res.status(400).json({ error: 'Message content is required' });
+        return;
+      }
 
-    // Verify channel membership
-    const membership = await query(
-      'SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2',
-      [channelId, userId]
-    );
+      // Verify channel membership (use cache for frequent lookups)
+      const channelMembers = await getCachedChannelMembers(channelId);
+      if (!channelMembers.includes(userId)) {
+        res.status(403).json({ error: 'Not a member of this channel' });
+        return;
+      }
 
-    if (membership.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this channel' });
-      return;
-    }
+      // Use transaction for atomicity (especially important for thread replies)
+      const message = await withTransaction(async (client) => {
+        // Insert message
+        const result = await client.query<Message>(
+          `INSERT INTO messages (workspace_id, channel_id, user_id, content, thread_ts, attachments)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING *`,
+          [workspaceId, channelId, userId, content.trim(), thread_ts || null, attachments ? JSON.stringify(attachments) : null]
+        );
 
-    // Insert message
-    const result = await query<Message>(
-      `INSERT INTO messages (workspace_id, channel_id, user_id, content, thread_ts, attachments)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [workspaceId, channelId, userId, content.trim(), thread_ts || null, attachments ? JSON.stringify(attachments) : null]
-    );
+        const msg = result.rows[0];
 
-    const message = result.rows[0];
+        // If this is a thread reply, update parent reply_count atomically
+        if (thread_ts) {
+          await client.query(
+            `UPDATE messages SET
+               reply_count = reply_count + 1,
+               latest_reply = NOW(),
+               reply_users = array_append(array_remove(COALESCE(reply_users, ARRAY[]::uuid[]), $1::uuid), $1::uuid)
+             WHERE id = $2`,
+            [userId, thread_ts]
+          );
+        }
 
-    // If this is a thread reply, update parent reply_count
-    if (thread_ts) {
-      await query(
-        'UPDATE messages SET reply_count = reply_count + 1 WHERE id = $1',
-        [thread_ts]
-      );
-    }
-
-    // Get user info for response
-    const userResult = await query(
-      'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
-      [userId]
-    );
-
-    const messageWithUser = {
-      ...message,
-      ...userResult.rows[0],
-      reactions: null,
-    };
-
-    // Publish to channel members
-    const members = await query<{ user_id: string }>(
-      'SELECT user_id FROM channel_members WHERE channel_id = $1',
-      [channelId]
-    );
-
-    for (const member of members.rows) {
-      await publishToUser(member.user_id, {
-        type: 'message',
-        payload: messageWithUser,
+        return msg;
       });
+
+      // Get user info (use cache)
+      const user = await getCachedUser(userId);
+
+      const messageWithUser = {
+        ...message,
+        username: user?.username,
+        display_name: user?.display_name,
+        avatar_url: user?.avatar_url,
+        reactions: null,
+      };
+
+      // Publish to channel members (use cached member list)
+      for (const memberId of channelMembers) {
+        await publishToUser(memberId, {
+          type: 'message',
+          payload: messageWithUser,
+        });
+      }
+
+      // Record metrics
+      const channelResult = await query<Channel>('SELECT is_private, is_dm FROM channels WHERE id = $1', [channelId]);
+      const channelType = channelResult.rows[0]?.is_dm ? 'dm' : channelResult.rows[0]?.is_private ? 'private' : 'public';
+      messagesSentCounter.inc({ workspace_id: workspaceId, channel_type: channelType });
+
+      // Index for search (async, non-blocking)
+      indexMessage({
+        id: message.id,
+        workspace_id: workspaceId,
+        channel_id: channelId,
+        user_id: userId,
+        content: content.trim(),
+        created_at: message.created_at,
+      }).catch((err) => logger.error({ err, msg: 'Failed to index message' }));
+
+      logger.info({
+        msg: 'Message sent',
+        messageId: message.id,
+        channelId,
+        userId,
+        hasThread: !!thread_ts,
+      });
+
+      res.status(201).json(messageWithUser);
+    } catch (error) {
+      logger.error({ err: error, msg: 'Send message error' });
+      res.status(500).json({ error: 'Failed to send message' });
     }
-
-    // Index for search (async)
-    indexMessage({
-      id: message.id,
-      workspace_id: workspaceId,
-      channel_id: channelId,
-      user_id: userId,
-      content: content.trim(),
-      created_at: message.created_at,
-    }).catch(console.error);
-
-    res.status(201).json(messageWithUser);
-  } catch (error) {
-    console.error('Send message error:', error);
-    res.status(500).json({ error: 'Failed to send message' });
   }
-});
+);
 
 /**
  * PUT /messages/:messageId - Edit an existing message.
  * Only the message author can edit. Updates timestamp and notifies channel members.
  */
-router.put('/:messageId', requireAuth, requireWorkspace, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { messageId } = req.params;
-    const { content } = req.body;
+router.put(
+  '/:messageId',
+  requireAuth,
+  requireWorkspace,
+  rateLimit('EDIT_MESSAGE'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { messageId } = req.params;
+      const { content } = req.body;
 
-    if (!content || content.trim() === '') {
-      res.status(400).json({ error: 'Message content is required' });
-      return;
+      if (!content || content.trim() === '') {
+        res.status(400).json({ error: 'Message content is required' });
+        return;
+      }
+
+      // Verify ownership
+      const existing = await query<Message>(
+        'SELECT * FROM messages WHERE id = $1 AND user_id = $2',
+        [messageId, req.session.userId]
+      );
+
+      if (existing.rows.length === 0) {
+        res.status(404).json({ error: 'Message not found or you do not have permission to edit it' });
+        return;
+      }
+
+      // Update message
+      const result = await query<Message>(
+        `UPDATE messages SET content = $1, edited_at = NOW()
+         WHERE id = $2
+         RETURNING *`,
+        [content.trim(), messageId]
+      );
+
+      const message = result.rows[0];
+
+      // Get user info (use cache)
+      const user = await getCachedUser(req.session.userId!);
+
+      const messageWithUser = {
+        ...message,
+        username: user?.username,
+        display_name: user?.display_name,
+        avatar_url: user?.avatar_url,
+      };
+
+      // Publish update to channel members (use cache)
+      const channelMembers = await getCachedChannelMembers(message.channel_id);
+      for (const memberId of channelMembers) {
+        await publishToUser(memberId, {
+          type: 'message_update',
+          payload: messageWithUser,
+        });
+      }
+
+      // Update search index
+      updateMessageIndex(message.id, content.trim()).catch((err) =>
+        logger.error({ err, msg: 'Failed to update message index' })
+      );
+
+      logger.info({ msg: 'Message updated', messageId: message.id });
+
+      res.json(messageWithUser);
+    } catch (error) {
+      logger.error({ err: error, msg: 'Update message error' });
+      res.status(500).json({ error: 'Failed to update message' });
     }
-
-    // Verify ownership
-    const existing = await query<Message>(
-      'SELECT * FROM messages WHERE id = $1 AND user_id = $2',
-      [messageId, req.session.userId]
-    );
-
-    if (existing.rows.length === 0) {
-      res.status(404).json({ error: 'Message not found or you do not have permission to edit it' });
-      return;
-    }
-
-    // Update message
-    const result = await query<Message>(
-      `UPDATE messages SET content = $1, edited_at = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [content.trim(), messageId]
-    );
-
-    const message = result.rows[0];
-
-    // Get user info
-    const userResult = await query(
-      'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
-      [req.session.userId]
-    );
-
-    const messageWithUser = {
-      ...message,
-      ...userResult.rows[0],
-    };
-
-    // Publish update to channel members
-    const members = await query<{ user_id: string }>(
-      'SELECT user_id FROM channel_members WHERE channel_id = $1',
-      [message.channel_id]
-    );
-
-    for (const member of members.rows) {
-      await publishToUser(member.user_id, {
-        type: 'message_update',
-        payload: messageWithUser,
-      });
-    }
-
-    // Update search index
-    updateMessageIndex(message.id, content.trim()).catch(console.error);
-
-    res.json(messageWithUser);
-  } catch (error) {
-    console.error('Update message error:', error);
-    res.status(500).json({ error: 'Failed to update message' });
   }
-});
+);
 
 /**
  * DELETE /messages/:messageId - Delete a message.
- * Only the message author can delete. Cascades to reactions and thread replies.
+ * Only the message author can delete (or admins with DELETE_ANY_MESSAGE permission).
+ * Cascades to reactions and thread replies.
  * Notifies channel members and removes from search index.
  */
-router.delete('/:messageId', requireAuth, requireWorkspace, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { messageId } = req.params;
+router.delete(
+  '/:messageId',
+  requireAuth,
+  requireWorkspace,
+  loadMembership(),
+  rateLimit('DELETE_MESSAGE'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { messageId } = req.params;
+      const userId = req.session.userId!;
 
-    // Verify ownership
-    const existing = await query<Message>(
-      'SELECT * FROM messages WHERE id = $1 AND user_id = $2',
-      [messageId, req.session.userId]
-    );
-
-    if (existing.rows.length === 0) {
-      res.status(404).json({ error: 'Message not found or you do not have permission to delete it' });
-      return;
-    }
-
-    const message = existing.rows[0];
-
-    // Delete message (cascade will handle reactions and thread replies)
-    await query('DELETE FROM messages WHERE id = $1', [messageId]);
-
-    // If this was a thread reply, update parent reply_count
-    if (message.thread_ts) {
-      await query(
-        'UPDATE messages SET reply_count = reply_count - 1 WHERE id = $1',
-        [message.thread_ts]
+      // Check ownership or admin permission
+      const existing = await query<Message>(
+        'SELECT * FROM messages WHERE id = $1',
+        [messageId]
       );
-    }
 
-    // Publish delete to channel members
-    const members = await query<{ user_id: string }>(
-      'SELECT user_id FROM channel_members WHERE channel_id = $1',
-      [message.channel_id]
-    );
+      if (existing.rows.length === 0) {
+        res.status(404).json({ error: 'Message not found' });
+        return;
+      }
 
-    for (const member of members.rows) {
-      await publishToUser(member.user_id, {
-        type: 'message_delete',
-        payload: { id: parseInt(messageId, 10), channel_id: message.channel_id },
+      const message = existing.rows[0];
+
+      // Check if user can delete this message
+      const isOwner = message.user_id === userId;
+      const canDeleteAny = req.membership && hasPermission(req.membership.role as 'guest' | 'member' | 'admin' | 'owner', 'DELETE_ANY_MESSAGE');
+
+      if (!isOwner && !canDeleteAny) {
+        res.status(403).json({ error: 'You do not have permission to delete this message' });
+        return;
+      }
+
+      // Delete message (cascade will handle reactions and thread replies)
+      await query('DELETE FROM messages WHERE id = $1', [messageId]);
+
+      // If this was a thread reply, update parent reply_count
+      if (message.thread_ts) {
+        await query(
+          'UPDATE messages SET reply_count = reply_count - 1 WHERE id = $1',
+          [message.thread_ts]
+        );
+      }
+
+      // Publish delete to channel members (use cache)
+      const channelMembers = await getCachedChannelMembers(message.channel_id);
+      for (const memberId of channelMembers) {
+        await publishToUser(memberId, {
+          type: 'message_delete',
+          payload: { id: parseInt(messageId, 10), channel_id: message.channel_id },
+        });
+      }
+
+      // Remove from search index
+      deleteMessageIndex(parseInt(messageId, 10)).catch((err) =>
+        logger.error({ err, msg: 'Failed to delete message from index' })
+      );
+
+      logger.info({
+        msg: 'Message deleted',
+        messageId: message.id,
+        deletedBy: userId,
+        wasOwner: isOwner,
       });
+
+      res.json({ message: 'Message deleted' });
+    } catch (error) {
+      logger.error({ err: error, msg: 'Delete message error' });
+      res.status(500).json({ error: 'Failed to delete message' });
     }
-
-    // Remove from search index
-    deleteMessageIndex(parseInt(messageId, 10)).catch(console.error);
-
-    res.json({ message: 'Message deleted' });
-  } catch (error) {
-    console.error('Delete message error:', error);
-    res.status(500).json({ error: 'Failed to delete message' });
   }
-});
+);
 
 /**
  * POST /messages/:messageId/reactions - Add an emoji reaction to a message.
  * Each user can add one reaction per emoji. Notifies channel members in real-time.
  */
-router.post('/:messageId/reactions', requireAuth, requireWorkspace, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { messageId } = req.params;
-    const { emoji } = req.body;
+router.post(
+  '/:messageId/reactions',
+  requireAuth,
+  requireWorkspace,
+  rateLimit('ADD_REACTION'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { messageId } = req.params;
+      const { emoji } = req.body;
 
-    if (!emoji) {
-      res.status(400).json({ error: 'Emoji is required' });
-      return;
+      if (!emoji) {
+        res.status(400).json({ error: 'Emoji is required' });
+        return;
+      }
+
+      // Verify message exists
+      const message = await query<Message>(
+        'SELECT * FROM messages WHERE id = $1',
+        [messageId]
+      );
+
+      if (message.rows.length === 0) {
+        res.status(404).json({ error: 'Message not found' });
+        return;
+      }
+
+      // Add reaction (idempotent via ON CONFLICT)
+      await query(
+        `INSERT INTO reactions (message_id, user_id, emoji)
+         VALUES ($1, $2, $3)
+         ON CONFLICT DO NOTHING`,
+        [messageId, req.session.userId, emoji]
+      );
+
+      // Publish to channel members (use cache)
+      const channelMembers = await getCachedChannelMembers(message.rows[0].channel_id);
+      for (const memberId of channelMembers) {
+        await publishToUser(memberId, {
+          type: 'reaction_add',
+          payload: {
+            message_id: parseInt(messageId, 10),
+            user_id: req.session.userId,
+            emoji,
+          },
+        });
+      }
+
+      res.json({ message: 'Reaction added' });
+    } catch (error) {
+      logger.error({ err: error, msg: 'Add reaction error' });
+      res.status(500).json({ error: 'Failed to add reaction' });
     }
-
-    // Verify message exists
-    const message = await query<Message>(
-      'SELECT * FROM messages WHERE id = $1',
-      [messageId]
-    );
-
-    if (message.rows.length === 0) {
-      res.status(404).json({ error: 'Message not found' });
-      return;
-    }
-
-    // Add reaction
-    await query(
-      `INSERT INTO reactions (message_id, user_id, emoji)
-       VALUES ($1, $2, $3)
-       ON CONFLICT DO NOTHING`,
-      [messageId, req.session.userId, emoji]
-    );
-
-    // Publish to channel members
-    const members = await query<{ user_id: string }>(
-      'SELECT user_id FROM channel_members WHERE channel_id = $1',
-      [message.rows[0].channel_id]
-    );
-
-    for (const member of members.rows) {
-      await publishToUser(member.user_id, {
-        type: 'reaction_add',
-        payload: {
-          message_id: parseInt(messageId, 10),
-          user_id: req.session.userId,
-          emoji,
-        },
-      });
-    }
-
-    res.json({ message: 'Reaction added' });
-  } catch (error) {
-    console.error('Add reaction error:', error);
-    res.status(500).json({ error: 'Failed to add reaction' });
   }
-});
+);
 
 /**
  * DELETE /messages/:messageId/reactions/:emoji - Remove a reaction from a message.
@@ -415,20 +478,16 @@ router.delete('/:messageId/reactions/:emoji', requireAuth, requireWorkspace, asy
       return;
     }
 
-    // Remove reaction
+    // Remove reaction (idempotent)
     await query(
       'DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
       [messageId, req.session.userId, emoji]
     );
 
-    // Publish to channel members
-    const members = await query<{ user_id: string }>(
-      'SELECT user_id FROM channel_members WHERE channel_id = $1',
-      [message.rows[0].channel_id]
-    );
-
-    for (const member of members.rows) {
-      await publishToUser(member.user_id, {
+    // Publish to channel members (use cache)
+    const channelMembers = await getCachedChannelMembers(message.rows[0].channel_id);
+    for (const memberId of channelMembers) {
+      await publishToUser(memberId, {
         type: 'reaction_remove',
         payload: {
           message_id: parseInt(messageId, 10),
@@ -440,7 +499,7 @@ router.delete('/:messageId/reactions/:emoji', requireAuth, requireWorkspace, asy
 
     res.json({ message: 'Reaction removed' });
   } catch (error) {
-    console.error('Remove reaction error:', error);
+    logger.error({ err: error, msg: 'Remove reaction error' });
     res.status(500).json({ error: 'Failed to remove reaction' });
   }
 });

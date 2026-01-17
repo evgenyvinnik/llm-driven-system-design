@@ -146,6 +146,22 @@ export async function migrate() {
       )
     `);
 
+    // Audit logs for sensitive operations (compliance and debugging)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        timestamp TIMESTAMP DEFAULT NOW(),
+        actor_id UUID,
+        actor_ip INET,
+        action VARCHAR(100) NOT NULL,
+        resource_type VARCHAR(50) NOT NULL,
+        resource_id UUID,
+        details JSONB DEFAULT '{}',
+        success BOOLEAN DEFAULT TRUE,
+        request_id VARCHAR(100)
+      )
+    `);
+
     // Create indexes
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
@@ -160,6 +176,10 @@ export async function migrate() {
       CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name);
       CREATE INDEX IF NOT EXISTS idx_albums_title ON albums(title);
       CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_id ON audit_logs(actor_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
     `);
 
     await client.query('COMMIT');

@@ -6,6 +6,23 @@ import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
 import { indexProduct, deleteProductFromIndex, searchProducts, getSimilarProducts } from '../services/elasticsearch.js';
 
+// Shared modules
+import {
+  getCachedProduct,
+  invalidateProductCache,
+  cacheAside,
+  CACHE_KEYS,
+  CACHE_TTL,
+} from '../shared/cache.js';
+import {
+  productViews,
+  searchQueries,
+  searchLatency,
+  searchResultsCount,
+} from '../shared/metrics.js';
+import { searchLogger as logger } from '../shared/logger.js';
+import { searchCircuitBreaker, createCircuitBreaker } from '../shared/circuit-breaker.js';
+
 const router = Router();
 
 // Configure multer for image uploads
@@ -32,27 +49,89 @@ const upload = multer({
   },
 });
 
-// Search products (Elasticsearch)
+// Initialize search circuit breaker with fallback
+searchCircuitBreaker.init(
+  async (query, filters) => {
+    return await searchProducts(query, filters);
+  },
+  async (query, filters) => {
+    // Fallback: search from PostgreSQL when Elasticsearch is down
+    logger.warn({ query }, 'Elasticsearch unavailable, falling back to PostgreSQL');
+    return await fallbackSearch(query, filters);
+  }
+);
+
+// Fallback search using PostgreSQL
+async function fallbackSearch(query, filters = {}) {
+  let sql = `
+    SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating, c.name as category_name
+    FROM products p
+    JOIN shops s ON p.shop_id = s.id
+    LEFT JOIN categories c ON p.category_id = c.id
+    WHERE p.is_active = true AND p.quantity > 0 AND s.is_active = true
+  `;
+  const params = [];
+
+  if (query) {
+    params.push(`%${query}%`);
+    sql += ` AND (p.title ILIKE $${params.length} OR p.description ILIKE $${params.length})`;
+  }
+
+  if (filters.categoryId) {
+    params.push(parseInt(filters.categoryId));
+    sql += ` AND p.category_id = $${params.length}`;
+  }
+
+  sql += ` ORDER BY p.view_count DESC LIMIT ${filters.limit || 20} OFFSET ${filters.offset || 0}`;
+
+  const result = await db.query(sql, params);
+  return {
+    products: result.rows,
+    total: result.rows.length,
+    aggregations: null,
+    fallback: true,
+  };
+}
+
+// Search products (Elasticsearch with circuit breaker)
 router.get('/search', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { q, categoryId, priceMin, priceMax, isVintage, isHandmade, freeShipping, sort, limit = 20, offset = 0 } = req.query;
 
-    const results = await searchProducts(q, {
-      categoryId,
-      priceMin,
-      priceMax,
-      isVintage,
-      isHandmade,
-      freeShipping,
-      sort,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-    });
+    const hasFilters = !!(categoryId || priceMin || priceMax || isVintage || isHandmade || freeShipping);
+
+    // Try to get from cache first for common queries
+    const cacheKey = `${CACHE_KEYS.SEARCH}${q || 'all'}:${JSON.stringify({ categoryId, priceMin, priceMax, isVintage, isHandmade, freeShipping, sort, limit, offset })}`;
+
+    const results = await cacheAside(
+      cacheKey,
+      async () => {
+        return await searchCircuitBreaker.fire(q, {
+          categoryId,
+          priceMin,
+          priceMax,
+          isVintage,
+          isHandmade,
+          freeShipping,
+          sort,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+        });
+      },
+      CACHE_TTL.SEARCH,
+      'search'
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    searchQueries.labels(hasFilters ? 'yes' : 'no').inc();
+    searchLatency.labels(q ? 'keyword' : 'browse').observe(duration);
+    searchResultsCount.labels(q ? 'keyword' : 'browse').observe(results.total);
 
     res.json(results);
   } catch (error) {
-    console.error('Search error:', error);
-    // Fallback to database search if Elasticsearch fails
+    logger.error({ error, query: req.query }, 'Search error');
     res.status(500).json({ error: 'Search failed' });
   }
 });
@@ -116,80 +195,100 @@ router.get('/', async (req, res) => {
 
     res.json({ products: result.rows });
   } catch (error) {
-    console.error('Get products error:', error);
+    logger.error({ error }, 'Get products error');
     res.status(500).json({ error: 'Failed to get products' });
   }
 });
 
-// Get trending products
+// Get trending products (with caching)
 router.get('/trending', async (req, res) => {
   try {
     const { limit = 12 } = req.query;
+    const cacheKey = `${CACHE_KEYS.TRENDING}${limit}`;
 
-    const result = await db.query(
-      `SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating, c.name as category_name
-       FROM products p
-       JOIN shops s ON p.shop_id = s.id
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.is_active = true AND p.quantity > 0 AND s.is_active = true
-       ORDER BY (p.view_count * 0.3 + p.favorite_count * 0.7) DESC, p.created_at DESC
-       LIMIT $1`,
-      [parseInt(limit)]
+    const products = await cacheAside(
+      cacheKey,
+      async () => {
+        const result = await db.query(
+          `SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating, c.name as category_name
+           FROM products p
+           JOIN shops s ON p.shop_id = s.id
+           LEFT JOIN categories c ON p.category_id = c.id
+           WHERE p.is_active = true AND p.quantity > 0 AND s.is_active = true
+           ORDER BY (p.view_count * 0.3 + p.favorite_count * 0.7) DESC, p.created_at DESC
+           LIMIT $1`,
+          [parseInt(limit)]
+        );
+        return result.rows;
+      },
+      CACHE_TTL.TRENDING,
+      'trending'
     );
 
-    res.json({ products: result.rows });
+    res.json({ products });
   } catch (error) {
-    console.error('Get trending products error:', error);
+    logger.error({ error }, 'Get trending products error');
     res.status(500).json({ error: 'Failed to get trending products' });
   }
 });
 
-// Get product by ID
+// Get product by ID (with caching)
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const productId = parseInt(id);
 
-    const result = await db.query(
-      `SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating,
-              s.sales_count as shop_sales_count, s.description as shop_description,
-              s.logo_image as shop_logo, s.location as shop_location,
-              c.name as category_name
-       FROM products p
-       JOIN shops s ON p.shop_id = s.id
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.id = $1`,
-      [parseInt(id)]
-    );
+    // Get product from cache or database
+    const product = await getCachedProduct(productId, async () => {
+      const result = await db.query(
+        `SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating,
+                s.sales_count as shop_sales_count, s.description as shop_description,
+                s.logo_image as shop_logo, s.location as shop_location,
+                c.name as category_name
+         FROM products p
+         JOIN shops s ON p.shop_id = s.id
+         LEFT JOIN categories c ON p.category_id = c.id
+         WHERE p.id = $1`,
+        [productId]
+      );
+      return result.rows.length > 0 ? result.rows[0] : null;
+    });
 
-    if (result.rows.length === 0) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const product = result.rows[0];
-
-    // Increment view count
-    await db.query(
+    // Increment view count asynchronously (don't block response)
+    db.query(
       'UPDATE products SET view_count = view_count + 1 WHERE id = $1',
-      [parseInt(id)]
-    );
+      [productId]
+    ).catch((err) => logger.error({ error: err }, 'Failed to increment view count'));
 
     // Record view history if user is logged in
     if (req.session && req.session.userId) {
-      await db.query(
+      db.query(
         'INSERT INTO view_history (user_id, product_id) VALUES ($1, $2)',
-        [req.session.userId, parseInt(id)]
-      );
+        [req.session.userId, productId]
+      ).catch((err) => logger.error({ error: err }, 'Failed to record view history'));
     }
 
-    // Get similar products
-    const similarProducts = await getSimilarProducts(parseInt(id), 6);
+    // Record metrics
+    productViews.labels(product.category_id?.toString() || 'unknown').inc();
+
+    // Get similar products (through circuit breaker)
+    let similarProducts = [];
+    try {
+      similarProducts = await getSimilarProducts(productId, 6);
+    } catch (error) {
+      logger.warn({ error }, 'Failed to get similar products');
+    }
 
     res.json({
       product,
       similarProducts,
     });
   } catch (error) {
-    console.error('Get product error:', error);
+    logger.error({ error }, 'Get product error');
     res.status(500).json({ error: 'Failed to get product' });
   }
 });
@@ -260,9 +359,13 @@ router.post('/', isAuthenticated, async (req, res) => {
       category_name: categoryResult.rows[0]?.name,
     });
 
+    // Invalidate related caches
+    await invalidateProductCache(product.id, parseInt(shopId), categoryId ? parseInt(categoryId) : null);
+
+    logger.info({ productId: product.id, shopId }, 'Product created');
     res.status(201).json({ product });
   } catch (error) {
-    console.error('Create product error:', error);
+    logger.error({ error }, 'Create product error');
     res.status(500).json({ error: 'Failed to create product' });
   }
 });
@@ -274,12 +377,14 @@ router.put('/:id', isAuthenticated, async (req, res) => {
     const productId = parseInt(id);
 
     // Get product to check shop ownership
-    const productCheck = await db.query('SELECT shop_id FROM products WHERE id = $1', [productId]);
+    const productCheck = await db.query('SELECT shop_id, category_id FROM products WHERE id = $1', [productId]);
     if (productCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
     const shopId = productCheck.rows[0].shop_id;
+    const oldCategoryId = productCheck.rows[0].category_id;
+
     if (!req.session.shopIds || !req.session.shopIds.includes(shopId)) {
       return res.status(403).json({ error: 'You do not own this shop' });
     }
@@ -353,9 +458,16 @@ router.put('/:id', isAuthenticated, async (req, res) => {
       category_name: categoryResult.rows[0]?.name,
     });
 
+    // Invalidate caches (both old and new category if changed)
+    await invalidateProductCache(productId, shopId, product.category_id);
+    if (oldCategoryId && oldCategoryId !== product.category_id) {
+      await invalidateProductCache(productId, shopId, oldCategoryId);
+    }
+
+    logger.info({ productId, shopId }, 'Product updated');
     res.json({ product });
   } catch (error) {
-    console.error('Update product error:', error);
+    logger.error({ error }, 'Update product error');
     res.status(500).json({ error: 'Failed to update product' });
   }
 });
@@ -367,12 +479,14 @@ router.delete('/:id', isAuthenticated, async (req, res) => {
     const productId = parseInt(id);
 
     // Get product to check shop ownership
-    const productCheck = await db.query('SELECT shop_id FROM products WHERE id = $1', [productId]);
+    const productCheck = await db.query('SELECT shop_id, category_id FROM products WHERE id = $1', [productId]);
     if (productCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
     const shopId = productCheck.rows[0].shop_id;
+    const categoryId = productCheck.rows[0].category_id;
+
     if (!req.session.shopIds || !req.session.shopIds.includes(shopId)) {
       return res.status(403).json({ error: 'You do not own this shop' });
     }
@@ -383,9 +497,13 @@ router.delete('/:id', isAuthenticated, async (req, res) => {
     // Remove from Elasticsearch
     await deleteProductFromIndex(productId);
 
+    // Invalidate caches
+    await invalidateProductCache(productId, shopId, categoryId);
+
+    logger.info({ productId, shopId }, 'Product deleted');
     res.json({ message: 'Product deleted' });
   } catch (error) {
-    console.error('Delete product error:', error);
+    logger.error({ error }, 'Delete product error');
     res.status(500).json({ error: 'Failed to delete product' });
   }
 });
@@ -400,7 +518,7 @@ router.post('/upload', isAuthenticated, upload.array('images', 5), async (req, r
     const imageUrls = req.files.map((file) => `/uploads/${file.filename}`);
     res.json({ images: imageUrls });
   } catch (error) {
-    console.error('Upload error:', error);
+    logger.error({ error }, 'Upload error');
     res.status(500).json({ error: 'Failed to upload images' });
   }
 });

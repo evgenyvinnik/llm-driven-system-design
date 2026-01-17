@@ -1,11 +1,14 @@
 import { Router } from 'express';
 import { authenticate, requireRider } from '../middleware/auth.js';
+import { idempotencyMiddleware } from '../middleware/idempotency.js';
 import matchingService from '../services/matchingService.js';
 import pricingService from '../services/pricingService.js';
 import locationService from '../services/locationService.js';
 import { query } from '../utils/db.js';
+import { createLogger } from '../utils/logger.js';
 
 const router = Router();
+const logger = createLogger('rides-route');
 
 // Get fare estimate
 router.post('/estimate', authenticate, requireRider, async (req, res) => {
@@ -44,37 +47,68 @@ router.post('/estimate', authenticate, requireRider, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Estimate error:', error);
+    logger.error({ error: error.message, stack: error.stack }, 'Estimate error');
     res.status(500).json({ error: 'Failed to get fare estimate' });
   }
 });
 
-// Request a ride
-router.post('/request', authenticate, requireRider, async (req, res) => {
-  try {
-    const { pickupLat, pickupLng, dropoffLat, dropoffLng, vehicleType, pickupAddress, dropoffAddress } = req.body;
+// Request a ride - with idempotency to prevent duplicate bookings
+router.post(
+  '/request',
+  authenticate,
+  requireRider,
+  idempotencyMiddleware({ operation: 'ride_request', ttl: 86400 }),
+  async (req, res) => {
+    try {
+      const { pickupLat, pickupLng, dropoffLat, dropoffLng, vehicleType, pickupAddress, dropoffAddress } = req.body;
 
-    if (!pickupLat || !pickupLng || !dropoffLat || !dropoffLng) {
-      return res.status(400).json({ error: 'Pickup and dropoff coordinates are required' });
+      if (!pickupLat || !pickupLng || !dropoffLat || !dropoffLng) {
+        return res.status(400).json({ error: 'Pickup and dropoff coordinates are required' });
+      }
+
+      // Check if rider already has an active ride
+      const activeRide = await query(
+        `SELECT id, status FROM rides
+         WHERE rider_id = $1 AND status IN ('requested', 'matched', 'driver_arrived', 'picked_up')
+         LIMIT 1`,
+        [req.user.id]
+      );
+
+      if (activeRide.rows.length > 0) {
+        logger.warn(
+          { riderId: req.user.id, existingRideId: activeRide.rows[0].id },
+          'Rider attempted to request ride while having active ride'
+        );
+        return res.status(409).json({
+          error: 'You already have an active ride',
+          existingRideId: activeRide.rows[0].id,
+          existingRideStatus: activeRide.rows[0].status,
+        });
+      }
+
+      const ride = await matchingService.requestRide(
+        req.user.id,
+        parseFloat(pickupLat),
+        parseFloat(pickupLng),
+        parseFloat(dropoffLat),
+        parseFloat(dropoffLng),
+        vehicleType || 'economy',
+        pickupAddress,
+        dropoffAddress
+      );
+
+      logger.info(
+        { rideId: ride.rideId, riderId: req.user.id },
+        'Ride requested successfully'
+      );
+
+      res.status(201).json(ride);
+    } catch (error) {
+      logger.error({ error: error.message, stack: error.stack }, 'Request ride error');
+      res.status(500).json({ error: 'Failed to request ride' });
     }
-
-    const ride = await matchingService.requestRide(
-      req.user.id,
-      parseFloat(pickupLat),
-      parseFloat(pickupLng),
-      parseFloat(dropoffLat),
-      parseFloat(dropoffLng),
-      vehicleType || 'economy',
-      pickupAddress,
-      dropoffAddress
-    );
-
-    res.status(201).json(ride);
-  } catch (error) {
-    console.error('Request ride error:', error);
-    res.status(500).json({ error: 'Failed to request ride' });
   }
-});
+);
 
 // Get ride status
 router.get('/:rideId', authenticate, async (req, res) => {
@@ -88,83 +122,110 @@ router.get('/:rideId', authenticate, async (req, res) => {
 
     res.json(ride);
   } catch (error) {
-    console.error('Get ride error:', error);
+    logger.error({ error: error.message }, 'Get ride error');
     res.status(500).json({ error: 'Failed to get ride status' });
   }
 });
 
-// Cancel ride
-router.post('/:rideId/cancel', authenticate, async (req, res) => {
-  try {
-    const { rideId } = req.params;
-    const { reason } = req.body;
+// Cancel ride - with idempotency to prevent double-cancel
+router.post(
+  '/:rideId/cancel',
+  authenticate,
+  idempotencyMiddleware({ operation: 'ride_cancel', ttl: 3600 }),
+  async (req, res) => {
+    try {
+      const { rideId } = req.params;
+      const { reason } = req.body;
 
-    const result = await matchingService.cancelRide(rideId, req.user.userType, reason);
+      const result = await matchingService.cancelRide(rideId, req.user.userType, reason);
 
-    if (!result.success) {
-      return res.status(400).json({ error: result.error });
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      res.json(result);
+    } catch (error) {
+      logger.error({ error: error.message }, 'Cancel ride error');
+      res.status(500).json({ error: 'Failed to cancel ride' });
     }
-
-    res.json(result);
-  } catch (error) {
-    console.error('Cancel ride error:', error);
-    res.status(500).json({ error: 'Failed to cancel ride' });
   }
-});
+);
 
-// Rate the ride
-router.post('/:rideId/rate', authenticate, async (req, res) => {
-  try {
-    const { rideId } = req.params;
-    const { rating } = req.body;
+// Rate the ride - with idempotency to prevent duplicate ratings
+router.post(
+  '/:rideId/rate',
+  authenticate,
+  idempotencyMiddleware({ operation: 'ride_rate', ttl: 86400 }),
+  async (req, res) => {
+    try {
+      const { rideId } = req.params;
+      const { rating } = req.body;
 
-    if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+      if (!rating || rating < 1 || rating > 5) {
+        return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+      }
+
+      // Get ride
+      const rideResult = await query('SELECT * FROM rides WHERE id = $1', [rideId]);
+      if (rideResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Ride not found' });
+      }
+
+      const ride = rideResult.rows[0];
+
+      // Verify ride is completed
+      if (ride.status !== 'completed') {
+        return res.status(400).json({ error: 'Can only rate completed rides' });
+      }
+
+      // Check if already rated
+      if (req.user.userType === 'rider' && ride.driver_rating !== null) {
+        return res.status(409).json({ error: 'You have already rated this ride' });
+      }
+      if (req.user.userType === 'driver' && ride.rider_rating !== null) {
+        return res.status(409).json({ error: 'You have already rated this ride' });
+      }
+
+      // Update rating based on who is rating
+      if (req.user.userType === 'rider' && ride.rider_id === req.user.id) {
+        // Rider rating driver
+        await query('UPDATE rides SET driver_rating = $1 WHERE id = $2', [rating, rideId]);
+
+        // Update driver's average rating
+        await query(
+          `UPDATE users SET
+           rating = (rating * rating_count + $1) / (rating_count + 1),
+           rating_count = rating_count + 1
+           WHERE id = $2`,
+          [rating, ride.driver_id]
+        );
+
+        logger.info({ rideId, rating, driverId: ride.driver_id }, 'Driver rated');
+      } else if (req.user.userType === 'driver' && ride.driver_id === req.user.id) {
+        // Driver rating rider
+        await query('UPDATE rides SET rider_rating = $1 WHERE id = $2', [rating, rideId]);
+
+        // Update rider's average rating
+        await query(
+          `UPDATE users SET
+           rating = (rating * rating_count + $1) / (rating_count + 1),
+           rating_count = rating_count + 1
+           WHERE id = $2`,
+          [rating, ride.rider_id]
+        );
+
+        logger.info({ rideId, rating, riderId: ride.rider_id }, 'Rider rated');
+      } else {
+        return res.status(403).json({ error: 'Not authorized to rate this ride' });
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      logger.error({ error: error.message }, 'Rate ride error');
+      res.status(500).json({ error: 'Failed to rate ride' });
     }
-
-    // Get ride
-    const rideResult = await query('SELECT * FROM rides WHERE id = $1', [rideId]);
-    if (rideResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Ride not found' });
-    }
-
-    const ride = rideResult.rows[0];
-
-    // Update rating based on who is rating
-    if (req.user.userType === 'rider' && ride.rider_id === req.user.id) {
-      // Rider rating driver
-      await query('UPDATE rides SET driver_rating = $1 WHERE id = $2', [rating, rideId]);
-
-      // Update driver's average rating
-      await query(
-        `UPDATE users SET
-         rating = (rating * rating_count + $1) / (rating_count + 1),
-         rating_count = rating_count + 1
-         WHERE id = $2`,
-        [rating, ride.driver_id]
-      );
-    } else if (req.user.userType === 'driver' && ride.driver_id === req.user.id) {
-      // Driver rating rider
-      await query('UPDATE rides SET rider_rating = $1 WHERE id = $2', [rating, rideId]);
-
-      // Update rider's average rating
-      await query(
-        `UPDATE users SET
-         rating = (rating * rating_count + $1) / (rating_count + 1),
-         rating_count = rating_count + 1
-         WHERE id = $2`,
-        [rating, ride.rider_id]
-      );
-    } else {
-      return res.status(403).json({ error: 'Not authorized to rate this ride' });
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Rate ride error:', error);
-    res.status(500).json({ error: 'Failed to rate ride' });
   }
-});
+);
 
 // Get ride history
 router.get('/', authenticate, async (req, res) => {
@@ -228,7 +289,7 @@ router.get('/', authenticate, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Get rides error:', error);
+    logger.error({ error: error.message }, 'Get rides error');
     res.status(500).json({ error: 'Failed to get ride history' });
   }
 });
@@ -258,7 +319,7 @@ router.get('/nearby/drivers', authenticate, requireRider, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Get nearby drivers error:', error);
+    logger.error({ error: error.message }, 'Get nearby drivers error');
     res.status(500).json({ error: 'Failed to get nearby drivers' });
   }
 });
@@ -276,7 +337,7 @@ router.get('/surge/info', authenticate, async (req, res) => {
 
     res.json(surgeInfo);
   } catch (error) {
-    console.error('Get surge info error:', error);
+    logger.error({ error: error.message }, 'Get surge info error');
     res.status(500).json({ error: 'Failed to get surge info' });
   }
 });

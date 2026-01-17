@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import playlistService from '../services/playlistService.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { rateLimiters } from '../shared/rateLimit.js';
+import { idempotencyMiddleware, playlistTrackIdempotencyKey } from '../shared/idempotency.js';
+import { playlistOperationsTotal } from '../shared/metrics.js';
 
 const router = Router();
 
@@ -107,48 +110,67 @@ router.delete('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Add track to playlist
-router.post('/:id/tracks', requireAuth, async (req, res) => {
-  try {
-    const { trackId } = req.body;
+// Add track to playlist (with idempotency)
+router.post(
+  '/:id/tracks',
+  requireAuth,
+  rateLimiters.playlistWrite,
+  idempotencyMiddleware('playlist_add_track', playlistTrackIdempotencyKey),
+  async (req, res) => {
+    try {
+      const { trackId } = req.body;
 
-    if (!trackId) {
-      return res.status(400).json({ error: 'Track ID is required' });
+      if (!trackId) {
+        return res.status(400).json({ error: 'Track ID is required' });
+      }
+
+      const result = await playlistService.addTrackToPlaylist(
+        req.params.id,
+        trackId,
+        req.session.userId
+      );
+
+      playlistOperationsTotal.inc({ operation: 'add_track' });
+
+      res.json(result);
+    } catch (error) {
+      const log = req.log || console;
+      log.error({ error: error.message, playlistId: req.params.id }, 'Add track to playlist error');
+      if (error.message.includes('Not authorized')) {
+        return res.status(403).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Internal server error' });
     }
-
-    const result = await playlistService.addTrackToPlaylist(
-      req.params.id,
-      trackId,
-      req.session.userId
-    );
-
-    res.json(result);
-  } catch (error) {
-    console.error('Add track to playlist error:', error);
-    if (error.message.includes('Not authorized')) {
-      return res.status(403).json({ error: error.message });
-    }
-    res.status(500).json({ error: 'Internal server error' });
   }
-});
+);
 
-// Remove track from playlist
-router.delete('/:id/tracks/:trackId', requireAuth, async (req, res) => {
-  try {
-    const result = await playlistService.removeTrackFromPlaylist(
-      req.params.id,
-      req.params.trackId,
-      req.session.userId
-    );
-    res.json(result);
-  } catch (error) {
-    console.error('Remove track from playlist error:', error);
-    if (error.message.includes('Not authorized')) {
-      return res.status(403).json({ error: error.message });
+// Remove track from playlist (with idempotency)
+router.delete(
+  '/:id/tracks/:trackId',
+  requireAuth,
+  rateLimiters.playlistWrite,
+  idempotencyMiddleware('playlist_remove_track', playlistTrackIdempotencyKey),
+  async (req, res) => {
+    try {
+      const result = await playlistService.removeTrackFromPlaylist(
+        req.params.id,
+        req.params.trackId,
+        req.session.userId
+      );
+
+      playlistOperationsTotal.inc({ operation: 'remove_track' });
+
+      res.json(result);
+    } catch (error) {
+      const log = req.log || console;
+      log.error({ error: error.message, playlistId: req.params.id }, 'Remove track from playlist error');
+      if (error.message.includes('Not authorized')) {
+        return res.status(403).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Internal server error' });
     }
-    res.status(500).json({ error: 'Internal server error' });
   }
-});
+);
 
 // Reorder playlist tracks
 router.put('/:id/tracks/reorder', requireAuth, async (req, res) => {

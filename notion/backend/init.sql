@@ -123,6 +123,21 @@ CREATE TABLE IF NOT EXISTS operations (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Audit log table for security events
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    user_id UUID NOT NULL,
+    resource_type VARCHAR(50) NOT NULL,
+    resource_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    metadata JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_pages_workspace ON pages(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_pages_parent ON pages(parent_id);
@@ -134,6 +149,9 @@ CREATE INDEX IF NOT EXISTS idx_operations_page ON operations(page_id);
 CREATE INDEX IF NOT EXISTS idx_operations_timestamp ON operations(page_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource_type, resource_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC);
 
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()

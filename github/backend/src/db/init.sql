@@ -286,3 +286,34 @@ CREATE INDEX IF NOT EXISTS idx_reviews_pr ON reviews(pr_id);
 CREATE INDEX IF NOT EXISTS idx_stars_user ON stars(user_id);
 CREATE INDEX IF NOT EXISTS idx_stars_repo ON stars(repo_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+
+-- Audit log table for security-sensitive operations
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id SERIAL PRIMARY KEY,
+  timestamp TIMESTAMP DEFAULT NOW(),
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action VARCHAR(100) NOT NULL,
+  resource_type VARCHAR(50) NOT NULL,
+  resource_id VARCHAR(100),
+  ip_address INET,
+  user_agent TEXT,
+  request_id VARCHAR(64),
+  details JSONB DEFAULT '{}',
+  outcome VARCHAR(20) DEFAULT 'success'
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+
+-- Idempotency keys table for preventing duplicate operations
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key VARCHAR(64) PRIMARY KEY,
+  operation_type VARCHAR(50) NOT NULL,
+  resource_id INTEGER,
+  response_body JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);

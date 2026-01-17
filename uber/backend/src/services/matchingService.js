@@ -4,6 +4,12 @@ import locationService from './locationService.js';
 import pricingService from './pricingService.js';
 import { calculateDistance, estimateTravelTime } from '../utils/geo.js';
 import config from '../config/index.js';
+import { publishToQueue, publishToExchange, consumeQueue, QUEUES, EXCHANGES } from '../utils/queue.js';
+import { createLogger } from '../utils/logger.js';
+import { metrics } from '../utils/metrics.js';
+import { withRetry } from '../utils/circuitBreaker.js';
+
+const logger = createLogger('matching-service');
 
 const PENDING_REQUESTS_KEY = 'rides:pending';
 const RIDE_PREFIX = 'ride:';
@@ -11,16 +17,19 @@ const RIDE_PREFIX = 'ride:';
 class MatchingService {
   constructor() {
     this.wsClients = new Map(); // userId -> WebSocket connection
+    this.matchingTimers = new Map(); // rideId -> timer for matching duration tracking
   }
 
   // Register WebSocket connection for real-time updates
   registerClient(userId, ws) {
     this.wsClients.set(userId, ws);
+    logger.debug({ userId }, 'WebSocket client registered');
   }
 
   // Unregister WebSocket connection
   unregisterClient(userId) {
     this.wsClients.delete(userId);
+    logger.debug({ userId }, 'WebSocket client unregistered');
   }
 
   // Send message to a user
@@ -34,8 +43,28 @@ class MatchingService {
     return false;
   }
 
-  // Request a ride
+  // Initialize queue consumers for async matching
+  async initializeQueues() {
+    try {
+      // Start consuming matching requests
+      await consumeQueue(
+        QUEUES.MATCHING_REQUESTS,
+        async (message, msg) => {
+          await this.processMatchingRequest(message);
+        },
+        { maxRetries: 3 }
+      );
+
+      logger.info('Matching service queue consumers initialized');
+    } catch (error) {
+      logger.error({ error: error.message }, 'Failed to initialize matching queues');
+    }
+  }
+
+  // Request a ride - now publishes to queue for async processing
   async requestRide(riderId, pickupLat, pickupLng, dropoffLat, dropoffLng, vehicleType = 'economy', pickupAddress = null, dropoffAddress = null) {
+    const startTime = Date.now();
+
     // Increment demand for surge pricing
     await pricingService.incrementDemand(pickupLat, pickupLng);
 
@@ -48,27 +77,40 @@ class MatchingService {
       vehicleType
     );
 
-    // Create ride in database
-    const result = await query(
-      `INSERT INTO rides (
-        rider_id, status, pickup_lat, pickup_lng, pickup_address,
-        dropoff_lat, dropoff_lng, dropoff_address, vehicle_type,
-        estimated_fare_cents, surge_multiplier, distance_meters
-      ) VALUES ($1, 'requested', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-      RETURNING *`,
-      [
-        riderId,
-        pickupLat,
-        pickupLng,
-        pickupAddress,
-        dropoffLat,
-        dropoffLng,
-        dropoffAddress,
-        vehicleType,
-        fareEstimate.totalFareCents,
-        fareEstimate.surgeMultiplier,
-        Math.round(fareEstimate.distanceKm * 1000),
-      ]
+    // Track surge pricing metrics
+    if (fareEstimate.surgeMultiplier > 1.0) {
+      const multiplierRange =
+        fareEstimate.surgeMultiplier <= 1.5 ? '1.1-1.5' :
+        fareEstimate.surgeMultiplier <= 2.0 ? '1.6-2.0' : '2.1+';
+      metrics.surgeEventCounter.inc({ multiplier_range: multiplierRange });
+    }
+
+    // Create ride in database with retry
+    const result = await withRetry(
+      async () => {
+        return await query(
+          `INSERT INTO rides (
+            rider_id, status, pickup_lat, pickup_lng, pickup_address,
+            dropoff_lat, dropoff_lng, dropoff_address, vehicle_type,
+            estimated_fare_cents, surge_multiplier, distance_meters
+          ) VALUES ($1, 'requested', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          RETURNING *`,
+          [
+            riderId,
+            pickupLat,
+            pickupLng,
+            pickupAddress,
+            dropoffLat,
+            dropoffLng,
+            dropoffAddress,
+            vehicleType,
+            fareEstimate.totalFareCents,
+            fareEstimate.surgeMultiplier,
+            Math.round(fareEstimate.distanceKm * 1000),
+          ]
+        );
+      },
+      { maxRetries: 2, baseDelay: 100 }
     );
 
     const ride = result.rows[0];
@@ -88,8 +130,45 @@ class MatchingService {
     // Add to pending requests
     await redis.zadd(PENDING_REQUESTS_KEY, Date.now(), ride.id);
 
-    // Start matching process
-    this.findDriver(ride.id, pickupLat, pickupLng, vehicleType);
+    // Track metrics
+    metrics.rideRequestsTotal.inc({ vehicle_type: vehicleType, status: 'requested' });
+    metrics.rideStatusGauge.inc({ status: 'requested' });
+
+    // Start matching timer for latency tracking
+    this.matchingTimers.set(ride.id, startTime);
+
+    // Publish matching request to queue for async processing
+    await publishToQueue(QUEUES.MATCHING_REQUESTS, {
+      requestId: ride.id, // Use ride ID as idempotency key
+      rideId: ride.id,
+      pickupLocation: { lat: pickupLat, lng: pickupLng },
+      dropoffLocation: { lat: dropoffLat, lng: dropoffLng },
+      vehicleType,
+      maxWaitSeconds: config.matching.matchingTimeoutSeconds,
+      attempt: 1,
+      riderId,
+    });
+
+    // Publish ride event to fanout exchange
+    await publishToExchange(EXCHANGES.RIDE_EVENTS, '', {
+      eventId: `${ride.id}-requested`,
+      eventType: 'requested',
+      rideId: ride.id,
+      timestamp: Date.now(),
+      payload: {
+        riderId,
+        pickupLocation: { lat: pickupLat, lng: pickupLng },
+        dropoffLocation: { lat: dropoffLat, lng: dropoffLng },
+        vehicleType,
+        estimatedFare: fareEstimate.totalFareCents,
+        surgeMultiplier: fareEstimate.surgeMultiplier,
+      },
+    });
+
+    logger.info(
+      { rideId: ride.id, riderId, vehicleType, surgeMultiplier: fareEstimate.surgeMultiplier },
+      'Ride requested'
+    );
 
     return {
       rideId: ride.id,
@@ -103,6 +182,28 @@ class MatchingService {
     };
   }
 
+  // Process matching request from queue
+  async processMatchingRequest(message) {
+    const { rideId, pickupLocation, vehicleType, attempt, riderId } = message;
+
+    logger.debug({ rideId, attempt }, 'Processing matching request from queue');
+
+    // Check if ride is still pending
+    const rideData = await redis.hgetall(`${RIDE_PREFIX}${rideId}`);
+    if (!rideData || rideData.status !== 'requested') {
+      logger.info({ rideId }, 'Ride no longer pending, skipping matching');
+      return;
+    }
+
+    await this.findDriver(
+      rideId,
+      pickupLocation.lat,
+      pickupLocation.lng,
+      vehicleType,
+      attempt
+    );
+  }
+
   // Find a driver for the ride
   async findDriver(rideId, pickupLat, pickupLng, vehicleType, attempt = 1) {
     const maxAttempts = 3;
@@ -112,6 +213,8 @@ class MatchingService {
       config.matching.searchRadiusKm * radiusMultiplier,
       config.matching.maxSearchRadiusKm
     );
+
+    logger.debug({ rideId, attempt, radiusKm }, 'Searching for nearby drivers');
 
     // Find nearby drivers
     let drivers = await locationService.findNearbyDrivers(pickupLat, pickupLng, radiusKm);
@@ -123,8 +226,16 @@ class MatchingService {
 
     if (drivers.length === 0) {
       if (attempt < maxAttempts) {
-        // Retry with larger radius after delay
-        setTimeout(() => this.findDriver(rideId, pickupLat, pickupLng, vehicleType, attempt + 1), 5000);
+        // Requeue with incremented attempt after delay
+        setTimeout(async () => {
+          await publishToQueue(QUEUES.MATCHING_REQUESTS, {
+            requestId: `${rideId}-attempt-${attempt + 1}`,
+            rideId,
+            pickupLocation: { lat: pickupLat, lng: pickupLng },
+            vehicleType,
+            attempt: attempt + 1,
+          });
+        }, 5000);
         return;
       }
 
@@ -146,7 +257,15 @@ class MatchingService {
 
     // All drivers declined, retry
     if (attempt < maxAttempts) {
-      setTimeout(() => this.findDriver(rideId, pickupLat, pickupLng, vehicleType, attempt + 1), 5000);
+      setTimeout(async () => {
+        await publishToQueue(QUEUES.MATCHING_REQUESTS, {
+          requestId: `${rideId}-attempt-${attempt + 1}`,
+          rideId,
+          pickupLocation: { lat: pickupLat, lng: pickupLng },
+          vehicleType,
+          attempt: attempt + 1,
+        });
+      }, 5000);
     } else {
       await this.handleNoDriversFound(rideId);
     }
@@ -230,13 +349,10 @@ class MatchingService {
     const sent = this.sendToUser(driverId, offer);
 
     if (sent) {
-      // Wait for response (handled via WebSocket)
-      // For demo, auto-accept after a delay
-      return new Promise((resolve) => {
-        // Store pending offer
-        redis.setex(`offer:${rideId}:${driverId}`, 20, JSON.stringify(offer));
-        resolve(true); // For demo, assume accepted
-      });
+      logger.info({ rideId, driverId, etaMinutes }, 'Ride offer sent to driver');
+      // Store pending offer
+      redis.setex(`offer:${rideId}:${driverId}`, 20, JSON.stringify(offer));
+      return true; // For demo, assume accepted
     }
 
     return false;
@@ -250,11 +366,17 @@ class MatchingService {
       return { success: false, error: 'Ride no longer available' };
     }
 
-    // Update ride status
-    await query(
-      `UPDATE rides SET driver_id = $1, status = 'matched', matched_at = NOW() WHERE id = $2`,
+    // Update ride status with optimistic locking (version check)
+    const updateResult = await query(
+      `UPDATE rides SET driver_id = $1, status = 'matched', matched_at = NOW()
+       WHERE id = $2 AND status = 'requested'
+       RETURNING *`,
       [driverId, rideId]
     );
+
+    if (updateResult.rowCount === 0) {
+      return { success: false, error: 'Ride already taken' };
+    }
 
     // Update Redis
     await redis.hset(`${RIDE_PREFIX}${rideId}`, 'status', 'matched', 'driverId', driverId);
@@ -267,6 +389,21 @@ class MatchingService {
 
     // Decrement demand
     await pricingService.decrementDemand(parseFloat(rideData.pickupLat), parseFloat(rideData.pickupLng));
+
+    // Track matching duration
+    const matchingStartTime = this.matchingTimers.get(rideId);
+    if (matchingStartTime) {
+      const matchingDuration = (Date.now() - matchingStartTime) / 1000;
+      metrics.rideMatchingDuration.observe(
+        { vehicle_type: rideData.vehicleType, success: 'true' },
+        matchingDuration
+      );
+      this.matchingTimers.delete(rideId);
+    }
+
+    // Update ride status metrics
+    metrics.rideStatusGauge.dec({ status: 'requested' });
+    metrics.rideStatusGauge.inc({ status: 'matched' });
 
     // Get driver details
     const driverResult = await query(
@@ -295,6 +432,20 @@ class MatchingService {
       },
     });
 
+    // Publish matched event
+    await publishToExchange(EXCHANGES.RIDE_EVENTS, '', {
+      eventId: `${rideId}-matched`,
+      eventType: 'matched',
+      rideId,
+      timestamp: Date.now(),
+      payload: {
+        riderId: rideData.riderId,
+        driverId,
+      },
+    });
+
+    logger.info({ rideId, driverId }, 'Ride matched');
+
     return {
       success: true,
       ride: {
@@ -321,11 +472,17 @@ class MatchingService {
 
     const rideData = await redis.hgetall(`${RIDE_PREFIX}${rideId}`);
 
+    // Update metrics
+    metrics.rideStatusGauge.dec({ status: 'matched' });
+    metrics.rideStatusGauge.inc({ status: 'driver_arrived' });
+
     // Notify rider
     this.sendToUser(rideData.riderId, {
       type: 'driver_arrived',
       rideId,
     });
+
+    logger.info({ rideId, driverId }, 'Driver arrived at pickup');
 
     return { success: true };
   }
@@ -338,11 +495,17 @@ class MatchingService {
 
     const rideData = await redis.hgetall(`${RIDE_PREFIX}${rideId}`);
 
+    // Update metrics
+    metrics.rideStatusGauge.dec({ status: 'driver_arrived' });
+    metrics.rideStatusGauge.inc({ status: 'picked_up' });
+
     // Notify rider
     this.sendToUser(rideData.riderId, {
       type: 'ride_started',
       rideId,
     });
+
+    logger.info({ rideId, driverId }, 'Ride started');
 
     return { success: true };
   }
@@ -395,7 +558,10 @@ class MatchingService {
       await locationService.setDriverAvailability(driverId, true, driverLocation.lat, driverLocation.lng);
     }
 
-    const rideData = await redis.hgetall(`${RIDE_PREFIX}${rideId}`);
+    // Update metrics
+    metrics.rideStatusGauge.dec({ status: 'picked_up' });
+    metrics.rideRequestsTotal.inc({ vehicle_type: ride.vehicle_type, status: 'completed' });
+    metrics.rideFareHistogram.observe({ vehicle_type: ride.vehicle_type }, fareDetails.totalFareCents);
 
     // Notify rider
     this.sendToUser(ride.rider_id, {
@@ -403,6 +569,26 @@ class MatchingService {
       rideId,
       fare: fareDetails,
     });
+
+    // Publish completed event
+    await publishToExchange(EXCHANGES.RIDE_EVENTS, '', {
+      eventId: `${rideId}-completed`,
+      eventType: 'completed',
+      rideId,
+      timestamp: Date.now(),
+      payload: {
+        riderId: ride.rider_id,
+        driverId,
+        fare: fareDetails.totalFareCents,
+        distanceKm,
+        durationMinutes,
+      },
+    });
+
+    logger.info(
+      { rideId, driverId, fare: fareDetails.totalFareCents, distanceKm, durationMinutes },
+      'Ride completed'
+    );
 
     return {
       success: true,
@@ -433,7 +619,22 @@ class MatchingService {
     // Decrement demand if still pending
     if (ride.status === 'requested') {
       await pricingService.decrementDemand(parseFloat(ride.pickup_lat), parseFloat(ride.pickup_lng));
+
+      // Track failed matching
+      const matchingStartTime = this.matchingTimers.get(rideId);
+      if (matchingStartTime) {
+        const matchingDuration = (Date.now() - matchingStartTime) / 1000;
+        metrics.rideMatchingDuration.observe(
+          { vehicle_type: ride.vehicle_type, success: 'false' },
+          matchingDuration
+        );
+        this.matchingTimers.delete(rideId);
+      }
     }
+
+    // Update metrics
+    metrics.rideStatusGauge.dec({ status: ride.status });
+    metrics.rideRequestsTotal.inc({ vehicle_type: ride.vehicle_type, status: 'cancelled' });
 
     // If driver was assigned, make them available
     if (ride.driver_id) {
@@ -459,12 +660,31 @@ class MatchingService {
       reason,
     });
 
+    // Publish cancelled event
+    await publishToExchange(EXCHANGES.RIDE_EVENTS, '', {
+      eventId: `${rideId}-cancelled`,
+      eventType: 'cancelled',
+      rideId,
+      timestamp: Date.now(),
+      payload: {
+        riderId: ride.rider_id,
+        driverId: ride.driver_id,
+        cancelledBy,
+        reason,
+      },
+    });
+
+    logger.info({ rideId, cancelledBy, reason }, 'Ride cancelled');
+
     return { success: true };
   }
 
   // Handle no drivers found
   async handleNoDriversFound(rideId) {
-    await query(`UPDATE rides SET status = 'cancelled', cancelled_at = NOW(), cancelled_by = 'system', cancellation_reason = 'No drivers available' WHERE id = $1`, [rideId]);
+    await query(
+      `UPDATE rides SET status = 'cancelled', cancelled_at = NOW(), cancelled_by = 'system', cancellation_reason = 'No drivers available' WHERE id = $1`,
+      [rideId]
+    );
 
     const rideData = await redis.hgetall(`${RIDE_PREFIX}${rideId}`);
 
@@ -475,12 +695,29 @@ class MatchingService {
     if (rideData) {
       await pricingService.decrementDemand(parseFloat(rideData.pickupLat), parseFloat(rideData.pickupLng));
 
+      // Track failed matching
+      const matchingStartTime = this.matchingTimers.get(rideId);
+      if (matchingStartTime) {
+        const matchingDuration = (Date.now() - matchingStartTime) / 1000;
+        metrics.rideMatchingDuration.observe(
+          { vehicle_type: rideData.vehicleType, success: 'false' },
+          matchingDuration
+        );
+        this.matchingTimers.delete(rideId);
+      }
+
+      // Update metrics
+      metrics.rideStatusGauge.dec({ status: 'requested' });
+      metrics.rideRequestsTotal.inc({ vehicle_type: rideData.vehicleType, status: 'no_drivers' });
+
       // Notify rider
       this.sendToUser(rideData.riderId, {
         type: 'no_drivers_available',
         rideId,
       });
     }
+
+    logger.info({ rideId }, 'No drivers available');
   }
 
   // Get ride status

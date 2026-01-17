@@ -3,6 +3,17 @@ import { query } from '../db.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { haversineDistance } from '../utils/geo.js';
 
+// Shared modules
+import logger from '../shared/logger.js';
+import {
+  getCachedRestaurantWithMenu,
+  setCachedRestaurantWithMenu,
+  invalidateRestaurantCache,
+  invalidateMenuCache,
+  getCachedCuisines,
+  setCachedCuisines,
+} from '../shared/cache.js';
+
 const router = Router();
 
 // Get all restaurants (with optional filters)
@@ -51,16 +62,23 @@ router.get('/', async (req, res) => {
 
     res.json({ restaurants });
   } catch (err) {
-    console.error('Get restaurants error:', err);
+    logger.error({ error: err.message }, 'Get restaurants error');
     res.status(500).json({ error: 'Failed to get restaurants' });
   }
 });
 
-// Get single restaurant with menu
+// Get single restaurant with menu (with caching)
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Try cache first
+    const cached = await getCachedRestaurantWithMenu(id);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // Cache miss - fetch from database
     const restaurantResult = await query(
       `SELECT id, name, description, address, lat, lon, cuisine_type,
               rating, rating_count, prep_time_minutes, is_open,
@@ -93,25 +111,43 @@ router.get('/:id', async (req, res) => {
       menuByCategory[item.category].push(item);
     }
 
-    res.json({
+    const responseData = {
       restaurant,
       menu: menuByCategory,
-    });
+    };
+
+    // Store in cache
+    await setCachedRestaurantWithMenu(id, restaurant, menuByCategory);
+
+    res.json(responseData);
   } catch (err) {
-    console.error('Get restaurant error:', err);
+    logger.error({ error: err.message, restaurantId: req.params.id }, 'Get restaurant error');
     res.status(500).json({ error: 'Failed to get restaurant' });
   }
 });
 
-// Get cuisine types
+// Get cuisine types (with caching)
 router.get('/meta/cuisines', async (req, res) => {
   try {
+    // Try cache first
+    const cached = await getCachedCuisines();
+    if (cached) {
+      return res.json({ cuisines: cached });
+    }
+
+    // Cache miss
     const result = await query(
       `SELECT DISTINCT cuisine_type FROM restaurants WHERE cuisine_type IS NOT NULL ORDER BY cuisine_type`
     );
-    res.json({ cuisines: result.rows.map((r) => r.cuisine_type) });
+
+    const cuisines = result.rows.map((r) => r.cuisine_type);
+
+    // Store in cache
+    await setCachedCuisines(cuisines);
+
+    res.json({ cuisines });
   } catch (err) {
-    console.error('Get cuisines error:', err);
+    logger.error({ error: err.message }, 'Get cuisines error');
     res.status(500).json({ error: 'Failed to get cuisines' });
   }
 });
@@ -127,7 +163,7 @@ router.get('/owner/my-restaurants', requireAuth, requireRole('restaurant_owner',
     );
     res.json({ restaurants: result.rows });
   } catch (err) {
-    console.error('Get my restaurants error:', err);
+    logger.error({ error: err.message }, 'Get my restaurants error');
     res.status(500).json({ error: 'Failed to get restaurants' });
   }
 });
@@ -158,14 +194,16 @@ router.post('/', requireAuth, requireRole('restaurant_owner', 'admin'), async (r
       [req.user.id, name, description, address, lat, lon, cuisineType, prepTimeMinutes, deliveryFee, minOrder]
     );
 
+    logger.info({ restaurantId: result.rows[0].id, ownerId: req.user.id }, 'Restaurant created');
+
     res.status(201).json({ restaurant: result.rows[0] });
   } catch (err) {
-    console.error('Create restaurant error:', err);
+    logger.error({ error: err.message }, 'Create restaurant error');
     res.status(500).json({ error: 'Failed to create restaurant' });
   }
 });
 
-// Update restaurant
+// Update restaurant (with cache invalidation)
 router.put('/:id', requireAuth, requireRole('restaurant_owner', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -199,16 +237,21 @@ router.put('/:id', requireAuth, requireRole('restaurant_owner', 'admin'), async 
       [id, name, description, address, lat, lon, cuisineType, prepTimeMinutes, isOpen, deliveryFee, minOrder]
     );
 
+    // Invalidate cache on update
+    await invalidateRestaurantCache(id);
+
+    logger.info({ restaurantId: id, updatedBy: req.user.id }, 'Restaurant updated');
+
     res.json({ restaurant: result.rows[0] });
   } catch (err) {
-    console.error('Update restaurant error:', err);
+    logger.error({ error: err.message, restaurantId: req.params.id }, 'Update restaurant error');
     res.status(500).json({ error: 'Failed to update restaurant' });
   }
 });
 
 // Menu item routes
 
-// Add menu item
+// Add menu item (with cache invalidation)
 router.post('/:id/menu', requireAuth, requireRole('restaurant_owner', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -234,14 +277,19 @@ router.post('/:id/menu', requireAuth, requireRole('restaurant_owner', 'admin'), 
       [id, name, description, price, category]
     );
 
+    // Invalidate menu cache
+    await invalidateMenuCache(id);
+
+    logger.info({ restaurantId: id, itemId: result.rows[0].id }, 'Menu item added');
+
     res.status(201).json({ item: result.rows[0] });
   } catch (err) {
-    console.error('Add menu item error:', err);
+    logger.error({ error: err.message, restaurantId: req.params.id }, 'Add menu item error');
     res.status(500).json({ error: 'Failed to add menu item' });
   }
 });
 
-// Update menu item
+// Update menu item (with cache invalidation)
 router.put('/:restaurantId/menu/:itemId', requireAuth, requireRole('restaurant_owner', 'admin'), async (req, res) => {
   try {
     const { restaurantId, itemId } = req.params;
@@ -273,14 +321,19 @@ router.put('/:restaurantId/menu/:itemId', requireAuth, requireRole('restaurant_o
       return res.status(404).json({ error: 'Menu item not found' });
     }
 
+    // Invalidate menu cache
+    await invalidateMenuCache(restaurantId);
+
+    logger.info({ restaurantId, itemId, updatedBy: req.user.id }, 'Menu item updated');
+
     res.json({ item: result.rows[0] });
   } catch (err) {
-    console.error('Update menu item error:', err);
+    logger.error({ error: err.message, restaurantId: req.params.restaurantId, itemId: req.params.itemId }, 'Update menu item error');
     res.status(500).json({ error: 'Failed to update menu item' });
   }
 });
 
-// Delete menu item
+// Delete menu item (with cache invalidation)
 router.delete(
   '/:restaurantId/menu/:itemId',
   requireAuth,
@@ -300,9 +353,14 @@ router.delete(
 
       await query('DELETE FROM menu_items WHERE id = $1 AND restaurant_id = $2', [itemId, restaurantId]);
 
+      // Invalidate menu cache
+      await invalidateMenuCache(restaurantId);
+
+      logger.info({ restaurantId, itemId, deletedBy: req.user.id }, 'Menu item deleted');
+
       res.json({ success: true });
     } catch (err) {
-      console.error('Delete menu item error:', err);
+      logger.error({ error: err.message, restaurantId: req.params.restaurantId, itemId: req.params.itemId }, 'Delete menu item error');
       res.status(500).json({ error: 'Failed to delete menu item' });
     }
   }

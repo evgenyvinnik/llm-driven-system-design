@@ -2,8 +2,18 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 
-// Load environment variables
+// Load environment variables first
 dotenv.config();
+
+// Import shared modules
+import logger, { createRequestLogger } from './shared/logger.js';
+import {
+  metricsMiddleware,
+  getMetrics,
+  getMetricsContentType,
+  dbConnectionPoolSize,
+  redisMemoryBytes,
+} from './shared/metrics.js';
 
 // Import routes
 import paymentIntentsRouter from './routes/paymentIntents.js';
@@ -23,48 +33,228 @@ import pool from './db/pool.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000'],
-  credentials: true,
-}));
+// ========================
+// Middleware Setup
+// ========================
+
+app.use(
+  cors({
+    origin: ['http://localhost:5173', 'http://localhost:3000'],
+    credentials: true,
+  })
+);
 
 app.use(express.json());
 
-// Request logging in development
-if (process.env.NODE_ENV === 'development') {
-  app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-    next();
+// Prometheus metrics middleware - collect request metrics
+app.use(metricsMiddleware);
+
+// Request logging middleware with structured logging
+app.use((req, res, next) => {
+  const startTime = process.hrtime();
+  req.logger = createRequestLogger(req);
+
+  // Log request received
+  req.logger.debug({
+    event: 'request_received',
+    method: req.method,
+    path: req.path,
+    query: req.query,
   });
-}
 
-// Health check
+  // Log response when finished
+  res.on('finish', () => {
+    const [seconds, nanoseconds] = process.hrtime(startTime);
+    const durationMs = (seconds * 1000 + nanoseconds / 1e6).toFixed(2);
+
+    const logData = {
+      event: 'request_completed',
+      method: req.method,
+      path: req.path,
+      status_code: res.statusCode,
+      duration_ms: parseFloat(durationMs),
+    };
+
+    if (res.statusCode >= 500) {
+      req.logger.error(logData);
+    } else if (res.statusCode >= 400) {
+      req.logger.warn(logData);
+    } else {
+      req.logger.info(logData);
+    }
+  });
+
+  next();
+});
+
+// ========================
+// Health Check Endpoints
+// ========================
+
+/**
+ * Basic health check - for load balancer probes
+ * Returns 200 if server is running
+ */
 app.get('/health', async (req, res) => {
-  try {
-    // Check database
-    await pool.query('SELECT 1');
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+  });
+});
 
-    // Check Redis
+/**
+ * Detailed health check - for monitoring dashboards
+ * Checks all dependencies and returns their status
+ */
+app.get('/health/detailed', async (req, res) => {
+  const health = {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: process.uptime(),
+    version: process.env.APP_VERSION || '1.0.0',
+    environment: process.env.NODE_ENV || 'development',
+    checks: {},
+  };
+
+  // Check PostgreSQL
+  try {
+    const start = process.hrtime();
+    await pool.query('SELECT 1');
+    const [s, ns] = process.hrtime(start);
+    const latencyMs = (s * 1000 + ns / 1e6).toFixed(2);
+
+    // Get pool stats
+    const poolStats = {
+      total: pool.totalCount,
+      idle: pool.idleCount,
+      waiting: pool.waitingCount,
+    };
+
+    // Update metrics
+    dbConnectionPoolSize.set({ state: 'total' }, poolStats.total);
+    dbConnectionPoolSize.set({ state: 'idle' }, poolStats.idle);
+    dbConnectionPoolSize.set({ state: 'waiting' }, poolStats.waiting);
+
+    health.checks.database = {
+      status: 'healthy',
+      latency_ms: parseFloat(latencyMs),
+      pool: poolStats,
+    };
+  } catch (error) {
+    health.status = 'unhealthy';
+    health.checks.database = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+  }
+
+  // Check Redis
+  try {
+    const start = process.hrtime();
     await redis.ping();
+    const [s, ns] = process.hrtime(start);
+    const latencyMs = (s * 1000 + ns / 1e6).toFixed(2);
+
+    // Get Redis memory info
+    let memoryBytes = 0;
+    try {
+      const info = await redis.info('memory');
+      const match = info.match(/used_memory:(\d+)/);
+      if (match) {
+        memoryBytes = parseInt(match[1]);
+        redisMemoryBytes.set(memoryBytes);
+      }
+    } catch (e) {
+      // Memory info not critical
+    }
+
+    health.checks.redis = {
+      status: 'healthy',
+      latency_ms: parseFloat(latencyMs),
+      memory_bytes: memoryBytes,
+    };
+  } catch (error) {
+    health.status = 'unhealthy';
+    health.checks.redis = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+  }
+
+  // Overall status based on critical services
+  const criticalServices = ['database', 'redis'];
+  const anyUnhealthy = criticalServices.some(
+    (service) => health.checks[service]?.status === 'unhealthy'
+  );
+
+  if (anyUnhealthy) {
+    health.status = 'unhealthy';
+    res.status(503);
+  }
+
+  res.json(health);
+});
+
+/**
+ * Readiness check - for Kubernetes readiness probes
+ * Returns 200 only when all dependencies are ready
+ */
+app.get('/ready', async (req, res) => {
+  try {
+    // Check both critical dependencies
+    await Promise.all([pool.query('SELECT 1'), redis.ping()]);
 
     res.json({
-      status: 'healthy',
+      ready: true,
       timestamp: new Date().toISOString(),
-      services: {
-        database: 'connected',
-        redis: 'connected',
-      },
     });
   } catch (error) {
     res.status(503).json({
-      status: 'unhealthy',
+      ready: false,
       error: error.message,
+      timestamp: new Date().toISOString(),
     });
   }
 });
 
-// API version prefix
+/**
+ * Liveness check - for Kubernetes liveness probes
+ * Returns 200 if the process is running (doesn't check dependencies)
+ */
+app.get('/live', (req, res) => {
+  res.json({
+    alive: true,
+    timestamp: new Date().toISOString(),
+    pid: process.pid,
+  });
+});
+
+// ========================
+// Prometheus Metrics Endpoint
+// ========================
+
+/**
+ * Prometheus metrics endpoint
+ * Exposes all collected metrics in Prometheus format
+ */
+app.get('/metrics', async (req, res) => {
+  try {
+    const metrics = await getMetrics();
+    res.set('Content-Type', getMetricsContentType());
+    res.send(metrics);
+  } catch (error) {
+    logger.error({
+      event: 'metrics_error',
+      error_message: error.message,
+    });
+    res.status(500).json({ error: 'Failed to collect metrics' });
+  }
+});
+
+// ========================
+// API Routes
+// ========================
+
 const apiRouter = express.Router();
 
 // Mount routes
@@ -80,7 +270,10 @@ apiRouter.use('/charges', chargesRouter);
 // Mount API router
 app.use('/v1', apiRouter);
 
-// Root endpoint
+// ========================
+// Root and Documentation
+// ========================
+
 app.get('/', (req, res) => {
   res.json({
     name: 'Stripe-like Payment API',
@@ -96,17 +289,24 @@ app.get('/', (req, res) => {
       balance: '/v1/balance',
       merchants: '/v1/merchants',
     },
+    monitoring: {
+      health: '/health',
+      health_detailed: '/health/detailed',
+      ready: '/ready',
+      live: '/live',
+      metrics: '/metrics',
+    },
   });
 });
 
-// API documentation endpoint
 app.get('/docs', (req, res) => {
   res.json({
     title: 'Stripe-like Payment API Documentation',
     authentication: {
       type: 'Bearer token',
       header: 'Authorization: Bearer sk_test_xxx',
-      description: 'All API requests require a valid API key in the Authorization header.',
+      description:
+        'All API requests require a valid API key in the Authorization header.',
     },
     endpoints: {
       'POST /v1/merchants': {
@@ -167,10 +367,15 @@ app.get('/docs', (req, res) => {
     },
     idempotency: {
       header: 'Idempotency-Key',
-      description: 'Include an idempotency key to safely retry requests. Keys expire after 24 hours.',
+      description:
+        'Include an idempotency key to safely retry requests. Keys expire after 24 hours.',
     },
   });
 });
+
+// ========================
+// Error Handlers
+// ========================
 
 // 404 handler
 app.use((req, res) => {
@@ -182,35 +387,129 @@ app.use((req, res) => {
   });
 });
 
-// Error handler
+// Global error handler
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
+  const reqLogger = req.logger || logger;
+
+  reqLogger.error({
+    event: 'unhandled_error',
+    error_type: err.constructor.name,
+    error_message: err.message,
+    error_code: err.code,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+  });
+
+  // Handle specific error types
+  if (err.name === 'CardNetworkUnavailableError') {
+    return res.status(503).json({
+      error: {
+        type: 'api_error',
+        code: 'payment_processor_unavailable',
+        message:
+          'Payment processor is temporarily unavailable. Please try again.',
+      },
+    });
+  }
+
+  res.status(err.statusCode || 500).json({
     error: {
       type: 'api_error',
-      message: 'An internal error occurred',
+      message:
+        process.env.NODE_ENV === 'development'
+          ? err.message
+          : 'An internal error occurred',
     },
   });
 });
 
-// Start server
+// ========================
+// Graceful Shutdown
+// ========================
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logger.info({
+    event: 'shutdown_initiated',
+    signal,
+    message: 'Starting graceful shutdown...',
+  });
+
+  // Stop accepting new connections
+  server.close(() => {
+    logger.info({ event: 'http_server_closed' });
+  });
+
+  // Wait for in-flight requests (max 30 seconds)
+  const shutdownTimeout = setTimeout(() => {
+    logger.warn({ event: 'shutdown_timeout', message: 'Forcing shutdown' });
+    process.exit(1);
+  }, 30000);
+
+  try {
+    // Close database pool
+    await pool.end();
+    logger.info({ event: 'database_pool_closed' });
+
+    // Close Redis connection
+    await redis.quit();
+    logger.info({ event: 'redis_connection_closed' });
+
+    clearTimeout(shutdownTimeout);
+    logger.info({ event: 'shutdown_complete' });
+    process.exit(0);
+  } catch (error) {
+    logger.error({
+      event: 'shutdown_error',
+      error_message: error.message,
+    });
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ========================
+// Server Startup
+// ========================
+
+let server;
+
 async function start() {
   try {
     // Connect to Redis
     await redis.connect();
-    console.log('Redis connected');
+    logger.info({ event: 'redis_connected' });
 
     // Start webhook worker
     startWebhookWorker();
-    console.log('Webhook worker started');
+    logger.info({ event: 'webhook_worker_started' });
 
     // Start HTTP server
-    app.listen(PORT, () => {
-      console.log(`Stripe-like API server running on http://localhost:${PORT}`);
-      console.log(`API documentation: http://localhost:${PORT}/docs`);
+    server = app.listen(PORT, () => {
+      logger.info({
+        event: 'server_started',
+        port: PORT,
+        environment: process.env.NODE_ENV || 'development',
+        pid: process.pid,
+        endpoints: {
+          api: `http://localhost:${PORT}`,
+          docs: `http://localhost:${PORT}/docs`,
+          metrics: `http://localhost:${PORT}/metrics`,
+          health: `http://localhost:${PORT}/health/detailed`,
+        },
+      });
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.error({
+      event: 'startup_failed',
+      error_message: error.message,
+      stack: error.stack,
+    });
     process.exit(1);
   }
 }

@@ -1,8 +1,14 @@
 import { Router } from 'express';
 import { query, transaction } from '../db.js';
 import { authenticate, requireHost } from '../middleware/auth.js';
+import { invalidateAvailabilityCache } from '../shared/cache.js';
+import { metrics } from '../shared/metrics.js';
+import { auditBooking, AUDIT_EVENTS, OUTCOMES } from '../shared/audit.js';
+import { publishBookingCreated, publishBookingConfirmed, publishBookingCancelled, publishHostAlert } from '../shared/queue.js';
+import { createModuleLogger } from '../shared/logger.js';
 
 const router = Router();
+const log = createModuleLogger('bookings');
 
 // Calculate booking price
 const calculateBookingPrice = (listing, checkIn, checkOut) => {
@@ -29,6 +35,7 @@ const calculateBookingPrice = (listing, checkIn, checkOut) => {
 // Check availability
 router.get('/check-availability', async (req, res) => {
   const { listing_id, check_in, check_out } = req.query;
+  const startTime = process.hrtime.bigint();
 
   if (!listing_id || !check_in || !check_out) {
     return res.status(400).json({ error: 'listing_id, check_in, and check_out are required' });
@@ -59,6 +66,11 @@ router.get('/check-availability', async (req, res) => {
 
     const available = parseInt(conflictResult.rows[0].conflicts) === 0;
 
+    // Track metrics
+    const durationSeconds = Number(process.hrtime.bigint() - startTime) / 1e9;
+    metrics.availabilityCheckLatency.observe(durationSeconds);
+    metrics.availabilityChecksTotal.inc({ available: available.toString() });
+
     // Calculate price if available
     let pricing = null;
     if (available) {
@@ -73,7 +85,7 @@ router.get('/check-availability', async (req, res) => {
       maximum_nights: listing.maximum_nights,
     });
   } catch (error) {
-    console.error('Check availability error:', error);
+    log.error({ error, listingId: listing_id }, 'Check availability error');
     res.status(500).json({ error: 'Failed to check availability' });
   }
 });
@@ -81,13 +93,14 @@ router.get('/check-availability', async (req, res) => {
 // Create booking (with double-booking prevention)
 router.post('/', authenticate, async (req, res) => {
   const { listing_id, check_in, check_out, guests, message } = req.body;
+  const startTime = process.hrtime.bigint();
 
   if (!listing_id || !check_in || !check_out) {
     return res.status(400).json({ error: 'listing_id, check_in, and check_out are required' });
   }
 
   try {
-    const booking = await transaction(async (client) => {
+    const result = await transaction(async (client) => {
       // Lock the listing row to prevent concurrent bookings
       const listingResult = await client.query(
         'SELECT * FROM listings WHERE id = $1 FOR UPDATE',
@@ -166,12 +179,48 @@ router.post('/', authenticate, async (req, res) => {
         [listing_id, check_in, check_out, newBooking.id]
       );
 
-      return newBooking;
+      return { booking: newBooking, listing };
     });
+
+    const { booking, listing } = result;
+
+    // Track metrics
+    const durationSeconds = Number(process.hrtime.bigint() - startTime) / 1e9;
+    metrics.bookingLatency.observe({ instant_book: listing.instant_book.toString() }, durationSeconds);
+    metrics.bookingsTotal.inc({ status: booking.status, instant_book: listing.instant_book.toString() });
+    metrics.bookingRevenue.inc({ property_type: listing.property_type || 'unknown', city: listing.city || 'unknown' }, Math.round(booking.total_price * 100));
+    metrics.bookingNights.inc({ property_type: listing.property_type || 'unknown' }, booking.nights);
+
+    // Invalidate availability cache
+    await invalidateAvailabilityCache(listing_id);
+
+    // Audit log
+    await auditBooking(AUDIT_EVENTS.BOOKING_CREATED, booking, req, {
+      metadata: { hostId: listing.host_id },
+    });
+
+    // Publish event to queue for async processing (notifications, etc.)
+    try {
+      await publishBookingCreated(booking, listing);
+
+      // Alert host about new booking
+      await publishHostAlert(listing.host_id, 'new_booking', {
+        bookingId: booking.id,
+        guestName: req.user.name,
+        checkIn: check_in,
+        checkOut: check_out,
+        listingTitle: listing.title,
+      });
+    } catch (queueError) {
+      // Don't fail the booking if queue publishing fails
+      log.error({ error: queueError }, 'Failed to publish booking event to queue');
+    }
+
+    log.info({ bookingId: booking.id, listingId: listing_id, guestId: req.user.id }, 'Booking created');
 
     res.status(201).json({ booking });
   } catch (error) {
-    console.error('Create booking error:', error);
+    log.error({ error, listingId: listing_id }, 'Create booking error');
     res.status(400).json({ error: error.message || 'Failed to create booking' });
   }
 });
@@ -208,7 +257,7 @@ router.get('/my-trips', authenticate, async (req, res) => {
     const result = await query(sql, params);
     res.json({ bookings: result.rows });
   } catch (error) {
-    console.error('Get trips error:', error);
+    log.error({ error }, 'Get trips error');
     res.status(500).json({ error: 'Failed to fetch bookings' });
   }
 });
@@ -244,7 +293,7 @@ router.get('/host-reservations', authenticate, requireHost, async (req, res) => 
     const result = await query(sql, params);
     res.json({ bookings: result.rows });
   } catch (error) {
-    console.error('Get host reservations error:', error);
+    log.error({ error }, 'Get host reservations error');
     res.status(500).json({ error: 'Failed to fetch reservations' });
   }
 });
@@ -293,7 +342,7 @@ router.get('/:id', authenticate, async (req, res) => {
 
     res.json({ booking });
   } catch (error) {
-    console.error('Get booking error:', error);
+    log.error({ error, bookingId: id }, 'Get booking error');
     res.status(500).json({ error: 'Failed to fetch booking' });
   }
 });
@@ -310,7 +359,7 @@ router.put('/:id/respond', authenticate, requireHost, async (req, res) => {
   try {
     // Verify host ownership
     const bookingResult = await query(
-      `SELECT b.* FROM bookings b
+      `SELECT b.*, l.host_id, l.title as listing_title FROM bookings b
       JOIN listings l ON b.listing_id = l.id
       WHERE b.id = $1 AND l.host_id = $2 AND b.status = 'pending'`,
       [id, req.user.id]
@@ -320,11 +369,29 @@ router.put('/:id/respond', authenticate, requireHost, async (req, res) => {
       return res.status(404).json({ error: 'Booking not found or not pending' });
     }
 
+    const beforeState = bookingResult.rows[0];
+
     if (action === 'confirm') {
       await query(
         `UPDATE bookings SET status = 'confirmed', host_response = $2 WHERE id = $1`,
         [id, message]
       );
+
+      // Track confirmed booking
+      metrics.bookingsTotal.inc({ status: 'confirmed', instant_book: 'false' });
+
+      // Audit log
+      await auditBooking(AUDIT_EVENTS.BOOKING_CONFIRMED, { ...beforeState, status: 'confirmed' }, req, {
+        before: { status: beforeState.status },
+        after: { status: 'confirmed' },
+      });
+
+      // Publish confirmation event
+      try {
+        await publishBookingConfirmed({ ...beforeState, status: 'confirmed' });
+      } catch (queueError) {
+        log.error({ error: queueError }, 'Failed to publish booking confirmed event');
+      }
     } else {
       // Decline: also unblock the dates
       await transaction(async (client) => {
@@ -338,11 +405,24 @@ router.put('/:id/respond', authenticate, requireHost, async (req, res) => {
           [id]
         );
       });
+
+      // Invalidate availability cache
+      await invalidateAvailabilityCache(beforeState.listing_id);
+
+      // Track declined booking
+      metrics.bookingsTotal.inc({ status: 'declined', instant_book: 'false' });
+
+      // Audit log
+      await auditBooking(AUDIT_EVENTS.BOOKING_DECLINED, { ...beforeState, status: 'declined' }, req, {
+        before: { status: beforeState.status },
+        after: { status: 'declined' },
+      });
     }
 
+    log.info({ bookingId: id, action }, 'Booking response');
     res.json({ message: `Booking ${action}ed` });
   } catch (error) {
-    console.error('Respond to booking error:', error);
+    log.error({ error, bookingId: id }, 'Respond to booking error');
     res.status(500).json({ error: 'Failed to respond to booking' });
   }
 });
@@ -354,7 +434,7 @@ router.put('/:id/cancel', authenticate, async (req, res) => {
   try {
     // Get booking with listing info
     const bookingResult = await query(
-      `SELECT b.*, l.host_id FROM bookings b
+      `SELECT b.*, l.host_id, l.title as listing_title FROM bookings b
       JOIN listings l ON b.listing_id = l.id
       WHERE b.id = $1 AND b.status IN ('pending', 'confirmed')`,
       [id]
@@ -374,6 +454,8 @@ router.put('/:id/cancel', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
+    const cancelledBy = isGuest ? 'guest' : 'host';
+
     await transaction(async (client) => {
       await client.query(
         `UPDATE bookings SET
@@ -381,7 +463,7 @@ router.put('/:id/cancel', authenticate, async (req, res) => {
           cancelled_by = $2,
           cancelled_at = NOW()
         WHERE id = $1`,
-        [id, isGuest ? 'guest' : 'host']
+        [id, cancelledBy]
       );
 
       await client.query(
@@ -390,9 +472,40 @@ router.put('/:id/cancel', authenticate, async (req, res) => {
       );
     });
 
+    // Invalidate availability cache
+    await invalidateAvailabilityCache(booking.listing_id);
+
+    // Track cancelled booking
+    metrics.bookingsTotal.inc({ status: 'cancelled', instant_book: 'false' });
+
+    // Audit log
+    await auditBooking(AUDIT_EVENTS.BOOKING_CANCELLED, { ...booking, status: 'cancelled' }, req, {
+      before: { status: booking.status },
+      after: { status: 'cancelled', cancelledBy },
+      metadata: { cancelledBy },
+    });
+
+    // Publish cancellation event
+    try {
+      await publishBookingCancelled({ ...booking, status: 'cancelled' }, cancelledBy);
+
+      // Alert the other party
+      const alertRecipient = isGuest ? booking.host_id : booking.guest_id;
+      await publishHostAlert(alertRecipient, 'booking_cancelled', {
+        bookingId: booking.id,
+        cancelledBy,
+        listingTitle: booking.listing_title,
+        checkIn: booking.check_in,
+        checkOut: booking.check_out,
+      });
+    } catch (queueError) {
+      log.error({ error: queueError }, 'Failed to publish booking cancelled event');
+    }
+
+    log.info({ bookingId: id, cancelledBy }, 'Booking cancelled');
     res.json({ message: 'Booking cancelled' });
   } catch (error) {
-    console.error('Cancel booking error:', error);
+    log.error({ error, bookingId: id }, 'Cancel booking error');
     res.status(500).json({ error: 'Failed to cancel booking' });
   }
 });
@@ -419,9 +532,15 @@ router.put('/:id/complete', authenticate, requireHost, async (req, res) => {
       return res.status(400).json({ error: 'Booking not found or cannot be completed' });
     }
 
-    res.json({ booking: result.rows[0] });
+    const booking = result.rows[0];
+
+    // Audit log
+    await auditBooking(AUDIT_EVENTS.BOOKING_COMPLETED, booking, req);
+
+    log.info({ bookingId: id }, 'Booking completed');
+    res.json({ booking });
   } catch (error) {
-    console.error('Complete booking error:', error);
+    log.error({ error, bookingId: id }, 'Complete booking error');
     res.status(500).json({ error: 'Failed to complete booking' });
   }
 });

@@ -1,4 +1,19 @@
 import { queryWithTenant, getClientWithTenant } from '../services/db.js';
+import logger from '../services/logger.js';
+import { withIdempotency } from '../services/idempotency.js';
+import { logInventoryChange, logOrderCreated, logCheckoutEvent, logPaymentEvent, AuditAction, ActorType } from '../services/audit.js';
+import { publishOrderCreated, publishInventoryUpdated, queueEmailNotification } from '../services/rabbitmq.js';
+import { processPayment } from '../services/circuit-breaker.js';
+import {
+  checkoutsTotal,
+  checkoutLatency,
+  orderValue,
+  ordersCreated,
+  inventoryLevel,
+  inventoryLow,
+  inventoryOutOfStock,
+} from '../services/metrics.js';
+import config from '../config/index.js';
 
 // List orders for store
 export async function listOrders(req, res) {
@@ -42,6 +57,19 @@ export async function updateOrder(req, res) {
   const { orderId } = req.params;
   const { payment_status, fulfillment_status, notes } = req.body;
 
+  // Get current state for audit
+  const currentResult = await queryWithTenant(
+    storeId,
+    'SELECT payment_status, fulfillment_status, notes FROM orders WHERE id = $1',
+    [orderId]
+  );
+
+  if (currentResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  const before = currentResult.rows[0];
+
   const updates = [];
   const values = [];
   let paramCount = 1;
@@ -73,11 +101,25 @@ export async function updateOrder(req, res) {
     values
   );
 
-  if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'Order not found' });
-  }
+  const order = result.rows[0];
 
-  res.json({ order: result.rows[0] });
+  // Audit log the update
+  const auditContext = {
+    storeId,
+    userId: req.user?.id,
+    userType: req.user?.role || ActorType.MERCHANT,
+    ip: req.ip,
+    userAgent: req.headers['user-agent'],
+  };
+
+  await import('../services/audit.js').then(m => m.logOrderUpdated(
+    auditContext,
+    orderId,
+    before,
+    { payment_status: order.payment_status, fulfillment_status: order.fulfillment_status, notes: order.notes }
+  ));
+
+  res.json({ order });
 }
 
 // === Cart & Checkout (Storefront) ===
@@ -282,11 +324,33 @@ export async function updateCartItem(req, res) {
   }
 }
 
-// Process checkout
+/**
+ * Process checkout with idempotency, audit logging, and async notifications
+ *
+ * This function demonstrates several reliability patterns:
+ * 1. Idempotency - prevents duplicate orders if client retries
+ * 2. Audit logging - tracks all checkout events for dispute resolution
+ * 3. Circuit breaker - protects against payment gateway failures
+ * 4. Async queues - reliable delivery of order notifications
+ * 5. Metrics - tracks checkout latency and success rates
+ */
 export async function checkout(req, res) {
   const { storeId } = req;
   const { email, shippingAddress, billingAddress } = req.body;
   const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'];
+  const idempotencyKey = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+
+  // Track checkout start time for latency metrics
+  const checkoutStartTime = Date.now();
+
+  // Build audit context
+  const auditContext = {
+    storeId,
+    userId: null, // Guest checkout
+    userType: ActorType.CUSTOMER,
+    ip: req.ip || req.connection?.remoteAddress,
+    userAgent: req.headers['user-agent'],
+  };
 
   if (!storeId) {
     return res.status(404).json({ error: 'Store not found' });
@@ -300,54 +364,150 @@ export async function checkout(req, res) {
     return res.status(400).json({ error: 'Email required' });
   }
 
+  // Log checkout started
+  await logCheckoutEvent(auditContext, AuditAction.CHECKOUT_STARTED, {
+    cartId: sessionId,
+    email,
+  });
+
+  try {
+    // If idempotency key provided, wrap in idempotency handler
+    if (idempotencyKey) {
+      const { result, deduplicated } = await withIdempotency(
+        idempotencyKey,
+        storeId,
+        'checkout',
+        async () => processCheckoutInternal(storeId, sessionId, email, shippingAddress, billingAddress, auditContext),
+        { email, cartSession: sessionId }
+      );
+
+      // Record metrics
+      const latency = (Date.now() - checkoutStartTime) / 1000;
+      checkoutLatency.observe({ store_id: storeId.toString(), status: 'success' }, latency);
+      checkoutsTotal.inc({ store_id: storeId.toString(), status: 'success' });
+
+      if (deduplicated) {
+        logger.info({ storeId, idempotencyKey }, 'Checkout deduplicated via idempotency key');
+        return res.status(200).json({ order: result, deduplicated: true });
+      }
+
+      res.clearCookie('cartSession');
+      return res.status(201).json({ order: result });
+    }
+
+    // No idempotency key - process directly (not recommended for production)
+    const order = await processCheckoutInternal(storeId, sessionId, email, shippingAddress, billingAddress, auditContext);
+
+    // Record metrics
+    const latency = (Date.now() - checkoutStartTime) / 1000;
+    checkoutLatency.observe({ store_id: storeId.toString(), status: 'success' }, latency);
+    checkoutsTotal.inc({ store_id: storeId.toString(), status: 'success' });
+
+    res.clearCookie('cartSession');
+    res.status(201).json({ order });
+  } catch (error) {
+    // Record failure metrics
+    const latency = (Date.now() - checkoutStartTime) / 1000;
+    checkoutLatency.observe({ store_id: storeId.toString(), status: 'failed' }, latency);
+    checkoutsTotal.inc({ store_id: storeId.toString(), status: 'failed' });
+
+    // Log checkout failure
+    await logCheckoutEvent(auditContext, AuditAction.CHECKOUT_FAILED, {
+      cartId: sessionId,
+      error: error.message,
+    });
+
+    logger.error({ err: error, storeId, sessionId }, 'Checkout failed');
+    throw error;
+  }
+}
+
+/**
+ * Internal checkout processing with transaction, inventory updates, and audit logging
+ */
+async function processCheckoutInternal(storeId, sessionId, email, shippingAddress, billingAddress, auditContext) {
   const client = await getClientWithTenant(storeId);
 
   try {
-    await client.query('BEGIN');
+    // Use SERIALIZABLE isolation for inventory consistency
+    await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
 
     // Get cart
     const cartResult = await client.query('SELECT * FROM carts WHERE session_id = $1', [sessionId]);
     if (cartResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Cart not found' });
+      throw new Error('Cart not found');
     }
 
     const cart = cartResult.rows[0];
     const items = cart.items || [];
 
     if (items.length === 0) {
-      return res.status(400).json({ error: 'Cart is empty' });
+      throw new Error('Cart is empty');
     }
 
-    // Validate and reserve inventory
+    // Validate and reserve inventory with pessimistic locking
     const lineItems = [];
     for (const item of items) {
+      // SELECT FOR UPDATE prevents concurrent modifications
       const variant = await client.query(
-        'SELECT v.*, p.title as product_title FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = $1',
+        `SELECT v.*, p.title as product_title
+         FROM variants v
+         JOIN products p ON p.id = v.product_id
+         WHERE v.id = $1
+         FOR UPDATE`,
         [item.variant_id]
       );
 
       if (variant.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `Variant ${item.variant_id} no longer exists` });
+        throw new Error(`Variant ${item.variant_id} no longer exists`);
       }
 
-      if (variant.rows[0].inventory_quantity < item.quantity) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `${variant.rows[0].product_title} is out of stock` });
+      const variantData = variant.rows[0];
+      const oldQuantity = variantData.inventory_quantity;
+
+      if (oldQuantity < item.quantity) {
+        throw new Error(`${variantData.product_title} is out of stock (requested: ${item.quantity}, available: ${oldQuantity})`);
       }
 
       lineItems.push({
-        variant: variant.rows[0],
+        variant: variantData,
         quantity: item.quantity,
-        price: variant.rows[0].price,
-        total: variant.rows[0].price * item.quantity,
+        price: variantData.price,
+        total: variantData.price * item.quantity,
+        oldQuantity,
       });
 
-      // Reserve inventory
+      // Reserve inventory (decrement)
+      const newQuantity = oldQuantity - item.quantity;
       await client.query(
-        'UPDATE variants SET inventory_quantity = inventory_quantity - $1 WHERE id = $2',
-        [item.quantity, item.variant_id]
+        'UPDATE variants SET inventory_quantity = $1, updated_at = NOW() WHERE id = $2',
+        [newQuantity, item.variant_id]
       );
+
+      // Log inventory change for audit trail
+      await logInventoryChange(
+        auditContext,
+        item.variant_id,
+        oldQuantity,
+        newQuantity,
+        `checkout_reserve:${sessionId}`
+      );
+
+      // Update inventory metrics
+      inventoryLevel.set(
+        { store_id: storeId.toString(), variant_id: item.variant_id.toString(), sku: variantData.sku || '' },
+        newQuantity
+      );
+
+      // Check for low/out of stock
+      if (newQuantity === 0) {
+        inventoryOutOfStock.inc({ store_id: storeId.toString(), variant_id: item.variant_id.toString() });
+      } else if (newQuantity < config.inventory.lowStockThreshold) {
+        inventoryLow.inc({ store_id: storeId.toString(), variant_id: item.variant_id.toString() });
+      }
+
+      // Publish inventory update event (async)
+      await publishInventoryUpdated(storeId, item.variant_id, oldQuantity, newQuantity);
     }
 
     // Calculate totals
@@ -356,14 +516,49 @@ export async function checkout(req, res) {
     const tax = subtotal * 0.1; // 10% tax for demo
     const total = subtotal + shippingCost + tax;
 
+    // Process payment with circuit breaker
+    const paymentResult = await processPayment({
+      amount: Math.round(total * 100), // cents
+      storeId,
+      cartId: sessionId,
+      email,
+    });
+
+    // Log payment result
+    await logPaymentEvent(auditContext, paymentResult.success, {
+      amount: total,
+      paymentIntentId: paymentResult.paymentIntentId,
+      orderId: null, // Will be set after order creation
+    });
+
+    if (!paymentResult.success && !paymentResult.deferred) {
+      // Payment failed - rollback inventory
+      for (const item of lineItems) {
+        await client.query(
+          'UPDATE variants SET inventory_quantity = $1, updated_at = NOW() WHERE id = $2',
+          [item.oldQuantity, item.variant.id]
+        );
+
+        // Log inventory restoration
+        await logInventoryChange(
+          auditContext,
+          item.variant.id,
+          item.oldQuantity - item.quantity,
+          item.oldQuantity,
+          'checkout_payment_failed:rollback'
+        );
+      }
+      throw new Error('Payment failed');
+    }
+
     // Generate order number
     const orderNumber = `ORD-${Date.now().toString(36).toUpperCase()}`;
 
     // Create order
     const orderResult = await client.query(
       `INSERT INTO orders (store_id, order_number, customer_email, subtotal, shipping_cost, tax, total,
-                          payment_status, fulfillment_status, shipping_address, billing_address)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                          payment_status, fulfillment_status, shipping_address, billing_address, stripe_payment_intent_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         storeId,
@@ -373,10 +568,11 @@ export async function checkout(req, res) {
         shippingCost,
         tax,
         total,
-        'paid', // Simulating successful payment for demo
+        paymentResult.deferred ? 'pending' : 'paid',
         'unfulfilled',
         JSON.stringify(shippingAddress || {}),
         JSON.stringify(billingAddress || shippingAddress || {}),
+        paymentResult.paymentIntentId || null,
       ]
     );
 
@@ -406,8 +602,41 @@ export async function checkout(req, res) {
 
     await client.query('COMMIT');
 
-    res.clearCookie('cartSession');
-    res.status(201).json({ order });
+    // Record order metrics
+    ordersCreated.inc({ store_id: storeId.toString() });
+    orderValue.observe({ store_id: storeId.toString() }, total);
+
+    // Log order created
+    await logOrderCreated(auditContext, {
+      ...order,
+      items: lineItems.map(i => ({
+        variantId: i.variant.id,
+        quantity: i.quantity,
+        price: i.price,
+      })),
+    });
+
+    // Publish order created event for async processing
+    await publishOrderCreated({
+      ...order,
+      items: lineItems.map(i => ({
+        variantId: i.variant.id,
+        title: i.variant.product_title,
+        quantity: i.quantity,
+        price: i.price,
+      })),
+    });
+
+    // Queue email notification
+    await queueEmailNotification(email, 'order_confirmation', {
+      orderNumber: order.order_number,
+      total: order.total,
+      items: lineItems.length,
+    });
+
+    logger.info({ storeId, orderId: order.id, orderNumber: order.order_number, total }, 'Order created successfully');
+
+    return order;
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

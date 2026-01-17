@@ -1,5 +1,7 @@
 import { query } from '../db/index.js';
 import { calculateHotScore } from '../utils/ranking.js';
+import logger from '../shared/logger.js';
+import { postCreatedTotal } from '../shared/metrics.js';
 
 export const createPost = async (subredditId, authorId, title, content, url) => {
   const now = new Date();
@@ -11,7 +13,26 @@ export const createPost = async (subredditId, authorId, title, content, url) => 
      RETURNING *`,
     [subredditId, authorId, title, content, url, hotScore]
   );
-  return result.rows[0];
+
+  const post = result.rows[0];
+
+  // Get subreddit name for metric label
+  const subredditResult = await query(
+    `SELECT name FROM subreddits WHERE id = $1`,
+    [subredditId]
+  );
+  const subredditName = subredditResult.rows[0]?.name || 'unknown';
+
+  // Record metric
+  postCreatedTotal.inc({ subreddit: subredditName });
+
+  logger.info({
+    postId: post.id,
+    subredditId,
+    authorId,
+  }, 'Post created');
+
+  return post;
 };
 
 export const findPostById = async (id) => {
@@ -51,7 +72,7 @@ export const listPostsBySubreddit = async (subredditId, sort = 'hot', limit = 25
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
      JOIN subreddits s ON p.subreddit_id = s.id
-     WHERE p.subreddit_id = $1
+     WHERE p.subreddit_id = $1 AND (p.is_archived IS NULL OR p.is_archived = FALSE)
      ORDER BY ${orderBy}
      LIMIT $2 OFFSET $3`,
     [subredditId, limit, offset]
@@ -84,6 +105,7 @@ export const listAllPosts = async (sort = 'hot', limit = 25, offset = 0) => {
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
      JOIN subreddits s ON p.subreddit_id = s.id
+     WHERE p.is_archived IS NULL OR p.is_archived = FALSE
      ORDER BY ${orderBy}
      LIMIT $1 OFFSET $2`,
     [limit, offset]
@@ -120,4 +142,44 @@ export const updatePostScore = async (postId, upvotes, downvotes) => {
 
 export const deletePost = async (postId) => {
   await query(`DELETE FROM posts WHERE id = $1`, [postId]);
+  logger.info({ postId }, 'Post deleted');
+};
+
+/**
+ * Archive old posts based on retention policy.
+ * Called by archival worker.
+ */
+export const archivePosts = async (cutoffDate) => {
+  const result = await query(
+    `UPDATE posts
+     SET is_archived = TRUE, archived_at = NOW()
+     WHERE created_at < $1
+       AND (is_archived IS NULL OR is_archived = FALSE)
+     RETURNING id`,
+    [cutoffDate]
+  );
+
+  if (result.rowCount > 0) {
+    logger.info({
+      count: result.rowCount,
+      cutoffDate,
+    }, 'Posts archived');
+  }
+
+  return result.rowCount;
+};
+
+/**
+ * Get posts to be archived for export.
+ */
+export const getPostsForArchival = async (cutoffDate, limit = 1000) => {
+  const result = await query(
+    `SELECT * FROM posts
+     WHERE created_at < $1
+       AND (is_archived IS NULL OR is_archived = FALSE)
+     ORDER BY created_at
+     LIMIT $2`,
+    [cutoffDate, limit]
+  );
+  return result.rows;
 };

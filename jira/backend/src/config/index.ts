@@ -27,6 +27,12 @@ export const config = {
     url: process.env.ELASTICSEARCH_URL || 'http://localhost:9200',
   },
 
+  /** RabbitMQ message queue settings */
+  rabbitmq: {
+    /** RabbitMQ connection URL */
+    url: process.env.RABBITMQ_URL || 'amqp://jira:jira_dev@localhost:5672',
+  },
+
   /** Session management configuration */
   session: {
     /** Secret key for signing session cookies */

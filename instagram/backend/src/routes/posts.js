@@ -4,12 +4,62 @@ import { query, getClient } from '../services/db.js';
 import { processAndUploadImage, FILTERS } from '../services/storage.js';
 import { timelineAdd, timelineRemove, cacheGet, cacheSet, cacheDel } from '../services/redis.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { postRateLimiter, likeRateLimiter } from '../services/rateLimiter.js';
+import { createCircuitBreaker, fallbackWithError } from '../services/circuitBreaker.js';
+import logger from '../services/logger.js';
+import {
+  postsCreatedTotal,
+  postsDeletedTotal,
+  likesTotal,
+  likesDuplicateTotal,
+  imageProcessingDuration,
+  imageProcessingErrors,
+} from '../services/metrics.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
+/**
+ * Circuit breaker for image processing
+ *
+ * WHY: Image processing is CPU-intensive and can fail due to:
+ * - Invalid/corrupted images
+ * - Memory exhaustion
+ * - Storage service issues
+ *
+ * The circuit breaker prevents cascading failures by:
+ * - Failing fast when image processing is consistently failing
+ * - Allowing time for the system to recover
+ * - Automatically testing recovery after timeout
+ */
+const imageProcessingBreaker = createCircuitBreaker(
+  'image_processing',
+  async (fileBuffer, originalName, filterName) => {
+    const startTime = Date.now();
+    try {
+      const result = await processAndUploadImage(fileBuffer, originalName, filterName);
+      imageProcessingDuration.labels('all').observe((Date.now() - startTime) / 1000);
+      return result;
+    } catch (error) {
+      imageProcessingErrors.labels(error.name || 'unknown').inc();
+      throw error;
+    }
+  },
+  {
+    timeout: 30000, // 30 seconds for image processing
+    errorThresholdPercentage: 50,
+    resetTimeout: 60000, // 1 minute before testing recovery
+    volumeThreshold: 3,
+  }
+);
+
+// Add fallback for image processing failure
+imageProcessingBreaker.fallback(
+  fallbackWithError('Image processing is temporarily unavailable. Please try again later.')
+);
+
 // Create post
-router.post('/', requireAuth, upload.array('media', 10), async (req, res) => {
+router.post('/', requireAuth, postRateLimiter, upload.array('media', 10), async (req, res) => {
   const client = await getClient();
 
   try {
@@ -40,13 +90,14 @@ router.post('/', requireAuth, upload.array('media', 10), async (req, res) => {
       filterArray = [];
     }
 
-    // Process and upload each media file
+    // Process and upload each media file using circuit breaker
     const mediaItems = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const filterName = filterArray[i] || 'none';
 
-      const mediaResult = await processAndUploadImage(file.buffer, file.originalname, filterName);
+      // Use circuit breaker for image processing
+      const mediaResult = await imageProcessingBreaker.fire(file.buffer, file.originalname, filterName);
 
       const mediaInsert = await client.query(
         `INSERT INTO post_media (post_id, media_type, media_url, thumbnail_url, filter_applied, width, height, order_index)
@@ -58,6 +109,16 @@ router.post('/', requireAuth, upload.array('media', 10), async (req, res) => {
     }
 
     await client.query('COMMIT');
+
+    // Increment metrics
+    postsCreatedTotal.inc();
+
+    logger.info({
+      type: 'post_created',
+      postId: post.id,
+      userId,
+      mediaCount: files.length,
+    }, `Post created: ${post.id}`);
 
     // Fan out to followers' timelines
     const followers = await query(
@@ -95,7 +156,17 @@ router.post('/', requireAuth, upload.array('media', 10), async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Create post error:', error);
+
+    // Handle circuit breaker errors
+    if (error.code === 'SERVICE_UNAVAILABLE') {
+      return res.status(503).json({ error: error.message });
+    }
+
+    logger.error({
+      type: 'post_create_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Create post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
@@ -190,7 +261,11 @@ router.get('/:postId', optionalAuth, async (req, res) => {
 
     res.json({ post: postData });
   } catch (error) {
-    console.error('Get post error:', error);
+    logger.error({
+      type: 'post_get_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Get post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -213,6 +288,15 @@ router.delete('/:postId', requireAuth, async (req, res) => {
     // Delete post (cascade will handle media, likes, comments)
     await query('DELETE FROM posts WHERE id = $1', [postId]);
 
+    // Increment metrics
+    postsDeletedTotal.inc();
+
+    logger.info({
+      type: 'post_deleted',
+      postId,
+      userId,
+    }, `Post deleted: ${postId}`);
+
     // Remove from timelines
     const followers = await query(
       'SELECT follower_id FROM follows WHERE following_id = $1',
@@ -228,45 +312,147 @@ router.delete('/:postId', requireAuth, async (req, res) => {
 
     res.json({ message: 'Post deleted' });
   } catch (error) {
-    console.error('Delete post error:', error);
+    logger.error({
+      type: 'post_delete_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Delete post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Like post
-router.post('/:postId/like', requireAuth, async (req, res) => {
+/**
+ * Like post - IDEMPOTENT operation
+ *
+ * WHY IDEMPOTENCY PREVENTS DUPLICATE LIKES:
+ *
+ * The `ON CONFLICT DO NOTHING` clause in PostgreSQL makes this operation
+ * idempotent, meaning calling it multiple times produces the same result.
+ *
+ * Without idempotency:
+ * - User clicks "like" button
+ * - Network delay, button is clicked again
+ * - Two like records created, count inflated
+ *
+ * With idempotency:
+ * - UNIQUE constraint on (user_id, post_id) prevents duplicates
+ * - ON CONFLICT DO NOTHING silently ignores duplicate attempts
+ * - Response indicates if like was new or already existed
+ * - like_count trigger only fires on actual inserts
+ *
+ * This is especially important for:
+ * - Mobile apps with unreliable network
+ * - Double-click prevention
+ * - Retry logic in the client
+ */
+router.post('/:postId/like', requireAuth, likeRateLimiter, async (req, res) => {
   try {
     const { postId } = req.params;
     const userId = req.session.userId;
 
-    await query(
-      'INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+    // Check if already liked (for idempotency tracking)
+    const existingLike = await query(
+      'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
       [userId, postId]
     );
+
+    const alreadyLiked = existingLike.rows.length > 0;
+
+    if (alreadyLiked) {
+      // Already liked - idempotent response
+      likesDuplicateTotal.inc();
+      logger.debug({
+        type: 'like_duplicate',
+        postId,
+        userId,
+      }, `Duplicate like attempt: ${postId}`);
+      return res.json({ message: 'Post already liked', idempotent: true });
+    }
+
+    // Insert like - ON CONFLICT handles race conditions
+    const result = await query(
+      'INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
+      [userId, postId]
+    );
+
+    if (result.rows.length === 0) {
+      // Race condition - another request inserted first
+      likesDuplicateTotal.inc();
+      return res.json({ message: 'Post already liked', idempotent: true });
+    }
+
+    // Track metrics
+    likesTotal.labels('like').inc();
+
+    logger.info({
+      type: 'like_created',
+      postId,
+      userId,
+    }, `Post liked: ${postId}`);
 
     // Clear post cache to reflect new like count
     await cacheDel(`post:${postId}`);
 
-    res.json({ message: 'Post liked' });
+    res.json({ message: 'Post liked', idempotent: false });
   } catch (error) {
-    console.error('Like post error:', error);
+    logger.error({
+      type: 'like_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Like post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Unlike post
+/**
+ * Unlike post - IDEMPOTENT operation
+ *
+ * Same idempotency pattern as liking:
+ * - DELETE returns the deleted row if it existed
+ * - If no row exists, operation succeeds silently
+ * - Multiple unlike requests have the same effect as one
+ */
 router.delete('/:postId/like', requireAuth, async (req, res) => {
   try {
     const { postId } = req.params;
     const userId = req.session.userId;
 
-    await query('DELETE FROM likes WHERE user_id = $1 AND post_id = $2', [userId, postId]);
+    // Delete like - returns deleted row if it existed
+    const result = await query(
+      'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING id',
+      [userId, postId]
+    );
+
+    const wasLiked = result.rows.length > 0;
+
+    if (!wasLiked) {
+      // Already not liked - idempotent response
+      logger.debug({
+        type: 'unlike_idempotent',
+        postId,
+        userId,
+      }, `Idempotent unlike: ${postId}`);
+      return res.json({ message: 'Post was not liked', idempotent: true });
+    }
+
+    // Track metrics
+    likesTotal.labels('unlike').inc();
+
+    logger.info({
+      type: 'unlike',
+      postId,
+      userId,
+    }, `Post unliked: ${postId}`);
 
     await cacheDel(`post:${postId}`);
 
-    res.json({ message: 'Post unliked' });
+    res.json({ message: 'Post unliked', idempotent: false });
   } catch (error) {
-    console.error('Unlike post error:', error);
+    logger.error({
+      type: 'unlike_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Unlike post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -284,7 +470,11 @@ router.post('/:postId/save', requireAuth, async (req, res) => {
 
     res.json({ message: 'Post saved' });
   } catch (error) {
-    console.error('Save post error:', error);
+    logger.error({
+      type: 'save_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Save post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -299,7 +489,11 @@ router.delete('/:postId/save', requireAuth, async (req, res) => {
 
     res.json({ message: 'Post unsaved' });
   } catch (error) {
-    console.error('Unsave post error:', error);
+    logger.error({
+      type: 'unsave_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Unsave post error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -341,7 +535,11 @@ router.get('/:postId/likes', async (req, res) => {
       nextCursor: hasMore ? likes[likes.length - 1].created_at : null,
     });
   } catch (error) {
-    console.error('Get likes error:', error);
+    logger.error({
+      type: 'get_likes_error',
+      error: error.message,
+      postId: req.params.postId,
+    }, `Get likes error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

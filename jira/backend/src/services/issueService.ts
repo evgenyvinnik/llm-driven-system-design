@@ -1,6 +1,9 @@
 import { query, withTransaction } from '../config/database.js';
 import { indexIssue, deleteIssueFromIndex } from '../config/elasticsearch.js';
-import { cacheDel } from '../config/redis.js';
+import { cacheDel, cacheDelPattern } from '../config/redis.js';
+import { logger } from '../config/logger.js';
+import { issuesCreatedCounter, transitionsCounter } from '../config/metrics.js';
+import { publishIssueEvent } from '../config/messageQueue.js';
 import { Issue, IssueWithDetails, IssueType, Priority, User, Comment, CommentWithAuthor, IssueHistory, IssueHistoryWithUser } from '../types/index.js';
 
 /**
@@ -44,13 +47,15 @@ export interface UpdateIssueData {
 /**
  * Creates a new issue within a project.
  * Generates a unique issue key (e.g., PROJ-123), sets initial status from workflow,
- * records creation history, and indexes the issue for search.
+ * records creation history, indexes the issue for search, and publishes an event.
  *
  * @param data - Issue creation data
  * @param user - User creating the issue (for history tracking)
  * @returns Newly created issue
  */
 export async function createIssue(data: CreateIssueData, user: User): Promise<Issue> {
+  const log = logger.child({ operation: 'createIssue', projectId: data.projectId, userId: user.id });
+
   return withTransaction(async (client) => {
     // Get project and increment counter
     const { rows: projects } = await client.query(
@@ -61,6 +66,7 @@ export async function createIssue(data: CreateIssueData, user: User): Promise<Is
     );
 
     if (projects.length === 0) {
+      log.warn('Project not found');
       throw new Error('Project not found');
     }
 
@@ -76,6 +82,7 @@ export async function createIssue(data: CreateIssueData, user: User): Promise<Is
     );
 
     if (statuses.length === 0) {
+      log.error({ workflowId: project.workflow_id }, 'No initial status found in workflow');
       throw new Error('No initial status found in workflow');
     }
 
@@ -118,12 +125,32 @@ export async function createIssue(data: CreateIssueData, user: User): Promise<Is
       [issue.id, user.id, issueKey]
     );
 
-    // Index in Elasticsearch
-    try {
-      await indexIssueForSearch(issue);
-    } catch (error) {
-      console.error('Failed to index issue in Elasticsearch:', error);
-    }
+    // Increment metrics
+    issuesCreatedCounter.inc({ project_key: project.key, issue_type: data.issueType });
+
+    log.info({ issueId: issue.id, issueKey }, 'Issue created');
+
+    // Index in Elasticsearch (async, non-blocking)
+    indexIssueForSearch(issue).catch((error) => {
+      log.error({ err: error }, 'Failed to index issue in Elasticsearch');
+    });
+
+    // Publish event for async processing (notifications, webhooks)
+    publishIssueEvent({
+      event_type: 'created',
+      issue_id: issue.id,
+      issue_key: issueKey,
+      project_id: data.projectId,
+      project_key: project.key,
+      actor_id: user.id,
+    }).catch((error) => {
+      log.error({ err: error }, 'Failed to publish issue created event');
+    });
+
+    // Invalidate board cache for this project
+    invalidateProjectBoardCache(data.projectId).catch((error) => {
+      log.error({ err: error }, 'Failed to invalidate board cache');
+    });
 
     return issue;
   });
@@ -179,7 +206,7 @@ export async function getIssueByKey(key: string): Promise<IssueWithDetails | nul
 /**
  * Updates an existing issue with partial data.
  * Records all field changes in issue history for audit trail.
- * Updates the Elasticsearch index after modification.
+ * Updates the Elasticsearch index and invalidates caches after modification.
  *
  * @param issueId - ID of the issue to update
  * @param data - Partial issue data to update
@@ -191,13 +218,19 @@ export async function updateIssue(
   data: UpdateIssueData,
   user: User
 ): Promise<Issue | null> {
+  const log = logger.child({ operation: 'updateIssue', issueId, userId: user.id });
+
   // Get current issue for history
   const current = await getIssueById(issueId);
-  if (!current) return null;
+  if (!current) {
+    log.warn('Issue not found');
+    return null;
+  }
 
   const updates: string[] = [];
   const values: unknown[] = [];
   const historyRecords: { field: string; oldValue: string | null; newValue: string | null }[] = [];
+  const changes: Record<string, { old: unknown; new: unknown }> = {};
   let paramIndex = 1;
 
   const addUpdate = (field: string, dbField: string, newValue: unknown, oldValue: unknown) => {
@@ -209,6 +242,7 @@ export async function updateIssue(
         oldValue: oldValue ? String(oldValue) : null,
         newValue: newValue ? String(newValue) : null,
       });
+      changes[field] = { old: oldValue, new: newValue };
     }
   };
 
@@ -245,11 +279,36 @@ export async function updateIssue(
     );
   }
 
-  // Update Elasticsearch index
-  try {
-    await indexIssueForSearch(rows[0]);
-  } catch (error) {
-    console.error('Failed to update issue in Elasticsearch:', error);
+  log.info({ changedFields: Object.keys(changes) }, 'Issue updated');
+
+  // Update Elasticsearch index (async)
+  indexIssueForSearch(rows[0]).catch((error) => {
+    log.error({ err: error }, 'Failed to update issue in Elasticsearch');
+  });
+
+  // Publish update event
+  publishIssueEvent({
+    event_type: 'updated',
+    issue_id: issueId,
+    issue_key: current.key,
+    project_id: current.project_id,
+    project_key: current.project.key,
+    changes,
+    actor_id: user.id,
+  }).catch((error) => {
+    log.error({ err: error }, 'Failed to publish issue updated event');
+  });
+
+  // Invalidate caches
+  invalidateIssueCache(issueId, current.key).catch((error) => {
+    log.error({ err: error }, 'Failed to invalidate issue cache');
+  });
+
+  // If sprint changed, invalidate board cache
+  if (data.sprintId !== undefined) {
+    invalidateProjectBoardCache(current.project_id).catch((error) => {
+      log.error({ err: error }, 'Failed to invalidate board cache');
+    });
   }
 
   return rows[0];
@@ -262,14 +321,39 @@ export async function updateIssue(
  * @returns True if issue was deleted, false if not found
  */
 export async function deleteIssue(issueId: number): Promise<boolean> {
+  const log = logger.child({ operation: 'deleteIssue', issueId });
+
+  // Get issue details before deletion for event publishing
+  const issue = await getIssueById(issueId);
+
   const { rowCount } = await query('DELETE FROM issues WHERE id = $1', [issueId]);
 
   if (rowCount && rowCount > 0) {
-    try {
-      await deleteIssueFromIndex(issueId);
-    } catch (error) {
-      console.error('Failed to delete issue from Elasticsearch:', error);
+    log.info('Issue deleted');
+
+    // Remove from Elasticsearch
+    deleteIssueFromIndex(issueId).catch((error) => {
+      log.error({ err: error }, 'Failed to delete issue from Elasticsearch');
+    });
+
+    // Publish delete event
+    if (issue) {
+      publishIssueEvent({
+        event_type: 'deleted',
+        issue_id: issueId,
+        issue_key: issue.key,
+        project_id: issue.project_id,
+        project_key: issue.project.key,
+        actor_id: 'system', // Would need to pass user context
+      }).catch((error) => {
+        log.error({ err: error }, 'Failed to publish issue deleted event');
+      });
+
+      // Invalidate caches
+      invalidateIssueCache(issueId, issue.key).catch(() => {});
+      invalidateProjectBoardCache(issue.project_id).catch(() => {});
     }
+
     return true;
   }
 
@@ -428,7 +512,7 @@ export async function getIssueComments(issueId: number): Promise<CommentWithAuth
 
 /**
  * Adds a comment to an issue.
- * Also updates the issue's updated_at timestamp.
+ * Also updates the issue's updated_at timestamp and publishes an event.
  *
  * @param issueId - ID of the issue to comment on
  * @param authorId - UUID of the comment author
@@ -440,6 +524,8 @@ export async function addComment(
   authorId: string,
   body: string
 ): Promise<Comment> {
+  const log = logger.child({ operation: 'addComment', issueId, authorId });
+
   const { rows } = await query<Comment>(
     `INSERT INTO comments (issue_id, author_id, body)
      VALUES ($1, $2, $3) RETURNING *`,
@@ -448,6 +534,23 @@ export async function addComment(
 
   // Update issue updated_at
   await query('UPDATE issues SET updated_at = NOW() WHERE id = $1', [issueId]);
+
+  // Get issue details for event
+  const issue = await getIssueById(issueId);
+  if (issue) {
+    publishIssueEvent({
+      event_type: 'commented',
+      issue_id: issueId,
+      issue_key: issue.key,
+      project_id: issue.project_id,
+      project_key: issue.project.key,
+      actor_id: authorId,
+    }).catch((error) => {
+      log.error({ err: error }, 'Failed to publish comment event');
+    });
+  }
+
+  log.info({ commentId: rows[0].id }, 'Comment added');
 
   return rows[0];
 }
@@ -580,4 +683,37 @@ async function indexIssueForSearch(issue: Issue): Promise<void> {
     created_at: issue.created_at,
     updated_at: issue.updated_at,
   });
+}
+
+/**
+ * Invalidates cache entries for a specific issue.
+ *
+ * @param issueId - Issue ID
+ * @param issueKey - Issue key (e.g., "PROJ-123")
+ */
+async function invalidateIssueCache(issueId: number, issueKey: string): Promise<void> {
+  await Promise.all([
+    cacheDel(`issue:${issueId}`),
+    cacheDel(`issue:key:${issueKey}`),
+  ]);
+}
+
+/**
+ * Invalidates board cache for a project when issues change.
+ *
+ * @param projectId - Project ID
+ */
+async function invalidateProjectBoardCache(projectId: string): Promise<void> {
+  await cacheDelPattern(`board:*:project:${projectId}*`);
+}
+
+/**
+ * Records a status transition for metrics.
+ *
+ * @param projectKey - Project key
+ * @param fromStatus - Previous status name
+ * @param toStatus - New status name
+ */
+export function recordTransitionMetric(projectKey: string, fromStatus: string, toStatus: string): void {
+  transitionsCounter.inc({ project_key: projectKey, from_status: fromStatus, to_status: toStatus });
 }

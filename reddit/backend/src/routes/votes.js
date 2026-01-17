@@ -3,6 +3,7 @@ import { castVote, getUserVote } from '../models/vote.js';
 import { findPostById } from '../models/post.js';
 import { findCommentById } from '../models/comment.js';
 import { requireAuth } from '../middleware/auth.js';
+import logger from '../shared/logger.js';
 
 const router = express.Router();
 
@@ -57,7 +58,7 @@ router.post('/', requireAuth, async (req, res) => {
 
     res.json({ success: true, direction: currentVote, score });
   } catch (error) {
-    console.error('Vote error:', error);
+    logger.error({ err: error, userId: req.user?.id }, 'Vote error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -79,7 +80,7 @@ router.get('/:type/:id', requireAuth, async (req, res) => {
     const direction = await getUserVote(req.user.id, type, targetId);
     res.json({ direction });
   } catch (error) {
-    console.error('Get vote error:', error);
+    logger.error({ err: error, userId: req.user?.id }, 'Get vote error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -22,7 +22,9 @@ import net from 'net';
 import { v4 as uuidv4 } from 'uuid';
 import { connectionManager, chatHandler } from '../core/index.js';
 import * as dbOps from '../db/index.js';
-import { logger } from '../utils/logger.js';
+import { logger, tcpLogger } from '../utils/logger.js';
+import { recordConnection, activeConnections, connectionErrors } from '../shared/metrics.js';
+import { server, shutdown as shutdownConfig } from '../shared/config.js';
 
 /**
  * Internal state for tracking a TCP client connection.
@@ -52,6 +54,8 @@ export class TCPServer {
   private port: number;
   /** Map of socket to client state for tracking connections */
   private clients: Map<net.Socket, TCPClientState> = new Map();
+  /** Whether server is draining connections (shutdown in progress) */
+  private isDraining: boolean = false;
 
   /**
    * Create a new TCP server.
@@ -63,11 +67,11 @@ export class TCPServer {
     this.server = net.createServer((socket) => this.handleConnection(socket));
 
     this.server.on('error', (err) => {
-      logger.error('TCP Server error', { error: err });
+      tcpLogger.error({ err }, 'TCP Server error');
     });
 
     this.server.on('close', () => {
-      logger.info('TCP Server closed');
+      tcpLogger.info('TCP Server closed');
     });
   }
 
@@ -79,29 +83,73 @@ export class TCPServer {
   start(): Promise<void> {
     return new Promise((resolve) => {
       this.server.listen(this.port, () => {
-        logger.info(`TCP Server listening on port ${this.port}`);
+        tcpLogger.info({ port: this.port }, 'TCP Server listening');
         resolve();
       });
     });
   }
 
   /**
-   * Stop the TCP server and close all client connections.
+   * Stop the TCP server and close all client connections gracefully.
    *
+   * WHY Graceful Shutdown Prevents Message Loss:
+   * - Sends shutdown warning to all connected clients
+   * - Allows in-flight messages to be processed
+   * - Gives clients time to reconnect to another instance
+   * - Prevents abrupt disconnections that could lose state
+   *
+   * @param gracePeriodMs - Time to wait for connections to close
    * @returns Promise that resolves when server is fully stopped
    */
-  stop(): Promise<void> {
+  stop(gracePeriodMs: number = 10000): Promise<void> {
     return new Promise((resolve) => {
-      // Close all client connections
-      for (const [socket] of this.clients) {
-        socket.destroy();
-      }
-      this.clients.clear();
+      this.isDraining = true;
+      tcpLogger.info('TCP Server entering drain mode');
 
+      // Stop accepting new connections
       this.server.close(() => {
-        logger.info('TCP Server stopped');
-        resolve();
+        tcpLogger.info('TCP Server stopped accepting new connections');
       });
+
+      // Notify all connected clients
+      for (const [socket, state] of this.clients) {
+        if (state.authenticated) {
+          try {
+            this.send(socket, '\n[SYSTEM] Server is shutting down. Please reconnect shortly.');
+          } catch {
+            // Client may already be disconnected
+          }
+        }
+      }
+
+      // Give clients time to finish their work
+      const warningInterval = setInterval(() => {
+        const remaining = this.clients.size;
+        if (remaining > 0) {
+          tcpLogger.info({ remaining }, 'Waiting for TCP clients to disconnect');
+        }
+      }, shutdownConfig.warningIntervalMs);
+
+      // Force close after grace period
+      setTimeout(() => {
+        clearInterval(warningInterval);
+
+        // Close all remaining connections
+        for (const [socket, state] of this.clients) {
+          try {
+            if (state.sessionId) {
+              chatHandler.handleDisconnect(state.sessionId).catch(() => {});
+            }
+            socket.destroy();
+          } catch {
+            // Ignore errors during shutdown
+          }
+        }
+        this.clients.clear();
+
+        tcpLogger.info('TCP Server stopped');
+        resolve();
+      }, gracePeriodMs);
     });
   }
 
@@ -112,8 +160,15 @@ export class TCPServer {
    * @param socket - The new client socket
    */
   private handleConnection(socket: net.Socket): void {
+    // Reject new connections during drain
+    if (this.isDraining) {
+      socket.write('Server is shutting down. Please try again later.\n');
+      socket.end();
+      return;
+    }
+
     const clientAddr = `${socket.remoteAddress}:${socket.remotePort}`;
-    logger.info('New TCP connection', { clientAddr });
+    tcpLogger.info({ clientAddr }, 'New TCP connection');
 
     // Initialize client state
     const state: TCPClientState = {
@@ -140,11 +195,24 @@ export class TCPServer {
 
     // Handle errors
     socket.on('error', (err) => {
-      logger.error('Socket error', { clientAddr, error: err.message });
+      tcpLogger.error({ clientAddr, err }, 'Socket error');
+      connectionErrors.labels({
+        transport: 'tcp',
+        error_type: err.message,
+        instance: server.instanceId,
+      }).inc();
     });
 
     // Set keep-alive
     socket.setKeepAlive(true, 60000);
+
+    // Set timeout for inactive connections
+    socket.setTimeout(300000); // 5 minutes
+    socket.on('timeout', () => {
+      tcpLogger.info({ clientAddr }, 'Socket timeout, closing connection');
+      this.send(socket, '\n[SYSTEM] Connection timed out due to inactivity.');
+      socket.end();
+    });
   }
 
   /**
@@ -210,6 +278,7 @@ export class TCPServer {
       const sendFn = (msg: string) => this.send(socket, msg);
 
       connectionManager.connect(sessionId, user.id, user.nickname, 'tcp', sendFn);
+      recordConnection('tcp', 1);
 
       state.sessionId = sessionId;
       state.authenticated = true;
@@ -220,13 +289,12 @@ export class TCPServer {
       this.send(socket, 'Type /help for available commands.');
       this.send(socket, '');
 
-      logger.info('TCP client authenticated', {
-        sessionId,
-        userId: user.id,
-        nickname: user.nickname,
-      });
+      tcpLogger.info(
+        { sessionId, userId: user.id, nickname: user.nickname },
+        'TCP client authenticated'
+      );
     } catch (error) {
-      logger.error('Failed to authenticate TCP client', { nickname, error });
+      tcpLogger.error({ nickname, err: error }, 'Failed to authenticate TCP client');
       this.send(socket, 'Failed to authenticate. Please try a different nickname: ');
     }
   }
@@ -256,6 +324,7 @@ export class TCPServer {
     // Handle disconnect command
     if (result.data?.disconnect) {
       await chatHandler.handleDisconnect(state.sessionId);
+      recordConnection('tcp', -1);
       socket.end();
     }
   }
@@ -271,10 +340,11 @@ export class TCPServer {
 
     if (state?.sessionId) {
       await chatHandler.handleDisconnect(state.sessionId);
+      recordConnection('tcp', -1);
     }
 
     this.clients.delete(socket);
-    logger.info('TCP client disconnected');
+    tcpLogger.info('TCP client disconnected');
   }
 
   /**
@@ -297,6 +367,13 @@ export class TCPServer {
    */
   getClientCount(): number {
     return this.clients.size;
+  }
+
+  /**
+   * Check if server is currently draining connections.
+   */
+  isDrainingConnections(): boolean {
+    return this.isDraining;
   }
 }
 

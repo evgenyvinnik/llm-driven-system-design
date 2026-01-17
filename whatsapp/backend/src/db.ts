@@ -18,12 +18,20 @@ export const pool = new Pool({
 });
 
 pool.on('connect', () => {
-  console.log('Connected to PostgreSQL');
+  // Log connection (will be replaced by structured logging in main app)
 });
 
 pool.on('error', (err) => {
   console.error('PostgreSQL pool error:', err);
 });
+
+/**
+ * Closes the database connection pool.
+ * Called during graceful shutdown.
+ */
+export async function closePool(): Promise<void> {
+  await pool.end();
+}
 
 /**
  * Tests the database connection by executing a simple query.

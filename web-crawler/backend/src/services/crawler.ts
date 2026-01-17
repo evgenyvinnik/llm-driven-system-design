@@ -12,20 +12,25 @@
  * - Content hashing for duplicate detection
  * - Worker registration and heartbeat for health monitoring
  * - Statistics tracking via Redis counters
+ * - Circuit breaker for failing domains
+ * - Retry with exponential backoff for transient failures
+ * - Structured logging for observability
+ * - Prometheus metrics for monitoring
  *
  * A typical crawl cycle:
  * 1. Get next URL from frontier (respects priority and rate limits)
- * 2. Check robots.txt permissions
- * 3. Fetch page content via HTTP
- * 4. Parse HTML and extract metadata (title, description)
- * 5. Extract and normalize links for the frontier
- * 6. Store results in PostgreSQL
- * 7. Mark URL as completed and update stats
+ * 2. Check if domain circuit breaker is open (skip if failing)
+ * 3. Check robots.txt permissions
+ * 4. Fetch page content via HTTP with retry/circuit breaker
+ * 5. Parse HTML and extract metadata (title, description)
+ * 6. Extract and normalize links for the frontier
+ * 7. Store results in PostgreSQL
+ * 8. Mark URL as completed and update stats/metrics
  *
  * @module services/crawler
  */
 
-import axios, { AxiosResponse } from 'axios';
+import axios, { AxiosResponse, AxiosError } from 'axios';
 import * as cheerio from 'cheerio';
 import { pool } from '../models/database.js';
 import { redis, REDIS_KEYS } from '../models/redis.js';
@@ -36,10 +41,24 @@ import {
   resolveUrl,
   shouldCrawl,
   normalizeUrl,
-  hashUrl,
   hashContent,
 } from '../utils/url.js';
 import { config } from '../config.js';
+import { createWorkerLogger } from '../shared/logger.js';
+import {
+  recordCrawl,
+  recordError,
+  activeWorkersGauge,
+} from '../shared/metrics.js';
+import {
+  withResilience,
+  isCircuitOpen,
+  isRetryableError,
+  CircuitOpenError,
+  DEFAULT_RETRY_CONFIG,
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+} from '../shared/resilience.js';
+import type pino from 'pino';
 
 /**
  * Result of crawling a single URL.
@@ -68,6 +87,8 @@ export interface CrawlResult {
   crawlDurationMs: number;
   /** Error message if crawl failed */
   error?: string;
+  /** Number of retry attempts made */
+  retryAttempts?: number;
 }
 
 /**
@@ -78,6 +99,9 @@ export interface CrawlResult {
  * - Registers itself with Redis for monitoring
  * - Sends periodic heartbeats to indicate health
  * - Respects politeness rules (robots.txt, rate limiting)
+ * - Uses circuit breakers to skip failing domains
+ * - Retries transient failures with exponential backoff
+ * - Emits structured logs and Prometheus metrics
  *
  * Workers are stateless and horizontally scalable - you can run as many
  * as needed to increase crawl throughput.
@@ -102,6 +126,10 @@ export class CrawlerService {
   private crawlCount: number = 0;
   /** Unix timestamp when worker started */
   private startTime: number = 0;
+  /** Structured logger for this worker */
+  private logger: pino.Logger;
+  /** Heartbeat interval handle */
+  private heartbeatInterval: NodeJS.Timeout | null = null;
 
   /**
    * Creates a new CrawlerService instance.
@@ -110,6 +138,7 @@ export class CrawlerService {
    */
   constructor(workerId: string) {
     this.workerId = workerId;
+    this.logger = createWorkerLogger(workerId);
   }
 
   /**
@@ -128,7 +157,7 @@ export class CrawlerService {
 
     this.isRunning = true;
     this.startTime = Date.now();
-    console.log(`Crawler worker ${this.workerId} starting...`);
+    this.logger.info('Crawler worker starting');
 
     // Register worker
     await this.registerWorker();
@@ -141,7 +170,8 @@ export class CrawlerService {
       try {
         await this.crawlNext();
       } catch (error) {
-        console.error(`Crawler ${this.workerId} error:`, error);
+        this.logger.error({ err: error }, 'Crawler loop error');
+        recordError(this.workerId, 'loop_error');
         await this.sleep(1000);
       }
     }
@@ -155,9 +185,16 @@ export class CrawlerService {
    * the worker from Redis.
    */
   async stop(): Promise<void> {
-    console.log(`Crawler worker ${this.workerId} stopping...`);
+    this.logger.info('Crawler worker stopping');
     this.isRunning = false;
+
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+
     await this.unregisterWorker();
+    this.logger.info({ crawlCount: this.crawlCount }, 'Crawler worker stopped');
   }
 
   /**
@@ -172,6 +209,12 @@ export class CrawlerService {
       REDIS_KEYS.WORKER_HEARTBEAT(this.workerId),
       Date.now().toString()
     );
+
+    // Update metrics
+    const workerCount = await redis.scard(REDIS_KEYS.ACTIVE_WORKERS);
+    activeWorkersGauge.set(workerCount);
+
+    this.logger.debug('Worker registered');
   }
 
   /**
@@ -183,6 +226,12 @@ export class CrawlerService {
   private async unregisterWorker(): Promise<void> {
     await redis.srem(REDIS_KEYS.ACTIVE_WORKERS, this.workerId);
     await redis.del(REDIS_KEYS.WORKER_HEARTBEAT(this.workerId));
+
+    // Update metrics
+    const workerCount = await redis.scard(REDIS_KEYS.ACTIVE_WORKERS);
+    activeWorkersGauge.set(workerCount);
+
+    this.logger.debug('Worker unregistered');
   }
 
   /**
@@ -192,12 +241,16 @@ export class CrawlerService {
    * is alive. The dashboard uses heartbeats to detect stale workers.
    */
   private startHeartbeat(): void {
-    setInterval(async () => {
+    this.heartbeatInterval = setInterval(async () => {
       if (this.isRunning) {
-        await redis.set(
-          REDIS_KEYS.WORKER_HEARTBEAT(this.workerId),
-          Date.now().toString()
-        );
+        try {
+          await redis.set(
+            REDIS_KEYS.WORKER_HEARTBEAT(this.workerId),
+            Date.now().toString()
+          );
+        } catch (error) {
+          this.logger.warn({ err: error }, 'Heartbeat update failed');
+        }
       }
     }, 5000);
   }
@@ -207,9 +260,10 @@ export class CrawlerService {
    *
    * This method is called in a loop and handles:
    * 1. Getting the next URL from the frontier
-   * 2. Crawling the URL
-   * 3. Storing results and adding discovered links
-   * 4. Updating status and statistics
+   * 2. Checking circuit breaker status
+   * 3. Crawling the URL with retry logic
+   * 4. Storing results and adding discovered links
+   * 5. Updating status and statistics
    *
    * If no URLs are available, sleeps briefly before retrying.
    */
@@ -223,8 +277,44 @@ export class CrawlerService {
       return;
     }
 
+    const { url, urlHash, domain } = frontierUrl;
+    const crawlLogger = this.logger.child({ url, domain, urlHash });
+
+    // Check if domain circuit breaker is open (distributed check)
     try {
+      const circuitOpen = await isCircuitOpen(domain);
+      if (circuitOpen) {
+        crawlLogger.debug('Domain circuit breaker is open, skipping');
+        // Re-queue the URL for later
+        await frontierService.markFailed(urlHash, 'Circuit breaker open');
+        recordCrawl(this.workerId, 'blocked', 0, 0, 0);
+        return;
+      }
+    } catch (error) {
+      // If we can't check, proceed with the crawl
+      crawlLogger.warn({ err: error }, 'Failed to check circuit breaker');
+    }
+
+    try {
+      crawlLogger.debug('Starting crawl');
       const result = await this.crawlUrl(frontierUrl);
+
+      // Determine crawl status
+      const status = result.error
+        ? result.error === 'Blocked by robots.txt'
+          ? 'blocked'
+          : 'failed'
+        : 'success';
+
+      // Record metrics
+      recordCrawl(
+        this.workerId,
+        status,
+        result.crawlDurationMs,
+        result.contentLength,
+        result.linksFound.length,
+        result.statusCode || undefined
+      );
 
       // Store results
       await this.storeCrawlResult(result);
@@ -236,20 +326,41 @@ export class CrawlerService {
         });
       }
 
-      // Mark as completed
-      await frontierService.markCompleted(frontierUrl.urlHash);
-
-      // Update stats
-      await redis.incr(REDIS_KEYS.STATS_PAGES_CRAWLED);
-      await redis.incrby(REDIS_KEYS.STATS_BYTES_DOWNLOADED, result.contentLength);
+      // Mark as completed or failed based on result
+      if (result.error) {
+        await frontierService.markFailed(urlHash, result.error);
+        await redis.incr(REDIS_KEYS.STATS_PAGES_FAILED);
+        crawlLogger.warn({ error: result.error }, 'Crawl failed');
+      } else {
+        await frontierService.markCompleted(urlHash);
+        await redis.incr(REDIS_KEYS.STATS_PAGES_CRAWLED);
+        await redis.incrby(REDIS_KEYS.STATS_BYTES_DOWNLOADED, result.contentLength);
+        crawlLogger.info(
+          {
+            statusCode: result.statusCode,
+            contentLength: result.contentLength,
+            linksFound: result.linksFound.length,
+            durationMs: result.crawlDurationMs,
+          },
+          'Crawl completed'
+        );
+      }
 
       this.crawlCount++;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
-      console.error(`Failed to crawl ${frontierUrl.url}:`, errorMessage);
+      const errorType =
+        error instanceof CircuitOpenError
+          ? 'circuit_open'
+          : isRetryableError(error)
+            ? 'network_error'
+            : 'unknown_error';
 
-      await frontierService.markFailed(frontierUrl.urlHash, errorMessage);
+      crawlLogger.error({ err: error, errorType }, 'Crawl failed with exception');
+      recordError(this.workerId, errorType);
+
+      await frontierService.markFailed(urlHash, errorMessage);
       await redis.incr(REDIS_KEYS.STATS_PAGES_FAILED);
     }
   }
@@ -259,7 +370,7 @@ export class CrawlerService {
    *
    * This method handles the complete crawl lifecycle:
    * 1. Check robots.txt permissions
-   * 2. Make HTTP request with proper headers and timeouts
+   * 2. Make HTTP request with retry and circuit breaker
    * 3. Validate response (HTML content only)
    * 4. Parse HTML and extract metadata
    * 5. Extract and normalize all links
@@ -289,26 +400,41 @@ export class CrawlerService {
       };
     }
 
-    // Fetch the page
+    // Fetch the page with retry and circuit breaker
     let response: AxiosResponse;
+    let retryAttempts = 0;
+
     try {
-      response = await axios.get(url, {
-        timeout: config.crawler.requestTimeout,
-        maxContentLength: config.crawler.maxPageSize,
-        headers: {
-          'User-Agent': config.crawler.userAgent,
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate',
-          Connection: 'keep-alive',
+      response = await withResilience(
+        domain,
+        async () => {
+          retryAttempts++;
+          return axios.get(url, {
+            timeout: config.crawler.requestTimeout,
+            maxContentLength: config.crawler.maxPageSize,
+            headers: {
+              'User-Agent': config.crawler.userAgent,
+              Accept:
+                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+              'Accept-Encoding': 'gzip, deflate',
+              Connection: 'keep-alive',
+            },
+            responseType: 'text',
+            validateStatus: (status) => status < 500, // Only retry on 5xx
+          });
         },
-        responseType: 'text',
-        validateStatus: () => true, // Accept all status codes
-      });
+        {
+          ...DEFAULT_RETRY_CONFIG,
+          maxAttempts: 3,
+        },
+        DEFAULT_CIRCUIT_BREAKER_CONFIG
+      );
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Request failed';
+      const errorCode = (error as AxiosError)?.code;
+
       return {
         url,
         urlHash,
@@ -320,12 +446,31 @@ export class CrawlerService {
         description: '',
         linksFound: [],
         crawlDurationMs: Date.now() - startTime,
-        error: errorMessage,
+        error: errorCode ? `${errorMessage} (${errorCode})` : errorMessage,
+        retryAttempts,
       };
     }
 
     const statusCode = response.status;
     const contentType = response.headers['content-type'] || '';
+
+    // Handle non-success status codes
+    if (statusCode >= 400) {
+      return {
+        url,
+        urlHash,
+        statusCode,
+        contentType,
+        contentLength: 0,
+        contentHash: '',
+        title: '',
+        description: '',
+        linksFound: [],
+        crawlDurationMs: Date.now() - startTime,
+        error: `HTTP ${statusCode}`,
+        retryAttempts,
+      };
+    }
 
     // Only process HTML content
     if (!contentType.includes('text/html')) {
@@ -341,6 +486,7 @@ export class CrawlerService {
         linksFound: [],
         crawlDurationMs: Date.now() - startTime,
         error: 'Not HTML content',
+        retryAttempts,
       };
     }
 
@@ -387,6 +533,7 @@ export class CrawlerService {
       description: description.substring(0, 1000),
       linksFound,
       crawlDurationMs: Date.now() - startTime,
+      retryAttempts,
     };
   }
 
@@ -433,11 +580,13 @@ export class CrawlerService {
       ]
     );
 
-    // Update domain page count
-    await pool.query(
-      `UPDATE domains SET page_count = page_count + 1, updated_at = NOW() WHERE domain = $1`,
-      [domain]
-    );
+    // Update domain page count (only for successful crawls)
+    if (!result.error) {
+      await pool.query(
+        `UPDATE domains SET page_count = page_count + 1, updated_at = NOW() WHERE domain = $1`,
+        [domain]
+      );
+    }
   }
 
   /**

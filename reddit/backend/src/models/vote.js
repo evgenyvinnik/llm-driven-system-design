@@ -3,6 +3,8 @@ import redis from '../db/redis.js';
 import { updatePostScore } from './post.js';
 import { updateCommentScore } from './comment.js';
 import { updateUserKarma } from './user.js';
+import logger from '../shared/logger.js';
+import { voteTotal, karmaCalculationDuration } from '../shared/metrics.js';
 
 export const castVote = async (userId, targetType, targetId, direction) => {
   // direction: 1 = upvote, -1 = downvote, 0 = remove vote
@@ -23,6 +25,7 @@ export const castVote = async (userId, targetType, targetId, direction) => {
     // Remove vote
     if (existingVote) {
       await query(`DELETE FROM votes WHERE id = $1`, [existingVote.id]);
+      logger.debug({ userId, targetType, targetId }, 'Vote removed');
     }
   } else if (existingVote) {
     // Update existing vote
@@ -31,6 +34,7 @@ export const castVote = async (userId, targetType, targetId, direction) => {
         `UPDATE votes SET direction = $1, created_at = NOW() WHERE id = $2`,
         [direction, existingVote.id]
       );
+      logger.debug({ userId, targetType, targetId, direction }, 'Vote changed');
     }
     // If same direction, do nothing
   } else {
@@ -40,6 +44,12 @@ export const castVote = async (userId, targetType, targetId, direction) => {
        VALUES ($1, $2, NULL, $3)`,
       [userId, targetId, direction]
     );
+
+    // Record metric for new votes
+    const directionLabel = direction === 1 ? 'up' : 'down';
+    voteTotal.inc({ direction: directionLabel, target_type: targetType });
+
+    logger.debug({ userId, targetType, targetId, direction }, 'Vote cast');
   }
 
   // Immediately aggregate for this target (for responsive UI)
@@ -126,17 +136,21 @@ export const aggregateVotesForTarget = async (targetType, targetId) => {
     await updatePostScore(targetId, parseInt(upvotes), parseInt(downvotes));
 
     // Update author karma
+    const start = Date.now();
     const postResult = await query(`SELECT author_id FROM posts WHERE id = $1`, [targetId]);
     if (postResult.rows[0]?.author_id) {
       await updateUserKarma(postResult.rows[0].author_id);
+      karmaCalculationDuration.observe((Date.now() - start) / 1000);
     }
   } else {
     await updateCommentScore(targetId, parseInt(upvotes), parseInt(downvotes));
 
     // Update author karma
+    const start = Date.now();
     const commentResult = await query(`SELECT author_id FROM comments WHERE id = $1`, [targetId]);
     if (commentResult.rows[0]?.author_id) {
       await updateUserKarma(commentResult.rows[0].author_id);
+      karmaCalculationDuration.observe((Date.now() - start) / 1000);
     }
   }
 };
@@ -164,4 +178,9 @@ export const aggregateAllVotes = async () => {
   for (const row of commentsResult.rows) {
     await aggregateVotesForTarget('comment', row.comment_id);
   }
+
+  return {
+    postsAggregated: postsResult.rowCount,
+    commentsAggregated: commentsResult.rowCount,
+  };
 };

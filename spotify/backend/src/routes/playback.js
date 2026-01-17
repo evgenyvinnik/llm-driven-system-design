@@ -1,14 +1,16 @@
 import { Router } from 'express';
 import playbackService from '../services/playbackService.js';
 import { requireAuth } from '../middleware/auth.js';
+import { rateLimiters } from '../shared/rateLimit.js';
+import { playbackEventsTotal, streamCountsTotal, activeStreams } from '../shared/metrics.js';
 
 const router = Router();
 
 // All playback routes require authentication
 router.use(requireAuth);
 
-// Get stream URL for a track
-router.get('/stream/:trackId', async (req, res) => {
+// Get stream URL for a track (with rate limiting)
+router.get('/stream/:trackId', rateLimiters.playback, async (req, res) => {
   try {
     const streamInfo = await playbackService.getStreamUrl(
       req.params.trackId,
@@ -46,9 +48,25 @@ router.post('/event', async (req, res) => {
       deviceType || 'web'
     );
 
+    // Track metrics
+    playbackEventsTotal.inc({ event_type: eventType, device_type: deviceType || 'web' });
+
+    // Track active streams
+    if (eventType === 'play_started' || eventType === 'play_resumed') {
+      activeStreams.inc();
+    } else if (eventType === 'play_paused' || eventType === 'play_completed' || eventType === 'skipped') {
+      activeStreams.dec();
+    }
+
+    // Track stream counts (30 second threshold)
+    if (eventType === 'stream_counted') {
+      streamCountsTotal.inc();
+    }
+
     res.json(result);
   } catch (error) {
-    console.error('Record playback event error:', error);
+    const log = req.log || console;
+    log.error({ error: error.message }, 'Record playback event error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

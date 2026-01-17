@@ -9,6 +9,15 @@ import pool from '../models/db.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { generatePosition } from '../utils/fractionalIndex.js';
 import type { Page } from '../types/index.js';
+import {
+  cacheAside,
+  invalidatePageCache,
+  invalidateWorkspaceCache,
+  CACHE_KEYS,
+  CACHE_TTL,
+} from '../shared/cache.js';
+import { pageLoadsCounter, pageEditsCounter, pageLoadDuration } from '../shared/metrics.js';
+import { auditLogger, AuditEventTypes } from '../shared/audit.js';
 
 const router = Router();
 

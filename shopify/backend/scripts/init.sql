@@ -315,3 +315,71 @@ INSERT INTO collections (store_id, handle, title, description) VALUES
 INSERT INTO collection_products (collection_id, product_id, position) VALUES
 (1, 1, 0),
 (1, 2, 1);
+
+-- =====================================================
+-- Idempotency Keys Table
+-- Prevents duplicate operations during retries
+-- =====================================================
+CREATE TABLE idempotency_keys (
+  id SERIAL PRIMARY KEY,
+  idempotency_key VARCHAR(64) NOT NULL,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  operation VARCHAR(50) NOT NULL,  -- 'checkout', 'inventory_update', etc.
+  status VARCHAR(20) DEFAULT 'processing',  -- 'processing', 'completed', 'failed'
+  request_params JSONB,
+  response_data JSONB,
+  resource_id INTEGER,  -- ID of created resource (order_id, etc.)
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(idempotency_key, store_id, operation)
+);
+
+CREATE INDEX idx_idempotency_keys_lookup ON idempotency_keys(idempotency_key, store_id, operation);
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys(created_at);
+
+-- =====================================================
+-- Audit Logs Table
+-- Tracks all important business events for compliance and debugging
+-- =====================================================
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  actor_id INTEGER,           -- user who performed action
+  actor_type VARCHAR(20),     -- 'merchant', 'customer', 'system', 'admin'
+  action VARCHAR(50) NOT NULL,-- 'order.created', 'inventory.adjusted', etc.
+  resource_type VARCHAR(50),  -- 'order', 'product', 'variant'
+  resource_id INTEGER,
+  changes JSONB,              -- { before: {...}, after: {...} }
+  ip_address INET,
+  user_agent TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_logs_store_created ON audit_logs(store_id, created_at DESC);
+CREATE INDEX idx_audit_logs_action ON audit_logs(action, created_at DESC);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id, created_at DESC);
+CREATE INDEX idx_audit_logs_actor ON audit_logs(actor_id, created_at DESC);
+
+-- =====================================================
+-- Processed Webhooks Table
+-- Prevents duplicate webhook processing (replay handling)
+-- =====================================================
+CREATE TABLE processed_webhooks (
+  id SERIAL PRIMARY KEY,
+  event_id VARCHAR(100) UNIQUE NOT NULL,
+  event_type VARCHAR(100) NOT NULL,
+  processed_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_processed_webhooks_event ON processed_webhooks(event_id);
+CREATE INDEX idx_processed_webhooks_created ON processed_webhooks(created_at);
+
+-- Grant permissions on new tables
+GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency_keys TO shopify_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON audit_logs TO shopify_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON processed_webhooks TO shopify_app;
+GRANT USAGE, SELECT ON SEQUENCE idempotency_keys_id_seq TO shopify_app;
+GRANT USAGE, SELECT ON SEQUENCE audit_logs_id_seq TO shopify_app;
+GRANT USAGE, SELECT ON SEQUENCE processed_webhooks_id_seq TO shopify_app;

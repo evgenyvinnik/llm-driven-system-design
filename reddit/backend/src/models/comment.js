@@ -1,4 +1,6 @@
 import { query, getClient } from '../db/index.js';
+import logger from '../shared/logger.js';
+import { commentCreatedTotal, commentTreeDepth } from '../shared/metrics.js';
 
 export const createComment = async (postId, authorId, content, parentId = null) => {
   const client = await getClient();
@@ -45,6 +47,18 @@ export const createComment = async (postId, authorId, content, parentId = null) 
     );
 
     await client.query('COMMIT');
+
+    // Record metrics
+    const depthBucket = depth <= 1 ? 'shallow' : depth <= 5 ? 'medium' : 'deep';
+    commentCreatedTotal.inc({ depth_bucket: depthBucket });
+    commentTreeDepth.observe(depth);
+
+    logger.info({
+      commentId,
+      postId,
+      authorId,
+      depth,
+    }, 'Comment created');
 
     return { ...result.rows[0], path: newPath };
   } catch (error) {
@@ -100,7 +114,7 @@ export const listCommentsByPost = async (postId, sort = 'best') => {
     `SELECT c.*, u.username as author_username
      FROM comments c
      LEFT JOIN users u ON c.author_id = u.id
-     WHERE c.post_id = $1
+     WHERE c.post_id = $1 AND (c.is_archived IS NULL OR c.is_archived = FALSE)
      ORDER BY c.path, ${orderBy}`,
     [postId]
   );
@@ -164,4 +178,30 @@ export const deleteComment = async (commentId) => {
     `UPDATE posts SET comment_count = GREATEST(comment_count - 1, 0) WHERE id = $1`,
     [comment.post_id]
   );
+
+  logger.info({ commentId, postId: comment.post_id }, 'Comment deleted');
+};
+
+/**
+ * Archive old comments based on retention policy.
+ * Called by archival worker.
+ */
+export const archiveComments = async (cutoffDate) => {
+  const result = await query(
+    `UPDATE comments
+     SET is_archived = TRUE, archived_at = NOW()
+     WHERE created_at < $1
+       AND (is_archived IS NULL OR is_archived = FALSE)
+     RETURNING id`,
+    [cutoffDate]
+  );
+
+  if (result.rowCount > 0) {
+    logger.info({
+      count: result.rowCount,
+      cutoffDate,
+    }, 'Comments archived');
+  }
+
+  return result.rowCount;
 };

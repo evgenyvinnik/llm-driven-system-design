@@ -9,6 +9,15 @@ import discussionsRoutes from './routes/discussions.js';
 import usersRoutes from './routes/users.js';
 import searchRoutes from './routes/search.js';
 
+// Import shared modules
+import logger, { requestLoggerMiddleware } from './shared/logger.js';
+import { metricsMiddleware, metricsHandler, activeConnections } from './shared/metrics.js';
+import { getCircuitBreakerStatus, resetCircuitBreaker } from './shared/circuitBreaker.js';
+import { queryAuditLogs, AUDITED_ACTIONS, auditLog } from './shared/audit.js';
+import { cleanupExpiredKeys } from './shared/idempotency.js';
+import pool from './db/index.js';
+import redisClient from './db/redis.js';
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -18,11 +27,75 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
+
+// Request logging and metrics
+app.use(requestLoggerMiddleware);
+app.use(metricsMiddleware);
 app.use(authMiddleware);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Prometheus metrics endpoint
+app.get('/metrics', metricsHandler);
+
+/**
+ * Enhanced health check endpoint
+ * Checks database, Redis, and Elasticsearch connectivity
+ */
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: process.env.APP_VERSION || 'dev',
+    checks: {},
+  };
+
+  // Check PostgreSQL
+  try {
+    const dbStart = Date.now();
+    await pool.query('SELECT 1');
+    health.checks.postgres = {
+      status: 'ok',
+      latencyMs: Date.now() - dbStart,
+    };
+  } catch (err) {
+    health.checks.postgres = { status: 'error', error: err.message };
+    health.status = 'degraded';
+  }
+
+  // Check Redis
+  try {
+    const redisStart = Date.now();
+    await redisClient.ping();
+    health.checks.redis = {
+      status: 'ok',
+      latencyMs: Date.now() - redisStart,
+    };
+  } catch (err) {
+    health.checks.redis = { status: 'error', error: err.message };
+    health.status = 'degraded';
+  }
+
+  // Add circuit breaker status
+  health.circuitBreakers = getCircuitBreakerStatus();
+
+  const statusCode = health.status === 'ok' ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+// Liveness probe (for Kubernetes)
+app.get('/health/live', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// Readiness probe (for Kubernetes)
+app.get('/health/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    await redisClient.ping();
+    res.json({ status: 'ready' });
+  } catch (err) {
+    res.status(503).json({ status: 'not ready', error: err.message });
+  }
 });
 
 // Auth routes
@@ -39,26 +112,113 @@ app.use('/api', discussionsRoutes); // Routes include /:owner/:repo/discussions
 app.use('/api/users', usersRoutes);
 app.use('/api/search', searchRoutes);
 
-// Error handler
+// Admin routes
+import { requireAdmin, requireAuth } from './middleware/auth.js';
+
+// Circuit breaker admin endpoints
+app.get('/api/admin/circuit-breakers', requireAuth, requireAdmin, (req, res) => {
+  res.json(getCircuitBreakerStatus());
+});
+
+app.post('/api/admin/circuit-breakers/:name/reset', requireAuth, requireAdmin, (req, res) => {
+  const success = resetCircuitBreaker(req.params.name);
+  if (success) {
+    res.json({ success: true, message: `Circuit breaker ${req.params.name} reset` });
+  } else {
+    res.status(404).json({ error: 'Circuit breaker not found' });
+  }
+});
+
+// Audit log admin endpoints
+app.get('/api/admin/audit-logs', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { userId, action, resourceType, resourceId, startDate, endDate, limit = 100, offset = 0 } = req.query;
+
+    const logs = await queryAuditLogs({
+      userId: userId ? parseInt(userId) : undefined,
+      action,
+      resourceType,
+      resourceId,
+      startDate: startDate ? new Date(startDate) : undefined,
+      endDate: endDate ? new Date(endDate) : undefined,
+    }, parseInt(limit), parseInt(offset));
+
+    res.json({ logs, count: logs.length });
+  } catch (err) {
+    logger.error({ err }, 'Error fetching audit logs');
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+// Error handler with structured logging
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
+  const log = req.log || logger;
+  log.error({ err, stack: err.stack }, 'Unhandled server error');
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// Graceful shutdown handler
+async function shutdown(signal) {
+  logger.info({ signal }, 'Received shutdown signal');
+
+  // Stop accepting new requests
+  server.close(() => {
+    logger.info('HTTP server closed');
+  });
+
+  // Cleanup resources
+  try {
+    await pool.end();
+    logger.info('PostgreSQL pool closed');
+  } catch (err) {
+    logger.error({ err }, 'Error closing PostgreSQL pool');
+  }
+
+  try {
+    await redisClient.quit();
+    logger.info('Redis connection closed');
+  } catch (err) {
+    logger.error({ err }, 'Error closing Redis connection');
+  }
+
+  process.exit(0);
+}
+
 // Start server
+let server;
+
 async function start() {
   try {
     // Initialize Elasticsearch index
     await initializeCodeIndex();
-    console.log('Elasticsearch index initialized');
+    logger.info('Elasticsearch index initialized');
   } catch (err) {
-    console.warn('Elasticsearch not available:', err.message);
+    logger.warn({ err: err.message }, 'Elasticsearch not available');
   }
 
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  // Run idempotency key cleanup periodically (every hour)
+  setInterval(async () => {
+    try {
+      const deleted = await cleanupExpiredKeys();
+      if (deleted > 0) {
+        logger.info({ deleted }, 'Cleaned up expired idempotency keys');
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error in idempotency cleanup');
+    }
+  }, 60 * 60 * 1000); // 1 hour
+
+  server = app.listen(PORT, () => {
+    logger.info({
+      port: PORT,
+      environment: process.env.NODE_ENV || 'development',
+      pid: process.pid,
+    }, 'Server started');
   });
+
+  // Handle graceful shutdown
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 start();

@@ -10,6 +10,8 @@ import {
 import { getUserSubscriptions } from '../models/subreddit.js';
 import { listPostsByUser } from '../models/post.js';
 import { requireAuth } from '../middleware/auth.js';
+import logger from '../shared/logger.js';
+import { auditLogin } from '../shared/audit.js';
 
 const router = express.Router();
 
@@ -38,6 +40,11 @@ router.post('/register', async (req, res) => {
     const user = await createUser(username, email, password);
     const sessionId = await createSession(user.id);
 
+    // Audit successful registration (treated as login)
+    await auditLogin(req, user.id, true);
+
+    logger.info({ userId: user.id, username }, 'User registered');
+
     res.cookie('session', sessionId, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -57,7 +64,7 @@ router.post('/register', async (req, res) => {
       sessionId,
     });
   } catch (error) {
-    console.error('Registration error:', error);
+    logger.error({ err: error }, 'Registration error');
     if (error.code === '23505') {
       return res.status(409).json({ error: 'Username or email already exists' });
     }
@@ -76,15 +83,26 @@ router.post('/login', async (req, res) => {
 
     const user = await findUserByUsername(username);
     if (!user) {
+      // Audit failed login attempt
+      await auditLogin(req, null, false);
+      logger.warn({ username }, 'Login failed - user not found');
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const valid = await verifyPassword(password, user.password_hash);
     if (!valid) {
+      // Audit failed login attempt
+      await auditLogin(req, user.id, false);
+      logger.warn({ userId: user.id, username }, 'Login failed - invalid password');
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const sessionId = await createSession(user.id);
+
+    // Audit successful login
+    await auditLogin(req, user.id, true);
+
+    logger.info({ userId: user.id, username }, 'User logged in');
 
     res.cookie('session', sessionId, {
       httpOnly: true,
@@ -105,7 +123,7 @@ router.post('/login', async (req, res) => {
       sessionId,
     });
   } catch (error) {
-    console.error('Login error:', error);
+    logger.error({ err: error }, 'Login error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -117,10 +135,13 @@ router.post('/logout', requireAuth, async (req, res) => {
     if (sessionId) {
       await deleteSession(sessionId);
     }
+
+    logger.info({ userId: req.user.id }, 'User logged out');
+
     res.clearCookie('session');
     res.json({ success: true });
   } catch (error) {
-    console.error('Logout error:', error);
+    logger.error({ err: error }, 'Logout error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -157,7 +178,7 @@ router.get('/users/:username', async (req, res) => {
       created_at: user.created_at,
     });
   } catch (error) {
-    console.error('Get user error:', error);
+    logger.error({ err: error }, 'Get user error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -176,7 +197,7 @@ router.get('/users/:username/posts', async (req, res) => {
     const posts = await listPostsByUser(user.id, limit, offset);
     res.json(posts);
   } catch (error) {
-    console.error('Get user posts error:', error);
+    logger.error({ err: error }, 'Get user posts error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -192,7 +213,7 @@ router.get('/users/:username/subscriptions', async (req, res) => {
     const subscriptions = await getUserSubscriptions(user.id);
     res.json(subscriptions);
   } catch (error) {
-    console.error('Get subscriptions error:', error);
+    logger.error({ err: error }, 'Get subscriptions error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

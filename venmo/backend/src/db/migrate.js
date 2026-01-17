@@ -56,12 +56,14 @@ const migrate = async () => {
       visibility VARCHAR(20) DEFAULT 'public', -- 'public', 'friends', 'private'
       status VARCHAR(20) NOT NULL DEFAULT 'completed',
       funding_source VARCHAR(50),
+      idempotency_key VARCHAR(128),  -- For duplicate prevention
       created_at TIMESTAMP DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_transfers_sender ON transfers(sender_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_transfers_receiver ON transfers(receiver_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_transfers_created ON transfers(created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_idempotency ON transfers(sender_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
     -- Payment Requests
     CREATE TABLE IF NOT EXISTS payment_requests (
@@ -135,6 +137,82 @@ const migrate = async () => {
     );
 
     CREATE INDEX IF NOT EXISTS idx_comments_transfer ON transfer_comments(transfer_id, created_at);
+
+    -- Audit Log (append-only for compliance)
+    -- WHY: Financial regulations require immutable audit trails of all money movements
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id BIGSERIAL PRIMARY KEY,
+      timestamp TIMESTAMP DEFAULT NOW(),
+      actor_id UUID,                    -- User or system performing action
+      actor_type VARCHAR(20),           -- 'user', 'admin', 'system'
+      action VARCHAR(50) NOT NULL,      -- 'transfer', 'cashout', 'link_bank', 'login'
+      resource_type VARCHAR(30),        -- 'wallet', 'transfer', 'payment_method'
+      resource_id UUID,
+      ip_address INET,
+      user_agent TEXT,
+      request_id VARCHAR(50),           -- Correlation ID
+      details JSONB,                    -- Action-specific data
+      outcome VARCHAR(20) NOT NULL      -- 'success', 'failure', 'denied'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource_type, resource_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp DESC);
+
+    -- Archive tables for historical data (warm storage)
+    -- WHY: Balance compliance vs storage costs - old transactions move here
+    CREATE TABLE IF NOT EXISTS transfers_archive (
+      id UUID PRIMARY KEY,
+      sender_id UUID,
+      receiver_id UUID,
+      amount INTEGER NOT NULL,
+      note TEXT,
+      visibility VARCHAR(20),
+      status VARCHAR(20),
+      funding_source VARCHAR(50),
+      idempotency_key VARCHAR(128),
+      created_at TIMESTAMP,
+      archived_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_transfers_archive_sender ON transfers_archive(sender_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transfers_archive_receiver ON transfers_archive(receiver_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS cashouts_archive (
+      id UUID PRIMARY KEY,
+      user_id UUID,
+      amount INTEGER NOT NULL,
+      fee INTEGER,
+      speed VARCHAR(20),
+      status VARCHAR(20),
+      payment_method_id UUID,
+      estimated_arrival TIMESTAMP,
+      completed_at TIMESTAMP,
+      created_at TIMESTAMP,
+      archived_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cashouts_archive_user ON cashouts_archive(user_id, created_at DESC);
+
+    -- Archive for audit logs (after 2 years, before 7 year deletion)
+    CREATE TABLE IF NOT EXISTS audit_log_archive (
+      id BIGINT PRIMARY KEY,
+      timestamp TIMESTAMP,
+      actor_id UUID,
+      actor_type VARCHAR(20),
+      action VARCHAR(50) NOT NULL,
+      resource_type VARCHAR(30),
+      resource_id UUID,
+      ip_address INET,
+      user_agent TEXT,
+      request_id VARCHAR(50),
+      details JSONB,
+      outcome VARCHAR(20) NOT NULL,
+      archived_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_archive_actor ON audit_log_archive(actor_id, timestamp DESC);
   `);
 
   console.log('Migrations completed successfully!');

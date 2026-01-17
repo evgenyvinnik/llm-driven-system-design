@@ -6,6 +6,13 @@
  * - Analyze data quality
  * - Start training jobs and manage models
  * Requires session-based authentication.
+ *
+ * Enhanced with:
+ * - Structured JSON logging for debugging and alerting
+ * - Prometheus metrics for observability
+ * - Health checks for container orchestration
+ * - Circuit breakers for external service resilience
+ *
  * @module admin
  */
 
@@ -20,10 +27,21 @@ import { validateLogin, createSession, getSession, deleteSession } from '../shar
 import { scoreDrawing, type StrokeData } from '../shared/quality.js'
 import { v4 as uuidv4 } from 'uuid'
 
+// New shared modules
+import { logger, createChildLogger, logError } from '../shared/logger.js'
+import { postgresCircuitBreaker, rabbitCircuitBreaker, minioCircuitBreaker, CircuitBreakerOpenError } from '../shared/circuitBreaker.js'
+import { withRetry, RetryPresets } from '../shared/retry.js'
+import { metricsMiddleware, metricsHandler, trainingJobsTotal, trackExternalCall } from '../shared/metrics.js'
+import { healthCheckRouter } from '../shared/healthCheck.js'
+import { runAllCleanupJobs, LifecycleConfig } from '../shared/cleanup.js'
+
 const app = express()
 
 /** Port for the admin service (default: 3002) */
 const PORT = parseInt(process.env.PORT || '3002')
+
+// Set service name for logging
+process.env.SERVICE_NAME = 'admin'
 
 /**
  * Session data attached to authenticated requests.
@@ -50,6 +68,15 @@ app.use(cors({
 }))
 app.use(express.json())
 app.use(cookieParser())
+
+// Prometheus metrics middleware (must be before routes)
+app.use(metricsMiddleware())
+
+// Health check endpoints
+app.use(healthCheckRouter())
+
+// Prometheus metrics endpoint
+app.get('/metrics', metricsHandler)
 
 /**
  * Authentication middleware that verifies the admin session cookie.
@@ -78,16 +105,13 @@ async function requireAdmin(req: express.Request, res: express.Response, next: e
   next()
 }
 
-// Health check endpoint
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'admin' })
-})
-
 /**
  * POST /api/admin/auth/login - Authenticates an admin user.
  * Creates a session and sets an httpOnly cookie.
  */
 app.post('/api/admin/auth/login', async (req, res) => {
+  const reqLogger = createChildLogger({ endpoint: '/api/admin/auth/login' })
+
   try {
     const { email, password, rememberMe } = req.body
 
@@ -97,6 +121,7 @@ app.post('/api/admin/auth/login', async (req, res) => {
 
     const user = await validateLogin(email, password)
     if (!user) {
+      reqLogger.warn({ msg: 'Invalid login attempt', email })
       return res.status(401).json({ error: 'Invalid credentials' })
     }
 
@@ -109,6 +134,8 @@ app.post('/api/admin/auth/login', async (req, res) => {
       maxAge: ttl * 1000, // Convert seconds to milliseconds
     })
 
+    reqLogger.info({ msg: 'Admin login successful', email })
+
     res.json({
       user: {
         id: user.id,
@@ -117,7 +144,7 @@ app.post('/api/admin/auth/login', async (req, res) => {
       },
     })
   } catch (error) {
-    console.error('Login error:', error)
+    logError(error as Error, { endpoint: '/api/admin/auth/login' })
     res.status(500).json({ error: 'Login failed' })
   }
 })
@@ -131,6 +158,7 @@ app.post('/api/admin/auth/logout', async (req, res) => {
 
   if (sessionId) {
     await deleteSession(sessionId)
+    logger.info({ msg: 'Admin logout', sessionId: sessionId.substring(0, 8) + '...' })
   }
 
   res.clearCookie('adminSession')
@@ -150,6 +178,8 @@ app.get('/api/admin/auth/me', requireAdmin, (req, res) => {
  * active model info, and recent training jobs. Cached for 30 seconds.
  */
 app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
+  const reqLogger = createChildLogger({ endpoint: '/api/admin/stats' })
+
   try {
     // Check cache first
     const cacheKey = CacheKeys.adminStats()
@@ -158,63 +188,74 @@ app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
       return res.json(cached)
     }
 
-    // Total drawings
-    const totalDrawings = await pool.query('SELECT COUNT(*) as count FROM drawings')
+    // Query database with circuit breaker protection
+    const stats = await postgresCircuitBreaker.execute(async () => {
+      // Total drawings
+      const totalDrawings = await pool.query('SELECT COUNT(*) as count FROM drawings')
 
-    // Drawings per shape
-    const perShape = await pool.query(`
-      SELECT s.name, COUNT(d.id) as count
-      FROM shapes s
-      LEFT JOIN drawings d ON d.shape_id = s.id
-      GROUP BY s.id, s.name
-      ORDER BY s.name
-    `)
+      // Drawings per shape
+      const perShape = await pool.query(`
+        SELECT s.name, COUNT(d.id) as count
+        FROM shapes s
+        LEFT JOIN drawings d ON d.shape_id = s.id
+        GROUP BY s.id, s.name
+        ORDER BY s.name
+      `)
 
-    // Flagged drawings
-    const flagged = await pool.query(
-      'SELECT COUNT(*) as count FROM drawings WHERE is_flagged = TRUE'
-    )
+      // Flagged drawings
+      const flagged = await pool.query(
+        'SELECT COUNT(*) as count FROM drawings WHERE is_flagged = TRUE'
+      )
 
-    // Today's drawings
-    const today = await pool.query(`
-      SELECT COUNT(*) as count FROM drawings
-      WHERE created_at > NOW() - INTERVAL '1 day'
-    `)
+      // Today's drawings
+      const today = await pool.query(`
+        SELECT COUNT(*) as count FROM drawings
+        WHERE created_at > NOW() - INTERVAL '1 day'
+      `)
 
-    // Total users
-    const totalUsers = await pool.query('SELECT COUNT(*) as count FROM users')
+      // Total users
+      const totalUsers = await pool.query('SELECT COUNT(*) as count FROM users')
 
-    // Active model
-    const activeModel = await pool.query(`
-      SELECT id, version, accuracy, created_at
-      FROM models WHERE is_active = TRUE
-    `)
+      // Active model
+      const activeModel = await pool.query(`
+        SELECT id, version, accuracy, created_at
+        FROM models WHERE is_active = TRUE
+      `)
 
-    // Recent training jobs
-    const recentJobs = await pool.query(`
-      SELECT id, status, created_at, completed_at,
-             metrics->>'accuracy' as accuracy
-      FROM training_jobs
-      ORDER BY created_at DESC
-      LIMIT 5
-    `)
+      // Recent training jobs
+      const recentJobs = await pool.query(`
+        SELECT id, status, created_at, completed_at,
+               metrics->>'accuracy' as accuracy
+        FROM training_jobs
+        ORDER BY created_at DESC
+        LIMIT 5
+      `)
 
-    const stats = {
-      total_drawings: parseInt(totalDrawings.rows[0].count),
-      drawings_per_shape: perShape.rows,
-      flagged_count: parseInt(flagged.rows[0].count),
-      today_count: parseInt(today.rows[0].count),
-      total_users: parseInt(totalUsers.rows[0].count),
-      active_model: activeModel.rows[0] || null,
-      recent_jobs: recentJobs.rows,
-    }
+      return {
+        total_drawings: parseInt(totalDrawings.rows[0].count),
+        drawings_per_shape: perShape.rows,
+        flagged_count: parseInt(flagged.rows[0].count),
+        today_count: parseInt(today.rows[0].count),
+        total_users: parseInt(totalUsers.rows[0].count),
+        active_model: activeModel.rows[0] || null,
+        recent_jobs: recentJobs.rows,
+      }
+    })
 
     // Cache for 30 seconds
     await cacheSet(cacheKey, stats, 30)
 
+    reqLogger.debug({ msg: 'Fetched admin stats', totalDrawings: stats.total_drawings })
     res.json(stats)
   } catch (error) {
-    console.error('Error fetching stats:', error)
+    if (error instanceof CircuitBreakerOpenError) {
+      return res.status(503).json({
+        error: 'Service temporarily unavailable',
+        retryAfter: Math.ceil(error.retryAfterMs / 1000),
+      })
+    }
+
+    logError(error as Error, { endpoint: '/api/admin/stats' })
     res.status(500).json({ error: 'Failed to fetch stats' })
   }
 })
@@ -296,7 +337,7 @@ app.get('/api/admin/drawings', requireAdmin, async (req, res) => {
       },
     })
   } catch (error) {
-    console.error('Error fetching drawings:', error)
+    logError(error as Error, { endpoint: '/api/admin/drawings' })
     res.status(500).json({ error: 'Failed to fetch drawings' })
   }
 })
@@ -318,9 +359,10 @@ app.post('/api/admin/drawings/:id/flag', requireAdmin, async (req, res) => {
     // Invalidate stats cache since flagged count changed
     await cacheDelete(CacheKeys.adminStats())
 
+    logger.info({ msg: 'Drawing flagged', drawingId: id, flagged: flagged !== false })
     res.json({ success: true })
   } catch (error) {
-    console.error('Error flagging drawing:', error)
+    logError(error as Error, { endpoint: '/api/admin/drawings/:id/flag' })
     res.status(500).json({ error: 'Failed to flag drawing' })
   }
 })
@@ -341,9 +383,10 @@ app.delete('/api/admin/drawings/:id', requireAdmin, async (req, res) => {
     // Invalidate stats cache
     await cacheDelete(CacheKeys.adminStats())
 
+    logger.info({ msg: 'Drawing soft-deleted', drawingId: id })
     res.json({ success: true })
   } catch (error) {
-    console.error('Error deleting drawing:', error)
+    logError(error as Error, { endpoint: '/api/admin/drawings/:id' })
     res.status(500).json({ error: 'Failed to delete drawing' })
   }
 })
@@ -364,9 +407,10 @@ app.post('/api/admin/drawings/:id/restore', requireAdmin, async (req, res) => {
     // Invalidate stats cache
     await cacheDelete(CacheKeys.adminStats())
 
+    logger.info({ msg: 'Drawing restored', drawingId: id })
     res.json({ success: true })
   } catch (error) {
-    console.error('Error restoring drawing:', error)
+    logError(error as Error, { endpoint: '/api/admin/drawings/:id/restore' })
     res.status(500).json({ error: 'Failed to restore drawing' })
   }
 })
@@ -391,12 +435,23 @@ app.get('/api/admin/drawings/:id/strokes', requireAdmin, async (req, res) => {
 
     const strokeDataPath = result.rows[0].stroke_data_path
 
-    // Fetch from MinIO
-    const strokeData = await getDrawing(strokeDataPath)
+    // Fetch from MinIO with circuit breaker
+    const strokeData = await minioCircuitBreaker.execute(async () => {
+      return trackExternalCall('minio', 'getObject', async () => {
+        return getDrawing(strokeDataPath)
+      })
+    })
 
     res.json(strokeData)
   } catch (error) {
-    console.error('Error fetching stroke data:', error)
+    if (error instanceof CircuitBreakerOpenError) {
+      return res.status(503).json({
+        error: 'Storage temporarily unavailable',
+        retryAfter: Math.ceil(error.retryAfterMs / 1000),
+      })
+    }
+
+    logError(error as Error, { endpoint: '/api/admin/drawings/:id/strokes' })
     res.status(500).json({ error: 'Failed to fetch stroke data' })
   }
 })
@@ -432,7 +487,7 @@ app.get('/api/admin/drawings/:id/quality', requireAdmin, async (req, res) => {
       quality,
     })
   } catch (error) {
-    console.error('Error analyzing drawing quality:', error)
+    logError(error as Error, { endpoint: '/api/admin/drawings/:id/quality' })
     res.status(500).json({ error: 'Failed to analyze drawing quality' })
   }
 })
@@ -443,11 +498,13 @@ app.get('/api/admin/drawings/:id/quality', requireAdmin, async (req, res) => {
  * Use updateScores=false for dry run.
  */
 app.post('/api/admin/quality/analyze-batch', requireAdmin, async (req, res) => {
+  const reqLogger = createChildLogger({ endpoint: '/api/admin/quality/analyze-batch' })
+
   try {
     const { minScore, limit = 100, updateScores = false } = req.body
 
     // Fetch drawings that need quality analysis (null quality_score)
-    let query = `
+    const query = `
       SELECT d.id, d.stroke_data_path, s.name as shape
       FROM drawings d
       JOIN shapes s ON d.shape_id = s.id
@@ -519,6 +576,13 @@ app.post('/api/admin/quality/analyze-batch', requireAdmin, async (req, res) => {
       }
     }
 
+    reqLogger.info({
+      msg: 'Batch quality analysis complete',
+      analyzed: analyzed.length,
+      failed: failed.length,
+      flagged: flaggedCount,
+    })
+
     res.json({
       analyzed: analyzed.length,
       failed: failed.length,
@@ -532,7 +596,7 @@ app.post('/api/admin/quality/analyze-batch', requireAdmin, async (req, res) => {
         : `Analyzed ${analyzed.length} drawings (dry run, scores not saved)`,
     })
   } catch (error) {
-    console.error('Error in batch quality analysis:', error)
+    logError(error as Error, { endpoint: '/api/admin/quality/analyze-batch' })
     res.status(500).json({ error: 'Failed to analyze drawings' })
   }
 })
@@ -585,7 +649,7 @@ app.get('/api/admin/quality/stats', requireAdmin, async (_req, res) => {
       unscoredCount: parseInt(unscored.rows[0].count),
     })
   } catch (error) {
-    console.error('Error fetching quality stats:', error)
+    logError(error as Error, { endpoint: '/api/admin/quality/stats' })
     res.status(500).json({ error: 'Failed to fetch quality statistics' })
   }
 })
@@ -595,6 +659,8 @@ app.get('/api/admin/quality/stats', requireAdmin, async (_req, res) => {
  * Creates a job record and publishes to RabbitMQ for async processing.
  */
 app.post('/api/admin/training/start', requireAdmin, async (req, res) => {
+  const reqLogger = createChildLogger({ endpoint: '/api/admin/training/start' })
+
   try {
     const config = req.body.config || {}
 
@@ -606,8 +672,39 @@ app.post('/api/admin/training/start', requireAdmin, async (req, res) => {
       [jobId, JSON.stringify(config)]
     )
 
-    // Publish to queue
-    await publishTrainingJob(jobId, config)
+    // Publish to queue with circuit breaker and retry
+    try {
+      await rabbitCircuitBreaker.execute(async () => {
+        return await withRetry(
+          async () => {
+            return trackExternalCall('rabbitmq', 'publish', async () => {
+              return publishTrainingJob(jobId, config)
+            })
+          },
+          RetryPresets.rabbitmq
+        )
+      })
+    } catch (error) {
+      // If queue fails, update job status to 'failed'
+      await pool.query(
+        `UPDATE training_jobs SET status = 'failed', error_message = $1 WHERE id = $2`,
+        ['Failed to queue job: ' + (error instanceof Error ? error.message : String(error)), jobId]
+      )
+
+      if (error instanceof CircuitBreakerOpenError) {
+        reqLogger.warn({ msg: 'RabbitMQ circuit breaker open' })
+        return res.status(503).json({
+          error: 'Queue temporarily unavailable',
+          retryAfter: Math.ceil(error.retryAfterMs / 1000),
+        })
+      }
+      throw error
+    }
+
+    // Record metric
+    trainingJobsTotal.labels('queued').inc()
+
+    reqLogger.info({ msg: 'Training job queued', jobId })
 
     res.status(201).json({
       id: jobId,
@@ -615,7 +712,7 @@ app.post('/api/admin/training/start', requireAdmin, async (req, res) => {
       message: 'Training job queued',
     })
   } catch (error) {
-    console.error('Error starting training job:', error)
+    logError(error as Error, { endpoint: '/api/admin/training/start' })
     res.status(500).json({ error: 'Failed to start training job' })
   }
 })
@@ -639,7 +736,7 @@ app.get('/api/admin/training/:id', requireAdmin, async (req, res) => {
 
     res.json(result.rows[0])
   } catch (error) {
-    console.error('Error fetching training job:', error)
+    logError(error as Error, { endpoint: '/api/admin/training/:id' })
     res.status(500).json({ error: 'Failed to fetch training job' })
   }
 })
@@ -659,7 +756,7 @@ app.get('/api/admin/training', requireAdmin, async (_req, res) => {
 
     res.json(result.rows)
   } catch (error) {
-    console.error('Error fetching training jobs:', error)
+    logError(error as Error, { endpoint: '/api/admin/training' })
     res.status(500).json({ error: 'Failed to fetch training jobs' })
   }
 })
@@ -679,7 +776,7 @@ app.get('/api/admin/models', requireAdmin, async (_req, res) => {
 
     res.json(result.rows)
   } catch (error) {
-    console.error('Error fetching models:', error)
+    logError(error as Error, { endpoint: '/api/admin/models' })
     res.status(500).json({ error: 'Failed to fetch models' })
   }
 })
@@ -698,14 +795,51 @@ app.post('/api/admin/models/:id/activate', requireAdmin, async (req, res) => {
     // Activate the selected model
     await pool.query('UPDATE models SET is_active = TRUE WHERE id = $1', [id])
 
+    logger.info({ msg: 'Model activated', modelId: id })
     res.json({ success: true, message: 'Model activated' })
   } catch (error) {
-    console.error('Error activating model:', error)
+    logError(error as Error, { endpoint: '/api/admin/models/:id/activate' })
     res.status(500).json({ error: 'Failed to activate model' })
+  }
+})
+
+/**
+ * POST /api/admin/cleanup/run - Manually triggers cleanup jobs.
+ * Runs soft-delete cleanup, flagged archival, and orphan detection.
+ */
+app.post('/api/admin/cleanup/run', requireAdmin, async (req, res) => {
+  const reqLogger = createChildLogger({ endpoint: '/api/admin/cleanup/run' })
+
+  try {
+    const config: Partial<LifecycleConfig> = {
+      dryRun: req.body.dryRun ?? false,
+      batchSize: req.body.batchSize ?? 100,
+    }
+
+    reqLogger.info({ msg: 'Starting manual cleanup', config })
+
+    const results = await runAllCleanupJobs(config)
+
+    const totalDeleted = results.reduce((sum, r) => sum + r.deletedCount, 0)
+    const totalErrors = results.reduce((sum, r) => sum + r.errorCount, 0)
+
+    res.json({
+      success: true,
+      totalDeleted,
+      totalErrors,
+      results,
+    })
+  } catch (error) {
+    logError(error as Error, { endpoint: '/api/admin/cleanup/run' })
+    res.status(500).json({ error: 'Failed to run cleanup jobs' })
   }
 })
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Admin service running on http://localhost:${PORT}`)
+  logger.info({
+    msg: 'Admin service started',
+    port: PORT,
+    env: process.env.NODE_ENV || 'development',
+  })
 })

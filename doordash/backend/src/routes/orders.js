@@ -5,6 +5,22 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import { haversineDistance, calculateETA } from '../utils/geo.js';
 import { broadcast, broadcastToChannels } from '../websocket.js';
 
+// Shared modules
+import logger from '../shared/logger.js';
+import {
+  ordersTotal,
+  ordersActive,
+  orderStatusTransitions,
+  orderPlacementDuration,
+  deliveryDuration,
+  etaAccuracy,
+  driverMatchDuration,
+  driverAssignmentsTotal,
+} from '../shared/metrics.js';
+import { auditOrderCreated, auditOrderStatusChange, auditDriverAssigned, ACTOR_TYPES } from '../shared/audit.js';
+import { idempotencyMiddleware, IDEMPOTENCY_KEYS, clearIdempotencyKey } from '../shared/idempotency.js';
+import { getDriverMatchCircuitBreaker } from '../shared/circuit-breaker.js';
+
 const router = Router();
 
 const TAX_RATE = 0.0875; // 8.75% tax
@@ -21,22 +37,28 @@ const ORDER_TRANSITIONS = {
   CANCELLED: { next: [], actor: null },
 };
 
-// Place a new order
-router.post('/', requireAuth, async (req, res) => {
+// Place a new order - with idempotency to prevent duplicate orders
+router.post('/', requireAuth, idempotencyMiddleware(IDEMPOTENCY_KEYS.ORDER_CREATE), async (req, res) => {
+  const startTime = Date.now();
+
   try {
     const { restaurantId, items, deliveryAddress, deliveryInstructions, tip = 0 } = req.body;
 
     if (!restaurantId || !items || !items.length || !deliveryAddress) {
+      // Clear idempotency key on validation error so client can retry
+      await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
       return res.status(400).json({ error: 'Restaurant, items, and delivery address are required' });
     }
 
     if (!deliveryAddress.lat || !deliveryAddress.lon || !deliveryAddress.address) {
+      await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
       return res.status(400).json({ error: 'Delivery address must include lat, lon, and address' });
     }
 
     // Get restaurant
     const restaurantResult = await query('SELECT * FROM restaurants WHERE id = $1', [restaurantId]);
     if (restaurantResult.rows.length === 0) {
+      await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     const restaurant = restaurantResult.rows[0];
@@ -57,9 +79,11 @@ router.post('/', requireAuth, async (req, res) => {
     for (const item of items) {
       const menuItem = menuItems.get(item.menuItemId);
       if (!menuItem) {
+        await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
       if (!menuItem.is_available) {
+        await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
         return res.status(400).json({ error: `${menuItem.name} is not available` });
       }
 
@@ -76,6 +100,7 @@ router.post('/', requireAuth, async (req, res) => {
 
     // Check minimum order
     if (subtotal < parseFloat(restaurant.min_order)) {
+      await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
       return res.status(400).json({
         error: `Minimum order is $${restaurant.min_order}`,
       });
@@ -116,6 +141,31 @@ router.post('/', requireAuth, async (req, res) => {
 
     // Get full order details
     const fullOrder = await getOrderWithDetails(order.id);
+    fullOrder.items = orderItems;
+
+    // Record metrics
+    ordersTotal.inc({ status: 'PLACED', restaurant_id: restaurantId.toString() });
+    ordersActive.inc({ status: 'PLACED' });
+    orderPlacementDuration.observe((Date.now() - startTime) / 1000);
+
+    // Create audit log
+    await auditOrderCreated(
+      fullOrder,
+      { type: ACTOR_TYPES.CUSTOMER, id: req.user.id },
+      {
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        idempotencyKey: req.idempotencyKey,
+      }
+    );
+
+    logger.info({
+      orderId: order.id,
+      customerId: req.user.id,
+      restaurantId,
+      total: order.total,
+      itemCount: orderItems.length,
+    }, 'Order placed');
 
     // Notify restaurant via WebSocket
     broadcast(`restaurant:${restaurantId}:orders`, {
@@ -125,7 +175,9 @@ router.post('/', requireAuth, async (req, res) => {
 
     res.status(201).json({ order: fullOrder });
   } catch (err) {
-    console.error('Place order error:', err);
+    // Clear idempotency key on error so client can retry
+    await clearIdempotencyKey(IDEMPOTENCY_KEYS.ORDER_CREATE, req.idempotencyKey);
+    logger.error({ error: err.message, stack: err.stack }, 'Place order error');
     res.status(500).json({ error: 'Failed to place order' });
   }
 });
@@ -152,7 +204,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 
     res.json({ order });
   } catch (err) {
-    console.error('Get order error:', err);
+    logger.error({ error: err.message, orderId: req.params.id }, 'Get order error');
     res.status(500).json({ error: 'Failed to get order' });
   }
 });
@@ -182,7 +234,7 @@ router.get('/', requireAuth, async (req, res) => {
 
     res.json({ orders: result.rows });
   } catch (err) {
-    console.error('Get orders error:', err);
+    logger.error({ error: err.message }, 'Get orders error');
     res.status(500).json({ error: 'Failed to get orders' });
   }
 });
@@ -198,6 +250,8 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    const previousStatus = order.status;
+
     // Validate transition
     const currentTransition = ORDER_TRANSITIONS[order.status];
     if (!currentTransition.next.includes(status)) {
@@ -212,12 +266,14 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
     const isDriver = order.driver?.user_id === req.user.id;
     const isAdmin = req.user.role === 'admin';
 
+    let actorType = ACTOR_TYPES.SYSTEM;
+
     // Special case: customer can cancel only in PLACED status
     if (status === 'CANCELLED') {
       if (order.status === 'PLACED' && isCustomer) {
-        // OK
+        actorType = ACTOR_TYPES.CUSTOMER;
       } else if (isRestaurantOwner || isAdmin) {
-        // Restaurant can cancel
+        actorType = isRestaurantOwner ? ACTOR_TYPES.RESTAURANT : ACTOR_TYPES.ADMIN;
       } else {
         return res.status(403).json({ error: 'Not authorized to cancel this order' });
       }
@@ -229,6 +285,11 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
       if (currentTransition.actor === 'driver' && !isDriver && !isAdmin) {
         return res.status(403).json({ error: 'Only driver can update this status' });
       }
+      actorType = isRestaurantOwner
+        ? ACTOR_TYPES.RESTAURANT
+        : isDriver
+          ? ACTOR_TYPES.DRIVER
+          : ACTOR_TYPES.ADMIN;
     }
 
     // Update status
@@ -256,10 +317,52 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
 
     await query(`UPDATE orders SET ${updateFields.join(', ')} WHERE id = $1`, params);
 
+    // Update metrics
+    orderStatusTransitions.inc({ from_status: previousStatus, to_status: status });
+    ordersActive.dec({ status: previousStatus });
+    if (!['DELIVERED', 'COMPLETED', 'CANCELLED'].includes(status)) {
+      ordersActive.inc({ status });
+    }
+
+    // If delivered, record delivery time metrics
+    if (status === 'DELIVERED' && order.placed_at) {
+      const deliveryTimeMinutes = (Date.now() - new Date(order.placed_at).getTime()) / 60000;
+      deliveryDuration.observe(deliveryTimeMinutes);
+
+      // Calculate ETA accuracy if we had an estimate
+      if (order.estimated_delivery_at) {
+        const estimatedTime = new Date(order.estimated_delivery_at).getTime();
+        const actualTime = Date.now();
+        const diffMinutes = (actualTime - estimatedTime) / 60000;
+        etaAccuracy.observe(diffMinutes);
+      }
+    }
+
     // If confirmed, start driver matching
     if (status === 'CONFIRMED') {
       await matchDriverToOrder(id);
     }
+
+    // Create audit log
+    await auditOrderStatusChange(
+      order,
+      previousStatus,
+      status,
+      { type: actorType, id: req.user.id },
+      {
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        cancelReason: status === 'CANCELLED' ? cancelReason : undefined,
+      }
+    );
+
+    logger.info({
+      orderId: id,
+      fromStatus: previousStatus,
+      toStatus: status,
+      actorType,
+      actorId: req.user.id,
+    }, 'Order status updated');
 
     // Get updated order
     const updatedOrder = await getOrderWithDetails(id);
@@ -285,7 +388,7 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
 
     res.json({ order: updatedOrder, eta });
   } catch (err) {
-    console.error('Update order status error:', err);
+    logger.error({ error: err.message, orderId: req.params.id }, 'Update order status error');
     res.status(500).json({ error: 'Failed to update order status' });
   }
 });
@@ -337,7 +440,7 @@ router.get('/restaurant/:restaurantId', requireAuth, requireRole('restaurant_own
 
     res.json({ orders });
   } catch (err) {
-    console.error('Get restaurant orders error:', err);
+    logger.error({ error: err.message, restaurantId: req.params.restaurantId }, 'Get restaurant orders error');
     res.status(500).json({ error: 'Failed to get orders' });
   }
 });
@@ -394,64 +497,100 @@ async function getOrderWithDetails(orderId) {
   return order;
 }
 
-// Helper: Match a driver to an order
+// Helper: Match a driver to an order (with circuit breaker)
 async function matchDriverToOrder(orderId) {
-  const order = await getOrderWithDetails(orderId);
-  if (!order || order.driver_id) {
-    return; // Already has driver or order not found
-  }
+  const startTime = Date.now();
+  const breaker = getDriverMatchCircuitBreaker();
 
-  // Find nearby available drivers using Redis geo
-  const nearbyDrivers = await findNearbyDrivers(order.restaurant.lat, order.restaurant.lon, 5);
+  try {
+    const result = await breaker.fire(async () => {
+      const order = await getOrderWithDetails(orderId);
+      if (!order || order.driver_id) {
+        return { matched: false, reason: 'already_matched' };
+      }
 
-  if (nearbyDrivers.length === 0) {
-    console.log(`No drivers available for order ${orderId}`);
-    return;
-  }
+      // Find nearby available drivers using Redis geo
+      const nearbyDrivers = await findNearbyDrivers(order.restaurant.lat, order.restaurant.lon, 5);
 
-  // Score drivers
-  const scoredDrivers = await Promise.all(
-    nearbyDrivers.map(async (d) => {
-      const driver = await query(
-        `SELECT d.*, u.name FROM drivers d JOIN users u ON d.user_id = u.id WHERE d.id = $1`,
-        [d.id]
+      if (nearbyDrivers.length === 0) {
+        logger.warn({ orderId }, 'No drivers available for order');
+        return { matched: false, reason: 'no_drivers' };
+      }
+
+      // Score drivers
+      const scoredDrivers = await Promise.all(
+        nearbyDrivers.map(async (d) => {
+          const driver = await query(
+            `SELECT d.*, u.name FROM drivers d JOIN users u ON d.user_id = u.id WHERE d.id = $1`,
+            [d.id]
+          );
+          if (driver.rows.length === 0) return null;
+
+          const driverData = driver.rows[0];
+          const score = calculateMatchScore(driverData, order, d.distance);
+          return { driver: driverData, score, distance: d.distance };
+        })
       );
-      if (driver.rows.length === 0) return null;
 
-      const driverData = driver.rows[0];
-      const score = calculateMatchScore(driverData, order, d.distance);
-      return { driver: driverData, score, distance: d.distance };
-    })
-  );
+      const validDrivers = scoredDrivers.filter((d) => d !== null).sort((a, b) => b.score - a.score);
 
-  const validDrivers = scoredDrivers.filter((d) => d !== null).sort((a, b) => b.score - a.score);
+      if (validDrivers.length === 0) {
+        return { matched: false, reason: 'no_valid_drivers' };
+      }
 
-  if (validDrivers.length === 0) {
-    return;
+      // Assign best driver
+      const bestMatch = validDrivers[0];
+      await query(
+        `UPDATE orders SET driver_id = $1, updated_at = NOW() WHERE id = $2`,
+        [bestMatch.driver.id, orderId]
+      );
+
+      // Mark driver as unavailable
+      await query(`UPDATE drivers SET is_available = false WHERE id = $1`, [bestMatch.driver.id]);
+
+      // Calculate ETA
+      const eta = calculateETA(order, bestMatch.driver, order.restaurant);
+      await query('UPDATE orders SET estimated_delivery_at = $1 WHERE id = $2', [eta.eta, orderId]);
+
+      // Create audit log for driver assignment
+      await auditDriverAssigned(orderId, bestMatch.driver.id, {
+        score: bestMatch.score,
+        distance: bestMatch.distance,
+      });
+
+      // Notify driver
+      broadcast(`driver:${bestMatch.driver.user_id}:orders`, {
+        type: 'order_assigned',
+        order: await getOrderWithDetails(orderId),
+        eta,
+      });
+
+      logger.info({
+        orderId,
+        driverId: bestMatch.driver.id,
+        score: bestMatch.score,
+        distance: bestMatch.distance,
+      }, 'Driver assigned to order');
+
+      return { matched: true, driverId: bestMatch.driver.id };
+    });
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    driverMatchDuration.observe(duration);
+
+    if (result.matched) {
+      driverAssignmentsTotal.inc({ result: 'success' });
+    } else {
+      driverAssignmentsTotal.inc({ result: result.reason || 'no_drivers' });
+    }
+
+    return result;
+  } catch (error) {
+    logger.error({ error: error.message, orderId }, 'Driver matching failed');
+    driverAssignmentsTotal.inc({ result: 'error' });
+    return { matched: false, reason: 'error', error: error.message };
   }
-
-  // Assign best driver
-  const bestMatch = validDrivers[0];
-  await query(
-    `UPDATE orders SET driver_id = $1, updated_at = NOW() WHERE id = $2`,
-    [bestMatch.driver.id, orderId]
-  );
-
-  // Mark driver as unavailable
-  await query(`UPDATE drivers SET is_available = false WHERE id = $1`, [bestMatch.driver.id]);
-
-  // Calculate ETA
-  const eta = calculateETA(order, bestMatch.driver, order.restaurant);
-  await query('UPDATE orders SET estimated_delivery_at = $1 WHERE id = $2', [eta.eta, orderId]);
-
-  // Notify driver
-  broadcast(`driver:${bestMatch.driver.user_id}:orders`, {
-    type: 'order_assigned',
-    order: await getOrderWithDetails(orderId),
-    eta,
-  });
-
-  console.log(`Assigned driver ${bestMatch.driver.id} to order ${orderId}`);
 }
 
 // Helper: Find nearby drivers using Redis geo
@@ -485,7 +624,7 @@ async function findNearbyDrivers(lat, lon, radiusKm) {
 
     return availableDrivers;
   } catch (err) {
-    console.error('Find nearby drivers error:', err);
+    logger.warn({ error: err.message }, 'Redis geo search failed, falling back to database');
     // Fallback to database query
     const result = await query(
       `SELECT id, current_lat, current_lon FROM drivers

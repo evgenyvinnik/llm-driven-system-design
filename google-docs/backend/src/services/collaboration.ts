@@ -5,6 +5,21 @@ import pool from '../utils/db.js';
 import redis, { redisPub, redisSub } from '../utils/redis.js';
 import { transform, transformOperations } from './ot.js';
 import type { Operation, PresenceState, WSMessage, UserPublic } from '../types/index.js';
+import logger, { createChildLogger } from '../shared/logger.js';
+import {
+  activeDocumentsGauge,
+  activeCollaboratorsGauge,
+  syncLatencyHistogram,
+  operationsCounter,
+  conflictsCounter,
+  recordCacheAccess,
+} from '../shared/metrics.js';
+import { createCircuitBreaker, OT_SYNC_OPTIONS, isCircuitOpen } from '../shared/circuitBreaker.js';
+import {
+  getIdempotencyResult,
+  setIdempotencyResult,
+  generateOperationKey,
+} from '../shared/idempotency.js';
 
 /**
  * Represents a connected WebSocket client with their session info.
@@ -40,6 +55,77 @@ const clients = new Map<WebSocket, ClientConnection>();
 const serverId = Math.random().toString(36).substring(7);
 
 /**
+ * Circuit breaker wrapped database persist function.
+ * Protects against slow/failing database during high load.
+ */
+async function persistOperationToDb(
+  documentId: string,
+  version: number,
+  operation: Operation[],
+  userId: string
+): Promise<void> {
+  // Store operation
+  await pool.query(
+    `INSERT INTO operations (document_id, version_number, operation, user_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (document_id, version_number) DO NOTHING`,
+    [documentId, version, JSON.stringify(operation), userId]
+  );
+
+  // Update document version
+  await pool.query(
+    `UPDATE documents SET current_version = $1, updated_at = NOW() WHERE id = $2`,
+    [version, documentId]
+  );
+
+  // Create snapshot every 100 versions
+  if (version % 100 === 0) {
+    const docResult = await pool.query(
+      'SELECT content FROM documents WHERE id = $1',
+      [documentId]
+    );
+
+    if (docResult.rows.length > 0) {
+      await pool.query(
+        `INSERT INTO document_versions (document_id, version_number, content, created_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (document_id, version_number) DO NOTHING`,
+        [documentId, version, docResult.rows[0].content, userId]
+      );
+    }
+  }
+}
+
+const persistCircuitBreaker = createCircuitBreaker(
+  'db-persist',
+  persistOperationToDb,
+  OT_SYNC_OPTIONS
+);
+
+/**
+ * Circuit breaker wrapped Redis publish function.
+ */
+async function publishToRedis(channel: string, message: string): Promise<void> {
+  await redisPub.publish(channel, message);
+}
+
+const redisPublishCircuitBreaker = createCircuitBreaker(
+  'redis-publish',
+  publishToRedis,
+  OT_SYNC_OPTIONS
+);
+
+/**
+ * Returns current collaboration statistics for health checks.
+ */
+export function getCollaborationStats(): { activeDocuments: number; activeConnections: number } {
+  return {
+    activeDocuments: documents.size,
+    activeConnections: clients.size,
+  };
+}
+
+/**
  * Initializes the WebSocket server for real-time collaboration.
  * Sets up Redis pub/sub for cross-server communication.
  * Handles client connections, authentication, and message routing.
@@ -47,7 +133,7 @@ const serverId = Math.random().toString(36).substring(7);
  * @param wss - The WebSocket server instance to configure
  */
 export function initWebSocket(wss: WebSocketServer): void {
-  console.log(`WebSocket server initialized (server: ${serverId})`);
+  logger.info({ serverId }, 'WebSocket server initialized');
 
   // Subscribe to Redis channels for cross-server communication
   redisSub.subscribe('doc:operations', 'doc:presence');
@@ -73,18 +159,22 @@ export function initWebSocket(wss: WebSocketServer): void {
         }, null);
       }
     } catch (error) {
-      console.error('Redis message error:', error);
+      logger.error({ error, channel }, 'Redis message parsing error');
     }
   });
 
   wss.on('connection', async (ws: WebSocket, request: IncomingMessage) => {
-    console.log('New WebSocket connection');
+    const connectionId = Math.random().toString(36).substring(7);
+    const connLogger = createChildLogger({ connectionId });
+
+    connLogger.debug('New WebSocket connection attempt');
 
     // Parse token from query string
     const url = parseUrl(request.url || '', true);
     const token = url.query.token as string;
 
     if (!token) {
+      connLogger.warn('Connection rejected: no token');
       ws.close(4001, 'Authentication required');
       return;
     }
@@ -93,11 +183,16 @@ export function initWebSocket(wss: WebSocketServer): void {
     const sessionData = await redis.get(`session:${token}`);
 
     if (!sessionData) {
+      recordCacheAccess('session', false);
+      connLogger.warn('Connection rejected: invalid session');
       ws.close(4001, 'Invalid session');
       return;
     }
 
+    recordCacheAccess('session', true);
     const user = JSON.parse(sessionData) as UserPublic;
+
+    connLogger.info({ userId: user.id, userName: user.name }, 'WebSocket authenticated');
 
     // Register client
     clients.set(ws, {
@@ -106,6 +201,9 @@ export function initWebSocket(wss: WebSocketServer): void {
       documentId: null,
       lastActivity: Date.now(),
     });
+
+    // Update metrics
+    activeCollaboratorsGauge.set(clients.size);
 
     // Handle messages
     ws.on('message', (data) => handleMessage(ws, data.toString()));
@@ -116,10 +214,13 @@ export function initWebSocket(wss: WebSocketServer): void {
         handleLeaveDocument(ws, client.documentId);
       }
       clients.delete(ws);
+      activeCollaboratorsGauge.set(clients.size);
+
+      connLogger.info({ userId: user.id }, 'WebSocket disconnected');
     });
 
     ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      connLogger.error({ error: error.message }, 'WebSocket error');
     });
 
     // Send welcome message
@@ -131,6 +232,7 @@ export function initWebSocket(wss: WebSocketServer): void {
     const now = Date.now();
     for (const [ws, client] of clients) {
       if (now - client.lastActivity > 60000) {
+        logger.debug({ userId: client.user.id }, 'Closing inactive connection');
         ws.close(4002, 'Inactive');
       }
     }
@@ -178,7 +280,7 @@ async function handleMessage(ws: WebSocket, message: string): Promise<void> {
         ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   } catch (error) {
-    console.error('Message handling error:', error);
+    logger.error({ error, userId: client.user.id }, 'Message handling error');
     ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid message format' }));
   }
 }
@@ -198,6 +300,12 @@ async function handleSubscribe(
   client: ClientConnection,
   documentId: string
 ): Promise<void> {
+  const opLogger = createChildLogger({
+    userId: client.user.id,
+    documentId,
+    action: 'subscribe',
+  });
+
   // Check permission
   const permCheck = await pool.query(
     `SELECT d.owner_id, d.current_version, d.content, dp.permission_level
@@ -208,6 +316,7 @@ async function handleSubscribe(
   );
 
   if (permCheck.rows.length === 0) {
+    opLogger.warn('Subscribe failed: document not found');
     ws.send(JSON.stringify({ type: 'ERROR', code: 'NOT_FOUND', error: 'Document not found' }));
     return;
   }
@@ -215,6 +324,7 @@ async function handleSubscribe(
   const { owner_id, current_version, content, permission_level } = permCheck.rows[0];
 
   if (owner_id !== client.user.id && !permission_level) {
+    opLogger.warn('Subscribe failed: access denied');
     ws.send(JSON.stringify({ type: 'ERROR', code: 'ACCESS_DENIED', error: 'Access denied' }));
     return;
   }
@@ -234,6 +344,7 @@ async function handleSubscribe(
       operationLog: [],
       presence: new Map(),
     });
+    activeDocumentsGauge.set(documents.size);
   }
 
   const docState = documents.get(documentId)!;
@@ -249,6 +360,11 @@ async function handleSubscribe(
   };
 
   docState.presence.set(client.user.id, presence);
+
+  opLogger.info({
+    version: docState.version,
+    activeUsers: docState.presence.size,
+  }, 'User subscribed to document');
 
   // Send sync message with current document state
   ws.send(JSON.stringify({
@@ -282,6 +398,12 @@ function handleLeaveDocument(ws: WebSocket, documentId: string): void {
   if (docState) {
     docState.presence.delete(client.user.id);
 
+    logger.debug({
+      userId: client.user.id,
+      documentId,
+      remainingUsers: docState.presence.size,
+    }, 'User left document');
+
     // Broadcast user left
     broadcastToDocument(documentId, {
       type: 'PRESENCE',
@@ -290,6 +412,12 @@ function handleLeaveDocument(ws: WebSocket, documentId: string): void {
         left: true,
       },
     }, ws);
+
+    // Clean up empty document states
+    if (docState.presence.size === 0) {
+      documents.delete(documentId);
+      activeDocumentsGauge.set(documents.size);
+    }
   }
 
   client.documentId = null;
@@ -298,6 +426,7 @@ function handleLeaveDocument(ws: WebSocket, documentId: string): void {
 /**
  * Handles an edit operation from a client.
  * Transforms the operation against any concurrent operations (OT).
+ * Uses idempotency keys to prevent duplicate operations on retry.
  * Broadcasts to other clients and persists to database.
  *
  * @param ws - The WebSocket connection sending the operation
@@ -309,38 +438,92 @@ async function handleOperation(
   client: ClientConnection,
   msg: WSMessage
 ): Promise<void> {
+  const startTime = Date.now();
   const documentId = client.documentId;
   if (!documentId || !msg.operation) return;
 
   const docState = documents.get(documentId);
   if (!docState) return;
 
+  const opLogger = createChildLogger({
+    userId: client.user.id,
+    documentId,
+    action: 'operation',
+  });
+
+  // Check idempotency if operation ID provided
+  const operationId = (msg.data as { operationId?: string })?.operationId;
+  if (operationId) {
+    const idempotencyKey = generateOperationKey(client.user.id, documentId, operationId);
+    const cachedResult = await getIdempotencyResult(idempotencyKey);
+
+    if (cachedResult) {
+      opLogger.debug({ operationId }, 'Duplicate operation detected (idempotency hit)');
+      // Return the cached ACK
+      ws.send(JSON.stringify(cachedResult.result));
+      return;
+    }
+  }
+
   const clientVersion = msg.version || 0;
 
   // Transform operation against any operations the client hasn't seen
   let transformedOps = msg.operation;
+  let hadConflicts = false;
 
   if (clientVersion < docState.version) {
     const missedOps = docState.operationLog.slice(clientVersion);
     for (const serverOps of missedOps) {
       transformedOps = transformOperations(transformedOps, serverOps);
     }
+    hadConflicts = true;
+    conflictsCounter.inc();
+    opLogger.debug({
+      clientVersion,
+      serverVersion: docState.version,
+      missedOps: missedOps.length,
+    }, 'OT conflict resolved');
   }
 
   // Increment version and store operation
   docState.version++;
   docState.operationLog.push(transformedOps);
 
+  // Track operation types for metrics
+  for (const op of transformedOps) {
+    operationsCounter.inc({ operation_type: op.type });
+  }
+
   // Limit operation log size (keep last 1000 operations)
   if (docState.operationLog.length > 1000) {
     docState.operationLog = docState.operationLog.slice(-500);
   }
 
-  // Acknowledge to sender
-  ws.send(JSON.stringify({
+  // Prepare ACK message
+  const ackMessage = {
     type: 'ACK',
     version: docState.version,
-  }));
+  };
+
+  // Acknowledge to sender
+  ws.send(JSON.stringify(ackMessage));
+
+  // Store idempotency result if key provided
+  if (operationId) {
+    const idempotencyKey = generateOperationKey(client.user.id, documentId, operationId);
+    await setIdempotencyResult(idempotencyKey, ackMessage);
+  }
+
+  // Record sync latency
+  const latencyMs = Date.now() - startTime;
+  syncLatencyHistogram.observe({ operation_type: transformedOps[0]?.type || 'unknown' }, latencyMs);
+
+  opLogger.debug({
+    version: docState.version,
+    latencyMs,
+    hadConflicts,
+    operationCount: transformedOps.length,
+  }, 'Operation processed');
 
   // Broadcast to other clients in document
   broadcastToDocument(documentId, {
@@ -353,17 +536,25 @@ async function handleOperation(
     },
   }, ws);
 
-  // Publish to Redis for other servers
-  redisPub.publish('doc:operations', JSON.stringify({
-    serverId,
-    docId: documentId,
-    version: docState.version,
-    operation: transformedOps,
-    userId: client.user.id,
-    userName: client.user.name,
-  }));
+  // Publish to Redis for other servers (with circuit breaker)
+  try {
+    await redisPublishCircuitBreaker.fire('doc:operations', JSON.stringify({
+      serverId,
+      docId: documentId,
+      version: docState.version,
+      operation: transformedOps,
+      userId: client.user.id,
+      userName: client.user.name,
+    }));
+  } catch (error) {
+    if (isCircuitOpen(error)) {
+      opLogger.warn('Redis publish circuit open, operation not broadcast to other servers');
+    } else {
+      opLogger.error({ error }, 'Failed to publish operation to Redis');
+    }
+  }
 
-  // Persist operation (debounced)
+  // Persist operation (debounced with circuit breaker)
   debouncedPersist(documentId, docState.version, transformedOps, client.user.id);
 }
 
@@ -400,12 +591,14 @@ function handlePresence(ws: WebSocket, client: ClientConnection, msg: WSMessage)
     data: presence,
   }, ws);
 
-  // Publish to Redis for other servers
+  // Publish to Redis for other servers (fire and forget, no circuit breaker for presence)
   redisPub.publish('doc:presence', JSON.stringify({
     serverId,
     docId: documentId,
     presence,
-  }));
+  })).catch((error) => {
+    logger.trace({ error, documentId }, 'Failed to publish presence to Redis');
+  });
 }
 
 /**
@@ -425,7 +618,9 @@ function broadcastPresence(documentId: string, presence: PresenceState): void {
     serverId,
     docId: documentId,
     presence,
-  }));
+  })).catch((error) => {
+    logger.trace({ error, documentId }, 'Failed to publish presence to Redis');
+  });
 }
 
 /**
@@ -456,7 +651,7 @@ const persistTimers = new Map<string, NodeJS.Timeout>();
 /**
  * Debounces database persistence of operations.
  * Batches rapid edits to reduce database writes.
- * Creates automatic version snapshots every 100 versions.
+ * Uses circuit breaker to protect against slow/failing database.
  *
  * @param documentId - The document UUID
  * @param version - The new version number
@@ -476,38 +671,18 @@ function debouncedPersist(
 
   persistTimers.set(documentId, setTimeout(async () => {
     try {
-      // Store operation
-      await pool.query(
-        `INSERT INTO operations (document_id, version_number, operation, user_id)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (document_id, version_number) DO NOTHING`,
-        [documentId, version, JSON.stringify(operation), userId]
-      );
-
-      // Update document version
-      await pool.query(
-        `UPDATE documents SET current_version = $1, updated_at = NOW() WHERE id = $2`,
-        [version, documentId]
-      );
-
-      // Create snapshot every 100 versions
-      if (version % 100 === 0) {
-        const docResult = await pool.query(
-          'SELECT content FROM documents WHERE id = $1',
-          [documentId]
-        );
-
-        if (docResult.rows.length > 0) {
-          await pool.query(
-            `INSERT INTO document_versions (document_id, version_number, content, created_by)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (document_id, version_number) DO NOTHING`,
-            [documentId, version, docResult.rows[0].content, userId]
-          );
-        }
-      }
+      await persistCircuitBreaker.fire(documentId, version, operation, userId);
+      logger.debug({ documentId, version }, 'Operation persisted to database');
     } catch (error) {
-      console.error('Persist error:', error);
+      if (isCircuitOpen(error)) {
+        logger.warn({ documentId, version }, 'Database persist circuit open, operation queued');
+        // Retry after circuit reset
+        setTimeout(() => {
+          debouncedPersist(documentId, version, operation, userId);
+        }, 15000);
+      } else {
+        logger.error({ error, documentId, version }, 'Failed to persist operation');
+      }
     }
 
     persistTimers.delete(documentId);

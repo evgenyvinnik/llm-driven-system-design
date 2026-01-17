@@ -4,6 +4,7 @@ import { listCommentsByPost } from '../models/comment.js';
 import { findSubredditByName } from '../models/subreddit.js';
 import { getUserVote, getUserVotesForPosts, getUserVotesForComments } from '../models/vote.js';
 import { requireAuth } from '../middleware/auth.js';
+import logger from '../shared/logger.js';
 
 const router = express.Router();
 
@@ -27,7 +28,7 @@ router.get('/', async (req, res) => {
 
     res.json(posts);
   } catch (error) {
-    console.error('Get posts error:', error);
+    logger.error({ err: error }, 'Get posts error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -58,7 +59,7 @@ router.post('/r/:subreddit', requireAuth, async (req, res) => {
       subreddit_name: subreddit.name,
     });
   } catch (error) {
-    console.error('Create post error:', error);
+    logger.error({ err: error, userId: req.user?.id }, 'Create post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -83,7 +84,7 @@ router.get('/:id', async (req, res) => {
 
     res.json(post);
   } catch (error) {
-    console.error('Get post error:', error);
+    logger.error({ err: error }, 'Get post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -135,7 +136,7 @@ router.get('/:id/comments', async (req, res) => {
 
     res.json({ post, comments });
   } catch (error) {
-    console.error('Get post comments error:', error);
+    logger.error({ err: error }, 'Get post comments error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

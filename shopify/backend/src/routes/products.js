@@ -1,4 +1,9 @@
 import { query, queryWithTenant } from '../services/db.js';
+import logger from '../services/logger.js';
+import { logInventoryChange, createAuditLog, AuditAction, ActorType } from '../services/audit.js';
+import { publishInventoryUpdated } from '../services/rabbitmq.js';
+import { inventoryLevel, inventoryLow, inventoryOutOfStock } from '../services/metrics.js';
+import config from '../config/index.js';
 
 // List products for store (admin)
 export async function listProducts(req, res) {
@@ -204,6 +209,19 @@ export async function updateVariant(req, res) {
   const { variantId } = req.params;
   const { sku, title, price, compare_at_price, inventory_quantity, options } = req.body;
 
+  // Get current state for audit logging if inventory is changing
+  let oldInventoryQuantity = null;
+  if (inventory_quantity !== undefined) {
+    const currentResult = await queryWithTenant(
+      storeId,
+      'SELECT inventory_quantity, sku FROM variants WHERE id = $1',
+      [variantId]
+    );
+    if (currentResult.rows.length > 0) {
+      oldInventoryQuantity = currentResult.rows[0].inventory_quantity;
+    }
+  }
+
   const updates = [];
   const values = [];
   let paramCount = 1;
@@ -251,7 +269,52 @@ export async function updateVariant(req, res) {
     return res.status(404).json({ error: 'Variant not found' });
   }
 
-  res.json({ variant: result.rows[0] });
+  const variant = result.rows[0];
+
+  // If inventory was updated, log it and update metrics
+  if (inventory_quantity !== undefined && oldInventoryQuantity !== null && oldInventoryQuantity !== inventory_quantity) {
+    const auditContext = {
+      storeId,
+      userId: req.user?.id,
+      userType: req.user?.role || ActorType.MERCHANT,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+    };
+
+    // Audit log the inventory change
+    await logInventoryChange(
+      auditContext,
+      variantId,
+      oldInventoryQuantity,
+      inventory_quantity,
+      'manual_adjustment'
+    );
+
+    // Update inventory metrics
+    inventoryLevel.set(
+      { store_id: storeId.toString(), variant_id: variantId.toString(), sku: variant.sku || '' },
+      inventory_quantity
+    );
+
+    // Check for low/out of stock
+    if (inventory_quantity === 0) {
+      inventoryOutOfStock.inc({ store_id: storeId.toString(), variant_id: variantId.toString() });
+    } else if (inventory_quantity < config.inventory.lowStockThreshold) {
+      inventoryLow.inc({ store_id: storeId.toString(), variant_id: variantId.toString() });
+    }
+
+    // Publish inventory update event
+    await publishInventoryUpdated(storeId, variantId, oldInventoryQuantity, inventory_quantity);
+
+    logger.info({
+      storeId,
+      variantId,
+      oldQuantity: oldInventoryQuantity,
+      newQuantity: inventory_quantity,
+    }, 'Inventory manually adjusted');
+  }
+
+  res.json({ variant });
 }
 
 // Add variant to product

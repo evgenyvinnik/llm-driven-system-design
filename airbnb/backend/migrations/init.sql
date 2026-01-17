@@ -266,3 +266,28 @@ CREATE TRIGGER check_publish_reviews_trigger
     AFTER INSERT ON reviews
     FOR EACH ROW
     EXECUTE FUNCTION check_and_publish_reviews();
+
+-- Audit logs table for tracking all booking and listing changes
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  event_type VARCHAR(100) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  resource_type VARCHAR(50) NOT NULL,
+  resource_id INTEGER,
+  action VARCHAR(50) NOT NULL,
+  outcome VARCHAR(20) NOT NULL DEFAULT 'success' CHECK (outcome IN ('success', 'failure', 'denied')),
+  ip_address VARCHAR(45),
+  user_agent TEXT,
+  session_id VARCHAR(255),
+  request_id VARCHAR(255),
+  metadata JSONB DEFAULT '{}',
+  before_state JSONB,
+  after_state JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_logs_event_type ON audit_logs(event_type);
+CREATE INDEX idx_audit_logs_user_id ON audit_logs(user_id);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
+CREATE INDEX idx_audit_logs_request_id ON audit_logs(request_id);
