@@ -42,3 +42,25 @@ yarn-error.log*
 tmp/
 temp/
 *.tmp
+
+# ===================
+# Node.js / JavaScript
+# ===================
+node_modules/
+dist/
+build/
+.cache/
+coverage/
+*.tsbuildinfo
+
+# ===================
+# Package Managers
+# ===================
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# ===================
+# Docker
+# ===================
+*.pid
