@@ -3,6 +3,7 @@ import cors from 'cors'
 import { pool } from '../shared/db.js'
 import { publishTrainingJob } from '../shared/queue.js'
 import { getDrawing } from '../shared/storage.js'
+import { cacheGet, cacheSet, cacheDelete, CacheKeys } from '../shared/cache.js'
 import { v4 as uuidv4 } from 'uuid'
 
 const app = express()
@@ -31,9 +32,16 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'admin' })
 })
 
-// Dashboard stats
+// Dashboard stats (cached for 30 seconds)
 app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
   try {
+    // Check cache first
+    const cacheKey = CacheKeys.adminStats()
+    const cached = await cacheGet<object>(cacheKey)
+    if (cached) {
+      return res.json(cached)
+    }
+
     // Total drawings
     const totalDrawings = await pool.query('SELECT COUNT(*) as count FROM drawings')
 
@@ -75,7 +83,7 @@ app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
       LIMIT 5
     `)
 
-    res.json({
+    const stats = {
       total_drawings: parseInt(totalDrawings.rows[0].count),
       drawings_per_shape: perShape.rows,
       flagged_count: parseInt(flagged.rows[0].count),
@@ -83,7 +91,12 @@ app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
       total_users: parseInt(totalUsers.rows[0].count),
       active_model: activeModel.rows[0] || null,
       recent_jobs: recentJobs.rows,
-    })
+    }
+
+    // Cache for 30 seconds
+    await cacheSet(cacheKey, stats, 30)
+
+    res.json(stats)
   } catch (error) {
     console.error('Error fetching stats:', error)
     res.status(500).json({ error: 'Failed to fetch stats' })
@@ -160,6 +173,9 @@ app.post('/api/admin/drawings/:id/flag', requireAdmin, async (req, res) => {
       'UPDATE drawings SET is_flagged = $1 WHERE id = $2',
       [flagged !== false, id]
     )
+
+    // Invalidate stats cache since flagged count changed
+    await cacheDelete(CacheKeys.adminStats())
 
     res.json({ success: true })
   } catch (error) {

@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import { pool } from '../shared/db.js'
 import { uploadDrawing } from '../shared/storage.js'
+import { cacheGet, cacheSet, cacheDelete, CacheKeys } from '../shared/cache.js'
 import { v4 as uuidv4 } from 'uuid'
 
 export const app = express()
@@ -15,12 +16,23 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'collection' })
 })
 
-// Get available shapes
+// Get available shapes (cached for 5 minutes since shapes rarely change)
 app.get('/api/shapes', async (_req, res) => {
   try {
+    // Check cache first
+    const cacheKey = CacheKeys.shapes()
+    const cached = await cacheGet<object[]>(cacheKey)
+    if (cached) {
+      return res.json(cached)
+    }
+
     const result = await pool.query(
       'SELECT id, name, description, difficulty FROM shapes ORDER BY difficulty, name'
     )
+
+    // Cache for 5 minutes
+    await cacheSet(cacheKey, result.rows, 300)
+
     res.json(result.rows)
   } catch (error) {
     console.error('Error fetching shapes:', error)
@@ -117,6 +129,10 @@ app.post('/api/drawings', async (req, res) => {
       [userId]
     )
 
+    // Invalidate caches (admin stats will be stale)
+    await cacheDelete(CacheKeys.adminStats())
+    await cacheDelete(CacheKeys.userStats(submission.sessionId))
+
     res.status(201).json({
       id: drawingId,
       message: 'Drawing saved successfully',
@@ -127,13 +143,20 @@ app.post('/api/drawings', async (req, res) => {
   }
 })
 
-// Get user stats
+// Get user stats (cached for 60 seconds)
 app.get('/api/user/stats', async (req, res) => {
   try {
     const sessionId = req.query.sessionId as string
 
     if (!sessionId) {
       return res.status(400).json({ error: 'Session ID required' })
+    }
+
+    // Check cache first
+    const cacheKey = CacheKeys.userStats(sessionId)
+    const cached = await cacheGet<object>(cacheKey)
+    if (cached) {
+      return res.json(cached)
     }
 
     const result = await pool.query(
@@ -144,14 +167,17 @@ app.get('/api/user/stats', async (req, res) => {
       [sessionId]
     )
 
-    if (result.rows.length === 0) {
-      return res.json({ total_drawings: 0, today_count: 0 })
-    }
+    const stats = result.rows.length === 0
+      ? { total_drawings: 0, today_count: 0 }
+      : {
+          total_drawings: result.rows[0].total_drawings,
+          today_count: parseInt(result.rows[0].today_count),
+        }
 
-    res.json({
-      total_drawings: result.rows[0].total_drawings,
-      today_count: parseInt(result.rows[0].today_count),
-    })
+    // Cache for 60 seconds
+    await cacheSet(cacheKey, stats, 60)
+
+    res.json(stats)
   } catch (error) {
     console.error('Error fetching user stats:', error)
     res.status(500).json({ error: 'Failed to fetch stats' })

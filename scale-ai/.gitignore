@@ -1,50 +1,43 @@
-# ===================
 # Dependencies
-# ===================
 node_modules/
 .pnp/
 .pnp.js
 
-# ===================
-# Build Outputs
-# ===================
+# Build outputs
 dist/
 build/
-*.tsbuildinfo
+.next/
+out/
 
-# ===================
-# Python
-# ===================
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-.venv/
-env/
-ENV/
-*.egg-info/
-.eggs/
+# Cache
+.cache/
+.turbo/
+.parcel-cache/
 
-# ===================
-# PyTorch Models
-# ===================
-*.pt
-*.pth
-*.onnx
+# Environment
+.env
+.env.local
+.env.*.local
 
-# ===================
-# Testing
-# ===================
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage
 coverage/
 .nyc_output/
-.pytest_cache/
 
-# ===================
-# Docker Volumes
-# ===================
-postgres_data/
-minio_data/
-rabbitmq_data/
-data/
+# Misc
+*.tsbuildinfo
