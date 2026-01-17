@@ -1462,3 +1462,207 @@ The `/metrics` endpoint exposes all metrics in Prometheus format, enabling:
 | Structured logging | `utils/logger.ts` | Debugging, trace correlation |
 | Enhanced health checks | `index.ts` | Kubernetes readiness, dependency monitoring |
 | RBAC middleware | `middleware/auth.ts` | Fine-grained access control |
+
+---
+
+## Frontend Architecture
+
+This section documents the organization and structure of the LinkedIn frontend application, including component architecture, routing, and state management patterns.
+
+### Technology Stack
+
+- **Framework**: React 19 with TypeScript
+- **Build Tool**: Vite
+- **Routing**: TanStack Router (file-based routing)
+- **State Management**: Zustand (global auth state), React useState (local UI state)
+- **Styling**: Tailwind CSS
+- **Icons**: Lucide React
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/              # Reusable UI components
+│   ├── profile/             # Profile page sub-components
+│   │   ├── index.ts         # Barrel export for profile components
+│   │   ├── ProfileHeader.tsx
+│   │   ├── EditProfileModal.tsx
+│   │   ├── ProfileAbout.tsx
+│   │   ├── ExperienceSection.tsx
+│   │   ├── EducationSection.tsx
+│   │   ├── SkillsSection.tsx
+│   │   └── ActivitySection.tsx
+│   ├── ConnectionCard.tsx   # Connection display card
+│   ├── JobCard.tsx          # Job listing card
+│   ├── Navbar.tsx           # Global navigation bar
+│   └── PostCard.tsx         # Feed post card with engagement
+├── routes/                  # TanStack Router file-based routes
+│   ├── __root.tsx           # Root layout with navbar
+│   ├── index.tsx            # Home/feed page
+│   ├── login.tsx            # Authentication page
+│   ├── register.tsx         # Registration page
+│   ├── profile.$userId.tsx  # Dynamic user profile page
+│   ├── network.tsx          # Connections and PYMK
+│   ├── jobs.tsx             # Job listings
+│   ├── jobs.$jobId.tsx      # Individual job detail
+│   └── search.tsx           # Global search page
+├── services/                # API client modules
+│   └── api.ts               # REST API service layer
+├── stores/                  # Zustand global state stores
+│   └── authStore.ts         # Authentication state
+├── types/                   # TypeScript type definitions
+│   └── index.ts             # Shared interface definitions
+└── main.tsx                 # Application entry point
+```
+
+### Component Organization Patterns
+
+#### 1. Profile Components
+
+The profile page was refactored from a single 534-line component into focused sub-components, each under 200 lines:
+
+| Component | Lines | Responsibility |
+|-----------|-------|----------------|
+| `ProfileHeader` | ~150 | Banner, avatar, name, connection actions |
+| `EditProfileModal` | ~160 | Profile editing form dialog |
+| `ProfileAbout` | ~35 | User summary/bio display |
+| `ExperienceSection` | ~115 | Work history list with add action |
+| `EducationSection` | ~110 | Education history list with add action |
+| `SkillsSection` | ~195 | Skills list with add/remove/endorse |
+| `ActivitySection` | ~40 | User's posts feed |
+
+**Benefits of this structure:**
+- **Readability**: Each component has a single, clear responsibility
+- **Testability**: Components can be unit tested in isolation
+- **Reusability**: Section components could be used in other contexts
+- **Maintainability**: Changes to one section don't affect others
+
+#### 2. Barrel Exports
+
+Components in feature directories use barrel exports (`index.ts`) for cleaner imports:
+
+```typescript
+// Instead of multiple imports
+import { ProfileHeader } from '../components/profile/ProfileHeader';
+import { EditProfileModal } from '../components/profile/EditProfileModal';
+
+// Single import from barrel
+import {
+  ProfileHeader,
+  EditProfileModal,
+  ProfileAbout,
+  ExperienceSection,
+  EducationSection,
+  SkillsSection,
+  ActivitySection,
+} from '../components/profile';
+```
+
+#### 3. JSDoc Documentation
+
+All components include JSDoc documentation following this pattern:
+
+```typescript
+/**
+ * Brief description of the component's purpose.
+ * Additional details about functionality and behavior.
+ *
+ * @module components/feature/ComponentName
+ */
+
+/**
+ * Props interface with field descriptions.
+ */
+interface ComponentNameProps {
+  /** Description of this prop */
+  propName: string;
+}
+
+/**
+ * Detailed component description.
+ *
+ * @param props - Component props
+ * @returns The component JSX element
+ */
+export function ComponentName({ propName }: ComponentNameProps) {
+  // Implementation
+}
+```
+
+### State Management Patterns
+
+#### Global State (Zustand)
+
+Authentication state is managed globally via Zustand:
+
+```typescript
+// stores/authStore.ts
+interface AuthState {
+  user: User | null;
+  isAuthenticated: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  logout: () => void;
+  updateUser: (user: User) => void;
+}
+```
+
+#### Local State (React useState)
+
+UI-specific state is managed locally within components:
+
+- Loading states
+- Form data
+- Modal visibility
+- Fetched data (profile, posts, skills, etc.)
+
+### Routing Architecture
+
+TanStack Router provides file-based routing with:
+
+- **Dynamic segments**: `profile.$userId.tsx` matches `/profile/123`
+- **Layout routes**: `__root.tsx` wraps all pages with the navbar
+- **Type-safe params**: Route params are typed and accessible via hooks
+
+```typescript
+// Accessing route params
+const { userId } = Route.useParams();
+
+// Programmatic navigation
+const navigate = useNavigate();
+navigate({ to: '/login' });
+```
+
+### API Integration
+
+The `services/api.ts` module provides typed API clients:
+
+```typescript
+// Grouped by feature domain
+export const usersApi = {
+  getProfile: (userId: number) => /* ... */,
+  updateProfile: (data: Partial<User>) => /* ... */,
+  addSkill: (skillName: string) => /* ... */,
+  // ...
+};
+
+export const feedApi = {
+  getUserPosts: (userId: number) => /* ... */,
+  likePost: (postId: number) => /* ... */,
+  // ...
+};
+
+export const connectionsApi = {
+  sendRequest: (userId: number) => /* ... */,
+  getConnectionDegree: (userId: number) => /* ... */,
+  // ...
+};
+```
+
+### Component Guidelines
+
+1. **Size Limit**: Keep components under 200 lines; extract sub-components when larger
+2. **Single Responsibility**: Each component should do one thing well
+3. **Props Interface**: Always define explicit TypeScript interfaces for props
+4. **Documentation**: Include JSDoc comments for all exported components and functions
+5. **Accessibility**: Include `aria-label` for icon-only buttons
+6. **Error Handling**: Log errors to console; consider toast notifications for user feedback

@@ -616,6 +616,122 @@ Driver selection algorithm considers multiple factors:
 - **Cache/Geo**: Redis 7
 - **Containerization**: Docker Compose
 
+## Frontend Architecture
+
+The frontend follows a component-based architecture with clear separation of concerns between presentation, state management, and business logic.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── driver/           # Driver dashboard components
+│   │   ├── index.ts              # Barrel exports
+│   │   ├── DriverStatusHeader.tsx    # Driver profile and online/offline toggle
+│   │   ├── DriverStatsGrid.tsx       # Statistics display (orders, rate, deliveries)
+│   │   ├── ActiveDeliveryCard.tsx    # Individual delivery order card
+│   │   └── DeliveryOfferModal.tsx    # Real-time offer notification modal
+│   ├── LoadingSpinner.tsx    # Loading states
+│   ├── MenuItemCard.tsx      # Menu item display
+│   ├── MerchantCard.tsx      # Merchant listing card
+│   ├── Navbar.tsx            # Navigation bar
+│   ├── OrderCard.tsx         # Order summary card
+│   └── StatusBadge.tsx       # Order status indicator
+├── hooks/                # Custom React hooks
+│   └── useDriverDashboard.ts # Driver dashboard state and logic
+├── routes/               # Page components (Tanstack Router)
+│   ├── __root.tsx            # Root layout
+│   ├── index.tsx             # Home page (merchant listings)
+│   ├── driver.tsx            # Driver dashboard
+│   ├── admin.tsx             # Admin dashboard
+│   ├── cart.tsx              # Shopping cart
+│   ├── login.tsx             # Login page
+│   ├── register.tsx          # Registration page
+│   ├── merchants.$merchantId.tsx  # Merchant detail page
+│   ├── orders.index.tsx      # Order history
+│   └── orders.$orderId.tsx   # Order tracking page
+├── services/             # API and WebSocket clients
+│   ├── api.ts                # REST API client
+│   └── websocket.ts          # WebSocket connection manager
+├── stores/               # Zustand state stores
+│   ├── authStore.ts          # Authentication state
+│   ├── cartStore.ts          # Shopping cart state
+│   └── locationStore.ts      # Geolocation state
+└── types/                # TypeScript type definitions
+    └── index.ts              # Shared types
+```
+
+### Component Design Principles
+
+1. **Single Responsibility**: Each component handles one specific concern
+   - `DriverStatusHeader`: Profile display and status toggle only
+   - `ActiveDeliveryCard`: Single order display and status transitions
+   - `DeliveryOfferModal`: Offer display and accept/decline actions
+
+2. **Props Interface Documentation**: All components have JSDoc-documented props interfaces describing each prop's purpose
+
+3. **Custom Hooks for Complex Logic**: Business logic is extracted into custom hooks
+   - `useDriverDashboard`: Encapsulates all driver dashboard state, API calls, WebSocket connections, and event handlers
+
+4. **Barrel Exports**: Related components are grouped in directories with `index.ts` barrel exports for clean imports
+
+5. **Component Size Guidelines**:
+   - Page components (routes): < 200 lines
+   - Reusable components: < 150 lines
+   - Complex logic extracted to custom hooks
+
+### State Management
+
+| Store | Purpose | Persistence |
+|-------|---------|-------------|
+| `authStore` | User session, token | localStorage |
+| `cartStore` | Shopping cart items | localStorage |
+| `locationStore` | Driver geolocation | None (real-time) |
+
+### Component Communication
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     driver.tsx (Page)                        │
+│                           │                                  │
+│    ┌──────────────────────┼──────────────────────┐          │
+│    │                      │                      │          │
+│    ▼                      ▼                      ▼          │
+│ DriverStatus         DriverStats         ActiveDeliveries  │
+│   Header               Grid                  Section        │
+│    │                                            │           │
+│    │                                            ▼           │
+│    │                                      ActiveDelivery    │
+│    │                                         Card(s)        │
+│    │                                                        │
+│    └──────────────────────┬─────────────────────┘          │
+│                           │                                  │
+│                           ▼                                  │
+│              useDriverDashboard (Hook)                       │
+│    ┌──────────────────────┼──────────────────────┐          │
+│    │                      │                      │          │
+│    ▼                      ▼                      ▼          │
+│  api.ts            wsService.ts          locationStore      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Real-Time Features
+
+The driver dashboard demonstrates real-time patterns:
+
+1. **WebSocket Connection**: Managed in `useDriverDashboard` hook
+   - Connects when driver goes online
+   - Subscribes to offer notifications
+   - Disconnects on cleanup or offline
+
+2. **Countdown Timer**: `DeliveryOfferModal` displays expiring offers
+   - Timer state managed in hook
+   - Offer auto-dismissed when expired
+
+3. **Location Tracking**: Via `locationStore`
+   - Watches position when online
+   - Sends updates to API and WebSocket
+
 ## Scalability Considerations
 
 ### Geographic Sharding (Production)

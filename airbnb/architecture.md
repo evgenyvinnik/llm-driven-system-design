@@ -1757,6 +1757,149 @@ Airbnb's business depends on understanding user behavior to optimize pricing, se
 
 ---
 
+## Frontend Architecture
+
+The React frontend follows a modular architecture with clear separation of concerns. This section describes the component organization and patterns used.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/                    # Reusable UI components
+│   ├── BookingWidget.tsx          # Booking form with calendar
+│   ├── Calendar.tsx               # Date selection calendar
+│   ├── Header.tsx                 # Site navigation header
+│   ├── ListingCard.tsx            # Listing preview card
+│   ├── SearchBar.tsx              # Search input with filters
+│   └── listing-form/              # Multi-step listing creation wizard
+│       ├── index.ts               # Barrel export for all components
+│       ├── types.ts               # Shared types and constants
+│       ├── useListingForm.ts      # Form state management hook
+│       ├── ProgressIndicator.tsx  # Step progress visualization
+│       ├── StepBasicInfo.tsx      # Step 1: Property type, title
+│       ├── StepLocation.tsx       # Step 2: Address, coordinates
+│       ├── StepDetails.tsx        # Step 3: Capacity, amenities
+│       └── StepPricing.tsx        # Step 4: Price, booking settings
+├── hooks/                         # Custom React hooks
+├── routes/                        # Page components (Tanstack Router)
+│   ├── __root.tsx                 # Root layout with Header
+│   ├── index.tsx                  # Home page
+│   ├── search.tsx                 # Search results
+│   ├── listing.$id.tsx            # Listing detail page
+│   ├── trips.tsx                  # Guest trip history
+│   ├── messages.tsx               # Conversations
+│   └── host/                      # Host-specific pages
+│       ├── listings.tsx           # Manage listings
+│       ├── listings.new.tsx       # Create new listing (wizard)
+│       └── reservations.tsx       # Manage reservations
+├── services/                      # API client functions
+│   └── api.ts                     # Centralized API calls
+├── stores/                        # Zustand state stores
+│   └── authStore.ts               # Authentication state
+├── types/                         # TypeScript type definitions
+│   └── index.ts                   # Shared types (Listing, Booking, etc.)
+└── utils/                         # Helper functions
+    └── helpers.ts                 # Formatters, label mappers
+```
+
+### Component Organization Principles
+
+#### 1. Feature-Based Grouping
+
+Related components are grouped into feature directories with barrel exports:
+
+```typescript
+// Import from feature directory
+import {
+  StepBasicInfo,
+  StepLocation,
+  useListingForm,
+  PROPERTY_TYPES,
+} from '../components/listing-form';
+```
+
+#### 2. Custom Hooks for State Logic
+
+Complex state management is extracted into custom hooks:
+
+```typescript
+// useListingForm.ts encapsulates:
+// - Multi-step navigation
+// - Form field state
+// - Validation logic
+// - API submission
+const { step, formData, updateField, submitForm } = useListingForm();
+```
+
+#### 3. Prop Interfaces with JSDoc
+
+All components have documented props:
+
+```typescript
+interface StepBasicInfoProps extends StepNavigationProps {
+  /** Current form data */
+  formData: ListingFormData;
+  /** Callback to update form fields */
+  onUpdate: <K extends keyof ListingFormData>(field: K, value: ListingFormData[K]) => void;
+}
+```
+
+#### 4. Component Size Guidelines
+
+- **Route components**: < 150 lines, orchestration only
+- **Feature components**: < 200 lines, single responsibility
+- **Shared components**: < 100 lines, highly reusable
+
+### State Management Strategy
+
+| State Type | Solution | Example |
+|------------|----------|---------|
+| Server data | React Query / useEffect | Listings, bookings |
+| Auth state | Zustand store | Current user, session |
+| Form state | Custom hook / useState | Listing creation wizard |
+| UI state | Local useState | Modal open, tab selection |
+
+### Multi-Step Form Pattern
+
+The listing creation wizard demonstrates the pattern for complex forms:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  NewListingPage                         │
+│  (Route component - orchestrates steps)                 │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │              useListingForm Hook                 │   │
+│  │  - step state                                    │   │
+│  │  - formData state                                │   │
+│  │  - navigation functions                          │   │
+│  │  - submit function                               │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │  Step 1  │ │  Step 2  │ │  Step 3  │ │  Step 4  │  │
+│  │ BasicInfo│ │ Location │ │ Details  │ │ Pricing  │  │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
+│       ▲            ▲            ▲            ▲         │
+│       │            │            │            │         │
+│       └────────────┴────────────┴────────────┘         │
+│              Shared: formData, onUpdate                 │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Testing Strategy (Planned)
+
+| Layer | Tool | Coverage |
+|-------|------|----------|
+| Components | Vitest + Testing Library | User interactions |
+| Hooks | Vitest | State transitions |
+| API calls | MSW | Mock server responses |
+| E2E | Playwright | Critical user flows |
+
+---
+
 ### Circuit Breaker for Resilience
 
 The circuit breaker pattern prevents cascading failures when dependent services fail.

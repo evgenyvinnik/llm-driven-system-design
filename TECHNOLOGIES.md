@@ -834,7 +834,7 @@ const result = await client.query({
 - Partition-based data distribution
 - Tunable consistency levels
 
-**Where it's used:** Instagram (Direct Messages)
+**Where it's used:** Instagram (Direct Messages), Netflix (Viewing History), WhatsApp (Messages)
 
 **Client library: cassandra-driver**
 
@@ -890,6 +890,115 @@ const result = await client.execute(
 | **DynamoDB** | Managed, simpler, vendor lock-in |
 | **HBase** | Hadoop ecosystem, more complex |
 | **PostgreSQL** | ACID, but lower write throughput at scale |
+
+---
+
+### Document Database
+
+#### CouchDB (v3.3)
+**What it is:** A document-oriented NoSQL database with built-in sync and offline-first capabilities.
+
+**Why we use it:**
+- Built-in replication protocol for offline sync
+- MVCC (Multi-Version Concurrency Control) for conflict detection
+- Change feeds (`_changes` API) for real-time updates
+- RESTful HTTP API (no special drivers needed)
+- PouchDB integration for browser-based sync
+- Document-native JSON storage
+
+**Where it's used:** Google Docs (Document Content & Offline Sync)
+
+**Client library: nano (Node.js)**
+
+**Example:**
+```javascript
+import Nano from 'nano';
+
+const couch = Nano('http://admin:admin123@localhost:5984');
+const documents = couch.db.use('documents');
+
+// Create/update document
+const doc = {
+  _id: 'doc-uuid',
+  title: 'My Document',
+  owner_id: 'user-uuid',
+  content: { type: 'doc', content: [...] },
+  updated_at: new Date().toISOString()
+};
+const response = await documents.insert(doc);
+// Returns: { ok: true, id: 'doc-uuid', rev: '1-abc123' }
+
+// Get document with conflict info
+const doc = await documents.get('doc-uuid', { conflicts: true });
+
+// Query using view
+const result = await documents.view('docs', 'by_owner', {
+  key: 'user-uuid',
+  include_docs: true
+});
+
+// Subscribe to changes (real-time updates)
+const feed = documents.changesReader.start({
+  since: 'now',
+  live: true,
+  include_docs: true
+});
+feed.on('change', (change) => {
+  console.log('Document changed:', change.doc);
+});
+```
+
+**Offline Sync with PouchDB:**
+```javascript
+// Browser-side (PouchDB)
+import PouchDB from 'pouchdb';
+
+const localDB = new PouchDB('documents');
+const remoteDB = new PouchDB('http://localhost:5984/documents');
+
+// Two-way sync with live updates
+localDB.sync(remoteDB, {
+  live: true,
+  retry: true
+}).on('change', (info) => {
+  console.log('Sync change:', info);
+}).on('error', (err) => {
+  console.log('Sync error:', err);
+});
+
+// Conflict resolution
+localDB.get('doc-uuid', { conflicts: true }).then((doc) => {
+  if (doc._conflicts) {
+    // Merge conflicting revisions
+    resolveConflicts(doc, doc._conflicts);
+  }
+});
+```
+
+**Key features used:**
+| Feature | Purpose |
+|---------|---------|
+| `_rev` (revisions) | MVCC for conflict detection |
+| Replication | Offline sync between CouchDB/PouchDB |
+| Change feeds | Real-time document updates |
+| Design documents | MapReduce views for queries |
+| Attachments | Binary file storage |
+
+**Data modeling patterns:**
+| Pattern | Example |
+|---------|---------|
+| Type field | `{ type: 'document' }` for filtering |
+| Embedded docs | Store related data together |
+| Linked docs | Reference by `_id` for normalization |
+| Conflict resolution | Merge or last-write-wins strategies |
+
+**Alternatives:**
+| Alternative | Trade-offs |
+|-------------|------------|
+| **MongoDB** | More query features, no built-in sync |
+| **Firebase Firestore** | Managed, real-time sync, vendor lock-in |
+| **RxDB** | Browser-first, sync with various backends |
+| **PostgreSQL JSONB** | Relational benefits, no offline sync |
 
 ---
 

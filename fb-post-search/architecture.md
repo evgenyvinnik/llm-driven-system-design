@@ -1072,6 +1072,96 @@ histogram_quantile(0.99, rate(indexing_lag_seconds_bucket[5m]))
 | `GET /livez` | Kubernetes liveness probe |
 | `GET /readyz` | Kubernetes readiness probe |
 
+## Frontend Architecture
+
+The frontend follows a component-based architecture using React 19 with TypeScript, TanStack Router for navigation, and Zustand for state management.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── admin/           # Admin dashboard components
+│   │   ├── index.ts     # Barrel export
+│   │   ├── AdminTabs.tsx
+│   │   ├── HealthStatusBar.tsx
+│   │   ├── OverviewTab.tsx
+│   │   ├── PostsTable.tsx
+│   │   ├── SearchHistoryTable.tsx
+│   │   ├── StatCard.tsx
+│   │   └── UsersTable.tsx
+│   ├── Header.tsx       # Application header
+│   ├── SearchBar.tsx    # Search input with typeahead
+│   ├── SearchFilters.tsx
+│   ├── SearchResultCard.tsx
+│   └── SearchResults.tsx
+├── routes/              # TanStack Router file-based routes
+│   ├── __root.tsx       # Root layout
+│   ├── index.tsx        # Home/search page
+│   ├── admin.tsx        # Admin dashboard (orchestrator)
+│   ├── login.tsx
+│   └── register.tsx
+├── services/            # API client layer
+│   └── api.ts           # Backend API calls
+├── stores/              # Zustand state stores
+│   └── authStore.ts     # Authentication state
+├── types/               # TypeScript type definitions
+│   └── index.ts         # Shared types
+└── main.tsx             # Application entry point
+```
+
+### Component Design Principles
+
+1. **Single Responsibility**: Each component handles one concern
+2. **Composition over Inheritance**: Complex UIs built from smaller components
+3. **Props Down, Events Up**: Data flows down, actions bubble up via callbacks
+4. **JSDoc Documentation**: All exported components have JSDoc comments
+
+### Admin Dashboard Components
+
+The admin dashboard (`/admin` route) is decomposed into focused sub-components:
+
+| Component | Lines | Responsibility |
+|-----------|-------|----------------|
+| `admin.tsx` | ~180 | Route orchestration, state management, data loading |
+| `AdminTabs.tsx` | ~65 | Tab navigation with icons |
+| `HealthStatusBar.tsx` | ~90 | Service health indicators, reindex button |
+| `OverviewTab.tsx` | ~105 | Statistics cards and breakdown panels |
+| `UsersTable.tsx` | ~80 | User list with role badges |
+| `PostsTable.tsx` | ~75 | Posts list with visibility/type badges |
+| `SearchHistoryTable.tsx` | ~70 | Search query history |
+| `StatCard.tsx` | ~60 | Reusable metric card |
+
+### Component Communication
+
+```
+AdminPage (Route Component)
+    │
+    ├── HealthStatusBar
+    │     └── onReindex callback → parent handles API call
+    │
+    ├── AdminTabs
+    │     └── onTabChange callback → parent updates activeTab state
+    │
+    └── Tab Content (conditional render)
+          ├── OverviewTab (receives stats prop)
+          ├── UsersTable (receives users prop)
+          ├── PostsTable (receives posts prop)
+          └── SearchHistoryTable (receives history prop)
+```
+
+### State Management
+
+- **Local State**: Component-specific UI state (active tab, loading flags)
+- **Zustand Store**: Authentication state (`authStore`)
+- **Server State**: Data fetched from API, stored in component state
+
+### Styling
+
+- Tailwind CSS for utility-first styling
+- Consistent color scheme with `primary-*` palette
+- Responsive grid layouts (1-4 columns based on viewport)
+
 ## Future Optimizations
 
 1. **Bloom Filters**: Compact visibility set representation

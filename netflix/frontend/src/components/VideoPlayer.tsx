@@ -4,22 +4,23 @@
  * Full-screen video player with Netflix-style controls.
  * Features: quality selection, keyboard shortcuts, progress saving,
  * fullscreen mode, and auto-hiding controls during playback.
+ *
+ * This component orchestrates sub-components for the player UI:
+ * - TopBar: Title display and back navigation
+ * - CenterPlayButton: Large central play/pause overlay
+ * - ControlBar: Bottom controls (progress, volume, quality, fullscreen)
+ *
+ * @see useVideoPlayerControls for keyboard shortcuts and control logic
  */
 import React from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import {
-  Play,
-  Pause,
-  Volume2,
-  VolumeX,
-  Maximize,
-  Minimize,
-  Settings,
-  SkipBack,
-  SkipForward,
-  ArrowLeft,
-} from 'lucide-react';
 import { usePlayerStore } from '../stores/playerStore';
+import {
+  TopBar,
+  CenterPlayButton,
+  ControlBar,
+  useVideoPlayerControls,
+} from './VideoPlayer/index';
 
 /** Props for VideoPlayer component */
 interface VideoPlayerProps {
@@ -36,13 +37,16 @@ interface VideoPlayerProps {
 /**
  * Full-screen video player component.
  * Manages playback, controls visibility, and progress tracking.
+ *
+ * @param props - VideoPlayer properties
+ * @returns JSX element for the video player
  */
 export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayerProps) {
   const navigate = useNavigate();
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
-  const controlsTimeoutRef = React.useRef<NodeJS.Timeout>();
 
+  // Player store state and actions
   const {
     isPlaying,
     manifest,
@@ -66,20 +70,46 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     saveProgress,
   } = usePlayerStore();
 
-  const [showQualityMenu, setShowQualityMenu] = React.useState(false);
+  /**
+   * Navigate back to browse page.
+   * Used by both escape key and back button.
+   */
+  const handleNavigateBack = React.useCallback(() => {
+    navigate({ to: '/browse' });
+  }, [navigate]);
+
+  // Video player controls hook
+  const {
+    togglePlay,
+    skip,
+    toggleFullscreen,
+    handleMouseMove,
+    handleMouseLeave,
+  } = useVideoPlayerControls({
+    videoRef,
+    containerRef,
+    volume,
+    isPlaying,
+    isFullscreen,
+    setVolume,
+    toggleMute,
+    setFullscreen,
+    setShowControls,
+    onNavigateBack: handleNavigateBack,
+  });
 
   // Load manifest on mount
   React.useEffect(() => {
     loadManifest(videoId, episodeId);
   }, [videoId, episodeId, loadManifest]);
 
-  // Save progress periodically
+  // Save progress periodically (every 10 seconds)
   React.useEffect(() => {
     const interval = setInterval(() => {
       if (isPlaying && currentTime > 0) {
         saveProgress();
       }
-    }, 10000); // Every 10 seconds
+    }, 10000);
 
     return () => clearInterval(interval);
   }, [isPlaying, currentTime, saveProgress]);
@@ -91,95 +121,19 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     };
   }, [saveProgress]);
 
-  // Keyboard controls
-  React.useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case ' ':
-          e.preventDefault();
-          togglePlay();
-          break;
-        case 'ArrowLeft':
-          skip(-10);
-          break;
-        case 'ArrowRight':
-          skip(10);
-          break;
-        case 'ArrowUp':
-          e.preventDefault();
-          setVolume(Math.min(1, volume + 0.1));
-          break;
-        case 'ArrowDown':
-          e.preventDefault();
-          setVolume(Math.max(0, volume - 0.1));
-          break;
-        case 'm':
-          toggleMute();
-          break;
-        case 'f':
-          toggleFullscreen();
-          break;
-        case 'Escape':
-          if (isFullscreen) {
-            toggleFullscreen();
-          } else {
-            navigate({ to: '/browse' });
-          }
-          break;
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [volume, isFullscreen, navigate, setVolume, toggleMute]);
-
-  // Auto-hide controls
-  const handleMouseMove = () => {
-    setShowControls(true);
-    if (controlsTimeoutRef.current) {
-      clearTimeout(controlsTimeoutRef.current);
-    }
-    controlsTimeoutRef.current = setTimeout(() => {
-      if (isPlaying) {
-        setShowControls(false);
-      }
-    }, 3000);
-  };
-
-  const togglePlay = () => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        videoRef.current.pause();
-      } else {
-        videoRef.current.play();
-      }
-    }
-  };
-
-  const skip = (seconds: number) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime += seconds;
-    }
-  };
-
-  const toggleFullscreen = async () => {
-    if (!containerRef.current) return;
-
-    if (!document.fullscreenElement) {
-      await containerRef.current.requestFullscreen();
-      setFullscreen(true);
-    } else {
-      await document.exitFullscreen();
-      setFullscreen(false);
-    }
-  };
-
+  /**
+   * Updates current time in store when video time changes.
+   */
   const handleTimeUpdate = () => {
     if (videoRef.current) {
       setCurrentTime(videoRef.current.currentTime);
     }
   };
 
+  /**
+   * Handles video metadata loaded event.
+   * Sets duration and resumes from saved position if available.
+   */
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
       setDuration(videoRef.current.duration);
@@ -191,42 +145,41 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     }
   };
 
-  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const time = parseFloat(e.target.value);
+  /**
+   * Handles seek requests from the progress bar.
+   *
+   * @param time - New playback position in seconds
+   */
+  const handleSeek = (time: number) => {
     if (videoRef.current) {
       videoRef.current.currentTime = time;
     }
     setCurrentTime(time);
   };
 
-  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const vol = parseFloat(e.target.value);
+  /**
+   * Handles volume change from the volume control.
+   *
+   * @param vol - New volume level (0-1)
+   */
+  const handleVolumeChange = (vol: number) => {
     setVolume(vol);
     if (videoRef.current) {
       videoRef.current.volume = vol;
     }
   };
 
-  const formatTime = (seconds: number): string => {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-
-    if (h > 0) {
-      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    }
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  };
-
   // Get stream URL - for demo, use a sample video
-  const streamUrl = currentQuality?.url || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+  const streamUrl =
+    currentQuality?.url ||
+    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
 
   return (
     <div
       ref={containerRef}
       className="relative w-full h-full bg-black"
       onMouseMove={handleMouseMove}
-      onMouseLeave={() => isPlaying && setShowControls(false)}
+      onMouseLeave={handleMouseLeave}
     >
       {/* Video element */}
       <video
@@ -237,7 +190,7 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
         onPause={() => setPlaying(false)}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
-        onEnded={() => navigate({ to: '/browse' })}
+        onEnded={handleNavigateBack}
         onClick={togglePlay}
         playsInline
       />
@@ -255,145 +208,31 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
           showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
-        {/* Top bar */}
-        <div className="absolute top-0 left-0 right-0 p-4 bg-gradient-to-b from-black/70 to-transparent">
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => navigate({ to: '/browse' })}
-              className="text-white hover:text-netflix-light-gray"
-            >
-              <ArrowLeft size={28} />
-            </button>
-            <div>
-              <h1 className="text-white text-xl font-bold">{title}</h1>
-              {subtitle && <p className="text-netflix-light-gray text-sm">{subtitle}</p>}
-            </div>
-          </div>
-        </div>
+        {/* Top bar with title and back button */}
+        <TopBar title={title} subtitle={subtitle} onBack={handleNavigateBack} />
 
         {/* Center play button */}
-        <div className="absolute inset-0 flex items-center justify-center">
-          <button
-            onClick={togglePlay}
-            className="w-20 h-20 rounded-full bg-black/50 flex items-center justify-center hover:bg-black/70 transition-colors"
-          >
-            {isPlaying ? (
-              <Pause size={40} className="text-white" />
-            ) : (
-              <Play size={40} fill="white" className="text-white ml-1" />
-            )}
-          </button>
-        </div>
+        <CenterPlayButton isPlaying={isPlaying} onToggle={togglePlay} />
 
-        {/* Bottom controls */}
-        <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/70 to-transparent">
-          {/* Progress bar */}
-          <div className="mb-4">
-            <input
-              type="range"
-              min={0}
-              max={duration || 100}
-              value={currentTime}
-              onChange={handleSeek}
-              className="w-full h-1 bg-zinc-600 rounded appearance-none cursor-pointer
-                        [&::-webkit-slider-thumb]:appearance-none
-                        [&::-webkit-slider-thumb]:w-4
-                        [&::-webkit-slider-thumb]:h-4
-                        [&::-webkit-slider-thumb]:rounded-full
-                        [&::-webkit-slider-thumb]:bg-netflix-red"
-            />
-            <div className="flex justify-between text-xs text-netflix-light-gray mt-1">
-              <span>{formatTime(currentTime)}</span>
-              <span>{formatTime(duration)}</span>
-            </div>
-          </div>
-
-          {/* Control buttons */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              {/* Play/Pause */}
-              <button onClick={togglePlay} className="text-white hover:text-netflix-light-gray">
-                {isPlaying ? <Pause size={28} /> : <Play size={28} />}
-              </button>
-
-              {/* Skip back */}
-              <button onClick={() => skip(-10)} className="text-white hover:text-netflix-light-gray">
-                <SkipBack size={24} />
-              </button>
-
-              {/* Skip forward */}
-              <button onClick={() => skip(10)} className="text-white hover:text-netflix-light-gray">
-                <SkipForward size={24} />
-              </button>
-
-              {/* Volume */}
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => toggleMute()}
-                  className="text-white hover:text-netflix-light-gray"
-                >
-                  {isMuted || volume === 0 ? <VolumeX size={24} /> : <Volume2 size={24} />}
-                </button>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.1}
-                  value={isMuted ? 0 : volume}
-                  onChange={handleVolumeChange}
-                  className="w-20 h-1 bg-zinc-600 rounded appearance-none cursor-pointer
-                            [&::-webkit-slider-thumb]:appearance-none
-                            [&::-webkit-slider-thumb]:w-3
-                            [&::-webkit-slider-thumb]:h-3
-                            [&::-webkit-slider-thumb]:rounded-full
-                            [&::-webkit-slider-thumb]:bg-white"
-                />
-              </div>
-            </div>
-
-            <div className="flex items-center gap-4">
-              {/* Quality selector */}
-              <div className="relative">
-                <button
-                  onClick={() => setShowQualityMenu(!showQualityMenu)}
-                  className="text-white hover:text-netflix-light-gray flex items-center gap-1"
-                >
-                  <Settings size={24} />
-                  <span className="text-sm">{currentQuality?.quality || 'Auto'}</span>
-                </button>
-
-                {showQualityMenu && manifest?.qualities && (
-                  <div className="absolute bottom-full right-0 mb-2 bg-black/90 rounded py-2 min-w-32">
-                    {manifest.qualities.map((q) => (
-                      <button
-                        key={q.quality}
-                        onClick={() => {
-                          setQuality(q);
-                          setShowQualityMenu(false);
-                        }}
-                        className={`w-full px-4 py-2 text-left text-sm hover:bg-zinc-700 ${
-                          currentQuality?.quality === q.quality
-                            ? 'text-netflix-red'
-                            : 'text-white'
-                        }`}
-                      >
-                        {q.quality} ({Math.round(q.bitrate / 1000)}Mbps)
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Fullscreen */}
-              <button
-                onClick={toggleFullscreen}
-                className="text-white hover:text-netflix-light-gray"
-              >
-                {isFullscreen ? <Minimize size={24} /> : <Maximize size={24} />}
-              </button>
-            </div>
-          </div>
-        </div>
+        {/* Bottom control bar */}
+        <ControlBar
+          isPlaying={isPlaying}
+          currentTime={currentTime}
+          duration={duration}
+          volume={volume}
+          isMuted={isMuted}
+          isFullscreen={isFullscreen}
+          currentQuality={currentQuality}
+          availableQualities={manifest?.qualities}
+          onTogglePlay={togglePlay}
+          onSkipBack={() => skip(-10)}
+          onSkipForward={() => skip(10)}
+          onSeek={handleSeek}
+          onVolumeChange={handleVolumeChange}
+          onMuteToggle={toggleMute}
+          onToggleFullscreen={toggleFullscreen}
+          onQualitySelect={setQuality}
+        />
       </div>
     </div>
   );

@@ -32,6 +32,43 @@ services:
       timeout: 5s
       retries: 5
 
+  cassandra:
+    image: cassandra:4.1
+    container_name: netflix-cassandra
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    environment:
+      CASSANDRA_CLUSTER_NAME: netflix-cluster
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # Cassandra schema initialization
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: netflix-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./backend/src/db/cassandra-init.cql:/scripts/init.cql:ro
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for Cassandra to be ready...';
+      sleep 10;
+      cqlsh cassandra -f /scripts/init.cql;
+      echo 'Cassandra schema initialized';
+      "
+
   minio:
     image: minio/minio:latest
     container_name: netflix-minio
@@ -70,4 +107,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  cassandra_data:
   minio_data:

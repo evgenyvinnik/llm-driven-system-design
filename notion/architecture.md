@@ -1347,3 +1347,136 @@ backend/src/shared/
 ```
 
 This separation of concerns keeps route handlers focused on business logic while infrastructure concerns are reusable and testable.
+
+---
+
+## Frontend Architecture
+
+### Overview
+
+The frontend follows a modular component architecture built with React, TypeScript, and Zustand for state management. Components are organized by feature area with clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/
+│   ├── blocks/              # Block editor components
+│   │   ├── BlockComponent.tsx      # Main orchestrator component
+│   │   ├── HeadingBlock.tsx        # H1/H2/H3 block renderer
+│   │   ├── ListBlock.tsx           # Bulleted/numbered list renderer
+│   │   ├── ToggleBlock.tsx         # Collapsible toggle with children
+│   │   ├── CodeBlock.tsx           # Code block with syntax support
+│   │   ├── QuoteBlock.tsx          # Blockquote renderer
+│   │   ├── CalloutBlock.tsx        # Callout/info box renderer
+│   │   ├── DividerBlock.tsx        # Horizontal rule renderer
+│   │   ├── TextBlock.tsx           # Default paragraph renderer
+│   │   ├── BlockTypeMenu.tsx       # Block type conversion menu
+│   │   ├── types.ts                # Shared types and utilities
+│   │   └── index.ts                # Barrel exports
+│   ├── database/            # Database view components
+│   │   ├── DatabaseView.tsx        # View switcher
+│   │   ├── TableView.tsx           # Table/spreadsheet view
+│   │   ├── BoardView.tsx           # Kanban board view
+│   │   ├── ListView.tsx            # Compact list view
+│   │   └── PropertyCell.tsx        # Property value renderer
+│   ├── editor/              # Editor wrapper components
+│   │   └── BlockEditor.tsx         # Full page editor
+│   └── sidebar/             # Navigation components
+│       └── Sidebar.tsx             # Workspace/page tree
+├── stores/                  # Zustand state stores
+│   └── editor.ts            # Block editing state
+├── services/                # API and WebSocket clients
+├── routes/                  # Page-level route components
+└── types/                   # Shared TypeScript definitions
+    └── index.ts             # All type exports
+```
+
+### Block Component Architecture
+
+The block editor uses a **delegation pattern** where the main `BlockComponent` acts as an orchestrator that:
+
+1. **Handles common functionality**: Focus management, keyboard navigation, block handles, and the type menu
+2. **Delegates rendering**: Each block type has its own specialized renderer component
+3. **Manages state**: Local state for menu visibility and toggle expansion
+
+```
+BlockComponent (orchestrator)
+├── BlockHandle          # Add/menu buttons
+├── HeadingBlock         # heading_1, heading_2, heading_3
+├── ListBlock            # bulleted_list, numbered_list
+├── ToggleBlock          # toggle (with children)
+├── CodeBlock            # code
+├── QuoteBlock           # quote
+├── CalloutBlock         # callout
+├── DividerBlock         # divider
+├── TextBlock            # text (default)
+└── BlockTypeMenu        # Type conversion dropdown
+```
+
+### Component Design Principles
+
+1. **Single Responsibility**: Each block type component handles only its rendering and type-specific behavior
+2. **Shared Props Interface**: All editable blocks receive the same `BlockRendererProps` for consistency
+3. **JSDoc Documentation**: All components and significant functions include JSDoc comments
+4. **Accessibility**: ARIA labels and roles for interactive elements
+5. **Under 200 Lines**: Components are kept small and focused
+
+### State Management
+
+Block editing state is managed by the Zustand `useEditorStore`:
+
+| State | Purpose |
+|-------|---------|
+| `blocks` | Array of all blocks in the current page |
+| `focusedBlockId` | Currently focused block for editing |
+| `selectedBlockId` | Selected block for bulk operations |
+| `presence` | Real-time presence of other users |
+
+Actions like `addBlock`, `updateBlock`, and `deleteBlock` implement optimistic updates with rollback on failure.
+
+### Block Type Renderers
+
+Each block type component follows a consistent pattern:
+
+```typescript
+interface BlockRendererProps {
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  textContent: string;
+  placeholder: string;
+  onInput: () => void;
+  onKeyDown: (e: React.KeyboardEvent) => void;
+  onFocus: () => void;
+}
+
+function MyBlockType(props: BlockRendererProps) {
+  return (
+    <div
+      ref={props.contentRef}
+      contentEditable
+      suppressContentEditableWarning
+      data-placeholder={props.placeholder}
+      onInput={props.onInput}
+      onKeyDown={props.onKeyDown}
+      onFocus={props.onFocus}
+    >
+      {props.textContent}
+    </div>
+  );
+}
+```
+
+### Utilities
+
+Shared utilities in `types.ts`:
+
+- `getPlaceholder(type)`: Returns contextual placeholder text for each block type
+- `getTextContent(content)`: Extracts plain text from RichText array
+
+### Future Improvements
+
+1. **Rich Text Formatting**: Inline bold, italic, code, and link support
+2. **Drag and Drop**: Block reordering via drag handles
+3. **Keyboard Shortcuts**: Markdown-style shortcuts (e.g., `##` for heading)
+4. **Selection**: Multi-block selection for bulk operations
+5. **Undo/Redo**: Operation history for reverting changes

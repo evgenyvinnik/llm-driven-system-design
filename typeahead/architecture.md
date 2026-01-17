@@ -1983,3 +1983,98 @@ if (cached) {
 | `/api/v1/admin/filtered` | GET | N/A | List filtered phrases |
 | `/api/v1/admin/cache/clear` | POST | Yes | Clear suggestion cache |
 | `/api/v1/admin/status` | GET | N/A | System status |
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React, TypeScript, and Tailwind CSS, following a component-based architecture with clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/
+│   ├── admin/                    # Admin dashboard components
+│   │   ├── index.ts              # Barrel export for admin components
+│   │   ├── TabButton.tsx         # Navigation tab button
+│   │   ├── StatusCard.tsx        # Service status indicator card
+│   │   ├── StatCard.tsx          # Simple statistics display card
+│   │   ├── LoadingState.tsx      # Loading spinner component
+│   │   ├── ErrorState.tsx        # Error message display
+│   │   ├── OverviewTab.tsx       # System overview dashboard tab
+│   │   ├── AnalyticsTab.tsx      # Analytics and charts tab
+│   │   └── ManagementTab.tsx     # Admin management controls tab
+│   ├── icons/                    # Reusable SVG icon components
+│   │   ├── index.ts              # Barrel export for icons
+│   │   ├── CheckCircleIcon.tsx   # Success/health status icon
+│   │   ├── ServerIcon.tsx        # Server/infrastructure icon
+│   │   └── DatabaseIcon.tsx      # Database service icon
+│   ├── index.ts                  # Main components barrel export
+│   ├── SearchBox.tsx             # Main search input with autocomplete
+│   ├── TrendingList.tsx          # Trending searches display
+│   └── SearchSettings.tsx        # Search configuration panel
+├── routes/
+│   ├── __root.tsx                # Root layout component
+│   ├── index.tsx                 # Home page (search interface)
+│   └── admin.tsx                 # Admin dashboard page
+├── services/
+│   └── api.ts                    # API client service
+├── stores/
+│   └── search-store.ts           # Zustand store for search state
+├── hooks/
+│   └── index.ts                  # Custom React hooks
+├── types/
+│   └── index.ts                  # TypeScript type definitions
+└── utils/
+    ├── index.ts                  # Utilities barrel export
+    └── formatters.ts             # Formatting utility functions
+```
+
+### Component Organization Principles
+
+1. **Feature-based grouping**: Components are grouped by feature area (admin, icons) rather than by type.
+
+2. **Barrel exports**: Each directory has an `index.ts` that re-exports all public components, enabling clean imports:
+   ```typescript
+   import { OverviewTab, TabButton } from '../components/admin';
+   import { CheckCircleIcon } from '../components/icons';
+   ```
+
+3. **Icon components**: SVG icons are extracted into separate component files, avoiding inline SVG clutter and enabling reusability.
+
+4. **Sub-components**: Large components are split into smaller, focused sub-components within the same file when tightly coupled, or into separate files when reusable.
+
+### Admin Dashboard Components
+
+The admin dashboard (`/admin` route) uses a tabbed interface with three main sections:
+
+| Component | Lines | Description |
+|-----------|-------|-------------|
+| `TabButton` | 27 | Reusable navigation tab button |
+| `StatusCard` | 35 | Service health indicator with icon |
+| `StatCard` | 18 | Simple metric display card |
+| `LoadingState` | 12 | Centered loading spinner |
+| `ErrorState` | 17 | Error message container |
+| `OverviewTab` | 160 | System status, metrics, and resources |
+| `AnalyticsTab` | 118 | Query charts and top phrases table |
+| `ManagementTab` | 228 | System actions and phrase management |
+
+### Utility Functions
+
+The `utils/formatters.ts` file contains pure formatting functions:
+
+- `formatUptime(seconds)` - Converts seconds to human-readable duration (e.g., "2d 5h")
+- `formatBytes(bytes)` - Converts bytes to human-readable size (e.g., "256.0 MB")
+
+### State Management
+
+- **Zustand** for global state (`search-store.ts`) - manages search query, suggestions, and user preferences
+- **React state** for local UI state - tab selection, form inputs, loading states
+
+### API Integration
+
+The `api.ts` service provides a typed API client with methods for:
+- Suggestions: `getSuggestions()`, `logSearch()`, `getTrending()`, `getHistory()`
+- Analytics: `getAnalyticsSummary()`, `getHourlyStats()`, `getTopPhrases()`
+- Admin: `getSystemStatus()`, `rebuildTrie()`, `clearCache()`, `addPhrase()`, `filterPhrase()`

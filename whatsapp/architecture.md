@@ -67,7 +67,8 @@ Designed to run on a single developer machine (8GB RAM, 4 cores).
 | Component | Instances | Resources | Purpose |
 |-----------|-----------|-----------|---------|
 | API/WebSocket Server | 2-5 | 256MB RAM each | Handle connections, route messages |
-| PostgreSQL | 1 | 512MB RAM | Persistent storage |
+| PostgreSQL | 1 | 512MB RAM | Users, conversations metadata |
+| Cassandra | 1 | 512MB RAM | Messages, delivery status (write-heavy) |
 | Redis/Valkey | 1 | 128MB RAM | Sessions, presence, pub/sub |
 | MinIO (optional) | 1 | 256MB RAM | Media storage |
 
@@ -281,6 +282,83 @@ CREATE TABLE message_status (
 
 CREATE INDEX idx_message_status_recipient ON message_status(recipient_id, status);
 ```
+
+### Cassandra Schema (Messages)
+
+While PostgreSQL handles users and conversation metadata, Cassandra is used for the high-write message storage. This hybrid approach leverages each database's strengths.
+
+**Why Cassandra for Messages?**
+- **High-write throughput**: WhatsApp handles billions of messages daily with 100:1 write:read ratio
+- **Time-ordered retrieval**: TimeUUID clustering keys provide natural ordering within conversations
+- **TTL for message lifecycle**: Automatic cleanup of old messages
+- **Partition by conversation**: All messages for a conversation are co-located for efficient retrieval
+
+```cql
+-- Keyspace configuration
+CREATE KEYSPACE whatsapp_messages WITH REPLICATION = {
+  'class': 'SimpleStrategy',
+  'replication_factor': 1
+};
+
+-- Messages by conversation
+-- Partition key: conversation_id (all messages together)
+-- Clustering key: message_id (TimeUUID for time ordering)
+CREATE TABLE messages_by_conversation (
+    conversation_id UUID,
+    message_id TIMEUUID,
+    sender_id UUID,
+    content TEXT,
+    content_type TEXT,          -- 'text', 'image', 'video', 'audio'
+    media_url TEXT,
+    reply_to_message_id TIMEUUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY (conversation_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC)
+  AND default_time_to_live = 31536000;  -- 1 year TTL
+
+-- User inbox (conversation list)
+CREATE TABLE user_inbox (
+    user_id UUID,
+    last_message_at TIMESTAMP,
+    conversation_id UUID,
+    other_username TEXT,        -- Denormalized for display
+    last_message_preview TEXT,  -- First 100 chars
+    unread_count INT,
+    PRIMARY KEY (user_id, last_message_at, conversation_id)
+) WITH CLUSTERING ORDER BY (last_message_at DESC);
+
+-- Message delivery status
+CREATE TABLE message_status (
+    conversation_id UUID,
+    message_id TIMEUUID,
+    recipient_id UUID,
+    status TEXT,                -- 'sent', 'delivered', 'read'
+    delivered_at TIMESTAMP,
+    read_at TIMESTAMP,
+    PRIMARY KEY ((conversation_id, message_id), recipient_id)
+);
+```
+
+**Data Flow:**
+```
+1. User sends message:
+   → INSERT into messages_by_conversation (Cassandra)
+   → UPDATE user_inbox for all participants (Cassandra)
+   → Redis pub/sub for real-time delivery
+
+2. User opens conversation:
+   → SELECT * FROM messages_by_conversation
+     WHERE conversation_id = ? LIMIT 50
+
+3. Message delivered/read:
+   → UPDATE message_status in Cassandra
+   → WebSocket notification to sender
+```
+
+**Why denormalize in user_inbox?**
+- Avoids joins across partitions (not supported in Cassandra)
+- Single query to render inbox list
+- Trade-off: Must update all inboxes when a message is sent
 
 ### Redis Data Structures
 

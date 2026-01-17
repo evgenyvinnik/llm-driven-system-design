@@ -605,6 +605,30 @@ Cron Job (daily)        Database
 
 ## API Design
 
+### Public Booking URL Pattern (Real-World Approach)
+
+The booking URL follows the pattern used by real scheduling platforms like Calendly:
+
+```
+/john-doe/30min-x7k2m9
+```
+
+This hybrid approach combines:
+- **Human-readable prefix**: `john-doe/30min` - Clean, shareable, memorable
+- **Security token suffix**: `-x7k2m9` - Prevents URL enumeration, can be rotated if leaked
+
+**Why this pattern?**
+- ✅ Balance of usability and security
+- ✅ Can rotate the token part without changing the slug
+- ✅ Supports multiple tokens per event (different campaigns, tracking)
+- ✅ Prevents enumeration attacks (can't guess `/john-doe/15min`)
+- ✅ Host can revoke specific tokens if shared inappropriately
+
+**Token rotation use cases:**
+- Link shared publicly (Twitter) → revoke, generate new
+- Different marketing channels → separate tokens, track conversion
+- Temporary access → expiring tokens for limited-time campaigns
+
 ### Core Endpoints
 
 **User & Meeting Type Management**
@@ -615,7 +639,12 @@ Cron Job (daily)        Database
 - `PUT /api/meeting-types/:id` - Update meeting type
 - `DELETE /api/meeting-types/:id` - Delete meeting type
 
-**Availability Management**
+**Public Booking APIs (Guest-Facing)**
+- `GET /api/:username/:slug-:token` - Get event type details (validates all three parts)
+- `GET /api/availability/:event_id?start_date=&end_date=` - Get available slots (UTC only)
+- `POST /api/bookings` - Create a booking (with idempotency support)
+
+**Availability Management (Host-Facing)**
 - `POST /api/availability/rules` - Set availability rules
 - `GET /api/availability/rules` - Get user's availability rules
 - `GET /api/availability/slots?meeting_type_id=:id&date=:date&timezone=:tz` - Get available slots
@@ -632,6 +661,29 @@ Cron Job (daily)        Database
 - `GET /api/integrations/google/callback` - Handle OAuth callback
 - `POST /api/integrations/:id/sync` - Trigger calendar sync
 - `DELETE /api/integrations/:id` - Remove calendar integration
+
+### Availability API Response Format
+
+The availability API returns UTC timestamps only, enabling instant timezone switching without re-fetching:
+
+```json
+{
+  "slots": {
+    "2025-01-15": [
+      {
+        "start_time": "2025-01-15T19:00:00Z",
+        "end_time": "2025-01-15T19:30:00Z"
+      }
+    ]
+  }
+}
+```
+
+**Why UTC-only?**
+- ✅ Client can switch timezones without re-fetching
+- ✅ Simpler API contract
+- ✅ One response works for all guests
+- ✅ Enables effective client-side caching across timezone changes
 
 ## Key Design Decisions
 
@@ -716,6 +768,96 @@ Following the repository's preferred open-source stack:
 **External APIs**:
 - Google Calendar API
 - Microsoft Graph API (Outlook)
+
+## Frontend Architecture
+
+The frontend follows a component-based architecture using React with TypeScript. Components are organized by feature and concern for maintainability and reusability.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/              # Shared UI components
+│   ├── icons/               # SVG icon components
+│   │   ├── index.ts         # Barrel export for all icons
+│   │   ├── ActivateIcon.tsx
+│   │   ├── CalendarIcon.tsx
+│   │   ├── DeactivateIcon.tsx
+│   │   ├── DeleteIcon.tsx
+│   │   └── EditIcon.tsx
+│   ├── meeting-types/       # Meeting type feature components
+│   │   ├── index.ts         # Barrel export
+│   │   ├── MeetingTypeCard.tsx
+│   │   ├── MeetingTypeModal.tsx
+│   │   └── MeetingTypesEmptyState.tsx
+│   ├── CalendarPicker.tsx   # Date selection widget
+│   ├── LoadingSpinner.tsx   # Loading indicator
+│   ├── Navbar.tsx           # Main navigation
+│   └── TimeSlotPicker.tsx   # Time slot selection widget
+├── routes/                  # Page components (Tanstack Router)
+│   ├── __root.tsx           # Root layout with Navbar
+│   ├── index.tsx            # Landing page
+│   ├── login.tsx            # Login page
+│   ├── register.tsx         # Registration page
+│   ├── dashboard.tsx        # User dashboard
+│   ├── meeting-types.tsx    # Meeting type management
+│   ├── availability.tsx     # Availability settings
+│   ├── bookings.tsx         # Booking list
+│   ├── bookings.$bookingId.tsx  # Single booking detail
+│   ├── book.$meetingTypeId.tsx  # Public booking page
+│   └── admin.tsx            # Admin dashboard
+├── services/                # API client and services
+│   └── api.ts               # REST API wrapper
+├── stores/                  # Zustand state stores
+│   └── authStore.ts         # Authentication state
+├── types/                   # TypeScript type definitions
+│   └── index.ts             # Shared interfaces
+└── utils/                   # Utility functions
+    └── time.ts              # Time/timezone helpers
+```
+
+### Component Organization Principles
+
+1. **Icons in Separate Directory**: All SVG icons are extracted into `components/icons/` with individual files. This keeps component code readable and enables tree-shaking.
+
+2. **Feature-Based Grouping**: Related components are grouped in feature directories (e.g., `meeting-types/`) with barrel exports for clean imports.
+
+3. **Small, Focused Components**: Components are kept under 200 lines. Larger components are split into sub-components (e.g., `MeetingTypeCard` contains `MeetingTypeCardHeader` and `MeetingTypeCardActions`).
+
+4. **JSDoc Documentation**: All components and significant functions include JSDoc comments describing their purpose and parameters.
+
+5. **Props Interfaces**: TypeScript interfaces are defined for all component props with descriptive documentation.
+
+### Import Patterns
+
+```typescript
+// Icons - import from barrel export
+import { CalendarIcon, EditIcon, DeleteIcon } from '../components/icons';
+
+// Feature components - import from barrel export
+import {
+  MeetingTypeCard,
+  MeetingTypeModal,
+  MeetingTypesEmptyState,
+} from '../components/meeting-types';
+
+// Shared components - import directly
+import { LoadingSpinner } from '../components/LoadingSpinner';
+```
+
+### State Management
+
+- **Local State**: React's `useState` for component-specific UI state
+- **Global State**: Zustand stores for shared state (authentication)
+- **Server State**: Direct API calls with loading/error state management
+
+### Routing
+
+Uses Tanstack Router with file-based routing. Route files define:
+- `beforeLoad`: Authentication guards and data prefetching
+- `component`: The page component to render
+
+---
 
 ## Scalability Considerations
 

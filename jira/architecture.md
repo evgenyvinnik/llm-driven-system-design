@@ -1114,3 +1114,86 @@ jira_search_latency_seconds{query_type="jql"}
 - Load balancer health checks route traffic only to healthy instances
 - Degraded state (ES down) returns 200 but indicates partial functionality
 - Individual latency helps identify slow dependencies
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React 19, TypeScript, Vite, and Tailwind CSS. It follows a component-based architecture with clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/
+│   ├── ui.tsx                    # Reusable UI primitives (Button, Input, Avatar, etc.)
+│   ├── Layout.tsx                # App shell with navigation
+│   ├── Board.tsx                 # Kanban/Scrum board view
+│   ├── CreateIssueModal.tsx      # Issue creation modal
+│   ├── IssueDetail.tsx           # Issue detail panel (container component)
+│   └── issue-detail/             # Sub-components for IssueDetail
+│       ├── index.ts              # Barrel exports
+│       ├── IssueDetailHeader.tsx
+│       ├── IssueDetailSidebar.tsx
+│       ├── IssueDetailTabs.tsx
+│       └── IssueSummaryEditor.tsx
+├── hooks/
+│   └── useIssueDetail.ts         # Custom hook for issue detail state management
+├── routes/                       # TanStack Router file-based routing
+├── services/
+│   └── api.ts                    # API client functions
+├── stores/                       # Zustand stores for global state
+└── types/
+    └── index.ts                  # TypeScript interfaces and types
+```
+
+### Component Organization Principles
+
+1. **Container Components**: Large components that manage state and coordinate sub-components (e.g., `IssueDetail.tsx`)
+
+2. **Sub-Component Directories**: Complex views are split into directories with:
+   - Multiple focused sub-components (< 200 lines each)
+   - A barrel export file (`index.ts`)
+   - Related custom hooks extracted to `hooks/`
+
+3. **UI Primitives**: Generic, reusable components in `components/ui.tsx`:
+   - `Button`, `Input`, `Textarea`, `Select`
+   - `Avatar`, `Spinner`, `Modal`
+   - `IssueTypeIcon`, `PriorityIcon`, `StatusBadge`
+
+4. **Custom Hooks**: Complex state logic extracted into custom hooks:
+   - `useIssueDetail`: Manages issue data fetching, editing state, and API operations
+
+### IssueDetail Component Architecture
+
+The `IssueDetail` component demonstrates the pattern for complex views:
+
+```
+IssueDetail (container)
+├── IssueDetailHeader     # Issue type icon, key, close button
+├── IssueSummaryEditor    # Inline editing for summary and description
+├── IssueDetailTabs       # Comments and history tabs
+│   ├── TabNavigation
+│   ├── CommentsTab
+│   │   └── CommentItem
+│   └── HistoryTab
+│       └── HistoryItem
+└── IssueDetailSidebar    # Status, assignee, priority, story points
+```
+
+**State Management:**
+- The `useIssueDetail` hook centralizes all state and actions
+- Returns `{ state, actions }` pattern for clean consumption
+- Sub-components receive only the props they need
+
+### Styling
+
+- **Tailwind CSS** for utility-first styling
+- **clsx** for conditional class composition
+- No CSS modules or styled-components
+
+### Type Safety
+
+- Strict TypeScript configuration
+- Shared types in `types/index.ts`
+- JSDoc comments on all exported components and functions

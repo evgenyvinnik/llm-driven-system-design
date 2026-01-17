@@ -361,6 +361,81 @@ CREATE TABLE experiments (
 );
 ```
 
+### Cassandra Schema (Viewing History)
+
+While PostgreSQL handles the core relational data (videos, profiles, experiments), Cassandra is used for high-write viewing history data. This hybrid approach leverages each database's strengths.
+
+**Why Cassandra for Viewing History?**
+- **High-write throughput**: Every play/pause/seek generates writes (100:1 write:read ratio)
+- **Time-ordered retrieval**: TimeUUID clustering keys provide natural ordering
+- **TTL for data lifecycle**: Automatic cleanup of old viewing progress
+- **Horizontal scalability**: Easily partition by profile_id for billions of users
+
+```cql
+-- Keyspace configuration
+CREATE KEYSPACE netflix_viewing WITH REPLICATION = {
+  'class': 'SimpleStrategy',
+  'replication_factor': 1
+};
+
+-- Viewing progress (for "Continue Watching")
+-- Partition key: profile_id (all progress for a user together)
+CREATE TABLE viewing_progress (
+    profile_id UUID,
+    content_id UUID,           -- video_id or episode_id
+    content_type TEXT,         -- 'movie' or 'episode'
+    video_id UUID,
+    episode_id UUID,
+    position_seconds INT,
+    duration_seconds INT,
+    progress_percent FLOAT,
+    completed BOOLEAN,
+    last_watched_at TIMESTAMP,
+    PRIMARY KEY (profile_id, last_watched_at, content_id)
+) WITH CLUSTERING ORDER BY (last_watched_at DESC)
+  AND default_time_to_live = 7776000;  -- 90 days TTL
+
+-- Watch history (for recommendations)
+CREATE TABLE watch_history (
+    profile_id UUID,
+    content_id UUID,
+    content_type TEXT,
+    video_id UUID,
+    title TEXT,                -- Denormalized for display
+    genres SET<TEXT>,          -- Denormalized for recommendations
+    watched_at TIMESTAMP,
+    PRIMARY KEY (profile_id, watched_at, content_id)
+) WITH CLUSTERING ORDER BY (watched_at DESC)
+  AND default_time_to_live = 31536000;  -- 1 year TTL
+
+-- Genre preferences (counter table for personalization)
+CREATE TABLE genre_preferences (
+    profile_id UUID,
+    genre TEXT,
+    watch_count COUNTER,
+    PRIMARY KEY (profile_id, genre)
+);
+```
+
+**Data Flow:**
+```
+1. User plays video
+   → UPDATE viewing_progress SET position_seconds = X, last_watched_at = now()
+
+2. User completes video
+   → INSERT into watch_history (denormalized from PostgreSQL video data)
+   → UPDATE genre_preferences (increment counters)
+
+3. Homepage generation
+   → SELECT * FROM viewing_progress WHERE profile_id = ? LIMIT 10
+   → JOIN with PostgreSQL for video metadata
+```
+
+**Why denormalize title/genres in watch_history?**
+- Avoids cross-database joins on every recommendation query
+- Cassandra doesn't support joins; data must be self-contained
+- Trade-off: Must handle video metadata updates (rare for historical data)
+
 ---
 
 ## Key Design Decisions
@@ -1302,3 +1377,133 @@ await deleteProfileData(profileId);
 | Rate limiting | Sliding window | Token bucket | Smoother limiting |
 | Backups | pg_dump + snapshots | Logical replication | Simpler for learning |
 | Archives | MinIO (S3-compat) | Glacier | Local development friendly |
+
+---
+
+## Frontend Architecture
+
+The frontend is built with React, TypeScript, and Tailwind CSS, following a component-based architecture with clear separation of concerns.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/          # Reusable UI components
+│   ├── VideoPlayer/     # Video player sub-components
+│   │   ├── index.ts           # Barrel exports
+│   │   ├── TopBar.tsx         # Title and back navigation
+│   │   ├── CenterPlayButton.tsx # Large play/pause overlay
+│   │   ├── ProgressBar.tsx    # Seek slider with time display
+│   │   ├── VolumeControl.tsx  # Volume slider and mute toggle
+│   │   ├── QualitySelector.tsx # Quality/bitrate selection menu
+│   │   ├── ControlBar.tsx     # Bottom controls container
+│   │   ├── useVideoPlayerControls.ts # Keyboard and control logic hook
+│   │   └── utils.ts           # Shared utilities (formatTime, etc.)
+│   ├── VideoPlayer.tsx  # Main player component (orchestrates sub-components)
+│   ├── Navbar.tsx       # Global navigation bar
+│   ├── HeroBanner.tsx   # Featured content banner
+│   ├── VideoCard.tsx    # Content card with hover preview
+│   ├── VideoRow.tsx     # Horizontal scrollable content row
+│   └── ContinueWatchingRow.tsx # Continue watching with progress
+├── stores/              # Zustand state management
+│   ├── authStore.ts     # Authentication state
+│   ├── browseStore.ts   # Content browsing state
+│   └── playerStore.ts   # Video playback state
+├── services/            # API service layer
+│   └── streaming.ts     # Streaming API client
+├── types/               # TypeScript type definitions
+└── routes/              # TanStack Router pages
+```
+
+### Component Organization Principles
+
+1. **Component Size Limit**: Components exceeding ~150 lines are split into sub-components
+2. **Colocation**: Related components are grouped in subdirectories (e.g., `VideoPlayer/`)
+3. **Barrel Exports**: Each component directory has an `index.ts` for clean imports
+4. **Custom Hooks**: Complex logic is extracted into custom hooks (e.g., `useVideoPlayerControls`)
+5. **Utility Functions**: Shared helpers live in `utils.ts` files within component directories
+
+### VideoPlayer Component Architecture
+
+The VideoPlayer is the most complex component, split into focused sub-components:
+
+| Component | Responsibility | Lines |
+|-----------|----------------|-------|
+| `VideoPlayer.tsx` | Orchestration, video element, effects | ~200 |
+| `TopBar.tsx` | Title display, back navigation | ~45 |
+| `CenterPlayButton.tsx` | Large play/pause overlay | ~40 |
+| `ControlBar.tsx` | Bottom controls container | ~130 |
+| `ProgressBar.tsx` | Seek slider with time display | ~60 |
+| `VolumeControl.tsx` | Volume slider and mute | ~75 |
+| `QualitySelector.tsx` | Quality selection dropdown | ~85 |
+| `useVideoPlayerControls.ts` | Keyboard shortcuts, control logic | ~175 |
+| `utils.ts` | Time formatting utilities | ~25 |
+
+**Benefits of this structure:**
+- Each component has a single responsibility
+- Easy to test individual components
+- Improved code navigation and maintainability
+- Enables parallel development by multiple developers
+
+### State Management
+
+The frontend uses Zustand stores organized by domain:
+
+| Store | Purpose | Key State |
+|-------|---------|-----------|
+| `authStore` | Authentication | User session, profile selection |
+| `browseStore` | Content browsing | Homepage rows, My List, search |
+| `playerStore` | Video playback | Play state, volume, quality, progress |
+
+**Store Design Pattern:**
+```typescript
+// Each store follows this pattern
+interface PlayerState {
+  // State
+  isPlaying: boolean;
+  currentTime: number;
+  // ...
+
+  // Actions
+  setPlaying: (playing: boolean) => void;
+  loadManifest: (videoId: string) => Promise<void>;
+  // ...
+}
+```
+
+### Keyboard Shortcuts (VideoPlayer)
+
+| Key | Action |
+|-----|--------|
+| Space | Play/Pause |
+| Arrow Left | Skip back 10 seconds |
+| Arrow Right | Skip forward 10 seconds |
+| Arrow Up | Increase volume |
+| Arrow Down | Decrease volume |
+| M | Toggle mute |
+| F | Toggle fullscreen |
+| Escape | Exit fullscreen or navigate back |
+
+### JSDoc Documentation Standards
+
+All components and significant functions include JSDoc comments:
+
+```typescript
+/**
+ * Component description.
+ * Additional context about behavior and usage.
+ *
+ * @param props - Component properties
+ * @returns JSX element description
+ */
+export function ComponentName({ prop1, prop2 }: ComponentProps) {
+  // ...
+}
+```
+
+### Testing Strategy
+
+Components are designed for testability:
+- Props-based components can be rendered in isolation
+- Custom hooks can be tested with `@testing-library/react-hooks`
+- Zustand stores can be mocked for component testing

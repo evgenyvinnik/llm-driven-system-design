@@ -2,7 +2,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: googledocs_postgres
+    container_name: googledocs-postgres
     environment:
       POSTGRES_USER: googledocs
       POSTGRES_PASSWORD: googledocs_secret
@@ -20,7 +20,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: googledocs_redis
+    container_name: googledocs-redis
     ports:
       - "6379:6379"
     volumes:
@@ -32,6 +32,53 @@ services:
       timeout: 5s
       retries: 5
 
+  couchdb:
+    image: couchdb:3.3
+    container_name: googledocs-couchdb
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: admin123
+    ports:
+      - "5984:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5984/_up"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # CouchDB initialization
+  couchdb-init:
+    image: curlimages/curl:latest
+    container_name: googledocs-couchdb-init
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Creating CouchDB databases...';
+      sleep 5;
+      curl -X PUT http://admin:admin123@couchdb:5984/_users;
+      curl -X PUT http://admin:admin123@couchdb:5984/_replicator;
+      curl -X PUT http://admin:admin123@couchdb:5984/documents;
+      curl -X PUT http://admin:admin123@couchdb:5984/document_versions;
+      echo '';
+      echo 'Creating design documents for views...';
+      curl -X PUT http://admin:admin123@couchdb:5984/documents/_design/docs -H 'Content-Type: application/json' -d '{
+        \"views\": {
+          \"by_owner\": {
+            \"map\": \"function(doc) { if(doc.owner_id) emit(doc.owner_id, doc._id); }\"
+          },
+          \"recent\": {
+            \"map\": \"function(doc) { if(doc.updated_at) emit(doc.updated_at, null); }\"
+          }
+        }
+      }';
+      echo 'CouchDB initialization complete';
+      "
+
 volumes:
   postgres_data:
   redis_data:
+  couchdb_data:

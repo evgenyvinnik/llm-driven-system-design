@@ -1368,3 +1368,104 @@ For local development, the following endpoints are available:
 - **RabbitMQ Management**: `http://localhost:15672` (appstore/appstore_pass)
 
 In production, configure Prometheus to scrape `/metrics` and Grafana dashboards for visualization.
+
+---
+
+## Frontend Architecture
+
+The frontend follows a component-based architecture with clear separation of concerns. Components are organized by feature domain and complexity level.
+
+### Directory Structure
+
+```
+frontend/src/
+├── components/           # Reusable UI components
+│   ├── developer/        # Developer dashboard components
+│   │   ├── index.ts              # Barrel export
+│   │   ├── utils.ts              # Shared utilities (getStatusColor)
+│   │   ├── DeveloperAppHeader.tsx
+│   │   ├── AppDetailsTab.tsx
+│   │   ├── AppReviewsTab.tsx
+│   │   ├── AppAnalyticsTab.tsx
+│   │   └── ResponseForm.tsx
+│   ├── AppCard.tsx       # App listing card with StarRating
+│   ├── Header.tsx        # Site navigation header
+│   └── ReviewCard.tsx    # User review display
+├── routes/               # TanStack Router page components
+│   ├── __root.tsx        # Root layout
+│   ├── index.tsx         # Home page
+│   ├── developer.tsx     # Developer dashboard
+│   ├── developer.app.$id.tsx  # App management page
+│   └── ...
+├── services/             # API client and utilities
+├── stores/               # Zustand state stores
+└── types/                # TypeScript type definitions
+```
+
+### Component Organization Principles
+
+1. **Feature-Based Grouping**: Components are organized by feature domain (e.g., `developer/` for developer dashboard components). This improves discoverability and maintains clear ownership.
+
+2. **Barrel Exports**: Each component directory has an `index.ts` that re-exports all public components. This simplifies imports:
+   ```typescript
+   // Clean import from barrel
+   import { DeveloperAppHeader, AppDetailsTab } from '../components/developer';
+
+   // Instead of multiple imports
+   import { DeveloperAppHeader } from '../components/developer/DeveloperAppHeader';
+   import { AppDetailsTab } from '../components/developer/AppDetailsTab';
+   ```
+
+3. **Component Size Guidelines**:
+   - Route components (pages): < 300 lines
+   - Feature components: < 200 lines
+   - Utility components: < 100 lines
+
+4. **JSDoc Documentation**: All components and significant functions include JSDoc comments with:
+   - `@fileoverview` for file descriptions
+   - `@param` for component props documentation
+   - `@returns` for return value descriptions
+   - `@example` where usage patterns are non-obvious
+
+### Developer Dashboard Components
+
+The developer app management page (`developer.app.$id.tsx`) demonstrates the component architecture:
+
+| Component | Responsibility | Lines |
+|-----------|----------------|-------|
+| `DeveloperAppHeader` | App icon, name, status badge, action buttons | ~75 |
+| `AppDetailsTab` | View/edit app metadata form | ~190 |
+| `AppReviewsTab` | Review list with response forms | ~105 |
+| `AppAnalyticsTab` | Metrics cards (downloads, revenue, ratings) | ~145 |
+| `ResponseForm` | Expandable review response form | ~75 |
+
+### Shared Components
+
+| Component | Location | Usage |
+|-----------|----------|-------|
+| `StarRating` | `components/AppCard.tsx` | Rating display throughout the app |
+| `ReviewCard` | `components/ReviewCard.tsx` | User review display with voting |
+| `RatingBar` | `components/ReviewCard.tsx` | Rating distribution chart |
+| `AppCard` | `components/AppCard.tsx` | App listing in charts and search |
+
+### State Management
+
+- **Route State**: Managed by TanStack Router via URL params and search params
+- **Auth State**: Global user session in Zustand store (`authStore`)
+- **Catalog State**: App listings and categories in Zustand store (`catalogStore`)
+- **Local UI State**: Component-level React state for forms and UI interactions
+
+### API Integration
+
+All API calls are centralized in `services/api.ts`. Components fetch data in effects and manage loading/error states locally:
+
+```typescript
+const [data, setData] = useState<Data | null>(null);
+const [isLoading, setIsLoading] = useState(true);
+
+useEffect(() => {
+  api.get('/endpoint')
+    .then(response => setData(response.data))
+    .finally(() => setIsLoading(false));
+}, []);
+```

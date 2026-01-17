@@ -1,28 +1,25 @@
 /**
  * @fileoverview Individual block component for rendering different block types.
- * Supports text editing, block type conversion, and nested child blocks.
+ * Acts as the main orchestrator that delegates rendering to specialized block
+ * type components while handling common functionality like focus, menus, and handles.
  */
 
 import { useRef, useEffect, useState } from 'react';
+import { GripVertical, Plus } from 'lucide-react';
 import type { Block, BlockType, RichText } from '@/types';
-import {
-  GripVertical,
-  Plus,
-  ChevronRight,
-  ChevronDown,
-  Type,
-  Heading1,
-  Heading2,
-  Heading3,
-  List,
-  ListOrdered,
-  ChevronRightSquare,
-  Code,
-  Quote,
-  AlertCircle,
-  Minus,
-} from 'lucide-react';
 import { useEditorStore } from '@/stores/editor';
+
+// Import block type components
+import { HeadingBlock } from './HeadingBlock';
+import { ListBlock } from './ListBlock';
+import { ToggleBlock } from './ToggleBlock';
+import { CodeBlock } from './CodeBlock';
+import { QuoteBlock } from './QuoteBlock';
+import { CalloutBlock } from './CalloutBlock';
+import { DividerBlock } from './DividerBlock';
+import { TextBlock } from './TextBlock';
+import { BlockTypeMenu } from './BlockTypeMenu';
+import { getPlaceholder, getTextContent } from './types';
 
 /**
  * Props for the BlockComponent.
@@ -52,32 +49,31 @@ interface BlockComponentProps {
   onSlashCommand: (command: string) => void;
 }
 
-/** Icon mapping for each block type in the type menu */
-const BLOCK_TYPE_ICONS: Record<BlockType, React.ReactNode> = {
-  text: <Type className="w-4 h-4" />,
-  heading_1: <Heading1 className="w-4 h-4" />,
-  heading_2: <Heading2 className="w-4 h-4" />,
-  heading_3: <Heading3 className="w-4 h-4" />,
-  bulleted_list: <List className="w-4 h-4" />,
-  numbered_list: <ListOrdered className="w-4 h-4" />,
-  toggle: <ChevronRightSquare className="w-4 h-4" />,
-  code: <Code className="w-4 h-4" />,
-  quote: <Quote className="w-4 h-4" />,
-  callout: <AlertCircle className="w-4 h-4" />,
-  divider: <Minus className="w-4 h-4" />,
-  image: <Type className="w-4 h-4" />,
-  video: <Type className="w-4 h-4" />,
-  embed: <Type className="w-4 h-4" />,
-  table: <Type className="w-4 h-4" />,
-  database: <Type className="w-4 h-4" />,
-};
-
 /**
  * BlockComponent renders a single block with type-specific styling.
- * Handles contentEditable text input, focus management, and block type menu.
+ * Orchestrates block rendering by delegating to specialized components
+ * while handling common functionality like focus management, block handles,
+ * and the type conversion menu.
  *
  * @param props - Component props
- * @returns The rendered block element
+ * @returns The rendered block element with handles and content
+ *
+ * @example
+ * ```tsx
+ * <BlockComponent
+ *   block={block}
+ *   childBlocks={children}
+ *   allBlocks={allBlocks}
+ *   isFocused={focusedId === block.id}
+ *   onFocus={() => setFocusedId(block.id)}
+ *   onUpdate={(content) => updateBlock(block.id, { content })}
+ *   onChangeType={(type) => updateBlock(block.id, { type })}
+ *   onDelete={() => deleteBlock(block.id)}
+ *   onAddBlock={(type) => addBlock(type, block.id)}
+ *   onKeyDown={handleKeyDown}
+ *   onSlashCommand={handleSlashCommand}
+ * />
+ * ```
  */
 export default function BlockComponent({
   block,
@@ -97,33 +93,38 @@ export default function BlockComponent({
   const [isExpanded, setIsExpanded] = useState(!block.is_collapsed);
   const { updateBlock } = useEditorStore();
 
-  // Focus management
+  // Manage focus when this block becomes focused
   useEffect(() => {
     if (isFocused && contentRef.current) {
       contentRef.current.focus();
-
-      // Place cursor at end
-      const range = document.createRange();
-      const selection = window.getSelection();
-      range.selectNodeContents(contentRef.current);
-      range.collapse(false);
-      selection?.removeAllRanges();
-      selection?.addRange(range);
+      placeCursorAtEnd(contentRef.current);
     }
   }, [isFocused]);
 
-  // Get text content from RichText array
-  const getTextContent = () => {
-    return block.content.map((rt) => rt.text).join('');
-  };
+  /**
+   * Places the cursor at the end of the contentEditable element.
+   *
+   * @param element - The contentEditable element to focus
+   */
+  function placeCursorAtEnd(element: HTMLElement) {
+    const range = document.createRange();
+    const selection = window.getSelection();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
 
-  // Handle content changes
+  /**
+   * Handles input changes in the contentEditable element.
+   * Detects slash commands and updates block content.
+   */
   const handleInput = () => {
     if (!contentRef.current) return;
 
     const text = contentRef.current.innerText;
 
-    // Check for slash commands
+    // Check for slash commands (e.g., "/heading " triggers type conversion)
     if (text.startsWith('/')) {
       const match = text.match(/^\/(\w+)\s/);
       if (match) {
@@ -135,333 +136,160 @@ export default function BlockComponent({
     onUpdate([{ text }]);
   };
 
-  // Handle key events
+  /**
+   * Handles keyboard events for the block.
+   * Opens the type menu on slash key when block is empty.
+   *
+   * @param e - The keyboard event
+   */
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Check for slash command
+    // Check for slash command when block is empty
     if (e.key === '/' && contentRef.current?.innerText === '') {
       setShowMenu(true);
       return;
     }
 
-    // Forward to parent handler
+    // Forward to parent handler for navigation
     onKeyDown(e);
   };
 
-  // Toggle expanded state for toggle blocks
+  /**
+   * Toggles the expanded state for toggle blocks.
+   * Persists the collapsed state to the backend.
+   */
   const handleToggle = async () => {
     const newExpanded = !isExpanded;
     setIsExpanded(newExpanded);
     await updateBlock(block.id, { is_collapsed: !newExpanded });
   };
 
-  // Render block content based on type
+  /**
+   * Handles block type changes from the menu.
+   *
+   * @param type - The new block type to convert to
+   */
+  const handleTypeChange = (type: BlockType) => {
+    onChangeType(type);
+    setShowMenu(false);
+  };
+
+  // Get text content and placeholder for the block
+  const textContent = getTextContent(block.content);
+  const placeholder = getPlaceholder(block.type);
+
+  /**
+   * Renders the appropriate block content based on block type.
+   * Delegates to specialized block type components.
+   *
+   * @returns The rendered block content element
+   */
   const renderBlockContent = () => {
-    const placeholder = getPlaceholder(block.type);
-    const textContent = getTextContent();
+    // Common props for most block renderers
+    const commonProps = {
+      contentRef,
+      textContent,
+      placeholder,
+      onInput: handleInput,
+      onKeyDown: handleKeyDown,
+      onFocus,
+    };
 
     switch (block.type) {
       case 'heading_1':
-        return (
-          <div
-            ref={contentRef}
-            className="notion-heading-1 outline-none"
-            contentEditable
-            suppressContentEditableWarning
-            data-placeholder={placeholder}
-            onInput={handleInput}
-            onKeyDown={handleKeyDown}
-            onFocus={onFocus}
-          >
-            {textContent}
-          </div>
-        );
-
       case 'heading_2':
-        return (
-          <div
-            ref={contentRef}
-            className="notion-heading-2 outline-none"
-            contentEditable
-            suppressContentEditableWarning
-            data-placeholder={placeholder}
-            onInput={handleInput}
-            onKeyDown={handleKeyDown}
-            onFocus={onFocus}
-          >
-            {textContent}
-          </div>
-        );
-
       case 'heading_3':
-        return (
-          <div
-            ref={contentRef}
-            className="notion-heading-3 outline-none"
-            contentEditable
-            suppressContentEditableWarning
-            data-placeholder={placeholder}
-            onInput={handleInput}
-            onKeyDown={handleKeyDown}
-            onFocus={onFocus}
-          >
-            {textContent}
-          </div>
-        );
+        return <HeadingBlock level={block.type} {...commonProps} />;
 
       case 'bulleted_list':
-        return (
-          <div className="notion-list-item">
-            <span className="text-notion-text mt-0.5">•</span>
-            <div
-              ref={contentRef}
-              className="flex-1 outline-none"
-              contentEditable
-              suppressContentEditableWarning
-              data-placeholder={placeholder}
-              onInput={handleInput}
-              onKeyDown={handleKeyDown}
-              onFocus={onFocus}
-            >
-              {textContent}
-            </div>
-          </div>
-        );
+        return <ListBlock variant="bulleted" {...commonProps} />;
 
       case 'numbered_list':
-        return (
-          <div className="notion-list-item">
-            <span className="text-notion-text mt-0.5 min-w-5">1.</span>
-            <div
-              ref={contentRef}
-              className="flex-1 outline-none"
-              contentEditable
-              suppressContentEditableWarning
-              data-placeholder={placeholder}
-              onInput={handleInput}
-              onKeyDown={handleKeyDown}
-              onFocus={onFocus}
-            >
-              {textContent}
-            </div>
-          </div>
-        );
+        return <ListBlock variant="numbered" {...commonProps} />;
 
       case 'toggle':
         return (
-          <div className="notion-toggle">
-            <button
-              className={`notion-toggle-icon ${isExpanded ? 'expanded' : ''}`}
-              onClick={handleToggle}
-            >
-              <ChevronRight className="w-4 h-4" />
-            </button>
-            <div className="flex-1">
-              <div
-                ref={contentRef}
-                className="outline-none"
-                contentEditable
-                suppressContentEditableWarning
-                data-placeholder={placeholder}
-                onInput={handleInput}
-                onKeyDown={handleKeyDown}
-                onFocus={onFocus}
-              >
-                {textContent}
-              </div>
-              {isExpanded && childBlocks.length > 0 && (
-                <div className="pl-2 mt-1 border-l-2 border-notion-border">
-                  {childBlocks.map((child) => (
-                    <BlockComponent
-                      key={child.id}
-                      block={child}
-                      childBlocks={allBlocks.filter(b => b.parent_block_id === child.id)}
-                      allBlocks={allBlocks}
-                      isFocused={false}
-                      onFocus={() => {}}
-                      onUpdate={() => {}}
-                      onChangeType={() => {}}
-                      onDelete={() => {}}
-                      onAddBlock={() => {}}
-                      onKeyDown={() => {}}
-                      onSlashCommand={() => {}}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
+          <ToggleBlock
+            block={block}
+            isExpanded={isExpanded}
+            onToggle={handleToggle}
+            childBlocks={childBlocks}
+            allBlocks={allBlocks}
+            {...commonProps}
+          />
         );
 
       case 'code':
-        return (
-          <pre className="notion-code">
-            <code
-              ref={contentRef}
-              className="outline-none block whitespace-pre-wrap"
-              contentEditable
-              suppressContentEditableWarning
-              data-placeholder={placeholder}
-              onInput={handleInput}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  // Allow new lines in code blocks
-                  e.stopPropagation();
-                } else {
-                  handleKeyDown(e);
-                }
-              }}
-              onFocus={onFocus}
-            >
-              {textContent}
-            </code>
-          </pre>
-        );
+        return <CodeBlock {...commonProps} />;
 
       case 'quote':
-        return (
-          <div className="notion-quote">
-            <div
-              ref={contentRef}
-              className="outline-none"
-              contentEditable
-              suppressContentEditableWarning
-              data-placeholder={placeholder}
-              onInput={handleInput}
-              onKeyDown={handleKeyDown}
-              onFocus={onFocus}
-            >
-              {textContent}
-            </div>
-          </div>
-        );
+        return <QuoteBlock {...commonProps} />;
 
       case 'callout':
-        return (
-          <div className="notion-callout">
-            <span className="text-xl">💡</span>
-            <div
-              ref={contentRef}
-              className="flex-1 outline-none"
-              contentEditable
-              suppressContentEditableWarning
-              data-placeholder={placeholder}
-              onInput={handleInput}
-              onKeyDown={handleKeyDown}
-              onFocus={onFocus}
-            >
-              {textContent}
-            </div>
-          </div>
-        );
+        return <CalloutBlock {...commonProps} />;
 
       case 'divider':
-        return <hr className="notion-divider" />;
+        return <DividerBlock />;
 
       default:
-        return (
-          <div
-            ref={contentRef}
-            className="outline-none min-h-6"
-            contentEditable
-            suppressContentEditableWarning
-            data-placeholder={placeholder}
-            onInput={handleInput}
-            onKeyDown={handleKeyDown}
-            onFocus={onFocus}
-          >
-            {textContent}
-          </div>
-        );
+        return <TextBlock {...commonProps} />;
     }
   };
 
   return (
     <div className={`notion-block group ${isFocused ? 'notion-block-focused' : ''}`}>
-      {/* Block handle and menu */}
-      <div className="notion-block-handle flex items-center gap-0.5 pr-1">
-        <button
-          className="w-5 h-5 flex items-center justify-center rounded hover:bg-notion-border"
-          onClick={() => onAddBlock()}
-        >
-          <Plus className="w-4 h-4 text-notion-text-secondary" />
-        </button>
-        <button
-          className="w-5 h-5 flex items-center justify-center rounded hover:bg-notion-border cursor-grab"
-          onClick={() => setShowMenu(!showMenu)}
-        >
-          <GripVertical className="w-4 h-4 text-notion-text-secondary" />
-        </button>
-      </div>
+      {/* Block handle with add button and grip */}
+      <BlockHandle
+        onAdd={() => onAddBlock()}
+        onMenuToggle={() => setShowMenu(!showMenu)}
+      />
 
-      {/* Block content */}
+      {/* Block content delegated to type-specific component */}
       {renderBlockContent()}
 
-      {/* Block type menu */}
-      {showMenu && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
-          <div className="absolute left-0 top-full z-50 bg-white border border-notion-border rounded-md shadow-lg py-1 min-w-48">
-            <div className="px-3 py-1 text-xs font-medium text-notion-text-secondary">
-              Turn into
-            </div>
-            {[
-              { type: 'text', label: 'Text' },
-              { type: 'heading_1', label: 'Heading 1' },
-              { type: 'heading_2', label: 'Heading 2' },
-              { type: 'heading_3', label: 'Heading 3' },
-              { type: 'bulleted_list', label: 'Bulleted List' },
-              { type: 'numbered_list', label: 'Numbered List' },
-              { type: 'toggle', label: 'Toggle' },
-              { type: 'code', label: 'Code' },
-              { type: 'quote', label: 'Quote' },
-              { type: 'callout', label: 'Callout' },
-              { type: 'divider', label: 'Divider' },
-            ].map(({ type, label }) => (
-              <button
-                key={type}
-                className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-notion-hover text-sm"
-                onClick={() => {
-                  onChangeType(type as BlockType);
-                  setShowMenu(false);
-                }}
-              >
-                {BLOCK_TYPE_ICONS[type as BlockType]}
-                {label}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      {/* Block type conversion menu */}
+      <BlockTypeMenu
+        isOpen={showMenu}
+        onClose={() => setShowMenu(false)}
+        onSelectType={handleTypeChange}
+      />
     </div>
   );
 }
 
 /**
- * Returns the placeholder text for a given block type.
- *
- * @param type - The block type
- * @returns Placeholder string for the block
+ * Props for the BlockHandle component.
  */
-function getPlaceholder(type: BlockType): string {
-  switch (type) {
-    case 'heading_1':
-      return 'Heading 1';
-    case 'heading_2':
-      return 'Heading 2';
-    case 'heading_3':
-      return 'Heading 3';
-    case 'bulleted_list':
-    case 'numbered_list':
-      return 'List item';
-    case 'toggle':
-      return 'Toggle';
-    case 'code':
-      return 'Type code here...';
-    case 'quote':
-      return 'Quote';
-    case 'callout':
-      return 'Type something...';
-    default:
-      return "Type '/' for commands...";
-  }
+interface BlockHandleProps {
+  /** Callback when the add button is clicked */
+  onAdd: () => void;
+  /** Callback when the grip/menu button is clicked */
+  onMenuToggle: () => void;
+}
+
+/**
+ * BlockHandle renders the left-side handle with add and grip buttons.
+ * Provides quick access to adding new blocks and opening the type menu.
+ *
+ * @param props - Component props with action callbacks
+ * @returns The block handle element with buttons
+ */
+function BlockHandle({ onAdd, onMenuToggle }: BlockHandleProps) {
+  return (
+    <div className="notion-block-handle flex items-center gap-0.5 pr-1">
+      <button
+        className="w-5 h-5 flex items-center justify-center rounded hover:bg-notion-border"
+        onClick={onAdd}
+        aria-label="Add block below"
+      >
+        <Plus className="w-4 h-4 text-notion-text-secondary" />
+      </button>
+      <button
+        className="w-5 h-5 flex items-center justify-center rounded hover:bg-notion-border cursor-grab"
+        onClick={onMenuToggle}
+        aria-label="Block options"
+      >
+        <GripVertical className="w-4 h-4 text-notion-text-secondary" />
+      </button>
+    </div>
+  );
 }

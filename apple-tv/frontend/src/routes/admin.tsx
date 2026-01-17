@@ -1,36 +1,16 @@
-import { createFileRoute, useNavigate, Link } from '@tanstack/react-router';
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
+import { Settings } from 'lucide-react';
 import { Header } from '../components';
 import { useAuthStore } from '../stores/authStore';
 import { adminApi } from '../services/api';
-import { Users, Film, Eye, TrendingUp, Star, Settings } from 'lucide-react';
-
-/**
- * Platform statistics for admin dashboard.
- */
-interface AdminStats {
-  /** Total registered users */
-  totalUsers: number;
-  /** Total content items (movies + series) */
-  totalContent: number;
-  /** Total video views across platform */
-  totalViews: number;
-  /** Breakdown of active subscriptions by tier */
-  activeSubscriptions: Record<string, number>;
-}
-
-/**
- * Content item type for admin content table.
- */
-interface AdminContent {
-  id: string;
-  title: string;
-  content_type: string;
-  status: string;
-  featured: boolean;
-  view_count: number;
-  created_at: string;
-}
+import {
+  AdminTabs,
+  OverviewTab,
+  ContentTab,
+  UsersTab,
+} from '../components/admin';
+import type { AdminTabType, AdminStats, AdminContent } from '../components/admin';
 
 /**
  * Admin dashboard page for platform management.
@@ -42,6 +22,8 @@ interface AdminContent {
  * - Content tab with table of all content items and featured toggle
  * - Users tab with list of registered users
  * - Role-based access control (admin only)
+ *
+ * @returns Admin dashboard page with tabbed navigation
  */
 function AdminPage() {
   const navigate = useNavigate();
@@ -49,7 +31,7 @@ function AdminPage() {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [content, setContent] = useState<AdminContent[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'overview' | 'content' | 'users'>('overview');
+  const [activeTab, setActiveTab] = useState<AdminTabType>('overview');
 
   useEffect(() => {
     if (!user || user.role !== 'admin') {
@@ -74,6 +56,12 @@ function AdminPage() {
     loadData();
   }, [user, navigate]);
 
+  /**
+   * Toggles the featured status of a content item.
+   * Updates local state optimistically after API call succeeds.
+   *
+   * @param contentId - ID of the content item to toggle
+   */
   const handleToggleFeatured = async (contentId: string) => {
     try {
       await adminApi.toggleFeatured(contentId);
@@ -87,6 +75,7 @@ function AdminPage() {
     }
   };
 
+  // Redirect non-admin users
   if (!user || user.role !== 'admin') {
     return null;
   }
@@ -95,183 +84,18 @@ function AdminPage() {
     <>
       <Header />
       <main className="pt-24 px-8 lg:px-16 pb-16 min-h-screen">
-        <div className="flex items-center justify-between mb-8">
-          <h1 className="text-3xl font-bold">Admin Dashboard</h1>
-          <div className="flex items-center gap-2 px-4 py-2 bg-apple-blue/20 text-apple-blue rounded-lg">
-            <Settings className="w-4 h-4" />
-            Admin Mode
-          </div>
-        </div>
-
-        {/* Tabs */}
-        <div className="flex gap-4 mb-8 border-b border-white/10">
-          <button
-            onClick={() => setActiveTab('overview')}
-            className={`pb-4 px-2 text-sm font-medium transition-colors ${
-              activeTab === 'overview'
-                ? 'text-white border-b-2 border-white'
-                : 'text-white/60 hover:text-white'
-            }`}
-          >
-            Overview
-          </button>
-          <button
-            onClick={() => setActiveTab('content')}
-            className={`pb-4 px-2 text-sm font-medium transition-colors ${
-              activeTab === 'content'
-                ? 'text-white border-b-2 border-white'
-                : 'text-white/60 hover:text-white'
-            }`}
-          >
-            Content
-          </button>
-          <button
-            onClick={() => setActiveTab('users')}
-            className={`pb-4 px-2 text-sm font-medium transition-colors ${
-              activeTab === 'users'
-                ? 'text-white border-b-2 border-white'
-                : 'text-white/60 hover:text-white'
-            }`}
-          >
-            Users
-          </button>
-        </div>
+        <AdminPageHeader />
+        <AdminTabs activeTab={activeTab} onTabChange={setActiveTab} />
 
         {isLoading ? (
-          <div className="flex items-center justify-center py-24">
-            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-white"></div>
-          </div>
+          <LoadingSpinner />
         ) : (
-          <>
-            {/* Overview Tab */}
-            {activeTab === 'overview' && stats && (
-              <div className="space-y-8">
-                {/* Stats cards */}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                  <StatCard
-                    icon={<Users className="w-6 h-6" />}
-                    label="Total Users"
-                    value={stats.totalUsers}
-                    color="blue"
-                  />
-                  <StatCard
-                    icon={<Film className="w-6 h-6" />}
-                    label="Total Content"
-                    value={stats.totalContent}
-                    color="purple"
-                  />
-                  <StatCard
-                    icon={<Eye className="w-6 h-6" />}
-                    label="Total Views"
-                    value={stats.totalViews}
-                    color="green"
-                  />
-                  <StatCard
-                    icon={<TrendingUp className="w-6 h-6" />}
-                    label="Active Subscriptions"
-                    value={Object.values(stats.activeSubscriptions).reduce((a, b) => a + b, 0)}
-                    color="orange"
-                  />
-                </div>
-
-                {/* Subscription breakdown */}
-                <div className="bg-apple-gray-800 rounded-2xl p-6">
-                  <h2 className="text-xl font-semibold mb-4">Subscription Breakdown</h2>
-                  <div className="grid grid-cols-2 gap-4">
-                    {Object.entries(stats.activeSubscriptions).map(([tier, count]) => (
-                      <div key={tier} className="flex items-center justify-between p-4 bg-apple-gray-700 rounded-xl">
-                        <span className="capitalize">{tier}</span>
-                        <span className="text-2xl font-bold">{count}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Recent content */}
-                <div className="bg-apple-gray-800 rounded-2xl p-6">
-                  <h2 className="text-xl font-semibold mb-4">Recent Content</h2>
-                  <div className="space-y-2">
-                    {content.slice(0, 5).map((item) => (
-                      <div key={item.id} className="flex items-center justify-between p-3 bg-apple-gray-700 rounded-lg">
-                        <div>
-                          <span className="font-medium">{item.title}</span>
-                          <span className="text-sm text-white/60 ml-2 capitalize">({item.content_type})</span>
-                        </div>
-                        <div className="flex items-center gap-4">
-                          <span className="text-sm text-white/60">{item.view_count} views</span>
-                          <span className={`px-2 py-1 text-xs rounded ${
-                            item.status === 'ready' ? 'bg-apple-green/20 text-apple-green' : 'bg-yellow-500/20 text-yellow-500'
-                          }`}>
-                            {item.status}
-                          </span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Content Tab */}
-            {activeTab === 'content' && (
-              <div className="bg-apple-gray-800 rounded-2xl overflow-hidden">
-                <table className="w-full">
-                  <thead className="bg-apple-gray-700">
-                    <tr>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Title</th>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Type</th>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Status</th>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Views</th>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Featured</th>
-                      <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/10">
-                    {content.map((item) => (
-                      <tr key={item.id} className="hover:bg-apple-gray-700">
-                        <td className="px-6 py-4">
-                          <Link to="/content/$contentId" params={{ contentId: item.id }} className="hover:text-apple-blue">
-                            {item.title}
-                          </Link>
-                        </td>
-                        <td className="px-6 py-4 capitalize">{item.content_type}</td>
-                        <td className="px-6 py-4">
-                          <span className={`px-2 py-1 text-xs rounded ${
-                            item.status === 'ready' ? 'bg-apple-green/20 text-apple-green' : 'bg-yellow-500/20 text-yellow-500'
-                          }`}>
-                            {item.status}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4">{item.view_count}</td>
-                        <td className="px-6 py-4">
-                          <button
-                            onClick={() => handleToggleFeatured(item.id)}
-                            className={`p-2 rounded-lg transition-colors ${
-                              item.featured ? 'bg-yellow-500/20 text-yellow-500' : 'bg-white/10 text-white/40'
-                            }`}
-                          >
-                            <Star className={`w-4 h-4 ${item.featured ? 'fill-current' : ''}`} />
-                          </button>
-                        </td>
-                        <td className="px-6 py-4">
-                          <Link
-                            to="/content/$contentId"
-                            params={{ contentId: item.id }}
-                            className="text-apple-blue hover:underline text-sm"
-                          >
-                            View
-                          </Link>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {/* Users Tab */}
-            {activeTab === 'users' && <UsersTab />}
-          </>
+          <TabContent
+            activeTab={activeTab}
+            stats={stats}
+            content={content}
+            onToggleFeatured={handleToggleFeatured}
+          />
         )}
       </main>
     </>
@@ -279,125 +103,75 @@ function AdminPage() {
 }
 
 /**
- * Statistic card component for displaying key metrics.
- * Shows an icon, label, and value with colored gradient background.
+ * Admin page header with title and admin mode badge.
  *
- * @param props - Card configuration
- * @param props.icon - React node icon element
- * @param props.label - Metric label text
- * @param props.value - Numeric value to display
- * @param props.color - Color theme for the card gradient
- * @returns Colored stat card component
+ * @returns Header section with title and status indicator
  */
-function StatCard({
-  icon,
-  label,
-  value,
-  color,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number;
-  color: 'blue' | 'purple' | 'green' | 'orange';
-}) {
-  const colors = {
-    blue: 'from-blue-500/20 to-blue-600/20 text-blue-400',
-    purple: 'from-purple-500/20 to-purple-600/20 text-purple-400',
-    green: 'from-green-500/20 to-green-600/20 text-green-400',
-    orange: 'from-orange-500/20 to-orange-600/20 text-orange-400',
-  };
-
+function AdminPageHeader() {
   return (
-    <div className={`bg-gradient-to-br ${colors[color]} rounded-2xl p-6`}>
-      <div className="flex items-center gap-4">
-        {icon}
-        <div>
-          <p className="text-sm text-white/60">{label}</p>
-          <p className="text-3xl font-bold">{value.toLocaleString()}</p>
-        </div>
+    <div className="flex items-center justify-between mb-8">
+      <h1 className="text-3xl font-bold">Admin Dashboard</h1>
+      <div className="flex items-center gap-2 px-4 py-2 bg-apple-blue/20 text-apple-blue rounded-lg">
+        <Settings className="w-4 h-4" />
+        Admin Mode
       </div>
     </div>
   );
 }
 
 /**
- * User data type for admin user listing.
+ * Full-page loading spinner for initial data load.
+ *
+ * @returns Centered spinning loader
  */
-interface AdminUser {
-  id: string;
-  email: string;
-  name: string;
-  role: string;
-  subscription_tier: string;
-  created_at: string;
+function LoadingSpinner() {
+  return (
+    <div className="flex items-center justify-center py-24">
+      <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-white"></div>
+    </div>
+  );
 }
 
 /**
- * Users tab component for admin dashboard.
- * Displays a table of all registered users with their details.
- *
- * @returns Table of platform users
+ * Props for the TabContent component.
  */
-function UsersTab() {
-  const [users, setUsers] = useState<AdminUser[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+interface TabContentProps {
+  /** Currently active tab */
+  activeTab: AdminTabType;
+  /** Platform statistics (may be null before load) */
+  stats: AdminStats | null;
+  /** Content items for content tab */
+  content: AdminContent[];
+  /** Handler for featured toggle */
+  onToggleFeatured: (contentId: string) => void;
+}
 
-  useEffect(() => {
-    const loadUsers = async () => {
-      try {
-        const data = await adminApi.getUsers({ limit: 50 }) as { users: AdminUser[] };
-        setUsers(data.users);
-      } catch (error) {
-        console.error('Failed to load users:', error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    loadUsers();
-  }, []);
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-white"></div>
-      </div>
-    );
+/**
+ * Renders the appropriate tab content based on active tab.
+ * Conditionally renders OverviewTab, ContentTab, or UsersTab.
+ *
+ * @param props - TabContentProps with tab state and data
+ * @returns Active tab's content component
+ */
+function TabContent({
+  activeTab,
+  stats,
+  content,
+  onToggleFeatured,
+}: TabContentProps) {
+  if (activeTab === 'overview' && stats) {
+    return <OverviewTab stats={stats} recentContent={content} />;
   }
 
-  return (
-    <div className="bg-apple-gray-800 rounded-2xl overflow-hidden">
-      <table className="w-full">
-        <thead className="bg-apple-gray-700">
-          <tr>
-            <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Name</th>
-            <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Email</th>
-            <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Role</th>
-            <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Subscription</th>
-            <th className="px-6 py-4 text-left text-sm font-medium text-white/60">Joined</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-white/10">
-          {users.map((user) => (
-            <tr key={user.id} className="hover:bg-apple-gray-700">
-              <td className="px-6 py-4">{user.name}</td>
-              <td className="px-6 py-4">{user.email}</td>
-              <td className="px-6 py-4">
-                <span className={`px-2 py-1 text-xs rounded ${
-                  user.role === 'admin' ? 'bg-apple-blue/20 text-apple-blue' : 'bg-white/10'
-                }`}>
-                  {user.role}
-                </span>
-              </td>
-              <td className="px-6 py-4 capitalize">{user.subscription_tier}</td>
-              <td className="px-6 py-4 text-white/60">
-                {new Date(user.created_at).toLocaleDateString()}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+  if (activeTab === 'content') {
+    return <ContentTab content={content} onToggleFeatured={onToggleFeatured} />;
+  }
+
+  if (activeTab === 'users') {
+    return <UsersTab />;
+  }
+
+  return null;
 }
 
 /**

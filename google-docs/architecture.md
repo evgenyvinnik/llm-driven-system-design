@@ -292,6 +292,112 @@ CREATE INDEX idx_suggestions_doc ON suggestions(document_id);
 CREATE INDEX idx_sessions_token ON sessions(token);
 ```
 
+### CouchDB Schema (Document Content & Offline Sync)
+
+While PostgreSQL handles users, permissions, and comments, CouchDB is used for document content storage with built-in offline sync capability. This hybrid approach leverages CouchDB's strengths for collaborative document editing.
+
+**Why CouchDB for Document Content?**
+- **Built-in sync protocol**: CouchDB replication enables offline-first applications
+- **MVCC (Multi-Version Concurrency Control)**: Automatic conflict detection and resolution
+- **Change feeds**: Real-time updates via `_changes` API (alternative to WebSocket)
+- **Document-native storage**: JSON documents stored natively without ORM overhead
+- **PouchDB integration**: Browser-based CouchDB for true offline-first experience
+
+**Document Structure:**
+```json
+{
+  "_id": "doc-uuid",
+  "_rev": "3-abc123",              // CouchDB revision (MVCC)
+  "type": "document",
+  "title": "My Document",
+  "owner_id": "user-uuid",
+  "content": {                      // ProseMirror document JSON
+    "type": "doc",
+    "content": [
+      {"type": "paragraph", "content": [{"type": "text", "text": "Hello"}]}
+    ]
+  },
+  "current_version": 42,
+  "created_at": "2024-01-15T10:30:00Z",
+  "updated_at": "2024-01-15T14:20:00Z"
+}
+```
+
+**Version History Structure:**
+```json
+{
+  "_id": "version-doc-uuid-42",
+  "type": "version",
+  "document_id": "doc-uuid",
+  "version_number": 42,
+  "content": { /* full snapshot */ },
+  "created_by": "user-uuid",
+  "is_named": true,
+  "name": "Before major edit",
+  "created_at": "2024-01-15T14:20:00Z"
+}
+```
+
+**Design Documents (Views):**
+```javascript
+// GET /documents/_design/docs/_view/by_owner?key="user-uuid"
+{
+  "views": {
+    "by_owner": {
+      "map": "function(doc) { if(doc.type === 'document') emit(doc.owner_id, doc._id); }"
+    },
+    "recent": {
+      "map": "function(doc) { if(doc.type === 'document') emit(doc.updated_at, null); }"
+    }
+  }
+}
+```
+
+**Offline Sync Flow:**
+```
+1. User loads document online:
+   → Browser PouchDB syncs from CouchDB
+   → Local replica stored in IndexedDB
+
+2. User edits offline:
+   → Changes saved to local PouchDB
+   → OT operations queued locally
+
+3. User reconnects:
+   → PouchDB automatically syncs to CouchDB
+   → Conflicts detected via _rev comparison
+   → Conflict resolution merges changes
+
+4. Real-time updates:
+   → CouchDB _changes feed notifies connected clients
+   → Or WebSocket for lower latency (current implementation)
+```
+
+**Conflict Resolution:**
+```javascript
+// When _rev conflicts occur, CouchDB keeps all versions
+// Application logic merges using OT or picks winner
+async function resolveConflict(docId) {
+  const doc = await couch.get(docId, { conflicts: true });
+  if (doc._conflicts) {
+    // Fetch all conflicting revisions
+    const revisions = await Promise.all(
+      doc._conflicts.map(rev => couch.get(docId, { rev }))
+    );
+    // Merge content using OT transform
+    const merged = mergeDocuments(doc, revisions);
+    // Save merged version, delete conflicts
+    await couch.put({ ...merged, _rev: doc._rev });
+  }
+}
+```
+
+**Databases:**
+| Database | Purpose | Indexes |
+|----------|---------|---------|
+| `documents` | Current document content | by_owner, recent, by_shared |
+| `document_versions` | Version history snapshots | by_document_version |
+
 ### Redis Data Structures
 
 | Key Pattern | Type | TTL | Purpose |

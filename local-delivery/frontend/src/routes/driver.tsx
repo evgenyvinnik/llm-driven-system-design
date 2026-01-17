@@ -1,192 +1,44 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useEffect, useState, useCallback } from 'react';
-import { api } from '@/services/api';
-import { wsService } from '@/services/websocket';
-import { useAuthStore } from '@/stores/authStore';
-import { useLocationStore } from '@/stores/locationStore';
-import { StatusBadge } from '@/components/StatusBadge';
+import { createFileRoute } from '@tanstack/react-router';
+import { useDriverDashboard } from '@/hooks/useDriverDashboard';
 import { PageLoading } from '@/components/LoadingSpinner';
-import type { Driver, DriverStats, OrderWithDetails, NewOfferPayload, DriverOffer } from '@/types';
+import {
+  DriverStatusHeader,
+  DriverStatsGrid,
+  ActiveDeliveryCard,
+  DeliveryOfferModal,
+} from '@/components/driver';
 
 export const Route = createFileRoute('/driver')({
   component: DriverDashboard,
 });
 
+/**
+ * Driver dashboard page component.
+ *
+ * Displays the driver's profile, statistics, active deliveries, and handles
+ * real-time delivery offer notifications. Allows drivers to:
+ * - Toggle online/offline status
+ * - View and respond to delivery offers
+ * - Manage active delivery orders (mark picked up, in transit, delivered)
+ *
+ * Uses the useDriverDashboard hook for all state management and business logic.
+ */
 function DriverDashboard() {
-  const [driver, setDriver] = useState<(Driver & DriverStats) | null>(null);
-  const [orders, setOrders] = useState<OrderWithDetails[]>([]);
-  const [pendingOffer, setPendingOffer] = useState<{
-    offer: DriverOffer;
-    order: OrderWithDetails;
-    expiresIn: number;
-  } | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isTogglingStatus, setIsTogglingStatus] = useState(false);
-
-  const { user, token } = useAuthStore();
-  const { location, getCurrentLocation, watchLocation, stopWatching } = useLocationStore();
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    if (!user || user.role !== 'driver') {
-      navigate({ to: '/login' });
-      return;
-    }
-
-    loadDriverData();
-  }, [user]);
-
-  useEffect(() => {
-    if (!token || !driver || driver.status === 'offline') {
-      return;
-    }
-
-    // Connect to WebSocket for real-time offers
-    wsService.connect(token, {
-      onConnected: () => {
-        wsService.subscribeToDriverOffers();
-      },
-      onNewOffer: (payload: NewOfferPayload) => {
-        setPendingOffer({
-          offer: { id: payload.offer_id } as DriverOffer,
-          order: payload.order,
-          expiresIn: payload.expires_in,
-        });
-      },
-      onError: (message) => {
-        console.error('WebSocket error:', message);
-      },
-    });
-
-    return () => {
-      wsService.disconnect();
-    };
-  }, [token, driver?.status]);
-
-  // Countdown timer for pending offer
-  useEffect(() => {
-    if (!pendingOffer) return;
-
-    const timer = setInterval(() => {
-      setPendingOffer((prev) => {
-        if (!prev) return null;
-        if (prev.expiresIn <= 1) {
-          return null;
-        }
-        return { ...prev, expiresIn: prev.expiresIn - 1 };
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [pendingOffer?.offer.id]);
-
-  const loadDriverData = async () => {
-    setIsLoading(true);
-    try {
-      const [profileData, ordersData] = await Promise.all([
-        api.getDriverProfile(),
-        api.getDriverOrders(),
-      ]);
-      setDriver(profileData as Driver & DriverStats);
-      setOrders(ordersData as OrderWithDetails[]);
-    } catch (error) {
-      console.error('Failed to load driver data:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleGoOnline = async () => {
-    setIsTogglingStatus(true);
-    try {
-      let loc = location;
-      if (!loc) {
-        loc = await getCurrentLocation();
-      }
-
-      await api.goOnline(loc.lat, loc.lng);
-
-      // Start watching location
-      watchLocation(async (newLoc) => {
-        await api.updateLocation(newLoc.lat, newLoc.lng);
-        wsService.updateLocation(newLoc.lat, newLoc.lng);
-      });
-
-      setDriver((prev) => prev ? { ...prev, status: 'available' } : null);
-    } catch (error) {
-      console.error('Failed to go online:', error);
-    } finally {
-      setIsTogglingStatus(false);
-    }
-  };
-
-  const handleGoOffline = async () => {
-    if (orders.length > 0) {
-      alert('Complete your active deliveries before going offline');
-      return;
-    }
-
-    setIsTogglingStatus(true);
-    try {
-      await api.goOffline();
-      stopWatching();
-      setDriver((prev) => prev ? { ...prev, status: 'offline' } : null);
-    } catch (error) {
-      console.error('Failed to go offline:', error);
-    } finally {
-      setIsTogglingStatus(false);
-    }
-  };
-
-  const handleAcceptOffer = async () => {
-    if (!pendingOffer) return;
-
-    try {
-      const order = await api.acceptOffer(pendingOffer.offer.id);
-      setOrders((prev) => [...prev, order as OrderWithDetails]);
-      setPendingOffer(null);
-    } catch (error) {
-      console.error('Failed to accept offer:', error);
-    }
-  };
-
-  const handleRejectOffer = async () => {
-    if (!pendingOffer) return;
-
-    try {
-      await api.rejectOffer(pendingOffer.offer.id);
-      setPendingOffer(null);
-    } catch (error) {
-      console.error('Failed to reject offer:', error);
-    }
-  };
-
-  const handlePickedUp = async (orderId: string) => {
-    try {
-      await api.markPickedUp(orderId);
-      loadDriverData();
-    } catch (error) {
-      console.error('Failed to mark picked up:', error);
-    }
-  };
-
-  const handleInTransit = async (orderId: string) => {
-    try {
-      await api.markInTransit(orderId);
-      loadDriverData();
-    } catch (error) {
-      console.error('Failed to mark in transit:', error);
-    }
-  };
-
-  const handleDelivered = async (orderId: string) => {
-    try {
-      await api.markDelivered(orderId);
-      loadDriverData();
-    } catch (error) {
-      console.error('Failed to mark delivered:', error);
-    }
-  };
+  const {
+    driver,
+    orders,
+    pendingOffer,
+    isLoading,
+    isTogglingStatus,
+    isOnline,
+    handleGoOnline,
+    handleGoOffline,
+    handleAcceptOffer,
+    handleRejectOffer,
+    handlePickedUp,
+    handleInTransit,
+    handleDelivered,
+  } = useDriverDashboard();
 
   if (isLoading) {
     return <PageLoading />;
@@ -200,201 +52,99 @@ function DriverDashboard() {
     );
   }
 
-  const isOnline = driver.status !== 'offline';
-
   return (
     <div className="max-w-4xl mx-auto px-4 py-8">
       {/* Pending Offer Modal */}
       {pendingOffer && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 max-w-lg w-full mx-4 shadow-2xl">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-bold">New Delivery Request</h2>
-              <div className="text-2xl font-bold text-accent-600">
-                {pendingOffer.expiresIn}s
-              </div>
-            </div>
-
-            <div className="space-y-4 mb-6">
-              <div>
-                <p className="text-sm text-gray-500">Restaurant</p>
-                <p className="font-medium">{pendingOffer.order.merchant?.name}</p>
-                <p className="text-sm text-gray-500">{pendingOffer.order.merchant?.address}</p>
-              </div>
-
-              <div>
-                <p className="text-sm text-gray-500">Deliver to</p>
-                <p className="font-medium">{pendingOffer.order.delivery_address}</p>
-              </div>
-
-              <div className="flex justify-between">
-                <div>
-                  <p className="text-sm text-gray-500">Items</p>
-                  <p>{pendingOffer.order.items.length} items</p>
-                </div>
-                <div className="text-right">
-                  <p className="text-sm text-gray-500">Payout</p>
-                  <p className="font-semibold text-lg text-green-600">
-                    ${(pendingOffer.order.delivery_fee + pendingOffer.order.tip).toFixed(2)}
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-4">
-              <button
-                onClick={handleRejectOffer}
-                className="btn-outline flex-1"
-              >
-                Decline
-              </button>
-              <button
-                onClick={handleAcceptOffer}
-                className="btn-primary flex-1"
-              >
-                Accept
-              </button>
-            </div>
-          </div>
-        </div>
+        <DeliveryOfferModal
+          pendingOffer={pendingOffer}
+          onAccept={handleAcceptOffer}
+          onDecline={handleRejectOffer}
+        />
       )}
 
       {/* Driver Status Header */}
-      <div className="card p-6 mb-6">
-        <div className="flex justify-between items-center">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900 mb-1">{driver.name}</h1>
-            <div className="flex items-center gap-4 text-sm text-gray-500">
-              <span className="capitalize">{driver.vehicle_type}</span>
-              <span>⭐ {driver.rating.toFixed(2)}</span>
-              <span>{driver.total_deliveries} deliveries</span>
-            </div>
-          </div>
+      <DriverStatusHeader
+        driver={driver}
+        isOnline={isOnline}
+        isTogglingStatus={isTogglingStatus}
+        hasActiveOrders={orders.length > 0}
+        onGoOnline={handleGoOnline}
+        onGoOffline={handleGoOffline}
+      />
 
-          <div className="text-right">
-            <div
-              className={`inline-block px-4 py-2 rounded-full font-medium ${
-                isOnline
-                  ? driver.status === 'busy'
-                    ? 'bg-yellow-100 text-yellow-800'
-                    : 'bg-green-100 text-green-800'
-                  : 'bg-gray-100 text-gray-600'
-              }`}
-            >
-              {isOnline ? (driver.status === 'busy' ? 'Busy' : 'Online') : 'Offline'}
-            </div>
-          </div>
+      {/* Stats Grid */}
+      <DriverStatsGrid stats={driver} />
+
+      {/* Active Deliveries Section */}
+      <ActiveDeliveriesSection
+        orders={orders}
+        isOnline={isOnline}
+        onPickedUp={handlePickedUp}
+        onInTransit={handleInTransit}
+        onDelivered={handleDelivered}
+      />
+    </div>
+  );
+}
+
+/**
+ * Props for the ActiveDeliveriesSection component.
+ */
+interface ActiveDeliveriesSectionProps {
+  /** List of active delivery orders */
+  orders: Parameters<typeof ActiveDeliveryCard>[0]['order'][];
+  /** Whether the driver is currently online */
+  isOnline: boolean;
+  /** Handler for marking an order as picked up */
+  onPickedUp: (orderId: string) => void;
+  /** Handler for marking an order as in transit */
+  onInTransit: (orderId: string) => void;
+  /** Handler for marking an order as delivered */
+  onDelivered: (orderId: string) => void;
+}
+
+/**
+ * Section component that displays the list of active deliveries or an
+ * appropriate empty state message based on the driver's online status.
+ */
+function ActiveDeliveriesSection({
+  orders,
+  isOnline,
+  onPickedUp,
+  onInTransit,
+  onDelivered,
+}: ActiveDeliveriesSectionProps) {
+  /**
+   * Returns the appropriate empty state message based on online status.
+   */
+  const getEmptyMessage = (): string => {
+    return isOnline
+      ? 'Waiting for orders...'
+      : 'Go online to receive delivery requests';
+  };
+
+  return (
+    <div className="mb-6">
+      <h2 className="text-lg font-semibold text-gray-900 mb-4">Active Deliveries</h2>
+
+      {orders.length === 0 ? (
+        <div className="card p-8 text-center">
+          <p className="text-gray-500">{getEmptyMessage()}</p>
         </div>
-
-        <div className="mt-4 pt-4 border-t">
-          {isOnline ? (
-            <button
-              onClick={handleGoOffline}
-              disabled={isTogglingStatus || orders.length > 0}
-              className="btn-outline w-full"
-            >
-              {isTogglingStatus ? 'Going offline...' : 'Go Offline'}
-            </button>
-          ) : (
-            <button
-              onClick={handleGoOnline}
-              disabled={isTogglingStatus}
-              className="btn-primary w-full"
-            >
-              {isTogglingStatus ? 'Going online...' : 'Go Online'}
-            </button>
-          )}
+      ) : (
+        <div className="space-y-4">
+          {orders.map((order) => (
+            <ActiveDeliveryCard
+              key={order.id}
+              order={order}
+              onPickedUp={onPickedUp}
+              onInTransit={onInTransit}
+              onDelivered={onDelivered}
+            />
+          ))}
         </div>
-      </div>
-
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <div className="card p-4 text-center">
-          <p className="text-2xl font-bold text-gray-900">{driver.stats?.current_orders || 0}</p>
-          <p className="text-sm text-gray-500">Active Orders</p>
-        </div>
-        <div className="card p-4 text-center">
-          <p className="text-2xl font-bold text-gray-900">{(driver.stats?.acceptance_rate * 100 || 100).toFixed(0)}%</p>
-          <p className="text-sm text-gray-500">Acceptance Rate</p>
-        </div>
-        <div className="card p-4 text-center">
-          <p className="text-2xl font-bold text-gray-900">{driver.total_deliveries}</p>
-          <p className="text-sm text-gray-500">Total Deliveries</p>
-        </div>
-      </div>
-
-      {/* Active Orders */}
-      <div className="mb-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Active Deliveries</h2>
-
-        {orders.length === 0 ? (
-          <div className="card p-8 text-center">
-            <p className="text-gray-500">
-              {isOnline
-                ? 'Waiting for orders...'
-                : 'Go online to receive delivery requests'}
-            </p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {orders.map((order) => (
-              <div key={order.id} className="card p-4">
-                <div className="flex justify-between items-start mb-4">
-                  <div>
-                    <h3 className="font-semibold">{order.merchant?.name}</h3>
-                    <p className="text-sm text-gray-500">{order.merchant?.address}</p>
-                  </div>
-                  <StatusBadge status={order.status} />
-                </div>
-
-                <div className="mb-4">
-                  <p className="text-sm text-gray-500">Deliver to</p>
-                  <p className="font-medium">{order.delivery_address}</p>
-                  {order.delivery_instructions && (
-                    <p className="text-sm text-gray-500 mt-1">
-                      Note: {order.delivery_instructions}
-                    </p>
-                  )}
-                </div>
-
-                <div className="mb-4">
-                  <p className="text-sm text-gray-500">Items ({order.items.length})</p>
-                  <p className="text-sm">
-                    {order.items.map((i) => `${i.quantity}x ${i.name}`).join(', ')}
-                  </p>
-                </div>
-
-                <div className="flex gap-3">
-                  {order.status === 'driver_assigned' && (
-                    <button
-                      onClick={() => handlePickedUp(order.id)}
-                      className="btn-primary flex-1"
-                    >
-                      Mark Picked Up
-                    </button>
-                  )}
-                  {order.status === 'picked_up' && (
-                    <button
-                      onClick={() => handleInTransit(order.id)}
-                      className="btn-accent flex-1"
-                    >
-                      Start Delivery
-                    </button>
-                  )}
-                  {order.status === 'in_transit' && (
-                    <button
-                      onClick={() => handleDelivered(order.id)}
-                      className="btn-primary flex-1 bg-green-600 hover:bg-green-700"
-                    >
-                      Mark Delivered
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 }
