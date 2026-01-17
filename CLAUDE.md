@@ -48,9 +48,29 @@ npm run db:seed-admin    # Seed admin user (if applicable)
 # Testing (vitest)
 npm run test             # Run tests once
 npm run test:watch       # Run tests in watch mode
+npm run test -- src/collection/app.test.ts           # Run single test file
+npm run test -- --grep "should return health status" # Run tests matching pattern
 
 # Infrastructure (when docker-compose.yml exists)
 docker-compose up -d     # Start PostgreSQL, Redis/Valkey, MinIO, RabbitMQ, etc.
+docker-compose down      # Stop services
+docker-compose down -v   # Stop and remove volumes
+```
+
+## Repository Scripts
+
+```bash
+# Count SLOC for entire repository
+node scripts/sloc.mjs
+
+# Count SLOC for specific project
+node scripts/sloc.mjs scale-ai
+
+# Output as JSON
+node scripts/sloc.mjs scale-ai --json
+
+# Output summary for README embedding
+node scripts/sloc.mjs scale-ai --summary
 ```
 
 ## Technology Stack Defaults
@@ -93,7 +113,27 @@ backend/src/
     └── seed-*.ts        # Database seeders
 ```
 
-Tests use vitest with mocked shared modules (see `scale-ai/backend/src/collection/app.test.ts` for pattern).
+Tests use vitest with mocked shared modules. Test files are co-located with source files (`app.test.ts` next to `app.ts`). Mock shared modules before importing the app:
+
+```typescript
+// Mock shared modules before import
+vi.mock('../shared/db.js', () => ({
+  pool: { query: vi.fn() },
+}))
+vi.mock('../shared/storage.js', () => ({
+  uploadDrawing: vi.fn().mockResolvedValue('path/to/file'),
+}))
+
+// Import after mocking
+import { app } from './app.js'
+```
+
+## Projects with Implementations
+
+Most projects are design-only. These have working code (check their package.json for available scripts):
+- `scale-ai/` - Full-stack data labeling platform (frontend + backend with tests)
+- `web-crawler/` - Distributed crawler with frontend dashboard
+- `news-aggregator/`, `airtag/`, `uber/`, `price-tracking/`, `google-docs/`, `twitter/`, `youtube-top-k/`, `spotlight/` - Partial implementations
 
 ## Creating New Projects
 
