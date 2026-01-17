@@ -1,6 +1,10 @@
 const { v4: uuidv4 } = require('uuid');
 const { query } = require('./database');
-const { publishMessage, subscribe, unsubscribe, checkRateLimit } = require('./redis');
+const { publishMessage, subscribe, unsubscribe, checkRateLimit, getRedisClient } = require('./redis');
+const { logger, logChatEvent } = require('../utils/logger');
+const { incChatMessage, incChatRateLimited, incWsConnection, decWsConnection } = require('../utils/metrics');
+const { checkChatMessageDedup, generateChatMessageId } = require('../utils/idempotency');
+const { createCircuitBreaker } = require('../utils/circuitBreaker');
 
 // Map of channelId -> Set of WebSocket clients
 const channelClients = new Map();
@@ -8,10 +12,49 @@ const channelClients = new Map();
 // Map of WebSocket -> client info
 const clientInfo = new Map();
 
+// Circuit breaker for Redis publish operations
+let redisChatBreaker = null;
+
+// Local broadcast fallback when Redis is unavailable
+function localBroadcast(channelId, message) {
+  const clients = channelClients.get(channelId);
+  if (!clients) return;
+
+  const data = JSON.stringify(message);
+  clients.forEach(client => {
+    if (client.readyState === 1) {
+      client.send(data);
+    }
+  });
+}
+
 function setupChatWebSocket(wss, redisClient) {
+  // Initialize circuit breaker for Redis chat publishing
+  redisChatBreaker = createCircuitBreaker(
+    'redis-chat-publish',
+    async (channel, message) => {
+      return publishMessage(channel, message);
+    },
+    {
+      timeout: 1000,
+      errorThresholdPercentage: 50,
+      resetTimeout: 5000,
+      volumeThreshold: 10
+    }
+  );
+
+  // Set up fallback for when Redis is unavailable
+  redisChatBreaker.fallback((channel, message) => {
+    logger.warn({ channel }, 'Redis unavailable, using local broadcast only');
+    const channelId = channel.replace('chat:', '');
+    localBroadcast(channelId, message);
+    return { fallback: true };
+  });
+
   wss.on('connection', (ws, req) => {
     const clientId = uuidv4();
-    console.log(`Chat client connected: ${clientId}`);
+    logger.debug({ client_id: clientId }, 'Chat client connected');
+    incWsConnection();
 
     clientInfo.set(ws, { clientId, channels: new Set(), userId: null, username: null });
 
@@ -20,7 +63,7 @@ function setupChatWebSocket(wss, redisClient) {
         const message = JSON.parse(data.toString());
         await handleChatMessage(ws, message);
       } catch (error) {
-        console.error('Error handling chat message:', error);
+        logger.error({ error: error.message, client_id: clientId }, 'Error handling chat message');
         ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
       }
     });
@@ -39,12 +82,13 @@ function setupChatWebSocket(wss, redisClient) {
           }
         });
         clientInfo.delete(ws);
-        console.log(`Chat client disconnected: ${info.clientId}`);
+        logger.debug({ client_id: info.clientId }, 'Chat client disconnected');
+        decWsConnection();
       }
     });
 
     ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      logger.error({ error: error.message }, 'WebSocket error');
     });
   });
 
@@ -98,6 +142,8 @@ async function handleAuth(ws, info, message) {
       username,
       role: info.role
     }));
+
+    logChatEvent('auth', null, { user_id: userId, username });
   } else {
     // Guest user
     info.userId = null;
@@ -150,6 +196,8 @@ async function handleJoin(ws, info, message) {
     channelId,
     viewerCount: channelClients.get(channelId).size
   });
+
+  logChatEvent('join', channelId, { user_id: info.userId, username: info.username });
 }
 
 async function handleLeave(ws, info, message) {
@@ -175,10 +223,11 @@ async function handleLeave(ws, info, message) {
   }
 
   ws.send(JSON.stringify({ type: 'left', channelId }));
+  logChatEvent('leave', channelId, { user_id: info.userId });
 }
 
 async function handleChat(ws, info, message) {
-  const { channelId, text } = message;
+  const { channelId, text, messageId: clientMessageId } = message;
 
   if (!channelId || !text || text.trim().length === 0) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid message' }));
@@ -191,9 +240,26 @@ async function handleChat(ws, info, message) {
     return;
   }
 
+  // Generate or use provided message ID for deduplication
+  const messageId = clientMessageId || generateChatMessageId(info.userId || info.clientId);
+
+  // Check for duplicate message (idempotency)
+  const redis = getRedisClient();
+  const dedupResult = await checkChatMessageDedup(redis, channelId, messageId);
+  if (dedupResult.dropped) {
+    logger.debug({
+      channel_id: channelId,
+      message_id: messageId,
+      user_id: info.userId
+    }, 'Duplicate chat message dropped');
+    // Silently drop duplicate - client may have retried
+    return;
+  }
+
   // Check rate limit
   const rateCheck = await checkRateLimit(info.userId || info.clientId, channelId, 1);
   if (!rateCheck.allowed) {
+    incChatRateLimited();
     ws.send(JSON.stringify({
       type: 'error',
       message: `Slow down! Wait ${Math.ceil(rateCheck.waitMs / 1000)}s`
@@ -241,7 +307,7 @@ async function handleChat(ws, info, message) {
   }
 
   const chatMessage = {
-    id: uuidv4(),
+    id: messageId,
     type: 'chat',
     channelId,
     userId: info.userId,
@@ -259,8 +325,19 @@ async function handleChat(ws, info, message) {
     `, [channelId, info.userId, info.username, chatMessage.message, JSON.stringify(badges)]);
   }
 
-  // Publish to Redis for cross-instance delivery
-  await publishMessage(`chat:${channelId}`, chatMessage);
+  // Publish to Redis for cross-instance delivery (with circuit breaker protection)
+  try {
+    await redisChatBreaker.fire(`chat:${channelId}`, chatMessage);
+  } catch (error) {
+    // Circuit breaker is open or fallback was used
+    logger.warn({
+      channel_id: channelId,
+      error: error.message
+    }, 'Chat publish via circuit breaker fallback');
+  }
+
+  // Update metrics
+  incChatMessage(channelId);
 }
 
 function broadcastToChannel(channelId, message) {

@@ -1,6 +1,10 @@
 const express = require('express');
-const { query } = require('../services/database');
-const { getSession } = require('../services/redis');
+const { query, getClient } = require('../services/database');
+const { getSession, getRedisClient } = require('../services/redis');
+const { logger } = require('../utils/logger');
+const { incSubscription } = require('../utils/metrics');
+const { checkSubscriptionIdempotency, storeSubscriptionResult } = require('../utils/idempotency');
+const { withRetry } = require('../utils/retry');
 
 const router = express.Router();
 
@@ -62,7 +66,7 @@ router.get('/', async (req, res) => {
       }))
     });
   } catch (error) {
-    console.error('Get channels error:', error);
+    logger.error({ error: error.message }, 'Get channels error');
     res.status(500).json({ error: 'Failed to get channels' });
   }
 });
@@ -106,7 +110,7 @@ router.get('/live', async (req, res) => {
       }))
     });
   } catch (error) {
-    console.error('Get live channels error:', error);
+    logger.error({ error: error.message }, 'Get live channels error');
     res.status(500).json({ error: 'Failed to get live channels' });
   }
 });
@@ -186,7 +190,7 @@ router.get('/:name', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get channel error:', error);
+    logger.error({ error: error.message }, 'Get channel error');
     res.status(500).json({ error: 'Failed to get channel' });
   }
 });
@@ -233,9 +237,10 @@ router.post('/:name/follow', async (req, res) => {
       [channelId]
     );
 
+    logger.info({ user_id: userId, channel_id: channelId }, 'User followed channel');
     res.json({ success: true });
   } catch (error) {
-    console.error('Follow channel error:', error);
+    logger.error({ error: error.message }, 'Follow channel error');
     res.status(500).json({ error: 'Failed to follow channel' });
   }
 });
@@ -274,14 +279,15 @@ router.delete('/:name/follow', async (req, res) => {
       );
     }
 
+    logger.info({ user_id: userId, channel_id: channelId }, 'User unfollowed channel');
     res.json({ success: true });
   } catch (error) {
-    console.error('Unfollow channel error:', error);
+    logger.error({ error: error.message }, 'Unfollow channel error');
     res.status(500).json({ error: 'Failed to unfollow channel' });
   }
 });
 
-// Subscribe to a channel
+// Subscribe to a channel (with idempotency support)
 router.post('/:name/subscribe', async (req, res) => {
   try {
     const sessionId = req.cookies.session;
@@ -297,6 +303,21 @@ router.post('/:name/subscribe', async (req, res) => {
     const { name } = req.params;
     const { tier = 1 } = req.body;
 
+    // Check for idempotency key (to prevent double-charging)
+    const idempotencyKey = req.idempotencyKey;
+    if (idempotencyKey) {
+      const redis = getRedisClient();
+      const { isDuplicate, cachedResult } = await checkSubscriptionIdempotency(redis, idempotencyKey);
+
+      if (isDuplicate && cachedResult) {
+        logger.info({
+          idempotency_key: idempotencyKey,
+          user_id: userId
+        }, 'Returning cached subscription result');
+        return res.json(cachedResult);
+      }
+    }
+
     const channelResult = await query('SELECT id FROM channels WHERE name = $1', [name]);
     if (channelResult.rows.length === 0) {
       return res.status(404).json({ error: 'Channel not found' });
@@ -311,28 +332,70 @@ router.post('/:name/subscribe', async (req, res) => {
     );
 
     if (existing.rows.length > 0) {
-      return res.json({ success: true, message: 'Already subscribed' });
+      const result = { success: true, message: 'Already subscribed' };
+
+      // Cache result for idempotency
+      if (idempotencyKey) {
+        const redis = getRedisClient();
+        await storeSubscriptionResult(redis, idempotencyKey, result);
+      }
+
+      return res.json(result);
     }
 
-    // Create subscription (expires in 30 days)
+    // Create subscription (expires in 30 days) with retry logic
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
 
-    await query(`
-      INSERT INTO subscriptions (user_id, channel_id, tier, expires_at)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (user_id, channel_id)
-      DO UPDATE SET tier = $3, expires_at = $4, started_at = NOW()
-    `, [userId, channelId, tier, expiresAt]);
+    // Use retry for the subscription creation (handles transient failures)
+    await withRetry(async () => {
+      const client = await getClient();
+      try {
+        await client.query('BEGIN');
 
-    await query(
-      'UPDATE channels SET subscriber_count = subscriber_count + 1 WHERE id = $1',
-      [channelId]
-    );
+        await client.query(`
+          INSERT INTO subscriptions (user_id, channel_id, tier, expires_at)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (user_id, channel_id)
+          DO UPDATE SET tier = $3, expires_at = $4, started_at = NOW()
+        `, [userId, channelId, tier, expiresAt]);
 
-    res.json({ success: true, expiresAt });
+        await client.query(
+          'UPDATE channels SET subscriber_count = subscriber_count + 1 WHERE id = $1',
+          [channelId]
+        );
+
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }, { maxRetries: 3 });
+
+    const result = { success: true, expiresAt, tier };
+
+    // Cache result for idempotency
+    if (idempotencyKey) {
+      const redis = getRedisClient();
+      await storeSubscriptionResult(redis, idempotencyKey, result);
+    }
+
+    // Update metrics
+    incSubscription(tier);
+
+    logger.info({
+      user_id: userId,
+      channel_id: channelId,
+      tier,
+      expires_at: expiresAt,
+      idempotency_key: idempotencyKey
+    }, 'User subscribed to channel');
+
+    res.json(result);
   } catch (error) {
-    console.error('Subscribe channel error:', error);
+    logger.error({ error: error.message }, 'Subscribe channel error');
     res.status(500).json({ error: 'Failed to subscribe' });
   }
 });
@@ -393,9 +456,10 @@ router.patch('/:name', async (req, res) => {
       WHERE id = $${paramIndex}
     `, params);
 
+    logger.info({ user_id: userId, channel_name: name }, 'Channel updated');
     res.json({ success: true });
   } catch (error) {
-    console.error('Update channel error:', error);
+    logger.error({ error: error.message }, 'Update channel error');
     res.status(500).json({ error: 'Failed to update channel' });
   }
 });

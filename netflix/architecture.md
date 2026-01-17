@@ -1095,6 +1095,201 @@ async function rebuildContinueWatching(profileId) {
 
 ---
 
+## Implementation Notes
+
+This section explains the rationale behind key implementation decisions in the codebase, focusing on patterns that might differ from production Netflix but are appropriate for a learning project.
+
+### Why Session-Based Auth Instead of JWT
+
+**Decision**: Use Redis-backed sessions with httpOnly cookies instead of JWTs for this learning project.
+
+**Rationale**:
+
+1. **Visibility and Debugging**: Sessions stored in Redis are easily inspectable (`redis-cli KEYS "session:*"`). You can view, modify, or revoke any session instantly. With JWTs, the token is opaque to the server until decoded, and revocation requires maintaining a blocklist anyway.
+
+2. **Simpler Mental Model**: Sessions follow a straightforward request-response pattern:
+   - User logs in → Server creates session in Redis → Cookie sent to client
+   - Each request → Server looks up session in Redis → User identity confirmed
+   - Logout → Server deletes session from Redis
+
+   JWTs require understanding cryptographic signatures, token refresh flows, and the stateless vs. stateful tradeoffs.
+
+3. **Immediate Revocation**: When a user logs out or an admin needs to terminate a session, deletion is immediate and atomic. With JWTs, you either wait for expiration or maintain a revocation list (which reintroduces statefulness).
+
+4. **Learning Value**: The session approach teaches core concepts (cookies, server-side state, TTLs) that transfer to understanding JWTs. Production Netflix uses JWTs for global scale, but the concepts learned here (identity, authorization, session lifecycle) apply directly.
+
+**When to Use JWTs Instead**:
+- Multi-region deployments where session replication latency is problematic
+- Third-party API access requiring self-contained credentials
+- Mobile apps that need offline token validation
+
+```typescript
+// Our session approach (simpler for learning)
+const session = await redis.get(`session:${token}`);
+if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+// Production JWT approach (more complex but scales globally)
+const decoded = jwt.verify(token, publicKey, { algorithms: ['RS256'] });
+// Still need Redis for revocation list...
+```
+
+### Why Circuit Breakers Prevent Cascade Failures
+
+**Decision**: Implement circuit breakers for Cassandra, CDN, and storage operations using the Opossum library.
+
+**Rationale**:
+
+1. **Cascade Failure Prevention**: In microservices, one failing service can bring down the entire system. Without circuit breakers:
+   - Storage service slows down → API threads wait → Thread pool exhausted → All requests fail
+   - This "cascading failure" can take down healthy services that depend on the failing one
+
+2. **Fail Fast, Recover Gracefully**: The circuit breaker pattern provides three states:
+   - **CLOSED**: Normal operation, requests pass through
+   - **OPEN**: Service is failing, immediately return error without trying (fail fast)
+   - **HALF-OPEN**: Test recovery with limited requests before fully reopening
+
+3. **Resource Protection**: By failing fast when a dependency is unhealthy, circuit breakers prevent:
+   - Connection pool exhaustion
+   - Memory pressure from queued requests
+   - CPU waste on retries that will fail
+   - User-facing latency from waiting on timeouts
+
+4. **Graceful Degradation**: Combined with fallbacks, circuit breakers enable degraded but functional experiences:
+   - CDN fails → Return cached content or lower quality
+   - Recommendation service fails → Show generic trending content
+   - Storage fails → Disable upload but continue browsing
+
+```typescript
+// Without circuit breaker: cascade failure
+const manifest = await fetchFromCDN(videoId); // Times out after 30s
+// Thread blocked, other requests queue up...
+
+// With circuit breaker: fail fast, protect resources
+const manifest = await cdnCircuitBreaker.fire(videoId);
+// Circuit open? Returns immediately with fallback/error
+// Healthy? Monitors success/failure for state transitions
+```
+
+**Metrics to Monitor**:
+- `circuit_breaker_state`: Current state per service (0=closed, 1=half_open, 2=open)
+- `circuit_breaker_failures_total`: Failure count (triggers opening)
+- `circuit_breaker_successes_total`: Success count (triggers closing)
+
+### Why Streaming Metrics Enable QoE Optimization
+
+**Decision**: Implement Prometheus metrics for streaming starts, buffer events, playback errors, and bitrate distribution.
+
+**Rationale**:
+
+1. **Quality of Experience (QoE)**: Netflix's primary user experience metric isn't uptime—it's viewing quality. Metrics like rebuffering ratio (time spent buffering / total watch time) directly correlate with user satisfaction and churn.
+
+2. **Adaptive Bitrate Insights**: Tracking bitrate distribution helps optimize the encoding ladder:
+   - If 90% of plays are at 720p, investing in more 720p quality levels pays off
+   - If 4K adoption is low, investigate whether it's device capability or bandwidth limits
+
+3. **Problem Detection**: Streaming metrics enable rapid problem detection:
+   - Spike in buffer events → CDN issue or ISP peering problem
+   - Increased playback errors in specific regions → Regional infrastructure issue
+   - Bitrate downgrades → Network congestion or ABR algorithm issues
+
+4. **Business Metrics**: Streaming metrics connect technical performance to business outcomes:
+   - Streaming starts → Engagement metric
+   - Buffer events → Frustration indicator
+   - Error rate → Service quality SLA
+
+```typescript
+// Key streaming metrics we track
+streamingStarts.labels(quality, contentType).inc();  // User engagement
+bufferEvents.labels(quality, contentType).inc();      // User frustration
+playbackErrors.labels(errorType, contentType).inc(); // Service quality
+streamingBitrate.labels(quality).observe(bitrateKbps); // Quality distribution
+```
+
+**Dashboard Queries** (Prometheus/Grafana):
+```promql
+# Rebuffering ratio (should be < 0.5%)
+rate(streaming_buffer_events_total[5m]) / rate(streaming_starts_total[5m])
+
+# Error rate by content type
+rate(streaming_playback_errors_total[5m]) / rate(streaming_starts_total[5m])
+
+# Quality distribution
+histogram_quantile(0.5, rate(streaming_bitrate_kbps_bucket[5m]))
+```
+
+### Why Watch History Retention Balances Personalization vs. Privacy
+
+**Decision**: Implement data lifecycle policies with 90-day viewing progress retention and 2-year watch history retention.
+
+**Rationale**:
+
+1. **Personalization Value Decay**: Older viewing data provides diminishing returns for recommendations:
+   - Last 30 days: Strong signal for current interests
+   - 30-90 days: Useful for understanding viewing patterns
+   - 90+ days: Genre preferences, but specific titles less relevant
+   - 2+ years: Minimal recommendation value
+
+2. **Privacy by Design**: Data minimization is a core privacy principle (GDPR Article 5):
+   - Collect only what's needed
+   - Retain only as long as necessary
+   - Provide deletion mechanisms (Right to Erasure)
+
+3. **Storage Cost Management**: Viewing events accumulate rapidly:
+   - 200M subscribers × 2 hours/day × 1 event/minute = 24B events/day
+   - Without retention policies, storage costs grow unboundedly
+
+4. **Tiered Storage Strategy**: Different data needs different access patterns:
+   - **Hot (Redis/Cassandra)**: Active viewing progress for Continue Watching
+   - **Warm (PostgreSQL)**: Recent watch history for recommendations
+   - **Cold (S3/MinIO)**: Archived history for auditing and analytics
+
+```typescript
+// Retention configuration
+const RETENTION_CONFIG = {
+  completedProgressRetentionDays: 90,   // "Continue Watching" cleanup
+  watchHistoryRetentionDays: 730,       // 2 years for recommendations
+  archiveBeforeDelete: true,            // Audit trail
+};
+
+// Archive pipeline: Hot → Cold
+await archiveWatchHistory(cutoffDate, batchSize);
+
+// GDPR deletion support
+await deleteProfileData(profileId);
+```
+
+**Compliance Considerations**:
+- GDPR: Right to erasure (Article 17), data minimization (Article 5)
+- CCPA: Right to delete personal information
+- Retention schedule documentation for audits
+
+### Rate Limiting Strategy
+
+**Decision**: Implement Redis-based sliding window rate limiting with tiered limits by endpoint category.
+
+**Rationale**:
+
+1. **Protection Against Abuse**: Rate limits prevent:
+   - Credential stuffing attacks on login endpoints
+   - Scraping of video catalog data
+   - Resource exhaustion from runaway clients
+
+2. **Fair Usage**: Per-user limits ensure no single user degrades service for others.
+
+3. **Sliding Window Algorithm**: Provides smoother limiting than fixed windows:
+   - Fixed window: 100 requests allowed, user sends 100 at minute boundary, then 100 more at next minute = 200 in 2 seconds
+   - Sliding window: Tracks requests over a rolling window, preventing burst abuse
+
+**Tier Configuration**:
+| Endpoint Category | Limit | Window | Rationale |
+|-------------------|-------|--------|-----------|
+| Browse/Search | 100/min | 60s | Normal browsing patterns |
+| Playback Start | 30/min | 60s | Streaming is expensive |
+| Auth (login) | 5/5min | 300s | Prevent credential stuffing |
+| Admin APIs | 200/min | 60s | Tools need higher limits |
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |

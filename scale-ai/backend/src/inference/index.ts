@@ -2,6 +2,13 @@
  * Inference service for ML model predictions.
  * Provides API endpoints for classifying drawings using trained models.
  * Currently uses heuristic-based classification; replace with actual ML inference in production.
+ *
+ * Enhanced with:
+ * - Structured JSON logging for debugging and alerting
+ * - Prometheus metrics for observability
+ * - Health checks for container orchestration
+ * - Circuit breakers for database resilience
+ *
  * @module inference
  */
 
@@ -10,10 +17,19 @@ import cors from 'cors'
 import { pool } from '../shared/db.js'
 import { getModel } from '../shared/storage.js'
 
+// New shared modules
+import { logger, createChildLogger, logError } from '../shared/logger.js'
+import { postgresCircuitBreaker, CircuitBreakerOpenError } from '../shared/circuitBreaker.js'
+import { metricsMiddleware, metricsHandler, inferenceRequestsTotal, inferenceLatency, trackExternalCall } from '../shared/metrics.js'
+import { healthCheckRouter } from '../shared/healthCheck.js'
+
 const app = express()
 
 /** Port for the inference service (default: 3003) */
 const PORT = parseInt(process.env.PORT || '3003')
+
+// Set service name for logging
+process.env.SERVICE_NAME = 'inference'
 
 /** Shape class names - must match training data order */
 const SHAPE_NAMES = ['circle', 'heart', 'line', 'square', 'triangle']
@@ -22,25 +38,38 @@ const SHAPE_NAMES = ['circle', 'heart', 'line', 'square', 'triangle']
 app.use(cors())
 app.use(express.json({ limit: '1mb' }))
 
-// Health check
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'inference' })
-})
+// Prometheus metrics middleware (must be before routes)
+app.use(metricsMiddleware())
+
+// Health check endpoints
+app.use(healthCheckRouter())
+
+// Prometheus metrics endpoint
+app.get('/metrics', metricsHandler)
 
 /**
  * GET /api/inference/model/info - Returns information about the active model.
  * Returns 404 if no model is active (train and activate one first).
  */
-app.get('/api/inference/model/info', async (_req, res) => {
+app.get('/api/inference/model/info', async (req, res) => {
+  const reqLogger = createChildLogger({
+    requestId: req.headers['x-request-id'] || Date.now().toString(),
+    endpoint: '/api/inference/model/info',
+  })
+
   try {
-    const result = await pool.query(`
-      SELECT m.id, m.version, m.accuracy, m.model_path, m.created_at,
-             tj.config as training_config,
-             tj.metrics as training_metrics
-      FROM models m
-      LEFT JOIN training_jobs tj ON m.training_job_id = tj.id
-      WHERE m.is_active = TRUE
-    `)
+    const result = await postgresCircuitBreaker.execute(async () => {
+      return trackExternalCall('postgres', 'select_active_model', async () => {
+        return pool.query(`
+          SELECT m.id, m.version, m.accuracy, m.model_path, m.created_at,
+                 tj.config as training_config,
+                 tj.metrics as training_metrics
+          FROM models m
+          LEFT JOIN training_jobs tj ON m.training_job_id = tj.id
+          WHERE m.is_active = TRUE
+        `)
+      })
+    })
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -50,6 +79,8 @@ app.get('/api/inference/model/info', async (_req, res) => {
     }
 
     const model = result.rows[0]
+    reqLogger.debug({ msg: 'Returned active model info', modelId: model.id })
+
     res.json({
       id: model.id,
       version: model.version,
@@ -58,7 +89,14 @@ app.get('/api/inference/model/info', async (_req, res) => {
       class_names: SHAPE_NAMES,
     })
   } catch (error) {
-    console.error('Error fetching model info:', error)
+    if (error instanceof CircuitBreakerOpenError) {
+      return res.status(503).json({
+        error: 'Service temporarily unavailable',
+        retryAfter: Math.ceil(error.retryAfterMs / 1000),
+      })
+    }
+
+    logError(error as Error, { endpoint: '/api/inference/model/info' })
     res.status(500).json({ error: 'Failed to fetch model info' })
   }
 })
@@ -69,6 +107,12 @@ app.get('/api/inference/model/info', async (_req, res) => {
  * Note: Currently uses heuristic analysis. For production, integrate actual ML model.
  */
 app.post('/api/inference/classify', async (req, res) => {
+  const startTime = Date.now()
+  const reqLogger = createChildLogger({
+    requestId: req.headers['x-request-id'] || Date.now().toString(),
+    endpoint: '/api/inference/classify',
+  })
+
   try {
     const { strokes, canvas } = req.body
 
@@ -77,18 +121,33 @@ app.post('/api/inference/classify', async (req, res) => {
     }
 
     // Check if we have an active model
-    const modelResult = await pool.query(
-      'SELECT id, version, model_path FROM models WHERE is_active = TRUE'
-    )
-
-    if (modelResult.rows.length === 0) {
-      return res.status(503).json({
-        error: 'No active model',
-        message: 'Train and activate a model first',
+    let activeModel: { id: string; version: string; model_path: string } | null = null
+    try {
+      const modelResult = await postgresCircuitBreaker.execute(async () => {
+        return trackExternalCall('postgres', 'select_active_model', async () => {
+          return pool.query(
+            'SELECT id, version, model_path FROM models WHERE is_active = TRUE'
+          )
+        })
       })
-    }
 
-    const activeModel = modelResult.rows[0]
+      if (modelResult.rows.length === 0) {
+        return res.status(503).json({
+          error: 'No active model',
+          message: 'Train and activate a model first',
+        })
+      }
+
+      activeModel = modelResult.rows[0]
+    } catch (error) {
+      if (error instanceof CircuitBreakerOpenError) {
+        return res.status(503).json({
+          error: 'Service temporarily unavailable',
+          retryAfter: Math.ceil(error.retryAfterMs / 1000),
+        })
+      }
+      throw error
+    }
 
     // In a real implementation, you would:
     // 1. Convert strokes to 64x64 image
@@ -101,10 +160,21 @@ app.post('/api/inference/classify', async (req, res) => {
 
     const prediction = analyzeStrokes(strokes, canvas)
 
-    const startTime = Date.now()
     // Simulate inference time
     await new Promise((resolve) => setTimeout(resolve, 50))
     const inferenceTime = Date.now() - startTime
+
+    // Record metrics
+    inferenceRequestsTotal.labels(activeModel.version, prediction.shape).inc()
+    inferenceLatency.labels(activeModel.version).observe(inferenceTime / 1000)
+
+    reqLogger.info({
+      msg: 'Classification complete',
+      predictedShape: prediction.shape,
+      confidence: prediction.confidence,
+      inferenceTimeMs: inferenceTime,
+      modelVersion: activeModel.version,
+    })
 
     res.json({
       prediction: prediction.shape,
@@ -115,7 +185,7 @@ app.post('/api/inference/classify', async (req, res) => {
       inference_time_ms: inferenceTime,
     })
   } catch (error) {
-    console.error('Error classifying drawing:', error)
+    logError(error as Error, { endpoint: '/api/inference/classify' })
     res.status(500).json({ error: 'Failed to classify drawing' })
   }
 })
@@ -183,7 +253,7 @@ function analyzeStrokes(strokes: Stroke[], canvas: Canvas) {
   const strokeCount = strokes.length
 
   // Analyze shape based on simple heuristics
-  let probabilities: Record<string, number> = {
+  const probabilities: Record<string, number> = {
     line: 0.1,
     circle: 0.1,
     square: 0.1,
@@ -239,5 +309,9 @@ function analyzeStrokes(strokes: Stroke[], canvas: Canvas) {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Inference service running on http://localhost:${PORT}`)
+  logger.info({
+    msg: 'Inference service started',
+    port: PORT,
+    env: process.env.NODE_ENV || 'development',
+  })
 })

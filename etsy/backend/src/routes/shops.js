@@ -2,6 +2,18 @@ import { Router } from 'express';
 import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
 
+// Shared modules
+import {
+  getCachedShop,
+  invalidateShopCache,
+  cacheAside,
+  CACHE_KEYS,
+  CACHE_TTL,
+} from '../shared/cache.js';
+import { createLogger } from '../shared/logger.js';
+
+const logger = createLogger('shops');
+
 const router = Router();
 
 // Get all shops (with pagination)
@@ -27,88 +39,107 @@ router.get('/', async (req, res) => {
       total: parseInt(countResult.rows[0].count),
     });
   } catch (error) {
-    console.error('Get shops error:', error);
+    logger.error({ error }, 'Get shops error');
     res.status(500).json({ error: 'Failed to get shops' });
   }
 });
 
-// Get shop by slug
+// Get shop by slug (with caching)
 router.get('/slug/:slug', async (req, res) => {
   try {
     const { slug } = req.params;
 
-    const result = await db.query(
-      `SELECT s.*, u.username as owner_username, u.full_name as owner_name,
-              (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.is_active = true) as product_count
-       FROM shops s
-       JOIN users u ON s.owner_id = u.id
-       WHERE s.slug = $1 AND s.is_active = true`,
-      [slug]
-    );
+    const shop = await getCachedShop(slug, async () => {
+      const result = await db.query(
+        `SELECT s.*, u.username as owner_username, u.full_name as owner_name,
+                (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.is_active = true) as product_count
+         FROM shops s
+         JOIN users u ON s.owner_id = u.id
+         WHERE s.slug = $1 AND s.is_active = true`,
+        [slug]
+      );
+      return result.rows.length > 0 ? result.rows[0] : null;
+    });
 
-    if (result.rows.length === 0) {
+    if (!shop) {
       return res.status(404).json({ error: 'Shop not found' });
     }
 
-    res.json({ shop: result.rows[0] });
+    res.json({ shop });
   } catch (error) {
-    console.error('Get shop error:', error);
+    logger.error({ error }, 'Get shop error');
     res.status(500).json({ error: 'Failed to get shop' });
   }
 });
 
-// Get shop by ID
+// Get shop by ID (with caching)
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const shopId = parseInt(id);
 
-    const result = await db.query(
-      `SELECT s.*, u.username as owner_username, u.full_name as owner_name,
-              (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.is_active = true) as product_count
-       FROM shops s
-       JOIN users u ON s.owner_id = u.id
-       WHERE s.id = $1 AND s.is_active = true`,
-      [parseInt(id)]
-    );
+    const shop = await getCachedShop(shopId, async () => {
+      const result = await db.query(
+        `SELECT s.*, u.username as owner_username, u.full_name as owner_name,
+                (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.is_active = true) as product_count
+         FROM shops s
+         JOIN users u ON s.owner_id = u.id
+         WHERE s.id = $1 AND s.is_active = true`,
+        [shopId]
+      );
+      return result.rows.length > 0 ? result.rows[0] : null;
+    });
 
-    if (result.rows.length === 0) {
+    if (!shop) {
       return res.status(404).json({ error: 'Shop not found' });
     }
 
-    res.json({ shop: result.rows[0] });
+    res.json({ shop });
   } catch (error) {
-    console.error('Get shop error:', error);
+    logger.error({ error }, 'Get shop error');
     res.status(500).json({ error: 'Failed to get shop' });
   }
 });
 
-// Get shop products
+// Get shop products (with caching)
 router.get('/:id/products', async (req, res) => {
   try {
     const { id } = req.params;
+    const shopId = parseInt(id);
     const { limit = 20, offset = 0 } = req.query;
 
-    const result = await db.query(
-      `SELECT p.*, c.name as category_name
-       FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.shop_id = $1 AND p.is_active = true
-       ORDER BY p.created_at DESC
-       LIMIT $2 OFFSET $3`,
-      [parseInt(id), parseInt(limit), parseInt(offset)]
+    const cacheKey = `${CACHE_KEYS.SHOP_PRODUCTS}${shopId}:${limit}:${offset}`;
+
+    const data = await cacheAside(
+      cacheKey,
+      async () => {
+        const result = await db.query(
+          `SELECT p.*, c.name as category_name
+           FROM products p
+           LEFT JOIN categories c ON p.category_id = c.id
+           WHERE p.shop_id = $1 AND p.is_active = true
+           ORDER BY p.created_at DESC
+           LIMIT $2 OFFSET $3`,
+          [shopId, parseInt(limit), parseInt(offset)]
+        );
+
+        const countResult = await db.query(
+          'SELECT COUNT(*) FROM products WHERE shop_id = $1 AND is_active = true',
+          [shopId]
+        );
+
+        return {
+          products: result.rows,
+          total: parseInt(countResult.rows[0].count),
+        };
+      },
+      CACHE_TTL.SHOP_PRODUCTS,
+      'shop'
     );
 
-    const countResult = await db.query(
-      'SELECT COUNT(*) FROM products WHERE shop_id = $1 AND is_active = true',
-      [parseInt(id)]
-    );
-
-    res.json({
-      products: result.rows,
-      total: parseInt(countResult.rows[0].count),
-    });
+    res.json(data);
   } catch (error) {
-    console.error('Get shop products error:', error);
+    logger.error({ error }, 'Get shop products error');
     res.status(500).json({ error: 'Failed to get shop products' });
   }
 });
@@ -157,9 +188,10 @@ router.post('/', isAuthenticated, async (req, res) => {
     }
     req.session.shopIds.push(shop.id);
 
+    logger.info({ shopId: shop.id, userId: req.session.userId }, 'Shop created');
     res.status(201).json({ shop });
   } catch (error) {
-    console.error('Create shop error:', error);
+    logger.error({ error }, 'Create shop error');
     res.status(500).json({ error: 'Failed to create shop' });
   }
 });
@@ -174,6 +206,10 @@ router.put('/:id', isAuthenticated, async (req, res) => {
     if (!req.session.shopIds || !req.session.shopIds.includes(shopId)) {
       return res.status(403).json({ error: 'You do not own this shop' });
     }
+
+    // Get current shop data to get slug for cache invalidation
+    const currentShop = await db.query('SELECT slug FROM shops WHERE id = $1', [shopId]);
+    const oldSlug = currentShop.rows[0]?.slug;
 
     const { name, description, location, bannerImage, logoImage, shippingPolicy, returnPolicy } = req.body;
 
@@ -205,9 +241,18 @@ router.put('/:id', isAuthenticated, async (req, res) => {
       return res.status(404).json({ error: 'Shop not found' });
     }
 
-    res.json({ shop: result.rows[0] });
+    const shop = result.rows[0];
+
+    // Invalidate shop cache (both by ID and slug)
+    await invalidateShopCache(shopId, oldSlug);
+    if (shop.slug !== oldSlug) {
+      await invalidateShopCache(shopId, shop.slug);
+    }
+
+    logger.info({ shopId }, 'Shop updated');
+    res.json({ shop: shop });
   } catch (error) {
-    console.error('Update shop error:', error);
+    logger.error({ error }, 'Update shop error');
     res.status(500).json({ error: 'Failed to update shop' });
   }
 });
@@ -254,7 +299,7 @@ router.get('/:id/orders', isAuthenticated, async (req, res) => {
 
     res.json({ orders: result.rows });
   } catch (error) {
-    console.error('Get shop orders error:', error);
+    logger.error({ error }, 'Get shop orders error');
     res.status(500).json({ error: 'Failed to get orders' });
   }
 });
@@ -310,7 +355,7 @@ router.get('/:id/stats', isAuthenticated, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Get shop stats error:', error);
+    logger.error({ error }, 'Get shop stats error');
     res.status(500).json({ error: 'Failed to get stats' });
   }
 });

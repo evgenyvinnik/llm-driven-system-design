@@ -8,6 +8,17 @@ import { createChargeEntries, calculateFee, getMerchantBalance } from '../servic
 import { authorize, capture } from '../services/cardNetwork.js';
 import { sendWebhook } from '../services/webhooks.js';
 
+// Import shared modules for observability
+import logger from '../shared/logger.js';
+import { auditLogger } from '../shared/audit.js';
+import {
+  paymentAmountCents,
+  activePaymentIntents,
+  fraudScoreDistribution,
+  fraudBlockedTotal,
+  recordFraudCheck,
+} from '../shared/metrics.js';
+
 const router = Router();
 
 // All routes require authentication
@@ -18,6 +29,8 @@ router.use(authenticateApiKey);
  * POST /v1/payment_intents
  */
 router.post('/', idempotencyMiddleware, async (req, res) => {
+  const startTime = process.hrtime();
+
   try {
     const {
       amount,
@@ -84,9 +97,39 @@ router.post('/', idempotencyMiddleware, async (req, res) => {
 
     const paymentIntent = formatPaymentIntent(result.rows[0]);
 
+    // Record metrics
+    paymentAmountCents.observe({ currency: currency.toLowerCase(), status: 'created' }, amount);
+    activePaymentIntents.inc({ status });
+
+    // Audit log: Payment intent created
+    await auditLogger.logPaymentIntentCreated(result.rows[0], {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      traceId: req.headers['x-trace-id'],
+      metadata: { idempotency_key: idempotencyKey },
+    });
+
+    // Log the event
+    const [s, ns] = process.hrtime(startTime);
+    const durationMs = (s * 1000 + ns / 1e6).toFixed(2);
+
+    logger.info({
+      event: 'payment_intent_created',
+      intent_id: id,
+      merchant_id: req.merchantId,
+      amount,
+      currency,
+      status,
+      duration_ms: parseFloat(durationMs),
+    });
+
     res.status(201).json(paymentIntent);
   } catch (error) {
-    console.error('Create payment intent error:', error);
+    logger.error({
+      event: 'payment_intent_create_error',
+      error_message: error.message,
+      merchant_id: req.merchantId,
+    });
 
     // Handle unique constraint violation for idempotency key
     if (error.code === '23505' && error.constraint?.includes('idempotency')) {
@@ -141,7 +184,11 @@ router.get('/:id', async (req, res) => {
 
     res.json(paymentIntent);
   } catch (error) {
-    console.error('Get payment intent error:', error);
+    logger.error({
+      event: 'payment_intent_get_error',
+      intent_id: req.params.id,
+      error_message: error.message,
+    });
     res.status(500).json({
       error: {
         type: 'api_error',
@@ -201,7 +248,10 @@ router.get('/', async (req, res) => {
       total_count: parseInt(countResult.rows[0].count),
     });
   } catch (error) {
-    console.error('List payment intents error:', error);
+    logger.error({
+      event: 'payment_intents_list_error',
+      error_message: error.message,
+    });
     res.status(500).json({
       error: {
         type: 'api_error',
@@ -216,6 +266,8 @@ router.get('/', async (req, res) => {
  * POST /v1/payment_intents/:id/confirm
  */
 router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
+  const startTime = process.hrtime();
+
   try {
     const { payment_method } = req.body;
 
@@ -235,6 +287,7 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
     }
 
     const intent = intentResult.rows[0];
+    const previousStatus = intent.status;
 
     // Validate state
     if (!['requires_payment_method', 'requires_confirmation'].includes(intent.status)) {
@@ -284,6 +337,21 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
       ipAddress: req.ip,
     });
 
+    // Record fraud metrics
+    recordFraudCheck(riskResult.score, riskResult.decision);
+
+    // Audit log: Fraud check
+    await auditLogger.logFraudCheck(
+      intent.id,
+      riskResult.score,
+      riskResult.decision,
+      riskResult.rules || [],
+      {
+        ipAddress: req.ip,
+        traceId: req.headers['x-trace-id'],
+      }
+    );
+
     // Block high-risk payments
     if (riskResult.decision === 'block') {
       await query(`
@@ -291,6 +359,24 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         SET status = 'failed', decline_code = 'fraudulent', error_message = $2
         WHERE id = $1
       `, [intent.id, 'Transaction blocked due to high fraud risk']);
+
+      // Update metrics
+      activePaymentIntents.dec({ status: previousStatus });
+      activePaymentIntents.inc({ status: 'failed' });
+      fraudBlockedTotal.inc({ rule: 'aggregate', risk_level: 'high' });
+
+      // Audit log: Payment blocked
+      await auditLogger.logPaymentIntentFailed(intent, 'fraudulent', {
+        ipAddress: req.ip,
+        traceId: req.headers['x-trace-id'],
+        metadata: { fraud_score: riskResult.score },
+      });
+
+      logger.warn({
+        event: 'payment_blocked_fraud',
+        intent_id: intent.id,
+        risk_score: riskResult.score,
+      });
 
       return res.status(402).json({
         error: {
@@ -310,6 +396,9 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         WHERE id = $1
       `, [intent.id, paymentMethodId]);
 
+      activePaymentIntents.dec({ status: previousStatus });
+      activePaymentIntents.inc({ status: 'requires_action' });
+
       const updatedIntent = await query(`SELECT * FROM payment_intents WHERE id = $1`, [intent.id]);
       const formatted = formatPaymentIntent(updatedIntent.rows[0]);
       formatted.next_action = {
@@ -317,10 +406,16 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         redirect_url: `http://localhost:3001/v1/payment_intents/${intent.id}/3ds`,
       };
 
+      logger.info({
+        event: 'payment_requires_3ds',
+        intent_id: intent.id,
+        risk_score: riskResult.score,
+      });
+
       return res.json(formatted);
     }
 
-    // Authorize with card network
+    // Authorize with card network (protected by circuit breaker)
     const authResult = await authorize({
       amount: intent.amount,
       currency: intent.currency,
@@ -335,9 +430,25 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         WHERE id = $1
       `, [intent.id, authResult.declineCode, paymentMethodId]);
 
+      // Update metrics
+      activePaymentIntents.dec({ status: previousStatus });
+      activePaymentIntents.inc({ status: 'failed' });
+
+      // Audit log: Payment failed
+      await auditLogger.logPaymentIntentFailed(intent, authResult.declineCode, {
+        ipAddress: req.ip,
+        traceId: req.headers['x-trace-id'],
+      });
+
       // Send webhook
       await sendWebhook(req.merchantId, 'payment_intent.payment_failed', {
         id: intent.id,
+        decline_code: authResult.declineCode,
+      });
+
+      logger.info({
+        event: 'payment_declined',
+        intent_id: intent.id,
         decline_code: authResult.declineCode,
       });
 
@@ -383,11 +494,36 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         return { chargeId, fee };
       });
 
+      // Update metrics
+      activePaymentIntents.dec({ status: previousStatus });
+      activePaymentIntents.inc({ status: 'succeeded' });
+
+      // Audit log: Payment confirmed and succeeded
+      await auditLogger.logPaymentIntentConfirmed(
+        { ...intent, status: 'succeeded', auth_code: authResult.authCode, payment_method_id: paymentMethodId },
+        previousStatus,
+        {
+          ipAddress: req.ip,
+          traceId: req.headers['x-trace-id'],
+          metadata: { charge_id: result.chargeId, fee: result.fee },
+        }
+      );
+
       // Send webhook
       await sendWebhook(req.merchantId, 'payment_intent.succeeded', {
         id: intent.id,
         amount: intent.amount,
         currency: intent.currency,
+      });
+
+      const [s, ns] = process.hrtime(startTime);
+      logger.info({
+        event: 'payment_succeeded',
+        intent_id: intent.id,
+        amount: intent.amount,
+        currency: intent.currency,
+        charge_id: result.chargeId,
+        duration_ms: ((s * 1000) + (ns / 1e6)).toFixed(2),
       });
     } else {
       // Manual capture - just update to requires_capture
@@ -396,6 +532,16 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
         SET status = 'requires_capture', auth_code = $2, payment_method_id = $3
         WHERE id = $1
       `, [intent.id, authResult.authCode, paymentMethodId]);
+
+      activePaymentIntents.dec({ status: previousStatus });
+      activePaymentIntents.inc({ status: 'requires_capture' });
+
+      logger.info({
+        event: 'payment_authorized',
+        intent_id: intent.id,
+        amount: intent.amount,
+        status: 'requires_capture',
+      });
     }
 
     // Get updated intent
@@ -404,7 +550,29 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
 
     res.json(paymentIntent);
   } catch (error) {
-    console.error('Confirm payment intent error:', error);
+    // Check for circuit breaker errors
+    if (error.name === 'CardNetworkUnavailableError') {
+      logger.warn({
+        event: 'payment_processor_unavailable',
+        intent_id: req.params.id,
+        error_message: error.message,
+      });
+
+      return res.status(503).json({
+        error: {
+          type: 'api_error',
+          code: 'payment_processor_unavailable',
+          message: 'Payment processor is temporarily unavailable. Please try again.',
+        },
+      });
+    }
+
+    logger.error({
+      event: 'payment_intent_confirm_error',
+      intent_id: req.params.id,
+      error_message: error.message,
+    });
+
     res.status(500).json({
       error: {
         type: 'api_error',
@@ -419,6 +587,8 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req, res) => {
  * POST /v1/payment_intents/:id/capture
  */
 router.post('/:id/capture', idempotencyMiddleware, async (req, res) => {
+  const startTime = process.hrtime();
+
   try {
     const { amount_to_capture } = req.body;
 
@@ -508,6 +678,17 @@ router.post('/:id/capture', idempotencyMiddleware, async (req, res) => {
       return { chargeId, fee };
     });
 
+    // Update metrics
+    activePaymentIntents.dec({ status: 'requires_capture' });
+    activePaymentIntents.inc({ status: 'succeeded' });
+
+    // Audit log: Payment captured
+    await auditLogger.logPaymentIntentCaptured(intent, captureAmount, {
+      ipAddress: req.ip,
+      traceId: req.headers['x-trace-id'],
+      metadata: { charge_id: result.chargeId },
+    });
+
     // Send webhook
     await sendWebhook(req.merchantId, 'payment_intent.succeeded', {
       id: intent.id,
@@ -515,11 +696,34 @@ router.post('/:id/capture', idempotencyMiddleware, async (req, res) => {
       currency: intent.currency,
     });
 
+    const [s, ns] = process.hrtime(startTime);
+    logger.info({
+      event: 'payment_captured',
+      intent_id: intent.id,
+      captured_amount: captureAmount,
+      duration_ms: ((s * 1000) + (ns / 1e6)).toFixed(2),
+    });
+
     // Get updated intent
     const updatedResult = await query(`SELECT * FROM payment_intents WHERE id = $1`, [intent.id]);
     res.json(formatPaymentIntent(updatedResult.rows[0]));
   } catch (error) {
-    console.error('Capture payment intent error:', error);
+    if (error.name === 'CardNetworkUnavailableError') {
+      return res.status(503).json({
+        error: {
+          type: 'api_error',
+          code: 'payment_processor_unavailable',
+          message: 'Payment processor is temporarily unavailable. Please try again.',
+        },
+      });
+    }
+
+    logger.error({
+      event: 'payment_intent_capture_error',
+      intent_id: req.params.id,
+      error_message: error.message,
+    });
+
     res.status(500).json({
       error: {
         type: 'api_error',
@@ -553,6 +757,7 @@ router.post('/:id/cancel', async (req, res) => {
     }
 
     const intent = intentResult.rows[0];
+    const previousStatus = intent.status;
 
     // Validate state
     const cancelableStatuses = ['requires_payment_method', 'requires_confirmation', 'requires_action', 'requires_capture'];
@@ -572,17 +777,32 @@ router.post('/:id/cancel', async (req, res) => {
       WHERE id = $1
     `, [intent.id, JSON.stringify({ cancellation_reason: cancellation_reason || 'requested' })]);
 
+    // Update metrics
+    activePaymentIntents.dec({ status: previousStatus });
+    activePaymentIntents.inc({ status: 'canceled' });
+
     // Send webhook
     await sendWebhook(req.merchantId, 'payment_intent.canceled', {
       id: intent.id,
       cancellation_reason,
     });
 
+    logger.info({
+      event: 'payment_canceled',
+      intent_id: intent.id,
+      previous_status: previousStatus,
+      reason: cancellation_reason,
+    });
+
     // Get updated intent
     const updatedResult = await query(`SELECT * FROM payment_intents WHERE id = $1`, [intent.id]);
     res.json(formatPaymentIntent(updatedResult.rows[0]));
   } catch (error) {
-    console.error('Cancel payment intent error:', error);
+    logger.error({
+      event: 'payment_intent_cancel_error',
+      intent_id: req.params.id,
+      error_message: error.message,
+    });
     res.status(500).json({
       error: {
         type: 'api_error',
@@ -663,11 +883,21 @@ router.post('/:id', async (req, res) => {
       WHERE id = $1
     `, params);
 
+    logger.info({
+      event: 'payment_intent_updated',
+      intent_id: intent.id,
+      updates: { amount, currency, description },
+    });
+
     // Get updated intent
     const updatedResult = await query(`SELECT * FROM payment_intents WHERE id = $1`, [intent.id]);
     res.json(formatPaymentIntent(updatedResult.rows[0]));
   } catch (error) {
-    console.error('Update payment intent error:', error);
+    logger.error({
+      event: 'payment_intent_update_error',
+      intent_id: req.params.id,
+      error_message: error.message,
+    });
     res.status(500).json({
       error: {
         type: 'api_error',

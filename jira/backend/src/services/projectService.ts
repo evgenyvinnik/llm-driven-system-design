@@ -1,13 +1,22 @@
 import { query } from '../config/database.js';
 import { cacheGet, cacheSet, cacheDel } from '../config/redis.js';
+import { logger } from '../config/logger.js';
+import { cacheHitsCounter, cacheMissesCounter } from '../config/metrics.js';
 import { Project, User, Sprint, Board, Label, Component, ProjectRole } from '../types/index.js';
 
-/** Cache TTL for project data in seconds (1 hour) */
-const PROJECT_CACHE_TTL = 3600;
+/** Cache TTL for project data in seconds (15 minutes) */
+const PROJECT_CACHE_TTL = 900;
+/** Cache TTL for board data in seconds (5 minutes) */
+const BOARD_CACHE_TTL = 300;
+/** Cache TTL for workflow data in seconds (30 minutes, rarely changes) */
+const WORKFLOW_CACHE_TTL = 1800;
 
 /**
  * Retrieves a project by its UUID with caching.
  * Uses Redis cache to reduce database load for frequently accessed projects.
+ *
+ * WHY: Project metadata is read frequently (every issue view, board load, etc.)
+ * but changes rarely. Caching reduces database load significantly.
  *
  * @param projectId - UUID of the project
  * @returns Project object or null if not found
@@ -15,7 +24,13 @@ const PROJECT_CACHE_TTL = 3600;
 export async function getProjectById(projectId: string): Promise<Project | null> {
   const cacheKey = `project:${projectId}`;
   const cached = await cacheGet<Project>(cacheKey);
-  if (cached) return cached;
+
+  if (cached) {
+    cacheHitsCounter.inc({ cache_type: 'project' });
+    return cached;
+  }
+
+  cacheMissesCounter.inc({ cache_type: 'project' });
 
   const { rows } = await query<Project>(
     'SELECT * FROM projects WHERE id = $1',
@@ -37,10 +52,24 @@ export async function getProjectById(projectId: string): Promise<Project | null>
  * @returns Project object or null if not found
  */
 export async function getProjectByKey(key: string): Promise<Project | null> {
+  const cacheKey = `project:key:${key.toUpperCase()}`;
+  const cached = await cacheGet<Project>(cacheKey);
+
+  if (cached) {
+    cacheHitsCounter.inc({ cache_type: 'project' });
+    return cached;
+  }
+
+  cacheMissesCounter.inc({ cache_type: 'project' });
+
   const { rows } = await query<Project>(
     'SELECT * FROM projects WHERE key = $1',
     [key.toUpperCase()]
   );
+
+  if (rows[0]) {
+    await cacheSet(cacheKey, rows[0], PROJECT_CACHE_TTL);
+  }
 
   return rows[0] || null;
 }
@@ -89,6 +118,8 @@ export async function createProject(data: {
   workflowId?: number;
   permissionSchemeId?: number;
 }): Promise<Project> {
+  const log = logger.child({ operation: 'createProject', key: data.key });
+
   // Get defaults
   const { rows: defaults } = await query<{ workflow_id: number; permission_scheme_id: number }>(
     `SELECT
@@ -115,6 +146,8 @@ export async function createProject(data: {
     );
   }
 
+  log.info({ projectId: rows[0].id }, 'Project created');
+
   return rows[0];
 }
 
@@ -130,6 +163,8 @@ export async function updateProject(
   projectId: string,
   data: Partial<Pick<Project, 'name' | 'description' | 'lead_id' | 'workflow_id' | 'permission_scheme_id'>>
 ): Promise<Project | null> {
+  const log = logger.child({ operation: 'updateProject', projectId });
+
   const fields: string[] = [];
   const values: unknown[] = [];
   let paramIndex = 1;
@@ -166,7 +201,9 @@ export async function updateProject(
   );
 
   if (rows[0]) {
-    await cacheDel(`project:${projectId}`);
+    // Invalidate all project-related caches
+    await invalidateProjectCache(projectId, rows[0].key);
+    log.info('Project updated');
   }
 
   return rows[0] || null;
@@ -180,9 +217,20 @@ export async function updateProject(
  * @returns True if deleted, false if not found
  */
 export async function deleteProject(projectId: string): Promise<boolean> {
+  const log = logger.child({ operation: 'deleteProject', projectId });
+
+  // Get project key for cache invalidation
+  const project = await getProjectById(projectId);
+
   const { rowCount } = await query('DELETE FROM projects WHERE id = $1', [projectId]);
-  await cacheDel(`project:${projectId}`);
-  return (rowCount ?? 0) > 0;
+
+  if (rowCount && rowCount > 0 && project) {
+    await invalidateProjectCache(projectId, project.key);
+    log.info('Project deleted');
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -394,35 +442,69 @@ export async function completeSprint(sprintId: number): Promise<Sprint | null> {
 }
 
 /**
- * Retrieves all boards for a project.
+ * Retrieves all boards for a project with caching.
+ *
+ * WHY: Board configurations are read on every board view but rarely change.
+ * Caching reduces database load for frequently accessed boards.
  *
  * @param projectId - UUID of the project
  * @returns Array of boards
  */
 export async function getBoardsByProject(projectId: string): Promise<Board[]> {
+  const cacheKey = `boards:project:${projectId}`;
+  const cached = await cacheGet<Board[]>(cacheKey);
+
+  if (cached) {
+    cacheHitsCounter.inc({ cache_type: 'board' });
+    return cached;
+  }
+
+  cacheMissesCounter.inc({ cache_type: 'board' });
+
   const { rows } = await query<Board>(
     'SELECT * FROM boards WHERE project_id = $1 ORDER BY name',
     [projectId]
   );
+
+  if (rows.length > 0) {
+    await cacheSet(cacheKey, rows, BOARD_CACHE_TTL);
+  }
+
   return rows;
 }
 
 /**
- * Retrieves a board by its ID.
+ * Retrieves a board by its ID with caching.
  *
  * @param boardId - ID of the board
  * @returns Board or null if not found
  */
 export async function getBoardById(boardId: number): Promise<Board | null> {
+  const cacheKey = `board:${boardId}`;
+  const cached = await cacheGet<Board>(cacheKey);
+
+  if (cached) {
+    cacheHitsCounter.inc({ cache_type: 'board' });
+    return cached;
+  }
+
+  cacheMissesCounter.inc({ cache_type: 'board' });
+
   const { rows } = await query<Board>(
     'SELECT * FROM boards WHERE id = $1',
     [boardId]
   );
+
+  if (rows[0]) {
+    await cacheSet(cacheKey, rows[0], BOARD_CACHE_TTL);
+  }
+
   return rows[0] || null;
 }
 
 /**
  * Creates a new board for a project.
+ * Invalidates the project's board list cache.
  *
  * @param data - Board creation data
  * @returns Newly created board
@@ -440,6 +522,10 @@ export async function createBoard(data: {
      RETURNING *`,
     [data.projectId, data.name, data.type, data.filterJql, JSON.stringify(data.columnConfig || [])]
   );
+
+  // Invalidate board list cache for this project
+  await cacheDel(`boards:project:${data.projectId}`);
+
   return rows[0];
 }
 
@@ -518,4 +604,18 @@ export async function createComponent(data: {
 export async function getProjectRoles(): Promise<ProjectRole[]> {
   const { rows } = await query<ProjectRole>('SELECT * FROM project_roles ORDER BY name');
   return rows;
+}
+
+/**
+ * Invalidates all cache entries related to a project.
+ *
+ * @param projectId - Project UUID
+ * @param projectKey - Project key
+ */
+async function invalidateProjectCache(projectId: string, projectKey: string): Promise<void> {
+  await Promise.all([
+    cacheDel(`project:${projectId}`),
+    cacheDel(`project:key:${projectKey}`),
+    cacheDel(`boards:project:${projectId}`),
+  ]);
 }

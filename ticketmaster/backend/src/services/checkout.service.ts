@@ -1,36 +1,83 @@
 /**
  * Checkout service for processing ticket purchases and managing orders.
  * Handles the final transaction step, converting seat reservations to sold tickets.
- * Integrates with payment processing (currently simulated).
+ *
+ * Key features:
+ * - Idempotency to prevent double-charging customers
+ * - Circuit breaker for payment processing resilience
+ * - Comprehensive metrics and logging
  */
 import { v4 as uuidv4 } from 'uuid';
 import { query, withTransaction } from '../db/pool.js';
 import redis from '../db/redis.js';
 import { seatService } from './seat.service.js';
 import type { Order, OrderItem } from '../types/index.js';
+import logger, { businessLogger, createRequestLogger } from '../shared/logger.js';
+import {
+  checkIdempotency,
+  storeIdempotency,
+  generateCheckoutIdempotencyKey,
+  validateIdempotencyKey,
+} from '../shared/idempotency.js';
+import { CircuitBreaker, CircuitState, createPaymentCircuitBreaker } from '../shared/circuit-breaker.js';
+import {
+  seatsSoldTotal,
+  checkoutCompletedTotal,
+  checkoutFailedTotal,
+  checkoutDuration,
+} from '../shared/metrics.js';
+
+/** Result type for checkout operations */
+interface CheckoutResult {
+  order: Order;
+  items: OrderItem[];
+}
+
+/** Payment processing result */
+interface PaymentResult {
+  success: boolean;
+  transactionId?: string;
+  error?: string;
+}
 
 /**
  * Service class for checkout and order management.
  * Processes payments, creates orders, and handles cancellations.
  */
 export class CheckoutService {
+  /** Circuit breaker for payment processing */
+  private paymentCircuitBreaker: CircuitBreaker<PaymentResult>;
+
+  constructor() {
+    this.paymentCircuitBreaker = createPaymentCircuitBreaker();
+  }
+
   /**
    * Completes a ticket purchase from a user's reservation.
-   * Validates the reservation, processes payment, and finalizes the order.
-   * Uses a database transaction to ensure atomicity.
+   *
+   * CRITICAL: This method is idempotent. If the same idempotency key is used,
+   * the previously completed order is returned instead of creating a duplicate.
+   * This prevents double-charging customers on retry or network issues.
    *
    * @param sessionId - The user's session ID (holds the reservation)
    * @param userId - The user making the purchase
    * @param paymentMethod - The payment method used (e.g., 'card')
+   * @param idempotencyKey - Optional idempotency key to prevent duplicates
+   * @param correlationId - Optional correlation ID for distributed tracing
    * @returns Object containing the created order and order items
-   * @throws Error if no reservation exists or it has expired
+   * @throws Error if no reservation exists, it has expired, or payment fails
    */
   async checkout(
     sessionId: string,
     userId: string,
-    paymentMethod: string
-  ): Promise<{ order: Order; items: OrderItem[] }> {
-    // Get reservation
+    paymentMethod: string,
+    idempotencyKey?: string,
+    correlationId?: string
+  ): Promise<CheckoutResult> {
+    const reqLogger = createRequestLogger(correlationId);
+    const startTime = Date.now();
+
+    // Get reservation first to generate idempotency key if not provided
     const reservation = await seatService.getReservation(sessionId);
     if (!reservation) {
       throw new Error('No active reservation found');
@@ -41,62 +88,209 @@ export class CheckoutService {
       throw new Error('Reservation has expired');
     }
 
-    // Create order and update seats in a transaction
-    const result = await withTransaction(async (client) => {
-      // Create order
-      const orderId = uuidv4();
-      const paymentId = `pay_${uuidv4().substring(0, 16)}`;
+    // Validate or generate idempotency key
+    const key = validateIdempotencyKey(idempotencyKey, () =>
+      generateCheckoutIdempotencyKey(sessionId, reservation.event_id, reservation.seat_ids)
+    );
 
-      const orderResult = await client.query(
-        `INSERT INTO orders (id, user_id, event_id, status, total_amount, payment_id, completed_at)
-         VALUES ($1, $2, $3, 'completed', $4, $5, NOW())
-         RETURNING *`,
-        [orderId, userId, reservation.event_id, reservation.total_price, paymentId]
-      );
-      const order = orderResult.rows[0] as Order;
-
-      // Create order items
-      const items: OrderItem[] = [];
-      for (const seat of reservation.seats) {
-        const itemResult = await client.query(
-          `INSERT INTO order_items (id, order_id, seat_id, price)
-           VALUES ($1, $2, $3, $4)
-           RETURNING *`,
-          [uuidv4(), orderId, seat.id, seat.price]
-        );
-        items.push(itemResult.rows[0] as OrderItem);
-      }
-
-      // Update seats to sold status
-      await client.query(
-        `UPDATE event_seats
-         SET status = 'sold',
-             order_id = $1,
-             held_until = NULL,
-             held_by_session = NULL,
-             updated_at = NOW()
-         WHERE id = ANY($2)
-         AND held_by_session = $3`,
-        [orderId, reservation.seat_ids, sessionId]
-      );
-
-      return { order, items };
+    reqLogger.info({
+      msg: 'Starting checkout',
+      userId,
+      eventId: reservation.event_id,
+      seatCount: reservation.seat_ids.length,
+      idempotencyKey: key,
     });
 
-    // Clean up Redis
-    await redis.del(`reservation:${sessionId}`);
-    for (const seatId of reservation.seat_ids) {
-      await redis.del(`seat_lock:${reservation.event_id}:${seatId}`);
+    // Check for idempotent request
+    const cached = await checkIdempotency<CheckoutResult>(key);
+    if (cached) {
+      businessLogger.idempotencyHit({
+        correlationId: correlationId || 'unknown',
+        idempotencyKey: key,
+        orderId: cached.data.order.id,
+      });
+
+      reqLogger.info({
+        msg: 'Returning cached checkout result',
+        orderId: cached.data.order.id,
+      });
+
+      return cached.data;
     }
 
-    // Invalidate availability cache
-    const keys = await redis.keys(`availability:${reservation.event_id}:*`);
-    if (keys.length > 0) {
-      await redis.del(...keys);
-    }
-    await redis.del(`event:${reservation.event_id}`);
+    try {
+      // Process payment through circuit breaker
+      const paymentResult = await this.processPayment(
+        userId,
+        reservation.total_price,
+        paymentMethod
+      );
 
-    return result;
+      if (!paymentResult.success) {
+        checkoutFailedTotal.inc({ event_id: reservation.event_id, reason: 'payment_declined' });
+        throw new Error(`Payment failed: ${paymentResult.error || 'Unknown error'}`);
+      }
+
+      // Create order and update seats in a transaction
+      const result = await withTransaction(async (client) => {
+        // Create order
+        const orderId = uuidv4();
+
+        const orderResult = await client.query(
+          `INSERT INTO orders (id, user_id, event_id, status, total_amount, payment_id, idempotency_key, completed_at)
+           VALUES ($1, $2, $3, 'completed', $4, $5, $6, NOW())
+           RETURNING *`,
+          [orderId, userId, reservation.event_id, reservation.total_price, paymentResult.transactionId, key]
+        );
+        const order = orderResult.rows[0] as Order;
+
+        // Create order items
+        const items: OrderItem[] = [];
+        for (const seat of reservation.seats) {
+          const itemResult = await client.query(
+            `INSERT INTO order_items (id, order_id, seat_id, price)
+             VALUES ($1, $2, $3, $4)
+             RETURNING *`,
+            [uuidv4(), orderId, seat.id, seat.price]
+          );
+          items.push(itemResult.rows[0] as OrderItem);
+        }
+
+        // Update seats to sold status with double-booking check
+        const updateResult = await client.query(
+          `UPDATE event_seats
+           SET status = 'sold',
+               order_id = $1,
+               held_until = NULL,
+               held_by_session = NULL,
+               updated_at = NOW()
+           WHERE id = ANY($2)
+           AND held_by_session = $3
+           AND status = 'held'
+           RETURNING id`,
+          [orderId, reservation.seat_ids, sessionId]
+        );
+
+        // Verify all seats were updated (no race condition)
+        if (updateResult.rowCount !== reservation.seat_ids.length) {
+          businessLogger.oversellPrevented({
+            eventId: reservation.event_id,
+            seatId: reservation.seat_ids.join(','),
+            details: `Expected ${reservation.seat_ids.length} seats, updated ${updateResult.rowCount}`,
+          });
+          throw new Error('Some seats are no longer available. Please select different seats.');
+        }
+
+        return { order, items };
+      });
+
+      // Clean up Redis
+      await redis.del(`reservation:${sessionId}`);
+      for (const seatId of reservation.seat_ids) {
+        await redis.del(`seat_lock:${reservation.event_id}:${seatId}`);
+      }
+
+      // Invalidate availability cache
+      const keys = await redis.keys(`availability:${reservation.event_id}:*`);
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+      await redis.del(`event:${reservation.event_id}`);
+
+      // Store idempotency result
+      await storeIdempotency(key, result);
+
+      // Update metrics
+      const durationMs = Date.now() - startTime;
+      seatsSoldTotal.inc({ event_id: reservation.event_id }, reservation.seat_ids.length);
+      checkoutCompletedTotal.inc({ event_id: reservation.event_id });
+      checkoutDuration.observe({ event_id: reservation.event_id }, durationMs / 1000);
+
+      // Log business event
+      businessLogger.checkoutCompleted({
+        correlationId: correlationId || 'unknown',
+        userId,
+        eventId: reservation.event_id,
+        orderId: result.order.id,
+        amount: reservation.total_price,
+        durationMs,
+      });
+
+      return result;
+    } catch (error) {
+      const durationMs = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+      businessLogger.checkoutFailed({
+        correlationId: correlationId || 'unknown',
+        userId,
+        eventId: reservation.event_id,
+        reason: errorMessage,
+        error: errorMessage,
+      });
+
+      checkoutFailedTotal.inc({ event_id: reservation.event_id, reason: 'error' });
+
+      throw error;
+    }
+  }
+
+  /**
+   * Processes payment through the payment provider.
+   * Uses circuit breaker pattern to handle payment provider failures gracefully.
+   *
+   * @param userId - The user making the payment
+   * @param amount - The payment amount
+   * @param paymentMethod - The payment method
+   * @returns Payment result with transaction ID on success
+   */
+  private async processPayment(
+    userId: string,
+    amount: number,
+    paymentMethod: string
+  ): Promise<PaymentResult> {
+    return this.paymentCircuitBreaker.execute(async () => {
+      // Simulated payment processing
+      // In production, this would call the actual payment provider API
+      return this.simulatePaymentProcessing(userId, amount, paymentMethod);
+    });
+  }
+
+  /**
+   * Simulates payment processing for local development.
+   * In production, replace with actual payment provider integration.
+   */
+  private async simulatePaymentProcessing(
+    _userId: string,
+    _amount: number,
+    _paymentMethod: string
+  ): Promise<PaymentResult> {
+    // Simulate network latency
+    await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 200));
+
+    // Simulate 95% success rate
+    if (Math.random() < 0.95) {
+      return {
+        success: true,
+        transactionId: `pay_${uuidv4().substring(0, 16)}`,
+      };
+    }
+
+    return {
+      success: false,
+      error: 'Payment declined by issuer',
+    };
+  }
+
+  /**
+   * Gets the current state of the payment circuit breaker.
+   * Useful for health checks and monitoring.
+   */
+  getPaymentCircuitBreakerState(): { state: string; failures: number } {
+    return {
+      state: this.paymentCircuitBreaker.getState(),
+      failures: this.paymentCircuitBreaker.getFailureCount(),
+    };
   }
 
   /**
@@ -230,6 +424,13 @@ export class CheckoutService {
       await redis.del(...keys);
     }
     await redis.del(`event:${eventId}`);
+
+    logger.info({
+      msg: 'Order cancelled',
+      orderId,
+      userId,
+      eventId,
+    });
   }
 }
 

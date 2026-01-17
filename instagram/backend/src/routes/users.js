@@ -4,6 +4,9 @@ import { query } from '../services/db.js';
 import { uploadProfilePicture } from '../services/storage.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { timelineAdd, cacheGet, cacheSet, cacheDel } from '../services/redis.js';
+import { followRateLimitMiddleware } from '../services/rateLimiter.js';
+import logger from '../services/logger.js';
+import { followsTotal } from '../services/metrics.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -51,7 +54,11 @@ router.get('/:username', optionalAuth, async (req, res) => {
 
     res.json({ user: profileData });
   } catch (error) {
-    console.error('Get user error:', error);
+    logger.error({
+      type: 'get_user_error',
+      error: error.message,
+      username: req.params.username,
+    }, `Get user error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -103,6 +110,12 @@ router.put('/me', requireAuth, upload.single('profilePicture'), async (req, res)
 
     const user = result.rows[0];
 
+    logger.info({
+      type: 'profile_updated',
+      userId,
+      updates: updates.map((u) => u.split(' = ')[0]),
+    }, `Profile updated: ${userId}`);
+
     res.json({
       user: {
         id: user.id,
@@ -119,7 +132,11 @@ router.put('/me', requireAuth, upload.single('profilePicture'), async (req, res)
       },
     });
   } catch (error) {
-    console.error('Update user error:', error);
+    logger.error({
+      type: 'update_profile_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Update user error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -187,7 +204,11 @@ router.get('/:username/posts', optionalAuth, async (req, res) => {
       nextCursor: hasMore ? posts[posts.length - 1].created_at : null,
     });
   } catch (error) {
-    console.error('Get user posts error:', error);
+    logger.error({
+      type: 'get_user_posts_error',
+      error: error.message,
+      username: req.params.username,
+    }, `Get user posts error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -233,13 +254,44 @@ router.get('/me/saved', requireAuth, async (req, res) => {
       nextCursor: hasMore ? posts[posts.length - 1].saved_at : null,
     });
   } catch (error) {
-    console.error('Get saved posts error:', error);
+    logger.error({
+      type: 'get_saved_posts_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Get saved posts error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Follow user
-router.post('/:userId/follow', requireAuth, async (req, res) => {
+/**
+ * Follow user - with rate limiting
+ *
+ * WHY RATE LIMITING PREVENTS FOLLOW SPAM:
+ *
+ * Follow spam is a common engagement manipulation technique where users:
+ * - Rapidly follow hundreds of accounts to get follow-backs
+ * - Use bots to automate mass following
+ * - Unfollow after getting follow-backs to inflate follower ratio
+ *
+ * Without rate limiting:
+ * - Bots can follow 1000+ users per hour
+ * - Creates notification spam for victims
+ * - Inflates social graphs with fake relationships
+ * - Degrades platform trust and authenticity
+ *
+ * With rate limiting (30 follows/hour):
+ * - Normal users rarely hit the limit
+ * - Bots become economically unviable
+ * - Real relationships are prioritized
+ * - Notification quality remains high
+ *
+ * Rate limit is per-user using Redis sliding window:
+ * - Key: ratelimit:follows:{userId}
+ * - Window: 1 hour
+ * - Limit: 30 follows
+ * - Distributed across all API servers
+ */
+router.post('/:userId/follow', requireAuth, followRateLimitMiddleware, async (req, res) => {
   try {
     const { userId: targetUserId } = req.params;
     const currentUserId = req.session.userId;
@@ -249,15 +301,31 @@ router.post('/:userId/follow', requireAuth, async (req, res) => {
     }
 
     // Check if target user exists
-    const userCheck = await query('SELECT id FROM users WHERE id = $1', [targetUserId]);
+    const userCheck = await query('SELECT id, username FROM users WHERE id = $1', [targetUserId]);
     if (userCheck.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    await query(
-      'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+    // Insert follow - idempotent with ON CONFLICT
+    const result = await query(
+      'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
       [currentUserId, targetUserId]
     );
+
+    if (result.rows.length === 0) {
+      // Already following - idempotent response
+      return res.json({ message: 'Already following user', idempotent: true });
+    }
+
+    // Track metrics
+    followsTotal.labels('follow').inc();
+
+    logger.info({
+      type: 'follow',
+      followerId: currentUserId,
+      followingId: targetUserId,
+      targetUsername: userCheck.rows[0].username,
+    }, `User ${currentUserId} followed ${targetUserId}`);
 
     // Add target user's recent posts to follower's timeline
     const recentPosts = await query(
@@ -269,9 +337,13 @@ router.post('/:userId/follow', requireAuth, async (req, res) => {
       await timelineAdd(currentUserId, post.id, new Date(post.created_at).getTime());
     }
 
-    res.json({ message: 'User followed' });
+    res.json({ message: 'User followed', idempotent: false });
   } catch (error) {
-    console.error('Follow user error:', error);
+    logger.error({
+      type: 'follow_error',
+      error: error.message,
+      targetUserId: req.params.userId,
+    }, `Follow user error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -282,14 +354,32 @@ router.delete('/:userId/follow', requireAuth, async (req, res) => {
     const { userId: targetUserId } = req.params;
     const currentUserId = req.session.userId;
 
-    await query(
-      'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
+    const result = await query(
+      'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2 RETURNING id',
       [currentUserId, targetUserId]
     );
 
-    res.json({ message: 'User unfollowed' });
+    if (result.rows.length === 0) {
+      // Already not following - idempotent response
+      return res.json({ message: 'Was not following user', idempotent: true });
+    }
+
+    // Track metrics
+    followsTotal.labels('unfollow').inc();
+
+    logger.info({
+      type: 'unfollow',
+      followerId: currentUserId,
+      followingId: targetUserId,
+    }, `User ${currentUserId} unfollowed ${targetUserId}`);
+
+    res.json({ message: 'User unfollowed', idempotent: false });
   } catch (error) {
-    console.error('Unfollow user error:', error);
+    logger.error({
+      type: 'unfollow_error',
+      error: error.message,
+      targetUserId: req.params.userId,
+    }, `Unfollow user error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -338,7 +428,11 @@ router.get('/:username/followers', async (req, res) => {
       nextCursor: hasMore ? followers[followers.length - 1].created_at : null,
     });
   } catch (error) {
-    console.error('Get followers error:', error);
+    logger.error({
+      type: 'get_followers_error',
+      error: error.message,
+      username: req.params.username,
+    }, `Get followers error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -387,7 +481,11 @@ router.get('/:username/following', async (req, res) => {
       nextCursor: hasMore ? following[following.length - 1].created_at : null,
     });
   } catch (error) {
-    console.error('Get following error:', error);
+    logger.error({
+      type: 'get_following_error',
+      error: error.message,
+      username: req.params.username,
+    }, `Get following error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -419,7 +517,10 @@ router.get('/search/users', async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Search users error:', error);
+    logger.error({
+      type: 'search_users_error',
+      error: error.message,
+    }, `Search users error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

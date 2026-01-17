@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import redis from '../utils/redis.js';
 import pool from '../utils/db.js';
+import logger from '../shared/logger.js';
+import { recordCacheAccess } from '../shared/metrics.js';
 import type { User, UserPublic } from '../types/index.js';
 
 /**
@@ -39,6 +41,7 @@ export async function authenticate(
       req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
+      logger.debug({ path: req.path }, 'Auth failed: no token provided');
       res.status(401).json({ success: false, error: 'Authentication required' });
       return;
     }
@@ -47,6 +50,8 @@ export async function authenticate(
     const sessionData = await redis.get(`session:${token}`);
 
     if (!sessionData) {
+      recordCacheAccess('session', false);
+
       // Check database as fallback
       const sessionResult = await pool.query(
         `SELECT s.*, u.id as user_id, u.email, u.name, u.avatar_color, u.role
@@ -57,6 +62,7 @@ export async function authenticate(
       );
 
       if (sessionResult.rows.length === 0) {
+        logger.debug({ path: req.path }, 'Auth failed: invalid or expired session');
         res.status(401).json({ success: false, error: 'Invalid or expired session' });
         return;
       }
@@ -78,17 +84,20 @@ export async function authenticate(
         JSON.stringify(userPublic)
       );
 
+      logger.debug({ userId: userPublic.id, path: req.path }, 'Session validated from database');
+
       req.user = userPublic;
       req.sessionToken = token;
       next();
       return;
     }
 
+    recordCacheAccess('session', true);
     req.user = JSON.parse(sessionData) as UserPublic;
     req.sessionToken = token;
     next();
   } catch (error) {
-    console.error('Auth middleware error:', error);
+    logger.error({ error, path: req.path }, 'Auth middleware error');
     res.status(500).json({ success: false, error: 'Authentication error' });
   }
 }
@@ -121,13 +130,17 @@ export async function optionalAuth(
     const sessionData = await redis.get(`session:${token}`);
 
     if (sessionData) {
+      recordCacheAccess('session', true);
       req.user = JSON.parse(sessionData) as UserPublic;
       req.sessionToken = token;
+    } else {
+      recordCacheAccess('session', false);
     }
 
     next();
   } catch (error) {
     // Don't fail on error, just proceed without user
+    logger.debug({ error }, 'Optional auth check failed, continuing without user');
     next();
   }
 }
@@ -152,6 +165,7 @@ export async function requireAdmin(
   }
 
   if (req.user.role !== 'admin') {
+    logger.warn({ userId: req.user.id, path: req.path }, 'Admin access denied');
     res.status(403).json({ success: false, error: 'Admin access required' });
     return;
   }

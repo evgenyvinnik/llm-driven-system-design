@@ -14,13 +14,28 @@ import {
 import { matchActivityToSegments } from '../services/segmentMatcher.js';
 import { checkAchievements } from '../services/achievements.js';
 
+// Shared modules
+import {
+  activityUploadsTotal,
+  activityUploadDuration,
+  activityGpsPointsTotal,
+  feedFanoutDuration
+} from '../shared/metrics.js';
+import { activityLogger as log, logError } from '../shared/logger.js';
+import { alerts, gps as gpsConfig } from '../shared/config.js';
+import {
+  checkIdempotency,
+  storeIdempotencyKey,
+  storeClientIdempotencyKey
+} from '../shared/idempotency.js';
+
 const router = Router();
 
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: alerts.activityUpload.maxFileSizeBytes },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/gpx+xml' || file.originalname.endsWith('.gpx')) {
       cb(null, true);
@@ -32,19 +47,49 @@ const upload = multer({
 
 // Create activity from GPX upload
 router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
-  try {
-    const userId = req.session.userId;
+  const uploadStart = Date.now();
+  const userId = req.session.userId;
 
+  try {
     if (!req.file) {
+      activityUploadsTotal.inc({ type: 'unknown', status: 'error_no_file' });
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Parse GPX
     const gpxContent = req.file.buffer.toString('utf-8');
+
+    // Parse GPX first to get start timestamp for idempotency check
     const { name, points } = parseGPX(gpxContent);
 
-    if (!points || points.length < 2) {
-      return res.status(400).json({ error: 'GPX file must contain at least 2 track points' });
+    if (!points || points.length < gpsConfig.minActivityPoints) {
+      activityUploadsTotal.inc({ type: 'unknown', status: 'error_invalid_gpx' });
+      return res.status(400).json({ error: `GPX file must contain at least ${gpsConfig.minActivityPoints} track points` });
+    }
+
+    // Check GPS point limit
+    if (points.length > alerts.activityUpload.maxGpsPoints) {
+      activityUploadsTotal.inc({ type: 'unknown', status: 'error_too_many_points' });
+      return res.status(400).json({
+        error: `Activity has too many GPS points (${points.length}). Maximum is ${alerts.activityUpload.maxGpsPoints}.`
+      });
+    }
+
+    const startTimestamp = points[0].timestamp;
+    const activityType = req.body.type || 'run';
+
+    // Check for duplicate upload (idempotency)
+    const existingActivity = await checkIdempotency(userId, gpxContent, startTimestamp);
+    if (existingActivity) {
+      log.info({
+        userId,
+        existingActivityId: existingActivity.id
+      }, 'Duplicate activity upload detected');
+
+      return res.status(200).json({
+        activity: existingActivity,
+        duplicate: true,
+        message: 'Activity already uploaded'
+      });
     }
 
     // Get user's privacy zones
@@ -65,7 +110,6 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     // Get bounding box
     const bbox = calculateBoundingBox(filteredPoints);
 
-    const activityType = req.body.type || 'run';
     const activityName = req.body.name || name || `${activityType.charAt(0).toUpperCase() + activityType.slice(1)} Activity`;
 
     // Create activity record
@@ -99,6 +143,14 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
 
     const activity = activityResult.rows[0];
 
+    log.info({
+      activityId: activity.id,
+      userId,
+      type: activityType,
+      distance: metrics.distance,
+      gpsPoints: filteredPoints.length
+    }, 'Activity created');
+
     // Store GPS points
     for (let i = 0; i < filteredPoints.length; i++) {
       const pt = filteredPoints[i];
@@ -109,17 +161,30 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
       );
     }
 
+    // Record GPS points metric
+    activityGpsPointsTotal.inc({ type: activityType }, filteredPoints.length);
+
+    // Store idempotency key for future duplicate detection
+    await storeIdempotencyKey(userId, gpxContent, startTimestamp, activity);
+
+    // Store client-provided idempotency key if present
+    const clientKey = req.headers['x-idempotency-key'] || req.headers['idempotency-key'];
+    if (clientKey) {
+      await storeClientIdempotencyKey(clientKey, activity);
+    }
+
     // Match segments asynchronously
     matchActivityToSegments(activity.id, filteredPoints, activityType, bbox).catch(err => {
-      console.error('Segment matching error:', err);
+      logError(log, err, 'Segment matching error', { activityId: activity.id });
     });
 
     // Check for achievements
     checkAchievements(userId, activity).catch(err => {
-      console.error('Achievement check error:', err);
+      logError(log, err, 'Achievement check error', { userId, activityId: activity.id });
     });
 
     // Add to followers' feeds
+    const fanoutStart = Date.now();
     const followersResult = await query(
       'SELECT follower_id FROM follows WHERE following_id = $1',
       [userId]
@@ -133,15 +198,37 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     // Also add to own feed
     await addToFeed(userId, activity.id, timestamp);
 
+    // Record feed fanout duration
+    const followerCount = followersResult.rows.length;
+    const followerBucket = followerCount < 10 ? '0-10' : followerCount < 100 ? '10-100' : followerCount < 1000 ? '100-1000' : '1000+';
+    feedFanoutDuration.observe({ follower_count_bucket: followerBucket }, (Date.now() - fanoutStart) / 1000);
+
+    // Record upload metrics
+    const uploadDuration = (Date.now() - uploadStart) / 1000;
+    activityUploadDuration.observe({ type: activityType }, uploadDuration);
+    activityUploadsTotal.inc({ type: activityType, status: 'success' });
+
+    // Log warning if upload took too long
+    if (uploadDuration * 1000 > alerts.activityUpload.processingTimeWarnMs) {
+      log.warn({
+        activityId: activity.id,
+        duration: `${uploadDuration.toFixed(2)}s`,
+        threshold: `${alerts.activityUpload.processingTimeWarnMs}ms`
+      }, 'Activity upload exceeded processing time threshold');
+    }
+
     res.status(201).json({ activity, gpsPointCount: filteredPoints.length });
   } catch (error) {
-    console.error('Activity upload error:', error);
+    activityUploadsTotal.inc({ type: 'unknown', status: 'error' });
+    logError(log, error, 'Activity upload error', { userId });
     res.status(500).json({ error: 'Failed to upload activity' });
   }
 });
 
 // Create simulated activity (for testing without GPX)
 router.post('/simulate', requireAuth, async (req, res) => {
+  const uploadStart = Date.now();
+
   try {
     const userId = req.session.userId;
     const {
@@ -196,6 +283,13 @@ router.post('/simulate', requireAuth, async (req, res) => {
 
     const activity = activityResult.rows[0];
 
+    log.info({
+      activityId: activity.id,
+      userId,
+      type,
+      simulated: true
+    }, 'Simulated activity created');
+
     // Store GPS points
     for (let i = 0; i < points.length; i++) {
       const pt = points[i];
@@ -206,14 +300,19 @@ router.post('/simulate', requireAuth, async (req, res) => {
       );
     }
 
+    // Record metrics
+    activityGpsPointsTotal.inc({ type }, points.length);
+    activityUploadDuration.observe({ type }, (Date.now() - uploadStart) / 1000);
+    activityUploadsTotal.inc({ type, status: 'success' });
+
     // Match segments
     matchActivityToSegments(activity.id, points, type, bbox).catch(err => {
-      console.error('Segment matching error:', err);
+      logError(log, err, 'Segment matching error', { activityId: activity.id });
     });
 
     // Check for achievements
     checkAchievements(userId, activity).catch(err => {
-      console.error('Achievement check error:', err);
+      logError(log, err, 'Achievement check error', { userId });
     });
 
     // Add to followers' feeds
@@ -230,7 +329,8 @@ router.post('/simulate', requireAuth, async (req, res) => {
 
     res.status(201).json({ activity, gpsPointCount: points.length });
   } catch (error) {
-    console.error('Simulate activity error:', error);
+    activityUploadsTotal.inc({ type: 'unknown', status: 'error' });
+    logError(log, error, 'Simulate activity error');
     res.status(500).json({ error: 'Failed to create simulated activity' });
   }
 });
@@ -273,7 +373,7 @@ router.get('/', optionalAuth, async (req, res) => {
 
     res.json({ activities: result.rows });
   } catch (error) {
-    console.error('Get activities error:', error);
+    logError(log, error, 'Get activities error');
     res.status(500).json({ error: 'Failed to get activities' });
   }
 });
@@ -346,7 +446,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
       segmentEfforts: effortsResult.rows
     });
   } catch (error) {
-    console.error('Get activity error:', error);
+    logError(log, error, 'Get activity error');
     res.status(500).json({ error: 'Failed to get activity' });
   }
 });
@@ -383,7 +483,7 @@ router.get('/:id/gps', optionalAuth, async (req, res) => {
 
     res.json({ points: result.rows });
   } catch (error) {
-    console.error('Get GPS points error:', error);
+    logError(log, error, 'Get GPS points error');
     res.status(500).json({ error: 'Failed to get GPS points' });
   }
 });
@@ -407,7 +507,7 @@ router.post('/:id/kudos', requireAuth, async (req, res) => {
 
     res.json({ message: 'Kudos given' });
   } catch (error) {
-    console.error('Kudos error:', error);
+    logError(log, error, 'Kudos error');
     res.status(500).json({ error: 'Failed to give kudos' });
   }
 });
@@ -431,7 +531,7 @@ router.delete('/:id/kudos', requireAuth, async (req, res) => {
 
     res.json({ message: 'Kudos removed' });
   } catch (error) {
-    console.error('Remove kudos error:', error);
+    logError(log, error, 'Remove kudos error');
     res.status(500).json({ error: 'Failed to remove kudos' });
   }
 });
@@ -461,7 +561,7 @@ router.post('/:id/comments', requireAuth, async (req, res) => {
 
     res.status(201).json({ comment: result.rows[0] });
   } catch (error) {
-    console.error('Add comment error:', error);
+    logError(log, error, 'Add comment error');
     res.status(500).json({ error: 'Failed to add comment' });
   }
 });
@@ -482,7 +582,7 @@ router.get('/:id/comments', async (req, res) => {
 
     res.json({ comments: result.rows });
   } catch (error) {
-    console.error('Get comments error:', error);
+    logError(log, error, 'Get comments error');
     res.status(500).json({ error: 'Failed to get comments' });
   }
 });
@@ -502,9 +602,10 @@ router.delete('/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Activity not found or not owned by you' });
     }
 
+    log.info({ activityId: id, userId }, 'Activity deleted');
     res.json({ message: 'Activity deleted' });
   } catch (error) {
-    console.error('Delete activity error:', error);
+    logError(log, error, 'Delete activity error');
     res.status(500).json({ error: 'Failed to delete activity' });
   }
 });

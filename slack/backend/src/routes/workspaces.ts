@@ -2,12 +2,16 @@
  * @fileoverview Workspace routes for multi-tenant workspace management.
  * Handles workspace CRUD, member management, and workspace selection.
  * Each workspace is isolated with its own channels and messages.
+ * Includes RBAC for admin operations and cache invalidation.
  */
 
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireRole, loadMembership } from '../middleware/rbac.js';
+import { getCachedWorkspace, invalidateWorkspaceCache, invalidateChannelCache } from '../services/cache.js';
+import { logger } from '../services/logger.js';
 import type { Workspace, WorkspaceMember } from '../types/index.js';
 
 const router = Router();
@@ -28,7 +32,7 @@ router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> 
 
     res.json(result.rows);
   } catch (error) {
-    console.error('Get workspaces error:', error);
+    logger.error({ err: error, msg: 'Get workspaces error' });
     res.status(500).json({ error: 'Failed to get workspaces' });
   }
 });
@@ -89,9 +93,17 @@ router.post('/', requireAuth, async (req: Request, res: Response): Promise<void>
 
     const result = await query<Workspace>('SELECT * FROM workspaces WHERE id = $1', [workspaceId]);
 
+    logger.info({
+      msg: 'Workspace created',
+      workspaceId,
+      name,
+      domain: domain.toLowerCase(),
+      createdBy: req.session.userId,
+    });
+
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error('Create workspace error:', error);
+    logger.error({ err: error, msg: 'Create workspace error' });
     res.status(500).json({ error: 'Failed to create workspace' });
   }
 });
@@ -114,13 +126,14 @@ router.get('/domain/:domain', async (req: Request, res: Response): Promise<void>
 
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Get workspace error:', error);
+    logger.error({ err: error, msg: 'Get workspace by domain error' });
     res.status(500).json({ error: 'Failed to get workspace' });
   }
 });
 
 /**
  * GET /workspaces/:id - Get detailed information about a specific workspace.
+ * Uses cache for faster lookups.
  * Requires membership in the workspace.
  */
 router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<void> => {
@@ -136,22 +149,65 @@ router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const result = await query<Workspace>(
-      'SELECT * FROM workspaces WHERE id = $1',
-      [req.params.id]
-    );
+    // Use cache for workspace data
+    const workspace = await getCachedWorkspace(req.params.id);
 
-    if (result.rows.length === 0) {
+    if (!workspace) {
       res.status(404).json({ error: 'Workspace not found' });
       return;
     }
 
-    res.json({ ...result.rows[0], role: membership.rows[0].role });
+    res.json({ ...workspace, role: membership.rows[0].role });
   } catch (error) {
-    console.error('Get workspace error:', error);
+    logger.error({ err: error, msg: 'Get workspace error' });
     res.status(500).json({ error: 'Failed to get workspace' });
   }
 });
+
+/**
+ * PUT /workspaces/:id - Update workspace settings.
+ * Only workspace owners can update settings.
+ * Invalidates cache after update.
+ */
+router.put(
+  '/:id',
+  requireAuth,
+  requireRole('owner'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { name, settings } = req.body;
+
+      const result = await query<Workspace>(
+        `UPDATE workspaces SET
+           name = COALESCE($1, name),
+           settings = COALESCE($2, settings),
+           updated_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [name, settings ? JSON.stringify(settings) : null, req.params.id]
+      );
+
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: 'Workspace not found' });
+        return;
+      }
+
+      // Invalidate cache
+      await invalidateWorkspaceCache(req.params.id);
+
+      logger.info({
+        msg: 'Workspace updated',
+        workspaceId: req.params.id,
+        updatedBy: req.session.userId,
+      });
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      logger.error({ err: error, msg: 'Update workspace error' });
+      res.status(500).json({ error: 'Failed to update workspace' });
+    }
+  }
+);
 
 /**
  * POST /workspaces/:id/join - Join an existing workspace.
@@ -189,13 +245,21 @@ router.post('/:id/join', requireAuth, async (req: Request, res: Response): Promi
         'INSERT INTO channel_members (channel_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
         [channel.id, req.session.userId]
       );
+      // Invalidate channel members cache
+      await invalidateChannelCache(channel.id);
     }
 
     req.session.workspaceId = workspaceId;
 
+    logger.info({
+      msg: 'User joined workspace',
+      workspaceId,
+      userId: req.session.userId,
+    });
+
     res.json({ message: 'Joined workspace successfully' });
   } catch (error) {
-    console.error('Join workspace error:', error);
+    logger.error({ err: error, msg: 'Join workspace error' });
     res.status(500).json({ error: 'Failed to join workspace' });
   }
 });
@@ -221,7 +285,7 @@ router.post('/:id/select', requireAuth, async (req: Request, res: Response): Pro
 
     res.json({ message: 'Workspace selected', workspaceId: req.params.id });
   } catch (error) {
-    console.error('Select workspace error:', error);
+    logger.error({ err: error, msg: 'Select workspace error' });
     res.status(500).json({ error: 'Failed to select workspace' });
   }
 });
@@ -230,8 +294,14 @@ router.post('/:id/select', requireAuth, async (req: Request, res: Response): Pro
  * GET /workspaces/:id/members - List all members of a workspace.
  * Returns user profiles with their roles and join dates.
  */
-router.get('/:id/members', requireAuth, async (req: Request, res: Response): Promise<void> => {
+router.get('/:id/members', requireAuth, loadMembership(), async (req: Request, res: Response): Promise<void> => {
   try {
+    // Verify user is a member (loadMembership populates req.membership)
+    if (!req.membership) {
+      res.status(403).json({ error: 'Not a member of this workspace' });
+      return;
+    }
+
     const result = await query(
       `SELECT u.id, u.username, u.display_name, u.avatar_url, wm.role, wm.joined_at
        FROM users u
@@ -243,9 +313,137 @@ router.get('/:id/members', requireAuth, async (req: Request, res: Response): Pro
 
     res.json(result.rows);
   } catch (error) {
-    console.error('Get members error:', error);
+    logger.error({ err: error, msg: 'Get members error' });
     res.status(500).json({ error: 'Failed to get members' });
   }
 });
+
+/**
+ * PUT /workspaces/:id/members/:userId - Update a member's role.
+ * Only workspace owners can change roles.
+ */
+router.put(
+  '/:id/members/:userId',
+  requireAuth,
+  requireRole('owner'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { role } = req.body;
+      const { id: workspaceId, userId } = req.params;
+
+      if (!['guest', 'member', 'admin', 'owner'].includes(role)) {
+        res.status(400).json({ error: 'Invalid role. Must be guest, member, admin, or owner' });
+        return;
+      }
+
+      // Prevent demoting yourself if you're the only owner
+      if (userId === req.session.userId && role !== 'owner') {
+        const owners = await query(
+          "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1 AND role = 'owner'",
+          [workspaceId]
+        );
+        if (parseInt(owners.rows[0].count, 10) <= 1) {
+          res.status(400).json({ error: 'Cannot demote the only owner' });
+          return;
+        }
+      }
+
+      const result = await query(
+        `UPDATE workspace_members SET role = $1
+         WHERE workspace_id = $2 AND user_id = $3
+         RETURNING *`,
+        [role, workspaceId, userId]
+      );
+
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: 'Member not found' });
+        return;
+      }
+
+      logger.info({
+        msg: 'Member role updated',
+        workspaceId,
+        targetUserId: userId,
+        newRole: role,
+        updatedBy: req.session.userId,
+      });
+
+      res.json({ message: 'Role updated successfully', role });
+    } catch (error) {
+      logger.error({ err: error, msg: 'Update member role error' });
+      res.status(500).json({ error: 'Failed to update role' });
+    }
+  }
+);
+
+/**
+ * DELETE /workspaces/:id/members/:userId - Remove a member from the workspace.
+ * Admins can remove members, owners can remove anyone except other owners.
+ */
+router.delete(
+  '/:id/members/:userId',
+  requireAuth,
+  requireRole('admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { id: workspaceId, userId } = req.params;
+
+      // Check target user's role
+      const targetMember = await query(
+        'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
+        [workspaceId, userId]
+      );
+
+      if (targetMember.rows.length === 0) {
+        res.status(404).json({ error: 'Member not found' });
+        return;
+      }
+
+      // Owners can only be removed by other owners
+      if (targetMember.rows[0].role === 'owner' && req.membership?.role !== 'owner') {
+        res.status(403).json({ error: 'Only owners can remove other owners' });
+        return;
+      }
+
+      // Prevent removing yourself if you're the only owner
+      if (userId === req.session.userId && targetMember.rows[0].role === 'owner') {
+        const owners = await query(
+          "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1 AND role = 'owner'",
+          [workspaceId]
+        );
+        if (parseInt(owners.rows[0].count, 10) <= 1) {
+          res.status(400).json({ error: 'Cannot remove the only owner' });
+          return;
+        }
+      }
+
+      // Remove from workspace
+      await query(
+        'DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
+        [workspaceId, userId]
+      );
+
+      // Remove from all channels in this workspace
+      await query(
+        `DELETE FROM channel_members WHERE user_id = $1 AND channel_id IN (
+           SELECT id FROM channels WHERE workspace_id = $2
+         )`,
+        [userId, workspaceId]
+      );
+
+      logger.info({
+        msg: 'Member removed from workspace',
+        workspaceId,
+        removedUserId: userId,
+        removedBy: req.session.userId,
+      });
+
+      res.json({ message: 'Member removed successfully' });
+    } catch (error) {
+      logger.error({ err: error, msg: 'Remove member error' });
+      res.status(500).json({ error: 'Failed to remove member' });
+    }
+  }
+);
 
 export default router;

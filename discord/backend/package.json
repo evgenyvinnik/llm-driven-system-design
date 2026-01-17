@@ -15,7 +15,9 @@
     "test:run": "vitest run",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src/**/*.ts",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate:status": "tsx src/db/migrate.ts status",
+    "db:migrate:rollback": "tsx src/db/migrate.ts rollback"
   },
   "keywords": [
     "chat",

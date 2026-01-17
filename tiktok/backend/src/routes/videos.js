@@ -4,9 +4,23 @@ import { v4 as uuidv4 } from 'uuid';
 import { query } from '../db.js';
 import { uploadFile, getPublicUrl } from '../storage.js';
 import { getRedis } from '../redis.js';
-import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { requireAuth, requireCreator, optionalAuth, PERMISSIONS, hasPermission } from '../middleware/auth.js';
+import { createLogger, auditLog } from '../shared/logger.js';
+import { getRateLimiters } from '../index.js';
+import {
+  videoViewsCounter,
+  videoLikesCounter,
+  videoUploadsCounter,
+  storageOperationDurationHistogram,
+  timeAsync,
+} from '../shared/metrics.js';
+import { getVideoRetentionPolicy, archiveDeletedVideo } from '../shared/retention.js';
 
 const router = express.Router();
+const logger = createLogger('videos');
+
+// Helper to get rate limiters
+const getLimiters = () => getRateLimiters();
 
 // Configure multer for video uploads
 const storage = multer.memoryStorage();
@@ -45,8 +59,19 @@ const formatVideo = (video, userId = null, likedVideoIds = []) => ({
   createdAt: video.created_at,
 });
 
-// Upload video
-router.post('/', requireAuth, upload.single('video'), async (req, res) => {
+// Upload video - requires creator role
+router.post('/', requireCreator, upload.single('video'), async (req, res, next) => {
+  // Apply rate limiting
+  const limiters = getLimiters();
+  if (limiters?.upload) {
+    return limiters.upload(req, res, async () => {
+      await handleUpload(req, res, next);
+    });
+  }
+  await handleUpload(req, res, next);
+});
+
+async function handleUpload(req, res, next) {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'Video file is required' });
@@ -63,17 +88,23 @@ router.post('/', requireAuth, upload.single('video'), async (req, res) => {
     const extension = req.file.originalname.split('.').pop() || 'mp4';
     const videoKey = `${req.session.userId}/${videoId}.${extension}`;
 
-    // Upload to MinIO
+    // Upload to MinIO with metrics
     const bucket = process.env.MINIO_BUCKET_VIDEOS || 'videos';
-    const videoUrl = await uploadFile(
-      bucket,
-      videoKey,
-      req.file.buffer,
-      req.file.mimetype
-    );
+
+    let videoUrl;
+    try {
+      videoUrl = await timeAsync(
+        storageOperationDurationHistogram,
+        { operation: 'upload' },
+        () => uploadFile(bucket, videoKey, req.file.buffer, req.file.mimetype)
+      );
+    } catch (error) {
+      logger.error({ error: error.message, userId: req.session.userId }, 'Video upload to storage failed');
+      videoUploadsCounter.labels('failure').inc();
+      return res.status(500).json({ error: 'Failed to upload video' });
+    }
 
     // For simplicity, we'll use a placeholder thumbnail
-    // In production, you'd generate this from the video
     const thumbnailUrl = null;
 
     // Insert video record
@@ -98,6 +129,14 @@ router.post('/', requireAuth, upload.single('video'), async (req, res) => {
 
     const video = result.rows[0];
 
+    // Metrics and logging
+    videoUploadsCounter.labels('success').inc();
+    auditLog('video_uploaded', req.session.userId, {
+      videoId: video.id,
+      hashtags: hashtagArray,
+    });
+    logger.info({ videoId: video.id, userId: req.session.userId }, 'Video uploaded successfully');
+
     res.status(201).json({
       message: 'Video uploaded successfully',
       video: {
@@ -116,10 +155,11 @@ router.post('/', requireAuth, upload.single('video'), async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Upload video error:', error);
+    logger.error({ error: error.message, userId: req.session.userId }, 'Upload video error');
+    videoUploadsCounter.labels('failure').inc();
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 // Get single video
 router.get('/:id', optionalAuth, async (req, res) => {
@@ -153,7 +193,33 @@ router.get('/:id', optionalAuth, async (req, res) => {
 
     res.json(formatVideo(video, req.session?.userId, likedVideoIds));
   } catch (error) {
-    console.error('Get video error:', error);
+    logger.error({ error: error.message, videoId: req.params.id }, 'Get video error');
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get video retention policy
+router.get('/:id/retention', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await query('SELECT * FROM videos WHERE id = $1', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    const video = result.rows[0];
+
+    // Only owner, moderators, or admins can view retention policy
+    if (video.creator_id !== req.session.userId &&
+        !hasPermission(req.session.role, PERMISSIONS.VIDEO_MODERATE)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const retentionPolicy = getVideoRetentionPolicy(video);
+    res.json(retentionPolicy);
+  } catch (error) {
+    logger.error({ error: error.message, videoId: req.params.id }, 'Get retention policy error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -199,7 +265,7 @@ router.get('/user/:username', optionalAuth, async (req, res) => {
       hasMore: result.rows.length === limit,
     });
   } catch (error) {
-    console.error('Get user videos error:', error);
+    logger.error({ error: error.message, username: req.params.username }, 'Get user videos error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -211,7 +277,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 
     // Check ownership
     const videoResult = await query(
-      'SELECT creator_id FROM videos WHERE id = $1',
+      'SELECT * FROM videos WHERE id = $1',
       [id]
     );
 
@@ -219,7 +285,11 @@ router.delete('/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Video not found' });
     }
 
-    if (videoResult.rows[0].creator_id !== req.session.userId && req.session.role !== 'admin') {
+    const video = videoResult.rows[0];
+    const isOwner = video.creator_id === req.session.userId;
+    const canDeleteAny = hasPermission(req.session.role, PERMISSIONS.VIDEO_DELETE_ANY);
+
+    if (!isOwner && !canDeleteAny) {
       return res.status(403).json({ error: 'Not authorized to delete this video' });
     }
 
@@ -229,12 +299,21 @@ router.delete('/:id', requireAuth, async (req, res) => {
     // Update user video count
     await query(
       'UPDATE users SET video_count = GREATEST(video_count - 1, 0) WHERE id = $1',
-      [videoResult.rows[0].creator_id]
+      [video.creator_id]
     );
+
+    // Audit log
+    auditLog('video_deleted', req.session.userId, {
+      videoId: id,
+      ownerId: video.creator_id,
+      deletedByOwner: isOwner,
+    });
+
+    logger.info({ videoId: id, userId: req.session.userId }, 'Video deleted');
 
     res.json({ message: 'Video deleted successfully' });
   } catch (error) {
-    console.error('Delete video error:', error);
+    logger.error({ error: error.message, videoId: req.params.id }, 'Delete video error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -243,11 +322,14 @@ router.delete('/:id', requireAuth, async (req, res) => {
 router.post('/:id/view', optionalAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { watchDurationMs, completionRate } = req.body;
+    const { watchDurationMs, completionRate, source = 'direct' } = req.body;
 
     // Increment view count in Redis (fast path)
     const redis = getRedis();
     await redis.incr(`video:${id}:views`);
+
+    // Record metric
+    videoViewsCounter.labels(source).inc();
 
     // Record watch history if user is logged in
     if (req.session?.userId) {
@@ -280,13 +362,24 @@ router.post('/:id/view', optionalAuth, async (req, res) => {
 
     res.json({ message: 'View recorded' });
   } catch (error) {
-    console.error('Record view error:', error);
+    logger.error({ error: error.message, videoId: req.params.id }, 'Record view error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Like video
-router.post('/:id/like', requireAuth, async (req, res) => {
+router.post('/:id/like', requireAuth, async (req, res, next) => {
+  // Apply rate limiting
+  const limiters = getLimiters();
+  if (limiters?.like) {
+    return limiters.like(req, res, async () => {
+      await handleLike(req, res, next);
+    });
+  }
+  await handleLike(req, res, next);
+});
+
+async function handleLike(req, res, next) {
   try {
     const { id } = req.params;
 
@@ -332,12 +425,17 @@ router.post('/:id/like', requireAuth, async (req, res) => {
       await updateUserHashtagPreferences(req.session.userId, videoResult.rows[0].hashtags, 2.0);
     }
 
+    // Record metric
+    videoLikesCounter.inc();
+
+    logger.debug({ videoId: id, userId: req.session.userId }, 'Video liked');
+
     res.json({ message: 'Liked successfully', isLiked: true });
   } catch (error) {
-    console.error('Like video error:', error);
+    logger.error({ error: error.message, videoId: req.params.id }, 'Like video error');
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 // Unlike video
 router.delete('/:id/like', requireAuth, async (req, res) => {
@@ -372,9 +470,39 @@ router.delete('/:id/like', requireAuth, async (req, res) => {
       [videoResult.rows[0].creator_id]
     );
 
+    logger.debug({ videoId: id, userId: req.session.userId }, 'Video unliked');
+
     res.json({ message: 'Unliked successfully', isLiked: false });
   } catch (error) {
-    console.error('Unlike video error:', error);
+    logger.error({ error: error.message, videoId: req.params.id }, 'Unlike video error');
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Share video (increment share count)
+router.post('/:id/share', optionalAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { platform = 'unknown' } = req.body;
+
+    // Increment share count
+    const result = await query(
+      'UPDATE videos SET share_count = share_count + 1 WHERE id = $1 AND status = $2 RETURNING share_count',
+      [id, 'active']
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    logger.debug({ videoId: id, platform }, 'Video shared');
+
+    res.json({
+      message: 'Share recorded',
+      shareCount: result.rows[0].share_count,
+    });
+  } catch (error) {
+    logger.error({ error: error.message, videoId: req.params.id }, 'Share video error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -418,7 +546,7 @@ async function updateUserHashtagPreferences(userId, hashtags, weight) {
       [userId, JSON.stringify(preferences)]
     );
   } catch (error) {
-    console.error('Update hashtag preferences error:', error);
+    logger.error({ error: error.message, userId }, 'Update hashtag preferences error');
   }
 }
 

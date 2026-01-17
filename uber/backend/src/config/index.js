@@ -13,6 +13,10 @@ export default {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
   },
 
+  rabbitmq: {
+    url: process.env.RABBITMQ_URL || 'amqp://uber:uber@localhost:5672',
+  },
+
   session: {
     secret: process.env.SESSION_SECRET || 'uber-dev-secret',
     expiresIn: 7 * 24 * 60 * 60 * 1000, // 7 days
@@ -40,5 +44,19 @@ export default {
   location: {
     updateIntervalMs: 3000, // Drivers send updates every 3 seconds
     staleThresholdMs: 30000, // Consider driver stale after 30 seconds
+  },
+
+  // Circuit breaker defaults
+  circuitBreaker: {
+    timeout: 5000,
+    errorThresholdPercentage: 50,
+    resetTimeout: 30000,
+    volumeThreshold: 5,
+  },
+
+  // Idempotency settings
+  idempotency: {
+    defaultTtl: 86400, // 24 hours
+    pendingTtl: 60, // 60 seconds for in-flight requests
   },
 };

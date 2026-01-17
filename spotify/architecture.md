@@ -949,3 +949,104 @@ app.post('/api/subscription/upgrade', requireAuth, async (req, res) => {
 | Auth | Session-based (Redis) | JWT tokens | Simpler revocation, local dev friendly |
 | Rate limiting | Sliding window (Redis) | Token bucket | More accurate, prevents bursts |
 | Observability | Prometheus + Grafana + Pino | ELK stack | Lighter weight for local dev |
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions in the backend code.
+
+### Why Idempotency Prevents Duplicate Track Additions
+
+**Problem**: Network retries, client bugs, or user double-clicks can send the same "add track to playlist" request multiple times. Without protection, this could result in duplicate entries or inconsistent playlist state.
+
+**Solution**: We implement idempotency at two levels:
+
+1. **Database-level**: The `playlist_tracks` table has a `UNIQUE (playlist_id, track_id)` constraint with `ON CONFLICT DO NOTHING`. This ensures a track can only appear once in a playlist, regardless of how many times the insert is attempted.
+
+2. **Application-level**: The `X-Idempotency-Key` header combined with Redis-based deduplication ensures that:
+   - If the same request is received while the first is still processing, we return a 409 (conflict) response
+   - If the same request is received after the first completed, we return the cached result
+   - The idempotency key is scoped to the user to prevent cross-user conflicts
+
+**Implementation**: See `/backend/src/shared/idempotency.js` and the playlist routes in `/backend/src/routes/playlists.js`.
+
+**Metrics**: The `idempotency_deduplications_total` counter tracks how often duplicate requests are detected, helping identify problematic clients or network issues.
+
+### Why Rate Limiting Protects Against Scraping
+
+**Problem**: The music catalog (artists, albums, tracks) and search endpoints are valuable targets for scraping. Automated bots could:
+- Harvest the entire catalog for competing services
+- Overwhelm the search infrastructure
+- Extract user playlist data at scale
+
+**Solution**: Sliding window rate limiting using Redis provides accurate, distributed rate limiting that:
+
+1. **Prevents catalog scraping**: Search is limited to 60 requests/minute per user/IP. At this rate, scraping 100M tracks would take over 3 years.
+
+2. **Protects authentication**: Auth endpoints are limited to 5 requests per 15 minutes per IP, making brute-force attacks impractical.
+
+3. **Allows legitimate use**: High limits for playback (300/min) and library operations (100/min) don't impact normal user behavior.
+
+**Implementation**: See `/backend/src/shared/rateLimit.js` for the sliding window algorithm using Redis sorted sets.
+
+**Why sliding window over token bucket**:
+- More accurate: No burst allowance that could be exploited
+- Smoother: Requests are evenly distributed
+- Simpler mental model: "60 requests in any 60-second window"
+
+### Why Audit Logging Enables Compliance and Debugging
+
+**Problem**: Music streaming platforms face regulatory requirements (GDPR, CCPA) and need to investigate user complaints, security incidents, and billing disputes.
+
+**Solution**: Comprehensive audit logging that persists to PostgreSQL provides:
+
+1. **Compliance**: GDPR requires logging of data access, exports, and deletions. Our audit log captures all sensitive operations with actor, timestamp, IP, and detailed context.
+
+2. **Security investigations**: Failed login attempts are logged with IP and email, enabling detection of brute-force attacks and account takeover attempts.
+
+3. **Debugging**: When a user reports "I didn't change my playlist", we can show exactly what happened, when, and from which IP.
+
+4. **Admin accountability**: All admin actions (bans, role changes, content removal) are logged, creating an audit trail for internal oversight.
+
+**Audited Actions** (from `/backend/src/shared/audit.js`):
+- Authentication: login, logout, failed login, registration
+- Account changes: profile updates, password changes, email changes
+- Subscription: upgrades, downgrades, cancellations
+- Admin actions: user bans, content removal, role changes
+- Data requests: export requests, deletion requests (GDPR)
+
+**Storage considerations**: Audit logs are stored in PostgreSQL with indexes on actor_id, action, timestamp, and resource. For high-volume systems, consider partitioning by month and archiving to cold storage after 90 days.
+
+### Why Metrics Enable Personalization Optimization
+
+**Problem**: Recommendation quality directly impacts user engagement and retention, but it's difficult to measure without proper instrumentation.
+
+**Solution**: Prometheus metrics capture the data needed to optimize personalization:
+
+1. **Recommendation latency** (`recommendation_generation_seconds`): Slow recommendations cause users to skip the feature. We track p50/p95/p99 latency by algorithm (for_you, discover_weekly) to identify performance regressions.
+
+2. **Playback events** (`playback_events_total`): By tracking play, skip, complete, and seek events by device type, we can:
+   - Measure recommendation quality (skip rate)
+   - Identify problematic content (high skip rate)
+   - Compare algorithm variants (A/B testing)
+
+3. **Stream counts** (`stream_counts_total`): The 30-second stream threshold is critical for royalty calculations. This metric helps verify accurate counting.
+
+4. **Search patterns** (`search_operations_total`): Understanding what users search for informs catalog gaps and recommendation improvements.
+
+**Dashboard queries** (for Grafana):
+```promql
+# Recommendation quality proxy: % of recommendations that result in 30+ second play
+rate(stream_counts_total[1h]) / rate(playback_events_total{event_type="play_started", source="recommendation"}[1h])
+
+# Skip rate by recommendation algorithm
+rate(playback_events_total{event_type="skipped", source="recommendation"}[1h])
+/ rate(playback_events_total{event_type="play_started", source="recommendation"}[1h])
+```
+
+**Feedback loop**: These metrics feed back into the recommendation system:
+- High-skip recommendations are deprioritized
+- Frequently-completed tracks are promoted
+- Search terms that don't yield results inform catalog expansion
+

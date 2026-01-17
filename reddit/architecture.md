@@ -1030,6 +1030,157 @@ docker-compose restart api
 
 ---
 
+## Implementation Notes
+
+This section documents the rationale behind observability and operational features implemented in the backend.
+
+### Why Metrics Enable Hot Post Detection and Spam Prevention
+
+Prometheus metrics (`/metrics` endpoint) provide real-time visibility into system behavior that enables:
+
+1. **Hot Post Detection (Rising Feed)**
+   - `reddit_votes_total` counter tracks vote velocity by post type
+   - Comparing vote rates over 5-minute windows identifies "rising" content
+   - Posts receiving 10x normal vote velocity surface in rising feeds
+   - Example: A post getting 50 votes/minute vs the subreddit average of 5 votes/minute
+
+2. **Spam and Brigade Prevention**
+   - `reddit_http_requests_total` by IP or user reveals coordinated activity
+   - Vote velocity spikes without corresponding view increases suggest brigading
+   - `reddit_karma_calculation_duration` spikes indicate suspicious batch voting
+   - Rate limiting thresholds derived from p99 request patterns
+
+3. **Performance Degradation Detection**
+   - `reddit_http_request_duration_seconds` histogram shows latency percentiles
+   - `reddit_db_query_duration_seconds` isolates slow database operations
+   - `reddit_vote_aggregation_lag_seconds` alerts when scores become stale
+   - Prevents user-visible issues by catching problems before complaints
+
+**Implemented Metrics:**
+- HTTP request duration and count by route
+- Vote counts by direction and target type
+- Karma calculation duration
+- Hot score calculation duration and batch size
+- Database connection pool utilization
+- Cache hit/miss ratios
+
+### Why Retention Policies Balance Community History vs Storage Costs
+
+Data lifecycle management (`src/shared/retention.js`) implements tiered storage:
+
+1. **Posts and Comments: Permanent Archival**
+   - Community discussions are valuable historical context
+   - Links in old posts may be referenced years later
+   - Legal requirements for content moderation audits
+   - Compress and move to cold storage (MinIO/S3) after 2 years
+   - Cost: ~$0.004/GB/month in S3 Glacier vs $0.023/GB in PostgreSQL
+
+2. **Votes: 90-Day Detail Retention**
+   - Individual vote records only needed for fraud detection
+   - After 90 days, only aggregate counts matter
+   - Partitioned by month for easy archival
+   - Reduces primary database size by 60-70%
+
+3. **Audit Logs: 7-Year Retention**
+   - Legal compliance (varies by jurisdiction)
+   - Appeals process requires historical records
+   - Hot storage for 90 days (frequent queries)
+   - Warm storage for 1 year (occasional queries)
+   - Cold archive for remaining 6 years
+
+4. **Sessions: 30-Day Expiry**
+   - No value in old session data
+   - Redis TTL handles automatic cleanup
+   - Reduces memory usage in cache layer
+
+**Configuration via Environment:**
+```bash
+POST_HOT_STORAGE_DAYS=365      # Keep in PostgreSQL
+POST_WARM_STORAGE_DAYS=730     # Keep before archival
+VOTE_DETAIL_RETENTION_DAYS=90  # Keep individual votes
+AUDIT_ARCHIVE_YEARS=7          # Total retention
+```
+
+### Why Audit Logging Enables Moderation Transparency
+
+Audit logging (`src/shared/audit.js`) creates immutable records that:
+
+1. **Support Moderation Appeals**
+   - Users can request review of mod actions
+   - Audit log shows: who acted, when, what was done, reason given
+   - Prevents "he said, she said" disputes
+   - Example: User claims post was wrongfully removed; log shows removal reason and moderator
+
+2. **Detect Moderator Abuse**
+   - Pattern analysis across audit logs reveals:
+     - Mods targeting specific users
+     - Unusual removal patterns (e.g., removing only opposing viewpoints)
+     - Time correlation with personal disputes
+   - Query: "Show all removals by mod X in subreddit Y this month"
+
+3. **Legal Compliance**
+   - Content moderation laws require audit trails
+   - GDPR/CCPA data requests need action history
+   - Law enforcement requests require verifiable records
+   - IP addresses stored for abuse correlation
+
+4. **Security Incident Investigation**
+   - `user.login_failed` events detect brute force attempts
+   - `vote.suspicious` events flag coordinated manipulation
+   - IP-based queries identify compromised accounts
+
+**Audited Events:**
+- `user.login` / `user.login_failed` - Authentication attempts
+- `post.delete` / `comment.delete` - Content removal
+- `user.ban` / `user.unban` - User moderation
+- `subreddit.settings_change` - Configuration changes
+- `vote.suspicious` - Potential vote manipulation
+
+### Why Graceful Shutdown Prevents Data Loss
+
+Graceful shutdown handling (`src/index.js`) ensures:
+
+1. **In-Flight Requests Complete**
+   - Server stops accepting new connections immediately
+   - Existing requests have 30 seconds to complete
+   - Prevents 502/503 errors for users mid-request
+   - Load balancer health check fails, directing traffic elsewhere
+
+2. **Vote Aggregation Consistency**
+   - Background workers finish current batch before exit
+   - Prevents partial aggregation (some posts updated, others not)
+   - `isShuttingDown` flag stops new batches from starting
+   - Redis queue remains consistent
+
+3. **Database Transaction Integrity**
+   - Connection pool `end()` waits for active queries
+   - No orphaned transactions holding locks
+   - Prevents "connection reset" errors in logs
+   - Clean reconnection on next startup
+
+4. **Cache Persistence**
+   - Redis `quit()` flushes pending writes
+   - Session data persists across restarts
+   - Vote caches remain consistent with database
+
+**Shutdown Sequence:**
+```
+1. SIGTERM/SIGINT received
+2. Set isShuttingDown = true (reject new requests)
+3. server.close() - stop accepting connections
+4. Wait for in-flight requests (max 30s)
+5. pool.end() - close PostgreSQL connections
+6. redis.quit() - close Redis connection
+7. process.exit(0)
+```
+
+**Timeout Safety:**
+- 30-second timeout prevents hung shutdowns
+- Force exit after timeout (exit code 1)
+- Kubernetes terminationGracePeriodSeconds should exceed this
+
+---
+
 ## Future Optimizations
 
 1. **Bloom filters** for vote deduplication

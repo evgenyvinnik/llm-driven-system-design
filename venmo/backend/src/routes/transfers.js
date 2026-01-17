@@ -1,12 +1,29 @@
 const express = require('express');
 const { pool } = require('../db/pool');
 const { authMiddleware } = require('../middleware/auth');
+const { idempotencyMiddleware, STATUS } = require('../shared/idempotency');
+const { logger } = require('../shared/logger');
 const { executeTransfer, getTransferById, MAX_TRANSFER_AMOUNT } = require('../services/transfer');
 
 const router = express.Router();
 
-// Send money to another user
-router.post('/send', authMiddleware, async (req, res) => {
+/**
+ * Send money to another user
+ *
+ * CRITICAL: This endpoint uses idempotency middleware to prevent duplicate transfers.
+ * Clients MUST provide an Idempotency-Key header (UUID v4 recommended).
+ *
+ * WHY: Without idempotency, network retries or double-clicks could result in
+ * sending money twice. The idempotency key ensures each logical payment intent
+ * is only processed once, even if the request is received multiple times.
+ */
+router.post('/send', authMiddleware, idempotencyMiddleware('transfer'), async (req, res) => {
+  const log = logger.child({
+    operation: 'send_transfer',
+    userId: req.user.id,
+    requestId: req.requestId,
+  });
+
   try {
     const { recipientUsername, amount, note, visibility = 'public' } = req.body;
 
@@ -37,21 +54,50 @@ router.post('/send', authMiddleware, async (req, res) => {
 
     const recipientId = recipientResult.rows[0].id;
 
-    // Execute the transfer
+    // Execute the transfer with idempotency key and request context
     const transfer = await executeTransfer(
       req.user.id,
       recipientId,
       amountCents,
       note || '',
-      visibility
+      visibility,
+      {
+        idempotencyKey: req.idempotencyKey, // From idempotency middleware
+        request: req, // For audit logging (IP, user agent)
+      }
     );
 
     // Get full transfer details
     const fullTransfer = await getTransferById(transfer.id);
 
+    // Store success in idempotency cache (if middleware is active)
+    if (req.storeIdempotencyResult && !transfer._cached) {
+      await req.storeIdempotencyResult(STATUS.COMPLETED, fullTransfer);
+    }
+
+    log.info({
+      event: 'transfer_sent',
+      transferId: transfer.id,
+      amount: amountCents,
+      recipient: recipientUsername,
+      cached: transfer._cached || false,
+    });
+
     res.status(201).json(fullTransfer);
   } catch (error) {
-    console.error('Transfer error:', error);
+    log.error({
+      event: 'transfer_failed',
+      error: error.message,
+    });
+
+    // Store failure in idempotency cache
+    if (req.storeIdempotencyResult) {
+      await req.storeIdempotencyResult(STATUS.FAILED, {
+        error: error.message,
+        statusCode: 400,
+      });
+    }
+
     res.status(400).json({ error: error.message || 'Transfer failed' });
   }
 });
@@ -101,7 +147,11 @@ router.get('/:id', authMiddleware, async (req, res) => {
       comments: commentsResult.rows,
     });
   } catch (error) {
-    console.error('Get transfer error:', error);
+    logger.error({
+      event: 'get_transfer_error',
+      error: error.message,
+      transferId: req.params.id,
+    });
     res.status(500).json({ error: 'Failed to get transfer' });
   }
 });
@@ -123,7 +173,11 @@ router.post('/:id/like', authMiddleware, async (req, res) => {
 
     res.json({ likes_count: parseInt(countResult.rows[0].count), user_liked: true });
   } catch (error) {
-    console.error('Like transfer error:', error);
+    logger.error({
+      event: 'like_transfer_error',
+      error: error.message,
+      transferId: req.params.id,
+    });
     res.status(500).json({ error: 'Failed to like transfer' });
   }
 });
@@ -143,7 +197,11 @@ router.delete('/:id/like', authMiddleware, async (req, res) => {
 
     res.json({ likes_count: parseInt(countResult.rows[0].count), user_liked: false });
   } catch (error) {
-    console.error('Unlike transfer error:', error);
+    logger.error({
+      event: 'unlike_transfer_error',
+      error: error.message,
+      transferId: req.params.id,
+    });
     res.status(500).json({ error: 'Failed to unlike transfer' });
   }
 });
@@ -171,7 +229,11 @@ router.post('/:id/comments', authMiddleware, async (req, res) => {
       avatar_url: req.user.avatar_url,
     });
   } catch (error) {
-    console.error('Add comment error:', error);
+    logger.error({
+      event: 'add_comment_error',
+      error: error.message,
+      transferId: req.params.id,
+    });
     res.status(500).json({ error: 'Failed to add comment' });
   }
 });

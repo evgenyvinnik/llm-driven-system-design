@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { lockAcquireTotal, lockHoldDuration, cacheHitsTotal, cacheMissesTotal } from './shared/metrics.js';
 
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',

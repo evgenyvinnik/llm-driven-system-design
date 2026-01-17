@@ -1,5 +1,23 @@
+/**
+ * Transfer Service - Core P2P Payment Logic
+ *
+ * This service handles:
+ * - Atomic money transfers between users
+ * - Funding waterfall (balance -> bank -> card)
+ * - Social feed fan-out
+ * - Audit logging for compliance
+ * - Metrics for observability
+ */
+
 const { pool, transaction } = require('../db/pool');
 const { invalidateBalanceCache } = require('../db/redis');
+const { logger, formatAmount } = require('../shared/logger');
+const {
+  transfersTotal,
+  transferAmountHistogram,
+  feedFanoutDuration,
+} = require('../shared/metrics');
+const { logTransfer, AUDIT_ACTIONS, OUTCOMES } = require('../shared/audit');
 
 // Maximum transfer amount in cents ($5,000)
 const MAX_TRANSFER_AMOUNT = 500000;
@@ -65,102 +83,208 @@ async function determineFunding(client, userId, amount, wallet) {
 
 /**
  * Execute an atomic P2P transfer
+ *
+ * @param {string} senderId - UUID of the sender
+ * @param {string} receiverId - UUID of the receiver
+ * @param {number} amount - Amount in cents
+ * @param {string} note - Transaction note
+ * @param {string} visibility - 'public', 'friends', or 'private'
+ * @param {Object} options - Additional options
+ * @param {string} options.idempotencyKey - Client-provided idempotency key
+ * @param {Object} options.request - Express request object for audit logging
  */
-async function executeTransfer(senderId, receiverId, amount, note, visibility = 'public') {
+async function executeTransfer(senderId, receiverId, amount, note, visibility = 'public', options = {}) {
+  const { idempotencyKey = null, request = null } = options;
+  const startTime = Date.now();
+
+  // Create logger with context
+  const log = logger.child({
+    operation: 'transfer',
+    senderId,
+    receiverId,
+    amount: formatAmount(amount),
+  });
+
+  log.info({ event: 'transfer_initiated' });
+
   // Validate amount
   if (amount <= 0) {
+    log.warn({ event: 'transfer_validation_failed', reason: 'non_positive_amount' });
     throw new Error('Amount must be positive');
   }
   if (amount > MAX_TRANSFER_AMOUNT) {
+    log.warn({ event: 'transfer_validation_failed', reason: 'exceeds_max', maxAmount: formatAmount(MAX_TRANSFER_AMOUNT) });
     throw new Error(`Maximum transfer amount is $${MAX_TRANSFER_AMOUNT / 100}`);
   }
 
   // Cannot send to self
   if (senderId === receiverId) {
+    log.warn({ event: 'transfer_validation_failed', reason: 'self_transfer' });
     throw new Error('Cannot send money to yourself');
   }
 
-  const transfer = await transaction(async (client) => {
-    // Lock sender's wallet row to prevent race conditions
-    const senderWalletResult = await client.query(
-      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [senderId]
-    );
+  let transfer;
+  let fundingSource = 'balance';
 
-    if (senderWalletResult.rows.length === 0) {
-      throw new Error('Sender wallet not found');
-    }
+  try {
+    transfer = await transaction(async (client) => {
+      // Check for duplicate transfer using idempotency key (database level)
+      if (idempotencyKey) {
+        const existingTransfer = await client.query(
+          'SELECT * FROM transfers WHERE sender_id = $1 AND idempotency_key = $2',
+          [senderId, idempotencyKey]
+        );
 
-    const senderWallet = senderWalletResult.rows[0];
+        if (existingTransfer.rows.length > 0) {
+          log.info({
+            event: 'transfer_idempotency_hit',
+            existingTransferId: existingTransfer.rows[0].id,
+            idempotencyKey,
+          });
+          // Return existing transfer - prevents duplicate charges
+          return { ...existingTransfer.rows[0], _cached: true };
+        }
+      }
 
-    // Verify receiver exists
-    const receiverResult = await client.query(
-      'SELECT id FROM users WHERE id = $1',
-      [receiverId]
-    );
+      // Lock sender's wallet row to prevent race conditions
+      const senderWalletResult = await client.query(
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [senderId]
+      );
 
-    if (receiverResult.rows.length === 0) {
-      throw new Error('Receiver not found');
-    }
+      if (senderWalletResult.rows.length === 0) {
+        throw new Error('Sender wallet not found');
+      }
 
-    // Lock receiver's wallet
-    await client.query(
-      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [receiverId]
-    );
+      const senderWallet = senderWalletResult.rows[0];
 
-    // Determine funding source
-    const fundingPlan = await determineFunding(client, senderId, amount, senderWallet);
+      // Verify receiver exists
+      const receiverResult = await client.query(
+        'SELECT id FROM users WHERE id = $1',
+        [receiverId]
+      );
 
-    // Debit sender (only the balance portion)
-    if (fundingPlan.fromBalance > 0) {
+      if (receiverResult.rows.length === 0) {
+        throw new Error('Receiver not found');
+      }
+
+      // Lock receiver's wallet
       await client.query(
-        'UPDATE wallets SET balance = balance - $2, updated_at = NOW() WHERE user_id = $1',
-        [senderId, fundingPlan.fromBalance]
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [receiverId]
+      );
+
+      // Determine funding source
+      const fundingPlan = await determineFunding(client, senderId, amount, senderWallet);
+
+      // Determine funding source label for metrics
+      if (fundingPlan.fromExternal > 0) {
+        fundingSource = fundingPlan.source.type;
+      }
+
+      // Debit sender (only the balance portion)
+      if (fundingPlan.fromBalance > 0) {
+        await client.query(
+          'UPDATE wallets SET balance = balance - $2, updated_at = NOW() WHERE user_id = $1',
+          [senderId, fundingPlan.fromBalance]
+        );
+      }
+
+      // Credit receiver with full amount
+      await client.query(
+        'UPDATE wallets SET balance = balance + $2, updated_at = NOW() WHERE user_id = $1',
+        [receiverId, amount]
+      );
+
+      // Build funding source description
+      let fundingSourceLabel = 'Venmo Balance';
+      if (fundingPlan.fromExternal > 0) {
+        if (fundingPlan.fromBalance > 0) {
+          fundingSourceLabel = `Venmo Balance + ${fundingPlan.source.name}`;
+        } else {
+          fundingSourceLabel = fundingPlan.source.name;
+        }
+      }
+
+      // Create transfer record with idempotency key
+      const transferResult = await client.query(
+        `INSERT INTO transfers (sender_id, receiver_id, amount, note, visibility, status, funding_source, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, 'completed', $6, $7)
+         RETURNING *`,
+        [senderId, receiverId, amount, note, visibility, fundingSourceLabel, idempotencyKey]
+      );
+
+      return transferResult.rows[0];
+    });
+
+    // Record success metrics
+    const durationMs = Date.now() - startTime;
+    transfersTotal.inc({ status: 'completed', funding_source: fundingSource });
+    transferAmountHistogram.observe(amount);
+
+    log.info({
+      event: 'transfer_completed',
+      transferId: transfer.id,
+      durationMs,
+      fundingSource,
+      cached: transfer._cached || false,
+    });
+
+    // Skip post-processing for cached (idempotent) responses
+    if (transfer._cached) {
+      return transfer;
+    }
+
+    // Invalidate balance caches
+    await invalidateBalanceCache(senderId);
+    await invalidateBalanceCache(receiverId);
+
+    // Audit log for compliance
+    await logTransfer(AUDIT_ACTIONS.TRANSFER_COMPLETED, transfer, OUTCOMES.SUCCESS, request, {
+      durationMs,
+      idempotencyKey,
+    });
+
+    // Fan out to social feed (async, handled separately)
+    await fanOutToFeed(transfer);
+
+    return transfer;
+  } catch (error) {
+    // Record failure metrics
+    const durationMs = Date.now() - startTime;
+    const failureType = error.message.includes('Insufficient')
+      ? 'insufficient_funds'
+      : 'failed';
+    transfersTotal.inc({ status: failureType, funding_source: fundingSource });
+
+    log.error({
+      event: 'transfer_failed',
+      error: error.message,
+      durationMs,
+    });
+
+    // Audit log for failed transfer attempt
+    if (request) {
+      await logTransfer(
+        AUDIT_ACTIONS.TRANSFER_FAILED,
+        { sender_id: senderId, receiver_id: receiverId, amount },
+        OUTCOMES.FAILURE,
+        request,
+        { error: error.message, durationMs, idempotencyKey }
       );
     }
 
-    // Credit receiver with full amount
-    await client.query(
-      'UPDATE wallets SET balance = balance + $2, updated_at = NOW() WHERE user_id = $1',
-      [receiverId, amount]
-    );
-
-    // Build funding source description
-    let fundingSource = 'Venmo Balance';
-    if (fundingPlan.fromExternal > 0) {
-      if (fundingPlan.fromBalance > 0) {
-        fundingSource = `Venmo Balance + ${fundingPlan.source.name}`;
-      } else {
-        fundingSource = fundingPlan.source.name;
-      }
-    }
-
-    // Create transfer record
-    const transferResult = await client.query(
-      `INSERT INTO transfers (sender_id, receiver_id, amount, note, visibility, status, funding_source)
-       VALUES ($1, $2, $3, $4, $5, 'completed', $6)
-       RETURNING *`,
-      [senderId, receiverId, amount, note, visibility, fundingSource]
-    );
-
-    return transferResult.rows[0];
-  });
-
-  // Invalidate balance caches
-  await invalidateBalanceCache(senderId);
-  await invalidateBalanceCache(receiverId);
-
-  // Fan out to social feed (async, handled separately)
-  await fanOutToFeed(transfer);
-
-  return transfer;
+    throw error;
+  }
 }
 
 /**
  * Fan out transfer to social feeds
  */
 async function fanOutToFeed(transfer) {
+  const startTime = Date.now();
+  const log = logger.child({ operation: 'feed_fanout', transferId: transfer.id });
+
   try {
     if (transfer.visibility === 'private') {
       // Only sender and receiver see it
@@ -169,11 +293,15 @@ async function fanOutToFeed(transfer) {
          VALUES ($1, $3, $4), ($2, $3, $4)`,
         [transfer.sender_id, transfer.receiver_id, transfer.id, transfer.created_at]
       );
+
+      const durationSec = (Date.now() - startTime) / 1000;
+      feedFanoutDuration.observe(durationSec);
+      log.debug({ event: 'feed_fanout_complete', visibility: 'private', recipients: 2, durationMs: durationSec * 1000 });
       return;
     }
 
     // Get friends of both participants who should see this
-    await pool.query(
+    const result = await pool.query(
       `INSERT INTO feed_items (user_id, transfer_id, created_at)
        SELECT DISTINCT user_id, $1, $4
        FROM (
@@ -188,12 +316,26 @@ async function fanOutToFeed(transfer) {
          UNION
          -- Friends of receiver see it
          SELECT friend_id FROM friendships WHERE user_id = $3 AND status = 'accepted'
-       ) feed_users`,
+       ) feed_users
+       RETURNING user_id`,
       [transfer.id, transfer.sender_id, transfer.receiver_id, transfer.created_at]
     );
+
+    const durationSec = (Date.now() - startTime) / 1000;
+    feedFanoutDuration.observe(durationSec);
+
+    log.debug({
+      event: 'feed_fanout_complete',
+      visibility: transfer.visibility,
+      recipients: result.rowCount,
+      durationMs: durationSec * 1000,
+    });
   } catch (error) {
     // Log but don't fail the transfer
-    console.error('Feed fan-out error:', error);
+    log.error({
+      event: 'feed_fanout_error',
+      error: error.message,
+    });
   }
 }
 

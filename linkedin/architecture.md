@@ -773,3 +773,162 @@ services:
 | Auth | Session + Valkey | JWT | Simpler revocation, less client complexity |
 | Rate Limiting | Token bucket in Valkey | Fixed window | Smoother traffic, burst tolerance |
 | Observability | Prometheus + Grafana | Datadog/New Relic | Free, self-hosted, learning-focused |
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions for the LinkedIn clone's backend infrastructure.
+
+### Why Async Queues Enable Efficient Feed Fanout
+
+When a user creates a post, their content needs to appear in the feeds of all their connections. For a user with 500+ connections, synchronously updating all those feeds would:
+
+1. **Block the API response** - The user would wait seconds for the post to publish
+2. **Create thundering herd problems** - Cache invalidation for 500 feeds simultaneously overwhelms Redis
+3. **Risk partial failures** - If the 300th cache update fails, is the post published or not?
+
+**RabbitMQ solves this by decoupling the publish from the fanout:**
+
+```
+User creates post -> API returns immediately -> Message queued
+                                                      |
+                                                      v
+                              Worker processes at controlled rate
+                              (10 connections/second, not 500 at once)
+```
+
+The queue provides:
+- **Backpressure handling**: Workers process at sustainable rates
+- **Retry semantics**: Failed fanouts retry with exponential backoff
+- **Observability**: Queue depth metrics alert when fanout falls behind
+- **Idempotency**: Deduplication keys prevent duplicate notifications
+
+For PYMK (People You May Know) recalculation, which can take 30+ seconds for users with large networks, async processing is essential. The queue allows batch computation during off-peak hours without blocking the main API.
+
+### Why Rate Limiting Prevents Spam Connection Requests
+
+LinkedIn's connection request feature is a prime target for spam:
+
+1. **Recruiters** may blast connection requests to thousands of candidates
+2. **Bots** harvest connection graphs for lead generation
+3. **Bad actors** send malicious links in connection messages
+
+Without rate limiting, a single user could send 10,000 connection requests per hour, creating:
+- Notification fatigue for recipients
+- Database load from pending request storage
+- Reputation damage to the platform
+
+**Our token bucket implementation provides:**
+
+| Endpoint | Limit | Burst | Rationale |
+|----------|-------|-------|-----------|
+| Connection requests | 20/min | 10 | Prevents spam while allowing normal networking |
+| Profile updates | 30/min | 30 | Generous for editing, prevents abuse |
+| Search queries | 20/min | 20 | Protects Elasticsearch from query storms |
+| Login attempts | 10/min | 10 | Mitigates credential stuffing attacks |
+
+The token bucket algorithm (vs. fixed window) provides smoother traffic patterns:
+- A user can burst 10 requests instantly, then must wait
+- Tokens refill gradually, not all-at-once at window boundaries
+- More predictable load on downstream services
+
+Rate limit headers (`X-RateLimit-Remaining`, `X-RateLimit-Reset`) allow well-behaved clients to back off gracefully before hitting limits.
+
+### Why Audit Logging Enables Account Recovery and Security
+
+Professional networks contain sensitive career data. Audit logging serves multiple critical functions:
+
+**1. Account Recovery**
+When a user reports their profile was changed without their knowledge:
+```sql
+SELECT * FROM audit_logs
+WHERE target_type = 'profile' AND target_id = 12345
+AND created_at > NOW() - INTERVAL '30 days'
+ORDER BY created_at DESC;
+```
+This reveals exactly what changed, when, and from which IP address, enabling:
+- Identification of unauthorized access
+- Restoration of previous profile state
+- Evidence for security investigations
+
+**2. Compliance Requirements**
+Professional platforms may need to demonstrate:
+- Who accessed candidate data (GDPR data subject requests)
+- When admin actions were taken (SOC 2 audits)
+- Login history for compromised account investigations
+
+**3. Security Monitoring**
+Audit logs enable detection of:
+- Credential stuffing (many failed logins from one IP)
+- Account takeover (login from unusual location)
+- Privilege escalation (role changes)
+
+**What we log:**
+| Event Type | Retention | Purpose |
+|------------|-----------|---------|
+| Login success/failure | 90 days | Security monitoring |
+| Profile updates | 1 year | Account recovery |
+| Connection events | 1 year | Network integrity |
+| Admin actions | 5 years | Compliance |
+
+**Privacy considerations:**
+- Sensitive field values are masked (showing only first/last 2 characters)
+- IP addresses are stored for security but not exposed to users
+- Audit logs are append-only (no UPDATE/DELETE access)
+
+### Why Metrics Enable Engagement Optimization
+
+LinkedIn's business model depends on user engagement. Prometheus metrics enable data-driven optimization:
+
+**1. Performance SLOs**
+```yaml
+# Alert when feed generation exceeds 500ms p99
+- alert: FeedLatencyHigh
+  expr: histogram_quantile(0.99, rate(feed_generation_duration_seconds_bucket[5m])) > 0.5
+```
+Slow feeds reduce scroll engagement. Metrics identify performance regressions before users complain.
+
+**2. Feature Adoption**
+```promql
+# Track connection request conversion rate
+rate(connections_created_total[1h]) / rate(connection_requests_total[1h])
+```
+This reveals whether PYMK algorithm changes improve actual connection formation.
+
+**3. Capacity Planning**
+```promql
+# Predict when we'll exceed queue capacity
+predict_linear(queue_depth{queue_name="notifications"}[1h], 3600)
+```
+Queue depth trends indicate when to scale notification workers.
+
+**4. Business Metrics**
+| Metric | What It Reveals |
+|--------|-----------------|
+| `posts_created_total` | Content creation health |
+| `profile_views_total` | Job seeker activity |
+| `post_likes_total` | Feed engagement quality |
+| `pymk_computation_duration_seconds` | Algorithm efficiency |
+
+**Key Prometheus patterns used:**
+- **Counters** for monotonically increasing values (requests, errors)
+- **Histograms** for latency distributions (p50, p95, p99)
+- **Gauges** for current state (queue depth, active sessions)
+
+The `/metrics` endpoint exposes all metrics in Prometheus format, enabling:
+- Grafana dashboards for real-time visibility
+- Alertmanager integration for on-call notifications
+- Long-term trend analysis for quarterly reviews
+
+### Implementation Summary
+
+| Feature | Files Added/Modified | Key Benefit |
+|---------|---------------------|-------------|
+| RabbitMQ integration | `utils/rabbitmq.ts` | Async fanout, decoupled architecture |
+| Rate limiting | `utils/rateLimiter.ts` | Spam prevention, fair usage |
+| Audit logging | `utils/audit.ts`, `db/migrations/001_create_audit_logs.sql` | Security, compliance, recovery |
+| Prometheus metrics | `utils/metrics.ts` | Observability, SLO monitoring |
+| Structured logging | `utils/logger.ts` | Debugging, trace correlation |
+| Enhanced health checks | `index.ts` | Kubernetes readiness, dependency monitoring |
+| RBAC middleware | `middleware/auth.ts` | Fine-grained access control |

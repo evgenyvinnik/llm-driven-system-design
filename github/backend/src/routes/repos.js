@@ -4,6 +4,27 @@ import * as gitService from '../services/git.js';
 import * as searchService from '../services/search.js';
 import { requireAuth } from '../middleware/auth.js';
 
+// Import shared modules
+import logger from '../shared/logger.js';
+import { auditLog, AUDITED_ACTIONS } from '../shared/audit.js';
+import {
+  getRepoFromCache,
+  setRepoInCache,
+  invalidateRepoCache,
+  getTreeFromCache,
+  setTreeInCache,
+  getBranchesFromCache,
+  setBranchesInCache,
+  getCommitsFromCache,
+  setCommitsInCache,
+  getFileFromCache,
+  setFileInCache,
+  invalidateRepoCaches,
+  invalidatePRCaches,
+} from '../shared/cache.js';
+import { withCircuitBreaker } from '../shared/circuitBreaker.js';
+import { pushesTotal } from '../shared/metrics.js';
+
 const router = Router();
 
 /**
@@ -56,36 +77,67 @@ router.get('/', async (req, res) => {
 });
 
 /**
- * Get single repository
+ * Get single repository (with caching)
  */
 router.get('/:owner/:repo', async (req, res) => {
   const { owner, repo } = req.params;
 
-  const result = await query(
-    `SELECT r.*, u.username as owner_name, u.avatar_url as owner_avatar,
-            u.display_name as owner_display_name
-     FROM repositories r
-     LEFT JOIN users u ON r.owner_id = u.id
+  // First, get repo ID for cache lookup
+  const repoIdResult = await query(
+    `SELECT r.id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
      WHERE u.username = $1 AND r.name = $2`,
     [owner, repo]
   );
 
-  if (result.rows.length === 0) {
+  if (repoIdResult.rows.length === 0) {
     return res.status(404).json({ error: 'Repository not found' });
   }
 
-  const repoData = result.rows[0];
+  const repoId = repoIdResult.rows[0].id;
+
+  // Try cache first
+  let repoData = await getRepoFromCache(repoId);
+
+  if (!repoData) {
+    // Cache miss - fetch from database
+    const result = await query(
+      `SELECT r.*, u.username as owner_name, u.avatar_url as owner_avatar,
+              u.display_name as owner_display_name
+       FROM repositories r
+       LEFT JOIN users u ON r.owner_id = u.id
+       WHERE r.id = $1`,
+      [repoId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Repository not found' });
+    }
+
+    repoData = result.rows[0];
+
+    // Store in cache
+    await setRepoInCache(repoId, repoData);
+  }
 
   // Check access
   if (repoData.is_private && (!req.user || req.user.id !== repoData.owner_id)) {
     return res.status(404).json({ error: 'Repository not found' });
   }
 
-  // Get branches
-  const branches = await gitService.getBranches(owner, repo);
+  // Get branches (with caching)
+  let branches = await getBranchesFromCache(repoId);
+  if (!branches) {
+    branches = await withCircuitBreaker('git_branches', () =>
+      gitService.getBranches(owner, repo)
+    );
+    await setBranchesInCache(repoId, branches);
+  }
 
   // Get tags
-  const tags = await gitService.getTags(owner, repo);
+  const tags = await withCircuitBreaker('git_tags', () =>
+    gitService.getTags(owner, repo)
+  );
 
   res.json({
     ...repoData,
@@ -148,9 +200,18 @@ router.post('/', requireAuth, async (req, res) => {
       );
     }
 
+    // Audit log
+    await auditLog(
+      AUDITED_ACTIONS.REPO_CREATE,
+      'repository',
+      repo.id,
+      { name, isPrivate, initWithReadme },
+      req
+    );
+
     res.status(201).json(repo);
   } catch (err) {
-    console.error('Create repo error:', err);
+    req.log?.error({ err }, 'Create repo error');
     res.status(500).json({ error: 'Failed to create repository' });
   }
 });
@@ -180,18 +241,22 @@ router.patch('/:owner/:repo', requireAuth, async (req, res) => {
 
   const updates = [];
   const params = [];
+  const changes = {};
 
   if (description !== undefined) {
     params.push(description);
     updates.push(`description = $${params.length}`);
+    changes.description = description;
   }
   if (isPrivate !== undefined) {
     params.push(isPrivate);
     updates.push(`is_private = $${params.length}`);
+    changes.isPrivate = isPrivate;
   }
   if (defaultBranch !== undefined) {
     params.push(defaultBranch);
     updates.push(`default_branch = $${params.length}`);
+    changes.defaultBranch = defaultBranch;
   }
 
   if (updates.length === 0) {
@@ -207,6 +272,13 @@ router.patch('/:owner/:repo', requireAuth, async (req, res) => {
     `UPDATE repositories SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
     params
   );
+
+  // Invalidate cache
+  await invalidateRepoCache(repoResult.rows[0].id);
+
+  // Audit log
+  const action = isPrivate !== undefined ? AUDITED_ACTIONS.REPO_VISIBILITY_CHANGE : AUDITED_ACTIONS.REPO_SETTINGS_CHANGE;
+  await auditLog(action, 'repository', repoResult.rows[0].id, changes, req);
 
   res.json(result.rows[0]);
 });
@@ -233,61 +305,151 @@ router.delete('/:owner/:repo', requireAuth, async (req, res) => {
   }
 
   try {
+    const repoId = repoResult.rows[0].id;
+
     // Delete git repository
     await gitService.deleteRepository(owner, repo);
 
     // Remove from search index
-    await searchService.removeRepositoryIndex(repoResult.rows[0].id);
+    await searchService.removeRepositoryIndex(repoId);
 
     // Delete from database (cascade will handle related records)
-    await query('DELETE FROM repositories WHERE id = $1', [repoResult.rows[0].id]);
+    await query('DELETE FROM repositories WHERE id = $1', [repoId]);
+
+    // Invalidate all caches for this repo
+    await invalidateRepoCaches(repoId);
+
+    // Audit log
+    await auditLog(
+      AUDITED_ACTIONS.REPO_DELETE,
+      'repository',
+      repoId,
+      { name: repo, owner },
+      req
+    );
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Delete repo error:', err);
+    req.log?.error({ err }, 'Delete repo error');
     res.status(500).json({ error: 'Failed to delete repository' });
   }
 });
 
 /**
- * Get repository tree
+ * Get repository tree (with caching and circuit breaker)
  */
 router.get('/:owner/:repo/tree/:ref(*)', async (req, res) => {
   const { owner, repo, ref } = req.params;
   const { path: treePath = '' } = req.query;
 
-  const tree = await gitService.getTree(owner, repo, ref, treePath);
+  // Get repo ID for caching
+  const repoIdResult = await query(
+    `SELECT r.id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
+     WHERE u.username = $1 AND r.name = $2`,
+    [owner, repo]
+  );
+
+  if (repoIdResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Repository not found' });
+  }
+
+  const repoId = repoIdResult.rows[0].id;
+
+  // Try cache first
+  let tree = await getTreeFromCache(repoId, ref, treePath);
+
+  if (!tree) {
+    // Cache miss - fetch with circuit breaker
+    tree = await withCircuitBreaker('git_tree', () =>
+      gitService.getTree(owner, repo, ref, treePath)
+    );
+
+    // Cache the result
+    await setTreeInCache(repoId, ref, treePath, tree);
+  }
+
   res.json(tree);
 });
 
 /**
- * Get file content
+ * Get file content (with caching and circuit breaker)
  */
 router.get('/:owner/:repo/blob/:ref/:path(*)', async (req, res) => {
   const { owner, repo, ref, path: filePath } = req.params;
 
-  const content = await gitService.getFileContent(owner, repo, ref, filePath);
+  // Get repo ID for caching
+  const repoIdResult = await query(
+    `SELECT r.id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
+     WHERE u.username = $1 AND r.name = $2`,
+    [owner, repo]
+  );
+
+  if (repoIdResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Repository not found' });
+  }
+
+  const repoId = repoIdResult.rows[0].id;
+
+  // Try cache first
+  let content = await getFileFromCache(repoId, ref, filePath);
 
   if (content === null) {
-    return res.status(404).json({ error: 'File not found' });
+    // Cache miss - fetch with circuit breaker
+    content = await withCircuitBreaker('git_file', () =>
+      gitService.getFileContent(owner, repo, ref, filePath)
+    );
+
+    if (content === null) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Cache the content
+    await setFileInCache(repoId, ref, filePath, content);
   }
 
   res.json({ path: filePath, content });
 });
 
 /**
- * Get commits
+ * Get commits (with caching and circuit breaker)
  */
 router.get('/:owner/:repo/commits', async (req, res) => {
   const { owner, repo } = req.params;
   const { branch = 'HEAD', page = 1, limit = 30 } = req.query;
 
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  const commits = await gitService.getCommits(owner, repo, {
-    branch,
-    maxCount: parseInt(limit),
-    skip,
-  });
+  // Get repo ID for caching
+  const repoIdResult = await query(
+    `SELECT r.id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
+     WHERE u.username = $1 AND r.name = $2`,
+    [owner, repo]
+  );
+
+  if (repoIdResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Repository not found' });
+  }
+
+  const repoId = repoIdResult.rows[0].id;
+
+  // Try cache first
+  let commits = await getCommitsFromCache(repoId, branch, page);
+
+  if (!commits) {
+    // Cache miss - fetch with circuit breaker
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    commits = await withCircuitBreaker('git_commits', () =>
+      gitService.getCommits(owner, repo, {
+        branch,
+        maxCount: parseInt(limit),
+        skip,
+      })
+    );
+
+    // Cache the result
+    await setCommitsInCache(repoId, branch, page, commits);
+  }
 
   res.json(commits);
 });
@@ -298,7 +460,9 @@ router.get('/:owner/:repo/commits', async (req, res) => {
 router.get('/:owner/:repo/commit/:sha', async (req, res) => {
   const { owner, repo, sha } = req.params;
 
-  const commit = await gitService.getCommit(owner, repo, sha);
+  const commit = await withCircuitBreaker('git_commit', () =>
+    gitService.getCommit(owner, repo, sha)
+  );
 
   if (!commit) {
     return res.status(404).json({ error: 'Commit not found' });
@@ -308,11 +472,35 @@ router.get('/:owner/:repo/commit/:sha', async (req, res) => {
 });
 
 /**
- * Get branches
+ * Get branches (with caching)
  */
 router.get('/:owner/:repo/branches', async (req, res) => {
   const { owner, repo } = req.params;
-  const branches = await gitService.getBranches(owner, repo);
+
+  // Get repo ID for caching
+  const repoIdResult = await query(
+    `SELECT r.id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
+     WHERE u.username = $1 AND r.name = $2`,
+    [owner, repo]
+  );
+
+  if (repoIdResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Repository not found' });
+  }
+
+  const repoId = repoIdResult.rows[0].id;
+
+  // Try cache first
+  let branches = await getBranchesFromCache(repoId);
+
+  if (!branches) {
+    branches = await withCircuitBreaker('git_branches', () =>
+      gitService.getBranches(owner, repo)
+    );
+    await setBranchesInCache(repoId, branches);
+  }
+
   res.json(branches);
 });
 
@@ -321,8 +509,54 @@ router.get('/:owner/:repo/branches', async (req, res) => {
  */
 router.get('/:owner/:repo/tags', async (req, res) => {
   const { owner, repo } = req.params;
-  const tags = await gitService.getTags(owner, repo);
+  const tags = await withCircuitBreaker('git_tags', () =>
+    gitService.getTags(owner, repo)
+  );
   res.json(tags);
+});
+
+/**
+ * Handle push event (webhook endpoint for cache invalidation)
+ * This would typically be called by git hooks
+ */
+router.post('/:owner/:repo/push', requireAuth, async (req, res) => {
+  const { owner, repo } = req.params;
+  const { branch, commits } = req.body;
+
+  // Get repo and verify access
+  const repoResult = await query(
+    `SELECT r.id, r.owner_id FROM repositories r
+     JOIN users u ON r.owner_id = u.id
+     WHERE u.username = $1 AND r.name = $2`,
+    [owner, repo]
+  );
+
+  if (repoResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Repository not found' });
+  }
+
+  const repoId = repoResult.rows[0].id;
+
+  // Invalidate all repository caches
+  await invalidateRepoCaches(repoId);
+
+  // Find open PRs that might be affected
+  const openPRs = await query(
+    `SELECT id FROM pull_requests
+     WHERE repo_id = $1 AND state = 'open'
+     AND (head_branch = $2 OR base_branch = $2)`,
+    [repoId, branch]
+  );
+
+  // Invalidate PR caches
+  await invalidatePRCaches(openPRs.rows.map(pr => pr.id));
+
+  // Update metrics
+  pushesTotal.inc({ status: 'success' });
+
+  req.log?.info({ repoId, branch, commitCount: commits?.length }, 'Push received, caches invalidated');
+
+  res.json({ success: true, invalidatedPRs: openPRs.rows.length });
 });
 
 /**
@@ -355,6 +589,9 @@ router.post('/:owner/:repo/star', requireAuth, async (req, res) => {
     [repoId]
   );
 
+  // Invalidate repo cache since stars count changed
+  await invalidateRepoCache(repoId);
+
   res.json({ starred: true });
 });
 
@@ -383,6 +620,9 @@ router.delete('/:owner/:repo/star', requireAuth, async (req, res) => {
     'UPDATE repositories SET stars_count = (SELECT COUNT(*) FROM stars WHERE repo_id = $1) WHERE id = $1',
     [repoId]
   );
+
+  // Invalidate repo cache since stars count changed
+  await invalidateRepoCache(repoId);
 
   res.json({ starred: false });
 });

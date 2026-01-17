@@ -3,6 +3,16 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import config from './config/index.js';
 
+// Services
+import logger, { requestLoggingMiddleware } from './services/logger.js';
+import { metricsMiddleware, getMetrics, getContentType } from './services/metrics.js';
+import { connect as connectRabbitMQ, isConnected as isRabbitMQConnected } from './services/rabbitmq.js';
+import { getCircuitBreakerStats } from './services/circuit-breaker.js';
+import { idempotencyMiddleware } from './services/idempotency.js';
+import { auditContextMiddleware } from './services/audit.js';
+import pool from './services/db.js';
+import redisClient from './services/redis.js';
+
 // Auth
 import {
   authMiddleware,
@@ -62,7 +72,7 @@ import {
 
 const app = express();
 
-// Middleware
+// ===== Global Middleware =====
 app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'],
   credentials: true,
@@ -70,9 +80,102 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Request logging middleware (structured JSON logs)
+app.use(requestLoggingMiddleware);
+
+// Prometheus metrics middleware
+app.use(metricsMiddleware);
+
+// Idempotency key extraction
+app.use(idempotencyMiddleware);
+
+// Audit context middleware
+app.use(auditContextMiddleware);
+
+// ===== Health Check Endpoint =====
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: process.env.APP_VERSION || '1.0.0',
+    checks: {},
+  };
+
+  // Check database connection
+  try {
+    const dbStart = Date.now();
+    await pool.query('SELECT 1');
+    health.checks.database = {
+      status: 'healthy',
+      latencyMs: Date.now() - dbStart,
+    };
+  } catch (error) {
+    health.checks.database = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+    health.status = 'degraded';
+  }
+
+  // Check Redis connection
+  try {
+    const redisStart = Date.now();
+    await redisClient.ping();
+    health.checks.redis = {
+      status: 'healthy',
+      latencyMs: Date.now() - redisStart,
+    };
+  } catch (error) {
+    health.checks.redis = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+    health.status = 'degraded';
+  }
+
+  // Check RabbitMQ connection
+  health.checks.rabbitmq = {
+    status: isRabbitMQConnected() ? 'healthy' : 'unhealthy',
+  };
+  if (!isRabbitMQConnected()) {
+    health.status = 'degraded';
+  }
+
+  // Circuit breaker status
+  health.circuitBreakers = getCircuitBreakerStats();
+
+  const statusCode = health.status === 'ok' ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+// ===== Readiness Check (for Kubernetes) =====
+app.get('/ready', async (req, res) => {
+  try {
+    // Check critical dependencies
+    await pool.query('SELECT 1');
+    await redisClient.ping();
+    res.status(200).json({ ready: true });
+  } catch (error) {
+    res.status(503).json({ ready: false, error: error.message });
+  }
+});
+
+// ===== Liveness Check (for Kubernetes) =====
+app.get('/live', (req, res) => {
+  res.status(200).json({ alive: true });
+});
+
+// ===== Prometheus Metrics Endpoint =====
+app.get('/metrics', async (req, res) => {
+  try {
+    const metrics = await getMetrics();
+    res.set('Content-Type', getContentType());
+    res.send(metrics);
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to collect metrics');
+    res.status(500).json({ error: 'Failed to collect metrics' });
+  }
 });
 
 // ===== Auth Routes =====
@@ -139,15 +242,51 @@ app.put('/api/storefront/:subdomain/cart/update', resolveStore, updateCartItem);
 // Checkout (storefront)
 app.post('/api/storefront/:subdomain/checkout', resolveStore, checkout);
 
-// Error handler
+// ===== Error Handler =====
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Internal server error' });
+  const requestId = req.headers['x-request-id'] || 'unknown';
+
+  logger.error({
+    err,
+    requestId,
+    method: req.method,
+    path: req.path,
+    storeId: req.storeId,
+  }, 'Unhandled error');
+
+  res.status(500).json({
+    error: 'Internal server error',
+    requestId,
+  });
 });
 
-// Start server
+// ===== Start Server =====
 const PORT = config.server.port;
-app.listen(PORT, () => {
-  console.log(`Shopify backend running on http://localhost:${PORT}`);
-  console.log(`API docs: http://localhost:${PORT}/health`);
-});
+
+async function startServer() {
+  // Connect to RabbitMQ (non-blocking, will retry in background)
+  connectRabbitMQ().catch(err => {
+    logger.warn({ err }, 'Initial RabbitMQ connection failed, will retry in background');
+  });
+
+  app.listen(PORT, () => {
+    logger.info({
+      port: PORT,
+      nodeEnv: process.env.NODE_ENV || 'development',
+    }, `Shopify backend started on http://localhost:${PORT}`);
+
+    console.log(`
+==========================================================
+  Shopify Backend Server
+==========================================================
+  API Server:     http://localhost:${PORT}
+  Health Check:   http://localhost:${PORT}/health
+  Metrics:        http://localhost:${PORT}/metrics
+  Ready Check:    http://localhost:${PORT}/ready
+  Live Check:     http://localhost:${PORT}/live
+==========================================================
+    `);
+  });
+}
+
+startServer();

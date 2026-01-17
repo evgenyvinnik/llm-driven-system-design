@@ -191,12 +191,16 @@ router.post('/', async (req: Request, res: Response) => {
 /**
  * GET /api/pages/:id
  * Gets a specific page with its blocks, child pages, and database views.
- * Provides all data needed to render the page editor.
+ * Uses cache-aside pattern for frequently accessed pages.
  */
 router.get('/:id', async (req: Request, res: Response) => {
+  const startTime = Date.now();
+  let hasCache = false;
+
   try {
     const { id } = req.params;
 
+    // First check basic page existence and permissions (not cached)
     const pageResult = await pool.query<Page>(
       'SELECT * FROM pages WHERE id = $1',
       [id]
@@ -221,41 +225,61 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    // Get blocks for this page
-    const blocksResult = await pool.query(
-      `SELECT * FROM blocks
-       WHERE page_id = $1
-       ORDER BY position`,
-      [id]
+    // Track page load metrics
+    pageLoadsCounter.inc({ workspace_id: page.workspace_id });
+
+    // Use cache-aside pattern for page content (blocks, children, views)
+    const cacheKey = CACHE_KEYS.pageWithBlocks(id);
+    const pageContent = await cacheAside(
+      cacheKey,
+      CACHE_TTL.page,
+      async () => {
+        // Get blocks for this page
+        const blocksResult = await pool.query(
+          `SELECT * FROM blocks
+           WHERE page_id = $1
+           ORDER BY position`,
+          [id]
+        );
+
+        // Get child pages
+        const childPagesResult = await pool.query<Page>(
+          `SELECT * FROM pages
+           WHERE parent_id = $1 AND is_archived = false
+           ORDER BY position`,
+          [id]
+        );
+
+        // If it's a database, get views
+        let views: unknown[] = [];
+        if (page.is_database) {
+          const viewsResult = await pool.query(
+            `SELECT * FROM database_views
+             WHERE page_id = $1
+             ORDER BY position`,
+            [id]
+          );
+          views = viewsResult.rows;
+        }
+
+        return {
+          blocks: blocksResult.rows,
+          children: childPagesResult.rows,
+          views,
+        };
+      },
+      'page'
     );
 
-    // Get child pages
-    const childPagesResult = await pool.query<Page>(
-      `SELECT * FROM pages
-       WHERE parent_id = $1 AND is_archived = false
-       ORDER BY position`,
-      [id]
-    );
-
-    // If it's a database, get views
-    let views = [];
-    if (page.is_database) {
-      const viewsResult = await pool.query(
-        `SELECT * FROM database_views
-         WHERE page_id = $1
-         ORDER BY position`,
-        [id]
-      );
-      views = viewsResult.rows;
-    }
+    hasCache = true;
+    pageLoadDuration.observe({ has_cache: hasCache ? 'true' : 'false' }, (Date.now() - startTime) / 1000);
 
     res.json({
       page,
-      blocks: blocksResult.rows,
-      children: childPagesResult.rows,
-      views,
+      ...pageContent,
     });
   } catch (error) {
+    pageLoadDuration.observe({ has_cache: hasCache ? 'true' : 'false' }, (Date.now() - startTime) / 1000);
     console.error('Get page error:', error);
     res.status(500).json({ error: 'Failed to get page' });
   }
@@ -339,7 +363,25 @@ router.patch('/:id', async (req: Request, res: Response) => {
       values
     );
 
-    res.json({ page: result.rows[0] });
+    const updatedPage = result.rows[0];
+
+    // Invalidate page cache on update
+    await invalidatePageCache(id);
+
+    // If parent changed, also invalidate old and new parent caches
+    if (parent_id !== undefined && parent_id !== page.parent_id) {
+      if (page.parent_id) {
+        await invalidatePageCache(page.parent_id);
+      }
+      if (parent_id) {
+        await invalidatePageCache(parent_id);
+      }
+    }
+
+    // Track metrics
+    pageEditsCounter.inc({ operation_type: 'update' });
+
+    res.json({ page: updatedPage });
   } catch (error) {
     console.error('Update page error:', error);
     res.status(500).json({ error: 'Failed to update page' });
@@ -383,6 +425,20 @@ router.delete('/:id', async (req: Request, res: Response) => {
     if (permanent === 'true') {
       // Permanent delete
       await pool.query('DELETE FROM pages WHERE id = $1', [id]);
+
+      // Audit log for permanent deletion
+      await auditLogger.logPageDeleted(
+        req.user!.id,
+        id,
+        {
+          title: page.title,
+          permanent: true,
+          workspaceId: page.workspace_id,
+        },
+        req.ip || null,
+        req.headers['user-agent'] || null
+      );
+
       res.json({ message: 'Page permanently deleted' });
     } else {
       // Soft delete (archive)
@@ -390,8 +446,31 @@ router.delete('/:id', async (req: Request, res: Response) => {
         'UPDATE pages SET is_archived = true WHERE id = $1',
         [id]
       );
+
+      // Audit log for archive
+      await auditLogger.logPageDeleted(
+        req.user!.id,
+        id,
+        {
+          title: page.title,
+          permanent: false,
+          workspaceId: page.workspace_id,
+        },
+        req.ip || null,
+        req.headers['user-agent'] || null
+      );
       res.json({ message: 'Page archived' });
     }
+
+    // Invalidate caches for deleted/archived page
+    await invalidatePageCache(id);
+    if (page.parent_id) {
+      await invalidatePageCache(page.parent_id);
+    }
+    await invalidateWorkspaceCache(page.workspace_id);
+
+    // Track metrics
+    pageEditsCounter.inc({ operation_type: 'delete' });
   } catch (error) {
     console.error('Delete page error:', error);
     res.status(500).json({ error: 'Failed to delete page' });

@@ -6,6 +6,17 @@ import { getDriverByUserId } from '../services/auth.js';
 import { haversineDistance, calculateETA } from '../utils/geo.js';
 import { broadcast, broadcastToChannels } from '../websocket.js';
 
+// Shared modules
+import logger from '../shared/logger.js';
+import {
+  driversActive,
+  driversAvailable,
+  driverLocationUpdates,
+  deliveryDuration,
+  etaAccuracy,
+} from '../shared/metrics.js';
+import { auditOrderStatusChange, ACTOR_TYPES } from '../shared/audit.js';
+
 const router = Router();
 
 const LOCATION_TTL = 300; // 5 minutes TTL for location data
@@ -46,6 +57,9 @@ router.post('/location', requireAuth, async (req, res) => {
     });
     await redisClient.expire(`driver:${driver.id}`, LOCATION_TTL);
 
+    // Record metric
+    driverLocationUpdates.inc();
+
     // Broadcast location to subscribers (customers tracking their orders)
     const activeOrders = await query(
       `SELECT id, customer_id FROM orders WHERE driver_id = $1 AND status IN ('CONFIRMED', 'PREPARING', 'READY_FOR_PICKUP', 'PICKED_UP')`,
@@ -64,7 +78,7 @@ router.post('/location', requireAuth, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Update location error:', err);
+    logger.error({ error: err.message }, 'Update location error');
     res.status(500).json({ error: 'Failed to update location' });
   }
 });
@@ -79,10 +93,21 @@ router.post('/status', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Not registered as driver' });
     }
 
+    const wasActive = driver.is_active;
+
     await query(`UPDATE drivers SET is_active = $1, is_available = $1, updated_at = NOW() WHERE id = $2`, [
       isActive,
       driver.id,
     ]);
+
+    // Update metrics
+    if (isActive && !wasActive) {
+      driversActive.inc();
+      driversAvailable.inc();
+    } else if (!isActive && wasActive) {
+      driversActive.dec();
+      driversAvailable.dec();
+    }
 
     if (!isActive) {
       // Remove from geo index when going offline
@@ -90,9 +115,11 @@ router.post('/status', requireAuth, async (req, res) => {
       await redisClient.del(`driver:${driver.id}`);
     }
 
+    logger.info({ driverId: driver.id, isActive }, 'Driver status changed');
+
     res.json({ isActive });
   } catch (err) {
-    console.error('Update status error:', err);
+    logger.error({ error: err.message }, 'Update status error');
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
@@ -138,7 +165,7 @@ router.get('/orders', requireAuth, async (req, res) => {
 
     res.json({ orders });
   } catch (err) {
-    console.error('Get driver orders error:', err);
+    logger.error({ error: err.message }, 'Get driver orders error');
     res.status(500).json({ error: 'Failed to get orders' });
   }
 });
@@ -164,6 +191,7 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
     }
 
     const order = orderResult.rows[0];
+    const previousStatus = order.status;
 
     if (order.status !== 'READY_FOR_PICKUP') {
       return res.status(400).json({ error: `Cannot pickup order in ${order.status} status` });
@@ -175,12 +203,23 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
       [orderId]
     );
 
+    // Create audit log
+    await auditOrderStatusChange(
+      order,
+      previousStatus,
+      'PICKED_UP',
+      { type: ACTOR_TYPES.DRIVER, id: req.user.id },
+      { ip: req.ip, userAgent: req.get('User-Agent') }
+    );
+
     // Get updated order with details
     const updatedOrder = await getOrderWithDetails(orderId);
 
     // Recalculate ETA
     const eta = calculateETA(updatedOrder, driver, updatedOrder.restaurant);
     await query('UPDATE orders SET estimated_delivery_at = $1 WHERE id = $2', [eta.eta, orderId]);
+
+    logger.info({ orderId, driverId: driver.id }, 'Order picked up');
 
     // Broadcast update
     broadcastToChannels(
@@ -194,7 +233,7 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
 
     res.json({ order: updatedOrder, eta });
   } catch (err) {
-    console.error('Pickup order error:', err);
+    logger.error({ error: err.message, orderId: req.params.orderId }, 'Pickup order error');
     res.status(500).json({ error: 'Failed to pickup order' });
   }
 });
@@ -217,6 +256,7 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
     }
 
     const order = orderResult.rows[0];
+    const previousStatus = order.status;
 
     if (order.status !== 'PICKED_UP') {
       return res.status(400).json({ error: `Cannot deliver order in ${order.status} status` });
@@ -233,8 +273,42 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
       driver.id,
     ]);
 
+    // Update metrics
+    driversAvailable.inc();
+
+    // Record delivery time
+    if (order.placed_at) {
+      const deliveryTimeMinutes = (Date.now() - new Date(order.placed_at).getTime()) / 60000;
+      deliveryDuration.observe(deliveryTimeMinutes);
+
+      // Calculate ETA accuracy if we had an estimate
+      if (order.estimated_delivery_at) {
+        const estimatedTime = new Date(order.estimated_delivery_at).getTime();
+        const actualTime = Date.now();
+        const diffMinutes = (actualTime - estimatedTime) / 60000;
+        etaAccuracy.observe(diffMinutes);
+      }
+    }
+
+    // Create audit log
+    await auditOrderStatusChange(
+      order,
+      previousStatus,
+      'DELIVERED',
+      { type: ACTOR_TYPES.DRIVER, id: req.user.id },
+      { ip: req.ip, userAgent: req.get('User-Agent') }
+    );
+
     // Get updated order
     const updatedOrder = await getOrderWithDetails(orderId);
+
+    logger.info({
+      orderId,
+      driverId: driver.id,
+      deliveryTimeMinutes: order.placed_at
+        ? Math.round((Date.now() - new Date(order.placed_at).getTime()) / 60000)
+        : null,
+    }, 'Order delivered');
 
     // Broadcast update
     broadcastToChannels(
@@ -247,7 +321,7 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
 
     res.json({ order: updatedOrder });
   } catch (err) {
-    console.error('Deliver order error:', err);
+    logger.error({ error: err.message, orderId: req.params.orderId }, 'Deliver order error');
     res.status(500).json({ error: 'Failed to deliver order' });
   }
 });
@@ -295,7 +369,7 @@ router.get('/stats', requireAuth, async (req, res) => {
       activeOrders: parseInt(activeResult.rows[0].active_orders) || 0,
     });
   } catch (err) {
-    console.error('Get driver stats error:', err);
+    logger.error({ error: err.message }, 'Get driver stats error');
     res.status(500).json({ error: 'Failed to get stats' });
   }
 });

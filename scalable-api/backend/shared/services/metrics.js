@@ -1,7 +1,14 @@
 import { normalizePath, percentile } from '../utils/index.js';
+import config from '../config/index.js';
 
 /**
  * Metrics service for collecting and exposing Prometheus-compatible metrics
+ *
+ * WHY per-endpoint metrics enable optimization:
+ * - Identify slow endpoints that need caching or query optimization
+ * - Detect endpoints with high error rates for targeted fixes
+ * - Enable SLO monitoring per API endpoint
+ * - Support capacity planning based on actual usage patterns
  */
 export class MetricsService {
   constructor() {
@@ -9,15 +16,24 @@ export class MetricsService {
     this.histograms = new Map();
     this.gauges = new Map();
     this.startTime = Date.now();
+
+    // Track queue depths for various components
+    this.queueDepths = new Map();
+
+    // Track circuit breaker states
+    this.circuitBreakerStates = new Map();
+
+    // Per-endpoint latency tracking for optimization insights
+    this.endpointLatencies = new Map();
   }
 
   /**
    * Increment a counter
    */
-  increment(name, labels = {}) {
+  increment(name, labels = {}, amount = 1) {
     const key = this.formatKey(name, labels);
     const current = this.counters.get(key) || 0;
-    this.counters.set(key, current + 1);
+    this.counters.set(key, current + amount);
   }
 
   /**
@@ -47,6 +63,8 @@ export class MetricsService {
 
   /**
    * Record HTTP request metrics
+   * WHY per-endpoint metrics: Enable identifying slow endpoints, high error rates,
+   * and usage patterns for targeted optimization and capacity planning.
    */
   recordRequest(data) {
     const { method, path, status, duration } = data;
@@ -54,6 +72,9 @@ export class MetricsService {
 
     this.increment('http_requests_total', { method, path: normalizedPath, status });
     this.observe('http_request_duration_ms', duration, { method, path: normalizedPath });
+
+    // Track per-endpoint latency for optimization insights
+    this.trackEndpointLatency(method, path, duration);
   }
 
   /**
@@ -76,6 +97,94 @@ export class MetricsService {
 
   recordCacheMiss() {
     this.increment('cache_misses_total');
+  }
+
+  /**
+   * Record queue depth for monitoring
+   * WHY: Queue depth is a leading indicator of system health.
+   * Rising queue depths indicate processing bottlenecks before they cause failures.
+   */
+  recordQueueDepth(queueName, depth) {
+    this.queueDepths.set(queueName, {
+      depth,
+      timestamp: Date.now(),
+    });
+    this.gauge('queue_depth', depth, { queue: queueName });
+  }
+
+  /**
+   * Record circuit breaker state changes
+   */
+  recordCircuitBreakerState(name, state, stats = {}) {
+    this.circuitBreakerStates.set(name, {
+      state,
+      stats,
+      timestamp: Date.now(),
+    });
+    // Map state to numeric value for graphing
+    const stateValue = { closed: 0, half_open: 1, open: 2 }[state.replace('-', '_')] ?? -1;
+    this.gauge('circuit_breaker_state', stateValue, { name });
+    this.gauge('circuit_breaker_failures', stats.failedCalls || 0, { name });
+  }
+
+  /**
+   * Track per-endpoint latency for optimization
+   */
+  trackEndpointLatency(method, path, duration) {
+    const normalizedPath = normalizePath(path);
+    const key = `${method}:${normalizedPath}`;
+
+    if (!this.endpointLatencies.has(key)) {
+      this.endpointLatencies.set(key, {
+        count: 0,
+        totalDuration: 0,
+        min: Infinity,
+        max: 0,
+        p50: 0,
+        p90: 0,
+        p99: 0,
+        samples: [],
+      });
+    }
+
+    const stats = this.endpointLatencies.get(key);
+    stats.count++;
+    stats.totalDuration += duration;
+    stats.min = Math.min(stats.min, duration);
+    stats.max = Math.max(stats.max, duration);
+    stats.samples.push(duration);
+
+    // Keep only last 1000 samples
+    if (stats.samples.length > 1000) {
+      stats.samples = stats.samples.slice(-1000);
+    }
+
+    // Recalculate percentiles
+    stats.p50 = percentile(stats.samples, 50);
+    stats.p90 = percentile(stats.samples, 90);
+    stats.p99 = percentile(stats.samples, 99);
+  }
+
+  /**
+   * Get slow endpoints that may need optimization
+   */
+  getSlowEndpoints(thresholdMs = 500) {
+    const slow = [];
+    for (const [key, stats] of this.endpointLatencies) {
+      if (stats.p90 > thresholdMs) {
+        const [method, path] = key.split(':');
+        slow.push({
+          method,
+          path,
+          avgDuration: stats.totalDuration / stats.count,
+          p50: stats.p50,
+          p90: stats.p90,
+          p99: stats.p99,
+          count: stats.count,
+        });
+      }
+    }
+    return slow.sort((a, b) => b.p90 - a.p90);
   }
 
   /**
@@ -233,6 +342,23 @@ export class MetricsService {
       requests,
       errors,
       durations,
+      queueDepths: Object.fromEntries(this.queueDepths),
+      circuitBreakers: Object.fromEntries(this.circuitBreakerStates),
+      slowEndpoints: this.getSlowEndpoints(500),
+      endpointLatencies: Object.fromEntries(
+        Array.from(this.endpointLatencies.entries()).map(([key, stats]) => [
+          key,
+          {
+            count: stats.count,
+            avgDuration: stats.totalDuration / stats.count,
+            min: stats.min === Infinity ? 0 : stats.min,
+            max: stats.max,
+            p50: stats.p50,
+            p90: stats.p90,
+            p99: stats.p99,
+          },
+        ])
+      ),
       counters: Object.fromEntries(this.counters),
       gauges: Object.fromEntries(this.gauges),
     };
@@ -263,6 +389,9 @@ export class MetricsService {
     this.counters.clear();
     this.histograms.clear();
     this.gauges.clear();
+    this.queueDepths.clear();
+    this.circuitBreakerStates.clear();
+    this.endpointLatencies.clear();
     this.startTime = Date.now();
   }
 }

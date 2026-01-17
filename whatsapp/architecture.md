@@ -1234,3 +1234,256 @@ Phase 4: Global Scale
 | API response p99 | ~300ms | < 200ms |
 | WebSocket connections per server | 500 | 10,000 |
 | Messages per second | 100 | 1,000 |
+
+---
+
+## Implementation Notes
+
+This section documents key implementation decisions and explains the rationale behind each pattern used in the codebase.
+
+### Why Delivery Receipts Require Idempotent Status Updates
+
+**Problem**: Message status transitions (sent -> delivered -> read) can be triggered multiple times due to:
+- Network retries when acknowledgments are lost
+- Cross-server routing via Redis pub/sub creating race conditions
+- Client reconnections triggering re-delivery of pending messages
+- Distributed systems lacking global ordering guarantees
+
+**Solution**: Implement idempotent status updates using conditional database writes.
+
+```sql
+-- Only update if the new status is more progressed than current
+UPDATE message_status
+SET status = $new_status
+WHERE message_id = $1 AND recipient_id = $2
+  AND CASE status WHEN 'sent' THEN 0 WHEN 'delivered' THEN 1 WHEN 'read' THEN 2 END
+  < CASE $new_status WHEN 'sent' THEN 0 WHEN 'delivered' THEN 1 WHEN 'read' THEN 2 END
+```
+
+**Benefits**:
+- Status can only progress forward, never backwards
+- Duplicate delivery confirmations are safely ignored
+- Race conditions resolve deterministically
+- No distributed locks required
+
+**Implementation**: See `/backend/src/shared/deliveryTracker.ts` - `idempotentStatusUpdate()`
+
+---
+
+### Why Rate Limiting Prevents Spam
+
+**Problem**: Without rate limiting, malicious or malfunctioning clients can:
+- Flood the messaging pipeline with thousands of messages per second
+- Exhaust server resources (memory, CPU, database connections)
+- Degrade service quality for legitimate users
+- Enable denial-of-service attacks
+
+**Solution**: Implement sliding window rate limiting at multiple levels.
+
+```
+Rate Limits Applied:
+├── REST API
+│   ├── Login: 5 attempts / 15 minutes (per IP)
+│   ├── Register: 3 accounts / hour (per IP)
+│   └── Message send: 60 messages / minute (per user)
+│
+└── WebSocket
+    ├── Messages: 30 / 10 seconds (burst), 60 / minute (sustained)
+    └── Typing: 10 / minute (prevents indicator spam)
+```
+
+**Benefits**:
+- Protects infrastructure from abuse
+- Ensures fair resource allocation among users
+- Reduces cost by rejecting excess traffic early
+- Provides natural backpressure to misbehaving clients
+
+**Implementation**: See `/backend/src/shared/rateLimiter.ts`
+
+---
+
+### Why Circuit Breakers Protect the Messaging Pipeline
+
+**Problem**: When Redis or PostgreSQL becomes slow or unavailable:
+- Threads/connections pile up waiting for timeouts
+- Memory exhaustion from queued operations
+- Cascading failures across dependent services
+- Extended recovery time due to thundering herd on restoration
+
+**Solution**: Implement the circuit breaker pattern for external dependencies.
+
+```
+Circuit States:
+┌──────────┐     failures > threshold     ┌──────────┐
+│  CLOSED  │ ───────────────────────────> │   OPEN   │
+│ (normal) │                              │(fail-fast)│
+└──────────┘                              └──────────┘
+     ^                                          │
+     │                                          │ timeout
+     │                                          v
+     │     success                        ┌──────────┐
+     └─────────────────────────────────── │HALF-OPEN │
+                                          │(testing) │
+                                          └──────────┘
+```
+
+**Configuration** (tuned for messaging):
+- **Timeout**: 3 seconds (messages should be fast)
+- **Error threshold**: 50% (catch genuine failures, not transient blips)
+- **Reset timeout**: 30 seconds (give services time to recover)
+
+**Benefits**:
+- Fails fast instead of hanging, improving UX
+- Prevents resource exhaustion during outages
+- Allows the failing service time to recover
+- Enables graceful degradation (local-only mode when Redis fails)
+
+**Implementation**: See `/backend/src/shared/circuitBreaker.ts`
+
+---
+
+### Why Metrics Enable Delivery Optimization
+
+**Problem**: Without visibility into message delivery:
+- Performance issues go undetected until users complain
+- Cannot identify bottlenecks (database, Redis, network)
+- No data to support capacity planning decisions
+- Unable to verify SLO compliance
+
+**Solution**: Comprehensive Prometheus metrics at every stage of delivery.
+
+```
+Key Metrics Collected:
+├── Message Lifecycle
+│   ├── whatsapp_messages_total{status=sent|delivered|read|failed}
+│   └── whatsapp_message_delivery_duration_seconds{delivery_type=local|cross_server|pending}
+│
+├── Connection Health
+│   ├── whatsapp_websocket_connections_total
+│   └── whatsapp_websocket_events_total{event=connect|disconnect|error|timeout}
+│
+├── Protection Mechanisms
+│   ├── whatsapp_rate_limit_hits_total{endpoint}
+│   └── whatsapp_circuit_breaker_state{name} (0=closed, 0.5=half-open, 1=open)
+│
+└── Infrastructure
+    ├── whatsapp_http_request_duration_seconds{method,route,status_code}
+    └── whatsapp_db_query_duration_seconds{operation}
+```
+
+**SLO Monitoring Examples**:
+```
+# Alert when message delivery p95 exceeds 200ms
+histogram_quantile(0.95, whatsapp_message_delivery_duration_seconds) > 0.2
+
+# Alert when delivery rate drops below 99%
+sum(rate(whatsapp_messages_total{status="delivered"}[5m]))
+/ sum(rate(whatsapp_messages_total{status="sent"}[5m])) < 0.99
+```
+
+**Benefits**:
+- Real-time visibility into delivery performance
+- Proactive identification of bottlenecks
+- Data-driven capacity planning
+- Verifiable SLO compliance
+- Foundation for A/B testing optimizations
+
+**Implementation**: See `/backend/src/shared/metrics.ts` and `/metrics` endpoint
+
+---
+
+### Retry Logic with Exponential Backoff
+
+**Problem**: Transient failures (network blips, momentary overloads) are common in distributed systems. Immediate retries can amplify load during issues.
+
+**Solution**: Exponential backoff with jitter spreads retry load over time.
+
+```
+Retry Progression:
+Attempt 1: 100ms + jitter (0-20ms)
+Attempt 2: 200ms + jitter
+Attempt 3: 400ms + jitter
+Attempt 4: 800ms + jitter
+Attempt 5: 1600ms + jitter (capped at maxDelay)
+```
+
+**Key Decisions**:
+- **Jitter**: Randomized delay prevents thundering herd when many retries fire together
+- **Non-retryable errors**: Unique constraint violations, auth failures, validation errors
+- **Operation-specific configs**: DB operations use shorter delays than message delivery
+
+**Implementation**: See `/backend/src/shared/retry.ts`
+
+---
+
+### Structured Logging with Pino
+
+**Problem**: Console.log statements are:
+- Difficult to parse and aggregate
+- Lack consistent structure for monitoring tools
+- Missing correlation IDs for distributed tracing
+- Expensive to search in production
+
+**Solution**: Structured JSON logging with consistent event types.
+
+```json
+{
+  "level": "info",
+  "time": 1704067200000,
+  "service": "whatsapp-api",
+  "server_id": "server-3001",
+  "event": "message_sent",
+  "message_id": "uuid",
+  "conversation_id": "uuid",
+  "sender_id": "uuid",
+  "content_type": "text"
+}
+```
+
+**Benefits**:
+- Efficient log aggregation (ELK, Datadog, CloudWatch)
+- Distributed tracing via correlation IDs
+- Consistent format for alerting rules
+- Low overhead (pino is the fastest Node.js logger)
+
+**Implementation**: See `/backend/src/shared/logger.ts`
+
+---
+
+### Health Check Design
+
+**Problem**: Simple "OK" health checks don't provide enough information for:
+- Kubernetes readiness probes (should we route traffic here?)
+- Load balancer decisions (is this instance healthy?)
+- Debugging degraded performance
+
+**Solution**: Tiered health checks with component status.
+
+```
+GET /health
+{
+  "status": "healthy|degraded|unhealthy",
+  "server": "server-3001",
+  "connections": 45,
+  "checks": {
+    "database": { "status": "healthy", "latency": 5 },
+    "redis": { "status": "healthy", "latency": 2 },
+    "circuits": { "status": "healthy" }
+  },
+  "circuits": {
+    "redis": { "state": "closed" },
+    "database": { "state": "closed" }
+  }
+}
+
+GET /live   - Process is running (liveness probe)
+GET /ready  - Can accept traffic (readiness probe)
+```
+
+**Status Logic**:
+- **healthy**: All components operational
+- **degraded**: Some components impaired but functional (e.g., Redis down but DB works)
+- **unhealthy**: Critical components failing (e.g., database unavailable)
+
+**Implementation**: See `/backend/src/index.ts` health endpoints
+

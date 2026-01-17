@@ -35,6 +35,7 @@
     "@types/express-session": "^1.17.10",
     "@types/node": "^20.10.0",
     "@types/pg": "^8.10.9",
+    "@types/pino-http": "^5.8.4",
     "@types/uuid": "^9.0.7",
     "@typescript-eslint/eslint-plugin": "^6.14.0",
     "@typescript-eslint/parser": "^6.14.0",

@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { query } from '../services/db.js';
+import { loginRateLimiter } from '../services/rateLimiter.js';
+import logger from '../services/logger.js';
+import { authAttempts, activeSessions } from '../services/metrics.js';
 
 const router = Router();
 
@@ -29,6 +32,7 @@ router.post('/register', async (req, res) => {
     );
 
     if (existingUser.rows.length > 0) {
+      authAttempts.labels('register', 'failure').inc();
       return res.status(409).json({ error: 'Username or email already exists' });
     }
 
@@ -50,6 +54,17 @@ router.post('/register', async (req, res) => {
     req.session.userId = user.id;
     req.session.username = user.username;
     req.session.role = user.role;
+    req.session.isVerified = user.role === 'verified' || user.role === 'admin';
+
+    // Track metrics
+    authAttempts.labels('register', 'success').inc();
+    activeSessions.inc();
+
+    logger.info({
+      type: 'user_registered',
+      userId: user.id,
+      username: user.username,
+    }, `User registered: ${user.username}`);
 
     res.status(201).json({
       user: {
@@ -66,13 +81,17 @@ router.post('/register', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Registration error:', error);
+    authAttempts.labels('register', 'failure').inc();
+    logger.error({
+      type: 'registration_error',
+      error: error.message,
+    }, `Registration error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Login
-router.post('/login', async (req, res) => {
+// Login - with rate limiting to prevent brute force
+router.post('/login', loginRateLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -89,6 +108,13 @@ router.post('/login', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      authAttempts.labels('login', 'failure').inc();
+      logger.warn({
+        type: 'login_failed',
+        reason: 'user_not_found',
+        username: username.toLowerCase(),
+        ip: req.ip,
+      }, `Login failed: user not found - ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -97,13 +123,34 @@ router.post('/login', async (req, res) => {
     // Verify password
     const isValid = await bcrypt.compare(password, user.password_hash);
     if (!isValid) {
+      authAttempts.labels('login', 'failure').inc();
+      logger.warn({
+        type: 'login_failed',
+        reason: 'invalid_password',
+        userId: user.id,
+        username: user.username,
+        ip: req.ip,
+      }, `Login failed: invalid password - ${user.username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Set session
+    // Set session with role information
     req.session.userId = user.id;
     req.session.username = user.username;
     req.session.role = user.role;
+    req.session.isVerified = user.role === 'verified' || user.role === 'admin';
+
+    // Track metrics
+    authAttempts.labels('login', 'success').inc();
+    activeSessions.inc();
+
+    logger.info({
+      type: 'login_success',
+      userId: user.id,
+      username: user.username,
+      role: user.role,
+      ip: req.ip,
+    }, `User logged in: ${user.username}`);
 
     res.json({
       user: {
@@ -120,17 +167,39 @@ router.post('/login', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Login error:', error);
+    authAttempts.labels('login', 'failure').inc();
+    logger.error({
+      type: 'login_error',
+      error: error.message,
+    }, `Login error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Logout
 router.post('/logout', (req, res) => {
+  const userId = req.session?.userId;
+  const username = req.session?.username;
+
   req.session.destroy((err) => {
     if (err) {
+      logger.error({
+        type: 'logout_error',
+        error: err.message,
+        userId,
+      }, `Logout error: ${err.message}`);
       return res.status(500).json({ error: 'Could not log out' });
     }
+
+    // Track metrics
+    activeSessions.dec();
+
+    logger.info({
+      type: 'logout',
+      userId,
+      username,
+    }, `User logged out: ${username}`);
+
     res.clearCookie('connect.sid');
     res.json({ message: 'Logged out successfully' });
   });
@@ -169,7 +238,11 @@ router.get('/me', (req, res) => {
       });
     })
     .catch((error) => {
-      console.error('Get me error:', error);
+      logger.error({
+        type: 'get_me_error',
+        error: error.message,
+        userId: req.session.userId,
+      }, `Get me error: ${error.message}`);
       res.status(500).json({ error: 'Internal server error' });
     });
 });
