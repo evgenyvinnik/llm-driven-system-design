@@ -1,0 +1,54 @@
+{
+  "name": "venmo",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "email": "alice@example.com",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='email'], input[type='email']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "03-pay",
+      "path": "/pay",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-request",
+      "path": "/request",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-wallet",
+      "path": "/wallet",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

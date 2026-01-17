@@ -1,0 +1,26 @@
+{
+  "name": "jira",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "02-projects",
+      "path": "/projects",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

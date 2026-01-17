@@ -1,0 +1,41 @@
+{
+  "name": "kindle-highlights-backend",
+  "version": "1.0.0",
+  "description": "Backend for Kindle Community Highlights platform",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm:dev:*\"",
+    "dev:highlight": "node --watch --experimental-strip-types src/highlight/index.ts",
+    "dev:sync": "node --watch --experimental-strip-types src/sync/index.ts",
+    "dev:aggregation": "node --watch --experimental-strip-types src/aggregation/index.ts",
+    "dev:social": "node --watch --experimental-strip-types src/social/index.ts",
+    "dev:worker": "node --watch --experimental-strip-types src/aggregation/worker.ts",
+    "build": "tsc",
+    "start": "node dist/highlight/index.js",
+    "db:migrate": "node --experimental-strip-types src/db/migrate.ts",
+    "db:seed": "node --experimental-strip-types src/db/seed.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.0.1",
+    "pg": "^8.13.1",
+    "redis": "^4.7.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.13",
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

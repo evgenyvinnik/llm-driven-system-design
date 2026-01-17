@@ -1,0 +1,32 @@
+{
+  "name": "job-scheduler",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-dashboard",
+      "path": "/dashboard",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "02-jobs",
+      "path": "/jobs",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "03-workers",
+      "path": "/workers",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

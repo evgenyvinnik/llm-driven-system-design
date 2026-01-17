@@ -1,0 +1,38 @@
+{
+  "name": "ad-click-aggregator",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-dashboard",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "02-campaigns",
+      "path": "/campaigns",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "03-analytics",
+      "path": "/analytics",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-clicks",
+      "path": "/clicks",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

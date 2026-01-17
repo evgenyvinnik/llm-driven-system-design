@@ -1,0 +1,44 @@
+{
+  "name": "web-crawler",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-dashboard",
+      "path": "/dashboard",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "02-domains",
+      "path": "/domains",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "03-frontier",
+      "path": "/frontier",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-pages",
+      "path": "/pages",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-admin",
+      "path": "/admin",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

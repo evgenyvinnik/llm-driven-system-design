@@ -1,0 +1,48 @@
+{
+  "name": "reddit",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username'], input[type='text']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "03-search",
+      "path": "/search?q=programming",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-submit",
+      "path": "/submit",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

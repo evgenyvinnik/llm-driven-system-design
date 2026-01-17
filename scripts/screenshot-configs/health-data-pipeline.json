@@ -1,0 +1,54 @@
+{
+  "name": "health-data-pipeline",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "email": "alice@example.com",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='email'], input[type='email']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-dashboard",
+      "path": "/dashboard",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "03-devices",
+      "path": "/devices",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-metrics",
+      "path": "/metrics",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-admin",
+      "path": "/admin",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

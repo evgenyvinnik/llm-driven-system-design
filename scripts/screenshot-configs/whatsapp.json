@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

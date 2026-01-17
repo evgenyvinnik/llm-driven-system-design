@@ -1,0 +1,44 @@
+{
+  "name": "stripe",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "02-payments",
+      "path": "/payments",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "03-customers",
+      "path": "/customers",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-balance",
+      "path": "/balance",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-webhooks",
+      "path": "/webhooks",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

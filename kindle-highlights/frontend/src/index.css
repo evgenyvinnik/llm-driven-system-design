@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: Georgia, Cambria, 'Times New Roman', Times, serif;
+  background-color: #faf8f5;
+  color: #1a1a1a;
+}
+
+.highlight-yellow {
+  @apply bg-kindle-yellow/60;
+}
+
+.highlight-orange {
+  @apply bg-kindle-orange/60;
+}
+
+.highlight-blue {
+  @apply bg-kindle-blue/60;
+}
+
+.highlight-green {
+  @apply bg-kindle-green/60;
+}
+
+.highlight-pink {
+  @apply bg-kindle-pink/60;
+}
+
+.prose {
+  @apply leading-relaxed text-lg;
+}
+
+.prose p {
+  @apply mb-4;
+}

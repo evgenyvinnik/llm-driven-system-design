@@ -1282,3 +1282,238 @@ class ComputeOptimization {
 | **Total** | ~2 GB | ~3.5 cores | ~2 GB |
 
 This fits comfortably on a development machine while simulating the key architectural patterns used at scale.
+
+---
+
+## Frontend Architecture
+
+### Technology Stack
+
+| Technology | Purpose |
+|------------|---------|
+| **React 19** | UI framework with concurrent features |
+| **TypeScript** | Type safety and developer experience |
+| **Vite** | Fast development server and build tool |
+| **TanStack Router** | Type-safe file-based routing |
+| **Zustand** | Lightweight state management |
+| **Tailwind CSS** | Utility-first styling |
+
+### Project Structure
+
+```
+frontend/
+├── src/
+│   ├── api/
+│   │   └── client.ts         # API client with typed endpoints
+│   ├── components/           # Reusable UI components
+│   ├── hooks/                # Custom React hooks
+│   ├── routes/               # File-based route components
+│   │   ├── __root.tsx        # Root layout with navigation
+│   │   ├── index.tsx         # Home page
+│   │   ├── login.tsx         # Authentication
+│   │   ├── register.tsx      # User registration
+│   │   ├── library.tsx       # User's book library
+│   │   ├── books.$bookId.tsx # Book detail with highlights
+│   │   ├── trending.tsx      # Popular highlights
+│   │   └── export.tsx        # Export functionality
+│   ├── stores/
+│   │   └── useStore.ts       # Zustand global state
+│   ├── index.css             # Tailwind styles
+│   └── main.tsx              # Application entry point
+├── public/                   # Static assets
+├── index.html                # HTML template
+└── package.json              # Dependencies and scripts
+```
+
+### State Management
+
+**Global State (Zustand)**:
+```typescript
+interface AppState {
+  // Authentication
+  user: User | null
+  isAuthenticated: boolean
+  setUser: (user: User | null) => void
+  logout: () => void
+
+  // Highlights cache
+  highlights: Highlight[]
+  setHighlights: (highlights: Highlight[]) => void
+  addHighlight: (highlight: Highlight) => void
+  removeHighlight: (id: string) => void
+
+  // Library
+  library: Book[]
+  setLibrary: (books: Book[]) => void
+
+  // UI State
+  selectedBookId: string | null
+  searchQuery: string
+}
+```
+
+**State Persistence**:
+- User session persisted to localStorage
+- Highlights fetched fresh on each page load
+- Session token stored for API authentication
+
+### Routing Structure
+
+| Route | Component | Description |
+|-------|-----------|-------------|
+| `/` | `index.tsx` | Landing page with feature overview |
+| `/login` | `login.tsx` | User login form |
+| `/register` | `register.tsx` | New user registration |
+| `/library` | `library.tsx` | User's books and all highlights |
+| `/books/:bookId` | `books.$bookId.tsx` | Book detail with tabs for my/popular/friends highlights |
+| `/trending` | `trending.tsx` | Trending highlights across all books |
+| `/export` | `export.tsx` | Export highlights in various formats |
+
+### API Integration
+
+The frontend communicates with backend services through a centralized API client:
+
+```typescript
+// Typed API client with authentication
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const sessionId = localStorage.getItem('sessionId')
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(sessionId && { Authorization: `Bearer ${sessionId}` }),
+  }
+
+  const response = await fetch(`/api${path}`, { ...options, headers })
+  if (!response.ok) throw new Error(await response.json())
+  return response.json()
+}
+
+// Usage
+const highlights = await getHighlights({ bookId: '123' })
+const popular = await getPopularHighlights(bookId)
+await createHighlight({ bookId, text, locationStart, locationEnd })
+```
+
+### Component Architecture
+
+**Design Principles**:
+1. **Composition over inheritance** - Small, focused components
+2. **Colocation** - Related code lives together (routes contain their components)
+3. **Props drilling minimized** - Use Zustand for cross-component state
+4. **Type safety** - Full TypeScript coverage
+
+**Key Components**:
+
+| Component | Responsibility |
+|-----------|---------------|
+| `RootLayout` | Navigation, authentication status |
+| `HighlightCard` | Display single highlight with actions |
+| `BookCard` | Book preview in library grid |
+| `TabButton` | Tab navigation in book detail |
+| `FormatOption` | Export format selection |
+
+### Styling Approach
+
+**Tailwind Configuration**:
+```javascript
+// Custom Kindle-inspired color palette
+colors: {
+  kindle: {
+    cream: '#faf8f5',    // Background
+    sepia: '#f4ecd8',    // Alternate background
+    yellow: '#fff59d',   // Default highlight
+    orange: '#ffab91',   // Highlight color
+    blue: '#90caf9',     // Highlight color
+    green: '#a5d6a7',    // Highlight color
+    pink: '#f48fb1',     // Highlight color
+  },
+}
+```
+
+**Highlight Colors**:
+```css
+.highlight-yellow { @apply bg-kindle-yellow/60; }
+.highlight-orange { @apply bg-kindle-orange/60; }
+.highlight-blue { @apply bg-kindle-blue/60; }
+.highlight-green { @apply bg-kindle-green/60; }
+.highlight-pink { @apply bg-kindle-pink/60; }
+```
+
+### Authentication Flow
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Login     │───▶│  API Call   │───▶│  Store      │
+│   Form      │    │  /auth/login│    │  Session    │
+└─────────────┘    └─────────────┘    └─────────────┘
+                          │                   │
+                          ▼                   ▼
+                   ┌─────────────┐    ┌─────────────┐
+                   │ localStorage│    │  setUser()  │
+                   │ sessionId   │    │  Zustand    │
+                   └─────────────┘    └─────────────┘
+```
+
+1. User submits login form
+2. API returns session ID
+3. Session stored in localStorage
+4. User state updated in Zustand
+5. Protected routes check `isAuthenticated`
+
+### Performance Optimizations
+
+| Optimization | Implementation |
+|--------------|----------------|
+| **Code splitting** | Vite automatic route-based splitting |
+| **State persistence** | Only auth state persisted (via Zustand persist) |
+| **API caching** | Server-side caching via Redis (not client) |
+| **Lazy loading** | Routes loaded on demand |
+
+### Error Handling
+
+```typescript
+// Centralized error handling in API client
+try {
+  const data = await apiCall()
+} catch (error) {
+  if (error.message === 'Unauthorized') {
+    logout()
+    navigate('/login')
+  } else {
+    setError(error.message)
+  }
+}
+```
+
+### Development Workflow
+
+```bash
+# Start development
+npm run dev          # Vite dev server on :5173
+
+# Type checking
+npm run type-check   # tsc --noEmit
+
+# Production build
+npm run build        # TypeScript + Vite build
+
+# Preview production
+npm run preview      # Serve built files
+```
+
+### Proxy Configuration
+
+Vite proxies API requests to backend services:
+
+```typescript
+// vite.config.ts
+server: {
+  proxy: {
+    '/api': {
+      target: 'http://localhost:3001',
+      changeOrigin: true,
+    },
+  },
+}
+```
+
+For production, a reverse proxy (nginx) routes requests to appropriate services.
