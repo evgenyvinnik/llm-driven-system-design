@@ -29,11 +29,68 @@ This repository prioritizes **open-source and free technologies** for educationa
 - **Time Series:** TimescaleDB (PostgreSQL extension)
 
 **Application Stack:**
-- **Frontend:** TypeScript + Vite + Tanstack React
+- **Frontend:**
+  - **Core:** TypeScript + Vite + React 19 + React Compiler
+  - **Routing:** Tanstack Router
+  - **State Management:** Zustand
+  - **Styling:** Tailwind CSS
+  - **Code Quality:** ESLint + Prettier
+  - **Progressive Web App:** PWA support (offline-first, installable)
 - **Backend:** Node.js + Express
 - **Message Queue:** RabbitMQ, Apache Kafka
 - **Search:** Elasticsearch (or OpenSearch)
 - **Monitoring:** Prometheus + Grafana
+
+### Why This Frontend Stack?
+
+The chosen frontend stack balances modern best practices with learning accessibility:
+
+**React 19 + React Compiler:**
+- Latest stable React with built-in optimizations
+- React Compiler automatically memoizes components, reducing need for manual optimization
+- Allows focus on system design rather than performance micro-optimizations
+
+**Vite:**
+- Lightning-fast dev server and build tool
+- Minimal configuration, maximum productivity
+- Native ESM support for faster development
+
+**Tanstack Router:**
+- Type-safe routing with excellent TypeScript support
+- Built-in data loading and code splitting
+- Modern alternative to React Router with better developer experience
+
+**Zustand:**
+- Minimal, unopinionated state management
+- Less boilerplate than Redux, simpler than Context API for complex state
+- Easy to test and reason about
+- Scales well from simple to complex applications
+
+**Tailwind CSS:**
+- Utility-first approach speeds up UI development
+- Consistent design system out of the box
+- Smaller bundle sizes with tree-shaking
+- Reduces CSS complexity and naming conflicts
+
+**ESLint + Prettier:**
+- Enforces code quality and consistency
+- Catches common bugs early
+- Auto-formatting reduces cognitive load
+- Essential for collaborative learning projects
+
+**PWA Support:**
+- Teaches modern web capabilities (offline-first, installable apps)
+- Service workers demonstrate caching strategies
+- Push notifications show real-time system design concepts
+- Relevant for many system design scenarios (mobile-first, offline support)
+
+**When to deviate:** For specific use cases, consider alternatives:
+- **Next.js/Remix** for SSR/SSG requirements (SEO-critical apps, static content)
+- **Svelte/SvelteKit** for minimal bundle size requirements
+- **Solid.js** for maximum runtime performance
+- **Vue 3 + Nuxt** if team familiarity is higher
+
+Any deviation should include justification comparing bundle size, performance, developer experience, and learning value.
 
 ### Why Node.js + Express?
 
@@ -75,6 +132,200 @@ docker-compose up -d # PostgreSQL, Valkey, etc.
 ```
 
 This approach teaches distributed system concepts without requiring cloud infrastructure.
+
+### Frontend Project Setup
+
+When creating a frontend application for any system design project, follow this standardized setup:
+
+**1. Initialize Project:**
+```bash
+npm create vite@latest frontend -- --template react-ts
+cd frontend
+```
+
+**2. Install Core Dependencies:**
+```bash
+# State management
+npm install zustand
+
+# Routing
+npm install @tanstack/react-router
+npm install -D @tanstack/router-vite-plugin
+
+# Styling
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+
+# PWA
+npm install -D vite-plugin-pwa
+```
+
+**3. Install Development Tools:**
+```bash
+# Linting and formatting
+npm install -D eslint @typescript-eslint/parser @typescript-eslint/eslint-plugin
+npm install -D prettier eslint-config-prettier eslint-plugin-prettier
+npm install -D eslint-plugin-react eslint-plugin-react-hooks
+
+# React Compiler (experimental, optional)
+npm install -D babel-plugin-react-compiler
+```
+
+**4. Configure Tailwind (`tailwind.config.js`):**
+```javascript
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+```
+
+**5. Configure PWA (`vite.config.ts`):**
+```typescript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
+import { TanStackRouterVite } from '@tanstack/router-vite-plugin'
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        plugins: [
+          ['babel-plugin-react-compiler', { target: '19' }] // Optional: React Compiler
+        ]
+      }
+    }),
+    TanStackRouterVite(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      includeAssets: ['favicon.ico', 'robots.txt', 'apple-touch-icon.png'],
+      manifest: {
+        name: 'Your App Name',
+        short_name: 'App',
+        description: 'Your app description',
+        theme_color: '#ffffff',
+        icons: [
+          {
+            src: 'pwa-192x192.png',
+            sizes: '192x192',
+            type: 'image/png'
+          },
+          {
+            src: 'pwa-512x512.png',
+            sizes: '512x512',
+            type: 'image/png'
+          }
+        ]
+      }
+    })
+  ],
+})
+```
+
+**6. ESLint Configuration (`.eslintrc.cjs`):**
+```javascript
+module.exports = {
+  root: true,
+  env: { browser: true, es2020: true },
+  extends: [
+    'eslint:recommended',
+    'plugin:@typescript-eslint/recommended',
+    'plugin:react-hooks/recommended',
+    'plugin:react/recommended',
+    'plugin:react/jsx-runtime',
+    'prettier'
+  ],
+  ignorePatterns: ['dist', '.eslintrc.cjs'],
+  parser: '@typescript-eslint/parser',
+  plugins: ['react-refresh', 'prettier'],
+  rules: {
+    'react-refresh/only-export-components': [
+      'warn',
+      { allowConstantExport: true },
+    ],
+    'prettier/prettier': 'error'
+  },
+  settings: {
+    react: {
+      version: '19'
+    }
+  }
+}
+```
+
+**7. Prettier Configuration (`.prettierrc`):**
+```json
+{
+  "semi": false,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "es5",
+  "printWidth": 100,
+  "arrowParens": "avoid"
+}
+```
+
+**8. Package.json Scripts:**
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
+    "type-check": "tsc --noEmit"
+  }
+}
+```
+
+**9. Project Structure:**
+```
+frontend/
+├── public/
+│   ├── pwa-192x192.png
+│   ├── pwa-512x512.png
+│   └── favicon.ico
+├── src/
+│   ├── components/      # Reusable UI components
+│   ├── routes/          # Tanstack Router routes
+│   ├── stores/          # Zustand stores
+│   ├── services/        # API clients and services
+│   ├── hooks/           # Custom React hooks
+│   ├── types/           # TypeScript type definitions
+│   ├── utils/           # Helper functions
+│   ├── App.tsx
+│   ├── main.tsx
+│   └── index.css        # Tailwind imports
+├── .eslintrc.cjs
+├── .prettierrc
+├── tailwind.config.js
+├── tsconfig.json
+├── vite.config.ts
+└── package.json
+```
+
+**10. Tailwind in CSS (`src/index.css`):**
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+**Key Development Practices:**
+- Use Zustand for global state, React state for local component state
+- Organize routes using Tanstack Router's file-based routing
+- Use Tailwind for styling, avoid custom CSS unless necessary
+- Run `npm run lint` and `npm run format` before commits
+- Test PWA features using Chrome DevTools (Application tab)
+- Keep components small and focused (single responsibility)
 
 ## 💬 Communicating with Claude: Detail is Key
 
