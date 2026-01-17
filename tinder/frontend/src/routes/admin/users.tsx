@@ -3,6 +3,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useState, useEffect } from 'react';
 import { adminApi } from '../../services/api';
 import type { User } from '../../types';
+import ReignsAvatar from '../../components/ReignsAvatar';
 
 function AdminUsersPage() {
   const { isAuthenticated, user: currentUser } = useAuthStore();
@@ -96,8 +97,11 @@ function AdminUsersPage() {
                 <div key={user.id} className="p-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className="w-12 h-12 rounded-full bg-gray-200 flex items-center justify-center text-gray-500 font-bold">
-                        {user.name[0]}
+                      <div className="w-12 h-12 rounded-full overflow-hidden bg-gray-800">
+                        <ReignsAvatar
+                          seed={`${user.id}-${user.name}`}
+                          size={48}
+                        />
                       </div>
                       <div>
                         <p className="font-medium">{user.name}</p>

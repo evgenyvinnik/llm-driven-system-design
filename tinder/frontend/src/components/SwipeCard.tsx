@@ -1,15 +1,20 @@
 import { useState, useRef } from 'react';
-import type { DiscoveryCard, Photo } from '../types';
+import type { DiscoveryCard } from '../types';
+import ReignsAvatar from './ReignsAvatar';
 
 interface SwipeCardProps {
   card: DiscoveryCard;
   isActive: boolean;
   onSwipe?: (direction: 'like' | 'pass') => void;
+  useReignsStyle?: boolean; // Enable Reigns: Her Majesty style avatars
 }
 
-export default function SwipeCard({ card, isActive, onSwipe }: SwipeCardProps) {
+export default function SwipeCard({ card, isActive, onSwipe, useReignsStyle = true }: SwipeCardProps) {
   const [currentPhotoIndex, setCurrentPhotoIndex] = useState(0);
   const [showInfo, setShowInfo] = useState(false);
+
+  // Generate a unique seed for the avatar based on user ID and name
+  const avatarSeed = `${card.user_id}-${card.name}`;
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [dragDelta, setDragDelta] = useState({ x: 0, y: 0 });
   const cardRef = useRef<HTMLDivElement>(null);
@@ -112,9 +117,13 @@ export default function SwipeCard({ card, isActive, onSwipe }: SwipeCardProps) {
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseLeave}
     >
-      {/* Photo */}
+      {/* Photo or Reigns-style Avatar */}
       <div className="relative w-full h-full">
-        {currentPhoto ? (
+        {useReignsStyle ? (
+          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-gray-900 to-gray-800">
+            <ReignsAvatar seed={avatarSeed} size={400} className="rounded-lg shadow-2xl" />
+          </div>
+        ) : currentPhoto ? (
           <img
             src={currentPhoto.url}
             alt={card.name}
@@ -122,13 +131,13 @@ export default function SwipeCard({ card, isActive, onSwipe }: SwipeCardProps) {
             draggable={false}
           />
         ) : (
-          <div className="w-full h-full bg-gradient-to-br from-gray-200 to-gray-300 flex items-center justify-center">
-            <span className="text-6xl text-gray-400 font-bold">{card.name[0]}</span>
+          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-gray-900 to-gray-800">
+            <ReignsAvatar seed={avatarSeed} size={400} className="rounded-lg shadow-2xl" />
           </div>
         )}
 
         {/* Photo navigation indicators */}
-        {photos.length > 1 && (
+        {!useReignsStyle && photos.length > 1 && (
           <div className="absolute top-2 left-0 right-0 flex justify-center gap-1 px-4">
             {photos.map((_, index) => (
               <div
@@ -142,7 +151,7 @@ export default function SwipeCard({ card, isActive, onSwipe }: SwipeCardProps) {
         )}
 
         {/* Photo navigation touch areas */}
-        {photos.length > 1 && (
+        {!useReignsStyle && photos.length > 1 && (
           <>
             <button
               onClick={prevPhoto}

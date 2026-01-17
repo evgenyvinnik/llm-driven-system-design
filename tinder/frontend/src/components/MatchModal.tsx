@@ -1,5 +1,6 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import type { SwipeResult } from '../types';
+import ReignsAvatar from './ReignsAvatar';
 
 interface MatchModalProps {
   match: SwipeResult['match'];
@@ -42,18 +43,11 @@ export default function MatchModal({ match, onClose }: MatchModalProps) {
 
         {/* Matched user photo */}
         <div className="mb-8">
-          <div className="w-32 h-32 mx-auto rounded-full overflow-hidden border-4 border-gradient-start shadow-lg">
-            {match.user.primary_photo ? (
-              <img
-                src={match.user.primary_photo}
-                alt={match.user.name}
-                className="w-full h-full object-cover"
-              />
-            ) : (
-              <div className="w-full h-full bg-gray-200 flex items-center justify-center text-gray-400 text-4xl font-bold">
-                {match.user.name[0]}
-              </div>
-            )}
+          <div className="w-32 h-32 mx-auto rounded-full overflow-hidden border-4 border-gradient-start shadow-lg bg-gray-800">
+            <ReignsAvatar
+              seed={`${match.user.id}-${match.user.name}`}
+              size={128}
+            />
           </div>
           <p className="mt-3 font-semibold text-lg">{match.user.name}</p>
         </div>

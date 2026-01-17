@@ -2,6 +2,7 @@ import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useMatchStore } from '../stores/matchStore';
 import { useEffect, useState, useRef } from 'react';
+import ReignsAvatar from '../components/ReignsAvatar';
 
 function ChatPage() {
   const { matchId } = Route.useParams();
@@ -78,18 +79,11 @@ function ChatPage() {
           </svg>
         </Link>
         <div className="flex items-center flex-1">
-          <div className="w-10 h-10 rounded-full bg-gray-200 overflow-hidden">
-            {match.user.primary_photo ? (
-              <img
-                src={match.user.primary_photo}
-                alt={match.user.name}
-                className="w-full h-full object-cover"
-              />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center text-gray-400 font-bold">
-                {match.user.name[0]}
-              </div>
-            )}
+          <div className="w-10 h-10 rounded-full overflow-hidden bg-gray-800">
+            <ReignsAvatar
+              seed={`${match.user.id}-${match.user.name}`}
+              size={40}
+            />
           </div>
           <h1 className="ml-3 font-semibold">{match.user.name}</h1>
         </div>

@@ -3,6 +3,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useMatchStore } from '../stores/matchStore';
 import { useEffect } from 'react';
 import BottomNav from '../components/BottomNav';
+import ReignsAvatar from '../components/ReignsAvatar';
 
 function MatchesPage() {
   const { isAuthenticated } = useAuthStore();
@@ -66,18 +67,11 @@ function MatchesPage() {
                 className="flex items-center p-4 bg-white hover:bg-gray-50 transition-colors"
               >
                 <div className="relative">
-                  <div className="w-14 h-14 rounded-full bg-gray-200 overflow-hidden">
-                    {match.user.primary_photo ? (
-                      <img
-                        src={match.user.primary_photo}
-                        alt={match.user.name}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-gray-400 text-xl font-bold">
-                        {match.user.name[0]}
-                      </div>
-                    )}
+                  <div className="w-14 h-14 rounded-full overflow-hidden bg-gray-800">
+                    <ReignsAvatar
+                      seed={`${match.user.id}-${match.user.name}`}
+                      size={56}
+                    />
                   </div>
                   {match.unread_count > 0 && (
                     <div className="absolute -top-1 -right-1 w-5 h-5 bg-gradient-start text-white text-xs rounded-full flex items-center justify-center">

@@ -3,6 +3,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useState } from 'react';
 import { userApi } from '../services/api';
 import BottomNav from '../components/BottomNav';
+import ReignsAvatar from '../components/ReignsAvatar';
 
 function ProfilePage() {
   const { isAuthenticated, user, logout, updateProfile } = useAuthStore();
@@ -56,18 +57,11 @@ function ProfilePage() {
         {/* Profile Photo */}
         <div className="card p-6 mb-4">
           <div className="flex items-center">
-            <div className="w-20 h-20 rounded-full bg-gray-200 overflow-hidden">
-              {user.photos && user.photos.length > 0 ? (
-                <img
-                  src={user.photos[0].url}
-                  alt={user.name}
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center text-gray-400 text-2xl font-bold">
-                  {user.name[0]}
-                </div>
-              )}
+            <div className="w-20 h-20 rounded-full overflow-hidden bg-gray-800">
+              <ReignsAvatar
+                seed={`${user.id}-${user.name}`}
+                size={80}
+              />
             </div>
             <div className="ml-4">
               <h2 className="text-xl font-semibold">{user.name}, {user.age}</h2>
