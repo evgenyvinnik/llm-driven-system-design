@@ -1,0 +1,19 @@
+{
+  "name": "llm-driven-system-design",
+  "private": true,
+  "type": "module",
+  "description": "System design learning repository with LLM-assisted implementations",
+  "scripts": {
+    "sloc": "node scripts/sloc.mjs",
+    "sloc:update": "node scripts/update-readme-sloc.mjs",
+    "screenshots": "node scripts/screenshots.mjs",
+    "screenshots:all": "node scripts/screenshots.mjs --all",
+    "screenshots:dry": "node scripts/screenshots.mjs --dry-run"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

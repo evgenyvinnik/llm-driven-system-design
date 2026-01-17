@@ -1,0 +1,33 @@
+{
+  "name": "scale-ai",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-drawing-game",
+      "path": "/draw",
+      "waitFor": "canvas, main",
+      "delay": 1000
+    },
+    {
+      "name": "02-admin-login",
+      "path": "/admin",
+      "waitFor": "form, main",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "03-implement",
+      "path": "/implement",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  }
+}

@@ -250,35 +250,15 @@ CREATE TABLE story_views (
 );
 CREATE INDEX idx_story_views_story ON story_views(story_id);
 
--- Direct messages
-CREATE TABLE conversations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE conversation_participants (
-    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    last_read_at TIMESTAMPTZ,
-    PRIMARY KEY (conversation_id, user_id)
-);
-CREATE INDEX idx_conv_participants_user ON conversation_participants(user_id);
-
-CREATE TABLE messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    content TEXT,
-    media_url VARCHAR(500),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_messages_conv ON messages(conversation_id, created_at DESC);
+-- Note: Direct Messages are stored in Cassandra, not PostgreSQL.
+-- See Cassandra Schema section below for DM tables.
 ```
 
 ### Cassandra Schema (Direct Messages)
 
-While PostgreSQL handles the core relational data (users, posts, follows), Cassandra is used for the high-write, time-ordered Direct Messages feature. This hybrid approach leverages each database's strengths.
+Direct Messages are stored in Cassandra, not PostgreSQL. This design choice leverages Cassandra's strengths for high-write, time-ordered data while PostgreSQL handles the relational data (users, posts, follows).
+
+**Schema file:** `backend/db/cassandra-init.cql`
 
 **Why Cassandra for DMs?**
 - **High-write throughput**: Messages are write-heavy (100:1 write:read ratio)

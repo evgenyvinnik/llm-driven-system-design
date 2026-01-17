@@ -1,0 +1,61 @@
+{
+  "name": "instagram",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username'], input[type='text']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "nav, [data-testid='feed'], .feed"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-register",
+      "path": "/register",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "03-feed",
+      "path": "/",
+      "waitFor": "main, article, .post",
+      "delay": 1000
+    },
+    {
+      "name": "04-explore",
+      "path": "/explore",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "05-profile",
+      "path": "/profile/alice",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "06-create",
+      "path": "/create",
+      "waitFor": "main, form",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  }
+}

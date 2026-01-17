@@ -273,14 +273,38 @@ app.post('/services/:workspace/:channel/:token', async (req, res) => {
 
 ## Database Schema
 
+**Schema file:** `backend/src/db/migrate.ts`
+
 ```sql
+-- Users
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  username VARCHAR(100) NOT NULL,
+  display_name VARCHAR(200) NOT NULL,
+  avatar_url TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Workspaces
 CREATE TABLE workspaces (
   id UUID PRIMARY KEY,
   name VARCHAR(200) NOT NULL,
   domain VARCHAR(100) UNIQUE,
   settings JSONB,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Workspace members (role-based access)
+CREATE TABLE workspace_members (
+  workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(20) DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+  joined_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (workspace_id, user_id)
 );
 
 -- Channels
@@ -289,10 +313,13 @@ CREATE TABLE channels (
   workspace_id UUID REFERENCES workspaces(id),
   name VARCHAR(100) NOT NULL,
   topic TEXT,
+  description TEXT,
   is_private BOOLEAN DEFAULT FALSE,
   is_archived BOOLEAN DEFAULT FALSE,
+  is_dm BOOLEAN DEFAULT FALSE,
   created_by UUID REFERENCES users(id),
   created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(workspace_id, name)
 );
 
@@ -301,6 +328,7 @@ CREATE TABLE channel_members (
   channel_id UUID REFERENCES channels(id),
   user_id UUID REFERENCES users(id),
   joined_at TIMESTAMP DEFAULT NOW(),
+  last_read_at TIMESTAMP,
   PRIMARY KEY (channel_id, user_id)
 );
 
@@ -326,6 +354,29 @@ CREATE TABLE reactions (
   created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (message_id, user_id, emoji)
 );
+
+-- Direct messages (separate from channels for workspace isolation)
+CREATE TABLE direct_messages (
+  id UUID PRIMARY KEY,
+  workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Direct message members
+CREATE TABLE direct_message_members (
+  dm_id UUID REFERENCES direct_messages(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (dm_id, user_id)
+);
+
+-- Indexes
+CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
+CREATE INDEX idx_messages_thread ON messages(thread_ts) WHERE thread_ts IS NOT NULL;
+CREATE INDEX idx_messages_workspace ON messages(workspace_id);
+CREATE INDEX idx_channel_members_user ON channel_members(user_id);
+CREATE INDEX idx_workspace_members_user ON workspace_members(user_id);
+CREATE INDEX idx_reactions_message ON reactions(message_id);
+CREATE INDEX idx_messages_content_fts ON messages USING gin(to_tsvector('english', content));
 ```
 
 ---
@@ -397,18 +448,11 @@ async function sendMessage(workspaceId, channelId, userId, content, idempotencyK
       created_at: new Date()
     }).returning('*')
 
-    // If this is a thread reply, update parent atomically
+    // If this is a thread reply, update parent reply count atomically
     if (msg.thread_ts) {
       await trx('messages')
         .where({ id: msg.thread_ts })
         .increment('reply_count', 1)
-        .update({
-          latest_reply: msg.created_at,
-          reply_users: trx.raw(
-            "array_append(array_remove(reply_users, ?), ?)",
-            [userId, userId]
-          )
-        })
     }
 
     return msg

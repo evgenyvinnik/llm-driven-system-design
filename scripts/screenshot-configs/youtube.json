@@ -1,0 +1,44 @@
+{
+  "name": "youtube",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "02-trending",
+      "path": "/trending",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "03-subscriptions",
+      "path": "/subscriptions",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "04-history",
+      "path": "/history",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-studio",
+      "path": "/studio",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

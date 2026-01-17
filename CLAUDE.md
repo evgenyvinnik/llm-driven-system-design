@@ -178,10 +178,27 @@ backend/src/
 │   ├── queue.ts         # RabbitMQ client
 │   └── auth.ts          # Authentication middleware
 └── db/
-    ├── migrations/      # SQL migration files (001_*.sql, 002_*.sql, ...)
+    ├── init.sql         # Database schema (consolidated)
     ├── migrate.ts       # Migration runner
     └── seed-*.ts        # Database seeders
 ```
+
+### Database Schema Files
+
+SQL schemas are stored as `init.sql` files (not numbered migrations). Common locations:
+
+| Location | Examples |
+|----------|----------|
+| `backend/src/db/init.sql` | scale-ai, discord, calendly, twitter |
+| `backend/db/init.sql` | instagram, airbnb, youtube, doordash |
+| `backend/init.sql` | slack (embedded in migrate.ts), dropbox, whatsapp |
+| `backend/scripts/init.sql` | google-search, shopify |
+
+For projects using multiple databases:
+- **Cassandra**: `backend/db/cassandra-init.cql` (e.g., instagram DMs)
+- **ClickHouse**: `backend/db/clickhouse-init.sql` (e.g., ad-click-aggregator)
+
+The `npm run db:migrate` command runs `migrate.ts` which executes `init.sql` against the database.
 
 Tests use vitest with mocked shared modules. Test files are co-located with source files (`app.test.ts` next to `app.ts`). Mock shared modules before importing the app:
 

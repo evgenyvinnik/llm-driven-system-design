@@ -1,0 +1,36 @@
+{
+  "name": "discord",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username'], input[type='text']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "[data-testid='chat'], .server-list, aside"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-chat",
+      "path": "/",
+      "waitFor": "main, aside",
+      "delay": 1500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

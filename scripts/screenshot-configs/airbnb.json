@@ -1,0 +1,54 @@
+{
+  "name": "airbnb",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "email": "alice@example.com",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='email'], input[type='email']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main, nav"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-home",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "03-search",
+      "path": "/search",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "04-become-host",
+      "path": "/become-host",
+      "waitFor": "main",
+      "delay": 500
+    },
+    {
+      "name": "05-messages",
+      "path": "/messages",
+      "waitFor": "main",
+      "delay": 500
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}
