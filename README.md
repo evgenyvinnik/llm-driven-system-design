@@ -85,6 +85,7 @@ Each folder contains an independent implementation of a system design problem:
 - [Design Notion](./notion/) - Collaborative workspace with blocks
 - [Design Jira](./jira/) - Issue tracking and project management
 - [Design Collaborative Editor](./collaborative-editor/) - Real-time document editing
+- [Design AI Code Assistant](./ai-code-assistant/) - CLI coding assistant like Claude Code/Cursor
 
 ### Financial Services & Payments
 - [Design Robinhood](./robinhood/) - Stock trading platform
@@ -122,7 +123,8 @@ Each project folder contains:
 
 - **README.md** - Implementation guide, setup instructions, and testing details
 - **architecture.md** - System design documentation, architectural decisions, and trade-offs
-- **claude.md** - Collaboration notes, LLM-assisted development insights, and iteration history
+- **system-design-answer.md** - Interview-style answer (45-minute format) - abridged version of architecture.md for interview preparation
+- **CLAUDE.md** - Collaboration notes, LLM-assisted development insights, and iteration history
 - **Source code** - Actual implementation (varies by project)
 
 ## 🚀 Getting Started

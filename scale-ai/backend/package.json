@@ -13,6 +13,8 @@
     "dev:server3": "PORT=3003 npm run dev:inference",
     "db:migrate": "tsx src/db/migrate.ts",
     "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write \"src/**/*.ts\""
   },
@@ -30,13 +32,16 @@
     "@types/express": "^4.17.21",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.6",
+    "@types/supertest": "^6.0.2",
     "@types/uuid": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "concurrently": "^9.0.0",
     "eslint": "^9.0.0",
     "prettier": "^3.3.0",
+    "supertest": "^7.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
   }
 }

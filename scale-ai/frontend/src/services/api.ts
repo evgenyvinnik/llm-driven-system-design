@@ -61,12 +61,26 @@ export async function submitDrawing(data: DrawingSubmission): Promise<{ id: stri
   return response.json()
 }
 
-export async function getUserStats(): Promise<{ total_drawings: number; today_count: number }> {
+export async function getUserStats(): Promise<{
+  total_drawings: number
+  today_count: number
+  streak_days: number
+  shapes_completed: string[]
+  level: number
+}> {
   const response = await fetch(
     `${COLLECTION_API}/api/user/stats?sessionId=${getSessionId()}`
   )
   if (!response.ok) throw new Error('Failed to fetch user stats')
-  return response.json()
+  const data = await response.json()
+  // Add computed fields if not provided by backend
+  return {
+    total_drawings: data.total_drawings || 0,
+    today_count: data.today_count || 0,
+    streak_days: data.streak_days || 0,
+    shapes_completed: data.shapes_completed || [],
+    level: Math.floor((data.total_drawings || 0) / 10) + 1,
+  }
 }
 
 // ============================================

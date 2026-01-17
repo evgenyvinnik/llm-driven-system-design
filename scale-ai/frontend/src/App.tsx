@@ -3,12 +3,16 @@ import { PostItCanvas } from './components/PostItCanvas'
 import { AdminDashboard } from './routes/admin/AdminDashboard'
 import { ImplementorPortal } from './routes/implement/ImplementorPortal'
 import { submitDrawing, getUserStats } from './services/api'
+import { sounds, isSoundEnabled, setSoundEnabled } from './utils/sounds'
 import './App.css'
 
 type Shape = 'line' | 'heart' | 'circle' | 'square' | 'triangle'
 type View = 'draw' | 'admin' | 'implement'
 
 const SHAPES: Shape[] = ['line', 'heart', 'circle', 'square', 'triangle']
+
+// Milestone thresholds for celebrations
+const MILESTONES = [5, 10, 25, 50, 100, 250, 500, 1000]
 
 function App() {
   // Router state (simple hash-based routing)
@@ -23,9 +27,13 @@ function App() {
   const [currentShapeIndex, setCurrentShapeIndex] = useState(0)
   const [totalDrawings, setTotalDrawings] = useState(0)
   const [todayDrawings, setTodayDrawings] = useState(0)
+  const [streakDays, setStreakDays] = useState(0)
+  const [level, setLevel] = useState(1)
   const [showSuccess, setShowSuccess] = useState(false)
+  const [showMilestone, setShowMilestone] = useState<number | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [soundOn, setSoundOn] = useState(isSoundEnabled())
 
   const currentShape = SHAPES[currentShapeIndex]
 
@@ -48,6 +56,8 @@ function App() {
         const stats = await getUserStats()
         setTotalDrawings(stats.total_drawings)
         setTodayDrawings(stats.today_count)
+        setStreakDays(stats.streak_days)
+        setLevel(stats.level)
       } catch (err) {
         // Stats might fail if backend is not running, that's ok
         console.log('Could not load user stats:', err)
@@ -55,6 +65,14 @@ function App() {
     }
     loadStats()
   }, [])
+
+  // Toggle sound
+  const toggleSound = () => {
+    const newValue = !soundOn
+    setSoundOn(newValue)
+    setSoundEnabled(newValue)
+    if (newValue) sounds.click()
+  }
 
   const handleComplete = useCallback(
     async (strokeData: {
@@ -80,9 +98,21 @@ function App() {
           device: 'ontouchstart' in window ? 'touch' : 'mouse',
         })
 
+        const newTotal = totalDrawings + 1
+
+        // Check for milestone
+        if (MILESTONES.includes(newTotal)) {
+          setShowMilestone(newTotal)
+          sounds.levelUp()
+          setTimeout(() => setShowMilestone(null), 3000)
+        } else {
+          sounds.success()
+        }
+
         // Update local counts
-        setTotalDrawings((prev) => prev + 1)
+        setTotalDrawings(newTotal)
         setTodayDrawings((prev) => prev + 1)
+        setLevel(Math.floor(newTotal / 10) + 1)
 
         // Show success animation
         setShowSuccess(true)
@@ -93,12 +123,13 @@ function App() {
       } catch (err) {
         console.error('Failed to submit drawing:', err)
         setError('Failed to save drawing. Is the backend running?')
+        sounds.error()
         setTimeout(() => setError(null), 3000)
       } finally {
         setSubmitting(false)
       }
     },
-    [currentShape, submitting]
+    [currentShape, submitting, totalDrawings]
   )
 
   const navigate = (newView: View) => {
@@ -147,6 +178,9 @@ function App() {
         </button>
         <button onClick={() => navigate('admin')}>Admin</button>
         <button onClick={() => navigate('implement')}>Test Model</button>
+        <button className="sound-toggle" onClick={toggleSound} title={soundOn ? 'Mute sounds' : 'Enable sounds'}>
+          {soundOn ? '🔊' : '🔇'}
+        </button>
       </nav>
 
       {/* Stats header */}
@@ -163,6 +197,16 @@ function App() {
           <div className="stat">
             <span className="stat-value">{todayDrawings}</span>
             <span className="stat-label">Today</span>
+          </div>
+          {streakDays > 0 && (
+            <div className="stat streak">
+              <span className="stat-value">🔥 {streakDays}</span>
+              <span className="stat-label">Streak</span>
+            </div>
+          )}
+          <div className="stat level">
+            <span className="stat-value">Lv.{level}</span>
+            <span className="stat-label">{level * 10 - totalDrawings} to next</span>
           </div>
         </div>
       </header>
@@ -185,6 +229,15 @@ function App() {
         <div className="success-toast">
           <span className="success-icon">✓</span>
           <span className="success-text">Nice doodle!</span>
+        </div>
+      )}
+
+      {/* Milestone celebration */}
+      {showMilestone && (
+        <div className="milestone-toast">
+          <span className="milestone-icon">🎉</span>
+          <span className="milestone-text">{showMilestone} drawings!</span>
+          <span className="milestone-sub">You're on fire!</span>
         </div>
       )}
 
