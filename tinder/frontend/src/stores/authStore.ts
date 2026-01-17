@@ -20,7 +20,13 @@ interface AuthState {
   }) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
-  updateProfile: (data: Partial<User>) => Promise<void>;
+  updateProfile: (data: {
+    name?: string;
+    bio?: string;
+    job_title?: string;
+    company?: string;
+    school?: string;
+  }) => Promise<void>;
   updateLocation: (latitude: number, longitude: number) => Promise<void>;
   clearError: () => void;
 }

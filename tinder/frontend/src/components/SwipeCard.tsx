@@ -14,7 +14,7 @@ export default function SwipeCard({ card, isActive, onSwipe, useReignsStyle = tr
   const [showInfo, setShowInfo] = useState(false);
 
   // Generate a unique seed for the avatar based on user ID and name
-  const avatarSeed = `${card.user_id}-${card.name}`;
+  const avatarSeed = `${card.id}-${card.name}`;
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [dragDelta, setDragDelta] = useState({ x: 0, y: 0 });
   const cardRef = useRef<HTMLDivElement>(null);

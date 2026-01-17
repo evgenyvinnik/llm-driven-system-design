@@ -1,4 +1,4 @@
-import { Link, useNavigate } from '@tanstack/react-router';
+import { useNavigate } from '@tanstack/react-router';
 import type { SwipeResult } from '../types';
 import ReignsAvatar from './ReignsAvatar';
 

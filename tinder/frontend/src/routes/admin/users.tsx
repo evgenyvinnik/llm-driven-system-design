@@ -42,15 +42,6 @@ function AdminUsersPage() {
     }
   };
 
-  const handleUnban = async (userId: string) => {
-    try {
-      await adminApi.unbanUser(userId);
-      loadUsers();
-    } catch (error) {
-      console.error('Failed to unban user:', error);
-    }
-  };
-
   const handleDelete = async (userId: string) => {
     if (!window.confirm('Are you sure you want to DELETE this user? This cannot be undone.')) {
       return;

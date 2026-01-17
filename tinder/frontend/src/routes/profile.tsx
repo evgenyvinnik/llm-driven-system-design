@@ -1,7 +1,6 @@
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useState } from 'react';
-import { userApi } from '../services/api';
 import BottomNav from '../components/BottomNav';
 import ReignsAvatar from '../components/ReignsAvatar';
 

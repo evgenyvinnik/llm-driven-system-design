@@ -8,190 +8,97 @@
 // You should NOT make any changes in this file as it will be overwritten.
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
-import { createFileRoute } from '@tanstack/react-router'
+import { Route as rootRouteImport } from './routes/__root'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as ProfileRouteImport } from './routes/profile'
+import { Route as PreferencesRouteImport } from './routes/preferences'
+import { Route as MatchesRouteImport } from './routes/matches'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as AdminRouteImport } from './routes/admin'
+import { Route as IndexRouteImport } from './routes/index'
+import { Route as ChatMatchIdRouteImport } from './routes/chat.$matchId'
+import { Route as AdminUsersRouteImport } from './routes/admin/users'
 
-// Import Routes
-
-import { Route as rootRoute } from './routes/__root'
-import { Route as RegisterImport } from './routes/register'
-import { Route as ProfileImport } from './routes/profile'
-import { Route as PreferencesImport } from './routes/preferences'
-import { Route as MatchesImport } from './routes/matches'
-import { Route as LoginImport } from './routes/login'
-import { Route as AdminImport } from './routes/admin'
-import { Route as IndexImport } from './routes/index'
-import { Route as ChatMatchIdImport } from './routes/chat.$matchId'
-import { Route as AdminUsersImport } from './routes/admin/users'
-
-// Create Virtual Routes
-
-const ChatMatchIdLazyImport = createFileRoute('/chat/$matchId')()
-
-// Create/Update Routes
-
-const RegisterRoute = RegisterImport.update({
+const RegisterRoute = RegisterRouteImport.update({
   id: '/register',
   path: '/register',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const ProfileRoute = ProfileImport.update({
+const ProfileRoute = ProfileRouteImport.update({
   id: '/profile',
   path: '/profile',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const PreferencesRoute = PreferencesImport.update({
+const PreferencesRoute = PreferencesRouteImport.update({
   id: '/preferences',
   path: '/preferences',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const MatchesRoute = MatchesImport.update({
+const MatchesRoute = MatchesRouteImport.update({
   id: '/matches',
   path: '/matches',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const LoginRoute = LoginImport.update({
+const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const AdminRoute = AdminImport.update({
+const AdminRoute = AdminRouteImport.update({
   id: '/admin',
   path: '/admin',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const IndexRoute = IndexImport.update({
+const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const ChatMatchIdRoute = ChatMatchIdImport.update({
+const ChatMatchIdRoute = ChatMatchIdRouteImport.update({
   id: '/chat/$matchId',
   path: '/chat/$matchId',
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => rootRouteImport,
 } as any)
-
-const AdminUsersRoute = AdminUsersImport.update({
+const AdminUsersRoute = AdminUsersRouteImport.update({
   id: '/users',
-  path: '/admin/users',
-  getParentRoute: () => rootRoute,
+  path: '/users',
+  getParentRoute: () => AdminRoute,
 } as any)
-
-// Populate the FileRoutesByPath interface
-
-declare module '@tanstack/react-router' {
-  interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexImport
-      parentRoute: typeof rootRoute
-    }
-    '/admin': {
-      id: '/admin'
-      path: '/admin'
-      fullPath: '/admin'
-      preLoaderRoute: typeof AdminImport
-      parentRoute: typeof rootRoute
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginImport
-      parentRoute: typeof rootRoute
-    }
-    '/matches': {
-      id: '/matches'
-      path: '/matches'
-      fullPath: '/matches'
-      preLoaderRoute: typeof MatchesImport
-      parentRoute: typeof rootRoute
-    }
-    '/preferences': {
-      id: '/preferences'
-      path: '/preferences'
-      fullPath: '/preferences'
-      preLoaderRoute: typeof PreferencesImport
-      parentRoute: typeof rootRoute
-    }
-    '/profile': {
-      id: '/profile'
-      path: '/profile'
-      fullPath: '/profile'
-      preLoaderRoute: typeof ProfileImport
-      parentRoute: typeof rootRoute
-    }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterImport
-      parentRoute: typeof rootRoute
-    }
-    '/chat/$matchId': {
-      id: '/chat/$matchId'
-      path: '/chat/$matchId'
-      fullPath: '/chat/$matchId'
-      preLoaderRoute: typeof ChatMatchIdImport
-      parentRoute: typeof rootRoute
-    }
-    '/admin/users': {
-      id: '/admin/users'
-      path: '/admin/users'
-      fullPath: '/admin/users'
-      preLoaderRoute: typeof AdminUsersImport
-      parentRoute: typeof rootRoute
-    }
-  }
-}
-
-// Create and export the route tree
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/admin': typeof AdminRoute
+  '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/chat/$matchId': typeof ChatMatchIdRoute
   '/admin/users': typeof AdminUsersRoute
+  '/chat/$matchId': typeof ChatMatchIdRoute
 }
-
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/admin': typeof AdminRoute
+  '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/chat/$matchId': typeof ChatMatchIdRoute
   '/admin/users': typeof AdminUsersRoute
+  '/chat/$matchId': typeof ChatMatchIdRoute
 }
-
 export interface FileRoutesById {
-  __root__: typeof rootRoute
+  __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/admin': typeof AdminRoute
+  '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/chat/$matchId': typeof ChatMatchIdRoute
   '/admin/users': typeof AdminUsersRoute
+  '/chat/$matchId': typeof ChatMatchIdRoute
 }
-
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
@@ -202,8 +109,8 @@ export interface FileRouteTypes {
     | '/preferences'
     | '/profile'
     | '/register'
-    | '/chat/$matchId'
     | '/admin/users'
+    | '/chat/$matchId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -213,8 +120,8 @@ export interface FileRouteTypes {
     | '/preferences'
     | '/profile'
     | '/register'
-    | '/chat/$matchId'
     | '/admin/users'
+    | '/chat/$matchId'
   id:
     | '__root__'
     | '/'
@@ -224,35 +131,109 @@ export interface FileRouteTypes {
     | '/preferences'
     | '/profile'
     | '/register'
-    | '/chat/$matchId'
     | '/admin/users'
+    | '/chat/$matchId'
   fileRoutesById: FileRoutesById
 }
-
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  AdminRoute: typeof AdminRoute
+  AdminRoute: typeof AdminRouteWithChildren
   LoginRoute: typeof LoginRoute
   MatchesRoute: typeof MatchesRoute
   PreferencesRoute: typeof PreferencesRoute
   ProfileRoute: typeof ProfileRoute
   RegisterRoute: typeof RegisterRoute
   ChatMatchIdRoute: typeof ChatMatchIdRoute
+}
+
+declare module '@tanstack/react-router' {
+  interface FileRoutesByPath {
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/profile': {
+      id: '/profile'
+      path: '/profile'
+      fullPath: '/profile'
+      preLoaderRoute: typeof ProfileRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/preferences': {
+      id: '/preferences'
+      path: '/preferences'
+      fullPath: '/preferences'
+      preLoaderRoute: typeof PreferencesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/matches': {
+      id: '/matches'
+      path: '/matches'
+      fullPath: '/matches'
+      preLoaderRoute: typeof MatchesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/admin': {
+      id: '/admin'
+      path: '/admin'
+      fullPath: '/admin'
+      preLoaderRoute: typeof AdminRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/chat/$matchId': {
+      id: '/chat/$matchId'
+      path: '/chat/$matchId'
+      fullPath: '/chat/$matchId'
+      preLoaderRoute: typeof ChatMatchIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/admin/users': {
+      id: '/admin/users'
+      path: '/users'
+      fullPath: '/admin/users'
+      preLoaderRoute: typeof AdminUsersRouteImport
+      parentRoute: typeof AdminRoute
+    }
+  }
+}
+
+interface AdminRouteChildren {
   AdminUsersRoute: typeof AdminUsersRoute
 }
 
+const AdminRouteChildren: AdminRouteChildren = {
+  AdminUsersRoute: AdminUsersRoute,
+}
+
+const AdminRouteWithChildren = AdminRoute._addFileChildren(AdminRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  AdminRoute: AdminRoute,
+  AdminRoute: AdminRouteWithChildren,
   LoginRoute: LoginRoute,
   MatchesRoute: MatchesRoute,
   PreferencesRoute: PreferencesRoute,
   ProfileRoute: ProfileRoute,
   RegisterRoute: RegisterRoute,
   ChatMatchIdRoute: ChatMatchIdRoute,
-  AdminUsersRoute: AdminUsersRoute,
 }
-
-export const routeTree = rootRoute
+export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()

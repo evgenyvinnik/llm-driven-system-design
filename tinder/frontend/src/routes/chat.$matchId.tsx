@@ -6,7 +6,7 @@ import ReignsAvatar from '../components/ReignsAvatar';
 
 function ChatPage() {
   const { matchId } = Route.useParams();
-  const { isAuthenticated, user } = useAuthStore();
+  const { isAuthenticated } = useAuthStore();
   const {
     matches,
     messages,
