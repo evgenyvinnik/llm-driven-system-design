@@ -63,9 +63,9 @@ For local development:
 ### Core Components
 
 1. **Frontend (React 19 + Vite + Zustand + Tailwind CSS)**
-   - Canvas-based editor with 2D rendering
-   - Zustand for state management
-   - WebSocket hook for real-time sync
+   - PixiJS-based editor with hardware-accelerated WebGL rendering
+   - Zustand for centralized state management (editorStore)
+   - WebSocket hook for real-time collaboration sync
    - File browser and version history UI
 
 2. **Backend (Node.js + Express + WebSocket)**
@@ -81,6 +81,175 @@ For local development:
 4. **Redis**
    - Presence tracking (cursor positions, selections)
    - Pub/Sub for cross-server coordination
+
+### Frontend Architecture
+
+The frontend follows a unidirectional data flow pattern with clear component responsibilities:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              App.tsx                                        │
+│                    (Route: FileBrowser ↔ Editor)                           │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+            ┌────────────────────┴────────────────────┐
+            ▼                                         ▼
+┌──────────────────────┐               ┌───────────────────────────────────────┐
+│    FileBrowser.tsx   │               │              Editor.tsx               │
+│  ┌────────────────┐  │               │  (Main workspace container)           │
+│  │ File grid      │  │               │                                       │
+│  │ Create/Delete  │  │               │  ┌─────────────────────────────────┐  │
+│  └────────────────┘  │               │  │           Toolbar.tsx           │  │
+└──────────────────────┘               │  │  [Select|Hand|Shapes|Zoom|User] │  │
+                                       │  └─────────────────────────────────┘  │
+                                       │                                       │
+                                       │  ┌─────────┬───────────┬───────────┐  │
+                                       │  │ Layers  │  Canvas   │ Properties│  │
+                                       │  │ Panel   │           │  Panel    │  │
+                                       │  │ .tsx    │  .tsx     │  .tsx     │  │
+                                       │  └─────────┴───────────┴───────────┘  │
+                                       │                                       │
+                                       │  ┌─────────────────────────────────┐  │
+                                       │  │    VersionHistory.tsx (Modal)   │  │
+                                       │  └─────────────────────────────────┘  │
+                                       └───────────────────────────────────────┘
+```
+
+#### Component Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         State Management Flow                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────────────┐
+                    │         editorStore (Zustand)       │
+                    │  ┌───────────────────────────────┐  │
+                    │  │ • canvasData: CanvasData      │  │
+                    │  │ • selectedIds: string[]       │  │
+                    │  │ • activeTool: Tool            │  │
+                    │  │ • viewport: Viewport          │  │
+                    │  │ • collaborators: Presence[]   │  │
+                    │  │ • history: CanvasData[]       │  │
+                    │  └───────────────────────────────┘  │
+                    └────────────────┬────────────────────┘
+                                     │
+         ┌───────────────────────────┼───────────────────────────┐
+         │                           │                           │
+         ▼                           ▼                           ▼
+┌─────────────────┐       ┌───────────────────┐       ┌──────────────────┐
+│   LayersPanel   │       │      Canvas       │       │ PropertiesPanel  │
+│                 │       │                   │       │                  │
+│ • Object list   │       │ • PixiRenderer    │       │ • Property form  │
+│ • Visibility    │◄─────►│ • Mouse events    │◄─────►│ • Live updates   │
+│ • Lock/Unlock   │       │ • Draw tools      │       │ • Color/Size/Pos │
+│ • Layer order   │       │ • Selection       │       │                  │
+└─────────────────┘       └─────────┬─────────┘       └──────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────────┐
+                    │       PixiRenderer.ts           │
+                    │  (WebGL Rendering Engine)       │
+                    │                                 │
+                    │  ┌───────────────────────────┐  │
+                    │  │ • Application (PIXI.js)   │  │
+                    │  │ • ShapeFactory.ts         │  │
+                    │  │ • SelectionOverlay.ts     │  │
+                    │  │ • CollaboratorCursors     │  │
+                    │  └───────────────────────────┘  │
+                    └─────────────────────────────────┘
+```
+
+#### Real-time Collaboration Flow
+
+```
+┌─────────────┐                  ┌──────────────────┐                ┌─────────────┐
+│  Client A   │                  │      Server      │                │  Client B   │
+│             │                  │                  │                │             │
+│ editorStore │                  │  WebSocket Hub   │                │ editorStore │
+└──────┬──────┘                  └────────┬─────────┘                └──────┬──────┘
+       │                                  │                                 │
+       │  1. addObject() / updateObject() │                                 │
+       │      ↓                           │                                 │
+       │  2. sendOperation()              │                                 │
+       │ ─────────────────────────────────►                                 │
+       │                                  │                                 │
+       │                         3. Persist to DB                           │
+       │                         4. Broadcast                               │
+       │                                  │─────────────────────────────────►
+       │                                  │                                 │
+       │                                  │            5. Apply operation   │
+       │                                  │               to canvasData     │
+       │                                  │                    ↓            │
+       │                                  │            6. PixiRenderer      │
+       │                                  │               re-renders        │
+       │                                  │                                 │
+       │  7. Presence update (cursor)     │                                 │
+       │ ─────────────────────────────────►                                 │
+       │                                  │─────────────────────────────────►
+       │                                  │                                 │
+       │              (Cursor displayed on canvas)                          │
+       ▼                                  ▼                                 ▼
+```
+
+#### Renderer Architecture
+
+The PixiJS-based rendering pipeline provides hardware-accelerated graphics:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PixiRenderer.ts (365 lines)                          │
+│                      WebGL-based Rendering Engine                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+         ┌───────────────────────────┼───────────────────────────┐
+         │                           │                           │
+         ▼                           ▼                           ▼
+┌─────────────────┐       ┌───────────────────┐       ┌──────────────────┐
+│ ShapeFactory.ts │       │ SelectionOverlay  │       │ Collaborator     │
+│   (199 lines)   │       │    .ts (143 ln)   │       │ Cursors          │
+│                 │       │                   │       │                  │
+│ Creates PIXI    │       │ Draws selection   │       │ Renders other    │
+│ Graphics for:   │       │ handles, bounds   │       │ users' cursors   │
+│ • Rectangle     │       │ for selected      │       │ with colors      │
+│ • Ellipse       │       │ objects           │       │ and names        │
+│ • Text          │       │                   │       │                  │
+│ • Frame         │       │                   │       │                  │
+│ • Group         │       │                   │       │                  │
+└─────────────────┘       └───────────────────┘       └──────────────────┘
+         │                           │                           │
+         └───────────────────────────┼───────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────┐
+                    │     PIXI.Application Stage      │
+                    │     (WebGL Canvas Context)      │
+                    │                                 │
+                    │  ┌────────────────────────────┐ │
+                    │  │   objectsContainer         │ │
+                    │  │   (z-ordered shapes)       │ │
+                    │  ├────────────────────────────┤ │
+                    │  │   selectionContainer       │ │
+                    │  │   (overlays)               │ │
+                    │  ├────────────────────────────┤ │
+                    │  │   presenceContainer        │ │
+                    │  │   (collaborator cursors)   │ │
+                    │  └────────────────────────────┘ │
+                    └─────────────────────────────────┘
+```
+
+#### Key Frontend Files
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `stores/editorStore.ts` | 359 | Zustand store for all editor state (canvas, selection, viewport, history) |
+| `renderer/PixiRenderer.ts` | 365 | WebGL rendering engine wrapper around PixiJS |
+| `renderer/ShapeFactory.ts` | 199 | Creates PixiJS graphics for each shape type |
+| `renderer/SelectionOverlay.ts` | 143 | Draws selection bounds and resize handles |
+| `hooks/useWebSocket.ts` | 201 | Real-time collaboration via WebSocket |
+| `components/Canvas.tsx` | 296 | Main canvas with mouse/keyboard event handling |
+| `components/Editor.tsx` | 121 | Workspace layout composing all panels |
+| `services/api.ts` | ~80 | REST API client for files and versions |
 
 ## Data Model
 
@@ -991,7 +1160,7 @@ npx wscat -c ws://localhost:3000
 
 ## Future Optimizations
 
-1. **WebGL Rendering**: For performance with thousands of objects
+1. **Raw WebGL Shaders**: Custom shaders for advanced effects (blur, shadows, filters)
 2. **CRDT Library**: Yjs or Automerge for robust conflict resolution
 3. **Viewport Culling**: Only sync objects in view
 4. **Delta Compression**: Send only changed properties

@@ -4,11 +4,65 @@
 
 A minimalist text editor where **everything is a plugin**. The core application provides only a plugin host and slot system—even the text input area itself is provided by a plugin. This extreme modularity demonstrates plugin architecture patterns and allows complete customization.
 
+**The system consists of three main parts:**
+1. **Frontend**: React-based plugin host with slot system
+2. **Backend**: Marketplace API for plugin distribution
+3. **Standalone Plugins**: Independent projects built by different developers
+
 **Learning Goals:**
 - Design a plugin slot/contribution system
 - Build loosely-coupled plugin communication
 - Implement plugin lifecycle management
-- Create composable UI from independent plugins
+- Create a marketplace for plugin distribution
+- Handle both authenticated and anonymous users
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Frontend (React)                                │
+│  ┌────────────────────┐  ┌─────────────────────────────────────────────────┐│
+│  │   Plugin Host      │  │              Marketplace UI                      ││
+│  │  ┌──────────────┐  │  │  ┌───────────┐ ┌───────────┐ ┌───────────────┐ ││
+│  │  │ Event Bus    │  │  │  │ Browse    │ │ Install   │ │ Auth Modal    │ ││
+│  │  │ State Mgr    │  │  │  │ Plugins   │ │ Uninstall │ │ Login/Register│ ││
+│  │  │ Slot System  │  │  │  └───────────┘ └───────────┘ └───────────────┘ ││
+│  │  └──────────────┘  │  └─────────────────────────────────────────────────┘│
+│  └────────────────────┘                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      │ HTTP/REST
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Backend (Express.js)                               │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌──────────────┐ │
+│  │ Auth Routes   │  │ Plugin Routes │  │ User Plugins  │  │ Developer    │ │
+│  │ - Register    │  │ - Browse      │  │ - Install     │  │ - Publish    │ │
+│  │ - Login       │  │ - Search      │  │ - Uninstall   │  │ - Versions   │ │
+│  │ - Session     │  │ - Details     │  │ - Settings    │  │ - Manage     │ │
+│  └───────────────┘  └───────────────┘  └───────────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+         │                      │                      │
+         ▼                      ▼                      ▼
+    ┌─────────┐           ┌─────────┐            ┌─────────┐
+    │PostgreSQL│           │  Redis  │            │  MinIO  │
+    │ - Users │           │ - Cache │            │ Plugin  │
+    │ - Plugins│           │ - Session│           │ Bundles │
+    │ - Reviews│           └─────────┘            └─────────┘
+    └─────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Standalone Plugin Projects                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │paper-background│ │font-selector │  │text-editor   │  │word-count    │   │
+│  │ - package.json │ │ - package.json│ │ - package.json│ │ - package.json│  │
+│  │ - vite.config │ │ - vite.config │ │ - vite.config │ │ - vite.config │   │
+│  │ - src/index.tsx│ │ - src/index.tsx││ - src/index.tsx││ - src/index.tsx│  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -51,14 +105,132 @@ Unlike traditional editors where plugins extend a core, this editor has no core 
 2. **Slot System**: Plugins register UI components to named slots
 3. **Event Bus**: Plugins communicate via publish/subscribe events
 4. **State Sharing**: Plugins can read/write shared editor state
-5. **Plugin Settings**: Each plugin can have configurable options
+5. **Plugin Marketplace**: Browse, search, and install plugins
+6. **User Authentication**: Session-based auth (optional for users)
+7. **Plugin Publishing**: Developers can publish and manage plugins
 
 ### Non-Functional Requirements
 
 - **Isolation**: Plugin failures don't crash the host
-- **Performance**: Lazy loading, minimal overhead
-- **Developer Experience**: Hot reload, easy debugging
+- **Performance**: Lazy loading, Redis caching
+- **Developer Experience**: CLI tools, hot reload
 - **Composability**: Plugins work independently and together
+
+---
+
+## Backend Architecture
+
+### Database Schema
+
+```sql
+-- Users table
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  username VARCHAR(50) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  is_developer BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Plugins table
+CREATE TABLE plugins (
+  id VARCHAR(100) PRIMARY KEY,  -- e.g., 'font-selector'
+  author_id UUID REFERENCES users(id),
+  name VARCHAR(100) NOT NULL,
+  description TEXT,
+  category VARCHAR(50),
+  license VARCHAR(50) DEFAULT 'MIT',
+  repository_url TEXT,
+  homepage_url TEXT,
+  icon_url TEXT,
+  status VARCHAR(20) DEFAULT 'draft',  -- draft, published, suspended
+  install_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Plugin versions
+CREATE TABLE plugin_versions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  plugin_id VARCHAR(100) REFERENCES plugins(id) ON DELETE CASCADE,
+  version VARCHAR(20) NOT NULL,
+  bundle_url TEXT NOT NULL,
+  manifest JSONB NOT NULL,
+  changelog TEXT,
+  min_platform_version VARCHAR(20),
+  file_size INTEGER,
+  checksum VARCHAR(64),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(plugin_id, version)
+);
+
+-- User installed plugins
+CREATE TABLE user_plugins (
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  plugin_id VARCHAR(100) REFERENCES plugins(id) ON DELETE CASCADE,
+  version_installed VARCHAR(20),
+  is_enabled BOOLEAN DEFAULT true,
+  settings JSONB DEFAULT '{}',
+  installed_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (user_id, plugin_id)
+);
+
+-- Anonymous user installs (tracked by session)
+CREATE TABLE anonymous_installs (
+  session_id VARCHAR(255) NOT NULL,
+  plugin_id VARCHAR(100) REFERENCES plugins(id) ON DELETE CASCADE,
+  version_installed VARCHAR(20),
+  is_enabled BOOLEAN DEFAULT true,
+  settings JSONB DEFAULT '{}',
+  installed_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (session_id, plugin_id)
+);
+
+-- Plugin reviews
+CREATE TABLE plugin_reviews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  plugin_id VARCHAR(100) REFERENCES plugins(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  rating INTEGER CHECK (rating >= 1 AND rating <= 5),
+  title VARCHAR(200),
+  content TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(plugin_id, user_id)
+);
+```
+
+### API Endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/v1/auth/register` | POST | None | Create account |
+| `/api/v1/auth/login` | POST | None | Login |
+| `/api/v1/auth/logout` | POST | Session | Logout |
+| `/api/v1/auth/me` | GET | Session | Get current user |
+| `/api/v1/plugins` | GET | Optional | Browse/search plugins |
+| `/api/v1/plugins/:id` | GET | Optional | Plugin details |
+| `/api/v1/plugins/categories` | GET | None | List categories |
+| `/api/v1/user/plugins` | GET | Optional | Installed plugins |
+| `/api/v1/user/plugins/install` | POST | Optional | Install plugin |
+| `/api/v1/user/plugins/:id` | DELETE | Optional | Uninstall |
+| `/api/v1/developer/register` | POST | Required | Become developer |
+| `/api/v1/developer/plugins` | GET/POST | Required | Manage plugins |
+| `/api/v1/developer/plugins/:id/versions` | POST | Required | Publish version |
+
+### Caching Strategy
+
+```typescript
+// Redis cache keys
+plugins:list:{hash}     // Browse results (5 min TTL)
+plugins:detail:{id}     // Plugin details (10 min TTL)
+plugins:categories      // Category list (30 min TTL)
+
+// Cache invalidation
+- On version publish: delete detail + list patterns
+- On plugin update: delete detail + list patterns
+- On install/uninstall: increment install_count
+```
 
 ---
 
@@ -74,6 +246,7 @@ interface PluginManifest {
   name: string;                  // Display name
   version: string;               // Semver version
   description: string;           // What this plugin does
+  category?: string;             // formatting, appearance, utilities, etc.
 
   // What this plugin provides
   contributes: {
@@ -96,35 +269,30 @@ interface SlotContribution {
 }
 ```
 
-### Plugin API
+### Plugin Context API
 
 Plugins receive a context object with available APIs:
 
 ```typescript
 interface PluginContext {
-  // Unique plugin ID
   pluginId: string;
 
-  // Event bus for inter-plugin communication
   events: {
-    emit: (event: string, data?: any) => void;
-    on: (event: string, handler: (data: any) => void) => () => void;
+    emit: (event: string, data?: unknown) => void;
+    on: (event: string, handler: (data: unknown) => void) => () => void;
   };
 
-  // Shared editor state
   state: {
     get: <T>(key: string) => T | undefined;
-    set: (key: string, value: any) => void;
-    subscribe: (key: string, handler: (value: any) => void) => () => void;
+    set: (key: string, value: unknown) => void;
+    subscribe: (key: string, handler: (value: unknown) => void) => () => void;
   };
 
-  // Plugin-specific storage (persisted)
   storage: {
-    get: <T>(key: string) => Promise<T | undefined>;
-    set: (key: string, value: any) => Promise<void>;
+    get: <T>(key: string) => T | undefined;
+    set: (key: string, value: unknown) => void;
   };
 
-  // Command registration
   commands: {
     register: (id: string, handler: () => void) => void;
     execute: (id: string) => void;
@@ -132,387 +300,45 @@ interface PluginContext {
 }
 ```
 
----
-
-## Core Components
-
-### 1. Plugin Host
-
-The host manages plugin lifecycle and provides infrastructure:
+### Standard Events
 
 ```typescript
-class PluginHost {
-  private plugins: Map<string, LoadedPlugin> = new Map();
-  private slots: Map<string, SlotRenderer> = new Map();
-  private eventBus: EventBus;
-  private stateManager: StateManager;
-
-  async loadPlugin(manifest: PluginManifest): Promise<void> {
-    // 1. Validate manifest
-    this.validateManifest(manifest);
-
-    // 2. Load plugin module
-    const module = await import(`/plugins/${manifest.id}/index.js`);
-
-    // 3. Create plugin context
-    const context = this.createContext(manifest.id);
-
-    // 4. Initialize plugin
-    if (module.activate) {
-      await module.activate(context);
-    }
-
-    // 5. Register contributions
-    this.registerContributions(manifest, module);
-
-    this.plugins.set(manifest.id, { manifest, module, context });
-  }
-
-  private registerContributions(manifest: PluginManifest, module: any): void {
-    // Register slot contributions
-    for (const slot of manifest.contributes.slots || []) {
-      const component = module[slot.component];
-      if (component) {
-        this.slots.get(slot.slot)?.register({
-          pluginId: manifest.id,
-          component,
-          order: slot.order ?? 100
-        });
-      }
-    }
-
-    // Register commands
-    for (const cmd of manifest.contributes.commands || []) {
-      this.commandRegistry.register(cmd.id, module[cmd.handler]);
-    }
-  }
-}
+const EVENTS = {
+  CONTENT_CHANGED: 'editor:content-changed',
+  SELECTION_CHANGED: 'editor:selection-changed',
+  FONT_CHANGED: 'format:font-changed',
+  SIZE_CHANGED: 'format:size-changed',
+  PAPER_CHANGED: 'theme:paper-changed',
+  THEME_CHANGED: 'theme:mode-changed',
+};
 ```
 
-### 2. Slot System
+### Standard State Keys
+
+```typescript
+const STATE_KEYS = {
+  CONTENT: 'editor.content',
+  SELECTION: 'editor.selection',
+  FONT_FAMILY: 'format.fontFamily',
+  FONT_SIZE: 'format.fontSize',
+  PAPER: 'theme.paper',
+  THEME_MODE: 'theme.mode',
+};
+```
+
+---
+
+## Slot System
 
 Slots are named regions where plugins contribute UI:
 
-```typescript
-interface SlotDefinition {
-  id: string;
-  layout: 'horizontal' | 'vertical' | 'stack' | 'single';
-  allowMultiple: boolean;
-}
-
-const SLOTS: SlotDefinition[] = [
-  { id: 'toolbar', layout: 'horizontal', allowMultiple: true },
-  { id: 'canvas', layout: 'stack', allowMultiple: true },
-  { id: 'sidebar', layout: 'vertical', allowMultiple: true },
-  { id: 'statusbar', layout: 'horizontal', allowMultiple: true },
-  { id: 'modal', layout: 'single', allowMultiple: false }
-];
-
-// React component for rendering a slot
-function Slot({ id }: { id: string }) {
-  const contributions = useSlotContributions(id);
-  const layout = SLOTS.find(s => s.id === id)?.layout;
-
-  return (
-    <div className={`slot slot-${id} layout-${layout}`}>
-      {contributions
-        .sort((a, b) => a.order - b.order)
-        .map(contrib => (
-          <contrib.component
-            key={contrib.pluginId}
-            context={contrib.context}
-          />
-        ))}
-    </div>
-  );
-}
-```
-
-### 3. Event Bus
-
-Decoupled plugin communication:
-
-```typescript
-class EventBus {
-  private handlers: Map<string, Set<EventHandler>> = new Map();
-
-  emit(event: string, data?: any): void {
-    const handlers = this.handlers.get(event);
-    if (handlers) {
-      handlers.forEach(handler => {
-        try {
-          handler(data);
-        } catch (error) {
-          console.error(`Event handler error for ${event}:`, error);
-          // Don't let one plugin crash others
-        }
-      });
-    }
-  }
-
-  on(event: string, handler: EventHandler): () => void {
-    if (!this.handlers.has(event)) {
-      this.handlers.set(event, new Set());
-    }
-    this.handlers.get(event)!.add(handler);
-
-    // Return unsubscribe function
-    return () => this.handlers.get(event)?.delete(handler);
-  }
-}
-
-// Standard events that plugins can emit/subscribe to
-const STANDARD_EVENTS = {
-  // Editor content
-  'editor:content-changed': { content: string },
-  'editor:selection-changed': { start: number, end: number },
-
-  // Formatting
-  'format:font-changed': { fontFamily: string },
-  'format:size-changed': { fontSize: number },
-
-  // Theme
-  'theme:paper-changed': { paperId: string },
-
-  // Commands
-  'command:execute': { commandId: string }
-};
-```
-
-### 4. State Manager
-
-Shared reactive state:
-
-```typescript
-class StateManager {
-  private state: Map<string, any> = new Map();
-  private subscribers: Map<string, Set<(value: any) => void>> = new Map();
-
-  get<T>(key: string): T | undefined {
-    return this.state.get(key);
-  }
-
-  set(key: string, value: any): void {
-    const oldValue = this.state.get(key);
-    if (oldValue !== value) {
-      this.state.set(key, value);
-      this.notifySubscribers(key, value);
-    }
-  }
-
-  subscribe(key: string, handler: (value: any) => void): () => void {
-    if (!this.subscribers.has(key)) {
-      this.subscribers.set(key, new Set());
-    }
-    this.subscribers.get(key)!.add(handler);
-
-    // Immediately call with current value
-    if (this.state.has(key)) {
-      handler(this.state.get(key));
-    }
-
-    return () => this.subscribers.get(key)?.delete(handler);
-  }
-}
-
-// Standard state keys
-const STANDARD_STATE = {
-  'editor.content': '',           // Current text content
-  'editor.selection': null,       // Selection range
-  'format.fontFamily': 'system',  // Current font
-  'format.fontSize': 16,          // Font size in px
-  'theme.paper': 'plain',         // Paper background style
-};
-```
-
----
-
-## Bundled Plugins
-
-The editor ships with these plugins enabled by default:
-
-### 1. Text Editor Plugin (`@plugins/text-editor`)
-
-Provides the actual text editing area:
-
-```typescript
-// manifest.json
-{
-  "id": "text-editor",
-  "name": "Text Editor",
-  "version": "1.0.0",
-  "description": "Core text editing functionality",
-  "contributes": {
-    "slots": [
-      { "slot": "canvas", "component": "TextEditor", "order": 50 }
-    ]
-  },
-  "requires": {
-    "state": ["format.fontFamily", "format.fontSize", "theme.paper"]
-  }
-}
-
-// index.tsx
-export function TextEditor({ context }: PluginProps) {
-  const [content, setContent] = useState('');
-  const fontFamily = useStateValue(context, 'format.fontFamily');
-  const fontSize = useStateValue(context, 'format.fontSize');
-
-  const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
-    setContent(e.target.value);
-    context.state.set('editor.content', e.target.value);
-    context.events.emit('editor:content-changed', { content: e.target.value });
-  };
-
-  return (
-    <textarea
-      className="editor-textarea"
-      style={{ fontFamily, fontSize: `${fontSize}px` }}
-      value={content}
-      onChange={handleChange}
-      placeholder="Start typing..."
-    />
-  );
-}
-```
-
-### 2. Paper Background Plugin (`@plugins/paper-background`)
-
-Provides different paper styles as backgrounds:
-
-```typescript
-// manifest.json
-{
-  "id": "paper-background",
-  "name": "Paper Background",
-  "version": "1.0.0",
-  "description": "Choose different paper styles for your editor",
-  "contributes": {
-    "slots": [
-      { "slot": "canvas", "component": "PaperBackground", "order": 0 },
-      { "slot": "toolbar", "component": "PaperSelector", "order": 100 }
-    ],
-    "settings": [
-      {
-        "id": "defaultPaper",
-        "type": "select",
-        "default": "plain",
-        "options": ["plain", "ruled", "checkered", "dotted"]
-      }
-    ]
-  }
-}
-
-// Papers available
-const PAPERS = {
-  plain: {
-    name: 'Plain',
-    background: '#fff',
-    pattern: 'none'
-  },
-  ruled: {
-    name: 'Ruled',
-    background: '#fffef0',
-    pattern: 'repeating-linear-gradient(transparent, transparent 27px, #e0e0e0 28px)'
-  },
-  checkered: {
-    name: 'Checkered',
-    background: '#fff',
-    pattern: `
-      linear-gradient(90deg, #f0f0f0 1px, transparent 1px),
-      linear-gradient(#f0f0f0 1px, transparent 1px)
-    `,
-    patternSize: '20px 20px'
-  },
-  dotted: {
-    name: 'Dotted',
-    background: '#fff',
-    pattern: 'radial-gradient(#ccc 1px, transparent 1px)',
-    patternSize: '20px 20px'
-  }
-};
-```
-
-### 3. Font Selector Plugin (`@plugins/font-selector`)
-
-Provides font family and size selection:
-
-```typescript
-// manifest.json
-{
-  "id": "font-selector",
-  "name": "Font Selector",
-  "version": "1.0.0",
-  "description": "Choose fonts and sizes for your text",
-  "contributes": {
-    "slots": [
-      { "slot": "toolbar", "component": "FontSelector", "order": 10 }
-    ],
-    "settings": [
-      { "id": "defaultFont", "type": "string", "default": "system-ui" },
-      { "id": "defaultSize", "type": "number", "default": 16 }
-    ]
-  }
-}
-
-// Available fonts
-const FONTS = [
-  { id: 'system', name: 'System', value: 'system-ui, sans-serif' },
-  { id: 'serif', name: 'Serif', value: 'Georgia, serif' },
-  { id: 'mono', name: 'Monospace', value: 'Monaco, monospace' },
-  { id: 'comic', name: 'Comic', value: 'Comic Sans MS, cursive' },
-  { id: 'handwriting', name: 'Handwriting', value: 'Brush Script MT, cursive' }
-];
-
-const SIZES = [12, 14, 16, 18, 20, 24, 28, 32, 36, 48];
-```
-
-### 4. Word Count Plugin (`@plugins/word-count`)
-
-Shows word and character count in statusbar:
-
-```typescript
-// manifest.json
-{
-  "id": "word-count",
-  "name": "Word Count",
-  "version": "1.0.0",
-  "description": "Display word and character counts",
-  "contributes": {
-    "slots": [
-      { "slot": "statusbar", "component": "WordCount", "order": 100 }
-    ]
-  },
-  "requires": {
-    "events": ["editor:content-changed"]
-  }
-}
-```
-
-### 5. Theme Plugin (`@plugins/theme`)
-
-Provides light/dark mode toggle:
-
-```typescript
-// manifest.json
-{
-  "id": "theme",
-  "name": "Theme Switcher",
-  "version": "1.0.0",
-  "description": "Toggle between light and dark mode",
-  "contributes": {
-    "slots": [
-      { "slot": "toolbar", "component": "ThemeToggle", "order": 200 }
-    ]
-  }
-}
-```
-
----
-
-## Application Layout
-
-The host application defines the slot layout:
+| Slot | Layout | Purpose |
+|------|--------|---------|
+| `toolbar` | Horizontal | Controls, selectors, buttons |
+| `canvas` | Stacked (z-index) | Paper background, text editor |
+| `sidebar` | Vertical | Settings, info panels |
+| `statusbar` | Horizontal | Stats, status info |
+| `modal` | Single | Dialog overlays |
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -525,70 +351,220 @@ The host application defines the slot layout:
 │                                                                  │
 │                      [canvas slot]                               │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│  │
 │  │ ░ Paper Background (z-index: 0)                         ░│  │
-│  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│  │
 │  │  ┌─────────────────────────────────────────────────────┐ │  │
 │  │  │ Text Editor (z-index: 1)                            │ │  │
-│  │  │                                                     │ │  │
-│  │  │ The quick brown fox jumps over the lazy dog...     │ │  │
-│  │  │                                                     │ │  │
 │  │  └─────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 ├─────────────────────────────────────────────────────────────────┤
 │                      [statusbar slot]                            │
-│  Words: 9  |  Characters: 44                                     │
+│  Words: 9  |  Characters: 44  |  Lines: 1                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Plugin Communication Patterns
+## Standalone Plugin Development
 
-### Pattern 1: State-Based Communication
+### Plugin Project Structure
 
-Plugins read/write shared state:
+Each plugin is an independent npm project:
+
+```
+plugins/font-selector/
+├── package.json          # Plugin metadata + manifest
+├── tsconfig.json         # TypeScript config
+├── vite.config.ts        # Build config (library mode)
+├── src/
+│   └── index.tsx         # Plugin entry point
+├── dist/
+│   ├── index.js          # Built bundle (ES module)
+│   └── index.js.map      # Source map
+└── README.md             # Plugin documentation
+```
+
+### package.json
+
+```json
+{
+  "name": "@plugins/font-selector",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "pluginManifest": {
+    "id": "font-selector",
+    "name": "Font Selector",
+    "category": "formatting",
+    "contributes": {
+      "slots": [
+        { "slot": "toolbar", "component": "FontSelector", "order": 10 }
+      ]
+    }
+  }
+}
+```
+
+### Plugin Entry Point
 
 ```typescript
-// Font plugin sets font
-context.state.set('format.fontFamily', 'Georgia, serif');
+// src/index.tsx
+import React from 'react';
+import {
+  definePlugin,
+  useStateValue,
+  STATE_KEYS,
+  type PluginProps,
+  type PluginManifest,
+  type PluginContext,
+} from '@plugin-platform/sdk';
 
-// Editor plugin reacts
-context.state.subscribe('format.fontFamily', (fontFamily) => {
-  textareaRef.current.style.fontFamily = fontFamily;
+export const manifest: PluginManifest = {
+  id: 'font-selector',
+  name: 'Font Selector',
+  version: '1.0.0',
+  contributes: {
+    slots: [{ slot: 'toolbar', component: 'FontSelector', order: 10 }],
+  },
+};
+
+export function FontSelector({ context }: PluginProps): React.ReactElement {
+  const currentFont = useStateValue<string>(context, STATE_KEYS.FONT_FAMILY);
+  // ... component implementation
+}
+
+export function activate(context: PluginContext): void {
+  console.log('[font-selector] Plugin activated');
+}
+
+export default definePlugin({
+  manifest,
+  activate,
+  FontSelector,
 });
 ```
 
-### Pattern 2: Event-Based Communication
-
-For transient notifications:
+### Build Configuration
 
 ```typescript
-// Editor emits content changes
-context.events.emit('editor:content-changed', { content: newContent });
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import dts from 'vite-plugin-dts';
 
-// Word count plugin listens
-context.events.on('editor:content-changed', ({ content }) => {
-  setWordCount(content.split(/\s+/).filter(Boolean).length);
+export default defineConfig({
+  plugins: [react(), dts({ include: ['src'] })],
+  build: {
+    lib: {
+      entry: 'src/index.tsx',
+      name: 'FontSelectorPlugin',
+      fileName: 'index',
+      formats: ['es'],
+    },
+    rollupOptions: {
+      external: ['react', 'react-dom'],
+    },
+  },
 });
 ```
 
-### Pattern 3: Command Execution
+### Plugin CLI
 
-For user actions:
+```bash
+# Initialize new plugin
+npm run plugin-cli init my-plugin
 
-```typescript
-// Theme plugin registers command
-context.commands.register('theme.toggle', () => {
-  const current = context.state.get('theme.mode');
-  context.state.set('theme.mode', current === 'dark' ? 'light' : 'dark');
-});
+# Build plugin
+cd plugins/my-plugin && npm run build
 
-// Toolbar can execute it
-<button onClick={() => context.commands.execute('theme.toggle')}>
-  Toggle Theme
-</button>
+# Publish to marketplace
+npm run plugin-cli publish
+```
+
+---
+
+## Bundled Plugins
+
+The editor ships with 5 plugins enabled by default:
+
+| Plugin | Category | Slots | Description |
+|--------|----------|-------|-------------|
+| `paper-background` | appearance | canvas, toolbar | Paper styles (ruled, checkered, dotted) |
+| `font-selector` | formatting | toolbar | Font family and size selection |
+| `text-editor` | core | canvas | The actual text editing area |
+| `word-count` | utilities | statusbar | Word, character, line counts |
+| `theme` | appearance | toolbar | Light/dark mode toggle |
+
+---
+
+## File Structure
+
+```
+plugin-platform/
+├── frontend/                     # React frontend
+│   ├── src/
+│   │   ├── core/                 # Plugin infrastructure
+│   │   │   ├── PluginHost.tsx
+│   │   │   ├── SlotRenderer.tsx
+│   │   │   ├── EventBus.ts
+│   │   │   ├── StateManager.ts
+│   │   │   └── types.ts
+│   │   ├── plugins/              # Bundled plugins (dev mode)
+│   │   ├── components/           # UI components
+│   │   │   ├── MarketplaceModal.tsx
+│   │   │   └── AuthModal.tsx
+│   │   ├── services/             # API client
+│   │   │   └── api.ts
+│   │   ├── stores/               # State management
+│   │   │   └── auth.ts
+│   │   ├── App.tsx
+│   │   └── main.tsx
+│   └── package.json
+│
+├── backend/                      # Express API
+│   ├── src/
+│   │   ├── api/
+│   │   │   ├── routes/
+│   │   │   │   ├── auth.ts
+│   │   │   │   ├── plugins.ts
+│   │   │   │   ├── user-plugins.ts
+│   │   │   │   └── developer.ts
+│   │   │   ├── app.ts
+│   │   │   └── index.ts
+│   │   ├── shared/
+│   │   │   ├── db.ts
+│   │   │   ├── cache.ts
+│   │   │   ├── storage.ts
+│   │   │   └── logger.ts
+│   │   └── db/
+│   │       ├── migrations/
+│   │       ├── migrate.ts
+│   │       └── seed.ts
+│   └── package.json
+│
+├── packages/
+│   └── plugin-sdk/               # Shared SDK for plugins
+│       ├── src/index.ts
+│       └── package.json
+│
+├── plugins/                      # Standalone plugin projects
+│   ├── paper-background/
+│   ├── font-selector/
+│   ├── text-editor/
+│   ├── word-count/
+│   └── theme/
+│
+├── scripts/
+│   └── plugin-cli.ts             # Plugin development CLI
+│
+├── docker-compose.yml            # PostgreSQL, Redis, MinIO
+├── package.json                  # Monorepo workspace
+├── architecture.md               # This file
+├── README.md                     # Setup instructions
+└── claude.md                     # Development notes
 ```
 
 ---
@@ -602,68 +578,95 @@ context.commands.register('theme.toggle', () => {
 **Rationale**:
 - Plugins need direct DOM access for UI rendering
 - React components can't easily run in workers
-- Trust boundary is different (bundled plugins vs. user-installed)
+- Bundled plugins from marketplace are vetted
 - Performance acceptable for this use case
 
 **Trade-off**: Less isolation, but simpler development
 
-### 2. Slot System vs. Component Injection
+### 2. Session-Based Auth with Anonymous Support
 
-**Decision**: Named slots with declarative contributions
-
-**Rationale**:
-- Plugins don't need to know about each other
-- Order can be controlled via manifest
-- Easy to reason about where UI appears
-- Familiar pattern (similar to Vue slots, Web Components)
-
-### 3. Event Bus + Shared State
-
-**Decision**: Use both events and shared state
+**Decision**: Use Express sessions with Redis, supporting both authenticated and anonymous users
 
 **Rationale**:
-- State: For persistent values (font, theme, content)
-- Events: For notifications (content changed, selection moved)
-- Plugins choose appropriate mechanism
-- Reactive state updates via subscriptions
+- Anonymous users can install plugins (stored by session ID)
+- When user logs in, installs can be migrated to their account
+- Simpler than JWT for this use case
+- Works well with server-rendered admin pages
+
+### 3. MinIO for Plugin Storage
+
+**Decision**: Store plugin bundles in MinIO (S3-compatible)
+
+**Rationale**:
+- Scales independently from database
+- Can serve bundles directly to browsers
+- Public read access for installed plugins
+- Easy local development with docker-compose
+
+### 4. Monorepo with npm Workspaces
+
+**Decision**: Single repo with workspace packages
+
+**Rationale**:
+- Easy to develop SDK and plugins together
+- Shared TypeScript config
+- Single install for all dependencies
+- Plugins can still be published independently
 
 ---
 
-## File Structure
+## Running the System
 
+### Prerequisites
+
+- Node.js 20+
+- Docker and Docker Compose
+
+### Quick Start
+
+```bash
+# Start infrastructure
+docker-compose up -d
+
+# Install dependencies
+npm install
+
+# Run database migrations
+npm run db:migrate
+
+# Build SDK
+npm run build:sdk
+
+# Start backend (port 3000)
+npm run dev:backend
+
+# Start frontend (port 5173)
+npm run dev:frontend
 ```
-plugin-platform/
-├── frontend/
-│   ├── src/
-│   │   ├── core/
-│   │   │   ├── PluginHost.tsx      # Plugin loading and management
-│   │   │   ├── SlotRenderer.tsx    # Renders slot contributions
-│   │   │   ├── EventBus.ts         # Pub/sub event system
-│   │   │   ├── StateManager.ts     # Shared reactive state
-│   │   │   └── types.ts            # TypeScript interfaces
-│   │   ├── plugins/
-│   │   │   ├── text-editor/        # Core text editing
-│   │   │   ├── paper-background/   # Paper styles
-│   │   │   ├── font-selector/      # Font controls
-│   │   │   ├── word-count/         # Word statistics
-│   │   │   └── theme/              # Dark/light mode
-│   │   ├── App.tsx                 # Main layout with slots
-│   │   └── main.tsx                # Entry point
-│   └── package.json
-├── architecture.md                  # This file
-├── README.md                        # Setup instructions
-└── claude.md                        # Development notes
+
+### Environment Variables
+
+```bash
+# Backend
+DATABASE_URL=postgresql://plugin_user:plugin_pass@localhost:5432/plugin_platform
+REDIS_URL=redis://localhost:6379
+MINIO_ENDPOINT=localhost
+MINIO_PORT=9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+SESSION_SECRET=your-session-secret
+
+# Frontend
+VITE_API_URL=http://localhost:3000
 ```
 
 ---
 
-## Future Plugin Ideas
+## Future Ideas
 
-- **Markdown Preview**: Render markdown as you type
-- **Spell Check**: Highlight misspelled words
-- **Auto Save**: Periodically save to localStorage
-- **Export**: Download as .txt, .md, .pdf
-- **Focus Mode**: Dim everything except current paragraph
-- **Typewriter Sounds**: Play keyboard sounds
-- **Reading Time**: Estimate time to read content
-- **Find & Replace**: Search functionality
+- **Remote Plugin Loading**: Load plugins from URL at runtime
+- **Plugin Dependencies**: Allow plugins to depend on other plugins
+- **Plugin Sandboxing**: Use iframes or Web Components for isolation
+- **Collaborative Editing**: Real-time sync via WebSocket
+- **Plugin Analytics**: Track usage, errors, performance
+- **Plugin Monetization**: Paid plugins with Stripe integration
