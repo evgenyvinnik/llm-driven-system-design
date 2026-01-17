@@ -6,10 +6,7 @@ const COLLECTION_API = import.meta.env.VITE_COLLECTION_API || 'http://localhost:
 const ADMIN_API = import.meta.env.VITE_ADMIN_API || 'http://localhost:3002'
 const INFERENCE_API = import.meta.env.VITE_INFERENCE_API || 'http://localhost:3003'
 
-// Admin token for development
-const ADMIN_TOKEN = import.meta.env.VITE_ADMIN_TOKEN || 'admin-secret-token'
-
-// Session ID management
+// Session ID management for anonymous users (drawing game)
 function getSessionId(): string {
   let sessionId = localStorage.getItem('scale-ai-session-id')
   if (!sessionId) {
@@ -87,6 +84,13 @@ export async function getUserStats(): Promise<{
 // Admin API (Port 3002)
 // ============================================
 
+// Admin user type
+export interface AdminUser {
+  id: string
+  email: string
+  name: string | null
+}
+
 export interface AdminStats {
   total_drawings: number
   drawings_per_shape: Array<{ name: string; count: number }>
@@ -136,16 +140,41 @@ export interface Model {
   created_at: string
 }
 
+// Admin API fetch with credentials (session cookies)
 async function adminFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const response = await fetch(`${ADMIN_API}${path}`, {
     ...options,
+    credentials: 'include', // Include session cookies
     headers: {
       ...options.headers,
-      Authorization: `Bearer ${ADMIN_TOKEN}`,
       'Content-Type': 'application/json',
     },
   })
   return response
+}
+
+// Authentication endpoints
+export async function adminLogin(email: string, password: string): Promise<{ user: AdminUser }> {
+  const response = await adminFetch('/api/admin/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  })
+  if (!response.ok) {
+    const data = await response.json()
+    throw new Error(data.error || 'Login failed')
+  }
+  return response.json()
+}
+
+export async function adminLogout(): Promise<void> {
+  await adminFetch('/api/admin/auth/logout', { method: 'POST' })
+}
+
+export async function getAdminUser(): Promise<AdminUser | null> {
+  const response = await adminFetch('/api/admin/auth/me')
+  if (!response.ok) return null
+  const data = await response.json()
+  return data.user
 }
 
 export async function getAdminStats(): Promise<AdminStats> {

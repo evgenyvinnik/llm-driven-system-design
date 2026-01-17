@@ -5,7 +5,7 @@ const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379'
 
 export const redis = new Redis(redisUrl, {
   maxRetriesPerRequest: 3,
-  retryStrategy: (times) => {
+  retryStrategy: (times: number) => {
     if (times > 3) {
       console.error('Redis connection failed after 3 retries')
       return null // Stop retrying
@@ -18,7 +18,7 @@ redis.on('connect', () => {
   console.log('Connected to Redis')
 })
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   console.error('Redis error:', err.message)
 })
 

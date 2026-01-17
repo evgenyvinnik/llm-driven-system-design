@@ -13,6 +13,18 @@ vi.mock('../shared/storage.js', () => ({
   ensureBuckets: vi.fn().mockResolvedValue(undefined),
 }))
 
+vi.mock('../shared/cache.js', () => ({
+  cacheGet: vi.fn().mockResolvedValue(null),
+  cacheSet: vi.fn().mockResolvedValue(undefined),
+  cacheDelete: vi.fn().mockResolvedValue(undefined),
+  CacheKeys: {
+    adminStats: () => 'admin:stats',
+    shapes: () => 'shapes:all',
+    userStats: (sessionId: string) => `user:stats:${sessionId}`,
+    drawing: (id: string) => `drawing:${id}`,
+  },
+}))
+
 // Import after mocking
 import { app } from './app.js'
 import { pool } from '../shared/db.js'

@@ -1,27 +1,58 @@
 import express from 'express'
 import cors from 'cors'
+import cookieParser from 'cookie-parser'
 import { pool } from '../shared/db.js'
 import { publishTrainingJob } from '../shared/queue.js'
 import { getDrawing } from '../shared/storage.js'
 import { cacheGet, cacheSet, cacheDelete, CacheKeys } from '../shared/cache.js'
+import { validateLogin, createSession, getSession, deleteSession } from '../shared/auth.js'
 import { v4 as uuidv4 } from 'uuid'
 
 const app = express()
 const PORT = parseInt(process.env.PORT || '3002')
 
-// Simple admin auth (in production, use proper auth)
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'admin-secret-token'
+// Session interface for typed requests
+interface AdminSession {
+  userId: string
+  email: string
+  name: string | null
+}
+
+// Extend Express Request type
+declare global {
+  namespace Express {
+    interface Request {
+      adminSession?: AdminSession
+    }
+  }
+}
 
 // Middleware
-app.use(cors())
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+}))
 app.use(express.json())
+app.use(cookieParser())
 
-// Auth middleware
-function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const token = req.headers.authorization?.replace('Bearer ', '')
+// Auth middleware - now uses session cookies
+async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const sessionId = req.cookies.adminSession
 
-  if (token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' })
+  if (!sessionId) {
+    return res.status(401).json({ error: 'Not authenticated' })
+  }
+
+  const session = await getSession(sessionId)
+  if (!session) {
+    return res.status(401).json({ error: 'Session expired' })
+  }
+
+  // Attach session to request
+  req.adminSession = {
+    userId: session.userId,
+    email: session.email,
+    name: session.name,
   }
 
   next()
@@ -30,6 +61,59 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'admin' })
+})
+
+// Login endpoint
+app.post('/api/admin/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' })
+    }
+
+    const user = await validateLogin(email, password)
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' })
+    }
+
+    const sessionId = await createSession(user.id, user.email, user.name)
+
+    res.cookie('adminSession', sessionId, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    })
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+      },
+    })
+  } catch (error) {
+    console.error('Login error:', error)
+    res.status(500).json({ error: 'Login failed' })
+  }
+})
+
+// Logout endpoint
+app.post('/api/admin/auth/logout', async (req, res) => {
+  const sessionId = req.cookies.adminSession
+
+  if (sessionId) {
+    await deleteSession(sessionId)
+  }
+
+  res.clearCookie('adminSession')
+  res.json({ success: true })
+})
+
+// Get current user
+app.get('/api/admin/auth/me', requireAdmin, (req, res) => {
+  res.json({ user: req.adminSession })
 })
 
 // Dashboard stats (cached for 30 seconds)

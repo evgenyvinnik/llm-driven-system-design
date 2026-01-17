@@ -6,14 +6,88 @@ import {
   getModels,
   activateModel,
   flagDrawing,
+  adminLogin,
+  adminLogout,
+  getAdminUser,
   type AdminStats,
   type Drawing,
   type Model,
+  type AdminUser,
 } from '../../services/api'
 import { DrawingCard } from '../../components/DrawingCard'
 import './AdminDashboard.css'
 
+// Login Component
+function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    setLoading(true)
+
+    try {
+      const { user } = await adminLogin(email, password)
+      onLogin(user)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Login failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="admin-login">
+      <div className="login-card">
+        <h1>Admin Dashboard</h1>
+        <p className="subtitle">Sign in to manage your data</p>
+
+        <form className="login-form" onSubmit={handleSubmit}>
+          <div className="form-group">
+            <label htmlFor="email">Email</label>
+            <input
+              id="email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="admin@scaleai.local"
+              required
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="password">Password</label>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter password"
+              required
+            />
+          </div>
+
+          {error && <div className="login-error">{error}</div>}
+
+          <button type="submit" className="login-btn" disabled={loading}>
+            {loading ? 'Signing in...' : 'Sign In'}
+          </button>
+        </form>
+
+        <div className="login-hint">
+          Default: <code>admin@scaleai.local</code> / <code>admin123</code>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function AdminDashboard() {
+  const [user, setUser] = useState<AdminUser | null>(null)
+  const [authChecked, setAuthChecked] = useState(false)
   const [stats, setStats] = useState<AdminStats | null>(null)
   const [drawings, setDrawings] = useState<Drawing[]>([])
   const [models, setModels] = useState<Model[]>([])
@@ -21,6 +95,16 @@ export function AdminDashboard() {
   const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'drawings' | 'training'>('overview')
   const [trainingInProgress, setTrainingInProgress] = useState(false)
+
+  // Check if user is already logged in
+  useEffect(() => {
+    getAdminUser()
+      .then((u) => {
+        setUser(u)
+        setAuthChecked(true)
+      })
+      .catch(() => setAuthChecked(true))
+  }, [])
 
   const loadData = useCallback(async () => {
     try {
@@ -42,8 +126,15 @@ export function AdminDashboard() {
   }, [])
 
   useEffect(() => {
-    loadData()
-  }, [loadData])
+    if (user) {
+      loadData()
+    }
+  }, [user, loadData])
+
+  const handleLogout = async () => {
+    await adminLogout()
+    setUser(null)
+  }
 
   const handleStartTraining = async () => {
     try {
@@ -78,6 +169,21 @@ export function AdminDashboard() {
     }
   }
 
+  // Show loading while checking auth
+  if (!authChecked) {
+    return (
+      <div className="admin-loading">
+        <div className="spinner" />
+        <p>Checking authentication...</p>
+      </div>
+    )
+  }
+
+  // Show login page if not authenticated
+  if (!user) {
+    return <AdminLogin onLogin={setUser} />
+  }
+
   if (loading) {
     return (
       <div className="admin-loading">
@@ -101,8 +207,15 @@ export function AdminDashboard() {
     <div className="admin-dashboard">
       <header className="admin-header">
         <h1>Admin Dashboard</h1>
-        <nav className="admin-nav">
-          <button
+        <div className="user-menu">
+          <span className="user-email">{user.email}</span>
+          <button className="logout-btn" onClick={handleLogout}>
+            Logout
+          </button>
+        </div>
+      </header>
+      <nav className="admin-nav" style={{ padding: '0 2rem', background: 'white', borderBottom: '1px solid #e2e8f0' }}>
+        <button
             className={activeTab === 'overview' ? 'active' : ''}
             onClick={() => setActiveTab('overview')}
           >
@@ -121,7 +234,6 @@ export function AdminDashboard() {
             Training
           </button>
         </nav>
-      </header>
 
       <main className="admin-content">
         {activeTab === 'overview' && stats && (

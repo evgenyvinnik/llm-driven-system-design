@@ -11,9 +11,10 @@ This is a **system design learning repository** where each subdirectory represen
 Each project folder follows this pattern:
 ```
 <project>/
-├── README.md          # Setup instructions and implementation guide
-├── architecture.md    # System design documentation and trade-offs
-└── claude.md          # LLM collaboration notes and iteration history
+├── README.md                  # Setup instructions and implementation guide
+├── architecture.md            # System design documentation and trade-offs
+├── system-design-answer.md    # Interview-style answer (45-minute format)
+└── claude.md                  # LLM collaboration notes and iteration history
 ```
 
 Some projects (like `scale-ai/frontend`) include actual implementation code.
@@ -33,13 +34,23 @@ npm run type-check       # TypeScript type checking (tsc --noEmit)
 
 # Backend (Node.js + Express, when implemented)
 cd <project>/backend
-npm run dev              # Start with hot reload
+npm run dev              # Start all services with hot reload (via concurrently)
+npm run dev:collection   # Run individual service (naming varies by project)
+npm run dev:admin        # Run admin service
 npm run dev:server1      # Run on port 3001 (for distributed testing)
 npm run dev:server2      # Run on port 3002
 npm run dev:server3      # Run on port 3003
 
+# Database
+npm run db:migrate       # Run migrations
+npm run db:seed-admin    # Seed admin user (if applicable)
+
+# Testing (vitest)
+npm run test             # Run tests once
+npm run test:watch       # Run tests in watch mode
+
 # Infrastructure (when docker-compose.yml exists)
-docker-compose up -d     # Start PostgreSQL, Redis/Valkey, etc.
+docker-compose up -d     # Start PostgreSQL, Redis/Valkey, MinIO, RabbitMQ, etc.
 ```
 
 ## Technology Stack Defaults
@@ -60,6 +71,29 @@ Use these unless there's a compelling reason to deviate (document justification 
 2. **Keep auth simple** - Session-based auth with Redis, avoid OAuth/JWT complexity unless studying those topics
 3. **Both user personas** - Implement end-user AND admin interfaces when applicable
 4. **Justify deviations** - Document why in the project's `claude.md` if straying from defaults
+
+## Backend Architecture Pattern
+
+Implemented projects follow a microservices structure under `src/`:
+
+```
+backend/src/
+├── <service1>/          # e.g., collection, admin, inference
+│   ├── index.ts         # Service entry point (starts Express server)
+│   └── app.ts           # Express app definition (exported for testing)
+├── <service2>/
+├── shared/              # Common modules used across services
+│   ├── db.ts            # PostgreSQL connection pool
+│   ├── cache.ts         # Redis/Valkey client and helpers
+│   ├── storage.ts       # MinIO object storage client
+│   └── auth.ts          # Authentication middleware
+└── db/
+    ├── migrations/      # SQL migration files (001_*.sql, 002_*.sql, ...)
+    ├── migrate.ts       # Migration runner
+    └── seed-*.ts        # Database seeders
+```
+
+Tests use vitest with mocked shared modules (see `scale-ai/backend/src/collection/app.test.ts` for pattern).
 
 ## Creating New Projects
 
