@@ -1,0 +1,547 @@
+/* Post-It Note Drawing Experience - Skeuomorphic Design */
+
+@import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600&family=Permanent+Marker&display=swap');
+
+/* ============================================
+   CSS Variables
+   ============================================ */
+:root {
+  /* Post-it colors - classic 3M yellow */
+  --postit-yellow: #ffeb3b;
+  --postit-yellow-light: #fff59d;
+  --postit-yellow-dark: #fbc02d;
+  --postit-shadow: rgba(0, 0, 0, 0.25);
+
+  /* Cork board */
+  --cork-light: #d4a574;
+  --cork-medium: #c49a6c;
+  --cork-dark: #a67c52;
+  --cork-grain: #8b6914;
+
+  /* Marker colors */
+  --marker-black: #1a1a1a;
+  --marker-body: #2d2d2d;
+  --marker-cap: #1a1a1a;
+
+  /* Accent colors */
+  --pin-red: #e53935;
+  --pin-shadow: rgba(0, 0, 0, 0.3);
+
+  /* Button colors */
+  --btn-clear: #78909c;
+  --btn-submit: #43a047;
+}
+
+/* ============================================
+   Workspace Container
+   ============================================ */
+.postit-workspace {
+  width: 100%;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  box-sizing: border-box;
+}
+
+/* ============================================
+   Cork Board Background
+   ============================================ */
+.cork-board {
+  position: relative;
+  width: 100%;
+  max-width: 600px;
+  min-height: 700px;
+  padding: 3rem;
+  border-radius: 8px;
+
+  /* Cork texture using gradients */
+  background:
+    /* Grain pattern */
+    repeating-radial-gradient(
+      circle at 17% 32%,
+      var(--cork-grain) 0px,
+      var(--cork-grain) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    repeating-radial-gradient(
+      circle at 73% 68%,
+      var(--cork-grain) 0px,
+      var(--cork-grain) 0.5px,
+      transparent 0.5px,
+      transparent 4px
+    ),
+    repeating-radial-gradient(
+      circle at 41% 89%,
+      var(--cork-dark) 0px,
+      var(--cork-dark) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    /* Base cork gradient */
+    linear-gradient(
+      135deg,
+      var(--cork-light) 0%,
+      var(--cork-medium) 50%,
+      var(--cork-dark) 100%
+    );
+
+  /* Realistic cork shadow */
+  box-shadow:
+    inset 0 0 60px rgba(0, 0, 0, 0.15),
+    0 10px 40px rgba(0, 0, 0, 0.3),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+
+  /* Wood frame effect */
+  border: 12px solid #5d4037;
+  border-image: linear-gradient(
+    145deg,
+    #8d6e63 0%,
+    #5d4037 20%,
+    #4e342e 50%,
+    #5d4037 80%,
+    #8d6e63 100%
+  ) 1;
+}
+
+/* ============================================
+   Prompt Post-It (Small instruction note)
+   ============================================ */
+.prompt-postit {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%) rotate(-2deg);
+  width: 180px;
+  padding: 1rem 1.25rem;
+
+  /* Pink post-it for contrast */
+  background: linear-gradient(
+    165deg,
+    #f8bbd9 0%,
+    #f48fb1 100%
+  );
+
+  /* Paper shadow */
+  box-shadow:
+    2px 3px 8px rgba(0, 0, 0, 0.2),
+    1px 1px 3px rgba(0, 0, 0, 0.1);
+
+  text-align: center;
+  z-index: 10;
+}
+
+.prompt-pin {
+  position: absolute;
+  top: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 16px;
+  height: 16px;
+  background: radial-gradient(
+    circle at 30% 30%,
+    #ef5350 0%,
+    var(--pin-red) 50%,
+    #c62828 100%
+  );
+  border-radius: 50%;
+  box-shadow:
+    0 2px 4px var(--pin-shadow),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.prompt-pin::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  width: 4px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.6);
+  border-radius: 50%;
+}
+
+.prompt-text {
+  display: block;
+  font-family: 'Caveat', cursive;
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #37474f;
+  margin-bottom: 0.25rem;
+}
+
+.prompt-hint {
+  display: block;
+  font-size: 2rem;
+  color: #546e7a;
+  opacity: 0.7;
+}
+
+/* ============================================
+   Main Post-It Note
+   ============================================ */
+.main-postit {
+  position: relative;
+  margin: 80px auto 0;
+  width: fit-content;
+}
+
+.postit-shadow {
+  position: absolute;
+  bottom: -15px;
+  left: 10px;
+  right: -10px;
+  height: 30px;
+  background: transparent;
+  box-shadow:
+    0 15px 25px -5px rgba(0, 0, 0, 0.25),
+    5px 20px 35px -10px rgba(0, 0, 0, 0.15);
+  transform: skewX(-3deg);
+  z-index: 0;
+}
+
+.postit-paper {
+  position: relative;
+  width: 420px;
+  height: 420px;
+
+  /* Classic yellow post-it */
+  background: linear-gradient(
+    175deg,
+    var(--postit-yellow-light) 0%,
+    var(--postit-yellow) 30%,
+    var(--postit-yellow-dark) 100%
+  );
+
+  /* Slight rotation for natural look */
+  transform: rotate(1deg);
+
+  /* Paper edge shadow */
+  box-shadow:
+    1px 1px 3px rgba(0, 0, 0, 0.1),
+    2px 2px 6px rgba(0, 0, 0, 0.08);
+
+  z-index: 1;
+}
+
+/* Paper texture overlay */
+.paper-texture {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  opacity: 0.4;
+
+  /* Subtle paper fiber texture */
+  background-image:
+    url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+
+  mix-blend-mode: multiply;
+}
+
+/* Adhesive strip at top */
+.adhesive-strip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.3) 0%,
+    rgba(255, 255, 255, 0.1) 50%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* Curl effect at bottom right */
+.postit-curl {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 60px;
+  height: 60px;
+  pointer-events: none;
+
+  background: linear-gradient(
+    315deg,
+    var(--cork-medium) 0%,
+    var(--cork-medium) 45%,
+    var(--postit-yellow-dark) 45%,
+    var(--postit-yellow-dark) 100%
+  );
+
+  /* Curl shadow */
+  box-shadow:
+    -3px -3px 8px rgba(0, 0, 0, 0.15) inset,
+    -1px -1px 3px rgba(0, 0, 0, 0.1) inset;
+
+  clip-path: polygon(100% 0%, 100% 100%, 0% 100%);
+}
+
+/* ============================================
+   Drawing Canvas
+   ============================================ */
+.drawing-canvas {
+  display: block;
+  width: 400px;
+  height: 400px;
+  margin: 10px;
+  cursor: crosshair;
+  touch-action: none;
+
+  /* Slight paper feel */
+  background: transparent;
+}
+
+/* Custom crosshair cursor that looks like a marker tip */
+.drawing-canvas:active {
+  cursor: crosshair;
+}
+
+/* ============================================
+   Marker Decoration
+   ============================================ */
+.marker-decoration {
+  position: absolute;
+  bottom: 30px;
+  right: 40px;
+  transform: rotate(-25deg);
+  z-index: 5;
+}
+
+.marker-body {
+  position: relative;
+  width: 120px;
+  height: 22px;
+  background: linear-gradient(
+    180deg,
+    #404040 0%,
+    var(--marker-body) 20%,
+    #1a1a1a 80%,
+    #0d0d0d 100%
+  );
+  border-radius: 3px;
+  box-shadow:
+    0 3px 8px rgba(0, 0, 0, 0.3),
+    0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.marker-cap {
+  position: absolute;
+  left: -25px;
+  top: -2px;
+  width: 28px;
+  height: 26px;
+  background: linear-gradient(
+    180deg,
+    #333 0%,
+    var(--marker-cap) 30%,
+    #0a0a0a 100%
+  );
+  border-radius: 3px 0 0 3px;
+  box-shadow:
+    -1px 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.marker-cap::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 3px;
+  width: 4px;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+}
+
+.marker-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: 'Arial Black', sans-serif;
+  font-size: 7px;
+  font-weight: 900;
+  color: #808080;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.marker-tip {
+  position: absolute;
+  right: -12px;
+  top: 5px;
+  width: 15px;
+  height: 12px;
+  background: linear-gradient(
+    90deg,
+    #1a1a1a 0%,
+    #0d0d0d 100%
+  );
+  clip-path: polygon(0 0, 0 100%, 100% 50%);
+}
+
+/* ============================================
+   Action Buttons
+   ============================================ */
+.action-buttons {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.btn-clear,
+.btn-submit {
+  font-family: 'Caveat', cursive;
+  font-size: 1.25rem;
+  font-weight: 600;
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+
+  /* Paper-like button */
+  box-shadow:
+    2px 3px 6px rgba(0, 0, 0, 0.2),
+    1px 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+.btn-clear {
+  background: linear-gradient(
+    165deg,
+    #eceff1 0%,
+    #cfd8dc 100%
+  );
+  color: #546e7a;
+}
+
+.btn-clear:hover:not(:disabled) {
+  background: linear-gradient(
+    165deg,
+    #cfd8dc 0%,
+    #b0bec5 100%
+  );
+  transform: translateY(-1px);
+  box-shadow:
+    3px 4px 8px rgba(0, 0, 0, 0.25),
+    1px 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.btn-submit {
+  background: linear-gradient(
+    165deg,
+    #81c784 0%,
+    var(--btn-submit) 100%
+  );
+  color: white;
+}
+
+.btn-submit:hover:not(:disabled) {
+  background: linear-gradient(
+    165deg,
+    #66bb6a 0%,
+    #388e3c 100%
+  );
+  transform: translateY(-1px);
+  box-shadow:
+    3px 4px 8px rgba(0, 0, 0, 0.25),
+    1px 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.btn-clear:disabled,
+.btn-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-clear:active:not(:disabled),
+.btn-submit:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow:
+    1px 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* ============================================
+   Responsive Adjustments
+   ============================================ */
+@media (max-width: 640px) {
+  .cork-board {
+    padding: 1.5rem;
+    border-width: 8px;
+    min-height: 600px;
+  }
+
+  .postit-paper {
+    width: 320px;
+    height: 320px;
+  }
+
+  .drawing-canvas {
+    width: 300px;
+    height: 300px;
+  }
+
+  .prompt-postit {
+    width: 150px;
+    padding: 0.75rem 1rem;
+  }
+
+  .prompt-text {
+    font-size: 1.25rem;
+  }
+
+  .marker-decoration {
+    display: none;
+  }
+
+  .action-buttons {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .btn-clear,
+  .btn-submit {
+    width: 200px;
+  }
+}
+
+/* ============================================
+   Animation for new shape prompt
+   ============================================ */
+@keyframes postit-drop {
+  0% {
+    transform: translateX(-50%) rotate(-2deg) translateY(-20px);
+    opacity: 0;
+  }
+  60% {
+    transform: translateX(-50%) rotate(-2deg) translateY(5px);
+  }
+  100% {
+    transform: translateX(-50%) rotate(-2deg) translateY(0);
+    opacity: 1;
+  }
+}
+
+.prompt-postit {
+  animation: postit-drop 0.4s ease-out;
+}
+
+/* Subtle hover effect on main post-it */
+.main-postit:hover .postit-paper {
+  transform: rotate(0.5deg);
+  transition: transform 0.3s ease;
+}
+
+/* Drawing feedback - slight indent effect */
+.drawing-canvas:active {
+  box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.05);
+}

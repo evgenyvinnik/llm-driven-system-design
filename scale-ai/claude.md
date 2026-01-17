@@ -47,6 +47,30 @@ This document tracks the LLM-assisted development process for this project.
 
 **Decision:** PyTorch for training worker, TensorFlow.js for optional browser inference.
 
+### UI Design Direction: Skeuomorphic Post-It Notes
+
+**Request:** Create a tactile, nostalgic experience for the drawing game.
+
+**Design Concept:**
+- Users draw on realistic yellow post-it notes
+- Black marker strokes with ink bleeding effect
+- Cork board background with wood frame
+- Pink instruction post-it with pushpin
+- Decorative Sharpie marker prop
+
+**Why Skeuomorphism?**
+- Makes drawing feel natural and familiar (like doodling at your desk)
+- Post-it metaphor implies quick, casual sketches (lowers pressure)
+- Tactile design encourages engagement and playfulness
+- Memorable aesthetic differentiates from clinical data collection tools
+
+**Implementation Details:**
+- Multi-pass canvas rendering for marker ink effect
+- CSS-only paper textures and shadows (no images)
+- Caveat font for handwritten feel
+- Touch-action: none to prevent scroll interference
+- Responsive design for mobile drawing
+
 ## Architecture Evolution
 
 ### Version 1 (Initial)
@@ -68,9 +92,9 @@ This document tracks the LLM-assisted development process for this project.
 ## Implementation Phases
 
 ### Phase 1: Core Drawing Game
-- [ ] Canvas component with mouse/touch support
-- [ ] Stroke data capture and formatting
-- [ ] Shape prompts and visual feedback
+- [x] Canvas component with mouse/touch support
+- [x] Stroke data capture and formatting
+- [x] Shape prompts and visual feedback
 - [ ] Submit to collection API
 
 ### Phase 2: Data Pipeline
