@@ -1,65 +1,50 @@
+# ===================
 # Dependencies
+# ===================
 node_modules/
 .pnp/
 .pnp.js
 
-# Build outputs
+# ===================
+# Build Outputs
+# ===================
 dist/
 build/
 *.tsbuildinfo
 
+# ===================
 # Python
+# ===================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 venv/
-ENV/
-env/
 .venv/
+env/
+ENV/
 *.egg-info/
 .eggs/
 
-# PyTorch models
+# ===================
+# PyTorch Models
+# ===================
 *.pt
 *.pth
 *.onnx
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
+# ===================
 # Testing
+# ===================
 coverage/
 .nyc_output/
 .pytest_cache/
 
-# Docker volumes (local data)
+# ===================
+# Docker Volumes
+# ===================
 postgres_data/
 minio_data/
 rabbitmq_data/
-
-# MinIO uploads (if stored locally)
 data/
-
-# Temporary files
-tmp/
-temp/
-*.tmp
