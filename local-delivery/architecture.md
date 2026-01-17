@@ -116,27 +116,427 @@ A last-mile delivery platform for local goods and services, similar to DoorDash,
 
 ## Data Model
 
-### PostgreSQL Schema
+### Entity-Relationship Diagram
 
-**Users Table**
-- id, email, password_hash, name, phone, role
-- Roles: customer, driver, merchant, admin
+```
+                                    ┌─────────────────────────┐
+                                    │      users              │
+                                    │─────────────────────────│
+                                    │ id (PK, UUID)           │
+                                    │ email (UNIQUE)          │
+                                    │ password_hash           │
+                                    │ name                    │
+                                    │ phone                   │
+                                    │ role                    │
+                                    │ created_at, updated_at  │
+                                    └───────────┬─────────────┘
+                                                │
+              ┌─────────────────────────────────┼─────────────────────────────────┐
+              │                                 │                                 │
+              │ 1:1 (id = users.id)             │ 1:N (owner_id)                  │ 1:N (user_id)
+              ▼                                 │                                 ▼
+┌─────────────────────────────┐                 │                   ┌─────────────────────────────┐
+│       drivers               │                 │                   │       sessions              │
+│─────────────────────────────│                 │                   │─────────────────────────────│
+│ id (PK, FK -> users)        │                 │                   │ id (PK, UUID)               │
+│ vehicle_type                │                 │                   │ user_id (FK -> users)       │
+│ license_plate               │                 │                   │ token (UNIQUE)              │
+│ status                      │                 │                   │ expires_at                  │
+│ rating, total_deliveries    │                 │                   │ created_at                  │
+│ acceptance_rate             │                 │                   └─────────────────────────────┘
+│ current_lat, current_lng    │                 │
+│ location_updated_at         │                 ▼
+│ created_at, updated_at      │   ┌─────────────────────────────┐
+└──────────────┬──────────────┘   │       merchants             │
+               │                  │─────────────────────────────│
+               │                  │ id (PK, UUID)               │
+               │                  │ owner_id (FK -> users)      │
+               │                  │ name, description           │
+               │                  │ address, lat, lng           │
+               │                  │ category                    │
+               │                  │ avg_prep_time_minutes       │
+               │                  │ rating, is_open             │
+               │                  │ opens_at, closes_at         │
+               │                  │ created_at, updated_at      │
+               │                  └──────────────┬──────────────┘
+               │                                 │
+               │  1:N (driver_id)                │  1:N (merchant_id)
+               │                                 ▼
+               │                  ┌─────────────────────────────┐
+               │                  │       menu_items            │
+               │                  │─────────────────────────────│
+               │                  │ id (PK, UUID)               │
+               │                  │ merchant_id (FK -> merchants│
+               │                  │ name, description, price    │
+               │                  │ category, image_url         │
+               │                  │ is_available                │
+               │                  │ created_at, updated_at      │
+               │                  └──────────────┬──────────────┘
+               │                                 │
+               │                                 │  N:1 (menu_item_id)
+               ▼                                 │
+┌─────────────────────────────┐                  │
+│       orders                │◄─────────────────┘
+│─────────────────────────────│
+│ id (PK, UUID)               │
+│ customer_id (FK -> users)   │◄──────── 1:N from users (customer role)
+│ merchant_id (FK -> merchants│
+│ driver_id (FK -> drivers)   │
+│ status                      │
+│ delivery_address/lat/lng    │
+│ subtotal, delivery_fee, tip │
+│ total                       │
+│ estimated_prep_time_minutes │
+│ estimated_delivery_time     │
+│ archived_at, retention_days │◄──────── Retention policy columns
+│ timestamps (created, etc.)  │
+└──────────────┬──────────────┘
+               │
+               │  1:N (order_id)
+    ┌──────────┼──────────┬───────────────┐
+    ▼          ▼          ▼               ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────────────────┐
+│order_items │ │driver_offers│ │  ratings   │ │driver_location_history │
+│────────────│ │────────────│ │────────────│ │────────────────────────│
+│id (PK)     │ │id (PK)     │ │id (PK)     │ │id (PK)                 │
+│order_id FK │ │order_id FK │ │order_id FK │ │driver_id (FK -> drivers│
+│menu_item_id│ │driver_id FK│ │rater_id FK │ │lat, lng                │
+│name, qty   │ │status      │ │rated_user  │ │speed, heading          │
+│unit_price  │ │offered_at  │ │rated_merch │ │recorded_at             │
+│special_inst│ │expires_at  │ │rating 1-5  │ └────────────────────────┘
+│created_at  │ │responded_at│ │comment     │
+└────────────┘ └────────────┘ │created_at  │
+                              └────────────┘
 
-**Drivers Table**
-- id (FK to users), vehicle_type, status, rating, total_deliveries
-- current_lat, current_lng, location_updated_at
+┌─────────────────────────────┐  ┌─────────────────────────────┐  ┌─────────────────────────────┐
+│     delivery_zones          │  │     idempotency_keys        │  │     retention_policies      │
+│─────────────────────────────│  │─────────────────────────────│  │─────────────────────────────│
+│ id (PK, UUID)               │  │ key (PK, VARCHAR(64))       │  │ id (PK, UUID)               │
+│ name                        │  │ user_id (FK -> users)       │  │ table_name (UNIQUE)         │
+│ center_lat, center_lng      │  │ operation                   │  │ hot_storage_days            │
+│ radius_km                   │  │ response (JSONB)            │  │ warm_storage_days           │
+│ is_active                   │  │ status                      │  │ archive_enabled             │
+│ base_delivery_fee           │  │ created_at, expires_at      │  │ last_cleanup_at             │
+│ per_km_fee                  │  └─────────────────────────────┘  │ created_at, updated_at      │
+│ created_at                  │                                   └─────────────────────────────┘
+└─────────────────────────────┘
+```
 
-**Merchants Table**
-- id, name, address, lat, lng, category, avg_prep_time_minutes, rating, is_open
+### Complete PostgreSQL Schema
 
-**Orders Table**
-- id, customer_id, merchant_id, driver_id, status
-- delivery_address, delivery_lat, delivery_lng
-- subtotal, delivery_fee, tip, total
-- timestamps for each state transition
+#### 1. Users Table
+Central identity table for all user types in the system.
 
-**Order Items Table**
-- id, order_id, menu_item_id, name, quantity, unit_price
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| email | VARCHAR(255) | UNIQUE NOT NULL | Login email address |
+| password_hash | VARCHAR(255) | NOT NULL | Bcrypt hashed password |
+| name | VARCHAR(255) | NOT NULL | Display name |
+| phone | VARCHAR(20) | | Contact phone number |
+| role | VARCHAR(20) | NOT NULL, CHECK | One of: 'customer', 'driver', 'merchant', 'admin' |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Account creation time |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification (trigger-updated) |
+
+**Design Rationale:** Single table for all user types with role-based access control. Drivers and merchants have extended tables linked by the same UUID. This simplifies authentication while allowing role-specific attributes.
+
+#### 2. Drivers Table
+Extended profile for users with role='driver'.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, FK -> users(id) ON DELETE CASCADE | Same as user ID (1:1 relationship) |
+| vehicle_type | VARCHAR(20) | NOT NULL, CHECK | 'bicycle', 'motorcycle', 'car', 'van' |
+| license_plate | VARCHAR(20) | | Vehicle registration (null for bicycles) |
+| status | VARCHAR(20) | NOT NULL DEFAULT 'offline', CHECK | 'offline', 'available', 'busy' |
+| rating | DECIMAL(3,2) | DEFAULT 5.00 | Average rating (1.00-5.00) |
+| total_deliveries | INTEGER | DEFAULT 0 | Lifetime completed deliveries |
+| acceptance_rate | DECIMAL(5,4) | DEFAULT 1.0000 | Offer acceptance ratio (0.0000-1.0000) |
+| current_lat | DECIMAL(10,8) | | Last known latitude |
+| current_lng | DECIMAL(11,8) | | Last known longitude |
+| location_updated_at | TIMESTAMP | | When location was last updated |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Driver profile creation |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification |
+
+**Design Rationale:** Inherits from users via same UUID (not a separate FK). This enforces 1:1 relationship and allows the user to be deleted with cascade to driver record. Location stored here is the "persistent" last-known location; real-time location is in Redis.
+
+#### 3. Merchants Table
+Business profiles that offer products for delivery.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| owner_id | UUID | FK -> users(id) ON DELETE SET NULL | User who manages this merchant |
+| name | VARCHAR(255) | NOT NULL | Business name |
+| description | TEXT | | Business description |
+| address | TEXT | NOT NULL | Full street address |
+| lat | DECIMAL(10,8) | NOT NULL | Pickup location latitude |
+| lng | DECIMAL(11,8) | NOT NULL | Pickup location longitude |
+| category | VARCHAR(50) | NOT NULL | Business type (pizza, burgers, sushi, etc.) |
+| avg_prep_time_minutes | INTEGER | DEFAULT 15 | Typical order preparation time |
+| rating | DECIMAL(3,2) | DEFAULT 5.00 | Average customer rating |
+| is_open | BOOLEAN | DEFAULT true | Currently accepting orders |
+| opens_at | TIME | DEFAULT '09:00' | Daily opening time |
+| closes_at | TIME | DEFAULT '22:00' | Daily closing time |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Profile creation |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification |
+
+**Design Rationale:** ON DELETE SET NULL for owner_id allows merchant to remain if owner account is deleted (business continuity). Separate from users table because a merchant is a business entity, not a person.
+
+#### 4. Menu Items Table
+Products available for order from merchants.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| merchant_id | UUID | FK -> merchants(id) ON DELETE CASCADE | Owning merchant |
+| name | VARCHAR(255) | NOT NULL | Item name |
+| description | TEXT | | Item description |
+| price | DECIMAL(10,2) | NOT NULL | Current price |
+| category | VARCHAR(50) | | Item category (pizza, sides, drinks) |
+| image_url | TEXT | | Product image URL |
+| is_available | BOOLEAN | DEFAULT true | Currently available for order |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Item creation |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification |
+
+**Design Rationale:** ON DELETE CASCADE because menu items have no meaning without their merchant. Price stored here is the current price; order_items stores the price at time of order.
+
+#### 5. Orders Table
+Core transaction table tracking customer orders.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| customer_id | UUID | FK -> users(id) ON DELETE SET NULL | Ordering customer |
+| merchant_id | UUID | FK -> merchants(id) ON DELETE SET NULL | Source merchant |
+| driver_id | UUID | FK -> drivers(id) ON DELETE SET NULL | Assigned driver |
+| status | VARCHAR(30) | NOT NULL DEFAULT 'pending', CHECK | Order lifecycle state |
+| delivery_address | TEXT | NOT NULL | Full delivery address |
+| delivery_lat | DECIMAL(10,8) | NOT NULL | Delivery latitude |
+| delivery_lng | DECIMAL(11,8) | NOT NULL | Delivery longitude |
+| delivery_instructions | TEXT | | Special delivery notes |
+| subtotal | DECIMAL(10,2) | NOT NULL | Sum of item prices |
+| delivery_fee | DECIMAL(10,2) | NOT NULL DEFAULT 0 | Delivery charge |
+| tip | DECIMAL(10,2) | DEFAULT 0 | Driver tip |
+| total | DECIMAL(10,2) | NOT NULL | subtotal + delivery_fee + tip |
+| estimated_prep_time_minutes | INTEGER | | Merchant's prep time estimate |
+| estimated_delivery_time | TIMESTAMP | | Predicted delivery time |
+| actual_delivery_time | TIMESTAMP | | Actual delivery time |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Order placed |
+| confirmed_at | TIMESTAMP | | Merchant confirmed |
+| picked_up_at | TIMESTAMP | | Driver picked up |
+| delivered_at | TIMESTAMP | | Order delivered |
+| cancelled_at | TIMESTAMP | | Order cancelled |
+| cancellation_reason | TEXT | | Why cancelled |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification |
+| archived_at | TIMESTAMP | | When archived to cold storage |
+| retention_days | INTEGER | DEFAULT 90 | Override retention period |
+
+**Status Values:** 'pending', 'confirmed', 'preparing', 'ready_for_pickup', 'driver_assigned', 'picked_up', 'in_transit', 'delivered', 'cancelled'
+
+**Design Rationale:** ON DELETE SET NULL for all FKs preserves order history even if users/merchants/drivers are deleted. Timestamps for each state transition enable SLA tracking and analytics. Archival columns support data lifecycle management.
+
+#### 6. Order Items Table
+Line items within an order.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| order_id | UUID | FK -> orders(id) ON DELETE CASCADE | Parent order |
+| menu_item_id | UUID | FK -> menu_items(id) ON DELETE SET NULL | Original menu item |
+| name | VARCHAR(255) | NOT NULL | Item name (denormalized) |
+| quantity | INTEGER | NOT NULL DEFAULT 1 | Number of items |
+| unit_price | DECIMAL(10,2) | NOT NULL | Price at time of order |
+| special_instructions | TEXT | | Customer customization notes |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Item added |
+
+**Design Rationale:** ON DELETE CASCADE because items are meaningless without their order. Name and unit_price are denormalized from menu_items to preserve historical accuracy if menu changes.
+
+#### 7. Driver Offers Table
+Tracks order assignments and driver responses.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| order_id | UUID | FK -> orders(id) ON DELETE CASCADE | Order being offered |
+| driver_id | UUID | FK -> drivers(id) ON DELETE CASCADE | Driver receiving offer |
+| status | VARCHAR(20) | NOT NULL DEFAULT 'pending', CHECK | 'pending', 'accepted', 'rejected', 'expired' |
+| offered_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | When offer was sent |
+| expires_at | TIMESTAMP | NOT NULL | Deadline for response |
+| responded_at | TIMESTAMP | | When driver responded |
+
+**Design Rationale:** ON DELETE CASCADE for both FKs because offer history is tied to specific orders and drivers. Enables tracking of acceptance rates and matching algorithm performance.
+
+#### 8. Ratings Table
+Two-way ratings for completed deliveries.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| order_id | UUID | FK -> orders(id) ON DELETE CASCADE | Related order |
+| rater_id | UUID | FK -> users(id) ON DELETE SET NULL | User giving rating |
+| rated_user_id | UUID | FK -> users(id) ON DELETE SET NULL | User being rated (driver or customer) |
+| rated_merchant_id | UUID | FK -> merchants(id) ON DELETE SET NULL | Merchant being rated |
+| rating | INTEGER | NOT NULL, CHECK (1-5) | Star rating |
+| comment | TEXT | | Review text |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Rating submitted |
+
+**Design Rationale:** Flexible schema allows rating drivers, customers, or merchants from the same table. Only one of rated_user_id or rated_merchant_id is set per record.
+
+#### 9. Delivery Zones Table
+Geographic areas with pricing configuration.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| name | VARCHAR(100) | NOT NULL | Zone name |
+| center_lat | DECIMAL(10,8) | NOT NULL | Zone center latitude |
+| center_lng | DECIMAL(11,8) | NOT NULL | Zone center longitude |
+| radius_km | DECIMAL(5,2) | NOT NULL | Coverage radius |
+| is_active | BOOLEAN | DEFAULT true | Zone accepting orders |
+| base_delivery_fee | DECIMAL(10,2) | DEFAULT 2.99 | Minimum delivery fee |
+| per_km_fee | DECIMAL(10,2) | DEFAULT 0.50 | Per-kilometer charge |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Zone creation |
+
+**Design Rationale:** Circular zones simplify containment checks (Haversine distance < radius). Per-zone pricing enables location-based fee structures.
+
+#### 10. Sessions Table
+Authentication sessions.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| user_id | UUID | FK -> users(id) ON DELETE CASCADE | Session owner |
+| token | VARCHAR(255) | UNIQUE NOT NULL | Session token |
+| expires_at | TIMESTAMP | NOT NULL | Expiration time |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Session creation |
+
+**Design Rationale:** ON DELETE CASCADE automatically invalidates sessions when user is deleted. Primarily used as backup to Redis session cache.
+
+#### 11. Driver Location History Table
+Historical location data for analytics.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| driver_id | UUID | FK -> drivers(id) ON DELETE CASCADE | Driver tracked |
+| lat | DECIMAL(10,8) | NOT NULL | Latitude |
+| lng | DECIMAL(11,8) | NOT NULL | Longitude |
+| speed | DECIMAL(6,2) | | Speed in km/h |
+| heading | DECIMAL(5,2) | | Direction in degrees |
+| recorded_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Recording time |
+
+**Design Rationale:** Separate from drivers table for time-series data. High-volume table with retention policy (7 days hot, then archived).
+
+#### 12. Idempotency Keys Table
+Prevents duplicate operations on network retry.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| key | VARCHAR(64) | PRIMARY KEY | Client-provided unique key |
+| user_id | UUID | FK -> users(id) ON DELETE CASCADE | Key owner |
+| operation | VARCHAR(50) | NOT NULL | Operation type (create_order, etc.) |
+| response | JSONB | | Cached response for completed ops |
+| status | VARCHAR(20) | NOT NULL DEFAULT 'pending', CHECK | 'pending', 'completed', 'failed' |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Key creation |
+| expires_at | TIMESTAMP | NOT NULL | Key expiration |
+
+**Design Rationale:** Enables exactly-once semantics for critical operations like order creation. Keys expire after 24 hours to prevent unbounded table growth.
+
+#### 13. Retention Policies Table
+Data lifecycle configuration per table.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PRIMARY KEY, DEFAULT uuid_generate_v4() | Unique identifier |
+| table_name | VARCHAR(100) | UNIQUE NOT NULL | Target table |
+| hot_storage_days | INTEGER | NOT NULL DEFAULT 30 | Days in primary storage |
+| warm_storage_days | INTEGER | NOT NULL DEFAULT 365 | Days before archival |
+| archive_enabled | BOOLEAN | DEFAULT true | Whether to archive |
+| last_cleanup_at | TIMESTAMP | | Last cleanup job run |
+| created_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Policy creation |
+| updated_at | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Last modification |
+
+**Design Rationale:** Centralized configuration for data lifecycle management. Enables automated cleanup jobs to manage database size.
+
+### Foreign Key Relationships and Cascade Behaviors
+
+| Parent Table | Child Table | FK Column | ON DELETE Behavior | Rationale |
+|--------------|-------------|-----------|-------------------|-----------|
+| users | drivers | id | CASCADE | Driver profile is meaningless without user |
+| users | merchants | owner_id | SET NULL | Keep merchant for business continuity |
+| users | orders | customer_id | SET NULL | Preserve order history |
+| users | sessions | user_id | CASCADE | Sessions should be deleted with user |
+| users | ratings (rater) | rater_id | SET NULL | Keep rating, just anonymize |
+| users | ratings (rated) | rated_user_id | SET NULL | Keep rating, just anonymize |
+| users | idempotency_keys | user_id | CASCADE | Keys are user-specific |
+| drivers | orders | driver_id | SET NULL | Preserve order history |
+| drivers | driver_offers | driver_id | CASCADE | Offers are driver-specific |
+| drivers | driver_location_history | driver_id | CASCADE | History is driver-specific |
+| merchants | menu_items | merchant_id | CASCADE | Menu belongs to merchant |
+| merchants | orders | merchant_id | SET NULL | Preserve order history |
+| merchants | ratings | rated_merchant_id | SET NULL | Keep rating, just anonymize |
+| orders | order_items | order_id | CASCADE | Items belong to order |
+| orders | driver_offers | order_id | CASCADE | Offers are order-specific |
+| orders | ratings | order_id | CASCADE | Rating belongs to order |
+| menu_items | order_items | menu_item_id | SET NULL | Keep ordered item history |
+
+### Database Indexes
+
+| Index Name | Table | Columns | Type | Purpose |
+|------------|-------|---------|------|---------|
+| idx_orders_status | orders | status | B-tree | Filter by order status |
+| idx_orders_customer | orders | customer_id | B-tree | Customer order history |
+| idx_orders_driver | orders | driver_id | Partial (active statuses) | Active driver orders |
+| idx_orders_merchant | orders | merchant_id | B-tree | Merchant order history |
+| idx_orders_created | orders | created_at DESC | B-tree | Recent orders listing |
+| idx_orders_archive | orders | created_at, archived_at | Partial (not archived) | Archive job queries |
+| idx_drivers_status | drivers | status | B-tree | Available driver lookup |
+| idx_drivers_location | drivers | current_lat, current_lng | Partial (available) | Nearby driver search |
+| idx_merchants_location | merchants | lat, lng | B-tree | Nearby merchant search |
+| idx_merchants_category | merchants | category | B-tree | Category filtering |
+| idx_menu_items_merchant | menu_items | merchant_id | B-tree | Menu listing |
+| idx_driver_offers_order | driver_offers | order_id | B-tree | Offers per order |
+| idx_driver_offers_driver | driver_offers | driver_id | B-tree | Offers per driver |
+| idx_sessions_token | sessions | token | B-tree | Session lookup |
+| idx_sessions_user | sessions | user_id | B-tree | User sessions |
+| idx_driver_location_history | driver_location_history | driver_id, recorded_at DESC | B-tree | Driver path queries |
+| idx_idempotency_keys_expires | idempotency_keys | expires_at | B-tree | Cleanup job |
+| idx_idempotency_keys_user | idempotency_keys | user_id | B-tree | User key lookup |
+
+### Data Flow Between Tables
+
+#### Order Placement Flow
+```
+1. Customer (users.role='customer') selects items from menu_items
+2. Order created in orders with customer_id, merchant_id, status='pending'
+3. Order items copied to order_items with denormalized name/price
+4. Matching service finds nearby drivers (via Redis geo-index)
+5. Driver offers created in driver_offers with 30-second expiry
+6. When driver accepts, orders.driver_id set, status='driver_assigned'
+7. Status transitions recorded via timestamp columns
+8. Rating created in ratings after delivery
+```
+
+#### Driver Location Flow
+```
+1. Driver logs in, session created in sessions
+2. Driver goes online, drivers.status='available'
+3. Location updates: Redis GEOADD (real-time) + drivers.current_lat/lng (persistent)
+4. Historical points logged to driver_location_history (analytics)
+5. Retention job archives location history after 7 days
+```
+
+#### Idempotency Flow
+```
+1. Client generates unique idempotency key
+2. Request arrives with X-Idempotency-Key header
+3. Check idempotency_keys for existing key
+4. If found + completed: return cached response
+5. If not found: create pending record, execute operation
+6. On success: update to completed with response JSONB
+7. Cleanup job removes expired keys daily
+```
 
 ### Redis Data Structures
 

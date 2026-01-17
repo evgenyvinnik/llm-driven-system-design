@@ -90,47 +90,274 @@ A privacy-aware search engine for social media posts with real-time indexing, pe
 
 ### PostgreSQL Schema
 
-```sql
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  display_name VARCHAR(100) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW()
-);
+The database consists of five tables that support user authentication, content management, social relationships, and search analytics. The complete schema is available in `/backend/src/db/init.sql`.
 
--- Posts
-CREATE TABLE posts (
-  id UUID PRIMARY KEY,
-  author_id UUID REFERENCES users(id),
-  content TEXT NOT NULL,
-  visibility VARCHAR(20) DEFAULT 'friends',
-  post_type VARCHAR(20) DEFAULT 'text',
-  like_count INTEGER DEFAULT 0,
-  comment_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+#### Entity-Relationship Diagram
 
--- Friendships
-CREATE TABLE friendships (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
-  friend_id UUID REFERENCES users(id),
-  status VARCHAR(20) DEFAULT 'pending',
-  created_at TIMESTAMP DEFAULT NOW()
-);
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              ENTITY RELATIONSHIPS                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
 
--- Search History
-CREATE TABLE search_history (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
-  query VARCHAR(500) NOT NULL,
-  results_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+                              ┌──────────────────┐
+                              │      users       │
+                              ├──────────────────┤
+                              │ id (PK)          │
+                              │ username         │
+                              │ email            │
+                              │ display_name     │
+                              │ password_hash    │
+                              │ avatar_url       │
+                              │ role             │
+                              │ created_at       │
+                              │ updated_at       │
+                              └────────┬─────────┘
+                                       │
+           ┌───────────────────────────┼───────────────────────────┐
+           │                           │                           │
+           │ 1:N                       │ 1:N                       │ 1:N
+           ▼                           ▼                           ▼
+┌──────────────────┐        ┌──────────────────┐        ┌──────────────────┐
+│      posts       │        │   friendships    │        │  search_history  │
+├──────────────────┤        ├──────────────────┤        ├──────────────────┤
+│ id (PK)          │        │ id (PK)          │        │ id (PK)          │
+│ author_id (FK)───┼────────│ user_id (FK)─────┼────────│ user_id (FK)     │
+│ content          │        │ friend_id (FK)───┼───┐    │ query            │
+│ visibility       │        │ status           │   │    │ filters (JSONB)  │
+│ post_type        │        │ created_at       │   │    │ results_count    │
+│ media_url        │        └──────────────────┘   │    │ created_at       │
+│ like_count       │                               │    └──────────────────┘
+│ comment_count    │        ┌──────────────────────┘
+│ share_count      │        │ (self-referential)
+│ created_at       │        │
+│ updated_at       │        │                           ┌──────────────────┐
+└──────────────────┘        │                           │     sessions     │
+                            │                           ├──────────────────┤
+                            │                           │ id (PK)          │
+                            └───────────────────────────│ user_id (FK)     │
+                                                        │ token            │
+                                                        │ expires_at       │
+                                                        │ created_at       │
+                                                        └──────────────────┘
+
+LEGEND:
+  PK = Primary Key
+  FK = Foreign Key
+  1:N = One-to-Many relationship
+  ──► = Foreign key reference direction
+```
+
+#### Table Definitions
+
+##### users
+The central identity table for all user accounts.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Unique user identifier |
+| username | VARCHAR(50) | UNIQUE, NOT NULL | Public username for @mentions |
+| email | VARCHAR(255) | UNIQUE, NOT NULL | Email address for login |
+| display_name | VARCHAR(100) | NOT NULL | Human-readable name shown in UI |
+| password_hash | VARCHAR(255) | NOT NULL | bcrypt-hashed password |
+| avatar_url | VARCHAR(500) | | URL to profile picture |
+| role | VARCHAR(20) | CHECK (user, admin), DEFAULT 'user' | Authorization level |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | Account creation time |
+| updated_at | TIMESTAMPTZ | DEFAULT NOW(), auto-trigger | Last profile modification |
+
+**Design rationale:**
+- UUID primary keys enable distributed ID generation without coordination
+- Separate username/email allows login by either method
+- Display name supports internationalization (non-ASCII names)
+- Role column enables admin features without separate admin table
+
+##### posts
+User-generated content with visibility controls and denormalized engagement metrics.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Unique post identifier |
+| author_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | Post creator |
+| content | TEXT | NOT NULL | Post body text (indexed to Elasticsearch) |
+| visibility | VARCHAR(20) | CHECK (public, friends, friends_of_friends, private), DEFAULT 'friends' | Access control level |
+| post_type | VARCHAR(20) | CHECK (text, photo, video, link), DEFAULT 'text' | Content type for filtering |
+| media_url | VARCHAR(500) | | URL to attached media (if applicable) |
+| like_count | INTEGER | DEFAULT 0 | Denormalized like count |
+| comment_count | INTEGER | DEFAULT 0 | Denormalized comment count |
+| share_count | INTEGER | DEFAULT 0 | Denormalized share count |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | Post creation time |
+| updated_at | TIMESTAMPTZ | DEFAULT NOW(), auto-trigger | Last post edit time |
+
+**Design rationale:**
+- Denormalized counters avoid expensive COUNT(*) aggregations at read time
+- Visibility enum maps directly to Elasticsearch visibility fingerprints
+- Post types enable faceted search filtering
+- ON DELETE CASCADE ensures orphan posts are removed when user is deleted
+
+##### friendships
+Directional social graph edges representing friend relationships.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Relationship identifier |
+| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | The user who owns this relationship |
+| friend_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | The friend in the relationship |
+| status | VARCHAR(20) | CHECK (pending, accepted, blocked), DEFAULT 'pending' | Relationship state |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | When relationship was created |
+| | | UNIQUE(user_id, friend_id) | Prevents duplicate relationships |
+
+**Design rationale:**
+- Directional design: each accepted friendship creates two rows (A->B and B->A)
+- Enables fast queries: "SELECT friend_id FROM friendships WHERE user_id = ? AND status = 'accepted'"
+- Status supports friend request workflow (pending -> accepted) and blocking
+- Self-referential FK to users enables friends-of-friends queries via join
+- ON DELETE CASCADE: when a user is deleted, all their friendships are removed
+
+**Data flow for visibility computation:**
+1. User searches for posts
+2. System queries `friendships` for user's accepted friends
+3. Builds visibility fingerprint set: `["PUBLIC", "PRIVATE:{user_id}", "FRIENDS:{friend_id}", ...]`
+4. Elasticsearch filters posts by fingerprint intersection
+
+##### search_history
+Analytics table for tracking search queries.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Search record identifier |
+| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | User who searched |
+| query | VARCHAR(500) | NOT NULL | Search query text |
+| filters | JSONB | | Applied filters (date_range, post_type, etc.) |
+| results_count | INTEGER | DEFAULT 0 | Number of results returned |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | When search was performed |
+
+**Design rationale:**
+- JSONB for filters enables flexible schema evolution without migrations
+- results_count helps identify low-yield queries for improvement
+- Subject to 90-day retention (cleaned by scheduled job)
+- Used for: trending searches, search suggestions, analytics
+
+##### sessions
+Authentication session storage (also cached in Redis).
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Session identifier |
+| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | Session owner |
+| token | VARCHAR(255) | UNIQUE, NOT NULL | Session token (cookie value) |
+| expires_at | TIMESTAMPTZ | NOT NULL | Session expiration time |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | Session creation time |
+
+**Design rationale:**
+- Token uniqueness prevents collision attacks
+- Explicit expires_at enables both database cleanup and application validation
+- ON DELETE CASCADE: deleting a user invalidates all their sessions
+- Redis caching reduces database load for high-frequency auth checks
+
+#### Indexes
+
+| Table | Index | Columns | Purpose |
+|-------|-------|---------|---------|
+| posts | idx_posts_author_id | author_id | User profile page queries |
+| posts | idx_posts_created_at | created_at DESC | Chronological feeds, date filtering |
+| posts | idx_posts_visibility | visibility | Privacy-aware query optimization |
+| friendships | idx_friendships_user_id | user_id | Friend list lookups |
+| friendships | idx_friendships_friend_id | friend_id | Reverse friend lookups |
+| friendships | idx_friendships_status | status | Filter by relationship state |
+| search_history | idx_search_history_user_id | user_id | User's recent searches |
+| search_history | idx_search_history_created_at | created_at DESC | Trending queries, cleanup |
+| sessions | idx_sessions_token | token | Auth token validation |
+| sessions | idx_sessions_user_id | user_id | Logout all devices feature |
+
+#### Foreign Key Cascade Behaviors
+
+All foreign keys use `ON DELETE CASCADE`:
+
+| Relationship | Cascade Effect | Rationale |
+|--------------|----------------|-----------|
+| posts.author_id -> users.id | User deletion removes all their posts | Prevents orphan content; supports GDPR right-to-erasure |
+| friendships.user_id -> users.id | User deletion removes outgoing relationships | Maintains referential integrity |
+| friendships.friend_id -> users.id | User deletion removes incoming relationships | Bidirectional cleanup |
+| search_history.user_id -> users.id | User deletion removes search history | Privacy compliance |
+| sessions.user_id -> users.id | User deletion invalidates all sessions | Security requirement |
+
+**Why CASCADE over SET NULL:**
+- Social graph integrity: orphan friendships pointing to deleted users would corrupt visibility computation
+- Privacy: deleted users should have no residual data in the system
+- Simplicity: application code doesn't need to handle null foreign keys
+
+**Why not RESTRICT:**
+- User deletion should always succeed without manual cleanup
+- Dependent data has no value after user deletion
+
+#### Triggers
+
+| Trigger | Table | Event | Function | Purpose |
+|---------|-------|-------|----------|---------|
+| update_users_updated_at | users | BEFORE UPDATE | update_updated_at_column() | Audit timestamp |
+| update_posts_updated_at | posts | BEFORE UPDATE | update_updated_at_column() | Edit tracking |
+
+The `update_updated_at_column()` function automatically sets `updated_at = NOW()` on any row modification, ensuring accurate audit trails without application-layer responsibility.
+
+#### Data Flow Examples
+
+**1. Creating a new post:**
+```
+Application                    PostgreSQL                    Elasticsearch
+    │                              │                              │
+    ├─ INSERT INTO posts ──────────►                              │
+    │  (author_id, content,        │                              │
+    │   visibility, post_type)     │                              │
+    │                              │                              │
+    │  ◄─── id, created_at ────────┤                              │
+    │                              │                              │
+    ├─ Compute visibility ─────────┼──────────────────────────────►
+    │  fingerprints                │  INDEX document with         │
+    │                              │  fingerprints                │
+    │                              │                              │
+    │  ◄───────────────────────────┼─── searchable immediately ───┤
+```
+
+**2. Searching for posts (privacy-aware):**
+```
+User Query         Search Service           PostgreSQL         Elasticsearch
+    │                    │                       │                   │
+    ├─ search "party" ──►│                       │                   │
+    │                    │                       │                   │
+    │                    ├─ GET user's friends ──►                   │
+    │                    │   FROM friendships    │                   │
+    │                    │   WHERE status='accepted'                 │
+    │                    │                       │                   │
+    │                    │  ◄─── friend_ids ─────┤                   │
+    │                    │                       │                   │
+    │                    ├─ Build visibility set: ─────────────────►│
+    │                    │   ["PUBLIC",          │  Filter by       │
+    │                    │    "PRIVATE:user",    │  visibility_     │
+    │                    │    "FRIENDS:friend1", │  fingerprints    │
+    │                    │    ...]               │                  │
+    │                    │                       │                   │
+    │                    │  ◄──────── matching posts ───────────────┤
+    │                    │                       │                   │
+    │  ◄─ ranked results ┤                       │                   │
+```
+
+**3. Accepting a friend request:**
+```
+Application                    PostgreSQL                    Redis (Cache)
+    │                              │                              │
+    ├─ UPDATE friendships ─────────►                              │
+    │  SET status='accepted'       │                              │
+    │  WHERE user_id=B, friend_id=A│                              │
+    │                              │                              │
+    ├─ INSERT INTO friendships ────►                              │
+    │  (user_id=A, friend_id=B,    │                              │
+    │   status='accepted')         │                              │
+    │                              │                              │
+    ├─ Invalidate visibility cache ┼──────────────────────────────►
+    │  for users A and B           │  DEL visibility:A            │
+    │                              │  DEL visibility:B            │
+    │                              │                              │
+    │  (Next search will           │                              │
+    │   recompute fresh set)       │                              │
 ```
 
 ### Elasticsearch Document Schema

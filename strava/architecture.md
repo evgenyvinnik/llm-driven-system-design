@@ -92,97 +92,375 @@ A fitness tracking and social platform for athletes that records GPS-based activ
 
 ## Data Model
 
-### PostgreSQL Schema
+### Entity-Relationship Overview
+
+The database follows a normalized design with clear entity boundaries. The central entities are **Users**, **Activities**, and **Segments**, connected through relationship tables.
+
+```
+                                    ┌──────────────────┐
+                                    │   achievements   │
+                                    │                  │
+                                    │ - id             │
+                                    │ - name           │
+                                    │ - criteria_type  │
+                                    │ - criteria_value │
+                                    └────────┬─────────┘
+                                             │
+                                             │ 1:N
+                                             │
+┌──────────────┐                    ┌────────▼─────────┐                    ┌──────────────┐
+│   follows    │◄───────────────────┤      users       ├───────────────────►│privacy_zones │
+│              │  1:N               │                  │  1:N               │              │
+│ - follower_id│  (as follower)     │ - id             │                    │ - id         │
+│ - following_id                    │ - username       │                    │ - user_id    │
+│ - created_at │  1:N               │ - email          │                    │ - center_lat │
+│              │◄─────(as following)│ - password_hash  │                    │ - center_lng │
+└──────────────┘                    │ - role           │                    │ - radius     │
+                                    └─────────┬────────┘                    └──────────────┘
+                                              │
+                    ┌─────────────────────────┼─────────────────────────┐
+                    │ 1:N                     │ 1:N                     │ 1:N
+                    ▼                         ▼                         ▼
+           ┌────────────────┐        ┌────────────────┐        ┌────────────────┐
+           │  activities    │        │   segments     │        │user_achievements│
+           │                │        │                │        │                │
+           │ - id           │        │ - id           │        │ - user_id      │
+           │ - user_id      │        │ - creator_id   │        │ - achievement_id│
+           │ - type         │        │ - name         │        │ - earned_at    │
+           │ - start_time   │        │ - activity_type│        └────────────────┘
+           │ - distance     │        │ - distance     │
+           │ - polyline     │        │ - polyline     │
+           │ - kudos_count  │        │ - bbox coords  │
+           └───────┬────────┘        └────────┬───────┘
+                   │                          │
+     ┌─────────────┼─────────────┐            │
+     │ 1:N         │ 1:N         │ 1:N        │
+     ▼             ▼             ▼            │
+┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│gps_points│ │  kudos   │ │ comments │        │
+│          │ │          │ │          │        │
+│- id      │ │-activity_│ │- id      │        │
+│-activity_│ │  id      │ │-activity_│        │
+│  id      │ │- user_id │ │  id      │        │
+│- lat/lng │ │          │ │- user_id │        │
+│- altitude│ └──────────┘ │- content │        │
+│- speed   │              └──────────┘        │
+└──────────┘                                  │
+                                              │
+                              ┌───────────────┴───────────────┐
+                              │       segment_efforts         │
+                              │                               │
+                              │ - id                          │
+                              │ - segment_id  ───────────────►│
+                              │ - activity_id ───────────────►│
+                              │ - user_id     ───────────────►│
+                              │ - elapsed_time                │
+                              │ - pr_rank                     │
+                              └───────────────────────────────┘
+```
+
+### Complete PostgreSQL Schema
+
+The full schema is available in `/backend/src/db/init.sql`. Below is the detailed documentation of each table.
+
+#### Core User Management
 
 ```sql
--- Users
+-- Users table: Central entity for all athletes
 CREATE TABLE users (
-    id              UUID PRIMARY KEY,
-    username        VARCHAR(50) UNIQUE NOT NULL,
-    email           VARCHAR(255) UNIQUE NOT NULL,
-    password_hash   VARCHAR(255) NOT NULL,
-    profile_photo   VARCHAR(512),
-    weight_kg       DECIMAL(5,2),
-    bio             TEXT,
-    location        VARCHAR(255),
-    role            VARCHAR(20) DEFAULT 'user',
-    created_at      TIMESTAMP DEFAULT NOW()
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username        VARCHAR(50) UNIQUE NOT NULL,    -- Public display name
+    email           VARCHAR(255) UNIQUE NOT NULL,   -- Login credential
+    password_hash   VARCHAR(255) NOT NULL,          -- bcrypt hashed
+    profile_photo   VARCHAR(512),                   -- URL to profile image
+    weight_kg       DECIMAL(5,2),                   -- For calorie calculations
+    bio             TEXT,                           -- User biography
+    location        VARCHAR(255),                   -- General location
+    role            VARCHAR(20) DEFAULT 'user',     -- 'user' or 'admin'
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
 );
 
--- Following relationships
+-- Following relationships: Directed social graph
 CREATE TABLE follows (
-    follower_id     UUID REFERENCES users(id),
-    following_id    UUID REFERENCES users(id),
+    follower_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    following_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at      TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (follower_id, following_id)
 );
+```
 
--- Activities
+**Design Rationale:**
+- **UUID primary keys**: Allows distributed ID generation and prevents ID enumeration attacks
+- **Composite primary key on follows**: Prevents duplicate relationships and enables efficient lookups in both directions
+- **ON DELETE CASCADE**: When a user is deleted, all their follow relationships are automatically removed
+
+#### Activity Tracking
+
+```sql
+-- Activities table: Core workout records
 CREATE TABLE activities (
-    id              UUID PRIMARY KEY,
-    user_id         UUID NOT NULL REFERENCES users(id),
-    type            VARCHAR(20) NOT NULL,      -- 'run', 'ride', 'hike'
-    name            VARCHAR(255),
-    start_time      TIMESTAMP NOT NULL,
-    elapsed_time    INTEGER NOT NULL,          -- seconds
-    moving_time     INTEGER NOT NULL,
-    distance        DECIMAL(12,2),             -- meters
-    elevation_gain  DECIMAL(8,2),              -- meters
-    avg_speed       DECIMAL(8,2),              -- m/s
-    max_speed       DECIMAL(8,2),
-    polyline        TEXT,                      -- Encoded polyline for display
-    privacy         VARCHAR(20) DEFAULT 'public',
-    kudos_count     INTEGER DEFAULT 0,
-    comment_count   INTEGER DEFAULT 0,
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type            VARCHAR(20) NOT NULL,           -- 'run', 'ride', 'hike', 'walk'
+    name            VARCHAR(255),                   -- Activity title
+    description     TEXT,                           -- User notes
+    start_time      TIMESTAMP NOT NULL,             -- When activity started
+    elapsed_time    INTEGER NOT NULL,               -- Total time (seconds)
+    moving_time     INTEGER NOT NULL,               -- Time moving (seconds)
+    distance        DECIMAL(12,2),                  -- Distance (meters)
+    elevation_gain  DECIMAL(8,2),                   -- Climbing (meters)
+    calories        INTEGER,                        -- Estimated calories
+    avg_heart_rate  INTEGER,                        -- Average bpm
+    max_heart_rate  INTEGER,                        -- Maximum bpm
+    avg_speed       DECIMAL(8,2),                   -- Average m/s
+    max_speed       DECIMAL(8,2),                   -- Maximum m/s
+    privacy         VARCHAR(20) DEFAULT 'followers', -- Visibility level
+    polyline        TEXT,                           -- Encoded route
+    start_lat       DECIMAL(10,7),                  -- Starting coordinates
+    start_lng       DECIMAL(10,7),
+    end_lat         DECIMAL(10,7),                  -- Ending coordinates
+    end_lng         DECIMAL(10,7),
+    kudos_count     INTEGER DEFAULT 0,              -- Denormalized count
+    comment_count   INTEGER DEFAULT 0,              -- Denormalized count
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
--- GPS Points (for segment matching)
+-- GPS Points: Detailed route data
 CREATE TABLE gps_points (
     id              SERIAL PRIMARY KEY,
-    activity_id     UUID REFERENCES activities(id),
-    point_index     INTEGER NOT NULL,
-    timestamp       TIMESTAMP,
-    latitude        DECIMAL(10,7) NOT NULL,
-    longitude       DECIMAL(10,7) NOT NULL,
-    altitude        DECIMAL(8,2),
-    speed           DECIMAL(8,2),
-    heart_rate      INTEGER
+    activity_id     UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    point_index     INTEGER NOT NULL,               -- Order in track
+    timestamp       TIMESTAMP,                      -- When recorded
+    latitude        DECIMAL(10,7) NOT NULL,         -- GPS latitude
+    longitude       DECIMAL(10,7) NOT NULL,         -- GPS longitude
+    altitude        DECIMAL(8,2),                   -- Elevation (meters)
+    speed           DECIMAL(8,2),                   -- Instantaneous m/s
+    heart_rate      INTEGER,                        -- Heart rate (bpm)
+    cadence         INTEGER,                        -- Steps/rev per minute
+    power           INTEGER                         -- Power (watts)
 );
 
--- Segments
+-- Index for efficient GPS retrieval
+CREATE INDEX idx_gps_points_activity ON gps_points(activity_id, point_index);
+```
+
+**Design Rationale:**
+- **Separate gps_points table**: Normalizes storage; an activity may have 1,000-50,000 GPS points
+- **point_index column**: Maintains GPS track order for segment matching
+- **polyline on activities**: Stores pre-encoded route for quick map display (avoids loading all GPS points)
+- **Denormalized kudos_count/comment_count**: Avoids COUNT(*) queries on every activity load
+- **DECIMAL for coordinates**: DECIMAL(10,7) provides ~1cm precision (7 decimal places)
+
+#### Segment System
+
+```sql
+-- Segments: Predefined route sections for competition
 CREATE TABLE segments (
-    id              UUID PRIMARY KEY,
-    creator_id      UUID REFERENCES users(id),
-    name            VARCHAR(255) NOT NULL,
-    activity_type   VARCHAR(20) NOT NULL,
-    distance        DECIMAL(12,2) NOT NULL,
-    elevation_gain  DECIMAL(8,2),
-    polyline        TEXT NOT NULL,
-    start_lat       DECIMAL(10,7) NOT NULL,
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    creator_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            VARCHAR(255) NOT NULL,          -- Segment name
+    activity_type   VARCHAR(20) NOT NULL,           -- 'run' or 'ride'
+    distance        DECIMAL(12,2) NOT NULL,         -- Length (meters)
+    elevation_gain  DECIMAL(8,2),                   -- Climbing (meters)
+    polyline        TEXT NOT NULL,                  -- Encoded route
+    start_lat       DECIMAL(10,7) NOT NULL,         -- Start coordinates
     start_lng       DECIMAL(10,7) NOT NULL,
-    end_lat         DECIMAL(10,7) NOT NULL,
+    end_lat         DECIMAL(10,7) NOT NULL,         -- End coordinates
     end_lng         DECIMAL(10,7) NOT NULL,
-    min_lat         DECIMAL(10,7) NOT NULL,
+    min_lat         DECIMAL(10,7) NOT NULL,         -- Bounding box
     min_lng         DECIMAL(10,7) NOT NULL,
     max_lat         DECIMAL(10,7) NOT NULL,
     max_lng         DECIMAL(10,7) NOT NULL,
-    effort_count    INTEGER DEFAULT 0,
-    athlete_count   INTEGER DEFAULT 0
+    effort_count    INTEGER DEFAULT 0,              -- Total completions
+    athlete_count   INTEGER DEFAULT 0,              -- Unique athletes
+    created_at      TIMESTAMP DEFAULT NOW()
 );
 
--- Segment Efforts
+-- Bounding box index for segment matching
+CREATE INDEX idx_segments_bbox ON segments(min_lat, max_lat, min_lng, max_lng);
+CREATE INDEX idx_segments_type ON segments(activity_type);
+
+-- Segment efforts: Records of segment completions
 CREATE TABLE segment_efforts (
-    id              UUID PRIMARY KEY,
-    segment_id      UUID REFERENCES segments(id),
-    activity_id     UUID REFERENCES activities(id),
-    user_id         UUID REFERENCES users(id),
-    elapsed_time    INTEGER NOT NULL,
-    moving_time     INTEGER NOT NULL,
-    pr_rank         INTEGER,                   -- 1, 2, 3 for top PRs
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    segment_id      UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    activity_id     UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    elapsed_time    INTEGER NOT NULL,               -- Completion time (seconds)
+    moving_time     INTEGER NOT NULL,               -- Moving time (seconds)
+    start_index     INTEGER,                        -- GPS point start
+    end_index       INTEGER,                        -- GPS point end
+    avg_speed       DECIMAL(8,2),                   -- Average m/s
+    max_speed       DECIMAL(8,2),                   -- Maximum m/s
+    pr_rank         INTEGER,                        -- Personal record rank (1,2,3)
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Leaderboard query optimization
+CREATE INDEX idx_segment_efforts_segment ON segment_efforts(segment_id, elapsed_time);
+-- Personal record lookups
+CREATE INDEX idx_segment_efforts_user ON segment_efforts(user_id, segment_id);
+```
+
+**Design Rationale:**
+- **Bounding box columns (min/max lat/lng)**: Enables fast Phase 1 segment matching using simple range queries
+- **start_index/end_index on efforts**: Allows linking back to exact GPS points for detailed analysis
+- **Composite indexes**: `(segment_id, elapsed_time)` enables efficient leaderboard sorting without filesort
+- **Triple foreign keys on segment_efforts**: Denormalized user_id (could be derived from activity) for faster user-specific queries
+
+#### Privacy Management
+
+```sql
+-- Privacy zones: Hide GPS data near sensitive locations
+CREATE TABLE privacy_zones (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            VARCHAR(100),                   -- Zone name (e.g., "Home")
+    center_lat      DECIMAL(10,7) NOT NULL,         -- Center point
+    center_lng      DECIMAL(10,7) NOT NULL,
+    radius_meters   INTEGER NOT NULL DEFAULT 500,   -- Hidden radius
     created_at      TIMESTAMP DEFAULT NOW()
 );
 ```
+
+**Design Rationale:**
+- **Circular zones**: Simple to implement with Haversine distance; sufficient for privacy
+- **Default 500m radius**: Balances privacy with route continuity
+- **Multiple zones per user**: Athletes can protect home, work, and other locations
+
+#### Social Features
+
+```sql
+-- Kudos: Activity "likes"
+CREATE TABLE kudos (
+    activity_id     UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (activity_id, user_id)
+);
+
+-- Comments: Discussion on activities
+CREATE TABLE comments (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    activity_id     UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+```
+
+**Design Rationale:**
+- **Composite primary key on kudos**: Prevents duplicate kudos and enables quick "has user given kudos?" checks
+- **ON DELETE CASCADE**: Automatically removes kudos/comments when activity is deleted
+
+#### Achievements/Gamification
+
+```sql
+-- Achievements: Badge definitions
+CREATE TABLE achievements (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(100) NOT NULL,
+    description     TEXT,
+    icon            VARCHAR(50),
+    criteria_type   VARCHAR(50) NOT NULL,           -- e.g., 'activity_count'
+    criteria_value  INTEGER NOT NULL                -- Threshold to earn
+);
+
+-- User achievements: Earned badges
+CREATE TABLE user_achievements (
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    achievement_id  UUID NOT NULL REFERENCES achievements(id) ON DELETE CASCADE,
+    earned_at       TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, achievement_id)
+);
+```
+
+**Design Rationale:**
+- **Flexible criteria system**: `criteria_type` + `criteria_value` allows defining new achievements without schema changes
+- **Junction table pattern**: Standard many-to-many relationship with timestamp for "when earned"
+
+### Foreign Key Relationships and Cascade Behaviors
+
+| Parent Table | Child Table | Cascade Behavior | Rationale |
+|-------------|-------------|------------------|-----------|
+| users | follows (as follower) | ON DELETE CASCADE | User deletion removes their follow relationships |
+| users | follows (as following) | ON DELETE CASCADE | User deletion removes others following them |
+| users | activities | ON DELETE CASCADE | User deletion removes all their activities |
+| users | segments | ON DELETE CASCADE | User deletion removes segments they created |
+| users | segment_efforts | ON DELETE CASCADE | User deletion removes their segment efforts |
+| users | privacy_zones | ON DELETE CASCADE | User deletion removes their privacy zones |
+| users | kudos | ON DELETE CASCADE | User deletion removes kudos they gave |
+| users | comments | ON DELETE CASCADE | User deletion removes their comments |
+| users | user_achievements | ON DELETE CASCADE | User deletion removes their achievements |
+| activities | gps_points | ON DELETE CASCADE | Activity deletion removes GPS data |
+| activities | segment_efforts | ON DELETE CASCADE | Activity deletion removes related efforts |
+| activities | kudos | ON DELETE CASCADE | Activity deletion removes kudos |
+| activities | comments | ON DELETE CASCADE | Activity deletion removes comments |
+| segments | segment_efforts | ON DELETE CASCADE | Segment deletion removes all efforts |
+| achievements | user_achievements | ON DELETE CASCADE | Achievement deletion removes user awards |
+
+### Index Strategy
+
+| Index Name | Table | Columns | Purpose |
+|-----------|-------|---------|---------|
+| idx_gps_points_activity | gps_points | (activity_id, point_index) | Fast retrieval of GPS track in order |
+| idx_segments_bbox | segments | (min_lat, max_lat, min_lng, max_lng) | Phase 1 segment matching (bounding box) |
+| idx_segments_type | segments | (activity_type) | Filter segments by run/ride |
+| idx_segment_efforts_segment | segment_efforts | (segment_id, elapsed_time) | Leaderboard queries with sorting |
+| idx_segment_efforts_user | segment_efforts | (user_id, segment_id) | Personal records lookup |
+
+### Data Flow Between Tables
+
+#### Activity Upload Flow
+```
+1. User uploads GPX file
+   └─► activities row created
+       └─► gps_points rows created (1000s of points)
+           └─► Segment matching triggered
+               ├─► Query segments by bounding box (idx_segments_bbox)
+               └─► For each matching segment:
+                   └─► segment_efforts row created
+                       ├─► segments.effort_count incremented
+                       ├─► segments.athlete_count updated (if first effort)
+                       └─► Redis leaderboard updated
+                           └─► Achievement check triggered
+                               └─► user_achievements row created (if earned)
+```
+
+#### Feed Generation Flow
+```
+1. Activity created
+   └─► Query follows WHERE following_id = activity.user_id
+       └─► For each follower:
+           └─► Add to Redis feed:{follower_id} sorted set
+```
+
+#### Kudos Flow
+```
+1. User gives kudos
+   └─► kudos row inserted (idempotent via primary key)
+       └─► activities.kudos_count incremented (denormalized)
+           └─► Achievement check for "Popular Athlete"
+```
+
+### Storage Estimation
+
+| Table | Row Size (avg) | Rows per Active User | Growth Rate |
+|-------|---------------|---------------------|-------------|
+| users | 500 bytes | 1 | Stable |
+| activities | 500 bytes | 100/year | Linear |
+| gps_points | 50 bytes | 500,000/year | Linear (largest table) |
+| segments | 300 bytes | 5/user created | Slow |
+| segment_efforts | 100 bytes | 500/year | Linear |
+| follows | 50 bytes | 100/user | Stable |
+| kudos | 50 bytes | 1000/year | Linear |
+| comments | 200 bytes | 200/year | Linear |
+
+**Example: 1,000 active users after 1 year:**
+- gps_points: 500M rows x 50 bytes = ~25 GB
+- activities: 100K rows x 500 bytes = ~50 MB
+- All other tables combined: < 100 MB
 
 ### Redis Data Structures
 

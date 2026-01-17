@@ -59,87 +59,483 @@ A collaborative spreadsheet application with real-time multi-user editing, formu
 
 ## Data Model
 
-### PostgreSQL Schema
+### Entity-Relationship Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              ENTITY RELATIONSHIPS                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│     ┌──────────┐                                                                 │
+│     │  users   │                                                                 │
+│     └────┬─────┘                                                                 │
+│          │                                                                        │
+│          │ 1:N (owner_id, nullable)                                              │
+│          ▼                                                                        │
+│     ┌──────────────┐         1:N (CASCADE)        ┌──────────────────┐          │
+│     │ spreadsheets │─────────────────────────────▶│   collaborators  │          │
+│     └──────┬───────┘                              └──────────────────┘          │
+│            │                                              ▲                       │
+│            │ 1:N (CASCADE)                               │                       │
+│            ▼                                     1:N (CASCADE)                   │
+│     ┌──────────────┐                                     │                       │
+│     │    sheets    │                              ┌──────┴─────┐                 │
+│     └──────┬───────┘                              │   users    │                 │
+│            │                                      └────────────┘                 │
+│            │                                                                      │
+│   ┌────────┼────────────────────┬──────────────────────┐                        │
+│   │        │                    │                      │                         │
+│   │ 1:N    │ 1:N               │ 1:N                  │ 1:N                     │
+│   │(CASCADE) (CASCADE)         │(CASCADE)             │(CASCADE)                │
+│   ▼        ▼                    ▼                      ▼                         │
+│ ┌──────┐ ┌────────────┐ ┌─────────────┐ ┌──────────────────┐                    │
+│ │cells │ │column_widths│ │ row_heights │ │   edit_history   │                    │
+│ └──────┘ └────────────┘ └─────────────┘ └──────────────────┘                    │
+│   ▲                                              ▲                               │
+│   │ N:1 (updated_by, nullable)                   │ N:1 (user_id, nullable)      │
+│   └─────────────────────────┬────────────────────┘                               │
+│                             │                                                    │
+│                      ┌──────┴─────┐                                              │
+│                      │   users    │                                              │
+│                      └────────────┘                                              │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Between Tables
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           DATA FLOW: CELL EDIT OPERATION                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  1. User authenticates                                                           │
+│     └──▶ users table (lookup by session_id)                                     │
+│                                                                                   │
+│  2. User opens spreadsheet                                                       │
+│     └──▶ spreadsheets table (verify access)                                     │
+│         └──▶ collaborators table (insert presence record)                       │
+│             └──▶ sheets table (load sheet list)                                 │
+│                 └──▶ cells table (load viewport cells)                          │
+│                     └──▶ column_widths, row_heights (load dimensions)           │
+│                                                                                   │
+│  3. User edits a cell                                                            │
+│     └──▶ cells table (UPSERT with updated_by = user.id)                         │
+│         └──▶ edit_history table (INSERT forward + inverse operation)            │
+│             └──▶ WebSocket broadcast to other collaborators                     │
+│                                                                                   │
+│  4. User moves cursor                                                            │
+│     └──▶ collaborators table (UPDATE cursor_row, cursor_col)                    │
+│         └──▶ WebSocket broadcast cursor position                                │
+│                                                                                   │
+│  5. User disconnects                                                             │
+│     └──▶ collaborators table (DELETE or mark stale via last_seen)               │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete PostgreSQL Schema
+
+#### Table: users
+
+Stores user information with session-based authentication. Users are identified by session_id without password requirements.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique user identifier |
+| `session_id` | VARCHAR(100) | UNIQUE NOT NULL | Browser session identifier |
+| `name` | VARCHAR(100) | NOT NULL DEFAULT 'Anonymous' | Display name |
+| `color` | VARCHAR(7) | NOT NULL DEFAULT '#4ECDC4' | Hex color for cursor/presence |
+| `created_at` | TIMESTAMP | DEFAULT NOW() | Account creation time |
+| `last_seen` | TIMESTAMP | DEFAULT NOW() | Last activity timestamp |
+
+**Indexes:**
+- `idx_users_session` on `session_id` - Fast session lookups on every WebSocket connection
+
+**Design Rationale:**
+- UUID primary key enables global uniqueness across distributed systems
+- Session-based auth is simple and sufficient for collaborative editing
+- Color field enables visual differentiation of collaborators in the UI
+- last_seen supports cleanup of inactive users via background jobs
 
 ```sql
--- Spreadsheets (documents)
-CREATE TABLE spreadsheets (
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(100) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
+    color VARCHAR(7) NOT NULL DEFAULT '#4ECDC4',
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_seen TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_id);
+```
+
+---
+
+#### Table: spreadsheets
+
+Top-level document container. Each spreadsheet contains multiple sheets (tabs).
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique spreadsheet identifier |
+| `title` | VARCHAR(255) | NOT NULL DEFAULT 'Untitled Spreadsheet' | Document title |
+| `owner_id` | UUID | REFERENCES users(id) | Owner (NULL if user deleted) |
+| `created_at` | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
+| `updated_at` | TIMESTAMP | DEFAULT NOW() | Last modification timestamp |
+
+**Foreign Keys:**
+- `owner_id` references `users(id)` - Soft reference (no CASCADE), allows orphaned spreadsheets
+
+**Design Rationale:**
+- Soft reference to users allows spreadsheets to persist even if owner account deleted
+- updated_at tracks last modification for sorting lists and cache invalidation
+- Title has a sensible default for quick creation flow
+
+```sql
+CREATE TABLE IF NOT EXISTS spreadsheets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title VARCHAR(255) NOT NULL DEFAULT 'Untitled Spreadsheet',
-    owner_id UUID NOT NULL,
+    owner_id UUID REFERENCES users(id),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+```
 
--- Sheets within a spreadsheet
-CREATE TABLE sheets (
+---
+
+#### Table: sheets
+
+Individual sheets within a spreadsheet (tabs at bottom of UI, like Excel worksheets).
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique sheet identifier |
+| `spreadsheet_id` | UUID | REFERENCES spreadsheets(id) ON DELETE CASCADE | Parent document |
+| `name` | VARCHAR(100) | NOT NULL DEFAULT 'Sheet1' | Tab name |
+| `sheet_index` | INTEGER | NOT NULL DEFAULT 0 | Order of tabs (0-based) |
+| `frozen_rows` | INTEGER | DEFAULT 0 | Number of frozen header rows |
+| `frozen_cols` | INTEGER | DEFAULT 0 | Number of frozen header columns |
+| `created_at` | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
+
+**Foreign Keys:**
+- `spreadsheet_id` references `spreadsheets(id)` with **CASCADE DELETE**
+
+**Indexes:**
+- `idx_sheets_spreadsheet` on `spreadsheet_id` - Fast sheet lookup when loading a spreadsheet
+
+**Design Rationale:**
+- CASCADE delete ensures sheets are removed when parent spreadsheet is deleted
+- sheet_index allows tab reordering via drag-and-drop
+- frozen_rows/cols support Excel-like freeze panes feature for headers
+
+```sql
+CREATE TABLE IF NOT EXISTS sheets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     spreadsheet_id UUID REFERENCES spreadsheets(id) ON DELETE CASCADE,
     name VARCHAR(100) NOT NULL DEFAULT 'Sheet1',
-    index INTEGER NOT NULL DEFAULT 0,
+    sheet_index INTEGER NOT NULL DEFAULT 0,
     frozen_rows INTEGER DEFAULT 0,
     frozen_cols INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Cell data (sparse storage - only non-empty cells)
-CREATE TABLE cells (
+CREATE INDEX IF NOT EXISTS idx_sheets_spreadsheet ON sheets(spreadsheet_id);
+```
+
+---
+
+#### Table: cells
+
+Cell data storage using **sparse representation**. Only non-empty cells are stored; empty cells do not exist in the table.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique cell identifier |
+| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
+| `row_index` | INTEGER | NOT NULL | 0-based row number |
+| `col_index` | INTEGER | NOT NULL | 0-based column number |
+| `raw_value` | TEXT | nullable | User input (formulas start with '=') |
+| `computed_value` | TEXT | nullable | Calculated result for formulas |
+| `format` | JSONB | DEFAULT '{}' | Cell styling (bold, color, etc.) |
+| `updated_at` | TIMESTAMP | DEFAULT NOW() | Last edit timestamp |
+| `updated_by` | UUID | REFERENCES users(id) | Last editor (NULL if user deleted) |
+
+**Constraints:**
+- `UNIQUE(sheet_id, row_index, col_index)` - One cell per position, enables UPSERT pattern
+
+**Foreign Keys:**
+- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
+- `updated_by` references `users(id)` - Soft reference (no CASCADE)
+
+**Indexes:**
+- `idx_cells_sheet` on `sheet_id` - Primary lookup pattern for loading all cells
+- `idx_cells_position` on `(sheet_id, row_index, col_index)` - Range queries for viewport loading
+
+**Design Rationale:**
+- **Sparse storage** is critical for efficiency: a 1M cell grid might only have 1000 non-empty cells
+- raw_value stores exactly what the user typed; computed_value stores calculation results
+- JSONB format enables flexible styling without schema migrations for new properties
+- UNIQUE constraint enables efficient UPSERT (INSERT ON CONFLICT UPDATE)
+- Tracking updated_by enables showing who made the last edit in collaboration
+
+**Format JSONB Structure:**
+```json
+{
+  "bold": true,
+  "italic": false,
+  "color": "#000000",
+  "backgroundColor": "#FFFFFF",
+  "textAlign": "left",
+  "fontSize": 12,
+  "numberFormat": "currency"
+}
+```
+
+```sql
+CREATE TABLE IF NOT EXISTS cells (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
     row_index INTEGER NOT NULL,
     col_index INTEGER NOT NULL,
-    raw_value TEXT,           -- User input (formula or value)
-    computed_value TEXT,      -- Calculated result
-    format JSONB,             -- {bold, italic, color, bgColor, align, fontSize}
+    raw_value TEXT,
+    computed_value TEXT,
+    format JSONB DEFAULT '{}',
     updated_at TIMESTAMP DEFAULT NOW(),
+    updated_by UUID REFERENCES users(id),
     UNIQUE(sheet_id, row_index, col_index)
 );
 
--- Column/row dimensions
-CREATE TABLE column_widths (
+CREATE INDEX IF NOT EXISTS idx_cells_sheet ON cells(sheet_id);
+CREATE INDEX IF NOT EXISTS idx_cells_position ON cells(sheet_id, row_index, col_index);
+```
+
+---
+
+#### Table: column_widths
+
+Custom column widths using sparse storage. Only columns with non-default widths are stored.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
+| `col_index` | INTEGER | NOT NULL | 0-based column number |
+| `width` | INTEGER | NOT NULL DEFAULT 100 | Width in pixels |
+
+**Primary Key:** `(sheet_id, col_index)` - Composite natural key
+
+**Foreign Keys:**
+- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
+
+**Design Rationale:**
+- Default width is 100px; only store deviations to save space
+- Composite primary key is the natural unique identifier
+- No separate UUID needed since position uniquely identifies the record
+
+```sql
+CREATE TABLE IF NOT EXISTS column_widths (
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
     col_index INTEGER NOT NULL,
     width INTEGER NOT NULL DEFAULT 100,
     PRIMARY KEY (sheet_id, col_index)
 );
+```
 
-CREATE TABLE row_heights (
+---
+
+#### Table: row_heights
+
+Custom row heights using sparse storage. Only rows with non-default heights are stored.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
+| `row_index` | INTEGER | NOT NULL | 0-based row number |
+| `height` | INTEGER | NOT NULL DEFAULT 32 | Height in pixels |
+
+**Primary Key:** `(sheet_id, row_index)` - Composite natural key
+
+**Foreign Keys:**
+- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
+
+**Design Rationale:**
+- Mirrors column_widths structure for consistency
+- Default height is 32px (comfortable for single-line text)
+- Sparse storage means a 1M row sheet only stores rows with custom heights
+
+```sql
+CREATE TABLE IF NOT EXISTS row_heights (
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
     row_index INTEGER NOT NULL,
     height INTEGER NOT NULL DEFAULT 32,
     PRIMARY KEY (sheet_id, row_index)
 );
+```
 
--- Active collaborators
-CREATE TABLE collaborators (
+---
+
+#### Table: collaborators
+
+Tracks active users in a spreadsheet for real-time collaboration. This is **ephemeral data**; rows are cleaned up when users disconnect.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `spreadsheet_id` | UUID | REFERENCES spreadsheets(id) ON DELETE CASCADE | Active document |
+| `user_id` | UUID | REFERENCES users(id) ON DELETE CASCADE | Active user |
+| `cursor_row` | INTEGER | nullable | Current cursor row |
+| `cursor_col` | INTEGER | nullable | Current cursor column |
+| `selection_start_row` | INTEGER | nullable | Selection range start row |
+| `selection_start_col` | INTEGER | nullable | Selection range start column |
+| `selection_end_row` | INTEGER | nullable | Selection range end row |
+| `selection_end_col` | INTEGER | nullable | Selection range end column |
+| `joined_at` | TIMESTAMP | DEFAULT NOW() | When user joined |
+| `last_seen` | TIMESTAMP | DEFAULT NOW() | Last activity (for cleanup) |
+
+**Primary Key:** `(spreadsheet_id, user_id)` - One entry per user per document
+
+**Foreign Keys:**
+- `spreadsheet_id` references `spreadsheets(id)` with **CASCADE DELETE**
+- `user_id` references `users(id)` with **CASCADE DELETE**
+
+**Indexes:**
+- `idx_collaborators_spreadsheet` on `spreadsheet_id` - Get all users in a document
+
+**Design Rationale:**
+- Ephemeral nature: rows represent active WebSocket connections
+- CASCADE on both FKs ensures cleanup when either parent is deleted
+- Cursor position enables rendering other users' cursors
+- Selection range enables showing other users' highlighted areas
+- last_seen enables background job to clean stale connections (24h threshold)
+
+```sql
+CREATE TABLE IF NOT EXISTS collaborators (
     spreadsheet_id UUID REFERENCES spreadsheets(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL,
-    session_id VARCHAR(100) NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     cursor_row INTEGER,
     cursor_col INTEGER,
-    color VARCHAR(7),         -- User color for presence
+    selection_start_row INTEGER,
+    selection_start_col INTEGER,
+    selection_end_row INTEGER,
+    selection_end_col INTEGER,
     joined_at TIMESTAMP DEFAULT NOW(),
     last_seen TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (spreadsheet_id, session_id)
+    PRIMARY KEY (spreadsheet_id, user_id)
 );
 
--- Edit history for undo/redo
-CREATE TABLE edit_history (
+CREATE INDEX IF NOT EXISTS idx_collaborators_spreadsheet ON collaborators(spreadsheet_id);
+```
+
+---
+
+#### Table: edit_history
+
+Operation log for undo/redo functionality and audit trail. Each entry represents one atomic operation.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique operation identifier |
+| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Sheet where operation occurred |
+| `user_id` | UUID | REFERENCES users(id) | Operation author (NULL if deleted) |
+| `operation_type` | VARCHAR(50) | NOT NULL | Operation category |
+| `operation_data` | JSONB | NOT NULL | Forward operation details |
+| `inverse_data` | JSONB | NOT NULL | Reverse operation for undo |
+| `created_at` | TIMESTAMP | DEFAULT NOW() | When operation was performed |
+
+**Foreign Keys:**
+- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
+- `user_id` references `users(id)` - Soft reference (no CASCADE)
+
+**Indexes:**
+- `idx_edit_history_sheet` on `(sheet_id, created_at DESC)` - Retrieve undo stack (most recent first)
+
+**Operation Types:**
+- `SET_CELL` - Cell value or format change
+- `DELETE_CELL` - Cell cleared
+- `RESIZE_COLUMN` - Column width changed
+- `RESIZE_ROW` - Row height changed
+- `PASTE` - Multi-cell paste operation
+- `CUT` - Multi-cell cut operation
+- `FORMAT_RANGE` - Apply formatting to range
+
+**Design Rationale:**
+- Storing both forward and inverse operations enables redo after undo
+- JSONB allows flexible operation schemas without migrations
+- Descending index on created_at optimizes "get last N operations" query
+- 90-day retention policy (via background job) prevents unbounded growth
+
+**Example operation_data and inverse_data:**
+```json
+// SET_CELL operation
+{
+  "operation_data": {
+    "row": 5,
+    "col": 2,
+    "newValue": "=SUM(A1:A5)",
+    "newFormat": { "bold": true }
+  },
+  "inverse_data": {
+    "row": 5,
+    "col": 2,
+    "oldValue": "100",
+    "oldFormat": {}
+  }
+}
+```
+
+```sql
+CREATE TABLE IF NOT EXISTS edit_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL,
-    operation_type VARCHAR(50) NOT NULL, -- SET_CELL, DELETE_CELL, RESIZE, etc.
+    user_id UUID REFERENCES users(id),
+    operation_type VARCHAR(50) NOT NULL,
     operation_data JSONB NOT NULL,
-    inverse_data JSONB NOT NULL,         -- For undo
+    inverse_data JSONB NOT NULL,
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Indexes
-CREATE INDEX idx_cells_sheet ON cells(sheet_id);
-CREATE INDEX idx_cells_position ON cells(sheet_id, row_index, col_index);
-CREATE INDEX idx_collaborators_spreadsheet ON collaborators(spreadsheet_id);
-CREATE INDEX idx_edit_history_sheet ON edit_history(sheet_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_edit_history_sheet ON edit_history(sheet_id, created_at DESC);
 ```
+
+---
+
+### Cascade Delete Behavior Summary
+
+| When Deleted | What Happens |
+|--------------|--------------|
+| **User** | Spreadsheets remain (owner_id becomes NULL), Cells remain (updated_by becomes NULL), Collaborator entries deleted (CASCADE), Edit history remains (user_id becomes NULL) |
+| **Spreadsheet** | All sheets deleted (CASCADE), All collaborator entries deleted (CASCADE) |
+| **Sheet** | All cells deleted (CASCADE), All column_widths deleted (CASCADE), All row_heights deleted (CASCADE), All edit_history entries deleted (CASCADE) |
+
+### Index Strategy Summary
+
+| Index | Purpose | Query Pattern |
+|-------|---------|---------------|
+| `idx_users_session` | Session lookup | `WHERE session_id = ?` |
+| `idx_sheets_spreadsheet` | Load spreadsheet | `WHERE spreadsheet_id = ?` |
+| `idx_cells_sheet` | Load all cells | `WHERE sheet_id = ?` |
+| `idx_cells_position` | Viewport loading | `WHERE sheet_id = ? AND row_index BETWEEN ? AND ?` |
+| `idx_collaborators_spreadsheet` | Presence list | `WHERE spreadsheet_id = ?` |
+| `idx_edit_history_sheet` | Undo stack | `WHERE sheet_id = ? ORDER BY created_at DESC LIMIT ?` |
+
+### Storage Estimates
+
+| Data Type | Size Estimate | Calculation |
+|-----------|---------------|-------------|
+| User record | ~150 bytes | UUID (16) + session (100) + name (100) + color (7) + timestamps (16) |
+| Spreadsheet record | ~300 bytes | UUID (16) + title (255) + owner_id (16) + timestamps (16) |
+| Sheet record | ~150 bytes | UUID (16) + spreadsheet_id (16) + name (100) + ints (16) |
+| Cell record | ~200 bytes avg | UUID (16) + sheet_id (16) + indices (8) + values (~150) + format (~50) |
+| Edit history record | ~500 bytes avg | UUID (16) + refs (32) + type (50) + JSONB (~400) |
+
+**Per spreadsheet (typical usage):**
+- 1 spreadsheet record: 300 bytes
+- 3 sheets: 450 bytes
+- 1,000 non-empty cells: 200 KB
+- 50 custom column widths: 2 KB
+- 20 custom row heights: 800 bytes
+- 500 edit history entries (1 week): 250 KB
+- **Total: ~450 KB per active spreadsheet**
 
 ### Cell Data Structure
 

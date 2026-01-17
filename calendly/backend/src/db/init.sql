@@ -1,10 +1,16 @@
 -- Calendly Database Schema
 -- All times stored in UTC
+-- Consolidated from init.sql + migrations 001, 002
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- ============================================================================
+-- CORE TABLES
+-- ============================================================================
+
 -- Users table
+-- Stores user accounts including hosts and admins
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -17,6 +23,7 @@ CREATE TABLE users (
 );
 
 -- Meeting Types table
+-- Defines different meeting templates a user can offer (e.g., "30-min call", "1-hour consultation")
 CREATE TABLE meeting_types (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -35,6 +42,7 @@ CREATE TABLE meeting_types (
 );
 
 -- Availability Rules table (weekly schedule)
+-- Defines when a user is available for meetings (e.g., Mon-Fri 9AM-5PM)
 CREATE TABLE availability_rules (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -49,7 +57,12 @@ CREATE TABLE availability_rules (
 -- Index for efficient availability queries
 CREATE INDEX idx_availability_user_day ON availability_rules(user_id, day_of_week, is_active);
 
+-- ============================================================================
+-- BOOKINGS TABLES
+-- ============================================================================
+
 -- Bookings table
+-- Stores confirmed and active meeting bookings
 CREATE TABLE bookings (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   meeting_type_id UUID NOT NULL REFERENCES meeting_types(id) ON DELETE CASCADE,
@@ -65,6 +78,8 @@ CREATE TABLE bookings (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   version INTEGER DEFAULT 1,
+  -- Migration 002: Idempotency key for duplicate prevention
+  idempotency_key VARCHAR(255),
   CONSTRAINT valid_booking_time CHECK (end_time > start_time)
 );
 
@@ -78,7 +93,47 @@ CREATE INDEX idx_bookings_host_time ON bookings(host_user_id, start_time, end_ti
 CREATE INDEX idx_bookings_status ON bookings(status);
 CREATE INDEX idx_bookings_meeting_type ON bookings(meeting_type_id);
 
+-- Migration 002: Unique index on idempotency_key (allows nulls)
+CREATE UNIQUE INDEX idx_bookings_idempotency_key
+  ON bookings(idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
+-- Migration 001: Bookings archive table for data lifecycle management
+-- Stores completed/cancelled bookings older than 90 days for historical reference
+CREATE TABLE bookings_archive (
+  id UUID PRIMARY KEY,
+  meeting_type_id UUID NOT NULL,
+  host_user_id UUID NOT NULL,
+  invitee_name VARCHAR(255) NOT NULL,
+  invitee_email VARCHAR(255) NOT NULL,
+  start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+  end_time TIMESTAMP WITH TIME ZONE NOT NULL,
+  invitee_timezone VARCHAR(50) NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  cancellation_reason TEXT,
+  notes TEXT,
+  created_at TIMESTAMP WITH TIME ZONE,
+  updated_at TIMESTAMP WITH TIME ZONE,
+  version INTEGER DEFAULT 1,
+  -- Migration 002: Idempotency key for consistency with bookings table
+  idempotency_key VARCHAR(255),
+  archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for querying archived bookings by host and time
+CREATE INDEX idx_bookings_archive_host_time
+  ON bookings_archive(host_user_id, start_time);
+
+-- Index for cleanup queries
+CREATE INDEX idx_bookings_archive_archived_at
+  ON bookings_archive(archived_at);
+
+-- ============================================================================
+-- NOTIFICATION TABLES
+-- ============================================================================
+
 -- Email notifications log (simulated)
+-- Tracks all email notifications sent for bookings
 CREATE TABLE email_notifications (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   booking_id UUID REFERENCES bookings(id) ON DELETE CASCADE,
@@ -92,6 +147,10 @@ CREATE TABLE email_notifications (
 
 CREATE INDEX idx_email_booking ON email_notifications(booking_id);
 
+-- ============================================================================
+-- SESSION MANAGEMENT
+-- ============================================================================
+
 -- Sessions table for express-session (using Redis is preferred, but this is a fallback)
 CREATE TABLE sessions (
   sid VARCHAR(255) PRIMARY KEY,
@@ -100,6 +159,10 @@ CREATE TABLE sessions (
 );
 
 CREATE INDEX idx_sessions_expire ON sessions(expire);
+
+-- ============================================================================
+-- SEED DATA (Demo/Development)
+-- ============================================================================
 
 -- Insert a demo user
 INSERT INTO users (id, email, password_hash, name, time_zone, role)
