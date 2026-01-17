@@ -68,18 +68,11 @@ export class MessageRouter {
       try {
         session.sendMessage(formatted);
       } catch (error) {
-        logger.error('Failed to send message to session', {
-          sessionId: session.sessionId,
-          error,
-        });
+        logger.error({ sessionId: session.sessionId, err: error }, 'Failed to send message to session');
       }
     }
 
-    logger.debug('Message routed to room', {
-      roomName,
-      recipientCount: sessions.length,
-      excludeSessionId,
-    });
+    logger.debug({ roomName, recipientCount: sessions.length, excludeSessionId }, 'Message routed to room');
   }
 
   /**
@@ -172,10 +165,7 @@ export class MessageRouter {
       try {
         session.sendMessage(message);
       } catch (error) {
-        logger.error('Failed to send message to session', {
-          sessionId,
-          error,
-        });
+        logger.error({ sessionId, err: error }, 'Failed to send message to session');
       }
     }
   }
@@ -196,10 +186,7 @@ export class MessageRouter {
       try {
         session.sendMessage(formatted);
       } catch (error) {
-        logger.error('Failed to send DM to session', {
-          sessionId: session.sessionId,
-          error,
-        });
+        logger.error({ sessionId: session.sessionId, err: error }, 'Failed to send DM to session');
       }
     }
   }

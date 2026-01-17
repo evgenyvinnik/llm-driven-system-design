@@ -8,7 +8,16 @@
 
 import db from './connection.js';
 import type { User, Room, Message, RoomMember, RoomInfo } from '../types/index.js';
-import { logger } from '../utils/logger.js';
+
+// Lazy logger initialization to avoid circular dependencies
+let logger: any = null;
+async function getLogger() {
+  if (!logger) {
+    const mod = await import('../utils/logger.js');
+    logger = mod.dbLogger || mod.logger;
+  }
+  return logger;
+}
 
 // ============================================================================
 // User Operations
@@ -301,9 +310,11 @@ export async function getRecentMessages(
 export async function cleanupOldMessages(): Promise<void> {
   try {
     await db.query('SELECT cleanup_old_messages()');
-    logger.debug('Old messages cleaned up');
+    const log = await getLogger();
+    if (log) log.debug('Old messages cleaned up');
   } catch (error) {
-    logger.error('Failed to cleanup old messages', { error });
+    const log = await getLogger();
+    if (log) log.error({ err: error }, 'Failed to cleanup old messages');
   }
 }
 

@@ -1,10 +1,15 @@
 /**
  * Checkout routes for processing purchases and managing orders.
+ *
  * Endpoints:
  * - POST / - Complete a purchase from active reservation
  * - GET /orders - List user's orders
  * - GET /orders/:id - Get single order details
  * - POST /orders/:id/cancel - Cancel an order
+ *
+ * Key features:
+ * - Idempotency support via Idempotency-Key header
+ * - Correlation ID support for distributed tracing
  */
 import { Router, Response } from 'express';
 import { checkoutService } from '../services/checkout.service.js';
@@ -16,11 +21,22 @@ const router = Router();
 /**
  * POST /
  * Completes a ticket purchase from the user's active reservation.
- * Requires a payment_method in request body.
+ *
+ * Request body:
+ * - payment_method: string (required) - The payment method to use
+ *
+ * Headers:
+ * - Idempotency-Key: string (optional) - Unique key to prevent duplicate charges
+ * - X-Correlation-Id: string (optional) - Correlation ID for distributed tracing
+ *
+ * CRITICAL: This endpoint is idempotent. Retrying with the same Idempotency-Key
+ * will return the previously completed order instead of creating a duplicate.
  */
 router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { payment_method } = req.body;
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+    const correlationId = req.headers['x-correlation-id'] as string | undefined;
 
     if (!payment_method) {
       res.status(400).json({ success: false, error: 'payment_method is required' });
@@ -30,7 +46,9 @@ router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response
     const result = await checkoutService.checkout(
       req.sessionId!,
       req.userId!,
-      payment_method
+      payment_method,
+      idempotencyKey,
+      correlationId
     );
 
     res.json({
@@ -43,7 +61,16 @@ router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Checkout failed';
-    res.status(400).json({ success: false, error: message });
+
+    // Determine appropriate status code
+    let statusCode = 400;
+    if (message.includes('Circuit breaker')) {
+      statusCode = 503; // Service Unavailable
+    } else if (message.includes('Payment failed')) {
+      statusCode = 402; // Payment Required
+    }
+
+    res.status(statusCode).json({ success: false, error: message });
   }
 });
 

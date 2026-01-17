@@ -121,6 +121,13 @@ airbnb/
 │   │   │   ├── bookings.js
 │   │   │   ├── reviews.js
 │   │   │   └── messages.js
+│   │   ├── shared/           # Common modules
+│   │   │   ├── cache.js      # Redis caching with cache-aside pattern
+│   │   │   ├── queue.js      # RabbitMQ producer/consumer
+│   │   │   ├── metrics.js    # Prometheus metrics
+│   │   │   ├── logger.js     # Pino structured logging
+│   │   │   ├── audit.js      # Audit logging for compliance
+│   │   │   └── circuitBreaker.js  # Circuit breaker pattern
 │   │   ├── services/       # Business logic
 │   │   └── middleware/     # Auth middleware
 │   └── migrations/
@@ -177,6 +184,49 @@ airbnb/
 - `GET /api/messages` - Get conversations
 - `GET /api/messages/:id` - Get messages
 - `POST /api/messages/:id/messages` - Send message
+
+### Observability Endpoints
+- `GET /health` - Detailed health check (Redis, PostgreSQL, RabbitMQ, Circuit Breakers)
+- `GET /metrics` - Prometheus metrics endpoint
+- `GET /ready` - Kubernetes readiness probe
+- `GET /live` - Kubernetes liveness probe
+- `GET /debug/circuit-breakers` - Circuit breaker status
+
+## Observability & Reliability Features
+
+### Caching (Redis)
+- **Cache-aside pattern** for listing details and availability
+- **TTL strategy**: 15 min for listings, 1 min for availability, 5 min for search results
+- **Cache invalidation** on booking/update operations
+
+### Message Queue (RabbitMQ)
+- **Async notifications** for booking confirmations and host alerts
+- **At-least-once delivery** with idempotency protection
+- **Dead-letter queues** for failed message handling
+- Access RabbitMQ Management UI at http://localhost:15672 (airbnb/airbnb_dev)
+
+### Prometheus Metrics
+Key metrics tracked:
+- `airbnb_bookings_total` - Booking counts by status
+- `airbnb_search_latency_seconds` - Search performance histogram
+- `airbnb_availability_checks_total` - Availability check counts
+- `airbnb_cache_hits_total` / `airbnb_cache_misses_total` - Cache efficiency
+- `airbnb_queue_depth` - RabbitMQ queue sizes
+
+### Structured Logging (Pino)
+- JSON-formatted logs for aggregation (Loki, ELK)
+- Request ID tracing across all logs
+- Pretty-printed output in development mode
+
+### Audit Logging
+- Complete audit trail for bookings (create, confirm, cancel)
+- Before/after state capture for changes
+- IP address and session tracking for dispute resolution
+
+### Circuit Breaker (Opossum)
+- Search and availability operations protected
+- Automatic fallback on service degradation
+- Self-healing with half-open state testing
 
 ## Multi-Instance Testing
 

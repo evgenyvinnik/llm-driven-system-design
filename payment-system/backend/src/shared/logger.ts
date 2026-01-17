@@ -78,7 +78,7 @@ export const auditLogger = logger.child({ audit: true });
 export function logAuditEvent(
   event: string,
   data: {
-    entityType: 'transaction' | 'refund' | 'chargeback' | 'merchant';
+    entityType: 'transaction' | 'refund' | 'chargeback' | 'merchant' | 'ledger';
     entityId: string;
     actorType: 'api_key' | 'admin' | 'system';
     actorId: string;

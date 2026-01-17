@@ -2,13 +2,27 @@
  * @fileoverview Main entry point for the Facebook News Feed backend server.
  * Sets up Express HTTP server with WebSocket support for real-time feed updates.
  * Implements a hybrid push/pull notification system using Redis pub/sub.
+ * Includes Prometheus metrics, structured logging, and comprehensive health checks.
  */
 
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { v4 as uuidv4 } from 'uuid';
 import { testConnections, redis } from './db/connection.js';
+
+// Shared modules
+import {
+  logger,
+  createRequestLogger,
+  register,
+  httpRequestsTotal,
+  httpRequestDuration,
+  wsActiveConnections,
+  wsMessagesTotal,
+  healthRouter,
+} from './shared/index.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -35,10 +49,90 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Health check
-app.get('/health', (_, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+/**
+ * Request logging and metrics middleware.
+ * Adds request ID, logs requests, and records Prometheus metrics.
+ */
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const requestId = (req.headers['x-request-id'] as string) || uuidv4();
+  const startTime = Date.now();
+
+  // Add request ID to response headers
+  res.setHeader('X-Request-ID', requestId);
+
+  // Create request-scoped logger
+  const log = createRequestLogger(requestId);
+
+  // Log request start (debug level)
+  log.debug(
+    {
+      method: req.method,
+      path: req.path,
+      query: req.query,
+    },
+    'Request started'
+  );
+
+  // On response finish, log and record metrics
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    const durationSeconds = duration / 1000;
+
+    // Normalize path for metrics (remove IDs)
+    const normalizedPath = normalizePath(req.path);
+
+    // Record metrics
+    httpRequestsTotal.labels(req.method, normalizedPath, res.statusCode.toString()).inc();
+    httpRequestDuration.labels(req.method, normalizedPath).observe(durationSeconds);
+
+    // Log request completion
+    log.info(
+      {
+        method: req.method,
+        path: req.path,
+        statusCode: res.statusCode,
+        duration_ms: duration,
+      },
+      'Request completed'
+    );
+  });
+
+  next();
 });
+
+/**
+ * Normalizes a path for metrics by replacing dynamic segments with placeholders.
+ * This prevents high cardinality in Prometheus labels.
+ *
+ * @param path - The request path
+ * @returns Normalized path
+ */
+function normalizePath(path: string): string {
+  // Replace UUIDs
+  let normalized = path.replace(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+    ':id'
+  );
+  // Replace numeric IDs
+  normalized = normalized.replace(/\/\d+/g, '/:id');
+  // Replace usernames in known patterns
+  normalized = normalized.replace(/\/users\/[^\/]+/g, '/users/:username');
+  return normalized;
+}
+
+// Prometheus metrics endpoint
+app.get('/metrics', async (_req: Request, res: Response) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (error) {
+    logger.error({ error }, 'Failed to generate metrics');
+    res.status(500).end();
+  }
+});
+
+// Health check routes (detailed)
+app.use('/health', healthRouter);
 
 // API Routes
 app.use('/api/v1/auth', authRoutes);
@@ -76,7 +170,10 @@ wss.on('connection', async (ws, req) => {
   }
   userConnections.get(userId)!.add(ws);
 
-  console.log(`WebSocket connected for user ${userId}`);
+  // Update metrics
+  wsActiveConnections.inc();
+
+  logger.info({ userId }, 'WebSocket connected');
 
   // Subscribe to user's feed updates
   const subscriber = redis.duplicate();
@@ -85,6 +182,7 @@ wss.on('connection', async (ws, req) => {
   subscriber.on('message', (_channel, message) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(message);
+      wsMessagesTotal.labels('new_post').inc();
     }
   });
 
@@ -95,15 +193,20 @@ wss.on('connection', async (ws, req) => {
     }
     await subscriber.unsubscribe();
     await subscriber.quit();
-    console.log(`WebSocket disconnected for user ${userId}`);
+
+    // Update metrics
+    wsActiveConnections.dec();
+
+    logger.info({ userId }, 'WebSocket disconnected');
   });
 
   ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
+    logger.error({ error, userId }, 'WebSocket error');
   });
 
   // Send initial connection success
   ws.send(JSON.stringify({ type: 'connected', userId }));
+  wsMessagesTotal.labels('connected').inc();
 });
 
 /**
@@ -124,7 +227,7 @@ export async function broadcastNewPost(userId: string, postData: object): Promis
 
 // Error handling middleware
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('Unhandled error:', err);
+  logger.error({ error: err.message, stack: err.stack }, 'Unhandled error');
   res.status(500).json({ error: 'Internal server error' });
 });
 
@@ -139,11 +242,11 @@ async function start() {
     await testConnections();
 
     server.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-      console.log(`WebSocket server running on ws://localhost:${PORT}`);
+      logger.info({ port: PORT }, 'Server running');
+      logger.info({ port: PORT, protocol: 'ws' }, 'WebSocket server running');
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.fatal({ error }, 'Failed to start server');
     process.exit(1);
   }
 }

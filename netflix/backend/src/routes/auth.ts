@@ -4,6 +4,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { query, queryOne } from '../db/index.js';
 import { setSession, deleteSession } from '../services/redis.js';
 import { authenticate } from '../middleware/auth.js';
+import { strictRateLimit } from '../middleware/rate-limit.js';
+import { authLogger } from '../services/logger.js';
 import { Account, Profile } from '../types/index.js';
 import { SERVER_CONFIG } from '../config.js';
 
@@ -42,7 +44,7 @@ interface ProfileRow {
  * Authenticates user with email/password and creates a session.
  * Sets httpOnly cookie with session token.
  */
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', strictRateLimit('auth'), async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -57,6 +59,7 @@ router.post('/login', async (req: Request, res: Response) => {
     );
 
     if (!account) {
+      authLogger.warn({ email: email.toLowerCase() }, 'Login attempt with unknown email');
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -66,6 +69,7 @@ router.post('/login', async (req: Request, res: Response) => {
     const isValidPassword = isDemo || await bcrypt.compare(password, account.password_hash);
 
     if (!isValidPassword) {
+      authLogger.warn({ email: email.toLowerCase(), accountId: account.id }, 'Login attempt with invalid password');
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -89,6 +93,8 @@ router.post('/login', async (req: Request, res: Response) => {
       maxAge: SERVER_CONFIG.sessionMaxAge,
     });
 
+    authLogger.info({ accountId: account.id, email: account.email }, 'User logged in');
+
     res.json({
       success: true,
       account: {
@@ -99,7 +105,7 @@ router.post('/login', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error('Login error:', error);
+    authLogger.error({ error }, 'Login error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -108,7 +114,7 @@ router.post('/login', async (req: Request, res: Response) => {
  * POST /api/auth/register
  * Creates a new account with default profile and establishes session.
  */
-router.post('/register', async (req: Request, res: Response) => {
+router.post('/register', strictRateLimit('auth'), async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
 
@@ -124,6 +130,7 @@ router.post('/register', async (req: Request, res: Response) => {
     );
 
     if (existing) {
+      authLogger.warn({ email: email.toLowerCase() }, 'Registration attempt with existing email');
       res.status(400).json({ error: 'Email already registered' });
       return;
     }
@@ -169,6 +176,8 @@ router.post('/register', async (req: Request, res: Response) => {
       maxAge: SERVER_CONFIG.sessionMaxAge,
     });
 
+    authLogger.info({ accountId: accountResult.id, email: accountResult.email }, 'New account registered');
+
     res.status(201).json({
       success: true,
       account: {
@@ -179,7 +188,7 @@ router.post('/register', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error('Register error:', error);
+    authLogger.error({ error }, 'Register error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

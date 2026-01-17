@@ -5,11 +5,12 @@
  *
  * @module utils/rabbitmq
  */
-import amqplib, { Connection, Channel, ConsumeMessage } from 'amqplib';
+import amqplib from 'amqplib';
+import type { ChannelModel, Channel, ConsumeMessage } from 'amqplib';
 import { logger } from './logger.js';
 import { redis } from './redis.js';
 
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://linkedin:linkedin123@localhost:5672';
@@ -90,42 +91,44 @@ export type QueueMessage = ConnectionEvent | ProfileUpdateEvent | PostCreatedEve
  */
 export async function connectRabbitMQ(): Promise<void> {
   try {
-    connection = await amqplib.connect(RABBITMQ_URL);
-    channel = await connection.createChannel();
+    const conn = await amqplib.connect(RABBITMQ_URL);
+    connection = conn;
+    const ch = await conn.createChannel();
+    channel = ch;
 
     // Set prefetch limit for backpressure
-    await channel.prefetch(10);
+    await ch.prefetch(10);
 
     // Declare exchanges
-    await channel.assertExchange(EXCHANGES.DIRECT, 'direct', { durable: true });
-    await channel.assertExchange(EXCHANGES.FANOUT, 'fanout', { durable: true });
-    await channel.assertExchange(EXCHANGES.TOPIC, 'topic', { durable: true });
+    await ch.assertExchange(EXCHANGES.DIRECT, 'direct', { durable: true });
+    await ch.assertExchange(EXCHANGES.FANOUT, 'fanout', { durable: true });
+    await ch.assertExchange(EXCHANGES.TOPIC, 'topic', { durable: true });
 
     // Declare queues with dead letter configuration
     for (const queue of Object.values(QUEUES)) {
-      await channel.assertQueue(queue, {
+      await ch.assertQueue(queue, {
         durable: true,
         deadLetterExchange: EXCHANGES.DIRECT,
         deadLetterRoutingKey: `${queue}.dlq`,
       });
 
       // Dead letter queue
-      await channel.assertQueue(`${queue}.dlq`, { durable: true });
-      await channel.bindQueue(`${queue}.dlq`, EXCHANGES.DIRECT, `${queue}.dlq`);
+      await ch.assertQueue(`${queue}.dlq`, { durable: true });
+      await ch.bindQueue(`${queue}.dlq`, EXCHANGES.DIRECT, `${queue}.dlq`);
     }
 
     // Bind queues to exchanges
-    await channel.bindQueue(QUEUES.FEED_FANOUT, EXCHANGES.TOPIC, 'post.*');
-    await channel.bindQueue(QUEUES.NOTIFICATIONS, EXCHANGES.TOPIC, 'notification.*');
-    await channel.bindQueue(QUEUES.PYMK_COMPUTE, EXCHANGES.TOPIC, 'connection.*');
-    await channel.bindQueue(QUEUES.SEARCH_INDEX, EXCHANGES.TOPIC, 'profile.*');
-    await channel.bindQueue(QUEUES.PROFILE_UPDATE, EXCHANGES.TOPIC, 'profile.*');
+    await ch.bindQueue(QUEUES.FEED_FANOUT, EXCHANGES.TOPIC, 'post.*');
+    await ch.bindQueue(QUEUES.NOTIFICATIONS, EXCHANGES.TOPIC, 'notification.*');
+    await ch.bindQueue(QUEUES.PYMK_COMPUTE, EXCHANGES.TOPIC, 'connection.*');
+    await ch.bindQueue(QUEUES.SEARCH_INDEX, EXCHANGES.TOPIC, 'profile.*');
+    await ch.bindQueue(QUEUES.PROFILE_UPDATE, EXCHANGES.TOPIC, 'profile.*');
 
-    connection.on('error', (err) => {
+    conn.on('error', (err) => {
       logger.error({ error: err }, 'RabbitMQ connection error');
     });
 
-    connection.on('close', () => {
+    conn.on('close', () => {
       logger.warn('RabbitMQ connection closed');
       connection = null;
       channel = null;
@@ -240,7 +243,9 @@ export async function consumeQueue<T extends QueueMessage>(
     return;
   }
 
-  await channel.consume(queue, async (msg: ConsumeMessage | null) => {
+  const ch = channel; // Capture for closure
+
+  await ch.consume(queue, async (msg: ConsumeMessage | null) => {
     if (!msg) return;
 
     try {
@@ -249,7 +254,7 @@ export async function consumeQueue<T extends QueueMessage>(
       // Check idempotency
       if (await isMessageProcessed(message.idempotencyKey)) {
         logger.debug({ idempotencyKey: message.idempotencyKey }, 'Skipping duplicate message');
-        channel?.ack(msg);
+        ch.ack(msg);
         return;
       }
 
@@ -259,12 +264,12 @@ export async function consumeQueue<T extends QueueMessage>(
       // Mark as processed
       await markMessageProcessed(message.idempotencyKey);
 
-      channel?.ack(msg);
+      ch.ack(msg);
       logger.debug({ queue, messageType: message.type }, 'Message processed successfully');
     } catch (error) {
       logger.error({ error, queue }, 'Failed to process message');
       // Reject with requeue=false to send to DLQ
-      channel?.nack(msg, false, false);
+      ch.nack(msg, false, false);
     }
   });
 

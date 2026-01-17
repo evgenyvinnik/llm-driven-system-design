@@ -65,11 +65,11 @@ export class PubSubManager {
       });
 
       this.publisher.on('error', (err) => {
-        logger.error('Redis publisher error', { error: err.message });
+        logger.error({ error: err.message }, 'Redis publisher error');
       });
 
       this.subscriber.on('error', (err) => {
-        logger.error('Redis subscriber error', { error: err.message });
+        logger.error({ error: err.message }, 'Redis subscriber error');
       });
 
       // Handle incoming messages
@@ -79,7 +79,7 @@ export class PubSubManager {
 
       logger.info('PubSub manager connected');
     } catch (error) {
-      logger.error('Failed to connect to Redis', { error });
+      logger.error({ err: error }, 'Failed to connect to Redis');
       throw error;
     }
   }
@@ -132,7 +132,7 @@ export class PubSubManager {
 
     await this.subscriber.subscribe(channel);
     this.subscribedChannels.add(channel);
-    logger.debug('Subscribed to room channel', { channel });
+    logger.debug({ channel }, 'Subscribed to room channel');
   }
 
   /**
@@ -153,7 +153,7 @@ export class PubSubManager {
 
     await this.subscriber.unsubscribe(channel);
     this.subscribedChannels.delete(channel);
-    logger.debug('Unsubscribed from room channel', { channel });
+    logger.debug({ channel }, 'Unsubscribed from room channel');
   }
 
   /**
@@ -173,7 +173,7 @@ export class PubSubManager {
     const payload = JSON.stringify(message);
 
     await this.publisher.publish(channel, payload);
-    logger.debug('Published message to channel', { channel, type: message.type });
+    logger.debug({ channel, type: message.type }, 'Published message to channel');
   }
 
   /**
@@ -192,17 +192,17 @@ export class PubSubManager {
         return;
       }
 
-      logger.debug('Received pub/sub message', {
+      logger.debug({
         channel,
         type: parsed.type,
         fromInstance: parsed.instanceId,
-      });
+      }, 'Received pub/sub message');
 
       if (this.messageHandler) {
         this.messageHandler(parsed);
       }
     } catch (error) {
-      logger.error('Failed to parse pub/sub message', { channel, error });
+      logger.error({ channel, err: error }, 'Failed to parse pub/sub message');
     }
   }
 

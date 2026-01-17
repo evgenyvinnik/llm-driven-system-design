@@ -6,6 +6,21 @@
 import { RateLimitResult } from '../types/index.js';
 
 /**
+ * Options for rate limiting algorithms.
+ * Different algorithms use different subsets of these options.
+ */
+export interface RateLimiterOptions {
+  /** Bucket capacity for token/leaky bucket algorithms */
+  burstCapacity?: number;
+  /** Token refill rate for token bucket (tokens/second) */
+  refillRate?: number;
+  /** Leak rate for leaky bucket (requests/second) */
+  leakRate?: number;
+  /** Additional algorithm-specific options */
+  [key: string]: unknown;
+}
+
+/**
  * Interface for rate limiter implementations.
  * All rate limiting algorithms (Fixed Window, Sliding Window, Token Bucket, etc.)
  * implement this interface to provide a consistent API.
@@ -21,7 +36,7 @@ export interface RateLimiter {
    * @param options - Algorithm-specific options (burstCapacity, refillRate, etc.)
    * @returns Promise resolving to the rate limit result with allowed status and metadata
    */
-  check(identifier: string, limit: number, windowSeconds: number, options?: Record<string, unknown>): Promise<RateLimitResult>;
+  check(identifier: string, limit: number, windowSeconds: number, options?: RateLimiterOptions): Promise<RateLimitResult>;
 
   /**
    * Get current rate limit state for an identifier without consuming a token.
@@ -30,9 +45,10 @@ export interface RateLimiter {
    * @param identifier - Unique ID for the rate limit subject
    * @param limit - Maximum requests allowed in the window
    * @param windowSeconds - Duration of the rate limit window
+   * @param options - Algorithm-specific options (for bucket algorithms)
    * @returns Promise resolving to the current rate limit state
    */
-  getState(identifier: string, limit: number, windowSeconds: number): Promise<RateLimitResult>;
+  getState(identifier: string, limit: number, windowSeconds: number, options?: RateLimiterOptions): Promise<RateLimitResult>;
 
   /**
    * Reset the rate limit state for an identifier.

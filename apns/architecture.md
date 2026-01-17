@@ -1133,3 +1133,236 @@ scrape_configs:
     static_configs:
       - targets: ['host.docker.internal:3000']  # API server
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the implementation of observability, caching, and resilience patterns in the APNs backend. Each change is explained with the WHY behind the design decision.
+
+### Prometheus Metrics (`src/shared/metrics.ts`)
+
+**Why Prometheus Metrics?**
+
+Metrics are essential for operating a push notification service at scale. Without metrics, we cannot:
+- Know if notifications are being delivered successfully (SLI: delivery success rate)
+- Track latency distribution (SLI: 99% of high-priority notifications < 500ms)
+- Detect anomalies before they become outages (alert on error rate spikes)
+- Make capacity planning decisions (understand load patterns)
+
+**Key Metrics Implemented:**
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `apns_notifications_sent_total` | Counter | Track notification throughput by priority and status |
+| `apns_notification_delivery_seconds` | Histogram | Measure delivery latency distribution |
+| `apns_active_device_connections` | Gauge | Monitor WebSocket connection count |
+| `apns_cache_operations_total` | Counter | Track cache hit/miss ratio for tuning TTLs |
+| `apns_circuit_breaker_state` | Gauge | Expose circuit breaker health (0=closed, 1=open, 2=half-open) |
+| `apns_dependency_health` | Gauge | Track database and Redis connectivity |
+
+**Endpoint:** `GET /metrics` returns Prometheus-formatted metrics for scraping.
+
+### Structured Logging with Pino (`src/shared/logger.ts`)
+
+**Why Structured Logging?**
+
+Console.log statements are inadequate for production systems because:
+- They cannot be efficiently parsed by log aggregation systems
+- They lack consistent structure for filtering and querying
+- They mix different severity levels without distinction
+- They don't support correlation across distributed systems
+
+**Pino Advantages:**
+- JSON output enables integration with ELK, Datadog, Splunk
+- Log levels (trace, debug, info, warn, error, fatal) for appropriate verbosity
+- Low overhead: pino is 5x faster than winston
+- Request correlation via `x-request-id` header propagation
+
+**Logging Categories:**
+
+1. **HTTP Request Logging** (`httpLogger`): Automatic request/response logging with timing
+2. **Application Events** (`logger`): Business logic events with structured context
+3. **Audit Logging** (`auditLogger`): Security-relevant events for compliance
+   - Token registration/invalidation
+   - Authentication attempts
+   - Admin operations
+
+### Redis Caching for Device Tokens (`src/shared/cache.ts`)
+
+**Why Cache Device Tokens?**
+
+Token lookups are in the critical path for every notification:
+1. Provider sends notification to device token
+2. System must look up device ID from token hash
+3. Without caching: every notification = 1 database query
+
+**Impact:**
+- At 10,000 notifications/second, that's 10,000 DB queries/second just for lookups
+- With 95% cache hit rate, we reduce DB load to 500 queries/second (20x reduction)
+
+**Cache-Aside Pattern:**
+
+```
+1. Check Redis cache for token
+2. If hit: return cached data (< 1ms)
+3. If miss: query PostgreSQL, cache result, return
+```
+
+**TTL Strategy:**
+
+| Key Pattern | TTL | Rationale |
+|-------------|-----|-----------|
+| `cache:token:{hash}` | 1 hour | Tokens rarely change, long TTL reduces DB load |
+| `cache:token:invalid:{hash}` | 5 min | Negative caching prevents repeated failed lookups |
+| `cache:idem:{id}` | 24 hours | Idempotency window for duplicate detection |
+
+**Invalidation:**
+- On token registration update: invalidate cache immediately
+- On token invalidation: remove from cache, add to negative cache
+- This ensures consistency: no stale positive lookups for invalidated tokens
+
+### Circuit Breaker for APNs Connections (`src/shared/circuitBreaker.ts`)
+
+**Why Circuit Breakers?**
+
+Without circuit breakers, a failing dependency causes cascading failures:
+1. Redis goes down
+2. All notification deliveries timeout waiting for Redis
+3. Thread pool exhausted, server becomes unresponsive
+4. Health checks fail, load balancer removes server
+5. Remaining servers get overloaded, cascade continues
+
+**Circuit Breaker Pattern:**
+
+```
+CLOSED (normal) -> errors exceed threshold -> OPEN (fail-fast)
+     ^                                              |
+     |                                              v
+     +-------- success rate recovers <---- HALF-OPEN (testing)
+```
+
+**Implementation:**
+
+Using [Opossum](https://github.com/nodeshift/opossum) circuit breaker library:
+- `redis_pubsub` circuit: Protects cross-server notification routing
+- Per-device WebSocket circuits: Protects against problematic device connections
+
+**Configuration:**
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `timeout` | 5s | Generous timeout for network operations |
+| `errorThresholdPercentage` | 50% | Open circuit when half of requests fail |
+| `resetTimeout` | 15-30s | Time before testing if service recovered |
+| `volumeThreshold` | 5-10 | Minimum requests before calculating error rate |
+
+**Fallback Behavior:**
+When Redis pub/sub circuit opens, notifications are stored for later delivery rather than failing immediately.
+
+### Idempotency for Push Delivery (`src/services/pushService.ts`)
+
+**Why Idempotency?**
+
+Providers retry failed requests. Without idempotency:
+1. Provider sends notification with ID `abc123`
+2. Network timeout before response received
+3. Provider retries same request
+4. Without idempotency: user gets 2 notifications
+5. With idempotency: duplicate detected, original status returned
+
+**Implementation:**
+
+1. Provider includes `apns-id` header (optional UUID)
+2. If provided, check Redis: `cache:idem:{id}`
+3. If exists: return existing notification status (duplicate)
+4. If not exists: set key with 24-hour TTL, process notification
+5. Mark as processed after successful creation
+
+**Redis Key Pattern:**
+```
+SET cache:idem:{notification_id} "1" EX 86400 NX
+```
+- `NX`: Only set if not exists (atomic check-and-set)
+- `EX 86400`: 24-hour expiration (reasonable retry window)
+
+**Trade-offs:**
+- 24-hour window balances memory usage vs. retry protection
+- Provider must include `apns-id` to enable idempotency
+- Without `apns-id`, each request is treated as unique
+
+### Health Check Enhancements (`GET /health`)
+
+**Why Enhanced Health Checks?**
+
+Basic health checks only report "healthy" or "unhealthy". Enhanced checks:
+- Report individual dependency status (database, Redis)
+- Update Prometheus metrics for alerting
+- Enable graceful degradation (Redis down but DB up = partial service)
+
+**Response Format:**
+```json
+{
+  "status": "healthy",
+  "server_id": "server-3000",
+  "services": {
+    "database": "connected",
+    "redis": "connected"
+  },
+  "timestamp": "2024-01-15T10:30:00.000Z"
+}
+```
+
+**Metrics Updated:**
+- `apns_dependency_health{dependency="database"}` = 1 (healthy) or 0 (unhealthy)
+- `apns_dependency_health{dependency="redis"}` = 1 or 0
+
+### Files Added/Modified
+
+**New Files:**
+- `src/shared/logger.ts` - Structured logging with pino
+- `src/shared/metrics.ts` - Prometheus metrics collection
+- `src/shared/cache.ts` - Redis caching with cache-aside pattern
+- `src/shared/circuitBreaker.ts` - Circuit breaker pattern implementation
+- `src/shared/index.ts` - Barrel export for shared modules
+
+**Modified Files:**
+- `src/index.ts` - Added metrics endpoint, structured logging, metrics instrumentation
+- `src/services/tokenRegistry.ts` - Added caching for token lookups
+- `src/services/pushService.ts` - Added idempotency, metrics, structured logging
+- `package.json` - Added dependencies: prom-client, pino, pino-http, opossum
+
+### Testing the Implementation
+
+1. **Metrics:**
+   ```bash
+   curl http://localhost:3000/metrics
+   # Returns Prometheus-formatted metrics
+   ```
+
+2. **Health Check:**
+   ```bash
+   curl http://localhost:3000/health
+   # Returns JSON with dependency status
+   ```
+
+3. **Idempotency:**
+   ```bash
+   # First request
+   curl -X POST http://localhost:3000/3/device/abc... \
+     -H "apns-id: test-123" \
+     -H "Content-Type: application/json" \
+     -d '{"aps":{"alert":"Hello"}}'
+
+   # Retry with same apns-id returns same notification_id
+   curl -X POST http://localhost:3000/3/device/abc... \
+     -H "apns-id: test-123" \
+     -H "Content-Type: application/json" \
+     -d '{"aps":{"alert":"Hello"}}'
+   ```
+
+4. **Logs (JSON format):**
+   ```bash
+   npm run dev
+   # Logs are JSON: {"level":"info","event":"server_started","port":3000,...}
+   ```

@@ -81,7 +81,7 @@ export function setupWebSocket(server: Server, sessionMiddleware: any): WebSocke
     wsLogger.error({ error }, 'Failed to subscribe to Redis channel');
   });
 
-  redisSub.on('message', async (channel, message) => {
+  redisSub.on('message', async (channel: string, message: string) => {
     if (channel === KEYS.serverChannel(config.serverId)) {
       try {
         const data = JSON.parse(message);

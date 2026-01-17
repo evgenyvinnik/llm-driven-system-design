@@ -2,12 +2,16 @@ import { Router } from 'express';
 import { pool, redis } from '../db.js';
 import { SyncService } from '../services/sync.js';
 import { broadcastToUser } from '../services/websocket.js';
+import logger from '../shared/logger.js';
+import { syncDuration, syncOperationsTotal, conflictsTotal, startTimer, bytesDownloaded } from '../shared/metrics.js';
+import { withIdempotency } from '../shared/idempotency.js';
 
 const router = Router();
 const syncService = new SyncService();
 
 // Get sync state for device
 router.get('/state', async (req, res) => {
+  const log = req.log || logger;
   try {
     const userId = req.user.id;
     const deviceId = req.deviceId;
@@ -36,19 +40,23 @@ router.get('/state', async (req, res) => {
       syncCursor: state.sync_cursor,
     });
   } catch (error) {
-    console.error('Get sync state error:', error);
+    log.error({ error: error.message }, 'Get sync state error');
     res.status(500).json({ error: 'Failed to get sync state' });
   }
 });
 
 // Get changes since last sync
 router.get('/changes', async (req, res) => {
+  const log = req.log || logger;
+  const timer = startTimer(syncDuration, { operation: 'get_changes' });
+
   try {
     const userId = req.user.id;
     const deviceId = req.deviceId;
     const { since } = req.query;
 
     if (!deviceId) {
+      timer.end({ result: 'error' });
       return res.status(400).json({ error: 'Device ID required for sync' });
     }
 
@@ -99,29 +107,46 @@ router.get('/changes', async (req, res) => {
       ? changes.rows[changes.rows.length - 1].modified_at.toISOString()
       : sinceDate.toISOString();
 
+    timer.end({ result: 'success' });
+    syncOperationsTotal.inc({ operation: 'get_changes', result: 'success' });
+
+    log.info({
+      event: 'sync.changes_fetched',
+      userId,
+      deviceId,
+      changesCount: changes.rows.length,
+    });
+
     res.json({
       changes: { created, updated, deleted },
       cursor: newCursor,
       hasMore: changes.rows.length === 1000,
     });
   } catch (error) {
-    console.error('Get changes error:', error);
+    timer.end({ result: 'error' });
+    syncOperationsTotal.inc({ operation: 'get_changes', result: 'error' });
+    log.error({ error: error.message }, 'Get changes error');
     res.status(500).json({ error: 'Failed to get changes' });
   }
 });
 
-// Push local changes to server
-router.post('/push', async (req, res) => {
+// Push local changes to server - wrapped with idempotency for safe retries
+router.post('/push', withIdempotency(async (req, res) => {
+  const log = req.log || logger;
+  const timer = startTimer(syncDuration, { operation: 'push' });
+
   try {
     const userId = req.user.id;
     const deviceId = req.deviceId;
     const { changes } = req.body;
 
     if (!deviceId) {
+      timer.end({ result: 'error' });
       return res.status(400).json({ error: 'Device ID required for sync' });
     }
 
     if (!changes || !Array.isArray(changes)) {
+      timer.end({ result: 'error' });
       return res.status(400).json({ error: 'Changes array required' });
     }
 
@@ -142,6 +167,18 @@ router.post('/push', async (req, res) => {
             serverVersion: result.serverVersion,
             conflictType: result.conflictType,
           });
+
+          // Track conflict metrics
+          conflictsTotal.inc({
+            conflict_type: result.conflictType,
+            resolution: 'pending',
+          });
+
+          log.warn({
+            event: 'sync.conflict_detected',
+            fileId: change.fileId,
+            conflictType: result.conflictType,
+          });
         } else {
           results.applied.push({
             fileId: change.fileId,
@@ -160,6 +197,7 @@ router.post('/push', async (req, res) => {
           fileId: change.fileId,
           error: error.message,
         });
+        log.error({ error: error.message, fileId: change.fileId }, 'Failed to apply change');
       }
     }
 
@@ -171,15 +209,30 @@ router.post('/push', async (req, res) => {
       [JSON.stringify({ lastPush: new Date().toISOString() }), deviceId]
     );
 
+    timer.end({ result: 'success' });
+    syncOperationsTotal.inc({ operation: 'push', result: 'success' });
+
+    log.info({
+      event: 'sync.push_completed',
+      userId,
+      deviceId,
+      applied: results.applied.length,
+      conflicts: results.conflicts.length,
+      errors: results.errors.length,
+    });
+
     res.json(results);
   } catch (error) {
-    console.error('Push changes error:', error);
+    timer.end({ result: 'error' });
+    syncOperationsTotal.inc({ operation: 'push', result: 'error' });
+    log.error({ error: error.message }, 'Push changes error');
     res.status(500).json({ error: 'Failed to push changes' });
   }
-});
+}));
 
 // Resolve conflict
-router.post('/resolve-conflict', async (req, res) => {
+router.post('/resolve-conflict', withIdempotency(async (req, res) => {
+  const log = req.log || logger;
   try {
     const userId = req.user.id;
     const deviceId = req.deviceId;
@@ -197,6 +250,12 @@ router.post('/resolve-conflict', async (req, res) => {
       keepBoth
     );
 
+    // Track resolution
+    conflictsTotal.inc({
+      conflict_type: 'resolved',
+      resolution: resolution,
+    });
+
     // Notify all devices
     broadcastToUser(userId, {
       type: 'conflict_resolved',
@@ -204,15 +263,24 @@ router.post('/resolve-conflict', async (req, res) => {
       resolution,
     });
 
+    log.info({
+      event: 'sync.conflict_resolved',
+      userId,
+      fileId,
+      resolution,
+      keepBoth,
+    });
+
     res.json(result);
   } catch (error) {
-    console.error('Resolve conflict error:', error);
+    log.error({ error: error.message }, 'Resolve conflict error');
     res.status(500).json({ error: 'Failed to resolve conflict' });
   }
-});
+}));
 
 // Get pending conflicts
 router.get('/conflicts', async (req, res) => {
+  const log = req.log || logger;
   try {
     const userId = req.user.id;
 
@@ -242,13 +310,14 @@ router.get('/conflicts', async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Get conflicts error:', error);
+    log.error({ error: error.message }, 'Get conflicts error');
     res.status(500).json({ error: 'Failed to get conflicts' });
   }
 });
 
 // Delta sync - get only changed chunks
 router.post('/delta', async (req, res) => {
+  const log = req.log || logger;
   try {
     const userId = req.user.id;
     const { fileId, localChunkHashes } = req.body;
@@ -295,21 +364,32 @@ router.post('/delta', async (req, res) => {
       }
     }
 
+    const totalBytesToDownload = chunksToDownload.reduce((sum, c) => sum + c.size, 0);
+
+    log.info({
+      event: 'sync.delta_computed',
+      fileId,
+      totalChunks: serverChunks.rows.length,
+      chunksToDownload: chunksToDownload.length,
+      bytesToDownload: totalBytesToDownload,
+    });
+
     res.json({
       fileId,
       totalChunks: serverChunks.rows.length,
       chunksToDownload,
       chunksToKeep,
-      bytesToDownload: chunksToDownload.reduce((sum, c) => sum + c.size, 0),
+      bytesToDownload: totalBytesToDownload,
     });
   } catch (error) {
-    console.error('Delta sync error:', error);
+    log.error({ error: error.message }, 'Delta sync error');
     res.status(500).json({ error: 'Failed to compute delta' });
   }
 });
 
 // Download a specific chunk
 router.get('/chunk/:chunkHash', async (req, res) => {
+  const log = req.log || logger;
   try {
     const { chunkHash } = req.params;
     const userId = req.user.id;
@@ -333,12 +413,15 @@ router.get('/chunk/:chunkHash', async (req, res) => {
     const chunkService = new ChunkService();
     const chunkData = await chunkService.downloadChunk(chunkHash);
 
+    // Track download metrics
+    bytesDownloaded.inc(chunkData.length);
+
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Length', chunkData.length);
     res.setHeader('X-Chunk-Hash', chunkHash);
     res.send(chunkData);
   } catch (error) {
-    console.error('Download chunk error:', error);
+    log.error({ error: error.message }, 'Download chunk error');
     res.status(500).json({ error: 'Failed to download chunk' });
   }
 });

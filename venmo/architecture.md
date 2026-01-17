@@ -1169,3 +1169,293 @@ services:
 ```
 
 **Total local dev footprint: ~2 GB RAM** - reasonable for development laptops.
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of key observability, failure handling, and compliance features in the `backend/src/` codebase.
+
+### 1. Idempotency for Payment Transfers
+
+**Location:** `backend/src/shared/idempotency.js`, `backend/src/routes/transfers.js`
+
+**WHY idempotency prevents duplicate money transfers:**
+
+Money transfers are inherently dangerous to retry. Consider these scenarios:
+
+1. **Network timeout**: User clicks "Send $50 to Alice". The request succeeds on the server, but the response is lost due to network issues. The user sees an error and clicks "Send" again. Without idempotency, Alice receives $100.
+
+2. **Double-click**: Users often double-click buttons. Two identical POST requests arrive milliseconds apart. Without idempotency, both are processed.
+
+3. **Mobile app retry**: Mobile clients automatically retry failed requests. A timeout doesn't mean failure - the server may have succeeded. Each retry risks a duplicate transfer.
+
+4. **Load balancer retry**: Infrastructure may retry requests that appear to have failed.
+
+**How our implementation works:**
+
+```javascript
+// Client generates UUID when user clicks "Send" (not on page load)
+const idempotencyKey = crypto.randomUUID();
+
+// Server checks Redis first (fast path)
+const { isNew, existingResponse } = await checkIdempotency(userId, key, 'transfer');
+
+if (!isNew) {
+  // Return cached result - no duplicate charge
+  return existingResponse;
+}
+
+// Process transfer, then store result in both Redis (24hr TTL) and PostgreSQL
+await storeIdempotencyResult(userId, key, 'transfer', 'completed', result);
+```
+
+The key insight: Idempotency is implemented at TWO levels:
+- **Redis**: Fast duplicate detection, expires after 24 hours
+- **PostgreSQL**: Permanent record via `idempotency_key` column with unique index
+
+This dual approach handles both rapid retries (Redis) and delayed retries/disputes (PostgreSQL).
+
+### 2. Audit Logging for Financial Compliance
+
+**Location:** `backend/src/shared/audit.js`, integrated into transfer service
+
+**WHY audit logging is required for financial regulations:**
+
+Financial services operate under strict regulatory requirements:
+
+1. **BSA/AML (Bank Secrecy Act / Anti-Money Laundering)**: Requires tracking all money movements to detect and report suspicious activity. Without audit logs, we cannot identify potential money laundering patterns.
+
+2. **SOX Compliance (Sarbanes-Oxley)**: Requires accurate financial records and controls. Audit logs provide the immutable trail needed for compliance audits.
+
+3. **PCI-DSS**: When handling payment card data, logging access and changes is mandatory.
+
+4. **Dispute Resolution**: When users claim "I didn't make that transfer", audit logs provide:
+   - Exact timestamp
+   - IP address and location
+   - Device/browser fingerprint
+   - Session information
+   - The specific actions taken
+
+5. **Fraud Investigation**: Security teams need to trace attacker actions during account takeover incidents.
+
+**Implementation details:**
+
+```javascript
+// Every money movement creates an audit entry
+await createAuditLog({
+  action: AUDIT_ACTIONS.TRANSFER_COMPLETED,
+  actorId: transfer.sender_id,
+  actorType: ACTOR_TYPES.USER,
+  resourceType: 'transfer',
+  resourceId: transfer.id,
+  outcome: OUTCOMES.SUCCESS,
+  details: {
+    amount_cents: transfer.amount,
+    receiver_id: transfer.receiver_id,
+    funding_source: transfer.funding_source,
+  },
+  request, // Captures IP, user agent automatically
+});
+```
+
+Audit logs are:
+- **Append-only**: No UPDATE or DELETE allowed
+- **Timestamped by server**: Cannot be backdated
+- **Retained 7 years**: Per regulatory requirements
+- **Separate from application logs**: Stored in dedicated `audit_log` table
+
+### 3. Circuit Breakers for Bank API Protection
+
+**Location:** `backend/src/shared/circuit-breaker.js`
+
+**WHY circuit breakers protect against bank API outages:**
+
+External dependencies fail. When they do, the impact on our system depends on how we handle those failures:
+
+**Without circuit breaker:**
+```
+User Request → Our API → Bank API (down, 30s timeout)
+                ↓
+        All requests wait 30 seconds
+                ↓
+        Thread pool exhausted
+                ↓
+        Our entire system becomes unresponsive
+                ↓
+        Users cannot even check balances (cascading failure)
+```
+
+**With circuit breaker:**
+```
+User Request → Our API → Circuit Breaker → Bank API (down)
+                              ↓
+        After 3 failures: Circuit OPENS
+                              ↓
+        Subsequent requests fail immediately (no 30s wait)
+                              ↓
+        System remains responsive
+                              ↓
+        Users see "Bank connection temporarily unavailable"
+                              ↓
+        After 60s: Circuit tries HALF-OPEN (test requests)
+                              ↓
+        If bank recovers: Circuit CLOSES (normal operation)
+```
+
+**Implementation:**
+
+```javascript
+const bankApiCircuit = new CircuitBreaker('bank-api', {
+  failureThreshold: 3,      // Open after 3 failures
+  resetTimeout: 60000,      // Try recovery after 60 seconds
+  halfOpenRequests: 3,      // Require 3 successes to fully close
+  timeout: 15000,           // Individual request timeout
+});
+
+// Usage
+try {
+  await bankApiCircuit.execute(async () => {
+    return await callBankAPI(request);
+  });
+} catch (error) {
+  if (error.code === 'CIRCUIT_BREAKER_OPEN') {
+    // Fail fast - bank is known to be down
+    throw new Error('Bank connection temporarily unavailable. Please try again later.');
+  }
+  throw error;
+}
+```
+
+Circuit breaker state is exposed via Prometheus metrics for alerting:
+- `venmo_circuit_breaker_state{service="bank-api"}` (0=closed, 1=half-open, 2=open)
+
+### 4. Transaction Archival and Retention
+
+**Location:** `backend/src/shared/archival.js`, `backend/src/db/migrate.js`
+
+**WHY transaction archival balances compliance vs storage costs:**
+
+The core tension: Regulations require keeping transaction records for 7 years, but storing everything in PostgreSQL forever is expensive and impacts performance.
+
+**The tradeoff matrix:**
+
+| Storage Tier | Data Age | Cost | Query Speed | Use Case |
+|-------------|----------|------|-------------|----------|
+| Hot (PostgreSQL) | 0-90 days | $$$ | < 50ms | Active users, recent history |
+| Warm (Archive table) | 90 days - 2 years | $$ | < 500ms | Dispute resolution, tax records |
+| Cold (S3/MinIO) | 2-7 years | $ | Minutes | Regulatory audits, subpoenas |
+| Deleted | > 7 years | Free | N/A | Beyond retention requirement |
+
+**Why each tier exists:**
+
+1. **Hot tier (90 days)**: Most user queries access recent transactions. Keeping this data in the main `transfers` table ensures fast response times. Users expect < 100ms to see their transaction history.
+
+2. **Warm tier (2 years)**: Occasional access for disputes ("I need my records from 8 months ago for taxes") or customer support cases. Slightly slower but still queryable via SQL.
+
+3. **Cold tier (7 years)**: Compliance-only. Rarely accessed except for legal requests, regulatory audits, or fraud investigations. Stored as compressed Parquet files in object storage.
+
+4. **Deletion (> 7 years)**: Reduces liability. Data you don't have cannot be breached or subpoenaed.
+
+**Implementation:**
+
+```javascript
+const RETENTION_CONFIG = {
+  hotRetentionDays: 90,     // In PostgreSQL transfers table
+  warmRetentionDays: 730,   // In transfers_archive table
+  totalRetentionDays: 2555, // 7 years total before deletion
+};
+
+// Archival job (run daily via cron)
+async function archiveOldTransfers() {
+  // Move from hot to warm tier
+  await pool.query(`
+    WITH archived AS (
+      DELETE FROM transfers
+      WHERE created_at < NOW() - INTERVAL '90 days'
+      RETURNING *
+    )
+    INSERT INTO transfers_archive
+    SELECT *, NOW() as archived_at FROM archived
+  `);
+}
+```
+
+**Cost example for 1M users:**
+- Hot tier (90 days, 5M transfers): ~50 GB PostgreSQL = ~$50/month
+- Warm tier (2 years, 50M transfers): ~100 GB PostgreSQL archive = ~$30/month
+- Cold tier (7 years, 175M transfers): ~500 GB S3 = ~$12/month
+
+Without archival: ~3 TB PostgreSQL = ~$1000/month
+
+### 5. Prometheus Metrics
+
+**Location:** `backend/src/shared/metrics.js`, exposed at `/metrics`
+
+**Key metrics implemented:**
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `venmo_transfers_total` | Counter | Track transfer success/failure rates |
+| `venmo_transfer_amount_cents` | Histogram | Monitor transfer amount distribution |
+| `venmo_http_request_duration_seconds` | Histogram | API latency SLIs |
+| `venmo_circuit_breaker_state` | Gauge | Alert on external service failures |
+| `venmo_postgres_connections_active` | Gauge | Connection pool health |
+| `venmo_idempotency_cache_hits_total` | Counter | Monitor duplicate request prevention |
+
+### 6. Structured Logging with Pino
+
+**Location:** `backend/src/shared/logger.js`
+
+**Log format:**
+```json
+{
+  "level": 30,
+  "time": 1705312200000,
+  "service": "venmo-api",
+  "requestId": "abc123",
+  "event": "transfer_completed",
+  "transferId": "uuid",
+  "amount": "$50.00",
+  "durationMs": 45
+}
+```
+
+**Sensitive data protection:**
+- Session tokens, passwords, account numbers are automatically redacted
+- User IDs logged, but PII (names, emails) only at DEBUG level
+
+### 7. Health Check Endpoints
+
+**Location:** `backend/src/index.js`
+
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `/health` | Basic liveness | Server running |
+| `/health/detailed` | Full dependency check | PostgreSQL, Redis, circuit breakers |
+| `/health/live` | Kubernetes liveness probe | Process alive |
+| `/health/ready` | Kubernetes readiness probe | Dependencies connected |
+
+---
+
+## Files Added/Modified
+
+**New shared modules:**
+- `backend/src/shared/logger.js` - Pino structured logging
+- `backend/src/shared/metrics.js` - Prometheus metrics
+- `backend/src/shared/circuit-breaker.js` - Circuit breaker pattern
+- `backend/src/shared/retry.js` - Exponential backoff retry logic
+- `backend/src/shared/audit.js` - Financial audit logging
+- `backend/src/shared/idempotency.js` - Duplicate request prevention
+- `backend/src/shared/archival.js` - Transaction retention/archival
+
+**Modified files:**
+- `backend/src/index.js` - Added metrics, health checks, structured logging
+- `backend/src/routes/transfers.js` - Added idempotency middleware
+- `backend/src/services/transfer.js` - Integrated audit logging and metrics
+- `backend/src/db/migrate.js` - Added audit_log and archive tables
+
+**Dependencies added:**
+- `pino` - Fast structured JSON logging
+- `prom-client` - Prometheus metrics client
+

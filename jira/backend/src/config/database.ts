@@ -1,4 +1,4 @@
-import { Pool, QueryResult, QueryResultRow } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { config } from './index.js';
 
 /**
@@ -37,7 +37,7 @@ export async function query<T extends QueryResultRow>(
  *
  * @returns Promise resolving to a pooled client connection
  */
-export async function getClient() {
+export async function getClient(): Promise<PoolClient> {
   const client = await pool.connect();
   return client;
 }
@@ -52,7 +52,7 @@ export async function getClient() {
  * @throws Rethrows any error after rolling back the transaction
  */
 export async function withTransaction<T>(
-  callback: (client: ReturnType<typeof pool.connect> extends Promise<infer C> ? C : never) => Promise<T>
+  callback: (client: PoolClient) => Promise<T>
 ): Promise<T> {
   const client = await pool.connect();
   try {

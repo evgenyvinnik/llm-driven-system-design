@@ -5,13 +5,22 @@ const redis = require('../db/redis');
 const codeExecutor = require('../services/codeExecutor');
 const { requireAuth } = require('../middleware/auth');
 
+// Shared modules
+const { createModuleLogger } = require('../shared/logger');
+const { metrics } = require('../shared/metrics');
+const { submissionRateLimiter, codeRunRateLimiter } = require('../shared/rateLimiter');
+const { submissionIdempotency, storeSubmission } = require('../shared/idempotency');
+
+const logger = createModuleLogger('submissions');
 const router = express.Router();
 
 // Initialize code executor
 codeExecutor.init();
 
-// Submit code
-router.post('/', requireAuth, async (req, res) => {
+// Submit code with rate limiting and idempotency
+router.post('/', requireAuth, submissionRateLimiter, submissionIdempotency(), async (req, res) => {
+  const startTime = Date.now();
+
   try {
     const { problemSlug, language, code } = req.body;
 
@@ -25,7 +34,7 @@ router.post('/', requireAuth, async (req, res) => {
 
     // Get problem
     const problemResult = await pool.query(
-      'SELECT id, time_limit_ms, memory_limit_mb FROM problems WHERE slug = $1',
+      'SELECT id, time_limit_ms, memory_limit_mb, difficulty FROM problems WHERE slug = $1',
       [problemSlug]
     );
 
@@ -43,6 +52,11 @@ router.post('/', requireAuth, async (req, res) => {
       [submissionId, req.session.userId, problem.id, language, code]
     );
 
+    // Store idempotency key for this submission
+    if (req.storeIdempotencyKey) {
+      await req.storeIdempotencyKey(submissionId);
+    }
+
     // Update attempt count
     await pool.query(
       `INSERT INTO user_problem_status (user_id, problem_id, status, attempts)
@@ -53,8 +67,19 @@ router.post('/', requireAuth, async (req, res) => {
       [req.session.userId, problem.id]
     );
 
+    // Increment submissions in progress metric
+    metrics.submissionsInProgress.inc();
+
+    logger.info({
+      submissionId,
+      userId: req.session.userId,
+      problemSlug,
+      language,
+      difficulty: problem.difficulty
+    }, 'Submission created');
+
     // Process submission asynchronously
-    processSubmission(submissionId, problem, language, code, req.session.userId);
+    processSubmission(submissionId, problem, language, code, req.session.userId, startTime);
 
     res.status(202).json({
       submissionId,
@@ -62,13 +87,18 @@ router.post('/', requireAuth, async (req, res) => {
       message: 'Submission received, processing...'
     });
   } catch (error) {
-    console.error('Submit error:', error);
+    logger.error({
+      error: error.message,
+      userId: req.session.userId,
+      path: req.path
+    }, 'Submit error');
+
     res.status(500).json({ error: 'Failed to submit code' });
   }
 });
 
 // Run code against sample test cases (without saving submission)
-router.post('/run', requireAuth, async (req, res) => {
+router.post('/run', requireAuth, codeRunRateLimiter, async (req, res) => {
   try {
     const { problemSlug, language, code, customInput } = req.body;
 
@@ -111,6 +141,13 @@ router.post('/run', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'No test cases available' });
     }
 
+    logger.info({
+      userId: req.session.userId,
+      problemSlug,
+      language,
+      testCaseCount: testCases.length
+    }, 'Running code against sample test cases');
+
     // Run against test cases
     const results = [];
     for (const tc of testCases) {
@@ -121,6 +158,15 @@ router.post('/run', requireAuth, async (req, res) => {
         problem.time_limit_ms,
         problem.memory_limit_mb
       );
+
+      // Check if circuit breaker rejected the request
+      if (result.isCircuitBreakerOpen) {
+        return res.status(503).json({
+          error: 'Service temporarily unavailable',
+          message: result.error,
+          retryAfter: 30
+        });
+      }
 
       let passed = null;
       if (tc.expected_output && result.status === 'success') {
@@ -140,7 +186,12 @@ router.post('/run', requireAuth, async (req, res) => {
 
     res.json({ results });
   } catch (error) {
-    console.error('Run error:', error);
+    logger.error({
+      error: error.message,
+      userId: req.session.userId,
+      path: req.path
+    }, 'Run error');
+
     res.status(500).json({ error: 'Failed to run code' });
   }
 });
@@ -171,7 +222,11 @@ router.get('/:id', async (req, res) => {
 
     res.json(submission);
   } catch (error) {
-    console.error('Get submission error:', error);
+    logger.error({
+      error: error.message,
+      submissionId: req.params.id
+    }, 'Get submission error');
+
     res.status(500).json({ error: 'Failed to fetch submission' });
   }
 });
@@ -184,8 +239,11 @@ router.get('/:id/status', async (req, res) => {
     // Check Redis cache first for faster polling
     const cached = await redis.get(`submission:${id}:status`);
     if (cached) {
+      metrics.cacheHits.inc({ cache_type: 'submission_status' });
       return res.json(JSON.parse(cached));
     }
+
+    metrics.cacheMisses.inc({ cache_type: 'submission_status' });
 
     const result = await pool.query(
       `SELECT status, runtime_ms, memory_kb, test_cases_passed, test_cases_total, error_message
@@ -199,13 +257,17 @@ router.get('/:id/status', async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Get submission status error:', error);
+    logger.error({
+      error: error.message,
+      submissionId: req.params.id
+    }, 'Get submission status error');
+
     res.status(500).json({ error: 'Failed to fetch submission status' });
   }
 });
 
 // Process submission in background
-async function processSubmission(submissionId, problem, language, code, userId) {
+async function processSubmission(submissionId, problem, language, code, userId, startTime) {
   try {
     // Update status to running
     await pool.query(
@@ -256,6 +318,13 @@ async function processSubmission(submissionId, problem, language, code, userId) 
         current_test: i + 1
       }));
 
+      // Check if circuit breaker is open
+      if (result.isCircuitBreakerOpen) {
+        finalStatus = 'system_error';
+        errorMessage = 'Code execution service temporarily unavailable. Please retry.';
+        break;
+      }
+
       if (result.status !== 'success') {
         finalStatus = result.status;
         errorMessage = result.stderr || result.error;
@@ -273,6 +342,7 @@ async function processSubmission(submissionId, problem, language, code, userId) 
     }
 
     const avgTime = testCases.length > 0 ? Math.round(totalTime / testCases.length) : 0;
+    const totalDuration = (Date.now() - startTime) / 1000;
 
     // Update submission record
     await pool.query(
@@ -286,6 +356,31 @@ async function processSubmission(submissionId, problem, language, code, userId) 
        WHERE id = $1`,
       [submissionId, finalStatus, avgTime, maxMemory, passed, testCases.length, errorMessage]
     );
+
+    // Record metrics
+    metrics.submissionsTotal.inc({
+      status: finalStatus,
+      language,
+      difficulty: problem.difficulty
+    });
+
+    metrics.submissionDuration.observe(
+      { language, status: finalStatus },
+      totalDuration
+    );
+
+    // Decrement in-progress counter
+    metrics.submissionsInProgress.dec();
+
+    logger.info({
+      submissionId,
+      userId,
+      problemId: problem.id,
+      status: finalStatus,
+      testCasesPassed: passed,
+      testCasesTotal: testCases.length,
+      durationMs: Date.now() - startTime
+    }, 'Submission processed');
 
     // Update user problem status if accepted
     if (finalStatus === 'accepted') {
@@ -316,7 +411,21 @@ async function processSubmission(submissionId, problem, language, code, userId) 
     }
 
   } catch (error) {
-    console.error('Process submission error:', error);
+    logger.error({
+      error: error.message,
+      submissionId,
+      userId
+    }, 'Process submission error');
+
+    // Decrement in-progress counter
+    metrics.submissionsInProgress.dec();
+
+    // Record error metric
+    metrics.submissionsTotal.inc({
+      status: 'system_error',
+      language,
+      difficulty: problem.difficulty
+    });
 
     // Update submission with error
     await pool.query(

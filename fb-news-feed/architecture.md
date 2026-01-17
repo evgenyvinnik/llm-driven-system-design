@@ -664,3 +664,198 @@ Current threshold: 10,000 followers
 - [Twitter Fan-out Architecture](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale)
 - [TAO: Facebook's Distributed Data Store](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/)
 - [Redis Sorted Sets](https://redis.io/docs/data-types/sorted-sets/)
+
+---
+
+## Implementation Notes
+
+This section documents the key implementation decisions and the reasoning behind critical system design patterns used in the codebase.
+
+### Feed Caching Strategy
+
+**Implementation:** Redis sorted sets for feed caching with 24-hour TTL.
+
+**Why feed caching is critical for read-heavy workloads:**
+
+1. **Read/Write Ratio:** Social media feeds are extremely read-heavy. A typical user might create 1-5 posts per day but refresh their feed 50+ times. This 10-100x read/write ratio makes caching essential for scalability.
+
+2. **Latency Requirements:** Users expect sub-200ms feed load times. Without caching, each feed request would require:
+   - Querying `feed_items` table (disk I/O)
+   - Joining with `posts` and `users` tables
+   - Fetching celebrity posts
+   - Calculating ranking scores
+   - This easily exceeds 500ms under load
+
+3. **Database Load Reduction:** With 100 DAU refreshing feeds 50x/day, that's 5,000 feed queries daily. Caching with 80% hit rate reduces DB queries to 1,000/day - an 80% reduction in database load.
+
+4. **Cost Efficiency:** Redis memory is cheaper than scaling PostgreSQL read replicas. A 64MB Redis instance can cache feeds for all 100 local dev users.
+
+**Implementation Pattern:**
+```typescript
+// Cache-aside with write-through on fanout
+const cachedFeed = await getFeedFromCache(userId, limit);
+if (cachedFeed) {
+  return cachedFeed; // Cache hit
+}
+// Cache miss: query DB, then cache results
+const dbResults = await queryDatabase();
+await setFeedCache(userId, dbResults);
+```
+
+### Post Creation Idempotency
+
+**Implementation:** Redis-backed idempotency keys with 24-hour TTL using `X-Idempotency-Key` header.
+
+**Why idempotency prevents duplicate posts:**
+
+1. **Network Unreliability:** Mobile networks are unreliable. A POST request might succeed on the server but the response is lost due to network timeout. The client retries, potentially creating a duplicate post.
+
+2. **User Behavior:** Users often double-click submit buttons or refresh after submission, inadvertently sending duplicate requests.
+
+3. **Distributed Systems:** With multiple API server instances, a request might be routed to different servers on retry. Without idempotency, each server would process it as a new request.
+
+4. **Data Integrity:** Duplicate posts pollute feeds and degrade user experience. They also skew engagement metrics and waste storage.
+
+**Implementation Pattern:**
+```typescript
+// Composite key includes user, path, and client-provided key
+const compositeKey = `${userId}:${path}:${idempotencyKey}`;
+
+// Check for cached response
+const cached = await getIdempotencyResponse(compositeKey);
+if (cached.hit) {
+  return cached.value; // Return cached response
+}
+
+// Process request and cache response
+const result = await processRequest();
+await setIdempotencyResponse(compositeKey, result);
+return result;
+```
+
+**Key Design Choices:**
+- Composite key prevents cross-endpoint collisions
+- 24-hour TTL balances storage cost with retry windows
+- Only successful responses (2xx) are cached
+- Fails open on cache errors to avoid blocking legitimate requests
+
+### Fanout Metrics
+
+**Implementation:** Prometheus counters and histograms for fanout operations.
+
+**Why fanout metrics enable ranking optimization:**
+
+1. **Distribution Analysis:** Tracking `fanout_followers_count` histogram reveals the distribution of post reach. This data informs threshold tuning for celebrity vs. regular user classification.
+
+2. **Latency Monitoring:** `fanout_duration_seconds` histogram identifies slow fanout operations that might delay real-time updates. P95/P99 values indicate worst-case user experience.
+
+3. **Volume Tracking:** `fanout_operations_total` with `author_type` label shows the ratio of push (regular) vs. pull (celebrity) operations. This validates the hybrid strategy is working as expected.
+
+4. **Ranking Algorithm Tuning:** By correlating fanout metrics with engagement metrics (likes, comments), we can:
+   - Identify if posts from users with large fanouts get less engagement per follower
+   - Adjust ranking weights for different post distribution paths
+   - Detect if celebrity posts (pull-based) have different engagement patterns
+
+**Key Metrics Collected:**
+```
+# Operations by author type
+fanout_operations_total{author_type="regular"} 847
+fanout_operations_total{author_type="celebrity"} 23
+
+# Followers notified distribution
+fanout_followers_count_bucket{le="10"} 650
+fanout_followers_count_bucket{le="100"} 180
+fanout_followers_count_bucket{le="1000"} 17
+
+# Fanout latency
+fanout_duration_seconds_bucket{le="0.1"} 800
+fanout_duration_seconds_bucket{le="0.5"} 860
+fanout_duration_seconds_bucket{le="1.0"} 870
+```
+
+### Circuit Breaker for Feed Generation
+
+**Implementation:** Opossum circuit breaker with configurable thresholds protecting feed generation.
+
+**Why circuit breakers protect against cascade failures:**
+
+1. **Failure Isolation:** When the database is overloaded or slow, continuing to send queries makes the problem worse. The circuit breaker "opens" after detecting failures, preventing additional load on the struggling dependency.
+
+2. **Fast Failure:** Without a circuit breaker, requests wait for timeout (often 30+ seconds). With an open circuit, requests fail immediately (< 1ms), freeing up resources and providing quick feedback to users.
+
+3. **Self-Healing:** The half-open state allows the system to automatically recover without manual intervention. Once the dependency recovers, a few test requests succeed and the circuit closes.
+
+4. **Resource Protection:** Thread pools, connection pools, and memory are finite resources. Without circuit breaking, a slow dependency consumes these resources, cascading failure to other features.
+
+**State Diagram:**
+```
+CLOSED (normal operation)
+    │
+    ├── 5 consecutive failures
+    │
+    ▼
+OPEN (fail fast)
+    │
+    ├── 30 second timeout
+    │
+    ▼
+HALF-OPEN (testing)
+    │
+    ├── 3 successful requests → CLOSED
+    │
+    └── 1 failure → OPEN
+```
+
+**Implementation Pattern:**
+```typescript
+const feedGenerationBreaker = createCircuitBreaker(
+  generateFeed,
+  'feed_generation',
+  {
+    timeout: 5000,              // 5 second timeout
+    errorThresholdPercentage: 25, // Open after 25% failures
+    resetTimeout: 30000,        // Try again after 30 seconds
+    volumeThreshold: 3,         // Minimum 3 requests before tripping
+  }
+);
+
+// Fallback returns popular posts when circuit is open
+feedGenerationBreaker.fallback(async () => {
+  return await getPopularPosts();
+});
+```
+
+**Graceful Degradation:**
+When the feed generation circuit opens:
+1. Users still see content (popular posts as fallback)
+2. System load on struggling components is reduced
+3. Metrics track circuit state changes for alerting
+4. Once recovered, personalized feeds resume automatically
+
+### Capacity and SLO Implementation
+
+**SLO Targets (Local Development):**
+
+| SLI | Target | Measurement Metric |
+|-----|--------|-------------------|
+| Feed Latency | < 200ms P95 | `feed_generation_duration_seconds` |
+| Post Creation Latency | < 100ms P95 | `http_request_duration_seconds{path="/api/v1/posts"}` |
+| Availability | 99.9% | `http_requests_total{status!~"5.*"}` / `http_requests_total` |
+| Error Rate | < 0.1% | 5xx responses / total responses |
+
+**Component Sizing Based on Capacity:**
+
+| Component | Peak Load | Resource Allocation | Justification |
+|-----------|-----------|---------------------|---------------|
+| PostgreSQL | 10 RPS reads, 2 RPS writes | 256MB RAM, 1GB disk | Handles all CRUD with connection pooling |
+| Redis | 50 RPS cache ops | 64MB RAM | Feed cache + session cache + pub/sub |
+| API Server | 20 RPS | 128MB RAM per instance | Stateless, scales horizontally |
+
+**Storage Growth Projections:**
+
+| Data Type | Daily Growth | Monthly Growth | 1 Year Retention |
+|-----------|--------------|----------------|------------------|
+| Posts | 500 KB/day | 15 MB/month | 180 MB |
+| Feed Items | 100 KB/day (pruned) | 3 MB/month | N/A (rolling) |
+| Sessions | 10 KB/day | 300 KB/month | N/A (7-day expiry) |
+| Affinity Scores | 50 KB/day | 1.5 MB/month | 18 MB |

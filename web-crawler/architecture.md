@@ -1262,3 +1262,254 @@ This v1 crawler:
 - Provides real-time observability via dashboard
 
 It forms a solid foundation for more advanced crawling systems while being runnable on a single laptop for learning purposes.
+
+---
+
+## 23. Implementation Notes
+
+This section documents the rationale behind key implementation decisions made during the v1 development phase. These patterns solve common distributed systems challenges and provide a foundation for production deployment.
+
+### 23.1 Rate Limiting Protects Crawl Targets and Prevents Abuse
+
+**The Problem:**
+Web crawlers can inadvertently become a denial-of-service attack. Without rate limiting:
+1. A runaway crawler can overwhelm target websites
+2. Multiple workers hitting the same domain saturate its resources
+3. Seed URL injection could flood the frontier with millions of URLs
+4. API abuse could degrade dashboard performance for legitimate users
+
+**Our Solution:**
+We implement rate limiting at multiple levels:
+
+| Level | Mechanism | Purpose |
+|-------|-----------|---------|
+| Per-domain crawling | Redis SET NX EX locks | Prevents hitting the same domain faster than allowed |
+| API by user tier | Redis sliding window | 10/100/500 req/min for anonymous/user/admin |
+| Seed injection | Separate low limit | 10 req/min prevents frontier flooding |
+
+**Why Redis Sliding Window:**
+The sliding window algorithm provides smoother rate limiting than fixed windows:
+- No "burst at window edge" problem where users get 2x quota at window boundaries
+- More accurate count of recent requests
+- Automatically cleans up old entries via sorted set scores
+
+**Code location:** `src/middleware/rateLimit.ts`
+
+### 23.2 Circuit Breakers Prevent Cascade Failures
+
+**The Problem:**
+When a target website becomes unresponsive or returns errors:
+1. Workers waste time waiting for timeouts (30 seconds per request)
+2. The frontier fills with URLs from the failing domain
+3. Other healthy domains get starved of crawler capacity
+4. Retries compound the load on the struggling server
+
+**Our Solution:**
+Domain-level circuit breakers using the cockatiel library:
+
+```
+CLOSED ──(5 failures)──► OPEN ──(60s timeout)──► HALF-OPEN
+   ▲                                                    │
+   └────────────(2 successes)───────────────────────────┘
+```
+
+**States:**
+- **Closed:** Normal operation, requests pass through
+- **Open:** Requests fail immediately without network call
+- **Half-Open:** Allow test requests to check if domain recovered
+
+**Why Per-Domain Isolation:**
+Each domain gets its own circuit breaker because:
+- example.com failing shouldn't affect crawling other-site.org
+- Different domains have different failure modes
+- Metrics can identify which domains are problematic
+
+**Distributed Awareness:**
+Circuit state is stored in Redis so all workers share knowledge:
+- Worker A trips the circuit for domain X
+- Worker B immediately knows to skip domain X
+- Prevents all workers from wasting time on the same failing domain
+
+**Code location:** `src/shared/resilience.ts`
+
+### 23.3 Structured Logging Enables Debugging Distributed Crawlers
+
+**The Problem:**
+In a distributed system with multiple workers:
+1. Logs from different workers interleave in unpredictable order
+2. Tracing a single URL's journey through the system is difficult
+3. Text-based logs are hard to search and aggregate
+4. Performance issues are hard to diagnose without context
+
+**Our Solution:**
+Structured JSON logging with pino:
+
+```json
+{
+  "level": "info",
+  "time": "2025-01-16T10:30:00.000Z",
+  "service": "web-crawler",
+  "component": "crawler",
+  "workerId": "worker-1",
+  "url": "https://example.com/page",
+  "domain": "example.com",
+  "statusCode": 200,
+  "contentLength": 15234,
+  "linksFound": 42,
+  "durationMs": 350,
+  "msg": "Crawl completed"
+}
+```
+
+**Why This Matters:**
+
+| Capability | Text Logs | Structured Logs |
+|------------|-----------|-----------------|
+| Filter by worker | grep "worker-1" | `jq 'select(.workerId == "worker-1")'` |
+| Calculate avg latency | Manual parsing | `jq '[.durationMs] | add / length'` |
+| Find all 5xx errors | Regex patterns | `jq 'select(.statusCode >= 500)'` |
+| Aggregate by domain | Very difficult | `jq 'group_by(.domain)'` |
+| Ingest into ELK/Loki | Custom parsers | Native JSON ingestion |
+
+**Child Loggers for Context:**
+Each crawl operation creates a child logger with URL context:
+```typescript
+const crawlLogger = this.logger.child({ url, domain, urlHash });
+crawlLogger.info('Starting crawl');  // All fields automatically included
+```
+
+**Code location:** `src/shared/logger.ts`
+
+### 23.4 Data Lifecycle Policies Prevent Unbounded Storage Growth
+
+**The Problem:**
+Web crawlers generate data continuously:
+- At 10 pages/second, that's 864,000 new rows per day
+- Each URL frontier entry is ~500 bytes; each crawled page is ~2KB
+- Without cleanup, storage grows ~2GB/day at modest scale
+- Query performance degrades as tables grow
+- Backup times increase with data volume
+
+**Our Solution:**
+TTL-based cleanup with configurable retention:
+
+| Data Type | Retention | Rationale |
+|-----------|-----------|-----------|
+| Completed URLs | 7 days | Job done, only keep for debugging |
+| Failed URLs | 30 days | Longer retention for failure analysis |
+| Crawled pages | 90 days | Historical data for re-crawl decisions |
+| Stats | 7 days | Roll up to daily aggregates then delete |
+| Redis keys | Auto-TTL | Session: 24h, Rate limits: 1min |
+
+**Batch Deletion:**
+Deletes are processed in batches of 1000 rows to:
+- Avoid long-running transactions that lock tables
+- Allow other queries to interleave
+- Prevent memory exhaustion from huge DELETE results
+
+**Scheduled Execution:**
+The cleanup service runs hourly by default:
+```typescript
+this.intervalId = setInterval(
+  () => this.runCleanup(),
+  60 * 60 * 1000  // 1 hour
+);
+```
+
+**Manual Trigger:**
+Admins can trigger cleanup via API:
+```bash
+curl -X POST http://localhost:3001/api/admin/cleanup \
+  -H "Cookie: crawler.sid=..."
+```
+
+**Storage Monitoring:**
+The `/api/admin/storage` endpoint provides current table sizes:
+```json
+{
+  "urlFrontier": { "pending": 1234, "inProgress": 10, "completed": 50000 },
+  "crawledPages": 48000,
+  "domains": 150,
+  "stats": 1000,
+  "redisMemory": "25.5M"
+}
+```
+
+**Code location:** `src/services/cleanup.ts`
+
+### 23.5 Prometheus Metrics Enable Operational Visibility
+
+Metrics exposed at `/metrics` in Prometheus format:
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `crawler_pages_crawled_total` | Counter | Total pages by status |
+| `crawler_crawl_duration_seconds` | Histogram | Latency distribution |
+| `crawler_frontier_size` | Gauge | Queue depth by status |
+| `crawler_circuit_breaker_state` | Gauge | Per-domain circuit state |
+| `crawler_rate_limit_hits_total` | Counter | Rate limit rejections |
+| `crawler_errors_total` | Counter | Errors by type |
+
+**Grafana Dashboard Queries (examples):**
+```promql
+# Crawl rate over time
+rate(crawler_pages_crawled_total{status="success"}[5m])
+
+# 95th percentile latency
+histogram_quantile(0.95, rate(crawler_crawl_duration_seconds_bucket[5m]))
+
+# Queue depth
+crawler_frontier_size{status="pending"}
+
+# Error rate
+rate(crawler_errors_total[5m]) / rate(crawler_pages_crawled_total[5m])
+```
+
+**Code location:** `src/shared/metrics.ts`
+
+### 23.6 Session-Based Authentication and RBAC
+
+**Authentication Flow:**
+```
+POST /api/auth/login { username, password }
+  ↓
+Validate credentials (pbkdf2)
+  ↓
+Create session in Redis: crawler:session:{id}
+  ↓
+Set cookie: crawler.sid (httpOnly, secure, sameSite)
+```
+
+**RBAC Boundaries:**
+
+| Role | Permissions | Endpoints |
+|------|-------------|-----------|
+| anonymous | Read public stats | `GET /health`, `GET /api/stats` |
+| user | View all data | `GET /api/*` |
+| admin | Full access | `POST/DELETE /api/admin/*` |
+
+**Admin-Only Operations:**
+- Inject seed URLs
+- Clear frontier
+- Purge crawled pages
+- Reset blocked domains
+- Trigger manual cleanup
+
+**Code location:** `src/middleware/auth.ts`
+
+---
+
+## 24. Module Index
+
+Quick reference for new code modules added in v1:
+
+| Module | Path | Purpose |
+|--------|------|---------|
+| Logger | `src/shared/logger.ts` | Structured JSON logging with pino |
+| Metrics | `src/shared/metrics.ts` | Prometheus metrics definitions |
+| Resilience | `src/shared/resilience.ts` | Circuit breaker and retry logic |
+| Auth | `src/middleware/auth.ts` | Session auth and RBAC |
+| Rate Limit | `src/middleware/rateLimit.ts` | Redis sliding window rate limiting |
+| Cleanup | `src/services/cleanup.ts` | TTL-based data lifecycle management |
+
+All modules follow the singleton pattern where appropriate and export typed interfaces for use across the codebase.

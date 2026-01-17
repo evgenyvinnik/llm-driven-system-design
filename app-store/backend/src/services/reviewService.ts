@@ -6,6 +6,9 @@
 import { query, transaction } from '../config/database.js';
 import { cacheGet, cacheSet, cacheDelete } from '../config/redis.js';
 import type { Review, PaginatedResponse, ReviewSubmission } from '../types/index.js';
+import { publishEvent, QueueConfig } from '../shared/queue.js';
+import { logger, logging } from '../shared/logger.js';
+import { reviewsSubmitted } from '../shared/metrics.js';
 
 /** Cache time-to-live in seconds (5 minutes) */
 const CACHE_TTL = 300;
@@ -152,6 +155,7 @@ export class ReviewService {
   /**
    * Creates a new review for an app.
    * Calculates integrity score and may hold review for moderation if score is low.
+   * Publishes review event to RabbitMQ for async processing.
    * @param userId - User UUID creating the review
    * @param appId - App UUID being reviewed
    * @param data - Review content (rating, title, body)
@@ -160,6 +164,8 @@ export class ReviewService {
    * @throws Error if user already reviewed this app
    */
   async createReview(userId: string, appId: string, data: ReviewSubmission, appVersion?: string): Promise<Review> {
+    const startTime = Date.now();
+
     // Check if user already reviewed this app
     const existing = await query(`
       SELECT id FROM reviews WHERE user_id = $1 AND app_id = $2
@@ -198,10 +204,42 @@ export class ReviewService {
       return reviewResult.rows[0];
     });
 
+    const review = mapReviewRow(result as Record<string, unknown>);
+
+    // Publish review event to RabbitMQ for async processing
+    // (integrity analysis, moderation, notifications)
+    const eventPublished = await publishEvent(QueueConfig.routingKeys.reviewCreated, {
+      reviewId: review.id,
+      userId,
+      appId,
+      rating: data.rating,
+      integrityScore,
+      status,
+      timestamp: new Date().toISOString(),
+    });
+
+    if (!eventPublished) {
+      logger.warn({ reviewId: review.id, appId, userId }, 'Failed to publish review event to queue');
+    }
+
+    // Update metrics
+    reviewsSubmitted.inc({ status });
+
+    // Log business event
+    logging.businessEvent('review_created', {
+      reviewId: review.id,
+      appId,
+      userId,
+      rating: data.rating,
+      integrityScore,
+      status,
+      durationMs: Date.now() - startTime,
+    });
+
     // Clear caches
     await this.clearReviewCaches(appId);
 
-    return mapReviewRow(result as Record<string, unknown>);
+    return review;
   }
 
   /**

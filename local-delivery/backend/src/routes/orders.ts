@@ -13,28 +13,59 @@ import {
   getOrderWithDetails,
   getCustomerOrders,
   updateOrderStatus,
-  startDriverMatching,
+  startDriverMatchingWithCircuitBreaker,
 } from '../services/orderService.js';
 import { createRating } from '../services/ratingService.js';
+import { withIdempotency } from '../shared/idempotency.js';
+import { orderLogger } from '../shared/logger.js';
+import { ordersCreatedCounter } from '../shared/metrics.js';
 
 const router = Router();
 
-// Create new order
+/**
+ * Create new order with idempotency protection.
+ * Clients should send X-Idempotency-Key header to prevent duplicate orders on retry.
+ *
+ * WHY idempotency:
+ * - Prevents duplicate orders when network timeouts cause retries
+ * - Prevents double charges if payment succeeds but response is lost
+ * - Enables safe client retries without side effects
+ */
 router.post('/', authenticate, requireCustomer, async (req: Request, res: Response) => {
+  const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+
   try {
-    const order = await createOrder(req.userId!, req.body);
+    const result = await withIdempotency(
+      idempotencyKey,
+      req.userId!,
+      'create_order',
+      async () => {
+        const order = await createOrder(req.userId!, req.body);
+
+        // Track order creation metric
+        ordersCreatedCounter.inc({ merchant_category: 'unknown' });
+
+        // Start driver matching in background with circuit breaker protection
+        startDriverMatchingWithCircuitBreaker(order.id).catch((error) => {
+          orderLogger.error({ orderId: order.id, error: (error as Error).message }, 'Driver matching error');
+        });
+
+        return order;
+      }
+    );
+
+    // Log whether this was a cached response or fresh execution
+    if (!result.executed) {
+      orderLogger.info({ idempotencyKey }, 'Returned cached order response');
+    }
 
     res.status(201).json({
       success: true,
-      data: order,
-    });
-
-    // Start driver matching in background (non-blocking)
-    startDriverMatching(order.id).catch((error) => {
-      console.error('Driver matching error:', error);
+      data: result.response,
+      cached: !result.executed,
     });
   } catch (error) {
-    console.error('Create order error:', error);
+    orderLogger.error({ error: (error as Error).message, idempotencyKey }, 'Create order error');
     res.status(400).json({
       success: false,
       error: (error as Error).message || 'Failed to create order',
@@ -52,7 +83,7 @@ router.get('/', authenticate, requireCustomer, async (req: Request, res: Respons
       data: orders,
     });
   } catch (error) {
-    console.error('Get orders error:', error);
+    orderLogger.error({ error: (error as Error).message }, 'Get orders error');
     res.status(500).json({
       success: false,
       error: 'Failed to get orders',
@@ -91,7 +122,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
       data: order,
     });
   } catch (error) {
-    console.error('Get order error:', error);
+    orderLogger.error({ orderId: req.params.id, error: (error as Error).message }, 'Get order error');
     res.status(500).json({
       success: false,
       error: 'Failed to get order',
@@ -135,12 +166,14 @@ router.post('/:id/cancel', authenticate, requireCustomer, async (req: Request, r
       cancellation_reason: reason || 'Cancelled by customer',
     });
 
+    orderLogger.info({ orderId: req.params.id, reason }, 'Order cancelled by customer');
+
     res.json({
       success: true,
       data: updatedOrder,
     });
   } catch (error) {
-    console.error('Cancel order error:', error);
+    orderLogger.error({ orderId: req.params.id, error: (error as Error).message }, 'Cancel order error');
     res.status(500).json({
       success: false,
       error: 'Failed to cancel order',
@@ -190,7 +223,7 @@ router.post('/:id/tip', authenticate, requireCustomer, async (req: Request, res:
       data: updatedOrder,
     });
   } catch (error) {
-    console.error('Add tip error:', error);
+    orderLogger.error({ orderId: req.params.id, error: (error as Error).message }, 'Add tip error');
     res.status(500).json({
       success: false,
       error: 'Failed to add tip',
@@ -226,7 +259,7 @@ router.post('/:id/rate/driver', authenticate, requireCustomer, async (req: Reque
       data: ratingRecord,
     });
   } catch (error) {
-    console.error('Rate driver error:', error);
+    orderLogger.error({ orderId: req.params.id, error: (error as Error).message }, 'Rate driver error');
     res.status(400).json({
       success: false,
       error: (error as Error).message || 'Failed to rate driver',
@@ -262,7 +295,7 @@ router.post('/:id/rate/merchant', authenticate, requireCustomer, async (req: Req
       data: ratingRecord,
     });
   } catch (error) {
-    console.error('Rate merchant error:', error);
+    orderLogger.error({ orderId: req.params.id, error: (error as Error).message }, 'Rate merchant error');
     res.status(400).json({
       success: false,
       error: (error as Error).message || 'Failed to rate merchant',

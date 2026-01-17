@@ -4,7 +4,8 @@
  * with configurable retry policies and dead letter queues.
  */
 
-import amqp, { Connection, Channel, ConsumeMessage } from 'amqplib';
+import amqp from 'amqplib';
+import type { Connection, Channel, ConsumeMessage, Options } from 'amqplib';
 import { logger, LogEvents, logEvent } from './logger.js';
 import {
   queueMessagesPublished,
@@ -143,18 +144,20 @@ class QueueManager {
   private async doConnect(): Promise<void> {
     try {
       const url = process.env.RABBITMQ_URL || 'amqp://notion:notion_local@localhost:5672';
-      this.connection = await amqp.connect(url);
-      this.channel = await this.connection.createChannel();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const conn = await amqp.connect(url) as any;
+      this.connection = conn;
+      this.channel = await conn.createChannel();
 
       // Handle connection close
-      this.connection.on('close', () => {
+      conn.on('close', () => {
         logger.warn('RabbitMQ connection closed, attempting reconnect...');
         this.connection = null;
         this.channel = null;
         this.scheduleReconnect();
       });
 
-      this.connection.on('error', (err) => {
+      conn.on('error', (err: Error) => {
         logger.error({ error: err }, 'RabbitMQ connection error');
       });
 
@@ -196,7 +199,7 @@ class QueueManager {
       }
 
       // Set up main queue with options
-      const queueOptions: amqp.Options.AssertQueue = {
+      const queueOptions: Options.AssertQueue = {
         durable: config.durable,
         arguments: {
           ...(config.ttl && { 'x-message-ttl': config.ttl }),
@@ -338,7 +341,8 @@ class QueueManager {
     }
 
     if (this.connection) {
-      await this.connection.close();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (this.connection as any).close();
       this.connection = null;
     }
 

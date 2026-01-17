@@ -729,25 +729,224 @@ npm run dev:server3  # Port 3003
 
 **Rationale**: Synchronous execution provides immediate feedback for market orders. Queue-based would be necessary at scale for rate limiting and retry handling.
 
+## Implementation Notes
+
+This section documents the critical reliability and compliance features implemented in the trading platform, explaining **why** each feature is essential for a financial system.
+
+### Idempotency for Trade Execution
+
+**Why it's critical**: In financial systems, duplicate trade execution can cause catastrophic losses.
+
+**Problem scenarios without idempotency:**
+1. **Network timeout with success**: Client sends buy order, server executes it, but network drops before response. Client retries, server executes again = user buys 2x shares
+2. **Load balancer retry**: ALB times out at 30s, retries to another server = duplicate execution
+3. **User double-click**: User clicks "Buy" twice quickly = two separate orders
+4. **Mobile network**: Flaky cellular connection causes automatic retries
+
+**Implementation:**
+```typescript
+// Client sends unique idempotency key with order
+POST /api/orders
+X-Idempotency-Key: user-generated-uuid
+
+// Server flow:
+1. Check Redis for existing key
+2. If found with status=completed, return cached result
+3. If found with status=pending, return 409 Conflict
+4. If not found, acquire lock with SETNX
+5. Execute order
+6. Store result with 24-hour TTL
+7. Return result
+```
+
+**Trade-off**: Requires Redis availability for idempotency checks. We fail open (allow order) if Redis is down to maintain availability.
+
+### Audit Logging for SEC Compliance
+
+**Why it's required**: SEC Rule 17a-4 and FINRA Rule 4511 mandate broker-dealers maintain complete records of all securities transactions.
+
+**Regulatory requirements:**
+- **Record retention**: 6 years for most records (3 years readily accessible)
+- **Immutability**: Records must be in non-rewritable, non-erasable format (WORM)
+- **Completeness**: Every order placement, execution, modification, and cancellation
+- **Accessibility**: Records must be immediately available for regulatory examination
+
+**What we log:**
+| Event | Data Captured |
+|-------|---------------|
+| ORDER_PLACED | User, symbol, side, type, quantity, price, timestamp, IP, user agent |
+| ORDER_FILLED | Execution price, quantity, total value, partial/full fill |
+| ORDER_CANCELLED | Reason, remaining quantity, user who cancelled |
+| ORDER_REJECTED | Rejection reason (insufficient funds, invalid symbol, etc.) |
+
+**Implementation:**
+```sql
+CREATE TABLE audit_logs (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL,
+  action VARCHAR(50) NOT NULL,
+  entity_type VARCHAR(20) NOT NULL,
+  entity_id UUID NOT NULL,
+  details JSONB NOT NULL,       -- Full transaction context
+  ip_address INET,
+  user_agent TEXT,
+  request_id VARCHAR(100),      -- For distributed tracing
+  idempotency_key VARCHAR(100), -- Links to order idempotency
+  status VARCHAR(20) NOT NULL,
+  error_message TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+**Production considerations:**
+- Use append-only table or write to immutable storage (S3 Glacier, WORM-enabled storage)
+- Implement audit log archival for 6-year retention
+- Consider separate audit database with different access controls
+- Regular integrity verification (checksums, blockchain anchoring for tamper evidence)
+
+### Circuit Breakers for External Dependencies
+
+**Why it's essential**: Market data providers and execution venues can become unavailable. Without circuit breakers, the entire trading system fails.
+
+**Failure scenarios protected:**
+1. **Market data provider outage**: Quote API returns 503 for 5 minutes
+2. **Execution venue timeout**: Order execution takes 30+ seconds
+3. **Redis unavailability**: Cache layer goes down
+4. **Database overload**: Connection pool exhausted
+
+**Circuit breaker states:**
+```
+CLOSED (Normal)
+    |
+    | Failure rate > 50%
+    v
+  OPEN (Fast fail)
+    |
+    | After 30 seconds
+    v
+HALF-OPEN (Test)
+    |
+    | Success -> CLOSED
+    | Failure -> OPEN
+```
+
+**Implementation:**
+```typescript
+// Quote service with circuit breaker
+this.marketDataBreaker = createCircuitBreaker(fetchMarketData, {
+  name: 'market-data',
+  timeout: 5000,              // 5 second timeout per call
+  errorThresholdPercentage: 50,  // Open after 50% failures
+  volumeThreshold: 10,        // Need 10 requests to calculate
+  resetTimeout: 30000,        // 30 seconds before half-open
+});
+
+// Fallback: return last known quote
+this.marketDataBreaker.fallback((symbol) => {
+  return lastKnownQuotes.get(symbol);
+});
+```
+
+**Trade-offs:**
+- **Stale data vs no data**: When circuit opens, we serve cached quotes. Users see slightly stale prices but can still trade.
+- **Fast failure vs retry**: Open circuit fails immediately rather than waiting for timeout. Improves user experience during outages.
+- **Recovery detection**: Half-open state tests if dependency recovered before fully closing circuit.
+
+### Real-Time Metrics for Order Execution Optimization
+
+**Why metrics matter**: You cannot optimize what you cannot measure. In trading, milliseconds matter.
+
+**Key metrics for trading platforms:**
+| Metric | Purpose | SLO Target |
+|--------|---------|------------|
+| `order_execution_duration_ms` | End-to-end order latency | p99 < 500ms |
+| `orders_placed_total` | Order volume by type | Monitor for anomalies |
+| `orders_rejected_total` | Failed orders by reason | < 1% rejection rate |
+| `quote_updates_total` | Market data freshness | 20 updates/second |
+| `circuit_breaker_state` | Dependency health | 0 (closed) = healthy |
+
+**How metrics enable optimization:**
+1. **Identify bottlenecks**: `order_execution_duration_ms` histogram shows where time is spent
+2. **Capacity planning**: `orders_placed_total` rate predicts infrastructure needs
+3. **Anomaly detection**: Sudden spike in `orders_rejected_total` indicates systemic issue
+4. **SLO monitoring**: Alert when p99 latency exceeds 500ms
+
+**Prometheus metrics exposed:**
+```
+# HELP orders_placed_total Total number of orders placed
+# TYPE orders_placed_total counter
+orders_placed_total{side="buy",order_type="market"} 1234
+orders_placed_total{side="sell",order_type="limit"} 567
+
+# HELP order_execution_duration_ms Order execution duration
+# TYPE order_execution_duration_ms histogram
+order_execution_duration_ms_bucket{order_type="market",le="50"} 890
+order_execution_duration_ms_bucket{order_type="market",le="100"} 1150
+order_execution_duration_ms_bucket{order_type="market",le="500"} 1230
+
+# HELP circuit_breaker_state Circuit breaker state
+# TYPE circuit_breaker_state gauge
+circuit_breaker_state{name="market-data"} 0
+circuit_breaker_state{name="redis-publish"} 0
+```
+
+**Grafana dashboard panels:**
+1. Order execution latency (p50, p95, p99 over time)
+2. Orders per second by type (stacked area chart)
+3. Rejection rate percentage (with threshold alerts)
+4. Circuit breaker states (traffic light visualization)
+5. Quote update rate (line chart with expected baseline)
+
+### Structured JSON Logging
+
+**Why structured logs**: Traditional text logs are impossible to query at scale. JSON logs enable:
+- Full-text search across all fields
+- Aggregations (orders per user, errors by type)
+- Correlation across distributed services
+- Automated anomaly detection
+
+**Log format:**
+```json
+{
+  "level": "info",
+  "time": 1705312800000,
+  "service": "robinhood-backend",
+  "requestId": "abc-123",
+  "userId": "user-456",
+  "orderId": "order-789",
+  "symbol": "AAPL",
+  "action": "order_placed",
+  "duration": 45,
+  "msg": "Order placed successfully"
+}
+```
+
+**Key correlation fields:**
+- `requestId`: Traces request across all log entries
+- `userId`: All actions by a specific user
+- `orderId`: Full lifecycle of a single order
+
 ## Future Optimizations
 
-### Phase 1: Enhanced Observability
-- [ ] Add Prometheus metrics endpoint
+### Completed (Phase 1: Enhanced Observability)
+- [x] Add Prometheus metrics endpoint (`/metrics`)
+- [x] Implement structured JSON logging (pino)
+- [x] Add request correlation IDs (X-Request-ID header)
 - [ ] Create Grafana dashboards
-- [ ] Implement structured JSON logging
-- [ ] Add request correlation IDs
 
-### Phase 2: Performance
-- [ ] Add Redis session caching
+### Completed (Phase 3: Reliability)
+- [x] Implement circuit breaker for external dependencies
+- [x] Add idempotency keys for order placement
+- [ ] Add rate limiting on order endpoints
+- [ ] Create database backup/restore procedures
+
+### Completed (Session Caching)
+- [x] Add Redis session caching (in auth middleware)
+
+### Phase 2: Performance (Remaining)
 - [ ] Implement database connection pooling with PgBouncer
 - [ ] Add database query result caching for portfolio summaries
 - [ ] Compress WebSocket messages
-
-### Phase 3: Reliability
-- [ ] Add rate limiting on order endpoints
-- [ ] Implement circuit breaker for external dependencies
-- [ ] Add idempotency keys for order placement
-- [ ] Create database backup/restore procedures
 
 ### Phase 4: Features
 - [ ] Admin dashboard for account management

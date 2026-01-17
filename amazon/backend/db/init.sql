@@ -206,3 +206,84 @@ INSERT INTO sellers (user_id, business_name, description)
 SELECT id, 'TechStore', 'Quality electronics and gadgets'
 FROM users WHERE email = 'seller@amazon.local'
 ON CONFLICT DO NOTHING;
+
+-- ============================================================
+-- Observability and Resilience Tables (Added for production readiness)
+-- ============================================================
+
+-- Idempotency Keys table
+-- Prevents duplicate order creation from retries or double-clicks
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key VARCHAR(255) PRIMARY KEY,
+  status VARCHAR(20) NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'failed')),
+  request_data JSONB,
+  response JSONB,
+  created_at TIMESTAMP DEFAULT NOW(),
+  completed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
+CREATE INDEX IF NOT EXISTS idx_idempotency_status ON idempotency_keys(status);
+
+-- Audit Logs table
+-- Tamper-evident audit trail for order and payment operations
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id SERIAL PRIMARY KEY,
+  created_at TIMESTAMP DEFAULT NOW(),
+  action VARCHAR(100) NOT NULL,
+  actor_id INTEGER,
+  actor_type VARCHAR(20) CHECK (actor_type IN ('user', 'admin', 'system', 'service')),
+  resource_type VARCHAR(50),
+  resource_id VARCHAR(100),
+  old_value JSONB,
+  new_value JSONB,
+  ip_address INET,
+  user_agent TEXT,
+  correlation_id UUID,
+  severity VARCHAR(20) DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'critical'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id, actor_type);
+CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_logs(correlation_id);
+
+-- Orders Archive table
+-- Cold storage for old orders (referenced from orders table)
+CREATE TABLE IF NOT EXISTS orders_archive (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL,
+  user_id INTEGER,
+  archive_data JSONB NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  archived_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_archive_order ON orders_archive(order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_archive_user ON orders_archive(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_archive_created ON orders_archive(created_at);
+
+-- Add archival columns to orders table
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS archive_status VARCHAR(20) DEFAULT 'active' CHECK (archive_status IN ('active', 'pending_archive', 'archived', 'anonymized'));
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_orders_archive_status ON orders(archive_status);
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+
+-- Search Logs table (for analytics and debugging)
+CREATE TABLE IF NOT EXISTS search_logs (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER,
+  query TEXT,
+  filters JSONB,
+  results_count INTEGER,
+  latency_ms INTEGER,
+  engine VARCHAR(20),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_search_logs_user ON search_logs(user_id);

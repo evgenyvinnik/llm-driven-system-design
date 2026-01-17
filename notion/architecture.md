@@ -1186,3 +1186,164 @@ groups:
         annotations:
           summary: "Dead letter queue has unprocessed messages"
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of caching, async queues, observability, and audit logging in the backend codebase.
+
+### Why Caching Reduces Load for Frequently Accessed Pages
+
+Pages and their blocks are read far more often than they are written. In a collaborative workspace like Notion:
+
+1. **Read-heavy workload**: Users view pages constantly (navigating, reading) while edits happen less frequently
+2. **Shared content**: Popular pages (team docs, wikis) are accessed by many users simultaneously
+3. **Database cost**: Each page view requires multiple JOIN queries (page + blocks + children + views)
+
+**Implementation**: We use the **cache-aside pattern** in `/backend/src/shared/cache.ts`:
+
+```typescript
+// Cache-aside: check cache first, fetch from DB on miss, then cache
+const pageContent = await cacheAside(
+  CACHE_KEYS.pageWithBlocks(pageId),
+  CACHE_TTL.page,  // 5 minutes
+  async () => {
+    // Only hit database on cache miss
+    const blocks = await pool.query('SELECT * FROM blocks WHERE page_id = $1', [pageId]);
+    return { blocks: blocks.rows, ... };
+  },
+  'page'
+);
+```
+
+**Cache invalidation** is event-driven - when a block is updated, we invalidate the page cache:
+
+```typescript
+// In blocks route after update
+await invalidatePageCache(block.page_id);
+```
+
+**Trade-offs**:
+- TTL of 5-10 minutes balances freshness vs load reduction
+- Eventual consistency: other users may see stale content briefly
+- Memory cost: Redis stores serialized page data
+
+### Why Async Queues Enable Reliable Export/Import Jobs
+
+Export operations (PDF, Markdown) are:
+1. **Time-consuming**: Rendering a large page with images takes seconds
+2. **Resource-intensive**: High CPU/memory for PDF generation
+3. **User-blocking**: Synchronous export would timeout or freeze the UI
+
+**Implementation**: We use RabbitMQ in `/backend/src/shared/queue.ts`:
+
+```typescript
+// Non-blocking: Returns immediately, user gets notified when done
+await publishExportJob({
+  type: 'pdf',
+  pageId: pageId,
+  userId: userId,
+  options: { includeSubpages: true, includeImages: true },
+  callbackUrl: '/api/exports/complete',
+});
+```
+
+**Queue configurations** are tuned per use case:
+
+| Queue | Prefetch | Retries | TTL | Rationale |
+|-------|----------|---------|-----|-----------|
+| fanout | 50 | 0 | 30s | Real-time, best-effort |
+| export | 2 | 5 | 24h | Resource-heavy, must succeed |
+| search | 10 | 3 | 1h | Index updates, idempotent |
+
+**Backpressure handling**:
+- Prefetch limits concurrent jobs per worker
+- Dead letter queues capture permanently failed jobs
+- Exponential backoff on retry (1s, 2s, 4s, 8s...)
+
+### Why Audit Logging Enables Security and Compliance
+
+Security-sensitive actions need an immutable record for:
+1. **Incident investigation**: Who shared this page externally? When?
+2. **Compliance requirements**: GDPR data access logs, SOC 2 audit trails
+3. **User accountability**: Tracking permission changes, deletions
+
+**Implementation**: Audit logger in `/backend/src/shared/audit.ts`:
+
+```typescript
+// Logs to both database (compliance) and structured logs (alerting)
+await auditLogger.logPageShared(
+  req.user.id,
+  pageId,
+  {
+    sharedWith: recipientEmail,
+    permission: 'view',
+    shareType: 'user',
+  },
+  req.ip,
+  req.headers['user-agent']
+);
+```
+
+**Audit events captured**:
+- Page sharing and permission changes
+- Workspace member additions/removals
+- Page exports
+- Permanent deletions
+- Authentication events (login, logout, failures)
+
+**Database schema** (`audit_log` table):
+- Append-only for immutability
+- Indexed by user, resource, and timestamp
+- JSON metadata for flexible event details
+
+### Why Metrics Enable Performance Optimization
+
+Without metrics, you're flying blind. Prometheus metrics enable:
+1. **Capacity planning**: Track request rates, queue depths, connection counts
+2. **Latency optimization**: Identify slow endpoints via p95/p99 histograms
+3. **Cache tuning**: Measure hit rates to optimize TTLs and key strategies
+4. **Alerting**: Automated detection of degraded performance
+
+**Implementation**: Metrics in `/backend/src/shared/metrics.ts`:
+
+```typescript
+// Request latency histogram with percentile buckets
+const httpRequestDuration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+});
+
+// Cache hit/miss tracking
+cacheHitsCounter.inc({ cache_type: 'page' });
+cacheMissesCounter.inc({ cache_type: 'page' });
+```
+
+**Key SLIs tracked**:
+- `http_request_duration_seconds` - API latency by endpoint
+- `page_loads_total` / `page_edits_total` - Business metrics
+- `cache_hits_total` / `cache_misses_total` - Cache effectiveness
+- `queue_depth` - Backpressure indicator
+
+**Endpoints**:
+- `/metrics` - Prometheus scrape endpoint
+- `/health` - Dependency health checks (DB, Redis, RabbitMQ)
+- `/ready` - Kubernetes readiness probe
+
+### Shared Module Structure
+
+All observability and infrastructure concerns are centralized in `/backend/src/shared/`:
+
+```
+backend/src/shared/
+├── logger.ts    # Structured JSON logging with pino
+├── cache.ts     # Redis caching with cache-aside/write-through
+├── queue.ts     # RabbitMQ producer/consumer with backpressure
+├── metrics.ts   # Prometheus metrics and middleware
+└── audit.ts     # Security audit logging
+```
+
+This separation of concerns keeps route handlers focused on business logic while infrastructure concerns are reusable and testable.

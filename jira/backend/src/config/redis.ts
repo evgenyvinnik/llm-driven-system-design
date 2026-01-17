@@ -1,14 +1,17 @@
-import Redis from 'ioredis';
+import IORedis from 'ioredis';
 import { config } from './index.js';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const RedisClient = (IORedis as any).default || IORedis;
 
 /**
  * Redis client instance for caching and session storage.
  * Used throughout the application for caching frequently accessed data
  * (projects, workflows) and storing user sessions.
  */
-export const redis = new Redis(config.redis.url);
+export const redis = new RedisClient(config.redis.url);
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   console.error('Redis connection error:', err);
 });
 

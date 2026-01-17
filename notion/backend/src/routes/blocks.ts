@@ -11,6 +11,9 @@ import { generatePosition } from '../utils/fractionalIndex.js';
 import { generateHLC, hlcToNumber } from '../utils/hlc.js';
 import type { Block, Page } from '../types/index.js';
 import { v4 as uuidv4 } from 'uuid';
+import { invalidatePageCache } from '../shared/cache.js';
+import { blockOperationsCounter } from '../shared/metrics.js';
+import { publishSearchIndex } from '../shared/queue.js';
 
 const router = Router();
 
@@ -181,6 +184,21 @@ router.post('/', async (req: Request, res: Response) => {
       [page_id, blockId, JSON.stringify(block), hlcToNumber(hlc), req.user!.id]
     );
 
+    // Invalidate page cache on block insert
+    await invalidatePageCache(page_id);
+
+    // Track metrics
+    blockOperationsCounter.inc({ type: 'insert', status: 'success' });
+
+    // Queue search index update
+    await publishSearchIndex({
+      type: 'index_block',
+      blockId: blockId,
+      pageId: page_id,
+      content: JSON.stringify(content || []),
+      workspaceId: pageResult.rows[0].workspace_id,
+    });
+
     res.status(201).json({ block });
   } catch (error) {
     console.error('Create block error:', error);
@@ -289,6 +307,23 @@ router.patch('/:id', async (req: Request, res: Response) => {
       ]
     );
 
+    // Invalidate page cache on block update
+    await invalidatePageCache(block.page_id);
+
+    // Track metrics
+    blockOperationsCounter.inc({ type: 'update', status: 'success' });
+
+    // Queue search index update if content changed
+    if (content !== undefined) {
+      await publishSearchIndex({
+        type: 'index_block',
+        blockId: id as string,
+        pageId: block.page_id,
+        content: JSON.stringify(content),
+        workspaceId: pageResult.rows[0].workspace_id,
+      });
+    }
+
     res.json({ block: updatedBlock });
   } catch (error) {
     console.error('Update block error:', error);
@@ -344,6 +379,20 @@ router.delete('/:id', async (req: Request, res: Response) => {
        VALUES ($1, $2, 'delete', $3, $4, $5)`,
       [block.page_id, id, JSON.stringify(block), hlcToNumber(hlc), req.user!.id]
     );
+
+    // Invalidate page cache on block delete
+    await invalidatePageCache(block.page_id);
+
+    // Track metrics
+    blockOperationsCounter.inc({ type: 'delete', status: 'success' });
+
+    // Queue search index deletion
+    await publishSearchIndex({
+      type: 'delete_block',
+      blockId: id as string,
+      pageId: block.page_id,
+      workspaceId: pageResult.rows[0].workspace_id,
+    });
 
     res.json({ message: 'Block deleted' });
   } catch (error) {

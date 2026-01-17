@@ -674,3 +674,101 @@ class CircuitBreaker {
 - [ ] Geographic distribution
 - [ ] Read replicas for history
 - [ ] CDN for static assets
+
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions in the backend codebase.
+
+### Why Rate Limiting Enforces Fair Pixel Placement
+
+Rate limiting via cooldown is the cornerstone of r/place's collaborative nature. The implementation uses Redis TTL keys for several critical reasons:
+
+1. **Fairness Guarantee**: The 30-second (configurable) cooldown ensures every user gets equal opportunity to participate. Without rate limiting, bots or power users could dominate the canvas, destroying the collaborative aspect that makes r/place engaging.
+
+2. **Atomic Check-and-Set**: Using `SET key value EX seconds NX` provides an atomic operation that both checks if a cooldown exists and sets a new one. This prevents race conditions where a fast user might place multiple pixels before the cooldown is recorded.
+
+3. **Distributed Enforcement**: Since cooldowns are stored in Redis (not in-memory on a single server), rate limiting works correctly across all server instances. A user connecting to server-1 for their first request and server-2 for their second is still properly rate-limited.
+
+4. **Automatic Cleanup**: Redis TTL automatically expires cooldown keys, eliminating the need for cleanup jobs and preventing memory bloat from accumulated user state.
+
+5. **Fail-Open Design**: If Redis is temporarily unavailable, the circuit breaker allows requests through (fail-open) rather than blocking all users. This prioritizes availability over strict enforcement for brief outages.
+
+### Why Redis is Critical for Real-time Canvas State
+
+Redis serves as the single source of truth for the canvas state, enabling real-time collaboration at scale:
+
+1. **Sub-Millisecond Reads**: Canvas reads via `GET` complete in < 1ms, enabling instant canvas loading for new connections. The entire 500x500 canvas (250KB) fits in a single Redis value.
+
+2. **Atomic Pixel Updates**: `SETRANGE` provides atomic byte-level updates to the canvas buffer. Multiple simultaneous pixel placements don't require locking - Redis handles the serialization.
+
+3. **Pub/Sub for Real-time Broadcast**: Redis pub/sub (`PUBLISH`/`SUBSCRIBE`) enables real-time pixel updates across all server instances. When server-1 receives a pixel placement, all servers (including server-1) receive the update via the shared channel and broadcast to their WebSocket clients.
+
+4. **Memory Efficiency**: The canvas is stored as a compact byte array (1 byte per pixel for 16 colors). At 250KB for a 500x500 canvas, this easily fits in Redis memory with room for thousands of user cooldowns.
+
+5. **Circuit Breaker Protection**: Redis operations are wrapped in circuit breakers that:
+   - Open after 5 consecutive failures (50% error threshold)
+   - Provide fallback values (empty canvas, allow placement) during outages
+   - Automatically test recovery after 30 seconds
+   - Prevent cascading failures from overwhelming a struggling Redis instance
+
+### Why Idempotency Prevents Duplicate Placements
+
+Network unreliability is a reality, especially for real-time applications. Idempotency ensures pixel placements are applied exactly once:
+
+1. **Network Retry Handling**: When a client sends a pixel placement and doesn't receive a response (timeout), it will retry. Without idempotency, retries could:
+   - Place the same pixel multiple times (wasting the user's cooldown)
+   - Return conflicting success/failure states to the client
+
+2. **Implementation Approach**: Each pixel placement generates an idempotency key based on:
+   - User ID (prevents cross-user conflicts)
+   - Coordinates (x, y)
+   - Color index
+   - Optional client-provided request ID (for exact duplicate detection)
+
+3. **Short TTL Window**: Idempotency keys expire after 10 seconds - long enough to catch retries, short enough to allow legitimate re-placements after cooldown expires.
+
+4. **Cached Result Return**: Duplicate requests receive the same response as the original request, including the `nextPlacement` timestamp. This provides consistent behavior to clients regardless of how many retries occur.
+
+5. **Client Integration**: Clients can optionally provide an `X-Request-ID` or `X-Idempotency-Key` header for guaranteed exactly-once semantics, useful for implementing reliable retry logic.
+
+### Why WebSocket Metrics Enable Scaling Decisions
+
+Real-time systems require visibility into connection patterns to make informed scaling decisions:
+
+1. **Active Connection Gauge**: `rplace_active_websocket_connections` tracks the current number of WebSocket clients. This metric directly indicates server load and helps determine when to add instances:
+   - < 100 connections per server: comfortable headroom
+   - 500-1000 connections: consider adding instances
+   - > 1000 connections: horizontal scaling needed
+
+2. **Connection Rate Tracking**: Logging connect/disconnect events with timestamps enables analysis of:
+   - Peak connection times (when to pre-scale)
+   - Session duration patterns (user engagement)
+   - Connection churn rate (health indicator)
+
+3. **Broadcast Efficiency**: `rplace_canvas_updates_total` tracks pixel updates broadcast. Combined with connection count, this reveals the message amplification factor:
+   - 20 pixels/second x 100 clients = 2,000 messages/second
+   - This metric drives decisions about batching or viewport-based updates
+
+4. **Active User Tracking**: `rplace_active_users` tracks users who placed pixels in the last 5 minutes. This business metric shows actual engagement rather than just connections (a user might connect but never place pixels).
+
+5. **Graceful Shutdown Support**: WebSocket metrics help validate graceful shutdown:
+   - Monitor connection drain rate during shutdown
+   - Ensure all clients receive shutdown notifications
+   - Verify zero connections before terminating the process
+
+### Observability Stack Summary
+
+The implementation provides comprehensive observability through:
+
+| Component | Purpose | Key Metrics |
+|-----------|---------|-------------|
+| Pino Logger | Structured JSON logs | Events, latencies, errors |
+| Prometheus Metrics | Time-series monitoring | Counters, gauges, histograms |
+| Health Endpoints | Load balancer integration | Liveness, readiness checks |
+| Circuit Breakers | Failure isolation | Open/closed state per operation |
+
+This observability foundation enables:
+- Alerting on error rates and latency spikes
+- Capacity planning from historical trends
+- Incident investigation via structured logs
+- Automated recovery via health checks

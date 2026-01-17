@@ -1014,3 +1014,270 @@ ENABLE_AUDIT_LOGGING=true
 | Delivery semantics | At-least-once + idempotency | Exactly-once | Simpler, reliable with dedup |
 | Tracing | OpenTelemetry + Jaeger | Zipkin | Vendor-neutral, better ecosystem |
 | Logging | Structured JSON | Plain text | Query-friendly, Loki/ELK compatible |
+
+---
+
+## Implementation Notes
+
+This section explains the **why** behind each major implementation decision for the caching, queue, observability, and reliability features.
+
+### Why Cache-Aside Reduces Database Load for Search-Heavy Workloads
+
+Airbnb is fundamentally a **read-heavy application**: users search for listings 100x more than they book. The search-to-booking ratio is typically 100:1 or higher, meaning for every booking, there are hundreds of searches and listing views.
+
+**Problem Without Caching:**
+- Each listing detail page fetches from PostgreSQL (listing + photos + reviews = 3 queries)
+- Each search hits PostGIS spatial indexes (CPU-intensive)
+- At scale (10M listings, 1M daily searches), database becomes the bottleneck
+
+**Why Cache-Aside (Lazy Loading):**
+1. **Only caches what's actually accessed** - Popular listings in Manhattan get cached; rural Montana cabin that's viewed once/month doesn't waste cache memory
+2. **Naturally handles cold start** - No need to pre-warm the cache; it populates organically as users browse
+3. **Simple invalidation** - Delete the key when data changes; next read repopulates
+4. **Graceful degradation** - If Redis is down, requests fall back to database (slower but works)
+
+**TTL Strategy:**
+- Listings: 15 minutes - Property details change infrequently; stale data is acceptable
+- Availability: 1 minute - Must be fresh to prevent booking conflicts
+- Search: 5 minutes - Slightly stale results are fine; exact availability verified at booking
+
+**Cache Invalidation Triggers:**
+```javascript
+// On listing update: delete listing cache + all search caches for that area
+await invalidateListingCache(listingId);
+
+// On booking: delete availability cache for that listing
+await invalidateAvailabilityCache(listingId);
+```
+
+**Measured Impact (Expected):**
+- Cache hit rate: 80%+ for popular listings
+- Database query reduction: 60-70%
+- Search latency improvement: 3x faster for cached results
+
+---
+
+### Why Async Queues Enable Reliable Notification Delivery
+
+When a guest books a listing, multiple things need to happen:
+1. Block the dates in the calendar
+2. Charge the payment (future)
+3. Email the guest confirmation
+4. Push notification to the host
+5. Update analytics/metrics
+6. Trigger review reminder scheduling
+
+**Problem With Synchronous Processing:**
+- Booking API becomes slow (waiting for email, push, etc.)
+- If email service is down, booking fails (bad UX)
+- No retry mechanism for transient failures
+- Traffic spikes overwhelm downstream services
+
+**Why RabbitMQ (Message Queue):**
+
+1. **Decoupling** - Booking service publishes event and returns immediately; notification workers consume asynchronously
+   ```javascript
+   // Booking completes in <500ms
+   await publishBookingCreated(booking, listing);
+   res.status(201).json({ booking }); // User sees success immediately
+
+   // Separately, workers process notifications (can take 5-10 seconds)
+   ```
+
+2. **Reliability (At-Least-Once Delivery)** - Messages persist until acknowledged
+   - If worker crashes mid-processing, message is redelivered
+   - Dead-letter queue captures permanently failed messages for investigation
+
+3. **Backpressure Handling** - Queue absorbs traffic spikes
+   - Black Friday: 10x normal booking volume
+   - Queue buffers the spike; workers process at sustainable rate
+   - Users see fast booking responses; notifications may be delayed 30 seconds
+
+4. **Retry with Exponential Backoff:**
+   ```javascript
+   // Retry 1: 5 seconds
+   // Retry 2: 10 seconds
+   // Retry 3: 20 seconds
+   // Then: Dead-letter queue
+   ```
+
+5. **Idempotency Protection:**
+   ```javascript
+   // Track processed message IDs in Redis (TTL 7 days)
+   if (await redis.get(`processed:${eventId}`)) {
+     channel.ack(msg); // Already processed, skip
+     return;
+   }
+   ```
+
+**Queue Design:**
+| Queue | Purpose | Consumers |
+|-------|---------|-----------|
+| `booking.events` | Booking lifecycle | Notification, Analytics |
+| `host.alerts` | Host notifications | Push, Email workers |
+| `notification.send` | All notification types | Email, SMS, Push workers |
+
+---
+
+### Why Audit Logging Enables Dispute Resolution
+
+Airbnb handles money and trust. When disputes arise, clear evidence is essential:
+- "I never cancelled that booking!" - Audit log shows IP, timestamp, session
+- "The host changed the price after I booked!" - Audit log shows before/after state
+- "Someone hacked my account and booked!" - Audit log shows unusual IP/device
+
+**What We Log:**
+```javascript
+{
+  event_type: 'booking.cancelled',
+  user_id: 123,
+  resource_type: 'booking',
+  resource_id: 456,
+  action: 'cancel',
+  outcome: 'success',
+  ip_address: '192.168.1.1',
+  user_agent: 'Mozilla/5.0...',
+  session_id: 'sess_abc123',
+  request_id: 'req_xyz789',  // For tracing
+  metadata: { cancelledBy: 'guest', reason: 'schedule_change' },
+  before_state: { status: 'confirmed', ... },
+  after_state: { status: 'cancelled', cancelled_at: '2025-01-15T10:30:00Z' },
+  created_at: '2025-01-15T10:30:00.123Z'
+}
+```
+
+**Use Cases:**
+
+1. **Dispute Resolution** - Customer service can pull complete history:
+   ```sql
+   SELECT * FROM audit_logs
+   WHERE resource_type = 'booking' AND resource_id = 456
+   ORDER BY created_at;
+   ```
+
+2. **Fraud Detection** - Identify suspicious patterns:
+   ```sql
+   -- Multiple cancellations from same IP
+   SELECT ip_address, COUNT(*) FROM audit_logs
+   WHERE event_type = 'booking.cancelled'
+   GROUP BY ip_address HAVING COUNT(*) > 10;
+   ```
+
+3. **Compliance** - Required for financial regulations:
+   - Who approved the refund?
+   - When was personal data accessed?
+   - Who modified the listing price?
+
+4. **Debugging** - Trace issues through request_id:
+   ```sql
+   SELECT * FROM audit_logs WHERE request_id = 'req_xyz789';
+   ```
+
+**Storage Strategy:**
+- Hot data (30 days): PostgreSQL `audit_logs` table with indexes
+- Cold data (1+ year): Archive to S3/object storage for compliance
+
+---
+
+### Why Metrics Enable Pricing Optimization
+
+Airbnb's business depends on understanding user behavior to optimize pricing, search ranking, and conversion rates.
+
+**Business Questions Metrics Answer:**
+
+1. **Are hosts pricing correctly?**
+   ```promql
+   # Average revenue per property type
+   sum(rate(airbnb_booking_revenue_total[24h])) by (property_type)
+   / sum(rate(airbnb_bookings_total{status="confirmed"}[24h])) by (property_type)
+   ```
+   If cabins have lower revenue/booking than apartments, recommend hosts adjust pricing.
+
+2. **What's our search-to-booking conversion?**
+   ```promql
+   rate(airbnb_bookings_total[1h]) / rate(airbnb_searches_total[1h])
+   ```
+   If conversion drops, investigate search ranking algorithm.
+
+3. **Where are users dropping off?**
+   ```promql
+   # Availability checks vs actual bookings
+   rate(airbnb_availability_checks_total{available="true"}[1h])
+   / rate(airbnb_bookings_total[1h])
+   ```
+   High availability check rate with low booking rate = pricing or UX issue.
+
+4. **Is the system healthy for users?**
+   ```promql
+   # Search latency p95
+   histogram_quantile(0.95, rate(airbnb_search_latency_seconds_bucket[5m]))
+
+   # Alert if > 500ms
+   ```
+
+**Metrics We Track:**
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `airbnb_bookings_total` | Counter | Conversion tracking, revenue |
+| `airbnb_booking_revenue_total` | Counter | Revenue by property type, city |
+| `airbnb_booking_nights_total` | Counter | Average stay length trends |
+| `airbnb_searches_total` | Counter | Demand patterns, geographic trends |
+| `airbnb_search_latency_seconds` | Histogram | Performance SLI |
+| `airbnb_availability_checks_total` | Counter | Demand/supply matching |
+| `airbnb_cache_hits_total` | Counter | Infrastructure efficiency |
+
+**Pricing Optimization Flow:**
+1. Collect booking/search metrics per location + property type
+2. Build demand model (searches per available night)
+3. Recommend price adjustments to hosts
+4. A/B test pricing suggestions
+5. Measure conversion rate changes
+
+**SLI/SLO Dashboard Example:**
+```
+| SLI | Target | Current | Alert |
+|-----|--------|---------|-------|
+| Search p95 | < 200ms | 145ms | OK |
+| Booking success rate | > 99% | 99.7% | OK |
+| Cache hit ratio | > 80% | 82% | OK |
+| Queue lag | < 30s | 5s | OK |
+```
+
+---
+
+### Circuit Breaker for Resilience
+
+The circuit breaker pattern prevents cascading failures when dependent services fail.
+
+**Problem Scenario:**
+1. PostgreSQL has high latency due to a slow query
+2. All API requests wait, connection pool exhausts
+3. Health checks fail, load balancer marks all instances unhealthy
+4. Complete outage
+
+**Circuit Breaker Solution:**
+```javascript
+// If 50% of requests fail over 10 seconds, open the circuit
+const breaker = createCircuitBreaker('search', searchFn, {
+  errorThresholdPercentage: 50,
+  resetTimeout: 30000, // Try again after 30 seconds
+});
+
+// When circuit is open, return fallback immediately
+breaker.fallback(() => ({ listings: [], fromFallback: true }));
+```
+
+**States:**
+- **CLOSED** - Normal operation, requests go through
+- **OPEN** - Too many failures, fail immediately with fallback
+- **HALF-OPEN** - Testing if service recovered
+
+**Configured Breakers:**
+| Service | Timeout | Threshold | Fallback |
+|---------|---------|-----------|----------|
+| Search | 5s | 60% failures | Empty results |
+| Availability | 3s | 40% failures | "Unavailable" |
+| Notifications | 15s | 70% failures | Queue for retry |
+
+This prevents one slow query from taking down the entire API.

@@ -3,23 +3,60 @@ const db = require('../db');
 const { client: redis } = require('../db/redis');
 const { isAuthenticated, hasSubscription } = require('../middleware/auth');
 const config = require('../config');
+
+// Shared observability and resilience modules
+const { logger, auditLog, AuditEvents } = require('../shared/logger');
+const {
+  manifestGenerationDuration,
+  activeStreams,
+  segmentRequestsTotal,
+  streamingErrors,
+  playbackStartLatency
+} = require('../shared/metrics');
+const { withCircuitBreaker } = require('../shared/circuitBreaker');
+
 const router = express.Router();
+
+// Track active streams per content
+const activeStreamTracking = new Map();
+
+/**
+ * Helper to track stream lifecycle
+ */
+function trackStreamStart(contentId, quality, deviceType) {
+  const key = `${contentId}:${quality}:${deviceType}`;
+  activeStreamTracking.set(key, Date.now());
+  activeStreams.inc({ quality, device_type: deviceType });
+}
+
+function trackStreamEnd(contentId, quality, deviceType) {
+  const key = `${contentId}:${quality}:${deviceType}`;
+  if (activeStreamTracking.has(key)) {
+    activeStreamTracking.delete(key);
+    activeStreams.dec({ quality, device_type: deviceType });
+  }
+}
 
 // Generate HLS master playlist
 router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
-  try {
-    const { contentId } = req.params;
+  const startTime = process.hrtime.bigint();
+  const { contentId } = req.params;
 
-    // Get content info
-    const content = await db.query(`
-      SELECT id, title, duration, status FROM content WHERE id = $1
-    `, [contentId]);
+  try {
+    // Get content info - wrapped in circuit breaker for DB resilience
+    const content = await withCircuitBreaker('storage', async () => {
+      return db.query(`
+        SELECT id, title, duration, status FROM content WHERE id = $1
+      `, [contentId]);
+    });
 
     if (content.rows.length === 0) {
+      streamingErrors.inc({ error_type: 'content_not_found', content_id: contentId });
       return res.status(404).send('#EXTM3U\n# Content not found');
     }
 
     if (content.rows[0].status !== 'ready') {
+      streamingErrors.inc({ error_type: 'content_not_ready', content_id: contentId });
       return res.status(404).send('#EXTM3U\n# Content not available');
     }
 
@@ -91,16 +128,37 @@ router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (r
       playlist += `/api/stream/${contentId}/variant/${variant.id}.m3u8\n`;
     }
 
+    // Record manifest generation duration
+    const duration = Number(process.hrtime.bigint() - startTime) / 1e9;
+    manifestGenerationDuration.observe({ manifest_type: 'master' }, duration);
+
+    // Log audit event for content access
+    auditLog(AuditEvents.CONTENT_ACCESSED, {
+      userId: req.session.userId,
+      profileId: req.session.profileId,
+      contentId,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      details: { type: 'manifest_request' }
+    });
+
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.send(playlist);
   } catch (error) {
-    console.error('Generate master playlist error:', error);
+    streamingErrors.inc({ error_type: 'manifest_generation', content_id: contentId });
+    if (req.log) {
+      req.log.error({ error: error.message, contentId }, 'Generate master playlist error');
+    } else {
+      logger.error({ error: error.message, contentId }, 'Generate master playlist error');
+    }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate variant playlist (video quality level)
 router.get('/:contentId/variant/:variantId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+  const startTime = process.hrtime.bigint();
+
   try {
     const { contentId, variantId } = req.params;
 
@@ -131,16 +189,26 @@ router.get('/:contentId/variant/:variantId.m3u8', isAuthenticated, hasSubscripti
 
     playlist += '#EXT-X-ENDLIST\n';
 
+    // Record manifest generation duration
+    const genDuration = Number(process.hrtime.bigint() - startTime) / 1e9;
+    manifestGenerationDuration.observe({ manifest_type: 'variant' }, genDuration);
+
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.send(playlist);
   } catch (error) {
-    console.error('Generate variant playlist error:', error);
+    const { contentId } = req.params;
+    streamingErrors.inc({ error_type: 'variant_manifest', content_id: contentId });
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Generate variant playlist error');
+    }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate audio playlist
 router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+  const startTime = process.hrtime.bigint();
+
   try {
     const { contentId, audioId } = req.params;
 
@@ -170,16 +238,24 @@ router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, 
 
     playlist += '#EXT-X-ENDLIST\n';
 
+    // Record manifest generation duration
+    const genDuration = Number(process.hrtime.bigint() - startTime) / 1e9;
+    manifestGenerationDuration.observe({ manifest_type: 'audio' }, genDuration);
+
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.send(playlist);
   } catch (error) {
-    console.error('Generate audio playlist error:', error);
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Generate audio playlist error');
+    }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate subtitle playlist
 router.get('/:contentId/subtitles/:subId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+  const startTime = process.hrtime.bigint();
+
   try {
     const { contentId, subId } = req.params;
 
@@ -192,10 +268,16 @@ router.get('/:contentId/subtitles/:subId.m3u8', isAuthenticated, hasSubscription
     playlist += `/api/stream/${contentId}/subtitle-file/${subId}.vtt\n`;
     playlist += '#EXT-X-ENDLIST\n';
 
+    // Record manifest generation duration
+    const genDuration = Number(process.hrtime.bigint() - startTime) / 1e9;
+    manifestGenerationDuration.observe({ manifest_type: 'subtitle' }, genDuration);
+
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.send(playlist);
   } catch (error) {
-    console.error('Generate subtitle playlist error:', error);
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Generate subtitle playlist error');
+    }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
@@ -205,17 +287,24 @@ router.get('/:contentId/segment/:variantId/:segmentNum.ts', isAuthenticated, has
   try {
     const { contentId, variantId, segmentNum } = req.params;
 
-    // In a real implementation, this would fetch from MinIO/CDN
-    // For demo purposes, we'll return a simple response
-    // indicating the segment would be served
+    // Track segment request metrics
+    segmentRequestsTotal.inc({ content_id: contentId, quality: variantId });
 
-    // Log segment access for analytics
-    await redis.incr(`segment:${contentId}:${variantId}:${segmentNum}`);
+    // In a real implementation, this would fetch from MinIO/CDN with circuit breaker
+    const segmentData = await withCircuitBreaker('cdn', async () => {
+      // Simulated CDN fetch - in production this would be actual segment data
+      await redis.incr(`segment:${contentId}:${variantId}:${segmentNum}`);
+      return Buffer.alloc(0); // Would contain actual segment data
+    });
 
     res.setHeader('Content-Type', 'video/mp2t');
-    res.status(200).send(''); // Would send actual segment data
+    res.status(200).send(segmentData);
   } catch (error) {
-    console.error('Serve segment error:', error);
+    const { contentId } = req.params;
+    streamingErrors.inc({ error_type: 'segment_fetch', content_id: contentId });
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Serve segment error');
+    }
     res.status(500).send('Server error');
   }
 });
@@ -223,10 +312,20 @@ router.get('/:contentId/segment/:variantId/:segmentNum.ts', isAuthenticated, has
 // Serve audio segment
 router.get('/:contentId/audio-segment/:audioId/:segmentNum.aac', isAuthenticated, hasSubscription, async (req, res) => {
   try {
+    const { contentId, audioId, segmentNum } = req.params;
+
+    // Track segment request with circuit breaker
+    await withCircuitBreaker('cdn', async () => {
+      await redis.incr(`audio-segment:${contentId}:${audioId}:${segmentNum}`);
+      return true;
+    });
+
     res.setHeader('Content-Type', 'audio/aac');
     res.status(200).send(''); // Would send actual audio data
   } catch (error) {
-    console.error('Serve audio segment error:', error);
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Serve audio segment error');
+    }
     res.status(500).send('Server error');
   }
 });
@@ -256,15 +355,20 @@ router.get('/:contentId/subtitle-file/:subId.vtt', isAuthenticated, hasSubscript
     res.setHeader('Content-Type', 'text/vtt');
     res.send(vtt);
   } catch (error) {
-    console.error('Serve subtitle error:', error);
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Serve subtitle error');
+    }
     res.status(500).send('Server error');
   }
 });
 
 // Get playback URL (used by client to initiate streaming)
 router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req, res) => {
+  const startTime = process.hrtime.bigint();
+
   try {
     const { contentId } = req.params;
+    const deviceType = req.headers['x-device-type'] || 'unknown';
 
     // Verify content exists and is ready
     const content = await db.query(`
@@ -287,14 +391,68 @@ router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req,
       expiresAt: Date.now() + 24 * 60 * 60 * 1000
     })).toString('base64');
 
+    // Track playback start latency
+    const latency = Number(process.hrtime.bigint() - startTime) / 1e9;
+    playbackStartLatency.observe({
+      device_type: deviceType,
+      quality: 'auto'
+    }, latency);
+
+    // Track active stream
+    trackStreamStart(contentId, 'auto', deviceType);
+
+    // Audit log for playback start
+    auditLog(AuditEvents.PLAYBACK_STARTED, {
+      userId: req.session.userId,
+      profileId: req.session.profileId,
+      contentId,
+      deviceId: req.headers['x-device-id'],
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      details: { deviceType, latency }
+    });
+
+    if (req.log) {
+      req.log.info({
+        contentId,
+        deviceType,
+        latency
+      }, 'Playback initiated');
+    }
+
     res.json({
       manifestUrl: `/api/stream/${contentId}/master.m3u8`,
       playbackToken,
       content: content.rows[0]
     });
   } catch (error) {
-    console.error('Get playback URL error:', error);
+    const { contentId } = req.params;
+    streamingErrors.inc({ error_type: 'playback_init', content_id: contentId });
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Get playback URL error');
+    }
     res.status(500).json({ error: 'Failed to get playback URL' });
+  }
+});
+
+// Endpoint to report playback end (for accurate stream tracking)
+router.post('/:contentId/playback/end', isAuthenticated, async (req, res) => {
+  try {
+    const { contentId } = req.params;
+    const { quality, deviceType } = req.body;
+
+    trackStreamEnd(contentId, quality || 'auto', deviceType || 'unknown');
+
+    if (req.log) {
+      req.log.info({ contentId, quality, deviceType }, 'Playback ended');
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    if (req.log) {
+      req.log.error({ error: error.message }, 'Report playback end error');
+    }
+    res.status(500).json({ error: 'Failed to report playback end' });
   }
 });
 

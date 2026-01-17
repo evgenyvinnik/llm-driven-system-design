@@ -639,3 +639,153 @@ npx wscat -c ws://localhost:3000
 3. **Viewport Culling**: Only sync objects in view
 4. **Delta Compression**: Send only changed properties
 5. **Offline Support**: IndexedDB for local persistence
+
+## Implementation Notes
+
+This section explains the rationale behind key architectural decisions implemented in the codebase.
+
+### Why Idempotency Enables Reliable CRDT Operations
+
+Idempotency is critical for collaborative editing because:
+
+1. **Network Unreliability**: WebSocket connections can drop and reconnect. Clients may retry operations that actually succeeded on the server but for which they never received acknowledgment. Without idempotency, these retries would create duplicate objects or apply updates multiple times.
+
+2. **CRDT Convergence**: CRDTs (Conflict-free Replicated Data Types) guarantee eventual consistency only when operations are applied exactly once. If a "create rectangle" operation is applied twice, you get two rectangles instead of one, breaking the fundamental CRDT guarantee.
+
+3. **Safe Client Retries**: With idempotency keys, clients can implement aggressive retry logic (exponential backoff) without fear of corrupting the document state. This is especially important for mobile clients with intermittent connectivity.
+
+**Implementation approach:**
+- Client generates a UUID idempotency key per operation
+- Server checks Redis for the key before processing (5-minute TTL)
+- If key exists, return cached result without re-processing
+- If operation fails, key is cleared to allow retry
+
+```typescript
+// Example: Client-side operation with idempotency
+const operation = {
+  idempotencyKey: crypto.randomUUID(),
+  operationType: 'create',
+  objectId: newObjectId,
+  payload: { type: 'rectangle', x: 100, y: 100 }
+};
+// Safe to retry on network failure - server deduplicates
+```
+
+### Why Circuit Breakers Protect Real-Time Collaboration
+
+Circuit breakers prevent cascading failures in the real-time sync system:
+
+1. **Broadcast Amplification**: When one client makes an edit, it broadcasts to N other clients. If the broadcast system is failing, each edit attempt adds load to an already struggling system. Circuit breakers stop this amplification.
+
+2. **Graceful Degradation**: When the sync circuit opens, clients continue to work locally with optimistic updates. When it closes again, they automatically re-sync. Users experience a brief lag rather than complete failure.
+
+3. **Resource Protection**: Without circuit breakers, a failing Redis instance could cause all WebSocket handlers to block waiting for responses, eventually exhausting connection pools and crashing the server.
+
+**Configuration rationale:**
+```typescript
+const syncConfig = {
+  errorThresholdPercentage: 60,  // More tolerant for sync (some failures OK)
+  resetTimeout: 5000,            // Quick recovery for real-time UX
+  timeout: 3000,                 // Fast fail for responsive editing
+  volumeThreshold: 10            // Need meaningful sample before opening
+};
+```
+
+The sync circuit breaker is more tolerant (60% threshold) because occasional broadcast failures to a single client are acceptable - that client will catch up on reconnect. Database circuit breakers are stricter (50%) because data consistency is critical.
+
+### Why Version History Retention Balances Undo Capability vs Storage
+
+The retention policy makes explicit tradeoffs:
+
+| Data Type | Retention | Rationale |
+|-----------|-----------|-----------|
+| Auto-save versions | 90 days, min 10/file | Users rarely need undo beyond 3 months |
+| Named versions | Indefinite | Explicit save = explicit intent to preserve |
+| Operations log | 30 days | Needed for replay/debug, not long-term storage |
+| Soft-deleted files | 30 days | Recovery window for accidental deletes |
+
+**Storage cost analysis:**
+- Average file: 500KB canvas data
+- With 100 versions: 50MB per file
+- Cleanup reduces to ~15MB (10 auto-saves + named versions)
+- 70% storage reduction while preserving user-critical history
+
+**Minimum version guarantee:**
+Even with 90-day cleanup, we always keep at least 10 auto-save versions per file. This ensures recent undo capability regardless of age.
+
+```typescript
+// Cleanup query preserves minimum versions
+DELETE FROM file_versions
+WHERE is_auto_save = true
+  AND created_at < NOW() - INTERVAL '90 days'
+  AND id NOT IN (
+    SELECT id FROM ranked_versions WHERE rn <= 10
+  );
+```
+
+### Why Metrics Enable Collaboration Optimization
+
+Prometheus metrics provide actionable insights for real-time collaboration:
+
+1. **Active Collaborators Gauge** (`figma_active_collaborators`):
+   - Identify hot files with many concurrent editors
+   - Trigger auto-scaling decisions
+   - Detect potential performance bottlenecks before users notice
+
+2. **Sync Latency Histogram** (`figma_sync_latency_seconds`):
+   - Measure p50/p95/p99 latency for presence and operation broadcasts
+   - Target: p95 < 100ms for presence, < 200ms for operations
+   - Alert if latency degrades, indicating infrastructure issues
+
+3. **Operation Counter** (`figma_operations_total`):
+   - Track create/update/delete/move by status (success/error)
+   - Calculate error rates to detect client bugs or API issues
+   - Identify most common operation types for optimization focus
+
+4. **Circuit Breaker State** (`figma_circuit_breaker_state`):
+   - 0 = closed (healthy), 1 = open (failing), 2 = half-open (testing)
+   - Alert on state transitions to detect infrastructure problems
+   - Track recovery time to tune circuit breaker parameters
+
+**Example Grafana dashboard queries:**
+```promql
+# Average active collaborators per file
+avg(figma_active_collaborators) by (file_id)
+
+# 95th percentile sync latency
+histogram_quantile(0.95, rate(figma_sync_latency_seconds_bucket[5m]))
+
+# Operation error rate
+sum(rate(figma_operations_total{status="error"}[5m])) /
+sum(rate(figma_operations_total[5m]))
+```
+
+### Shared Module Architecture
+
+The backend uses a layered architecture with shared modules:
+
+```
+src/
+├── shared/                  # Cross-cutting concerns
+│   ├── logger.ts           # Pino structured logging
+│   ├── metrics.ts          # Prometheus metrics
+│   ├── circuitBreaker.ts   # Opossum circuit breakers
+│   ├── retry.ts            # Exponential backoff
+│   ├── idempotency.ts      # Redis-based deduplication
+│   └── retention.ts        # Version cleanup scheduling
+├── db/
+│   ├── postgres.ts         # Connection pool + query helpers
+│   ├── redis.ts            # Redis clients (main + pub/sub)
+│   ├── migrate.ts          # Migration runner
+│   └── migrations/         # SQL migration files
+├── services/               # Business logic
+├── routes/                 # REST API handlers
+├── websocket/              # Real-time sync handlers
+└── types/                  # TypeScript interfaces
+```
+
+This separation enables:
+- Consistent logging and metrics across all components
+- Reusable retry and circuit breaker logic
+- Testable business logic isolated from infrastructure concerns
+

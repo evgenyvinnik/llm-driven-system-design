@@ -1218,6 +1218,280 @@ const envConfig = {
 
 ---
 
+## Implementation Notes
+
+This section documents the production-ready reliability features implemented in the codebase and explains **why** each improvement matters for a high-throughput notification system.
+
+### 1. Structured Logging with Pino
+
+**File:** `backend/src/utils/logger.js`
+
+**What we implemented:**
+- Pino-based structured JSON logging with consistent field names
+- Component-specific child loggers for tracing
+- Request correlation IDs (X-Request-ID header support)
+- Sensitive field redaction (authorization headers, tokens)
+- Performance timing helper for async operations
+
+**Why this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Console.log scattered everywhere | Centralized logger with levels | Filter logs by severity in production |
+| Can't trace requests across services | Request correlation IDs | Debug distributed flows end-to-end |
+| Logs are unstructured text | JSON output with standard fields | Parse logs with ELK/Loki/Datadog |
+| Secrets leak in logs | Redact sensitive paths | Security compliance |
+
+**Usage example:**
+```javascript
+import { createLogger } from '../utils/logger.js';
+const log = createLogger('notification-service');
+
+log.info({ userId, notificationId }, 'Notification queued successfully');
+log.error({ err: error, userId }, 'Failed to send notification');
+```
+
+### 2. Prometheus Metrics
+
+**File:** `backend/src/utils/metrics.js`
+
+**What we implemented:**
+- Counter: `notifications_sent_total` by channel, priority, status
+- Counter: `delivery_attempts_total` by channel, success/failure
+- Histogram: `processing_duration_seconds` for latency percentiles
+- Histogram: `http_request_duration_seconds` for API latency
+- Gauge: `queue_depth` by queue and priority
+- Gauge: `circuit_breaker_state` per channel (0=closed, 1=open, 2=half-open)
+- Counter: `rate_limited_total`, `deduplicated_total`, `retries_total`
+
+**Why this improves the system:**
+
+| Metric Type | Use Case | Alert Threshold Example |
+|-------------|----------|-------------------------|
+| Counter (sent) | Throughput monitoring | Rate drops > 50% in 5 min |
+| Histogram (latency) | SLO tracking | p99 > 500ms for critical |
+| Gauge (queue depth) | Backpressure detection | Depth > 10k for 10 min |
+| Gauge (circuit breaker) | Provider health | State = 1 (open) |
+
+**Endpoints:**
+- `GET /metrics` - Prometheus scrape endpoint
+- Integrates with Grafana for visualization
+
+### 3. Enhanced Health Checks
+
+**File:** `backend/src/index.js`
+
+**What we implemented:**
+- `/health` - Comprehensive check with component status and circuit breaker states
+- `/health/live` - Simple liveness probe (process is running)
+- `/health/ready` - Readiness probe (dependencies available)
+
+**Why this improves the system:**
+
+```
+Kubernetes/Load Balancer Integration:
+
+livenessProbe:
+  httpGet:
+    path: /health/live  <- Restart if this fails
+    port: 3001
+  initialDelaySeconds: 10
+  periodSeconds: 30
+
+readinessProbe:
+  httpGet:
+    path: /health/ready  <- Remove from rotation if this fails
+    port: 3001
+  periodSeconds: 5
+```
+
+| Check Type | Failure Response | Recovery Action |
+|------------|------------------|-----------------|
+| Liveness | 200 OK | None - pod is alive |
+| Readiness | 503 | Remove from load balancer |
+| Full health | Degraded | Alert ops, continue serving |
+
+**Response example:**
+```json
+{
+  "status": "degraded",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "uptime": 3600,
+  "components": {
+    "postgres": { "status": "healthy", "latencyMs": 2 },
+    "redis": { "status": "healthy", "latencyMs": 1 },
+    "rabbitmq": { "status": "healthy" }
+  },
+  "circuitBreakers": {
+    "push": "closed",
+    "email": "open",
+    "sms": "closed"
+  }
+}
+```
+
+### 4. Circuit Breaker for Delivery Channels
+
+**File:** `backend/src/utils/circuitBreaker.js`
+
+**What we implemented:**
+- Per-channel circuit breakers (push, email, SMS)
+- Consecutive failure threshold (5 failures opens circuit)
+- Half-open testing after 30-60 seconds
+- State change logging and Prometheus metrics
+- Integration with Cockatiel library for production-grade implementation
+
+**Why this improves the system:**
+
+Without circuit breaker:
+```
+Provider outage -> All workers blocked waiting on timeouts
+                -> Queue backs up exponentially
+                -> Memory exhaustion / cascading failure
+```
+
+With circuit breaker:
+```
+Provider outage -> 5 failures trigger OPEN state
+                -> Immediate rejection (no timeout wait)
+                -> Workers process other channels
+                -> Half-open tests recovery
+                -> Auto-close when provider healthy
+```
+
+**Configuration per channel:**
+```javascript
+const configs = {
+  push: { consecutiveFailures: 5, halfOpenAfter: 30000 },   // APNs/FCM are reliable
+  email: { consecutiveFailures: 3, halfOpenAfter: 60000 },  // SMTP more sensitive
+  sms: { consecutiveFailures: 3, halfOpenAfter: 60000 }     // Carrier APIs rate limit
+};
+```
+
+### 5. Idempotency for Notifications
+
+**File:** `backend/src/utils/idempotency.js`
+
+**What we implemented:**
+- Client-provided idempotency key support
+- Redis-backed key storage with 24-hour TTL
+- Processing state tracking to detect concurrent duplicates
+- Automatic result caching for repeated requests
+- Conflict detection (409 response for in-flight duplicates)
+
+**Why this improves the system:**
+
+| Failure Scenario | Without Idempotency | With Idempotency |
+|------------------|---------------------|------------------|
+| Client network timeout | Retry sends duplicate | Returns cached result |
+| Service restart mid-request | Retry sends duplicate | Returns cached result |
+| Load balancer retry | Sends to two instances | Second returns cached |
+
+**API usage:**
+```javascript
+// Client sends
+POST /api/v1/notifications
+{
+  "idempotencyKey": "order-service:order-123:confirmation:1704067200",
+  "userId": "...",
+  "templateId": "order_confirmation"
+}
+
+// First request: processes and caches result
+// Retry request: returns cached result immediately
+```
+
+**Key format recommendation:**
+```
+{service-name}:{entity-id}:{action}:{timestamp}
+order-service:order-123:confirmation:1704067200
+```
+
+### 6. Retry with Exponential Backoff
+
+**File:** `backend/src/utils/retry.js`
+
+**What we implemented:**
+- Configurable max retries, base delay, max delay
+- Exponential backoff with jitter (prevents thundering herd)
+- Retryable error detection (status codes, network errors)
+- Preset configurations (fast, standard, slow, aggressive)
+- Integration with Prometheus retry counter
+
+**Why this improves the system:**
+
+Fixed retry interval problem:
+```
+10,000 requests fail at t=0
+All retry at t+5s -> provider overwhelmed -> all fail
+All retry at t+10s -> same problem
+```
+
+Exponential backoff with jitter:
+```
+10,000 requests fail at t=0
+Retry spread: t+1s...t+2s (random)
+Retry 2 spread: t+3s...t+6s
+Load distributed, provider can recover
+```
+
+**Retry schedule (standard preset):**
+| Attempt | Base Delay | With Jitter | Cumulative |
+|---------|------------|-------------|------------|
+| 1 | 1s | 1.0-1.1s | ~1s |
+| 2 | 2s | 2.0-2.2s | ~3s |
+| 3 | 4s | 4.0-4.4s | ~7s |
+| 4 | 8s | 8.0-8.8s | ~15s |
+| 5 | 16s | 16.0-17.6s | ~32s |
+
+### 7. Graceful Shutdown
+
+**File:** `backend/src/index.js`, `backend/src/workers/index.js`
+
+**What we implemented:**
+- SIGTERM/SIGINT signal handlers
+- Stop accepting new connections
+- Wait for in-flight requests to complete
+- Close database and Redis connections cleanly
+- 30-second timeout for forced shutdown
+
+**Why this improves the system:**
+
+| Shutdown Type | Without Graceful | With Graceful |
+|---------------|------------------|---------------|
+| Rolling deploy | Dropped requests, broken connections | Zero dropped requests |
+| Scale down | Lost queue messages | Messages acked or requeued |
+| Emergency stop | Corrupted state possible | Clean state guaranteed |
+
+### Architecture Impact Summary
+
+These improvements address the Codex feedback systematically:
+
+1. **Authentication/Authorization** (already documented):
+   - Session-based auth with Redis backing
+   - RBAC with user/service/admin roles
+   - Rate limits by role
+
+2. **Failure Handling** (now implemented):
+   - Idempotency keys prevent duplicates
+   - Circuit breakers prevent cascading failures
+   - Exponential backoff with jitter for retries
+   - Dead letter queue for persistent failures
+   - Graceful shutdown preserves state
+
+3. **Observability** (now implemented):
+   - Structured logging for debugging
+   - Prometheus metrics for alerting
+   - Health checks for orchestration
+
+4. **Cost Tradeoffs** (already documented):
+   - Storage tiering strategy
+   - Cache sizing guidelines
+   - Queue retention settings
+   - Compute vs storage optimization
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -1232,3 +1506,7 @@ const envConfig = {
 | Circuit breaker | Per-provider | Global | Isolate failures by channel |
 | Storage | 30-day retention | Unlimited | Bounded disk usage |
 | Cache | 256 MB Redis | Larger cache | Fits local dev constraints |
+| Logging | Pino structured JSON | Console.log | Queryable, machine-readable |
+| Metrics | Prometheus counters/histograms | Custom tracking | Industry standard, Grafana compatible |
+| Health checks | Three-tier (live/ready/full) | Single endpoint | Kubernetes-native deployment |
+| Idempotency | Redis with 24h TTL | Database | Low latency, automatic cleanup |

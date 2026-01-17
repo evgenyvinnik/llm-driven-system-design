@@ -10,6 +10,8 @@
  * - Reaction aggregation for high-volume updates
  * - Heartbeat monitoring for connection health
  * - Redis Pub/Sub for multi-instance synchronization
+ * - Prometheus metrics for observability
+ * - Graceful shutdown for zero message loss
  *
  * @module services/wsGateway
  */
@@ -29,6 +31,17 @@ import {
   PostCommentPayload,
   ReactPayload,
 } from '../types/index.js';
+import {
+  logger,
+  wsConnectionsGauge,
+  wsConnectionsOpenedCounter,
+  wsConnectionsClosedCounter,
+  wsMessageSizeHistogram,
+  reactionsPostedCounter,
+  peakViewersGauge,
+} from '../shared/index.js';
+
+const wsLogger = logger.child({ module: 'websocket-gateway' });
 
 /**
  * Extended WebSocket interface with stream session data.
@@ -60,6 +73,15 @@ export class WebSocketGateway {
   /** Reaction aggregators per stream for high-volume handling */
   private reactionAggregators: Map<string, ReactionAggregator> = new Map();
 
+  /** Heartbeat interval timer */
+  private heartbeatInterval: NodeJS.Timeout | null = null;
+
+  /** Peak viewer counts per stream for metrics */
+  private peakViewers: Map<string, number> = new Map();
+
+  /** Flag indicating if shutdown is in progress */
+  private isShuttingDown = false;
+
   /**
    * Creates a new WebSocket gateway attached to an HTTP server.
    * Initializes WebSocket handling, Redis Pub/Sub, and heartbeat monitoring.
@@ -67,10 +89,12 @@ export class WebSocketGateway {
    * @param server - HTTP server to attach WebSocket server to
    */
   constructor(server: unknown) {
-    this.wss = new WebSocketServer({ server: server as Parameters<typeof WebSocketServer>[0]['server'] });
+    this.wss = new WebSocketServer({ server: server as import('http').Server });
     this.setupWebSocket();
     this.setupRedisPubSub();
     this.startHeartbeat();
+
+    wsLogger.info('WebSocket gateway initialized');
   }
 
   /**
@@ -79,7 +103,14 @@ export class WebSocketGateway {
    */
   private setupWebSocket(): void {
     this.wss.on('connection', (ws: ExtendedWebSocket, req: IncomingMessage) => {
-      console.log('New WebSocket connection from:', req.socket.remoteAddress);
+      if (this.isShuttingDown) {
+        wsLogger.warn('Rejecting connection during shutdown');
+        ws.close(1001, 'Server is shutting down');
+        return;
+      }
+
+      wsLogger.info({ remoteAddress: req.socket.remoteAddress }, 'New WebSocket connection');
+      wsConnectionsOpenedCounter.inc();
 
       ws.isAlive = true;
 
@@ -89,23 +120,46 @@ export class WebSocketGateway {
 
       ws.on('message', async (data: Buffer) => {
         try {
+          const size = data.length;
+          wsMessageSizeHistogram.labels('inbound', 'message').observe(size);
+
           const message: WSMessage = JSON.parse(data.toString());
           await this.handleMessage(ws, message);
         } catch (error) {
-          console.error('Error handling message:', error);
+          wsLogger.error({ error: (error as Error).message }, 'Error handling message');
           this.sendError(ws, 'INVALID_MESSAGE', 'Failed to parse message');
         }
       });
 
-      ws.on('close', () => {
+      ws.on('close', (code, reason) => {
+        wsConnectionsClosedCounter.labels(this.getCloseReason(code)).inc();
         this.handleDisconnect(ws);
       });
 
       ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
+        wsLogger.error({ error: error.message }, 'WebSocket error');
+        wsConnectionsClosedCounter.labels('error').inc();
         this.handleDisconnect(ws);
       });
     });
+  }
+
+  /**
+   * Maps WebSocket close codes to human-readable reasons for metrics.
+   */
+  private getCloseReason(code: number): string {
+    switch (code) {
+      case 1000: return 'normal';
+      case 1001: return 'going_away';
+      case 1002: return 'protocol_error';
+      case 1003: return 'unsupported_data';
+      case 1006: return 'abnormal';
+      case 1007: return 'invalid_payload';
+      case 1008: return 'policy_violation';
+      case 1009: return 'message_too_big';
+      case 1011: return 'server_error';
+      default: return 'unknown';
+    }
   }
 
   /**
@@ -121,16 +175,21 @@ export class WebSocketGateway {
       const streamId = parts[1];
       const type = parts[2];
 
+      const payload = JSON.parse(message);
+      const msgSize = message.length;
+
       if (type === 'comments') {
+        wsMessageSizeHistogram.labels('outbound', 'comments_batch').observe(msgSize);
         this.broadcastToStream(streamId, {
           type: 'comments_batch',
-          payload: JSON.parse(message),
+          payload,
           timestamp: Date.now(),
         });
       } else if (type === 'reactions') {
+        wsMessageSizeHistogram.labels('outbound', 'reactions_batch').observe(msgSize);
         this.broadcastToStream(streamId, {
           type: 'reactions_batch',
-          payload: JSON.parse(message),
+          payload,
           timestamp: Date.now(),
         });
       }
@@ -142,9 +201,10 @@ export class WebSocketGateway {
    * Terminates connections that fail to respond to pings within 30 seconds.
    */
   private startHeartbeat(): void {
-    setInterval(() => {
+    this.heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws: ExtendedWebSocket) => {
         if (ws.isAlive === false) {
+          wsLogger.debug({ userId: ws.userId }, 'Terminating unresponsive connection');
           this.handleDisconnect(ws);
           return ws.terminate();
         }
@@ -229,9 +289,19 @@ export class WebSocketGateway {
       aggregator.start();
     }
 
-    // Update viewer count
+    // Update viewer count and metrics
     const viewerCount = this.connections.get(stream_id)!.size;
     await redis.hset(`stream:${stream_id}`, 'viewer_count', viewerCount.toString());
+
+    // Update connection gauge
+    wsConnectionsGauge.labels(stream_id).set(viewerCount);
+
+    // Track peak viewers
+    const currentPeak = this.peakViewers.get(stream_id) || 0;
+    if (viewerCount > currentPeak) {
+      this.peakViewers.set(stream_id, viewerCount);
+      peakViewersGauge.labels(stream_id).set(viewerCount);
+    }
 
     // Broadcast viewer count
     this.broadcastToStream(stream_id, {
@@ -250,7 +320,7 @@ export class WebSocketGateway {
       })
     );
 
-    console.log(`User ${user_id} joined stream ${stream_id}. Viewers: ${viewerCount}`);
+    wsLogger.info({ userId: user_id, streamId: stream_id, viewers: viewerCount }, 'User joined stream');
   }
 
   /**
@@ -263,6 +333,7 @@ export class WebSocketGateway {
     if (!ws.streamId) return;
 
     const streamId = ws.streamId;
+    const userId = ws.userId;
     const connections = this.connections.get(streamId);
 
     if (connections) {
@@ -285,10 +356,17 @@ export class WebSocketGateway {
           aggregator.stop();
           this.reactionAggregators.delete(streamId);
         }
+
+        // Reset gauge to 0
+        wsConnectionsGauge.labels(streamId).set(0);
+
+        wsLogger.info({ streamId }, 'All viewers left, stream resources cleaned up');
       } else {
         // Update viewer count
         const viewerCount = connections.size;
         redis.hset(`stream:${streamId}`, 'viewer_count', viewerCount.toString());
+        wsConnectionsGauge.labels(streamId).set(viewerCount);
+
         this.broadcastToStream(streamId, {
           type: 'viewer_count',
           payload: { stream_id: streamId, count: viewerCount },
@@ -299,6 +377,8 @@ export class WebSocketGateway {
 
     ws.streamId = undefined;
     ws.userId = undefined;
+
+    wsLogger.debug({ userId, streamId }, 'User left stream');
   }
 
   /**
@@ -358,6 +438,9 @@ export class WebSocketGateway {
         payload.reaction_type,
         payload.comment_id
       );
+
+      // Record metric
+      reactionsPostedCounter.labels(payload.stream_id, payload.reaction_type).inc();
 
       // Add to aggregator
       const aggregator = this.reactionAggregators.get(payload.stream_id);
@@ -424,6 +507,122 @@ export class WebSocketGateway {
   getViewerCount(streamId: string): number {
     return this.connections.get(streamId)?.size || 0;
   }
+
+  /**
+   * Gets total connection count across all streams.
+   *
+   * @returns Total number of active WebSocket connections
+   */
+  getTotalConnections(): number {
+    let total = 0;
+    this.connections.forEach((conns) => {
+      total += conns.size;
+    });
+    return total;
+  }
+
+  /**
+   * Performs graceful shutdown of the WebSocket gateway.
+   *
+   * 1. Stops accepting new connections
+   * 2. Flushes all pending batches to ensure no message loss
+   * 3. Sends shutdown notification to all connected clients
+   * 4. Closes all connections gracefully
+   * 5. Cleans up resources
+   *
+   * @param timeoutMs - Maximum time to wait for cleanup (default: 10000ms)
+   * @returns Promise that resolves when shutdown is complete
+   */
+  async gracefulShutdown(timeoutMs = 10000): Promise<void> {
+    wsLogger.info('Starting graceful WebSocket shutdown');
+    this.isShuttingDown = true;
+
+    // Stop heartbeat
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+
+    // Flush all batchers and aggregators
+    wsLogger.info('Flushing pending batches');
+    const flushPromises: Promise<void>[] = [];
+
+    this.commentBatchers.forEach((batcher, streamId) => {
+      wsLogger.debug({ streamId }, 'Stopping comment batcher');
+      batcher.stop();
+    });
+
+    this.reactionAggregators.forEach((aggregator, streamId) => {
+      wsLogger.debug({ streamId }, 'Stopping reaction aggregator');
+      aggregator.stop();
+    });
+
+    // Give time for final publishes to propagate
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Notify all clients and close connections
+    wsLogger.info({ connectionCount: this.getTotalConnections() }, 'Closing all connections');
+
+    const closePromises: Promise<void>[] = [];
+    this.wss.clients.forEach((ws) => {
+      closePromises.push(
+        new Promise<void>((resolve) => {
+          // Send shutdown message
+          try {
+            ws.send(
+              JSON.stringify({
+                type: 'error',
+                payload: { code: 'SERVER_SHUTDOWN', message: 'Server is shutting down' },
+                timestamp: Date.now(),
+              })
+            );
+          } catch {
+            // Ignore send errors during shutdown
+          }
+
+          // Close with going away code
+          ws.close(1001, 'Server shutting down');
+
+          // Set a timeout in case close doesn't complete
+          const timeout = setTimeout(() => {
+            ws.terminate();
+            resolve();
+          }, 1000);
+
+          ws.once('close', () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+        })
+      );
+    });
+
+    // Wait for all connections to close with overall timeout
+    await Promise.race([
+      Promise.all(closePromises),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+
+    // Close the WebSocket server
+    await new Promise<void>((resolve, reject) => {
+      this.wss.close((err) => {
+        if (err) {
+          wsLogger.error({ error: err.message }, 'Error closing WebSocket server');
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+
+    // Clear all maps
+    this.connections.clear();
+    this.commentBatchers.clear();
+    this.reactionAggregators.clear();
+    this.peakViewers.clear();
+
+    wsLogger.info('WebSocket gateway shutdown complete');
+  }
 }
 
 /**
@@ -477,7 +676,7 @@ class CommentBatcher {
 
   /**
    * Stops the periodic flush timer and delivers any remaining comments.
-   * Should be called when last viewer leaves the stream.
+   * Should be called when last viewer leaves the stream or during shutdown.
    */
   stop(): void {
     if (this.intervalId) {
@@ -556,7 +755,7 @@ class ReactionAggregator {
 
   /**
    * Stops the periodic flush timer and delivers any remaining reactions.
-   * Should be called when last viewer leaves the stream.
+   * Should be called when last viewer leaves the stream or during shutdown.
    */
   stop(): void {
     if (this.intervalId) {

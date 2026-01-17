@@ -597,3 +597,272 @@ server {
 6. **Webhooks**: Notify external services on click thresholds
 7. **Geographic Distribution**: CDN edge workers for redirect latency
 8. **Malicious URL Detection**: Integrate with Google Safe Browsing API
+
+## Implementation Notes
+
+This section documents the critical infrastructure patterns implemented in the backend and explains why each is essential for a production-grade URL shortening service.
+
+### Why Caching is CRITICAL for Redirect Performance
+
+Caching is the single most important optimization for a URL shortener. Here is why:
+
+**The Problem:**
+- URL redirects are extremely read-heavy: a typical ratio is 100:1 (reads to writes)
+- Every redirect requires looking up the short code to find the long URL
+- Without caching, every redirect would query the database
+- At 10,000 redirects/day (our target), that is 10,000 DB queries daily just for redirects
+- Database queries typically take 5-50ms; Redis lookups take 0.1-1ms
+
+**The Solution:**
+```
+Read Path with Cache:
+1. Check Redis cache for url:{short_code}     → ~0.5ms
+2. If cache hit: return immediately           → Total: ~1ms
+3. If cache miss: query PostgreSQL            → ~20ms
+4. Store result in Redis with 24h TTL         → ~0.5ms
+5. Return result                              → Total: ~21ms
+```
+
+**Impact:**
+- Cache hit ratio of 90% (typical for Zipf-distributed access patterns)
+- Average redirect latency drops from 20ms to ~3ms
+- Database load reduced by 90%
+- Can handle 10x traffic spikes without database scaling
+
+**Implementation:**
+```typescript
+// src/utils/cache.ts - urlCache with metrics
+async get(shortCode: string): Promise<string | null> {
+  const result = await redis.get(`url:${shortCode}`);
+  if (result) {
+    cacheHitsTotal.inc();   // Track for SLI monitoring
+  } else {
+    cacheMissesTotal.inc();
+  }
+  return result;
+}
+```
+
+### Why Idempotency Prevents Duplicate Short URLs
+
+Idempotency ensures that retrying the same URL creation request produces the same result, preventing duplicate short URLs.
+
+**The Problem:**
+- Network requests can fail or timeout after the server processes them
+- Clients often implement automatic retry logic
+- Without idempotency, a retry creates a second short URL for the same long URL
+- Users end up with multiple short codes pointing to the same destination
+- Wastes key pool resources (pre-generated short codes are finite)
+
+**The Solution:**
+```
+Idempotency Flow:
+1. Client sends POST /api/v1/urls with Idempotency-Key header (or we generate fingerprint)
+2. Check Redis: idempotency:{key} exists?
+3. If exists: return cached response (no DB operation)
+4. If not: process request, cache response with 24h TTL
+5. Return response to client
+```
+
+**Implementation:**
+```typescript
+// src/utils/idempotency.ts
+function generateRequestFingerprint(req: Request): string {
+  // Create deterministic hash from request data
+  const fingerprint = JSON.stringify({
+    long_url,
+    custom_code: custom_code || null,
+    user_id: req.user?.id || 'anonymous',
+  });
+  return crypto.createHash('sha256').update(fingerprint).digest('hex');
+}
+```
+
+**Why This Matters:**
+- Same long URL + custom code + user = same short URL every time
+- Clients can safely retry without checking if the request succeeded
+- Prevents key pool exhaustion from duplicate creations
+- Metrics track `idempotency_hits_total` to monitor duplicate request frequency
+
+### Why Rate Limiting Prevents Abuse
+
+Rate limiting protects the service from abuse, ensures fair usage, and prevents resource exhaustion.
+
+**The Problem:**
+- Without limits, a single user could exhaust the entire key pool in minutes
+- Malicious actors could use the service for spam campaigns
+- Bot traffic could overwhelm the database with creation requests
+- Legitimate users would experience degraded performance
+
+**The Solution:**
+```
+Rate Limit Configuration:
+- URL creation: 100 requests/hour per IP
+- Redirects: 1000 requests/minute per IP
+- API general: 200 requests/minute per IP
+- Auth endpoints: 5 requests/minute per IP (brute force protection)
+```
+
+**Implementation:**
+```typescript
+// src/index.ts - Rate limiter with metrics
+const createUrlLimiter = rateLimit({
+  windowMs: RATE_LIMIT_CONFIG.createUrl.windowMs,
+  max: RATE_LIMIT_CONFIG.createUrl.max,
+  handler: (req, res) => {
+    rateLimitHitsTotal.inc({ endpoint: 'create_url' });  // Alert on abuse
+    res.status(429).json({ error: 'Too many URLs created' });
+  },
+});
+```
+
+**Benefits:**
+- Prevents key pool exhaustion (finite pre-generated codes)
+- Protects against DDoS attacks on creation endpoints
+- Ensures fair resource allocation among users
+- Metrics (`rate_limit_hits_total`) enable abuse detection and alerting
+
+### Why Redirect Metrics Enable Analytics
+
+Comprehensive metrics on redirects are essential for understanding usage patterns, debugging issues, and meeting SLOs.
+
+**The Problem:**
+- Without metrics, you have no visibility into service performance
+- Cannot answer: "What is our p99 redirect latency?" or "What is our cache hit ratio?"
+- No way to detect degradation before users report issues
+- Cannot prove SLA compliance to stakeholders
+
+**The Solution:**
+```
+Metrics Collected (Prometheus format):
+- url_redirects_total{cached, status}     # Count by cache hit/miss and success/error
+- click_events_total{device_type}         # Device breakdown for analytics
+- cache_hits_total / cache_misses_total   # Cache efficiency monitoring
+- http_request_duration_seconds{endpoint} # Latency distribution
+```
+
+**Implementation:**
+```typescript
+// src/routes/redirect.ts
+urlRedirectsTotal.inc({
+  cached: cacheHit ? 'hit' : 'miss',
+  status: 'success'
+});
+
+clickEventsTotal.inc({ device_type: parseDeviceType(userAgent) });
+```
+
+**Dashboard Queries:**
+```promql
+# Cache hit ratio (target: >90%)
+cache_hits_total / (cache_hits_total + cache_misses_total)
+
+# Redirect p99 latency (target: <50ms)
+histogram_quantile(0.99, http_request_duration_seconds{endpoint="/:shortCode"})
+
+# Redirects per second
+rate(url_redirects_total[5m])
+```
+
+**Benefits:**
+- Real-time visibility into service health
+- Cache hit ratio monitoring ensures caching is working
+- Device breakdown enables mobile optimization decisions
+- Latency histograms catch performance regressions early
+- Error rate tracking for SLO compliance
+
+### Circuit Breaker for Database Operations
+
+The circuit breaker pattern prevents cascading failures when the database is unhealthy.
+
+**The Problem:**
+- If the database becomes slow or unresponsive, requests queue up
+- Connection pool exhaustion causes all requests to fail
+- Retry storms make the situation worse
+- The entire service becomes unavailable
+
+**The Solution:**
+```
+Circuit Breaker States:
+- CLOSED: Normal operation, all requests go through
+- OPEN: Database unhealthy, fail fast without trying
+- HALF-OPEN: Test with one request, close if successful
+
+Configuration:
+- timeout: 5000ms (fail if DB query takes >5s)
+- errorThresholdPercentage: 50% (open if half of requests fail)
+- resetTimeout: 30000ms (try again after 30s)
+- volumeThreshold: 10 (need 10 requests before opening)
+```
+
+**Implementation:**
+```typescript
+// src/utils/database.ts
+const queryBreaker = createCircuitBreaker(
+  executeQuery,
+  'database',
+  dbCircuitBreakerOptions
+);
+
+queryBreaker.fallback(() => {
+  throw new Error('Database circuit breaker is open');
+});
+```
+
+**Benefits:**
+- Fail fast: Return errors in milliseconds instead of waiting for timeout
+- Self-healing: Automatically retry when database recovers
+- Observability: `circuit_breaker_state` metric shows current state
+- Graceful degradation: Cached URLs still work even if DB is down
+
+### Health Check Endpoints
+
+Three-tier health check strategy for different monitoring needs.
+
+**Endpoints:**
+```
+GET /health           # Basic liveness (load balancer)
+GET /health/detailed  # Full status with dependencies
+GET /ready            # Kubernetes readiness probe
+GET /metrics          # Prometheus scrape endpoint
+```
+
+**Detailed Health Response:**
+```json
+{
+  "status": "healthy",
+  "dependencies": {
+    "database": {
+      "status": "connected",
+      "circuit_breaker": { "state": "closed", "stats": {...} }
+    },
+    "redis": { "status": "connected" }
+  },
+  "key_pool": { "local_cache": 87 }
+}
+```
+
+### Structured Logging with Pino
+
+JSON-formatted logs enable log aggregation, searching, and alerting.
+
+**Log Format:**
+```json
+{
+  "level": "info",
+  "time": "2025-01-15T10:30:00.123Z",
+  "service": "bitly-api",
+  "server_id": "server-12345",
+  "short_code": "abc1234",
+  "cache_hit": true,
+  "duration_ms": 2,
+  "msg": "Redirect successful"
+}
+```
+
+**Benefits:**
+- Structured data enables filtering: `level:error AND service:bitly-api`
+- Request correlation across distributed logs
+- Performance tracking with duration_ms
+- Redacted sensitive headers (cookies, auth tokens)
+

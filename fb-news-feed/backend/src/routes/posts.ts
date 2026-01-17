@@ -2,13 +2,23 @@
  * @fileoverview Post management routes for CRUD operations and engagement.
  * Handles post creation with automatic fan-out, likes, comments, and deletion.
  * Integrates with affinity scoring to improve future feed personalization.
+ * Includes idempotency protection for post creation and comprehensive metrics.
  */
 
 import { Router, Request, Response } from 'express';
 import { pool, redis } from '../db/connection.js';
 import { authMiddleware, optionalAuthMiddleware } from '../middleware/auth.js';
 import { fanoutPost, removeFanout, updateAffinity, calculatePostScore } from '../services/fanout.js';
+import {
+  componentLoggers,
+  postsCreatedTotal,
+  postLikesTotal,
+  commentsCreatedTotal,
+  requireIdempotency,
+} from '../shared/index.js';
 import type { CreatePostRequest, PostWithAuthor } from '../types/index.js';
+
+const log = componentLoggers.posts;
 
 /** Express router for post endpoints */
 const router = Router();
@@ -17,8 +27,9 @@ const router = Router();
  * POST / - Creates a new post and distributes it to followers' feeds.
  * Triggers fan-out service to push post to followers (for non-celebrities)
  * or store in celebrity post cache (for celebrities).
+ * Protected by idempotency middleware to prevent duplicate posts.
  */
-router.post('/', authMiddleware, async (req: Request, res: Response) => {
+router.post('/', authMiddleware, requireIdempotency(), async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const { content, image_url, post_type = 'text', privacy = 'public' } = req.body as CreatePostRequest;
@@ -38,6 +49,14 @@ router.post('/', authMiddleware, async (req: Request, res: Response) => {
 
     const post = result.rows[0];
 
+    // Record metrics
+    postsCreatedTotal.labels(post_type, privacy).inc();
+
+    log.info(
+      { postId: post.id, authorId: userId, postType: post_type, privacy },
+      'Post created'
+    );
+
     // Fan out to followers
     await fanoutPost(post.id, userId, post.created_at);
 
@@ -56,7 +75,7 @@ router.post('/', authMiddleware, async (req: Request, res: Response) => {
 
     res.status(201).json(response);
   } catch (error) {
-    console.error('Create post error:', error);
+    log.error({ error }, 'Create post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -135,7 +154,7 @@ router.get('/:postId', optionalAuthMiddleware, async (req: Request, res: Respons
       },
     });
   } catch (error) {
-    console.error('Get post error:', error);
+    log.error({ error, postId: req.params.postId }, 'Get post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -146,8 +165,9 @@ router.get('/:postId', optionalAuthMiddleware, async (req: Request, res: Respons
  * Triggers fan-out removal to clean up followers' feeds.
  */
 router.delete('/:postId', authMiddleware, async (req: Request, res: Response) => {
+  const postId = req.params.postId as string;
+
   try {
-    const { postId } = req.params;
     const userId = req.user!.id;
 
     // Check ownership
@@ -177,7 +197,7 @@ router.delete('/:postId', authMiddleware, async (req: Request, res: Response) =>
 
     res.json({ message: 'Post deleted successfully' });
   } catch (error) {
-    console.error('Delete post error:', error);
+    log.error({ error, postId }, 'Delete post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -233,9 +253,14 @@ router.post('/:postId/like', authMiddleware, async (req: Request, res: Response)
     await redis.sadd(`post_likes:${postId}`, userId);
     await redis.incr(`like_count:${postId}`);
 
+    // Record metrics
+    postLikesTotal.labels('like').inc();
+
+    log.info({ postId, userId }, 'Post liked');
+
     res.json({ message: 'Post liked successfully' });
   } catch (error) {
-    console.error('Like post error:', error);
+    log.error({ error, postId: req.params.postId }, 'Like post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -271,9 +296,12 @@ router.delete('/:postId/like', authMiddleware, async (req: Request, res: Respons
     await redis.srem(`post_likes:${postId}`, userId);
     await redis.decr(`like_count:${postId}`);
 
+    // Record metrics
+    postLikesTotal.labels('unlike').inc();
+
     res.json({ message: 'Post unliked successfully' });
   } catch (error) {
-    console.error('Unlike post error:', error);
+    log.error({ error, postId: req.params.postId }, 'Unlike post error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -338,7 +366,7 @@ router.get('/:postId/comments', optionalAuthMiddleware, async (req: Request, res
       has_more: result.rows.length === limit,
     });
   } catch (error) {
-    console.error('Get comments error:', error);
+    log.error({ error, postId: req.params.postId }, 'Get comments error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -393,12 +421,17 @@ router.post('/:postId/comments', authMiddleware, async (req: Request, res: Respo
       [userId]
     );
 
+    // Record metrics
+    commentsCreatedTotal.inc();
+
+    log.info({ postId, commentId: result.rows[0].id, userId }, 'Comment created');
+
     res.status(201).json({
       ...result.rows[0],
       author: authorResult.rows[0],
     });
   } catch (error) {
-    console.error('Create comment error:', error);
+    log.error({ error, postId: req.params.postId }, 'Create comment error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -438,9 +471,11 @@ router.delete('/:postId/comments/:commentId', authMiddleware, async (req: Reques
       [postId]
     );
 
+    log.info({ postId, commentId, userId }, 'Comment deleted');
+
     res.json({ message: 'Comment deleted successfully' });
   } catch (error) {
-    console.error('Delete comment error:', error);
+    log.error({ error, postId: req.params.postId, commentId: req.params.commentId }, 'Delete comment error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

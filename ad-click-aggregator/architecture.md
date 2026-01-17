@@ -815,6 +815,151 @@ Row 4: Business Metrics
 
 ---
 
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions. Understanding the "why" behind these choices is critical for maintaining system correctness, especially for billing-critical analytics.
+
+### Why Idempotency Prevents Duplicate Click Counting
+
+**The Problem:**
+In distributed systems, network failures, load balancer retries, and client bugs can cause the same click event to be submitted multiple times. Without proper handling, each submission would:
+1. Increment the click counter
+2. Update aggregation tables
+3. Result in incorrect billing (advertisers charged for phantom clicks)
+
+**The Solution:**
+We implement defense-in-depth idempotency at multiple layers:
+
+1. **Idempotency-Key Header (Request Level):**
+   - Clients provide a unique key per logical request
+   - Key is stored in Redis with the response for 5 minutes
+   - Subsequent requests with the same key return the cached response
+   - This catches load balancer retries and network timeouts
+
+2. **click_id Deduplication (Click Level):**
+   - Redis SETEX with 5-minute TTL tracks processed click IDs
+   - Catches duplicate click IDs from different requests
+   - Fast O(1) lookups in the hot path
+
+3. **PostgreSQL UPSERT (Storage Level):**
+   - `ON CONFLICT (click_id) DO NOTHING` ensures database-level idempotency
+   - Catches edge cases where Redis TTL expires but click exists in DB
+   - Last line of defense for data integrity
+
+**Why This Matters:**
+Ad click billing is typically based on click counts. A 1% duplicate rate on 10M daily clicks = 100K phantom clicks = significant overbilling. Idempotency ensures we charge exactly once per actual user click.
+
+### Why Data Retention Balances Analytics vs Storage Costs
+
+**The Problem:**
+Raw click events at 10K/second generate ~430GB/day. Unlimited retention would:
+1. Exhaust storage capacity within weeks
+2. Degrade query performance as tables grow
+3. Increase backup/recovery time
+4. Violate data privacy regulations (GDPR requires data minimization)
+
+**The Solution:**
+Tiered retention with aggregation-first design:
+
+```
+Raw Clicks → Hot (7 days) → Warm (30 days) → Cold (1 year) → Delete
+                  ↓
+         Aggregates (permanent)
+```
+
+| Data Type | Hot Storage | Purpose |
+|-----------|-------------|---------|
+| Raw clicks | 7 days | Debugging, fraud investigation |
+| Minute aggregates | 7 days | Real-time dashboards |
+| Hourly aggregates | 1 year | Standard analytics |
+| Daily aggregates | 5 years | Historical trends, billing reconciliation |
+
+**Why This Matters:**
+- **Analytics:** 99% of queries hit aggregates, not raw data. Hourly/daily granularity suffices for business decisions.
+- **Cost:** 7 days of raw data = ~3GB (local dev) vs 430GB x 365 = 157TB/year for full retention.
+- **Performance:** Aggregation queries on pre-computed tables are 100-1000x faster than scanning raw events.
+- **Compliance:** Limited retention reduces PII exposure window.
+
+### Why Queue Lag Alerts Enable Backpressure Detection
+
+**The Problem:**
+In high-throughput ingestion systems, processing can fall behind incoming traffic due to:
+1. Database connection pool exhaustion
+2. Redis latency spikes
+3. CPU saturation
+4. Downstream service degradation
+
+Without monitoring, this creates:
+- Growing memory usage (unbounded queues)
+- Stale real-time metrics (dashboards show old data)
+- Eventual OOM crashes or data loss
+
+**The Solution:**
+Queue lag metrics with tiered alerting:
+
+```
+Prometheus Metrics:
+- click_queue_size: Current items waiting to process
+- click_queue_lag_ms: Age of oldest unprocessed item
+- click_ingestion_duration_seconds: Processing time histogram
+
+Alert Thresholds:
+- WARNING: Lag > 1 second, sustained 5 minutes
+- CRITICAL: Lag > 5 seconds, sustained 2 minutes
+```
+
+**Why This Matters:**
+- **Early Warning:** Lag alerts fire before OOM or data loss
+- **Backpressure Signals:** Operators can shed load, scale up, or fix root cause
+- **SLO Monitoring:** Lag directly impacts "freshness" SLO for real-time dashboards
+- **Capacity Planning:** Lag trends reveal when horizontal scaling is needed
+
+### Why Aggregation Metrics Enable Billing Accuracy
+
+**The Problem:**
+Advertisers pay per click. Billing disputes arise when:
+1. Aggregated counts don't match raw event counts
+2. Fraud filtering is applied inconsistently
+3. Time zone handling differs between systems
+4. Duplicates are counted in some views but not others
+
+**The Solution:**
+Comprehensive aggregation metrics with audit trail:
+
+```
+Prometheus Metrics:
+- aggregation_updates_total{granularity}: Updates by table
+- aggregation_update_duration_seconds: Processing time
+- aggregation_errors_total: Failed updates
+
+Audit Capabilities:
+- All raw clicks stored with timestamps
+- Aggregates can be rebuilt from raw data
+- Fraud flags preserved in both raw and aggregate tables
+```
+
+**Why This Matters:**
+- **Reconciliation:** If `SUM(clicks_processed_total)` != `SUM(aggregation_updates_total)`, we have a bug
+- **Dispute Resolution:** Can replay raw events to prove billing accuracy
+- **Fraud Accounting:** Track legitimate clicks vs filtered fraud separately
+- **Latency Monitoring:** Slow aggregation updates = stale billing reports
+
+### Implementation Checklist
+
+| Feature | File(s) | Status |
+|---------|---------|--------|
+| Idempotency-Key header | `routes/clicks.ts`, `services/redis.ts` | Implemented |
+| Redis deduplication | `services/redis.ts`, `services/click-ingestion.ts` | Implemented |
+| PostgreSQL UPSERT | `services/click-ingestion.ts` | Implemented |
+| Prometheus metrics | `shared/metrics.ts`, `/metrics` endpoint | Implemented |
+| Structured JSON logging | `shared/logger.ts`, all services | Implemented |
+| Retention configuration | `shared/config.ts` | Implemented |
+| Alert thresholds | `shared/config.ts` | Implemented |
+| Database migrations | `db/migrate.ts`, `db/migrations/` | Implemented |
+| Health check endpoints | `/health`, `/health/ready`, `/health/live` | Implemented |
+
+---
+
 ## Future Optimizations
 
 1. Add Kafka for event streaming

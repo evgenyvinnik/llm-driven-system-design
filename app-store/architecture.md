@@ -1217,3 +1217,154 @@ npm run test:integration
 | Message queue | RabbitMQ | Kafka | Simpler for local dev, sufficient for learning |
 | Consistency | Strong for payments, eventual for analytics | All strong | Performance vs correctness tradeoff |
 | Idempotency | Client-provided keys with Redis locks | Database constraints only | Handles network retries gracefully |
+
+---
+
+## Implementation Notes
+
+This section documents the production-readiness improvements made to the codebase, explaining WHY each change improves the system.
+
+### 1. Structured Logging with Pino
+
+**What:** Replaced `console.log` and `morgan` with `pino` structured JSON logging.
+
+**Why This Improves the System:**
+- **Observability**: JSON logs can be parsed by log aggregation systems (ELK, Datadog, CloudWatch) enabling powerful search and filtering
+- **Context Propagation**: Child loggers attach request IDs, user IDs, and trace IDs to all log entries, making debugging distributed issues possible
+- **Performance**: Pino is the fastest Node.js logger, adding minimal latency to request handling
+- **Consistency**: Standardized log levels and formats across all services make it easier to set up alerts and dashboards
+
+**Files:**
+- `/backend/src/shared/logger.ts` - Logger configuration and helper functions
+
+### 2. Prometheus Metrics
+
+**What:** Added `prom-client` for exposing metrics at `/metrics` endpoint.
+
+**Why This Improves the System:**
+- **Proactive Monitoring**: Track request latency distributions, error rates, and throughput before users report issues
+- **Capacity Planning**: Database pool sizes, queue depths, and memory usage help predict scaling needs
+- **SLA Tracking**: P50/P95/P99 latency metrics enable data-driven SLA commitments
+- **Alerting**: Prometheus AlertManager can trigger PagerDuty/Slack alerts when error rates spike
+- **Business Metrics**: Track downloads, reviews, and purchases to correlate system changes with business impact
+
+**Metrics Categories:**
+- HTTP request duration and counts (by route, method, status)
+- Database query latency and pool utilization
+- Cache hit/miss rates
+- Message queue depths and processing times
+- Circuit breaker state changes
+- Business events (downloads, reviews, purchases)
+
+**Files:**
+- `/backend/src/shared/metrics.ts` - Prometheus metric definitions and middleware
+
+### 3. Comprehensive Health Checks
+
+**What:** Added `/health`, `/health/live`, and `/health/ready` endpoints with dependency checks.
+
+**Why This Improves the System:**
+- **Kubernetes Readiness**: Load balancers only route traffic to healthy instances, preventing user-facing errors during deployments or partial outages
+- **Liveness Probes**: Containers stuck in bad states get automatically restarted
+- **Dependency Visibility**: Health check response shows which dependencies are degraded, speeding up incident triage
+- **Graceful Degradation**: Distinguishes between "unhealthy" (don't route traffic) and "degraded" (still functional but impaired)
+
+**Health Check Hierarchy:**
+- `/health/live` - Process is running (very lightweight)
+- `/health/ready` - Can handle requests (checks Postgres, Redis)
+- `/health` - Full status (checks all dependencies, queue depths, circuit breakers)
+
+**Files:**
+- `/backend/src/shared/health.ts` - Health check implementations
+
+### 4. Idempotency for Purchases
+
+**What:** Added Redis-backed idempotency key handling for critical operations.
+
+**Why This Improves the System:**
+- **Double-Purchase Prevention**: Network retries, client bugs, and duplicate form submissions cannot cause double charges
+- **Safe Retries**: Clients can safely retry failed requests without fear of duplicate processing
+- **Atomic Locking**: Redis NX (set-if-not-exists) prevents race conditions between concurrent requests with the same idempotency key
+- **Replay Protection**: Cached results are returned for duplicate requests within the 24-hour window
+
+**Implementation Pattern:**
+1. Check for existing result with idempotency key
+2. If found, return cached result (duplicate request)
+3. If not found, acquire lock
+4. If lock acquired, process request and cache result
+5. If lock not acquired, return "in progress" error
+
+**Files:**
+- `/backend/src/shared/idempotency.ts` - Idempotency checking and result caching
+
+### 5. RabbitMQ for Async Processing
+
+**What:** Added RabbitMQ message queue for download and review event processing.
+
+**Why This Improves the System:**
+- **Decoupling**: HTTP responses return immediately; heavy processing (integrity analysis, analytics) happens asynchronously
+- **Backpressure**: Prefetch limits prevent workers from being overwhelmed; messages queue up when processing is slow
+- **Reliability**: Persistent messages survive broker restarts; dead letter queues capture failed messages for investigation
+- **Scalability**: Add more worker instances to increase throughput without changing code
+- **Fault Isolation**: If the review integrity service is down, reviews still get submitted and processed when it recovers
+
+**Queue Architecture:**
+- `download.processing` - Analytics aggregation, recommendation updates
+- `review.processing` - Deep integrity analysis, moderation, notifications
+- `dead-letter` - Failed messages for inspection and retry
+
+**Delivery Semantics:**
+- At-least-once delivery with idempotent consumers
+- Exponential backoff retry with max retry count
+- Deduplication via Redis-cached event IDs
+
+**Files:**
+- `/backend/src/shared/queue.ts` - RabbitMQ connection and pub/sub utilities
+- `/backend/src/workers/downloadWorker.ts` - Download event consumer
+- `/backend/src/workers/reviewWorker.ts` - Review event consumer
+
+### 6. Circuit Breaker for External Services
+
+**What:** Added `opossum` circuit breaker for payment and search service calls.
+
+**Why This Improves the System:**
+- **Fail Fast**: When an external service is down, fail immediately instead of waiting for timeout on every request
+- **Self-Healing**: After a cooldown period, the circuit half-opens to test if the service has recovered
+- **Cascade Prevention**: Without circuit breakers, a slow/failing dependency can exhaust connection pools and bring down the entire system
+- **Graceful Degradation**: Fallback functions can provide degraded functionality (e.g., PostgreSQL full-text search when Elasticsearch is down)
+
+**Circuit Breaker States:**
+- **Closed**: Normal operation, requests pass through
+- **Open**: Service is failing, requests fail immediately
+- **Half-Open**: Testing recovery, limited requests pass through
+
+**Pre-configured Breakers:**
+- Payment service: Aggressive 5s timeout, 30% failure threshold (critical path)
+- Elasticsearch: 10s timeout, 50% failure threshold (degradable)
+
+**Files:**
+- `/backend/src/shared/circuitBreaker.ts` - Circuit breaker factory and pre-configured instances
+
+### Running the Workers
+
+Start the async processing workers alongside the main server:
+
+```bash
+# Terminal 1: Main server
+npm run dev
+
+# Terminal 2: Download worker
+npm run dev:download-worker
+
+# Terminal 3: Review worker
+npm run dev:review-worker
+```
+
+### Monitoring Stack
+
+For local development, the following endpoints are available:
+- **Prometheus Metrics**: `http://localhost:3000/metrics`
+- **Health Check**: `http://localhost:3000/health`
+- **RabbitMQ Management**: `http://localhost:15672` (appstore/appstore_pass)
+
+In production, configure Prometheus to scrape `/metrics` and Grafana dashboards for visualization.

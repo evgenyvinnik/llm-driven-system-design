@@ -812,8 +812,8 @@ For local development: Rely on Docker volumes and `docker-compose down -v` aware
 ## Future Optimizations
 
 ### Short Term (Next Implementation Phase)
-- [ ] Add comprehensive test suite (unit, integration, e2e)
-- [ ] Implement Prometheus metrics collection
+- [x] Add comprehensive test suite (unit, integration, e2e)
+- [x] Implement Prometheus metrics collection
 - [ ] Add Grafana dashboards
 - [ ] Load test booking concurrency with k6
 
@@ -830,3 +830,268 @@ For local development: Rely on Docker volumes and `docker-compose down -v` aware
 - [ ] Mobile app API endpoints
 - [ ] Loyalty program implementation
 - [ ] Machine learning for dynamic pricing
+
+## Implementation Notes
+
+This section documents the key patterns implemented in the backend and explains WHY each pattern is necessary for a production-grade hotel booking system.
+
+### 1. Idempotency for Booking Creation
+
+**Location:** `backend/src/shared/idempotency.js`, `backend/src/services/bookingService.js`
+
+**Implementation:**
+```javascript
+// Generate idempotency key from booking parameters
+const idempotencyKey = generateIdempotencyKey(userId, {
+  hotelId, roomTypeId, checkIn, checkOut, roomCount
+});
+
+// Check for existing booking with same key
+const existing = await checkIdempotency(idempotencyKey);
+if (existing) {
+  return { ...existing, deduplicated: true };
+}
+```
+
+**WHY idempotency prevents double-charging guests:**
+
+1. **Network Failures Cause Retries:** When a user submits a booking, the request may time out even though the booking was successfully created on the server. The user sees an error and clicks "Book Again."
+
+2. **Double-Click Prevention:** Users frequently double-click submit buttons. Without idempotency, each click creates a new booking.
+
+3. **Load Balancer Retries:** Some load balancers automatically retry failed requests. This can create duplicate bookings without any user action.
+
+4. **Payment Implications:** Each booking triggers a payment charge. Without idempotency:
+   - Guest books room for $200/night
+   - Network timeout occurs
+   - Guest retries, creating second $200 booking
+   - Guest is charged $400 for what they thought was one room
+
+**Our Solution:**
+- Generate SHA-256 hash from: userId + hotelId + roomTypeId + checkIn + checkOut + roomCount
+- Store hash in `idempotency_key` column (unique constraint)
+- On duplicate request, return existing booking instead of creating new one
+- Cache idempotency results in Redis for 24 hours for fast lookups
+
+### 2. Distributed Locking for Room Selection
+
+**Location:** `backend/src/shared/distributedLock.js`, `backend/src/services/bookingService.js`
+
+**Implementation:**
+```javascript
+// Create lock resource for room type and dates
+const lockResource = createRoomLockResource(hotelId, roomTypeId, checkIn, checkOut);
+
+// Execute booking within distributed lock
+const booking = await withLock(lockResource, async () => {
+  return this._executeBookingTransaction(bookingData, userId);
+});
+```
+
+**WHY distributed locking prevents room overselling:**
+
+1. **Multiple API Servers:** In production, multiple API server instances handle requests. Each server has no knowledge of what other servers are doing.
+
+2. **Race Condition Without Locking:**
+   ```
+   Time T0: Server A receives booking for Room 101, Jan 15
+   Time T0: Server B receives booking for Room 101, Jan 15
+   Time T1: Server A checks availability -> 1 room available
+   Time T1: Server B checks availability -> 1 room available
+   Time T2: Server A creates booking (success)
+   Time T2: Server B creates booking (success - OVERSOLD!)
+   ```
+
+3. **Database Locks Are Insufficient:** PostgreSQL `SELECT ... FOR UPDATE` only works within a single database transaction on a single connection. It cannot prevent concurrent requests on different servers from both seeing "available" before either commits.
+
+4. **Financial Impact of Overselling:**
+   - Guest A arrives at hotel, has confirmed booking
+   - Guest B arrives at hotel, also has confirmed booking for same room
+   - Hotel must provide free upgrade, pay for alternative hotel, or offer refund + compensation
+   - Customer trust is destroyed
+
+**Our Solution:**
+- Use Redis SETNX for distributed locking with unique lock IDs
+- Lock key: `lock:room:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}`
+- Lock TTL: 30 seconds (prevents deadlocks from crashed processes)
+- Retry with exponential backoff for contention
+- Lua script for atomic check-and-delete on release
+
+### 3. Availability Caching
+
+**Location:** `backend/src/services/bookingService.js`
+
+**Implementation:**
+```javascript
+// Try cache first
+const cacheKey = `availability:check:${hotelId}:${roomTypeId}:${checkIn}:${checkOut}`;
+const cached = await redis.get(cacheKey);
+if (cached) {
+  metrics.availabilityCacheHitsTotal.inc();
+  return JSON.parse(cached);
+}
+
+// Cache miss: query database
+const availability = await queryDatabase(...);
+await redis.setex(cacheKey, 300, JSON.stringify(availability)); // 5 min TTL
+```
+
+**WHY availability caching reduces database load:**
+
+1. **Search Page Load Pattern:**
+   - User searches for "hotels in NYC, Jan 15-17"
+   - System returns 50 hotels
+   - For each hotel, check availability for 3-5 room types
+   - Total: 150-250 availability queries per search
+
+2. **Database Impact Without Caching:**
+   - Each availability check runs complex date-range queries with `generate_series`
+   - At 100 concurrent users searching: 15,000-25,000 queries/second
+   - PostgreSQL connection pool exhausted
+   - Query latency increases from 10ms to 500ms+
+
+3. **Availability Changes Infrequently:**
+   - Bookings happen at ~1:100 ratio vs. searches
+   - Once availability is calculated, it's valid until next booking
+   - 5-minute cache provides 90%+ hit rate during peak hours
+
+4. **Intelligent Cache Invalidation:**
+   - On booking create/confirm/cancel, delete relevant cache keys
+   - Pattern: `availability:*:{hotelId}:{roomTypeId}:*`
+   - Ensures cache never serves stale data after state change
+
+**Cache Key Strategy:**
+```
+availability:{hotelId}:{roomTypeId}:{year}-{month}  # Calendar view (monthly)
+availability:check:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}  # Specific date range
+```
+
+### 4. Booking Metrics for Revenue Optimization
+
+**Location:** `backend/src/shared/metrics.js`, exposed at `/metrics`
+
+**Key Metrics Implemented:**
+
+```javascript
+// Business metrics
+bookings_created_total{status, hotel_id}
+bookings_confirmed_total{hotel_id}
+bookings_cancelled_total{hotel_id, reason}
+bookings_expired_total
+booking_revenue_total_cents{hotel_id, room_type_id}
+booking_creation_duration_seconds
+
+// Search metrics
+search_requests_total{has_dates, city}
+search_duration_seconds
+search_results_count
+
+// Availability metrics
+availability_cache_hits_total
+availability_cache_misses_total
+availability_checks_total{cache_hit}
+```
+
+**WHY booking metrics enable revenue optimization:**
+
+1. **Conversion Funnel Analysis:**
+   ```
+   search_requests_total: 10,000
+   bookings_created_total{status="reserved"}: 500
+   bookings_confirmed_total: 400
+   ```
+   - Search-to-booking ratio: 5%
+   - Booking-to-confirmation ratio: 80%
+   - 20% abandonment at payment = revenue opportunity
+
+2. **Reservation Hold Optimization:**
+   - `bookings_expired_total` tracks reservations that weren't confirmed
+   - High expiry rate suggests hold time too long (inventory blocked)
+   - Low expiry rate suggests hold time could be extended
+
+3. **Dynamic Pricing Signals:**
+   - `search_requests_total{city="NYC"}` by hour shows demand patterns
+   - High search volume + low availability = raise prices
+   - Low search volume + high availability = promotional pricing
+
+4. **Cache Efficiency:**
+   - `availability_cache_hits_total / availability_checks_total` = hit rate
+   - If hit rate < 80%, consider longer TTL or pre-warming
+
+5. **SLO Monitoring:**
+   - `booking_creation_duration_seconds` p95 should be < 1s
+   - `search_duration_seconds` p95 should be < 500ms
+   - Alerts when latency exceeds thresholds
+
+### 5. Circuit Breaker Pattern
+
+**Location:** `backend/src/shared/circuitBreaker.js`
+
+**Implementation:**
+```javascript
+const paymentBreaker = createPaymentCircuitBreaker(async (bookingId, amount) => {
+  return await paymentGateway.charge(bookingId, amount);
+});
+
+// Fallback when circuit is open
+breaker.fallback(async (bookingId, amount) => {
+  return { success: false, queued: true, message: 'Payment queued' };
+});
+```
+
+**WHY circuit breakers prevent cascading failures:**
+
+1. **External Service Dependencies:** Payment gateways, email services, and other external APIs can fail or become slow.
+
+2. **Cascading Failure Pattern:**
+   - Payment service becomes slow (5s response time)
+   - All booking confirmations wait 5s
+   - Thread pool exhausted
+   - Entire API becomes unresponsive
+   - Users cannot even search for hotels
+
+3. **Circuit Breaker States:**
+   - **Closed:** Normal operation, requests pass through
+   - **Open:** Service failed too many times, fail fast with fallback
+   - **Half-Open:** Try one request to see if service recovered
+
+4. **Configuration:**
+   - Payment service: Open after 30% failures, wait 60s before retry
+   - Availability service: Open after 50% failures, wait 30s
+
+### 6. Structured JSON Logging
+
+**Location:** `backend/src/shared/logger.js`
+
+**Implementation:**
+```javascript
+logger.info({
+  bookingId: booking.id,
+  hotelId,
+  totalPrice: booking.totalPrice,
+  traceId: req.traceId,
+  durationSeconds,
+}, 'Booking created successfully');
+```
+
+**Output:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "hotel-booking-api",
+  "traceId": "abc123-def456",
+  "bookingId": "booking-789",
+  "hotelId": "hotel-456",
+  "totalPrice": 450.00,
+  "durationSeconds": 0.245,
+  "msg": "Booking created successfully"
+}
+```
+
+**Benefits:**
+- Machine-parseable for log aggregation (ELK, Datadog)
+- Trace ID correlation across distributed services
+- Sensitive data redaction (passwords, card numbers)
+- Consistent format for alerting rules
+

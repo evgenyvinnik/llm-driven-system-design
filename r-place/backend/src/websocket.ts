@@ -5,17 +5,23 @@
  * - Broadcasting pixel updates to all connected clients
  * - Sending initial canvas state on connection
  * - Managing connection lifecycle and heartbeats
+ * - Graceful shutdown with connection draining
  *
  * Uses Redis pub/sub to coordinate updates across multiple server instances.
  */
 import { WebSocketServer, WebSocket } from 'ws';
 import { Server } from 'http';
 import { parse as parseCookie } from 'cookie';
-import { redisSub } from '../services/redis.js';
-import { canvasService } from '../services/canvas.js';
-import { authService } from '../services/auth.js';
-import { REDIS_KEYS } from '../config.js';
-import type { PixelEvent, User } from '../types/index.js';
+import { redisSub } from './services/redis.js';
+import { canvasService } from './services/canvas.js';
+import { authService } from './services/auth.js';
+import { REDIS_KEYS } from './config.js';
+import { logger, logWebSocketConnection } from './shared/logger.js';
+import {
+  activeWebSocketConnections,
+  canvasUpdatesTotal,
+} from './shared/metrics.js';
+import type { PixelEvent, User } from './types/index.js';
 
 /**
  * Extended WebSocket interface with user identification and health tracking.
@@ -28,6 +34,12 @@ interface ExtendedWebSocket extends WebSocket {
   /** Health check flag for detecting dead connections. */
   isAlive: boolean;
 }
+
+/** Set of all connected clients for broadcast and metrics. */
+let clients: Set<ExtendedWebSocket>;
+
+/** Heartbeat interval reference for cleanup on shutdown. */
+let heartbeatInterval: NodeJS.Timeout;
 
 /**
  * Initializes and configures the WebSocket server.
@@ -44,14 +56,14 @@ interface ExtendedWebSocket extends WebSocket {
 export function setupWebSocket(server: Server): WebSocketServer {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
-  const clients = new Set<ExtendedWebSocket>();
+  clients = new Set<ExtendedWebSocket>();
 
   // Subscribe to Redis pixel updates
   redisSub.subscribe(REDIS_KEYS.PIXEL_CHANNEL, (err) => {
     if (err) {
-      console.error('Failed to subscribe to pixel updates:', err);
+      logger.error({ error: err }, 'Failed to subscribe to pixel updates');
     } else {
-      console.log('Subscribed to pixel updates channel');
+      logger.info('Subscribed to pixel updates channel');
     }
   });
 
@@ -61,8 +73,13 @@ export function setupWebSocket(server: Server): WebSocketServer {
    */
   redisSub.on('message', (channel, message) => {
     if (channel === REDIS_KEYS.PIXEL_CHANNEL) {
-      const event: PixelEvent = JSON.parse(message);
-      broadcastPixel(event);
+      try {
+        const event: PixelEvent = JSON.parse(message);
+        broadcastPixel(event);
+        canvasUpdatesTotal.inc();
+      } catch (error) {
+        logger.error({ error, message }, 'Failed to parse pixel event');
+      }
     }
   });
 
@@ -108,7 +125,14 @@ export function setupWebSocket(server: Server): WebSocketServer {
     }
 
     clients.add(ws);
-    console.log(`WebSocket client connected: ${user?.username || 'anonymous'} (${clients.size} total)`);
+    activeWebSocketConnections.set(clients.size);
+
+    logWebSocketConnection({
+      event: 'connected',
+      userId: ws.userId,
+      username: ws.username,
+      totalConnections: clients.size,
+    });
 
     /**
      * Sends initial state to the newly connected client:
@@ -146,7 +170,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         }));
       }
     } catch (error) {
-      console.error('Error sending initial state:', error);
+      logger.error({ error }, 'Error sending initial state');
       ws.send(JSON.stringify({
         type: 'error',
         data: 'Failed to load canvas',
@@ -172,7 +196,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
           ws.send(JSON.stringify({ type: 'pong' }));
         }
       } catch (error) {
-        console.error('Error handling WebSocket message:', error);
+        logger.error({ error }, 'Error handling WebSocket message');
       }
     });
 
@@ -181,12 +205,26 @@ export function setupWebSocket(server: Server): WebSocketServer {
      */
     ws.on('close', () => {
       clients.delete(ws);
-      console.log(`WebSocket client disconnected: ${ws.username || 'anonymous'} (${clients.size} total)`);
+      activeWebSocketConnections.set(clients.size);
+
+      logWebSocketConnection({
+        event: 'disconnected',
+        userId: ws.userId,
+        username: ws.username,
+        totalConnections: clients.size,
+      });
     });
 
     ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      logWebSocketConnection({
+        event: 'error',
+        userId: ws.userId,
+        username: ws.username,
+        totalConnections: clients.size,
+        error: error.message,
+      });
       clients.delete(ws);
+      activeWebSocketConnections.set(clients.size);
     });
   });
 
@@ -194,11 +232,12 @@ export function setupWebSocket(server: Server): WebSocketServer {
    * Heartbeat interval to detect and clean up dead connections.
    * Runs every 30 seconds, terminating connections that don't respond to pings.
    */
-  const heartbeatInterval = setInterval(() => {
+  heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
       const extWs = ws as ExtendedWebSocket;
       if (!extWs.isAlive) {
         clients.delete(extWs);
+        activeWebSocketConnections.set(clients.size);
         return extWs.terminate();
       }
       extWs.isAlive = false;
@@ -210,6 +249,74 @@ export function setupWebSocket(server: Server): WebSocketServer {
     clearInterval(heartbeatInterval);
   });
 
-  console.log('WebSocket server initialized');
+  logger.info('WebSocket server initialized');
   return wss;
+}
+
+/**
+ * Gracefully shuts down the WebSocket server.
+ * Notifies all clients of impending shutdown and waits for them to disconnect.
+ *
+ * @param wss - The WebSocket server to shut down.
+ * @param timeoutMs - Maximum time to wait for clients to disconnect (default 5000ms).
+ */
+export async function shutdownWebSocket(
+  wss: WebSocketServer,
+  timeoutMs: number = 5000
+): Promise<void> {
+  // Clear heartbeat interval
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+  }
+
+  // Unsubscribe from Redis
+  try {
+    await redisSub.unsubscribe(REDIS_KEYS.PIXEL_CHANNEL);
+  } catch (error) {
+    logger.error({ error }, 'Error unsubscribing from Redis');
+  }
+
+  // Notify all clients of shutdown
+  const shutdownMessage = JSON.stringify({
+    type: 'shutdown',
+    data: { message: 'Server is shutting down', reconnectDelayMs: 5000 },
+  });
+
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(shutdownMessage);
+      } catch {
+        // Ignore send errors during shutdown
+      }
+    }
+  });
+
+  // Give clients a moment to receive the shutdown message
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  // Close all connections
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      // Force close remaining connections after timeout
+      clients.forEach((client) => {
+        try {
+          client.terminate();
+        } catch {
+          // Ignore terminate errors
+        }
+      });
+      clients.clear();
+      activeWebSocketConnections.set(0);
+      wss.close(() => resolve());
+    }, timeoutMs);
+
+    // Close gracefully
+    wss.close(() => {
+      clearTimeout(timeout);
+      clients.clear();
+      activeWebSocketConnections.set(0);
+      resolve();
+    });
+  });
 }

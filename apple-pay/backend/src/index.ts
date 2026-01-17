@@ -10,6 +10,14 @@
  *
  * The server requires PostgreSQL for persistent storage and
  * Redis for session management and caching.
+ *
+ * New Infrastructure Features:
+ * - Structured logging with Pino (JSON format)
+ * - Prometheus metrics at /metrics
+ * - Deep health checks at /health, /health/live, /health/ready
+ * - Circuit breakers for payment network resilience
+ * - Idempotency middleware for payment safety
+ * - Audit logging for compliance
  */
 import express from 'express';
 import cors from 'cors';
@@ -20,42 +28,49 @@ import cardsRoutes from './routes/cards.js';
 import paymentsRoutes from './routes/payments.js';
 import merchantsRoutes from './routes/merchants.js';
 
+// Import shared infrastructure modules
+import {
+  logger,
+  requestLogger,
+  metricsMiddleware,
+  createMetricsRouter,
+  healthRouter,
+} from './shared/index.js';
+
 /** Express application instance */
 const app = express();
 
 /** Server port from environment or default 3000 */
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-  credentials: true,
-}));
+// Middleware - CORS configuration
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true,
+  })
+);
+
+// Body parsing
 app.use(express.json());
 
-// Request logging
-app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-  next();
-});
+// Prometheus metrics collection middleware
+// Records request duration and counts by method, route, and status
+app.use(metricsMiddleware);
 
-/**
- * GET /health
- * Health check endpoint for monitoring and load balancer probes.
- * Verifies database and Redis connectivity.
- */
-app.get('/health', async (_req, res) => {
-  try {
-    // Check database
-    await pool.query('SELECT 1');
-    // Check Redis
-    await redis.ping();
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-  } catch (error) {
-    console.error('Health check failed:', error);
-    res.status(503).json({ status: 'unhealthy', error: (error as Error).message });
-  }
-});
+// Structured logging middleware with request correlation
+// Adds requestId to each request and logs request/response details
+app.use(requestLogger);
+
+// Health check endpoints
+// - /health/live: Liveness probe for container orchestration
+// - /health/ready: Readiness probe for load balancers
+// - /health or /health/deep: Detailed component status
+app.use('/health', healthRouter);
+
+// Prometheus metrics endpoint
+// Exposes application and Node.js metrics in Prometheus format
+app.use(createMetricsRouter());
 
 // API Routes
 app.use('/api/auth', authRoutes);
@@ -63,11 +78,30 @@ app.use('/api/cards', cardsRoutes);
 app.use('/api/payments', paymentsRoutes);
 app.use('/api/merchants', merchantsRoutes);
 
-// Error handling
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
+// Global error handling with structured logging
+app.use(
+  (
+    err: Error,
+    req: express.Request & { requestId?: string },
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    logger.error(
+      {
+        error: err.message,
+        stack: err.stack,
+        requestId: req.requestId,
+        path: req.path,
+        method: req.method,
+      },
+      'Unhandled error'
+    );
+    res.status(500).json({
+      error: 'Internal server error',
+      requestId: req.requestId,
+    });
+  }
+);
 
 /**
  * Initializes and starts the Express server.
@@ -78,21 +112,42 @@ async function start() {
   try {
     // Connect to Redis
     await redis.connect();
-    console.log('Connected to Redis');
+    logger.info('Connected to Redis');
 
     // Verify database connection
     await pool.query('SELECT 1');
-    console.log('Connected to PostgreSQL');
+    logger.info('Connected to PostgreSQL');
 
     app.listen(PORT, () => {
-      console.log(`Apple Pay server running on port ${PORT}`);
-      console.log(`Health check: http://localhost:${PORT}/health`);
+      logger.info(
+        {
+          port: PORT,
+          nodeEnv: process.env.NODE_ENV || 'development',
+        },
+        'Apple Pay server started'
+      );
+      logger.info(`Health check: http://localhost:${PORT}/health`);
+      logger.info(`Metrics: http://localhost:${PORT}/metrics`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.fatal({ error: (error as Error).message }, 'Failed to start server');
     process.exit(1);
   }
 }
+
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  try {
+    await redis.quit();
+    await pool.end();
+    logger.info('Connections closed');
+    process.exit(0);
+  } catch (error) {
+    logger.error({ error: (error as Error).message }, 'Error during shutdown');
+    process.exit(1);
+  }
+});
 
 start();
 

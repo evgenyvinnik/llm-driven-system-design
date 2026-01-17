@@ -135,6 +135,7 @@ CREATE TABLE watch_progress (
   position INTEGER NOT NULL DEFAULT 0, -- seconds
   duration INTEGER NOT NULL,
   completed BOOLEAN DEFAULT false,
+  client_timestamp BIGINT, -- Client-side timestamp for last-write-wins conflict resolution
   updated_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (profile_id, content_id)
 );
@@ -188,3 +189,19 @@ CREATE TABLE content_ratings (
 );
 
 CREATE INDEX idx_ratings_content ON content_ratings(content_id);
+
+-- Audit log for security-relevant events
+CREATE TABLE audit_log (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  event VARCHAR(100) NOT NULL,
+  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  device_id VARCHAR(255),
+  content_id UUID REFERENCES content(id) ON DELETE SET NULL,
+  ip_address VARCHAR(45),
+  details JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_user ON audit_log(user_id, created_at DESC);
+CREATE INDEX idx_audit_event ON audit_log(event, created_at DESC);
+CREATE INDEX idx_audit_created ON audit_log(created_at DESC);

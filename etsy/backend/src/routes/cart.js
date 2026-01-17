@@ -2,6 +2,12 @@ import { Router } from 'express';
 import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
 
+// Shared modules
+import { cartOperations } from '../shared/metrics.js';
+import { createLogger } from '../shared/logger.js';
+
+const logger = createLogger('cart');
+
 const router = Router();
 
 // Get user's cart (grouped by shop)
@@ -63,7 +69,7 @@ router.get('/', isAuthenticated, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Get cart error:', error);
+    logger.error({ error }, 'Get cart error');
     res.status(500).json({ error: 'Failed to get cart' });
   }
 });
@@ -111,6 +117,9 @@ router.post('/items', isAuthenticated, async (req, res) => {
         'UPDATE cart_items SET quantity = $1, updated_at = NOW() WHERE id = $2',
         [newQuantity, existingResult.rows[0].id]
       );
+
+      cartOperations.labels('update').inc();
+      logger.debug({ userId: req.session.userId, productId, newQuantity }, 'Cart item quantity updated');
     } else {
       // Add new item with reservation for unique items
       const reservedUntil = product.quantity === 1
@@ -121,11 +130,14 @@ router.post('/items', isAuthenticated, async (req, res) => {
         'INSERT INTO cart_items (user_id, product_id, quantity, reserved_until) VALUES ($1, $2, $3, $4)',
         [req.session.userId, parseInt(productId), parseInt(quantity), reservedUntil]
       );
+
+      cartOperations.labels('add').inc();
+      logger.debug({ userId: req.session.userId, productId, quantity }, 'Item added to cart');
     }
 
     res.json({ message: 'Item added to cart' });
   } catch (error) {
-    console.error('Add to cart error:', error);
+    logger.error({ error }, 'Add to cart error');
     res.status(500).json({ error: 'Failed to add item to cart' });
   }
 });
@@ -164,9 +176,12 @@ router.put('/items/:itemId', isAuthenticated, async (req, res) => {
       [parseInt(quantity), parseInt(itemId)]
     );
 
+    cartOperations.labels('update').inc();
+    logger.debug({ userId: req.session.userId, itemId, quantity }, 'Cart item updated');
+
     res.json({ message: 'Cart updated' });
   } catch (error) {
-    console.error('Update cart error:', error);
+    logger.error({ error }, 'Update cart error');
     res.status(500).json({ error: 'Failed to update cart' });
   }
 });
@@ -185,9 +200,12 @@ router.delete('/items/:itemId', isAuthenticated, async (req, res) => {
       return res.status(404).json({ error: 'Cart item not found' });
     }
 
+    cartOperations.labels('remove').inc();
+    logger.debug({ userId: req.session.userId, itemId }, 'Item removed from cart');
+
     res.json({ message: 'Item removed from cart' });
   } catch (error) {
-    console.error('Remove from cart error:', error);
+    logger.error({ error }, 'Remove from cart error');
     res.status(500).json({ error: 'Failed to remove item from cart' });
   }
 });
@@ -195,10 +213,19 @@ router.delete('/items/:itemId', isAuthenticated, async (req, res) => {
 // Clear cart
 router.delete('/', isAuthenticated, async (req, res) => {
   try {
-    await db.query('DELETE FROM cart_items WHERE user_id = $1', [req.session.userId]);
+    const result = await db.query(
+      'DELETE FROM cart_items WHERE user_id = $1 RETURNING id',
+      [req.session.userId]
+    );
+
+    if (result.rows.length > 0) {
+      cartOperations.labels('clear').inc();
+      logger.debug({ userId: req.session.userId, itemsCleared: result.rows.length }, 'Cart cleared');
+    }
+
     res.json({ message: 'Cart cleared' });
   } catch (error) {
-    console.error('Clear cart error:', error);
+    logger.error({ error }, 'Clear cart error');
     res.status(500).json({ error: 'Failed to clear cart' });
   }
 });

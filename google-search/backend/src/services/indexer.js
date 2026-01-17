@@ -2,25 +2,79 @@ import { db } from '../models/db.js';
 import { bulkIndexDocuments, indexDocument } from '../models/elasticsearch.js';
 import { extractDomain } from '../utils/helpers.js';
 import { processText, extractKeywords } from '../utils/tokenizer.js';
+import { logger } from '../shared/logger.js';
+import {
+  indexOperationsCounter,
+  indexLatencyHistogram,
+} from '../shared/metrics.js';
+import { createCircuitBreaker } from '../shared/circuitBreaker.js';
+import {
+  filterAlreadyIndexed,
+  markBatchAsIndexed,
+  generateDocumentIdempotencyKey,
+} from '../shared/idempotency.js';
+import crypto from 'crypto';
 
 /**
  * Indexer - builds search index from crawled documents
+ *
+ * Uses circuit breaker to protect Elasticsearch availability
+ * Uses idempotency to prevent duplicate indexing
  */
 class Indexer {
   constructor() {
     this.batchSize = 100;
+
+    // Create circuit breaker for bulk indexing
+    this.bulkIndexBreaker = createCircuitBreaker(
+      'elasticsearch-bulk-index',
+      async (docs) => bulkIndexDocuments(docs),
+      {
+        timeout: 30000, // Bulk operations can take time
+        errorThresholdPercentage: 40,
+        resetTimeout: 15000,
+      }
+    );
+
+    // Create circuit breaker for single document indexing
+    this.singleIndexBreaker = createCircuitBreaker(
+      'elasticsearch-single-index',
+      async (doc) => indexDocument(doc),
+      {
+        timeout: 10000,
+        errorThresholdPercentage: 50,
+        resetTimeout: 10000,
+      }
+    );
+  }
+
+  /**
+   * Generate content hash for idempotency
+   */
+  generateContentHash(doc) {
+    const content = `${doc.title}:${doc.content?.substring(0, 1000) || ''}`;
+    return crypto.createHash('md5').update(content).digest('hex').substring(0, 12);
   }
 
   /**
    * Index all documents that have been crawled but not yet indexed
+   *
+   * WHY circuit breaker protects index availability:
+   * - If Elasticsearch is overloaded, circuit breaker trips
+   * - Allows ES cluster to recover instead of piling up requests
+   * - Fail fast pattern prevents request queue buildup
    */
   async indexAll() {
-    console.log('Starting indexing process...');
+    logger.info('Starting indexing process...');
 
     let offset = 0;
     let indexedCount = 0;
+    let skippedCount = 0;
+    const startTime = Date.now();
 
     while (true) {
+      const batchStartTime = Date.now();
+
       // Get batch of documents to index
       const result = await db.query(
         `SELECT
@@ -59,23 +113,86 @@ class Indexer {
         inlink_count: row.inlink_count || 0,
         fetch_time: row.fetch_time,
         content_length: row.content_length,
+        _contentHash: this.generateContentHash(row),
       }));
 
-      // Bulk index to Elasticsearch
-      await bulkIndexDocuments(docs);
+      // Filter out already indexed documents (idempotency)
+      const keyGenerator = (doc) =>
+        generateDocumentIdempotencyKey(doc.url_id, doc._contentHash);
 
-      indexedCount += docs.length;
+      const docsToIndex = await filterAlreadyIndexed(docs, keyGenerator);
+
+      if (docsToIndex.length > 0) {
+        try {
+          // Use circuit breaker for bulk indexing
+          await this.bulkIndexBreaker.fire(docsToIndex);
+
+          // Mark as indexed for idempotency
+          await markBatchAsIndexed(docsToIndex, keyGenerator);
+
+          indexedCount += docsToIndex.length;
+          indexOperationsCounter.labels('bulk', 'success').inc();
+
+          const batchDuration = (Date.now() - batchStartTime) / 1000;
+          indexLatencyHistogram.labels('bulk').observe(batchDuration);
+
+          logger.info(
+            {
+              batchSize: docsToIndex.length,
+              totalIndexed: indexedCount,
+              batchDurationMs: Date.now() - batchStartTime,
+            },
+            `Indexed batch of ${docsToIndex.length} documents`
+          );
+        } catch (error) {
+          indexOperationsCounter.labels('bulk', 'error').inc();
+
+          if (error.message.includes('Circuit breaker')) {
+            logger.warn(
+              { error: error.message },
+              'Circuit breaker open - pausing indexing'
+            );
+            // Wait before retrying
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+            continue; // Retry same batch
+          }
+
+          throw error;
+        }
+      }
+
+      skippedCount += docs.length - docsToIndex.length;
       offset += this.batchSize;
 
-      console.log(`Indexed ${indexedCount} documents...`);
+      logger.debug(
+        {
+          indexed: docsToIndex.length,
+          skipped: docs.length - docsToIndex.length,
+          offset,
+        },
+        'Batch processed'
+      );
     }
 
-    console.log(`Indexing complete. Total: ${indexedCount} documents`);
+    const totalDuration = Date.now() - startTime;
+    logger.info(
+      {
+        totalIndexed: indexedCount,
+        totalSkipped: skippedCount,
+        durationMs: totalDuration,
+      },
+      `Indexing complete. Indexed: ${indexedCount}, Skipped: ${skippedCount}`
+    );
+
     return indexedCount;
   }
 
   /**
    * Index a single document
+   *
+   * WHY circuit breaker protects availability:
+   * - Individual document indexing is wrapped with circuit breaker
+   * - Prevents cascading failures if ES is slow
    */
   async indexOne(urlId) {
     const result = await db.query(
@@ -115,7 +232,17 @@ class Indexer {
       content_length: row.content_length,
     };
 
-    await indexDocument(doc);
+    try {
+      // Use circuit breaker for single document indexing
+      await this.singleIndexBreaker.fire(doc);
+      indexOperationsCounter.labels('single', 'success').inc();
+
+      logger.debug({ urlId, url: doc.url }, 'Single document indexed');
+    } catch (error) {
+      indexOperationsCounter.labels('single', 'error').inc();
+      throw error;
+    }
+
     return doc;
   }
 
@@ -123,7 +250,7 @@ class Indexer {
    * Update inlink counts in URLs table
    */
   async updateInlinkCounts() {
-    console.log('Updating inlink counts...');
+    logger.info('Updating inlink counts...');
 
     await db.query(`
       UPDATE urls u
@@ -135,7 +262,7 @@ class Indexer {
       updated_at = NOW()
     `);
 
-    console.log('Inlink counts updated');
+    logger.info('Inlink counts updated');
   }
 
   /**

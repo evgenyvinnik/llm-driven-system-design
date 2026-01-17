@@ -14,6 +14,18 @@ import {
 } from "../types/index.js";
 import { generateUUID, isExpired, parseExpiration } from "../utils/index.js";
 import { tokenRegistry } from "./tokenRegistry.js";
+import {
+  checkIdempotency,
+  markNotificationProcessed,
+} from "../shared/cache.js";
+import {
+  notificationsSent,
+  notificationDeliveryLatency,
+  pendingNotifications,
+  notificationsInFlight,
+  idempotencyChecks,
+} from "../shared/metrics.js";
+import { logger, logDelivery } from "../shared/logger.js";
 
 /**
  * Push Notification Service.
@@ -37,10 +49,11 @@ export class PushService {
    * Sends a notification to a device by its raw token.
    * Creates a notification record and attempts immediate delivery.
    * If device is offline, queues for later delivery.
+   * Uses idempotency keys to prevent duplicate notifications.
    *
    * @param deviceToken - Raw 64-character hex device token
    * @param payload - APNs notification payload
-   * @param options - Delivery options (priority, expiration, collapse ID)
+   * @param options - Delivery options (priority, expiration, collapse ID, idempotency key)
    * @returns Notification ID and delivery status
    * @throws Error if device token is not registered
    */
@@ -51,52 +64,102 @@ export class PushService {
       priority?: NotificationPriority;
       expiration?: number;
       collapseId?: string;
+      idempotencyKey?: string;
     } = {}
   ): Promise<SendNotificationResponse> {
-    const device = await tokenRegistry.lookup(deviceToken);
+    const startTime = Date.now();
+    const notificationId = options.idempotencyKey || generateUUID();
+    const priority = options.priority || 10;
 
-    if (!device) {
-      throw new Error("Unregistered device token");
+    // Check idempotency - prevent duplicate notifications
+    if (options.idempotencyKey) {
+      const isDuplicate = await checkIdempotency(options.idempotencyKey);
+      if (isDuplicate) {
+        idempotencyChecks.inc({ result: "duplicate" });
+        logger.info({
+          event: "notification_duplicate",
+          notification_id: notificationId,
+          device_token_prefix: deviceToken.substring(0, 8),
+        });
+        // Return existing notification status without reprocessing
+        const existing = await this.getNotification(notificationId);
+        return {
+          notification_id: notificationId,
+          status: existing?.status || "duplicate",
+        };
+      }
+      idempotencyChecks.inc({ result: "new" });
     }
 
-    const notificationId = generateUUID();
-    const priority = options.priority || 10;
-    const expiration = parseExpiration(options.expiration);
+    notificationsInFlight.inc();
 
-    // Create notification record
-    await db.query(
-      `INSERT INTO notifications (id, device_id, payload, priority, expiration, collapse_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-      [
-        notificationId,
-        device.device_id,
-        JSON.stringify(payload),
+    try {
+      const device = await tokenRegistry.lookup(deviceToken);
+
+      if (!device) {
+        notificationsInFlight.dec();
+        throw new Error("Unregistered device token");
+      }
+
+      const expiration = parseExpiration(options.expiration);
+
+      // Create notification record
+      await db.query(
+        `INSERT INTO notifications (id, device_id, payload, priority, expiration, collapse_id, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [
+          notificationId,
+          device.device_id,
+          JSON.stringify(payload),
+          priority,
+          expiration,
+          options.collapseId || null,
+        ]
+      );
+
+      // Mark as processed for idempotency
+      await markNotificationProcessed(notificationId);
+
+      // Try to deliver immediately or queue
+      const result = await this.deliverNotification({
+        id: notificationId,
+        device_id: device.device_id,
+        payload,
         priority,
         expiration,
-        options.collapseId || null,
-      ]
-    );
+        collapse_id: options.collapseId || null,
+        created_at: new Date(),
+      });
 
-    // Try to deliver immediately or queue
-    const result = await this.deliverNotification({
-      id: notificationId,
-      device_id: device.device_id,
-      payload,
-      priority,
-      expiration,
-      collapse_id: options.collapseId || null,
-      created_at: new Date(),
-    });
+      const status = result.delivered ? "delivered" : "queued";
+      const latency = (Date.now() - startTime) / 1000;
 
-    return {
-      notification_id: notificationId,
-      status: result.delivered ? "delivered" : "queued",
-    };
+      // Record metrics
+      notificationsSent.inc({ priority: priority.toString(), status });
+      notificationDeliveryLatency.observe({ priority: priority.toString() }, latency);
+
+      logDelivery(notificationId, device.device_id, status, {
+        priority,
+        latency_ms: Date.now() - startTime,
+      });
+
+      notificationsInFlight.dec();
+
+      return {
+        notification_id: notificationId,
+        status,
+      };
+    } catch (error) {
+      notificationsInFlight.dec();
+      notificationsSent.inc({ priority: priority.toString(), status: "failed" });
+      throw error;
+    }
   }
 
   /**
    * Sends a notification to a device by its server-assigned ID.
    * Similar to sendToDevice but uses the internal device ID.
+   * Includes metrics tracking and structured logging.
    *
    * @param deviceId - Server-assigned device UUID
    * @param payload - APNs notification payload
@@ -113,45 +176,73 @@ export class PushService {
       collapseId?: string;
     } = {}
   ): Promise<SendNotificationResponse> {
-    const device = await tokenRegistry.lookupById(deviceId);
-
-    if (!device || !device.is_valid) {
-      throw new Error("Invalid device ID");
-    }
-
+    const startTime = Date.now();
     const notificationId = generateUUID();
     const priority = options.priority || 10;
-    const expiration = parseExpiration(options.expiration);
 
-    // Create notification record
-    await db.query(
-      `INSERT INTO notifications (id, device_id, payload, priority, expiration, collapse_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-      [
-        notificationId,
-        deviceId,
-        JSON.stringify(payload),
+    notificationsInFlight.inc();
+
+    try {
+      const device = await tokenRegistry.lookupById(deviceId);
+
+      if (!device || !device.is_valid) {
+        notificationsInFlight.dec();
+        throw new Error("Invalid device ID");
+      }
+
+      const expiration = parseExpiration(options.expiration);
+
+      // Create notification record
+      await db.query(
+        `INSERT INTO notifications (id, device_id, payload, priority, expiration, collapse_id, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [
+          notificationId,
+          deviceId,
+          JSON.stringify(payload),
+          priority,
+          expiration,
+          options.collapseId || null,
+        ]
+      );
+
+      // Mark as processed for idempotency
+      await markNotificationProcessed(notificationId);
+
+      // Try to deliver immediately or queue
+      const result = await this.deliverNotification({
+        id: notificationId,
+        device_id: deviceId,
+        payload,
         priority,
         expiration,
-        options.collapseId || null,
-      ]
-    );
+        collapse_id: options.collapseId || null,
+        created_at: new Date(),
+      });
 
-    // Try to deliver immediately or queue
-    const result = await this.deliverNotification({
-      id: notificationId,
-      device_id: deviceId,
-      payload,
-      priority,
-      expiration,
-      collapse_id: options.collapseId || null,
-      created_at: new Date(),
-    });
+      const status = result.delivered ? "delivered" : "queued";
+      const latency = (Date.now() - startTime) / 1000;
 
-    return {
-      notification_id: notificationId,
-      status: result.delivered ? "delivered" : "queued",
-    };
+      // Record metrics
+      notificationsSent.inc({ priority: priority.toString(), status });
+      notificationDeliveryLatency.observe({ priority: priority.toString() }, latency);
+
+      logDelivery(notificationId, deviceId, status, {
+        priority,
+        latency_ms: Date.now() - startTime,
+      });
+
+      notificationsInFlight.dec();
+
+      return {
+        notification_id: notificationId,
+        status,
+      };
+    } catch (error) {
+      notificationsInFlight.dec();
+      notificationsSent.inc({ priority: priority.toString(), status: "failed" });
+      throw error;
+    }
   }
 
   /**

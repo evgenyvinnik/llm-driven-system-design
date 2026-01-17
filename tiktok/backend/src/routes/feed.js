@@ -2,8 +2,20 @@ import express from 'express';
 import { query } from '../db.js';
 import { getRedis } from '../redis.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
+import { createLogger } from '../shared/logger.js';
+import { getRateLimiters } from '../index.js';
+import {
+  fypLatencyHistogram,
+  recommendationLatencyHistogram,
+  timeAsync,
+} from '../shared/metrics.js';
+import { createCircuitBreaker, withCircuitBreaker } from '../shared/circuitBreaker.js';
 
 const router = express.Router();
+const logger = createLogger('feed');
+
+// Helper to get rate limiters
+const getLimiters = () => getRateLimiters();
 
 // Exploration rate for new content discovery
 const EXPLORE_RATE = 0.2; // 20% exploration
@@ -29,18 +41,56 @@ const formatVideo = (video, userId = null, likedVideoIds = []) => ({
   createdAt: video.created_at,
 });
 
+// Circuit breaker for recommendation service
+const recommendationBreaker = createCircuitBreaker(
+  'recommendation',
+  async (userId, limit, offset) => {
+    return await getPersonalizedFeedInternal(userId, limit, offset);
+  },
+  {
+    timeout: 5000,                    // 5 seconds max
+    errorThresholdPercentage: 50,
+    resetTimeout: 15000,
+    volumeThreshold: 20,
+  }
+);
+
 // For You Page - personalized feed
-router.get('/fyp', optionalAuth, async (req, res) => {
+router.get('/fyp', optionalAuth, async (req, res, next) => {
+  // Apply rate limiting
+  const limiters = getLimiters();
+  if (limiters?.feed) {
+    return limiters.feed(req, res, async () => {
+      await handleFYP(req, res, next);
+    });
+  }
+  await handleFYP(req, res, next);
+});
+
+async function handleFYP(req, res, next) {
+  const startTime = Date.now();
+
   try {
     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const offset = parseInt(req.query.offset) || 0;
 
     let videos;
     const userId = req.session?.userId;
+    const userType = userId ? 'authenticated' : 'anonymous';
 
     if (userId) {
-      // Personalized feed for logged-in users
-      videos = await getPersonalizedFeed(userId, limit, offset);
+      // Personalized feed with circuit breaker
+      try {
+        videos = await recommendationBreaker.fire(userId, limit, offset);
+      } catch (error) {
+        if (error.message === 'Breaker is open') {
+          logger.warn({ userId }, 'Recommendation circuit open, falling back to trending');
+          // Fallback to trending when recommendation service is down
+          videos = await getTrendingFeed(limit, offset);
+        } else {
+          throw error;
+        }
+      }
     } else {
       // Trending feed for anonymous users
       videos = await getTrendingFeed(limit, offset);
@@ -59,18 +109,32 @@ router.get('/fyp', optionalAuth, async (req, res) => {
       }
     }
 
+    // Record FYP latency metric
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    fypLatencyHistogram.labels(userType).observe(durationSeconds);
+
     res.json({
       videos: videos.map(v => formatVideo(v, userId, likedVideoIds)),
       hasMore: videos.length === limit,
     });
   } catch (error) {
-    console.error('Get FYP error:', error);
+    logger.error({ error: error.message, userId: req.session?.userId }, 'Get FYP error');
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 // Following feed - videos from followed users
-router.get('/following', requireAuth, async (req, res) => {
+router.get('/following', requireAuth, async (req, res, next) => {
+  const limiters = getLimiters();
+  if (limiters?.feed) {
+    return limiters.feed(req, res, async () => {
+      await handleFollowing(req, res, next);
+    });
+  }
+  await handleFollowing(req, res, next);
+});
+
+async function handleFollowing(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const offset = parseInt(req.query.offset) || 0;
@@ -104,13 +168,23 @@ router.get('/following', requireAuth, async (req, res) => {
       hasMore: result.rows.length === limit,
     });
   } catch (error) {
-    console.error('Get following feed error:', error);
+    logger.error({ error: error.message, userId: req.session.userId }, 'Get following feed error');
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 // Trending feed
-router.get('/trending', optionalAuth, async (req, res) => {
+router.get('/trending', optionalAuth, async (req, res, next) => {
+  const limiters = getLimiters();
+  if (limiters?.feed) {
+    return limiters.feed(req, res, async () => {
+      await handleTrending(req, res, next);
+    });
+  }
+  await handleTrending(req, res, next);
+});
+
+async function handleTrending(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const offset = parseInt(req.query.offset) || 0;
@@ -136,10 +210,10 @@ router.get('/trending', optionalAuth, async (req, res) => {
       hasMore: videos.length === limit,
     });
   } catch (error) {
-    console.error('Get trending error:', error);
+    logger.error({ error: error.message }, 'Get trending error');
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 // Hashtag feed
 router.get('/hashtag/:tag', optionalAuth, async (req, res) => {
@@ -179,13 +253,23 @@ router.get('/hashtag/:tag', optionalAuth, async (req, res) => {
       hasMore: result.rows.length === limit,
     });
   } catch (error) {
-    console.error('Get hashtag feed error:', error);
+    logger.error({ error: error.message, hashtag: req.params.tag }, 'Get hashtag feed error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Search videos
-router.get('/search', optionalAuth, async (req, res) => {
+router.get('/search', optionalAuth, async (req, res, next) => {
+  const limiters = getLimiters();
+  if (limiters?.search) {
+    return limiters.search(req, res, async () => {
+      await handleSearch(req, res, next);
+    });
+  }
+  await handleSearch(req, res, next);
+});
+
+async function handleSearch(req, res, next) {
   try {
     const { q } = req.query;
     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
@@ -227,24 +311,34 @@ router.get('/search', optionalAuth, async (req, res) => {
       }
     }
 
+    logger.debug({ query: q, resultCount: result.rows.length }, 'Search completed');
+
     res.json({
       query: q,
       videos: result.rows.map(v => formatVideo(v, userId, likedVideoIds)),
       hasMore: result.rows.length === limit,
     });
   } catch (error) {
-    console.error('Search error:', error);
+    logger.error({ error: error.message, query: req.query.q }, 'Search error');
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
-// Get personalized feed with two-phase approach
-async function getPersonalizedFeed(userId, limit, offset) {
-  // Phase 1: Candidate Generation
-  const candidates = await generateCandidates(userId, limit * 5 + offset);
+// Internal personalized feed function (wrapped by circuit breaker)
+async function getPersonalizedFeedInternal(userId, limit, offset) {
+  // Phase 1: Candidate Generation with metrics
+  const candidates = await timeAsync(
+    recommendationLatencyHistogram,
+    { phase: 'candidate_generation' },
+    () => generateCandidates(userId, limit * 5 + offset)
+  );
 
-  // Phase 2: Ranking
-  const ranked = await rankVideos(userId, candidates);
+  // Phase 2: Ranking with metrics
+  const ranked = await timeAsync(
+    recommendationLatencyHistogram,
+    { phase: 'ranking' },
+    () => rankVideos(userId, candidates)
+  );
 
   // Apply offset and limit
   return ranked.slice(offset, offset + limit);

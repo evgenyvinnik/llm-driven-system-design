@@ -1045,3 +1045,162 @@ app.put('/api/v1/admin/tracks/:id', auditLog('admin.track.update'), updateTrackH
 | Consistency | Strong for library, eventual for plays | All strong | Performance vs correctness tradeoff |
 | Auth | Session + Redis | JWT | Easier revocation, simpler for local dev |
 | Rate limiting | Redis-backed sliding window | In-memory | Distributed, persistent across restarts |
+
+---
+
+## Implementation Notes
+
+This section documents the observability, security, and consistency improvements implemented in the backend codebase.
+
+### 1. Structured Logging with Pino
+
+**Location:** `backend/src/shared/logger.js`
+
+**What was implemented:**
+- JSON-formatted logging using pino
+- Request correlation via `X-Request-ID` headers
+- Separate audit logger for security events
+- Stream-specific event logging
+
+**Why this improves the system:**
+- **Queryability**: JSON logs enable filtering in log aggregation tools (Loki, ELK, CloudWatch). Finding all errors for a specific user becomes a simple query: `userId="abc" AND level="error"`.
+- **Correlation**: Request IDs allow tracing a single request across all log entries, essential for debugging distributed issues.
+- **Compliance**: Audit logs create a separate, immutable record of security-relevant events (login attempts, admin actions, permission changes) required for SOC2/GDPR compliance.
+- **Performance**: Pino is one of the fastest Node.js loggers, adding minimal overhead to request processing.
+
+### 2. Prometheus Metrics
+
+**Location:** `backend/src/shared/metrics.js`
+
+**What was implemented:**
+- HTTP request duration histogram (p50/p95/p99 latency)
+- Stream start latency histogram (critical SLI)
+- Active streams gauge (capacity planning)
+- Library/playlist operation counters
+- Cache hit rate counters
+- Rate limit hit counters
+- Idempotency cache usage counters
+
+**Why this improves the system:**
+- **SLI Tracking**: Histograms for stream latency directly map to SLOs (e.g., "95th percentile stream start < 200ms"). Dashboards can show real-time SLO compliance.
+- **Capacity Planning**: Active streams gauge helps determine when to scale. If `activeStreams` approaches server capacity, auto-scaling can trigger.
+- **Cache Effectiveness**: Cache hit counters reveal when Redis is providing value. A low hit rate suggests cache TTL issues or key invalidation bugs.
+- **Alerting**: Metrics enable Prometheus alerting rules. Example: alert when error rate exceeds 0.5% for 5 minutes.
+
+### 3. Rate Limiting
+
+**Location:** `backend/src/shared/rateLimit.js`
+
+**What was implemented:**
+- Redis-backed sliding window rate limiting
+- Tiered limits by endpoint category:
+  - Global: 100 req/min
+  - Streaming: 300 req/min (higher for segment fetching)
+  - Search: 30 req/min (expensive operation)
+  - Login: 5 attempts/15 min (brute force protection)
+  - Admin: 50 req/min
+  - Playlist creation: 10/hour (spam prevention)
+
+**Why this improves the system:**
+- **Distributed Consistency**: Redis-backed limiting ensures rate limits are enforced correctly across multiple server instances. In-memory limits would reset on restart and vary by instance.
+- **Fair Resource Usage**: Different limits for different operations prevent abuse while allowing legitimate usage. Users can stream many songs but cannot spam search requests.
+- **Security**: Login rate limiting prevents credential stuffing attacks. 5 attempts per 15 minutes makes brute force impractical.
+- **Graceful Degradation**: Standard `429 Too Many Requests` response with `Retry-After` header tells clients exactly when to retry.
+
+### 4. Idempotency for Playlist Operations
+
+**Location:** `backend/src/shared/idempotency.js`, `backend/src/routes/playlists.js`
+
+**What was implemented:**
+- `X-Idempotency-Key` header support for POST operations
+- 24-hour cached response storage in Redis
+- Automatic response replay for duplicate requests
+- Idempotency key validation (format checking)
+
+**Why this improves the system:**
+- **Network Resilience**: Mobile clients on spotty connections can safely retry requests. If a playlist creation request times out, the client can resend with the same idempotency key and either get the cached success response or trigger a new creation.
+- **Duplicate Prevention**: Without idempotency, a network timeout after successful creation leads to duplicate playlists when the client retries.
+- **Consistent User Experience**: Users never see unexpected duplicate content. The database stays clean.
+- **24-Hour TTL**: Balances memory usage (keys are cleaned up) with a reasonable retry window (user could retry the next day).
+
+### 5. Session-Based Authentication with RBAC
+
+**Location:** `backend/src/middleware/auth.js`
+
+**What was implemented:**
+- Session validation with Redis caching
+- Role-based permissions: `user`, `premium_user`, `curator`, `admin`
+- Permission-based middleware (`requirePermission('playlist:public')`)
+- Subscription tier checks
+- Session invalidation for logout
+
+**Why this improves the system:**
+- **Instant Revocation**: Unlike JWTs, sessions can be invalidated immediately. If a user's subscription expires or they're banned, their access is revoked on the next request.
+- **Redis Caching**: Sessions are validated from cache on most requests (avoiding database hits), with cache-aside pattern for cache misses.
+- **Granular Permissions**: RBAC enables fine-grained access control. A curator can create public playlists but cannot access admin endpoints. Permissions can evolve independently of roles.
+- **Subscription Enforcement**: Streaming quality is automatically limited based on subscription tier. Premium users get lossless; free users get 256 AAC.
+
+### 6. Enhanced Health Checks
+
+**Location:** `backend/src/shared/health.js`
+
+**What was implemented:**
+- `/health` - Simple liveness probe
+- `/health/ready` - Detailed readiness check with component status
+- PostgreSQL and Redis connectivity checks
+- Latency measurement per component
+
+**Why this improves the system:**
+- **Load Balancer Integration**: Kubernetes and load balancers use these endpoints to route traffic only to healthy instances.
+- **Component-Level Visibility**: When `/health/ready` fails, the response shows exactly which component (PostgreSQL or Redis) is unhealthy, speeding up incident diagnosis.
+- **Zero-Downtime Deployments**: Readiness checks ensure new instances don't receive traffic until all dependencies are connected.
+
+### 7. Streaming Metrics
+
+**Location:** `backend/src/routes/streaming.js`
+
+**What was implemented:**
+- Stream start latency tracking (histogram)
+- Active streams gauge by quality
+- Total streams counter by quality and subscription tier
+- Stream lifecycle events (started, prefetch, completed, ended)
+
+**Why this improves the system:**
+- **SLI Monitoring**: Stream start latency is a critical user experience metric. Tracking p95 latency ensures we meet the < 200ms target.
+- **Quality Distribution**: Metrics show which quality tiers are most used. If 90% of streams are 256 AAC, it might indicate bandwidth issues or free tier dominance.
+- **Capacity Signals**: Active streams gauge provides real-time load visibility. Correlating with CPU/memory metrics reveals per-stream resource cost.
+- **User Journey Tracking**: Stream events (start, prefetch, complete, end) enable funnel analysis. High prefetch-to-start ratio indicates good UX; high start-to-end-early ratio might indicate content issues.
+
+### Files Created/Modified
+
+| File | Purpose |
+|------|---------|
+| `src/shared/logger.js` | Structured logging with pino |
+| `src/shared/metrics.js` | Prometheus metrics collection |
+| `src/shared/rateLimit.js` | Redis-backed rate limiting |
+| `src/shared/idempotency.js` | Request idempotency handling |
+| `src/shared/health.js` | Health check endpoints |
+| `src/middleware/auth.js` | Enhanced auth with RBAC |
+| `src/index.js` | Integration of all modules |
+| `src/routes/playlists.js` | Idempotency for mutations |
+| `src/routes/streaming.js` | Stream metrics and logging |
+
+### Dependencies Added
+
+```json
+{
+  "pino": "^8.x",
+  "pino-http": "^9.x",
+  "prom-client": "^15.x",
+  "express-rate-limit": "^7.x",
+  "rate-limit-redis": "^4.x"
+}
+```
+
+### Endpoint Summary
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | Liveness probe |
+| `GET /health/ready` | Readiness probe with component status |
+| `GET /metrics` | Prometheus metrics export |

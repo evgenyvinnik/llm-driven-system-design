@@ -872,3 +872,247 @@ Admin API (/api/v1/admin/*)
 ├── /workspaces/:id/audit-log      # View audit trail
 └── /workspaces/:id/export         # Data export
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the implementation of key middleware and patterns in the backend codebase.
+
+### Idempotency for Message Sending
+
+**Location:** `backend/src/middleware/idempotency.ts`
+
+**WHY idempotency prevents duplicate messages on network retry:**
+
+When a client sends a message and the network fails after the server processes the request but before the response reaches the client, the client will retry. Without idempotency, this creates duplicate messages in the database.
+
+**How it works:**
+1. Client includes an `X-Idempotency-Key` header with a unique identifier (e.g., `msg:channel123:abc:1234567890`)
+2. Middleware checks Redis for this key before processing
+3. If found, returns the cached response (no database write)
+4. If not found, processes the request and caches the response for 24 hours
+5. A distributed lock prevents race conditions when parallel retries arrive
+
+```typescript
+// Client retry scenario without idempotency:
+POST /messages { content: "Hello" }  → Server saves message #1
+                                      → Response lost in network
+POST /messages { content: "Hello" }  → Server saves message #2 (DUPLICATE!)
+
+// With idempotency:
+POST /messages + X-Idempotency-Key: abc123  → Server saves message #1, caches response
+                                             → Response lost in network
+POST /messages + X-Idempotency-Key: abc123  → Cache hit, returns cached response (NO DUPLICATE)
+```
+
+**Benefits:**
+- At-least-once delivery becomes effectively exactly-once for writes
+- Safe for clients to retry without coordination
+- 24-hour TTL balances memory usage vs retry window
+
+---
+
+### Cache-Aside Pattern for Channels/Users
+
+**Location:** `backend/src/services/cache.ts`
+
+**WHY cache-aside pattern reduces database load for read-heavy workloads:**
+
+Slack-like applications are extremely read-heavy. Every message sent requires looking up channel members to fan out via WebSocket. User profiles are fetched on every message display. Without caching, the database becomes the bottleneck.
+
+**How it works:**
+1. On read: Check Redis cache first
+2. On cache miss: Query PostgreSQL, then populate cache with TTL
+3. On write: Invalidate cache (not update) to ensure consistency
+4. Application controls all cache population (flexibility)
+
+```typescript
+// Cache-aside read flow:
+async function getCachedUser(userId: string) {
+  // 1. Check cache first
+  const cached = await redis.get(`cache:user:${userId}`);
+  if (cached) return JSON.parse(cached);  // Cache HIT
+
+  // 2. Cache miss - fetch from database
+  const user = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+
+  // 3. Populate cache for future reads
+  await redis.setex(`cache:user:${userId}`, 300, JSON.stringify(user));
+
+  return user;
+}
+```
+
+**TTL Configuration:**
+| Cache Key | TTL | Rationale |
+|-----------|-----|-----------|
+| `cache:user:{id}` | 5 min | Profiles change infrequently |
+| `cache:channel:{id}` | 2 min | Channel metadata accessed often |
+| `cache:channel:{id}:members` | 2 min | Critical for message fan-out |
+| `cache:workspace:{id}` | 10 min | Settings rarely change |
+
+**Why cache-aside over write-through:**
+- Only caches data that's actually accessed (memory efficient)
+- Handles cache failures gracefully (falls back to database)
+- Simple invalidation model (just delete the key)
+
+---
+
+### RBAC for Workspace Isolation
+
+**Location:** `backend/src/middleware/rbac.ts`
+
+**WHY RBAC enables workspace isolation:**
+
+Each Slack workspace is an isolated tenant with its own members, channels, and messages. RBAC ensures:
+1. Users can only access workspaces they belong to
+2. Different permission levels within each workspace
+3. Admins can manage their workspace without affecting others
+4. Owners have full control without needing system-wide admin access
+
+**Role Hierarchy:**
+```
+owner (3) → Can delete workspace, manage all settings
+  ↓
+admin (2) → Can manage channels, remove members
+  ↓
+member (1) → Can create channels, send messages
+  ↓
+guest (0) → Can only send messages in allowed channels
+```
+
+**Permission Matrix:**
+| Permission | Guest | Member | Admin | Owner |
+|------------|-------|--------|-------|-------|
+| Send messages | Yes | Yes | Yes | Yes |
+| Create channels | No | Yes | Yes | Yes |
+| Delete any message | No | No | Yes | Yes |
+| Remove members | No | No | Yes | Yes |
+| Update workspace settings | No | No | No | Yes |
+
+**Implementation:**
+```typescript
+// Middleware checks role hierarchy
+export function requireRole(minRole: WorkspaceRole) {
+  return async (req, res, next) => {
+    const membership = await db.query(
+      'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
+      [workspaceId, userId]
+    );
+
+    if (ROLE_HIERARCHY[membership.role] < ROLE_HIERARCHY[minRole]) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    req.membership = membership;
+    next();
+  };
+}
+```
+
+**Benefits:**
+- Single authorization check handles all role-based restrictions
+- Workspace isolation is enforced at the middleware level
+- Easy to add new roles or permissions
+- Membership data available to route handlers for business logic
+
+---
+
+### Rate Limiting for Abuse Prevention
+
+**Location:** `backend/src/middleware/rateLimit.ts`
+
+**WHY rate limiting prevents abuse:**
+
+Without rate limiting, a single user could:
+- Spam thousands of messages overwhelming the database
+- Exhaust server resources causing slowdowns for everyone
+- Create denial-of-service conditions for their workspace
+- Abuse search functionality to scan all content
+
+**How it works (Sliding Window Algorithm):**
+```typescript
+async function checkRateLimit(key: string, limit: number, windowSec: number) {
+  const now = Date.now();
+  const windowStart = now - windowSec * 1000;
+
+  const pipeline = redis.pipeline();
+  pipeline.zremrangebyscore(key, 0, windowStart);  // Remove old entries
+  pipeline.zadd(key, now, `${now}:${random()}`);   // Add current request
+  pipeline.zcard(key);                              // Count in window
+  pipeline.expire(key, windowSec);                  // Set TTL
+
+  const count = (await pipeline.exec())[2][1];
+  return { allowed: count <= limit, remaining: limit - count };
+}
+```
+
+**Rate Limits by Operation:**
+| Endpoint | Limit | Window | Admin Multiplier |
+|----------|-------|--------|------------------|
+| POST /messages | 60 | 1 min | 2x (120) |
+| POST /channels | 10 | 1 min | 2x (20) |
+| POST /reactions | 30 | 1 min | 2x (60) |
+| GET /search | 20 | 1 min | 3x (60) |
+
+**Why sliding window over fixed window:**
+- Fixed window allows burst at window boundaries (e.g., 60 requests at 0:59, 60 more at 1:00)
+- Sliding window provides smooth rate limiting with no boundary effects
+- Uses Redis sorted sets for O(1) operations
+
+**Response Headers:**
+```
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 45
+X-RateLimit-Reset: 1642934400
+```
+
+---
+
+### Prometheus Metrics
+
+**Location:** `backend/src/services/metrics.ts`
+
+**Available Metrics:**
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `slack_messages_sent_total` | Counter | workspace_id, channel_type | Message throughput |
+| `slack_websocket_connections_active` | Gauge | - | Real-time connection health |
+| `slack_http_request_duration_seconds` | Histogram | method, route, status_code | API latency monitoring |
+| `slack_cache_operations_total` | Counter | cache_name, result | Cache hit/miss ratio |
+| `slack_rate_limit_hits_total` | Counter | endpoint | Abuse detection |
+
+**Endpoints:**
+- `GET /metrics` - Prometheus text format
+- `GET /health` - Basic health check
+- `GET /health/detailed` - Service-by-service status
+- `GET /ready` - Readiness probe for K8s
+- `GET /live` - Liveness probe for K8s
+
+---
+
+### Structured Logging
+
+**Location:** `backend/src/services/logger.ts`
+
+**Features:**
+- JSON output in production for log aggregation
+- Pretty-printed output in development
+- Request-scoped context (request ID, user ID, workspace ID)
+- Log levels: trace, debug, info, warn, error, fatal
+
+**Example Log Output:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "slack-backend",
+  "requestId": "abc123",
+  "userId": "user-456",
+  "workspaceId": "ws-789",
+  "msg": "Message sent",
+  "messageId": 12345,
+  "channelId": "ch-101"
+}
+```

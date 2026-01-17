@@ -3,14 +3,15 @@
  *
  * Provides endpoints for:
  * - Getting canvas configuration and current state
- * - Placing pixels with rate limiting
+ * - Placing pixels with rate limiting and idempotency
  * - Retrieving pixel history and recent events
  * - Generating timelapse frames
  */
 import { Router, Request, Response } from 'express';
 import { canvasService } from '../services/canvas.js';
-import { authMiddleware, optionalAuthMiddleware } from '../middleware/auth.js';
+import { authMiddleware } from '../middleware/auth.js';
 import { CANVAS_WIDTH, CANVAS_HEIGHT, COLOR_PALETTE, COOLDOWN_SECONDS } from '../config.js';
+import { logger } from '../shared/logger.js';
 
 const router = Router();
 
@@ -38,7 +39,7 @@ router.get('/', async (req: Request, res: Response) => {
     const canvasBase64 = await canvasService.getCanvasBase64();
     res.json({ canvas: canvasBase64 });
   } catch (error) {
-    console.error('Error getting canvas:', error);
+    logger.error({ error }, 'Error getting canvas');
     res.status(500).json({ error: 'Failed to get canvas' });
   }
 });
@@ -47,6 +48,12 @@ router.get('/', async (req: Request, res: Response) => {
  * POST /pixel - Place a pixel on the canvas.
  * Requires authentication. Enforces rate limiting via cooldown.
  * Returns 429 if user is still in cooldown period.
+ *
+ * Supports idempotency via:
+ * - X-Request-ID header: Client-provided request ID for exact duplicate detection
+ * - X-Idempotency-Key header: Alternative header for idempotency key
+ *
+ * Duplicate requests with the same idempotency key will return the cached result.
  */
 router.post('/pixel', authMiddleware, async (req: Request, res: Response) => {
   const { x, y, color } = req.body;
@@ -56,10 +63,18 @@ router.post('/pixel', authMiddleware, async (req: Request, res: Response) => {
     return;
   }
 
-  const result = await canvasService.placePixel(req.user!.id, x, y, color);
+  // Extract optional request ID for idempotency
+  const requestId =
+    req.headers['x-request-id'] as string ||
+    req.headers['x-idempotency-key'] as string ||
+    undefined;
+
+  const result = await canvasService.placePixel(req.user!.id, x, y, color, requestId);
 
   if (!result.success) {
-    res.status(429).json({
+    // Return 429 for rate limiting, 400 for validation errors
+    const status = result.error?.includes('Rate limited') ? 429 : 400;
+    res.status(status).json({
       error: result.error,
       nextPlacement: result.nextPlacement,
     });

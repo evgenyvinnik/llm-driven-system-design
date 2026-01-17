@@ -11,6 +11,8 @@
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { queryMetrics } from './queryService.js';
+import logger from '../shared/logger.js';
+import { alertsFiring, alertEvaluationsTotal } from '../shared/metrics.js';
 import type {
   AlertRule,
   AlertInstance,
@@ -407,14 +409,19 @@ export async function evaluateAllAlerts(): Promise<void> {
           // Create new alert instance
           const instance = await createAlertInstance(rule.id, currentValue);
           await sendNotifications(rule, instance, currentValue);
+          alertEvaluationsTotal.inc({ result: 'firing' });
         }
       } else if (!shouldFire && currentFiring) {
         // Resolve the alert
         await resolveAlertInstance(currentFiring.id);
-        console.log(`Alert resolved: ${rule.name}`);
+        logger.info({ ruleId: rule.id, ruleName: rule.name }, 'Alert resolved');
+        alertEvaluationsTotal.inc({ result: 'resolved' });
+      } else {
+        alertEvaluationsTotal.inc({ result: 'no_change' });
       }
     } catch (error) {
-      console.error(`Error evaluating alert rule ${rule.id}:`, error);
+      logger.error({ error, ruleId: rule.id }, 'Error evaluating alert rule');
+      alertEvaluationsTotal.inc({ result: 'error' });
     }
   }
 }
@@ -440,13 +447,17 @@ async function sendNotifications(
   for (const notification of notifications) {
     switch (notification.channel) {
       case 'console':
-        console.log(
-          `[ALERT] ${rule.severity.toUpperCase()}: ${rule.name} - Value: ${value.toFixed(2)} (threshold: ${rule.condition.operator} ${rule.condition.threshold})`
-        );
+        logger.warn({
+          alertName: rule.name,
+          severity: rule.severity,
+          value,
+          threshold: rule.condition.threshold,
+          operator: rule.condition.operator,
+        }, 'Alert fired');
         break;
       case 'webhook':
         // In a real system, would send HTTP request
-        console.log(`Would send webhook to ${notification.target}`);
+        logger.info({ target: notification.target }, 'Would send webhook notification');
         break;
     }
   }
@@ -478,18 +489,18 @@ export function startAlertEvaluator(intervalSeconds: number = 30): void {
     clearInterval(alertInterval);
   }
 
-  console.log(`Starting alert evaluator (interval: ${intervalSeconds}s)`);
+  logger.info({ intervalSeconds }, 'Starting alert evaluator');
 
   alertInterval = setInterval(async () => {
     try {
       await evaluateAllAlerts();
     } catch (error) {
-      console.error('Alert evaluation error:', error);
+      logger.error({ error }, 'Alert evaluation error');
     }
   }, intervalSeconds * 1000);
 
   // Run once immediately
-  evaluateAllAlerts().catch(console.error);
+  evaluateAllAlerts().catch((error) => logger.error({ error }, 'Initial alert evaluation failed'));
 }
 
 /**

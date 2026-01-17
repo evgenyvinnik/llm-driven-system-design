@@ -2,12 +2,21 @@
  * @fileoverview Core search service for the post search system.
  * Handles Elasticsearch query building, privacy filtering, personalized ranking,
  * search suggestions, and search history management.
+ * Includes Prometheus metrics, circuit breaker protection, and structured logging.
  */
 
 import { esClient, POSTS_INDEX } from '../config/elasticsearch.js';
-import { getUserVisibilitySet, getUserFriendIds } from './visibilityService.js';
+import { getUserVisibilitySet } from './visibilityService.js';
 import { query } from '../config/database.js';
 import { redis, cacheKeys, setCache, getCache } from '../config/redis.js';
+import {
+  recordSearchMetrics,
+  recordCacheAccess,
+  logSearch,
+  logger,
+  executeWithCircuitBreaker,
+  isElasticsearchCircuitOpen,
+} from '../shared/index.js';
 import type {
   SearchRequest,
   SearchResponse,
@@ -171,81 +180,115 @@ async function buildSearchQuery(
  * Executes a search query against the posts index.
  * Handles pagination, privacy filtering, friend boosting, and result highlighting.
  * Records search in history for authenticated users and updates trending searches.
+ * Protected by circuit breaker for Elasticsearch failures.
  * @param request - Search request containing query, filters, pagination, and user context
  * @returns Promise resolving to search results with metadata
  */
 export async function searchPosts(request: SearchRequest): Promise<SearchResponse> {
   const startTime = Date.now();
+  const hasUser = !!request.user_id;
 
-  const limit = request.pagination?.limit || 20;
-  const from = request.pagination?.cursor ? parseInt(request.pagination.cursor, 10) : 0;
-
-  const esQuery = await buildSearchQuery(
-    request.query,
-    request.filters,
-    request.user_id,
-    from,
-    limit
-  );
-
-  interface EsHit {
-    _id: string;
-    _score: number;
-    _source: PostDocument;
-    highlight?: {
-      content?: string[];
-    };
+  // Check if circuit breaker is open - fail fast
+  if (isElasticsearchCircuitOpen()) {
+    logger.warn('Search request rejected - Elasticsearch circuit breaker is open');
+    recordSearchMetrics(0, 'error', hasUser, 0);
+    throw new Error('Search service temporarily unavailable');
   }
 
-  const response = await esClient.search<PostDocument>({
-    index: POSTS_INDEX,
-    body: esQuery,
-  });
+  try {
+    const limit = request.pagination?.limit || 20;
+    const from = request.pagination?.cursor ? parseInt(request.pagination.cursor, 10) : 0;
 
-  const hits = response.hits.hits as EsHit[];
-  const total = typeof response.hits.total === 'object'
-    ? response.hits.total.value
-    : response.hits.total || 0;
-
-  const results: SearchResult[] = hits.map((hit) => {
-    const source = hit._source;
-    const highlight = hit.highlight?.content?.[0] || source.content.substring(0, 200);
-
-    return {
-      post_id: source.post_id,
-      author_id: source.author_id,
-      author_name: source.author_name,
-      content: source.content,
-      snippet: highlight,
-      hashtags: source.hashtags,
-      created_at: source.created_at,
-      visibility: source.visibility,
-      post_type: source.post_type,
-      engagement_score: source.engagement_score,
-      like_count: source.like_count,
-      comment_count: source.comment_count,
-      relevance_score: hit._score,
-    };
-  });
-
-  // Record search in history if user is logged in
-  if (request.user_id && request.query.trim()) {
-    recordSearchHistory(request.user_id, request.query, request.filters, results.length).catch(
-      console.error
+    const esQuery = await buildSearchQuery(
+      request.query,
+      request.filters,
+      request.user_id,
+      from,
+      limit
     );
 
-    // Update trending searches
-    updateTrendingSearches(request.query).catch(console.error);
+    interface EsHit {
+      _id: string;
+      _score: number;
+      _source: PostDocument;
+      highlight?: {
+        content?: string[];
+      };
+    }
+
+    // Execute search with circuit breaker protection
+    const response = await executeWithCircuitBreaker(async () => {
+      return esClient.search<PostDocument>({
+        index: POSTS_INDEX,
+        body: esQuery,
+      });
+    });
+
+    const hits = response.hits.hits as EsHit[];
+    const total = typeof response.hits.total === 'object'
+      ? response.hits.total.value
+      : response.hits.total || 0;
+
+    const results: SearchResult[] = hits.map((hit) => {
+      const source = hit._source;
+      const highlight = hit.highlight?.content?.[0] || source.content.substring(0, 200);
+
+      return {
+        post_id: source.post_id,
+        author_id: source.author_id,
+        author_name: source.author_name,
+        content: source.content,
+        snippet: highlight,
+        hashtags: source.hashtags,
+        created_at: source.created_at,
+        visibility: source.visibility,
+        post_type: source.post_type,
+        engagement_score: source.engagement_score,
+        like_count: source.like_count,
+        comment_count: source.comment_count,
+        relevance_score: hit._score,
+      };
+    });
+
+    // Record search in history if user is logged in
+    if (request.user_id && request.query.trim()) {
+      recordSearchHistory(request.user_id, request.query, request.filters, results.length).catch(
+        (err) => logger.error({ error: err }, 'Failed to record search history')
+      );
+
+      // Update trending searches
+      updateTrendingSearches(request.query).catch(
+        (err) => logger.error({ error: err }, 'Failed to update trending searches')
+      );
+    }
+
+    const nextCursor = from + results.length < total ? String(from + limit) : undefined;
+    const durationMs = Date.now() - startTime;
+
+    // Record metrics
+    recordSearchMetrics(durationMs / 1000, 'success', hasUser, results.length);
+
+    // Log search operation
+    logSearch({
+      query: request.query,
+      userId: request.user_id,
+      filters: request.filters as Record<string, unknown> | undefined,
+      resultsCount: results.length,
+      durationMs,
+    });
+
+    return {
+      results,
+      next_cursor: nextCursor,
+      total_estimate: total,
+      took_ms: durationMs,
+    };
+  } catch (error) {
+    const durationMs = Date.now() - startTime;
+    recordSearchMetrics(durationMs / 1000, 'error', hasUser, 0);
+    logger.error({ error, query: request.query }, 'Search failed');
+    throw error;
   }
-
-  const nextCursor = from + results.length < total ? String(from + limit) : undefined;
-
-  return {
-    results,
-    next_cursor: nextCursor,
-    total_estimate: total,
-    took_ms: Date.now() - startTime,
-  };
 }
 
 /**
@@ -312,42 +355,53 @@ export async function getSearchSuggestions(
   const cacheKey = cacheKeys.searchSuggestions(normalizedPrefix);
   const cached = await getCache<SearchSuggestion[]>(cacheKey);
   if (cached) {
+    recordCacheAccess('suggestions', true);
     return cached.slice(0, limit);
   }
+  recordCacheAccess('suggestions', false);
 
   // 1. Search for hashtag suggestions
   if (normalizedPrefix.startsWith('#')) {
     const hashtagPrefix = normalizedPrefix.substring(1);
-    const response = await esClient.search({
-      index: POSTS_INDEX,
-      body: {
-        size: 0,
-        aggs: {
-          hashtag_suggestions: {
-            terms: {
-              field: 'hashtags',
-              size: 20,
-              include: `${hashtagPrefix}.*`,
+
+    // Use circuit breaker for ES call
+    try {
+      const response = await executeWithCircuitBreaker(async () => {
+        return esClient.search({
+          index: POSTS_INDEX,
+          body: {
+            size: 0,
+            aggs: {
+              hashtag_suggestions: {
+                terms: {
+                  field: 'hashtags',
+                  size: 20,
+                  include: `${hashtagPrefix}.*`,
+                },
+              },
             },
           },
-        },
-      },
-    });
-
-    interface AggBucket {
-      key: string;
-      doc_count: number;
-    }
-
-    const aggs = response.aggregations as { hashtag_suggestions?: { buckets: AggBucket[] } };
-    const buckets = aggs?.hashtag_suggestions?.buckets || [];
-
-    for (const bucket of buckets) {
-      suggestions.push({
-        text: bucket.key,
-        type: 'hashtag',
-        score: bucket.doc_count,
+        });
       });
+
+      interface AggBucket {
+        key: string;
+        doc_count: number;
+      }
+
+      const aggs = response.aggregations as { hashtag_suggestions?: { buckets: AggBucket[] } };
+      const buckets = aggs?.hashtag_suggestions?.buckets || [];
+
+      for (const bucket of buckets) {
+        suggestions.push({
+          text: bucket.key,
+          type: 'hashtag',
+          score: bucket.doc_count,
+        });
+      }
+    } catch (error) {
+      logger.warn({ error }, 'Failed to get hashtag suggestions from ES');
+      // Continue without hashtag suggestions
     }
   } else {
     // 2. Get trending searches matching prefix

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import routingService from '../services/routingService.js';
+import logger from '../shared/logger.js';
 
 const router = Router();
 
@@ -30,7 +31,7 @@ router.post('/', async (req, res) => {
       route,
     });
   } catch (error) {
-    console.error('Route calculation error:', error);
+    logger.error({ error: error.message, path: '/api/routes' }, 'Route calculation error');
     res.status(500).json({
       error: error.message || 'Failed to calculate route',
     });
@@ -73,7 +74,7 @@ router.post('/alternatives', async (req, res) => {
       routes: [primaryRoute, ...alternatives],
     });
   } catch (error) {
-    console.error('Route alternatives error:', error);
+    logger.error({ error: error.message, path: '/api/routes/alternatives' }, 'Route alternatives error');
     res.status(500).json({
       error: error.message || 'Failed to calculate routes',
     });

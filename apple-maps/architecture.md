@@ -1140,3 +1140,208 @@ async function checkRoutingGraph() {
 | Probe deduplication | Redis with TTL | Database unique constraint | Performance at scale |
 | Circuit breaker timeout | 30 seconds | Shorter/longer | Balance between recovery and availability |
 | Backup frequency | Daily | Hourly | Sufficient for learning project, low data change rate |
+
+---
+
+## Implementation Notes
+
+This section documents the production-ready observability and resilience patterns implemented in the backend codebase.
+
+### Prometheus Metrics (src/shared/metrics.js)
+
+**WHY**: Metrics are the foundation of the RED method (Rate, Errors, Duration) observability:
+
+1. **Route Calculation Latency** (`routing_calculation_duration_seconds`)
+   - Histogram with buckets from 50ms to 5s
+   - Enables SLI tracking: "p95 route latency < 500ms"
+   - Labels by route_type and status for drill-down
+
+2. **HTTP Request Metrics** (`http_request_duration_seconds`, `http_requests_total`)
+   - Track every API request's duration and status code
+   - Normalized routes prevent cardinality explosion
+   - Active request gauge shows concurrent load
+
+3. **Cache Hit Rates** (`cache_hits_total`, `cache_misses_total`)
+   - Critical for capacity planning
+   - Low hit rate indicates cache misconfiguration
+   - Labels by cache_name for targeted optimization
+
+4. **Circuit Breaker State** (`circuit_breaker_state`)
+   - Real-time visibility into service health
+   - Enables alerts when breakers open
+   - Tracks failure/success counts for debugging
+
+**Alert Thresholds**:
+```
+routing_calculation_duration_seconds{quantile="0.95"} > 0.5 for 5m  -> Warning
+routing_requests_total{status="error"} / routing_requests_total > 0.01 for 5m -> Warning
+circuit_breaker_state{name="routing_graph_load"} == 1 for 1m -> Critical
+```
+
+### Structured Logging with Pino (src/shared/logger.js)
+
+**WHY**: Structured logs enable machine parsing and correlation:
+
+1. **JSON Format**: Every log is a JSON object with consistent fields
+   - `timestamp`, `level`, `service`, `message`
+   - Additional context fields as needed
+
+2. **Request Correlation**: HTTP middleware adds `requestId` to every log
+   - Trace a single request across all log entries
+   - Essential for debugging distributed issues
+
+3. **Sensitive Data Redaction**: Automatically removes:
+   - Authorization headers
+   - Cookies
+   - Password fields
+
+4. **Log Levels by Environment**:
+   - Production: `info` level, JSON output
+   - Development: `debug` level, pretty-printed
+
+5. **Audit Logging**: Separate logger for compliance events
+   - Admin actions, data exports, incident management
+   - Longer retention, immutable storage
+
+### Circuit Breakers (src/shared/circuitBreaker.js)
+
+**WHY**: Prevent cascading failures when dependencies fail:
+
+1. **Routing Graph Load Breaker**
+   - Protects against database overload during graph queries
+   - Fallback returns stale cached graph if available
+   - Opens after 5 failures, closes after 3 successes
+
+2. **Geocoding Breaker**
+   - Isolates geocoding failures from routing
+   - 5-second timeout prevents slow queries from blocking
+   - Allows 50% error rate before opening
+
+3. **Nearest Node Breaker**
+   - Separate breaker for expensive spatial queries
+   - Database index issues won't take down entire service
+
+**State Machine**:
+```
+CLOSED (normal) --[5 failures]--> OPEN (fail fast)
+OPEN --[30s timeout]--> HALF-OPEN (testing)
+HALF-OPEN --[3 successes]--> CLOSED
+HALF-OPEN --[1 failure]--> OPEN
+```
+
+### Idempotency (src/shared/idempotency.js)
+
+**WHY**: Ensure exactly-once semantics for write operations:
+
+1. **GPS Probe Ingestion**
+   - Key: `deviceId:timestamp`
+   - TTL: 1 hour (probes older than this are irrelevant)
+   - Duplicates return cached result, don't reprocess
+
+2. **Incident Reports**
+   - Client provides `Idempotency-Key` header or `clientRequestId`
+   - Merges nearby incidents rather than duplicating
+   - TTL: 24 hours for replay protection
+
+3. **Implementation**:
+   ```
+   1. Check Redis for existing key
+   2. If processing: return 409 Conflict with retryAfter
+   3. If completed: return cached result (replay)
+   4. If new: SET NX to acquire lock
+   5. Process request
+   6. Store result with TTL
+   ```
+
+4. **Failure Handling**:
+   - Failed requests marked with short TTL to allow retry
+   - Processing timeout (60s) prevents stuck locks
+
+### Rate Limiting (src/shared/rateLimit.js)
+
+**WHY**: Protect system from abuse and ensure fair usage:
+
+| Endpoint | Limit | Rationale |
+|----------|-------|-----------|
+| General API | 100/min | Baseline protection |
+| Routing | 30/min | CPU-intensive A* algorithm |
+| Search | 60/min | Database full-text search |
+| Geocoding | 45/min | Spatial query overhead |
+| Traffic data | 120/min | Frequent client polling |
+| Incident report | 10/min | Prevent spam |
+| GPS probe | 600/min | Navigation updates (10/sec max) |
+
+**Headers Returned**:
+- `RateLimit-Limit`: Maximum requests in window
+- `RateLimit-Remaining`: Requests left in current window
+- `RateLimit-Reset`: Unix timestamp when window resets
+
+### Health Checks (src/routes/health.js)
+
+**WHY**: Enable load balancer and orchestrator decisions:
+
+1. **Full Health Check** (`GET /health`)
+   - Checks all dependencies: PostgreSQL, Redis, routing graph, traffic freshness
+   - Returns 503 if any critical check fails
+   - Includes circuit breaker status for debugging
+
+2. **Liveness Probe** (`GET /health/live`)
+   - Returns 200 if process is running
+   - Kubernetes uses this to decide container restart
+
+3. **Readiness Probe** (`GET /health/ready`)
+   - Returns 200 only if service can handle traffic
+   - Checks database and cache connectivity
+   - Load balancer removes instance if unhealthy
+
+**Response Example**:
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "uptime": 3600.5,
+  "checks": {
+    "database": { "status": "healthy", "latencyMs": 2 },
+    "cache": { "status": "healthy", "latencyMs": 1 },
+    "routingGraph": { "status": "healthy", "nodes": 2500 },
+    "trafficData": { "status": "healthy", "freshnessRatio": "95%" }
+  },
+  "circuitBreakers": {
+    "routing_graph_load": { "state": "CLOSED" },
+    "geocoding": { "state": "CLOSED" }
+  }
+}
+```
+
+### Graceful Shutdown
+
+**WHY**: Prevent data loss and connection leaks during deployments:
+
+1. Handle `SIGTERM` and `SIGINT` signals
+2. Stop accepting new requests
+3. Wait for in-flight requests to complete (max 10s)
+4. Close database connection pool
+5. Disconnect from Redis
+6. Exit cleanly
+
+### Module Summary
+
+| Module | File | Purpose |
+|--------|------|---------|
+| Logger | `src/shared/logger.js` | Structured logging with pino |
+| Metrics | `src/shared/metrics.js` | Prometheus metrics collection |
+| Circuit Breaker | `src/shared/circuitBreaker.js` | Failure isolation with opossum |
+| Idempotency | `src/shared/idempotency.js` | Exactly-once write semantics |
+| Rate Limiting | `src/shared/rateLimit.js` | Request throttling per endpoint |
+| Health Checks | `src/routes/health.js` | Readiness and liveness probes |
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Full system health check |
+| `/health/live` | GET | Liveness probe (is process alive?) |
+| `/health/ready` | GET | Readiness probe (can serve traffic?) |
+| `/metrics` | GET | Prometheus metrics endpoint |
+| `/api/traffic/probe` | POST | Idempotent GPS probe ingestion |
+| `/api/traffic/incidents` | POST | Idempotent incident reporting |

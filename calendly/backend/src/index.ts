@@ -1,8 +1,13 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import session from 'express-session';
-import pinoHttp from 'pino-http';
+import * as pinoHttpModule from 'pino-http';
+import { IncomingMessage, ServerResponse } from 'http';
 import { testDatabaseConnection, testRedisConnection, redis, pool } from './db/index.js';
+
+// Handle ESM/CJS default export for pino-http
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pinoHttp = (pinoHttpModule as any).default || pinoHttpModule;
 
 // Shared modules
 import { logger } from './shared/logger.js';
@@ -36,19 +41,19 @@ const PORT = APP_CONFIG.PORT;
 // Structured JSON logging for all HTTP requests
 app.use(pinoHttp({
   logger,
-  genReqId: (req) => req.headers['x-request-id'] as string || crypto.randomUUID(),
-  customProps: (req) => ({
-    userId: (req as any).session?.userId,
+  genReqId: (req: IncomingMessage) => (req.headers['x-request-id'] as string) || crypto.randomUUID(),
+  customProps: (req: IncomingMessage) => ({
+    userId: (req as unknown as Request).session?.userId,
   }),
-  customLogLevel: (_req, res, err) => {
+  customLogLevel: (_req: IncomingMessage, res: ServerResponse, err: Error | undefined) => {
     if (res.statusCode >= 500 || err) return 'error';
     if (res.statusCode >= 400) return 'warn';
     return 'info';
   },
-  customSuccessMessage: (req, res) => {
+  customSuccessMessage: (req: IncomingMessage, res: ServerResponse) => {
     return `${req.method} ${req.url} ${res.statusCode}`;
   },
-  customErrorMessage: (req, res) => {
+  customErrorMessage: (req: IncomingMessage, res: ServerResponse) => {
     return `${req.method} ${req.url} ${res.statusCode}`;
   },
 }));

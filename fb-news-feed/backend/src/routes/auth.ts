@@ -2,6 +2,7 @@
  * @fileoverview Authentication routes for user registration, login, and logout.
  * Handles session creation with UUID tokens stored in both PostgreSQL and Redis.
  * Sessions expire after 7 days and are cached in Redis for fast validation.
+ * Includes authentication metrics for monitoring login patterns.
  */
 
 import { Router, Request, Response } from 'express';
@@ -9,7 +10,10 @@ import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import { pool, redis } from '../db/connection.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { componentLoggers, authAttemptsTotal } from '../shared/index.js';
 import type { RegisterRequest, LoginRequest, UserPublic } from '../types/index.js';
+
+const log = componentLoggers.auth;
 
 /** Express router for authentication endpoints */
 const router = Router();
@@ -64,6 +68,11 @@ router.post('/register', async (req: Request, res: Response) => {
     // Cache session in Redis
     await redis.setex(`session:${token}`, 7 * 24 * 60 * 60, user.id);
 
+    // Record metrics
+    authAttemptsTotal.labels('register', 'success').inc();
+
+    log.info({ userId: user.id, username: user.username }, 'User registered');
+
     res.status(201).json({
       user: {
         id: user.id,
@@ -79,7 +88,8 @@ router.post('/register', async (req: Request, res: Response) => {
       token,
     });
   } catch (error) {
-    console.error('Register error:', error);
+    authAttemptsTotal.labels('register', 'failure').inc();
+    log.error({ error }, 'Register error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -130,6 +140,11 @@ router.post('/login', async (req: Request, res: Response) => {
     // Cache session in Redis
     await redis.setex(`session:${token}`, 7 * 24 * 60 * 60, user.id);
 
+    // Record metrics
+    authAttemptsTotal.labels('login', 'success').inc();
+
+    log.info({ userId: user.id, email: user.email }, 'User logged in');
+
     res.json({
       user: {
         id: user.id,
@@ -145,7 +160,8 @@ router.post('/login', async (req: Request, res: Response) => {
       token,
     });
   } catch (error) {
-    console.error('Login error:', error);
+    authAttemptsTotal.labels('login', 'failure').inc();
+    log.error({ error }, 'Login error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -165,9 +181,15 @@ router.post('/logout', authMiddleware, async (req: Request, res: Response) => {
     // Delete from Redis
     await redis.del(`session:${token}`);
 
+    // Record metrics
+    authAttemptsTotal.labels('logout', 'success').inc();
+
+    log.info({ userId: req.user?.id }, 'User logged out');
+
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    console.error('Logout error:', error);
+    authAttemptsTotal.labels('logout', 'failure').inc();
+    log.error({ error }, 'Logout error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -194,7 +216,7 @@ router.get('/me', authMiddleware, async (req: Request, res: Response) => {
       created_at: user.created_at,
     });
   } catch (error) {
-    console.error('Get me error:', error);
+    log.error({ error }, 'Get me error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -157,7 +157,7 @@ router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    res.json({ ...workspace, role: membership.rows[0].role });
+    res.json({ ...workspace, role: (membership.rows[0] as { role: string }).role });
   } catch (error) {
     logger.error({ err: error, msg: 'Get workspace error' });
     res.status(500).json({ error: 'Failed to get workspace' });
@@ -338,7 +338,7 @@ router.put(
 
       // Prevent demoting yourself if you're the only owner
       if (userId === req.session.userId && role !== 'owner') {
-        const owners = await query(
+        const owners = await query<{ count: string }>(
           "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1 AND role = 'owner'",
           [workspaceId]
         );
@@ -389,7 +389,7 @@ router.delete(
       const { id: workspaceId, userId } = req.params;
 
       // Check target user's role
-      const targetMember = await query(
+      const targetMember = await query<{ role: string }>(
         'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
         [workspaceId, userId]
       );
@@ -407,7 +407,7 @@ router.delete(
 
       // Prevent removing yourself if you're the only owner
       if (userId === req.session.userId && targetMember.rows[0].role === 'owner') {
-        const owners = await query(
+        const owners = await query<{ count: string }>(
           "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1 AND role = 'owner'",
           [workspaceId]
         );

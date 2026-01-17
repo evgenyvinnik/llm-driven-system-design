@@ -11,9 +11,17 @@ dotenv.config();
 import { LeaderElection } from '../queue/leader-election';
 import { queue } from '../queue/reliable-queue';
 import * as db from '../db/repository';
-import { logger } from '../utils/logger';
-import { JobStatus } from '../types';
+import { logger, createChildLogger } from '../utils/logger';
+import { JobStatus, ExecutionStatus } from '../types';
 import { migrate } from '../db/migrate';
+
+// Import shared modules
+import {
+  schedulerIsLeader,
+  stalledJobsRecovered,
+  jobsScheduledTotal,
+  updateQueueMetrics,
+} from '../shared/metrics';
 
 /** Unique instance ID for this scheduler, used in leader election */
 const INSTANCE_ID = process.env.SCHEDULER_INSTANCE_ID || `scheduler-${Date.now()}`;
@@ -23,6 +31,9 @@ const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '1000', 10);
 const LEADER_LOCK_TTL = parseInt(process.env.LEADER_LOCK_TTL || '30', 10);
 /** How often to check for stalled jobs in milliseconds */
 const STALE_RECOVERY_INTERVAL_MS = 60000; // 1 minute
+
+/** Scheduler-specific logger */
+const schedulerLogger = createChildLogger({ instanceId: INSTANCE_ID });
 
 /**
  * Main scheduler class that coordinates job scheduling.
@@ -35,6 +46,7 @@ class Scheduler {
   private scanLoopHandle: NodeJS.Timeout | null = null;
   private recoveryLoopHandle: NodeJS.Timeout | null = null;
   private retryLoopHandle: NodeJS.Timeout | null = null;
+  private metricsLoopHandle: NodeJS.Timeout | null = null;
 
   /** Initializes the scheduler with leader election configuration */
   constructor() {
@@ -50,7 +62,10 @@ class Scheduler {
    * Runs migrations, then starts the scan, recovery, and retry loops.
    */
   async start(): Promise<void> {
-    logger.info(`Starting scheduler instance: ${INSTANCE_ID}`);
+    schedulerLogger.info({
+      scanInterval: SCAN_INTERVAL_MS,
+      leaderLockTTL: LEADER_LOCK_TTL,
+    }, `Starting scheduler instance: ${INSTANCE_ID}`);
     this.running = true;
 
     // Run migrations first
@@ -65,7 +80,10 @@ class Scheduler {
     // Start the retry scheduling loop
     this.runRetryLoop();
 
-    logger.info('Scheduler started');
+    // Start metrics update loop
+    this.startMetricsLoop();
+
+    schedulerLogger.info('Scheduler started');
   }
 
   /**
@@ -73,7 +91,7 @@ class Scheduler {
    * Clears all loop timers and releases leadership.
    */
   async stop(): Promise<void> {
-    logger.info('Stopping scheduler...');
+    schedulerLogger.info('Stopping scheduler...');
     this.running = false;
 
     if (this.scanLoopHandle) {
@@ -91,8 +109,17 @@ class Scheduler {
       this.retryLoopHandle = null;
     }
 
+    if (this.metricsLoopHandle) {
+      clearInterval(this.metricsLoopHandle);
+      this.metricsLoopHandle = null;
+    }
+
     await this.leaderElection.releaseLeadership();
-    logger.info('Scheduler stopped');
+
+    // Update leader metric
+    schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 0);
+
+    schedulerLogger.info('Scheduler stopped');
   }
 
   /**
@@ -103,9 +130,14 @@ class Scheduler {
     while (this.running) {
       try {
         // Try to become or maintain leadership
-        if (!this.leaderElection.getIsLeader()) {
+        const wasLeader = this.leaderElection.getIsLeader();
+        if (!wasLeader) {
           const acquired = await this.leaderElection.tryBecomeLeader();
-          if (!acquired) {
+          if (acquired) {
+            schedulerLogger.info('Became leader');
+            schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 1);
+          } else {
+            schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 0);
             await this.sleep(SCAN_INTERVAL_MS);
             continue;
           }
@@ -114,7 +146,7 @@ class Scheduler {
         // Only the leader scans for due jobs
         await this.scanDueJobs();
       } catch (error) {
-        logger.error('Error in scheduler scan loop', error);
+        schedulerLogger.error({ err: error }, 'Error in scheduler scan loop');
       }
 
       await this.sleep(SCAN_INTERVAL_MS);
@@ -132,7 +164,7 @@ class Scheduler {
       return;
     }
 
-    logger.info(`Found ${dueJobs.length} due jobs`);
+    schedulerLogger.info({ count: dueJobs.length }, `Found ${dueJobs.length} due jobs`);
 
     for (const job of dueJobs) {
       try {
@@ -153,9 +185,19 @@ class Scheduler {
           await db.scheduleNextRun(job.id);
         }
 
-        logger.info(`Scheduled execution ${execution.id} for job ${job.name}`);
+        // Update metrics
+        jobsScheduledTotal.inc({
+          handler: job.handler,
+          priority: job.priority.toString(),
+        });
+
+        schedulerLogger.info({
+          executionId: execution.id,
+          jobId: job.id,
+          jobName: job.name,
+        }, `Scheduled execution ${execution.id} for job ${job.name}`);
       } catch (error) {
-        logger.error(`Error scheduling job ${job.id}`, error);
+        schedulerLogger.error({ err: error, jobId: job.id }, `Error scheduling job ${job.id}`);
       }
     }
   }
@@ -180,16 +222,17 @@ class Scheduler {
             if (job) {
               // Re-enqueue the recovered job
               await queue.enqueue(executionId, job.id, job.priority);
-              logger.warn(`Re-enqueued stalled execution ${executionId}`);
+              stalledJobsRecovered.inc();
+              schedulerLogger.warn({ executionId, jobId: job.id }, `Re-enqueued stalled execution ${executionId}`);
             }
           }
         }
 
         if (recoveredIds.length > 0) {
-          logger.info(`Recovered ${recoveredIds.length} stalled executions`);
+          schedulerLogger.info({ count: recoveredIds.length }, `Recovered ${recoveredIds.length} stalled executions`);
         }
       } catch (error) {
-        logger.error('Error in recovery loop', error);
+        schedulerLogger.error({ err: error }, 'Error in recovery loop');
       }
     }, STALE_RECOVERY_INTERVAL_MS);
   }
@@ -222,18 +265,37 @@ class Scheduler {
 
           // Update the old execution to mark it as superseded
           await db.updateExecution(execution.id, {
-            status: 'FAILED' as const,
+            status: ExecutionStatus.FAILED,
           });
 
           // Enqueue the retry
           await queue.enqueue(newExecution.id, job.id, job.priority);
 
-          logger.info(`Scheduled retry for job ${job.name}, attempt ${newExecution.attempt}`);
+          schedulerLogger.info({
+            jobName: job.name,
+            attempt: newExecution.attempt,
+            oldExecutionId: execution.id,
+            newExecutionId: newExecution.id,
+          }, `Scheduled retry for job ${job.name}, attempt ${newExecution.attempt}`);
         }
       } catch (error) {
-        logger.error('Error in retry loop', error);
+        schedulerLogger.error({ err: error }, 'Error in retry loop');
       }
     }, 5000); // Check every 5 seconds
+  }
+
+  /**
+   * Starts a loop to periodically update queue metrics.
+   */
+  private startMetricsLoop(): void {
+    this.metricsLoopHandle = setInterval(async () => {
+      try {
+        const stats = await queue.getStats();
+        await updateQueueMetrics(stats);
+      } catch (error) {
+        schedulerLogger.error({ err: error }, 'Error updating queue metrics');
+      }
+    }, 10000); // Every 10 seconds
   }
 
   /**
@@ -270,20 +332,20 @@ const scheduler = new Scheduler();
  */
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  logger.info('Received SIGTERM, shutting down...');
+  schedulerLogger.info('Received SIGTERM, shutting down...');
   await scheduler.stop();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  logger.info('Received SIGINT, shutting down...');
+  schedulerLogger.info('Received SIGINT, shutting down...');
   await scheduler.stop();
   process.exit(0);
 });
 
 // Start the scheduler
 scheduler.start().catch((error) => {
-  logger.error('Failed to start scheduler', error);
+  schedulerLogger.error({ err: error }, 'Failed to start scheduler');
   process.exit(1);
 });
 

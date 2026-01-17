@@ -6,6 +6,9 @@
 import { query } from '../config/database.js';
 import { cacheGet, cacheSet, cacheDelete } from '../config/redis.js';
 import type { App, Category, Screenshot, PaginatedResponse, Developer } from '../types/index.js';
+import { publishEvent, QueueConfig } from '../shared/queue.js';
+import { logger, logging } from '../shared/logger.js';
+import { downloadsTotal } from '../shared/metrics.js';
 
 /** Cache time-to-live in seconds (5 minutes) */
 const CACHE_TTL = 300;
@@ -556,6 +559,7 @@ export class CatalogService {
   /**
    * Records an app download and updates analytics.
    * Increments download count, creates download event, and updates user library.
+   * Publishes download event to RabbitMQ for async processing.
    * @param appId - App UUID that was downloaded
    * @param userId - Optional user UUID if logged in
    * @param metadata - Optional download context (version, country, device)
@@ -565,29 +569,74 @@ export class CatalogService {
     country?: string;
     deviceType?: string;
   }): Promise<void> {
-    // Update download count
-    await query(`
-      UPDATE apps SET download_count = download_count + 1, updated_at = NOW()
-      WHERE id = $1
-    `, [appId]);
+    const startTime = Date.now();
 
-    // Record download event
-    await query(`
-      INSERT INTO download_events (app_id, user_id, version, country, device_type)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [appId, userId || null, metadata?.version || null, metadata?.country || null, metadata?.deviceType || null]);
-
-    // Update user_apps if user is logged in
-    if (userId) {
+    try {
+      // Update download count (eventual consistency is acceptable)
       await query(`
-        INSERT INTO user_apps (user_id, app_id, download_count, last_downloaded_at)
-        VALUES ($1, $2, 1, NOW())
-        ON CONFLICT (user_id, app_id)
-        DO UPDATE SET download_count = user_apps.download_count + 1, last_downloaded_at = NOW()
-      `, [userId, appId]);
-    }
+        UPDATE apps SET download_count = download_count + 1, updated_at = NOW()
+        WHERE id = $1
+      `, [appId]);
 
-    await cacheDelete(`app:${appId}`);
+      // Record download event in database
+      const downloadResult = await query(`
+        INSERT INTO download_events (app_id, user_id, version, country, device_type)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+      `, [appId, userId || null, metadata?.version || null, metadata?.country || null, metadata?.deviceType || null]);
+
+      const downloadId = downloadResult.rows[0]?.id;
+
+      // Update user_apps if user is logged in
+      if (userId) {
+        await query(`
+          INSERT INTO user_apps (user_id, app_id, download_count, last_downloaded_at)
+          VALUES ($1, $2, 1, NOW())
+          ON CONFLICT (user_id, app_id)
+          DO UPDATE SET download_count = user_apps.download_count + 1, last_downloaded_at = NOW()
+        `, [userId, appId]);
+      }
+
+      // Publish download event to RabbitMQ for async processing
+      // (analytics, recommendations update, etc.)
+      const eventPublished = await publishEvent(QueueConfig.routingKeys.downloadCreated, {
+        downloadId,
+        appId,
+        userId: userId || null,
+        version: metadata?.version || null,
+        country: metadata?.country || null,
+        deviceType: metadata?.deviceType || null,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (!eventPublished) {
+        logger.warn({ appId, userId }, 'Failed to publish download event to queue');
+      }
+
+      // Update metrics
+      const app = await this.getAppById(appId);
+      if (app) {
+        downloadsTotal.inc({ app_id: appId, is_free: app.isFree ? 'true' : 'false' });
+      }
+
+      // Log business event
+      logging.businessEvent('download', {
+        appId,
+        userId,
+        country: metadata?.country,
+        deviceType: metadata?.deviceType,
+        durationMs: Date.now() - startTime,
+      });
+
+      await cacheDelete(`app:${appId}`);
+    } catch (error) {
+      logger.error({
+        appId,
+        userId,
+        error: (error as Error).message,
+      }, 'Failed to record download');
+      throw error;
+    }
   }
 }
 

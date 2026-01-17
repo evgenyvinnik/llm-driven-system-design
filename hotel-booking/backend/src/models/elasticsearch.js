@@ -214,8 +214,14 @@ async function searchHotels(params) {
   }
 }
 
+// Get the Elasticsearch client (for health checks)
+function getClient() {
+  return client;
+}
+
 module.exports = {
   client,
+  getClient,
   HOTELS_INDEX,
   setupIndex,
   indexHotel,

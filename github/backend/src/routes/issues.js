@@ -2,6 +2,12 @@ import { Router } from 'express';
 import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
 
+// Import shared modules
+import logger from '../shared/logger.js';
+import { auditLog, AUDITED_ACTIONS } from '../shared/audit.js';
+import { getIdempotencyKey, withIdempotencyTransaction } from '../shared/idempotency.js';
+import { issuesCreated, issuesClosed } from '../shared/metrics.js';
+
 const router = Router();
 
 /**
@@ -159,11 +165,12 @@ router.get('/:owner/:repo/issues/:number', async (req, res) => {
 });
 
 /**
- * Create issue
+ * Create issue (with idempotency)
  */
 router.post('/:owner/:repo/issues', requireAuth, async (req, res) => {
   const { owner, repo } = req.params;
   const { title, body, labels, assignee } = req.body;
+  const idempotencyKey = getIdempotencyKey(req);
 
   if (!title) {
     return res.status(400).json({ error: 'Title required' });
@@ -191,35 +198,79 @@ router.post('/:owner/:repo/issues', requireAuth, async (req, res) => {
     }
   }
 
-  // Get next number
-  const number = await getNextNumber(repoId);
-
-  const result = await query(
-    `INSERT INTO issues (repo_id, number, title, body, author_id, assignee_id)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING *`,
-    [repoId, number, title, body || null, req.user.id, assigneeId]
-  );
-
-  const issue = result.rows[0];
-
-  // Add labels
-  if (labels && labels.length > 0) {
-    for (const labelName of labels) {
-      const labelResult = await query(
-        'SELECT id FROM labels WHERE repo_id = $1 AND name = $2',
-        [repoId, labelName]
-      );
-      if (labelResult.rows.length > 0) {
-        await query(
-          'INSERT INTO issue_labels (issue_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-          [issue.id, labelResult.rows[0].id]
+  try {
+    // Use idempotency transaction
+    const { cached, response } = await withIdempotencyTransaction(
+      idempotencyKey,
+      'issue_create',
+      async (tx) => {
+        // Get next number (use transaction client)
+        const prMax = await tx.query(
+          'SELECT COALESCE(MAX(number), 0) as max_num FROM pull_requests WHERE repo_id = $1',
+          [repoId]
         );
-      }
-    }
-  }
+        const issueMax = await tx.query(
+          'SELECT COALESCE(MAX(number), 0) as max_num FROM issues WHERE repo_id = $1',
+          [repoId]
+        );
+        const number = Math.max(
+          parseInt(prMax.rows[0].max_num),
+          parseInt(issueMax.rows[0].max_num)
+        ) + 1;
 
-  res.status(201).json(issue);
+        // Insert issue
+        const result = await tx.query(
+          `INSERT INTO issues (repo_id, number, title, body, author_id, assignee_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING *`,
+          [repoId, number, title, body || null, req.user.id, assigneeId]
+        );
+
+        const issue = result.rows[0];
+
+        // Add labels within the same transaction
+        if (labels && labels.length > 0) {
+          for (const labelName of labels) {
+            const labelResult = await tx.query(
+              'SELECT id FROM labels WHERE repo_id = $1 AND name = $2',
+              [repoId, labelName]
+            );
+            if (labelResult.rows.length > 0) {
+              await tx.query(
+                'INSERT INTO issue_labels (issue_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [issue.id, labelResult.rows[0].id]
+              );
+            }
+          }
+        }
+
+        return { resourceId: issue.id, response: issue };
+      }
+    );
+
+    if (cached) {
+      // Return cached response for duplicate request
+      issuesCreated.inc({ status: 'duplicate' });
+      req.log?.info({ idempotencyKey }, 'Issue creation request deduplicated');
+      return res.status(200).json(response);
+    }
+
+    // Audit log
+    await auditLog(
+      AUDITED_ACTIONS.ISSUE_CREATE,
+      'issue',
+      response.id,
+      { title, labels, assignee },
+      req
+    );
+
+    issuesCreated.inc({ status: 'success' });
+    res.status(201).json(response);
+  } catch (err) {
+    req.log?.error({ err }, 'Create issue error');
+    issuesCreated.inc({ status: 'error' });
+    res.status(500).json({ error: 'Failed to create issue' });
+  }
 });
 
 /**
@@ -260,6 +311,10 @@ router.patch('/:owner/:repo/issues/:number', requireAuth, async (req, res) => {
     if (state === 'closed') {
       params.push(new Date());
       updates.push(`closed_at = $${params.length}`);
+
+      // Audit log for close
+      await auditLog(AUDITED_ACTIONS.ISSUE_CLOSE, 'issue', issue.id, { number }, req);
+      issuesClosed.inc();
     }
   }
   if (assignee !== undefined) {

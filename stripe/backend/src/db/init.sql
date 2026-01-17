@@ -237,6 +237,33 @@ CREATE TABLE risk_assessments (
 CREATE INDEX idx_risk_assessments_payment_intent ON risk_assessments(payment_intent_id);
 CREATE INDEX idx_risk_assessments_level ON risk_assessments(risk_level);
 
+-- Audit Log (for compliance and forensic analysis)
+-- Required for PCI DSS Requirement 10 and SOX compliance
+CREATE TABLE audit_log (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('merchant', 'admin', 'system', 'api')),
+  actor_id VARCHAR(100) NOT NULL,
+  action VARCHAR(100) NOT NULL,
+  resource_type VARCHAR(50) NOT NULL,
+  resource_id VARCHAR(100) NOT NULL,
+  old_value JSONB,
+  new_value JSONB,
+  ip_address VARCHAR(45), -- IPv6 compatible
+  user_agent TEXT,
+  trace_id VARCHAR(100),
+  metadata JSONB,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Audit log is append-only - no updates or deletes should be performed
+-- Indexes for common query patterns
+CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
+CREATE INDEX idx_audit_log_actor ON audit_log(actor_type, actor_id);
+CREATE INDEX idx_audit_log_resource ON audit_log(resource_type, resource_id);
+CREATE INDEX idx_audit_log_action ON audit_log(action);
+CREATE INDEX idx_audit_log_trace ON audit_log(trace_id) WHERE trace_id IS NOT NULL;
+
 -- Helper function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -281,3 +308,14 @@ SELECT
 FROM merchants m
 LEFT JOIN ledger_entries l ON l.account = 'merchant:' || m.id || ':payable'
 GROUP BY m.id, m.name, l.currency;
+
+-- Daily revenue summary view for monitoring
+CREATE OR REPLACE VIEW daily_revenue AS
+SELECT
+  DATE(created_at) as date,
+  SUM(credit) as revenue,
+  COUNT(DISTINCT payment_intent_id) as transaction_count
+FROM ledger_entries
+WHERE account = 'revenue:transaction_fees'
+GROUP BY DATE(created_at)
+ORDER BY date DESC;

@@ -4,10 +4,25 @@
  * Handles high-throughput metric data ingestion into TimescaleDB with
  * multi-layer caching for metric IDs. Provides functions to query and
  * explore metric definitions and their tags.
+ *
+ * WHY ingestion metrics enable capacity planning:
+ * Ingestion metrics provide visibility into the data flow rate, enabling:
+ * 1. Capacity planning: Track points/second to predict storage growth
+ * 2. Anomaly detection: Sudden drops indicate data source failures
+ * 3. Rate limiting: Know when to throttle or scale ingestion workers
+ * 4. Cost forecasting: Storage costs directly correlate with ingestion rate
+ *
+ * Key metrics tracked:
+ * - ingest_points_total: Total data points ingested (for throughput)
+ * - ingest_requests_total: API call count (for load patterns)
+ * - ingest_latency_seconds: Time to ingest batches (for performance)
  */
 
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
+import logger from '../shared/logger.js';
+import { metricsIngestBreaker, withCircuitBreaker, emptyQueryResult } from '../shared/circuitBreaker.js';
+import { ingestPointsTotal, ingestRequestsTotal, ingestLatency } from '../shared/metrics.js';
 import type { MetricDataPoint, MetricDefinition } from '../types/index.js';
 
 /**
@@ -58,11 +73,16 @@ export async function getOrCreateMetricId(
   }
 
   // Check Redis cache
-  const cachedId = await redis.get(`metric:${cacheKey}`);
-  if (cachedId) {
-    const id = parseInt(cachedId);
-    metricIdCache.set(cacheKey, id);
-    return id;
+  try {
+    const cachedId = await redis.get(`metric:${cacheKey}`);
+    if (cachedId) {
+      const id = parseInt(cachedId);
+      metricIdCache.set(cacheKey, id);
+      return id;
+    }
+  } catch (error) {
+    // Redis failure - continue to database
+    logger.warn({ error, cacheKey }, 'Redis cache lookup failed');
   }
 
   // Query or insert into database
@@ -78,7 +98,12 @@ export async function getOrCreateMetricId(
 
   // Cache the result
   metricIdCache.set(cacheKey, id);
-  await redis.set(`metric:${cacheKey}`, id.toString(), 'EX', 3600);
+  try {
+    await redis.set(`metric:${cacheKey}`, id.toString(), 'EX', 3600);
+  } catch (error) {
+    // Redis failure - log but don't fail the operation
+    logger.warn({ error, cacheKey }, 'Redis cache set failed');
+  }
 
   return id;
 }
@@ -90,32 +115,62 @@ export async function getOrCreateMetricId(
  * Each data point is first resolved to a metric_id via getOrCreateMetricId,
  * then all points are inserted in a single query for optimal performance.
  *
+ * Tracks ingestion metrics for capacity planning and monitoring:
+ * - Total points ingested
+ * - Request count
+ * - Latency histogram
+ *
  * @param dataPoints - Array of metric data points to ingest
  * @returns The number of data points successfully ingested
  */
 export async function ingestMetrics(dataPoints: MetricDataPoint[]): Promise<number> {
   if (dataPoints.length === 0) return 0;
 
-  // Get or create metric IDs for all data points
-  const enrichedPoints = await Promise.all(
-    dataPoints.map(async (dp) => ({
-      ...dp,
-      metric_id: await getOrCreateMetricId(dp.name, dp.tags),
-    }))
-  );
+  const startTime = Date.now();
 
-  // Batch insert using COPY-like approach with unnest
-  const times = enrichedPoints.map((p) => new Date(p.timestamp));
-  const metricIds = enrichedPoints.map((p) => p.metric_id);
-  const values = enrichedPoints.map((p) => p.value);
+  try {
+    // Get or create metric IDs for all data points
+    const enrichedPoints = await Promise.all(
+      dataPoints.map(async (dp) => ({
+        ...dp,
+        metric_id: await getOrCreateMetricId(dp.name, dp.tags),
+      }))
+    );
 
-  await pool.query(
-    `INSERT INTO metrics (time, metric_id, value)
-     SELECT * FROM unnest($1::timestamptz[], $2::integer[], $3::double precision[])`,
-    [times, metricIds, values]
-  );
+    // Batch insert using COPY-like approach with unnest
+    const times = enrichedPoints.map((p) => new Date(p.timestamp));
+    const metricIds = enrichedPoints.map((p) => p.metric_id);
+    const values = enrichedPoints.map((p) => p.value);
 
-  return enrichedPoints.length;
+    // Use circuit breaker for database insert
+    await withCircuitBreaker(
+      metricsIngestBreaker,
+      `INSERT INTO metrics (time, metric_id, value)
+       SELECT * FROM unnest($1::timestamptz[], $2::integer[], $3::double precision[])`,
+      [times, metricIds, values],
+      emptyQueryResult()
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    ingestPointsTotal.inc(enrichedPoints.length);
+    ingestRequestsTotal.inc({ status: 'success' });
+    ingestLatency.observe(duration);
+
+    logger.debug({
+      points: enrichedPoints.length,
+      duration_ms: Date.now() - startTime,
+    }, 'Metrics ingested');
+
+    return enrichedPoints.length;
+  } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    ingestRequestsTotal.inc({ status: 'error' });
+    ingestLatency.observe(duration);
+
+    logger.error({ error, pointCount: dataPoints.length }, 'Metrics ingestion failed');
+    throw error;
+  }
 }
 
 /**
@@ -211,4 +266,25 @@ export async function getTagValues(
 
   const result = await pool.query<{ value: string }>(query, params);
   return result.rows.map((r) => r.value).filter(Boolean);
+}
+
+/**
+ * Clears the in-memory metric ID cache.
+ * Useful for testing or when metric definitions are bulk-modified.
+ */
+export function clearMetricIdCache(): void {
+  metricIdCache.clear();
+  logger.info({ size: metricIdCache.size }, 'Metric ID cache cleared');
+}
+
+/**
+ * Gets statistics about the metric ID cache.
+ *
+ * @returns Object with cache statistics
+ */
+export function getMetricIdCacheStats(): { size: number; entries: string[] } {
+  return {
+    size: metricIdCache.size,
+    entries: Array.from(metricIdCache.keys()).slice(0, 100), // First 100 for debugging
+  };
 }

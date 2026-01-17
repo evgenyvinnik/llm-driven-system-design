@@ -49,7 +49,25 @@ services:
       timeout: 10s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: linkedin-rabbitmq
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: linkedin
+      RABBITMQ_DEFAULT_PASS: linkedin123
+    volumes:
+      - linkedin-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   linkedin-postgres-data:
   linkedin-redis-data:
   linkedin-elasticsearch-data:
+  linkedin-rabbitmq-data:

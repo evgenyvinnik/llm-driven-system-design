@@ -1,7 +1,8 @@
 import pg from 'pg';
-import Redis from 'ioredis';
+import IORedis from 'ioredis';
 
 const { Pool } = pg;
+const Redis = IORedis.default || IORedis;
 
 /**
  * PostgreSQL connection pool for database operations.

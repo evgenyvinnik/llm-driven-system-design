@@ -5,6 +5,18 @@ import type { WSMessage, PresenceState, Operation, CanvasData } from '../types/i
 import { fileService } from '../services/fileService.js';
 import { presenceService } from '../services/presenceService.js';
 import { operationService } from '../services/operationService.js';
+import {
+  logger,
+  createCircuitBreaker,
+  registerCircuitBreaker,
+  syncConfig,
+  withIdempotency,
+  generateFileOperationKey,
+  activeCollaboratorsGauge,
+  syncLatencyHistogram,
+  operationsCounter,
+  operationLatencyHistogram,
+} from '../shared/index.js';
 
 /**
  * Extended WebSocket with additional properties for tracking user state.
@@ -40,6 +52,42 @@ const pendingOperations = new Map<string, Operation[]>();
 const BATCH_INTERVAL = 50; // 50ms batching window
 
 /**
+ * Circuit breaker for sync/broadcast operations.
+ * Protects against cascading failures in real-time collaboration.
+ */
+const syncCircuitBreaker = createCircuitBreaker(
+  'sync',
+  async (fileId: string, message: WSMessage, exclude?: ExtendedWebSocket) => {
+    const clients = fileClients.get(fileId);
+    if (!clients) return;
+
+    const data = JSON.stringify(message);
+    let successCount = 0;
+    let errorCount = 0;
+
+    clients.forEach((client) => {
+      if (client !== exclude && client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(data);
+          successCount++;
+        } catch {
+          errorCount++;
+        }
+      }
+    });
+
+    if (errorCount > 0 && successCount === 0) {
+      throw new Error(`Failed to broadcast to any clients in file ${fileId}`);
+    }
+
+    return { successCount, errorCount };
+  },
+  syncConfig
+);
+
+registerCircuitBreaker('sync', syncCircuitBreaker);
+
+/**
  * Sets up the WebSocket server for real-time collaboration.
  * Handles client connections, message routing, and heartbeat monitoring.
  * @param server - The HTTP server to attach the WebSocket server to
@@ -62,6 +110,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
 
   // Operation batching interval
   setInterval(() => {
+    const batchStart = Date.now();
     pendingOperations.forEach((ops, fileId) => {
       if (ops.length > 0) {
         broadcastToFile(fileId, {
@@ -70,6 +119,12 @@ export function setupWebSocket(server: Server): WebSocketServer {
           fileId,
         });
         pendingOperations.set(fileId, []);
+
+        // Track sync latency
+        syncLatencyHistogram.observe(
+          { message_type: 'operation_batch' },
+          (Date.now() - batchStart) / 1000
+        );
       }
     });
   }, BATCH_INTERVAL);
@@ -83,7 +138,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
     extWs.id = uuidv4();
     extWs.isAlive = true;
 
-    console.log(`WebSocket client connected: ${extWs.id}`);
+    logger.info({ clientId: extWs.id }, 'WebSocket client connected');
 
     extWs.on('pong', () => {
       extWs.isAlive = true;
@@ -94,7 +149,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         const message: WSMessage = JSON.parse(data.toString());
         await handleMessage(extWs, message);
       } catch (error) {
-        console.error('WebSocket message error:', error);
+        logger.error({ clientId: extWs.id, error }, 'WebSocket message error');
         sendError(extWs, 'Invalid message format');
       }
     });
@@ -104,12 +159,12 @@ export function setupWebSocket(server: Server): WebSocketServer {
     });
 
     extWs.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      logger.error({ clientId: extWs.id, error }, 'WebSocket error');
       handleDisconnect(extWs);
     });
   });
 
-  console.log('WebSocket server initialized');
+  logger.info('WebSocket server initialized');
   return wss;
 }
 
@@ -171,6 +226,10 @@ async function handleSubscribe(ws: ExtendedWebSocket, message: WSMessage): Promi
   }
   fileClients.get(fileId)!.add(ws);
 
+  // Update metrics
+  const clientCount = fileClients.get(fileId)!.size;
+  activeCollaboratorsGauge.set({ file_id: fileId }, clientCount);
+
   // Get file data
   const file = await fileService.getFile(fileId);
   if (!file) {
@@ -213,7 +272,7 @@ async function handleSubscribe(ws: ExtendedWebSocket, message: WSMessage): Promi
     fileId,
   }, ws);
 
-  console.log(`User ${userName} (${userId}) subscribed to file ${fileId}`);
+  logger.info({ userName, userId, fileId, clientCount }, 'User subscribed to file');
 }
 
 /**
@@ -229,8 +288,13 @@ async function handleUnsubscribe(ws: ExtendedWebSocket): Promise<void> {
 
   if (clients) {
     clients.delete(ws);
-    if (clients.size === 0) {
+    const remaining = clients.size;
+
+    if (remaining === 0) {
       fileClients.delete(fileId);
+      activeCollaboratorsGauge.set({ file_id: fileId }, 0);
+    } else {
+      activeCollaboratorsGauge.set({ file_id: fileId }, remaining);
     }
   }
 
@@ -248,14 +312,14 @@ async function handleUnsubscribe(ws: ExtendedWebSocket): Promise<void> {
     });
   }
 
-  console.log(`User ${ws.userName} unsubscribed from file ${fileId}`);
+  logger.info({ userName: ws.userName, fileId }, 'User unsubscribed from file');
 
   ws.fileId = undefined;
 }
 
 /**
  * Handles incoming design operations from a client.
- * Processes, stores, acknowledges, and broadcasts operations.
+ * Processes with idempotency, stores, acknowledges, and broadcasts operations.
  * @param ws - The WebSocket connection
  * @param message - The operation message with operations array
  */
@@ -265,23 +329,35 @@ async function handleOperation(ws: ExtendedWebSocket, message: WSMessage): Promi
     return;
   }
 
-  const payload = message.payload as { operations: Operation[] };
+  const payload = message.payload as { operations: (Operation & { idempotencyKey?: string })[] };
   const { operations } = payload;
 
   const processedOps: Operation[] = [];
 
   for (const op of operations) {
+    const opStart = Date.now();
     try {
-      // Process operation
-      const operation: Operation = {
-        ...op,
-        fileId: ws.fileId,
-        userId: ws.userId,
-        timestamp: operationService.getNextTimestamp(),
-        clientId: ws.id,
-      };
+      // Generate idempotency key if not provided by client
+      const idempotencyKey = op.idempotencyKey || uuidv4();
 
-      await operationService.processOperation(operation);
+      // Process operation with idempotency protection
+      const operation = await withIdempotency(
+        generateFileOperationKey(ws.fileId, op.operationType, idempotencyKey),
+        async () => {
+          const processedOp: Operation = {
+            ...op,
+            id: op.id || uuidv4(),
+            fileId: ws.fileId!,
+            userId: ws.userId!,
+            timestamp: operationService.getNextTimestamp(),
+            clientId: ws.id,
+          };
+
+          await operationService.processOperation(processedOp);
+          return processedOp;
+        }
+      );
+
       processedOps.push(operation);
 
       // Add to batch for broadcasting
@@ -289,8 +365,16 @@ async function handleOperation(ws: ExtendedWebSocket, message: WSMessage): Promi
         pendingOperations.set(ws.fileId, []);
       }
       pendingOperations.get(ws.fileId)!.push(operation);
+
+      // Track metrics
+      operationsCounter.inc({ operation_type: op.operationType, status: 'success' });
+      operationLatencyHistogram.observe(
+        { operation_type: op.operationType },
+        (Date.now() - opStart) / 1000
+      );
     } catch (error) {
-      console.error('Operation error:', error);
+      logger.error({ clientId: ws.id, operation: op, error }, 'Operation error');
+      operationsCounter.inc({ operation_type: op.operationType, status: 'error' });
       sendError(ws, `Operation failed: ${(error as Error).message}`);
     }
   }
@@ -331,11 +415,14 @@ async function handlePresence(ws: ExtendedWebSocket, message: WSMessage): Promis
   await presenceService.updatePresence(ws.fileId, presence);
 
   // Broadcast to others (skip batching for presence - send immediately)
+  const start = Date.now();
   broadcastToFile(ws.fileId, {
     type: 'presence',
     payload: { presence: [presence] },
     fileId: ws.fileId,
   }, ws);
+
+  syncLatencyHistogram.observe({ message_type: 'presence' }, (Date.now() - start) / 1000);
 }
 
 /**
@@ -383,7 +470,7 @@ async function handleSync(ws: ExtendedWebSocket, message: WSMessage): Promise<vo
  * @param ws - The disconnected WebSocket
  */
 function handleDisconnect(ws: ExtendedWebSocket): void {
-  console.log(`WebSocket client disconnected: ${ws.id}`);
+  logger.info({ clientId: ws.id, userName: ws.userName }, 'WebSocket client disconnected');
   handleUnsubscribe(ws);
 }
 
@@ -413,20 +500,15 @@ function sendError(ws: ExtendedWebSocket, error: string): void {
 
 /**
  * Broadcasts a message to all clients viewing a specific file.
- * Optionally excludes one client (typically the sender).
+ * Uses circuit breaker for resilience.
  * @param fileId - The file to broadcast to
  * @param message - The message to broadcast
  * @param exclude - Optional client to exclude from broadcast
  */
 function broadcastToFile(fileId: string, message: WSMessage, exclude?: ExtendedWebSocket): void {
-  const clients = fileClients.get(fileId);
-  if (!clients) return;
-
-  const data = JSON.stringify(message);
-  clients.forEach((client) => {
-    if (client !== exclude && client.readyState === WebSocket.OPEN) {
-      client.send(data);
-    }
+  // Use circuit breaker for broadcast operations
+  syncCircuitBreaker.fire(fileId, message, exclude).catch((error: unknown) => {
+    logger.warn({ fileId, error }, 'Broadcast failed (circuit breaker may be open)');
   });
 }
 
@@ -439,4 +521,30 @@ function broadcastToFile(fileId: string, message: WSMessage, exclude?: ExtendedW
 // Get connected users count for a file
 export function getFileUserCount(fileId: string): number {
   return fileClients.get(fileId)?.size || 0;
+}
+
+/**
+ * Gets the total number of WebSocket connections.
+ * Used for health checks and capacity monitoring.
+ * @returns Total connection count
+ */
+export function getTotalConnections(): number {
+  let total = 0;
+  fileClients.forEach((clients) => {
+    total += clients.size;
+  });
+  return total;
+}
+
+/**
+ * Gets information about all active file subscriptions.
+ * Used for debugging and monitoring.
+ * @returns Map of file IDs to user counts
+ */
+export function getFileSubscriptions(): Map<string, number> {
+  const subscriptions = new Map<string, number>();
+  fileClients.forEach((clients, fileId) => {
+    subscriptions.set(fileId, clients.size);
+  });
+  return subscriptions;
 }

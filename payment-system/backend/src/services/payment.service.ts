@@ -18,10 +18,33 @@ import { redis } from '../db/connection.js';
 import { LedgerService } from './ledger.service.js';
 import { FraudService } from './fraud.service.js';
 
+// Import shared modules for observability and resilience
+import {
+  logger,
+  withIdempotency,
+  processorCircuitBreaker,
+  paymentTransactionsTotal,
+  paymentProcessingDuration,
+  paymentAmountHistogram,
+  fraudScoreHistogram,
+  fraudDecisionsTotal,
+  auditPaymentCreated,
+  auditPaymentAuthorized,
+  auditPaymentCaptured,
+  auditPaymentVoided,
+  auditPaymentFailed,
+} from '../shared/index.js';
+
 /**
  * Core payment processing service.
  * Handles the full lifecycle of payments: creation, authorization, capture, and void.
  * Coordinates with fraud detection, ledger recording, and idempotency handling.
+ *
+ * CRITICAL FEATURES:
+ * - Idempotency: Prevents double-charging on network retries
+ * - Circuit Breaker: Protects against payment processor outages
+ * - Audit Logging: Required for PCI-DSS compliance
+ * - Metrics: Enables fraud detection and SLO monitoring
  */
 export class PaymentService {
   private ledgerService: LedgerService;
@@ -54,6 +77,7 @@ export class PaymentService {
    * Checks Redis cache first, then falls back to database lookup.
    * @param key - Unique idempotency key provided by the client
    * @returns Existing transaction if found, null if this is a new request
+   * @deprecated Use withIdempotency from shared/idempotency.ts instead
    */
   async checkIdempotency(key: string): Promise<Transaction | null> {
     // First check Redis cache
@@ -79,16 +103,23 @@ export class PaymentService {
   /**
    * Creates a new payment transaction with fraud detection and optional capture.
    * Implements the authorize-then-capture flow for card payments.
+   *
+   * IDEMPOTENCY: If idempotency_key is provided, duplicate requests return
+   * the cached response without reprocessing.
+   *
    * @param merchantId - UUID of the merchant initiating the payment
    * @param merchantAccountId - UUID of the merchant's ledger account
    * @param request - Payment details including amount, currency, and payment method
+   * @param clientInfo - Optional client info for audit logging
    * @returns Response with transaction ID, status, and fee breakdown
    */
   async createPayment(
     merchantId: string,
     merchantAccountId: string,
-    request: CreatePaymentRequest
+    request: CreatePaymentRequest,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
   ): Promise<CreatePaymentResponse> {
+    const startTime = Date.now();
     const {
       amount,
       currency,
@@ -100,21 +131,55 @@ export class PaymentService {
       capture = true, // Default to immediate capture
     } = request;
 
-    // Check idempotency if key provided
-    if (idempotency_key) {
-      const existing = await this.checkIdempotency(idempotency_key);
-      if (existing) {
-        return {
-          id: existing.id,
-          status: existing.status,
-          amount: existing.amount,
-          currency: existing.currency,
-          fee_amount: existing.fee_amount,
-          net_amount: existing.net_amount,
-          created_at: existing.created_at,
-        };
+    // Use shared idempotency wrapper for all payment operations
+    const { result, fromCache } = await withIdempotency<CreatePaymentResponse>(
+      'payment',
+      merchantId,
+      idempotency_key,
+      async () => {
+        return this.processPayment(
+          merchantId,
+          merchantAccountId,
+          request,
+          clientInfo
+        );
       }
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    paymentProcessingDuration.labels('create', result.status).observe(duration);
+
+    if (fromCache) {
+      logger.info(
+        { merchantId, idempotencyKey: idempotency_key, transactionId: result.id },
+        'Returned cached payment response'
+      );
     }
+
+    return result;
+  }
+
+  /**
+   * Internal payment processing logic.
+   * Called by createPayment after idempotency check.
+   */
+  private async processPayment(
+    merchantId: string,
+    merchantAccountId: string,
+    request: CreatePaymentRequest,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
+  ): Promise<CreatePaymentResponse> {
+    const {
+      amount,
+      currency,
+      payment_method,
+      description,
+      customer_email,
+      idempotency_key,
+      metadata = {},
+      capture = true,
+    } = request;
 
     // Calculate fee
     const feeAmount = this.calculateFee(amount);
@@ -122,6 +187,9 @@ export class PaymentService {
 
     // Create transaction in pending status
     const transactionId = uuidv4();
+
+    // Record payment amount metric
+    paymentAmountHistogram.labels(currency).observe(amount);
 
     const transaction = await withTransaction(async (client: PoolClient) => {
       // Insert transaction
@@ -150,6 +218,16 @@ export class PaymentService {
       return result.rows[0];
     });
 
+    // Audit log: payment created
+    await auditPaymentCreated(
+      transactionId,
+      merchantId,
+      amount,
+      currency,
+      clientInfo?.ipAddress,
+      clientInfo?.userAgent
+    );
+
     // Fraud check
     const riskScore = await this.fraudService.evaluate({
       amount,
@@ -159,8 +237,25 @@ export class PaymentService {
       customerEmail: customer_email,
     });
 
+    // Record fraud metrics
+    fraudScoreHistogram.labels(riskScore > 90 ? 'decline' : 'approve').observe(riskScore);
+
     if (riskScore > 90) {
+      fraudDecisionsTotal.labels('decline').inc();
       await this.updateTransactionStatus(transactionId, 'failed', { risk_score: riskScore });
+
+      // Audit log: payment failed due to fraud
+      await auditPaymentFailed(
+        transactionId,
+        merchantId,
+        'High fraud risk score',
+        clientInfo?.ipAddress,
+        clientInfo?.userAgent
+      );
+
+      // Record failure metric
+      paymentTransactionsTotal.labels('failed', currency).inc();
+
       return {
         id: transactionId,
         status: 'failed',
@@ -172,11 +267,26 @@ export class PaymentService {
       };
     }
 
-    // Simulate processor authorization
-    const authorized = await this.simulateProcessorAuth(amount, payment_method);
+    fraudDecisionsTotal.labels('approve').inc();
+
+    // Simulate processor authorization with circuit breaker protection
+    const authorized = await this.authorizeWithProcessor(amount, payment_method);
 
     if (!authorized) {
       await this.updateTransactionStatus(transactionId, 'failed', { risk_score: riskScore });
+
+      // Audit log: payment failed
+      await auditPaymentFailed(
+        transactionId,
+        merchantId,
+        'Processor declined',
+        clientInfo?.ipAddress,
+        clientInfo?.userAgent
+      );
+
+      // Record failure metric
+      paymentTransactionsTotal.labels('failed', currency).inc();
+
       return {
         id: transactionId,
         status: 'failed',
@@ -189,22 +299,27 @@ export class PaymentService {
     }
 
     // Update to authorized
+    const processorRef = `proc_${uuidv4().slice(0, 8)}`;
     await this.updateTransactionStatus(transactionId, 'authorized', {
       risk_score: riskScore,
-      processor_ref: `proc_${uuidv4().slice(0, 8)}`,
+      processor_ref: processorRef,
     });
+
+    // Audit log: payment authorized
+    await auditPaymentAuthorized(
+      transactionId,
+      merchantId,
+      processorRef,
+      clientInfo?.ipAddress,
+      clientInfo?.userAgent
+    );
+
+    // Record authorization metric
+    paymentTransactionsTotal.labels('authorized', currency).inc();
 
     // If capture is true, immediately capture
     if (capture) {
-      await this.capturePayment(transactionId, merchantAccountId);
-
-      // Cache the idempotency key
-      if (idempotency_key) {
-        const finalTx = await this.getTransaction(transactionId);
-        if (finalTx) {
-          await redis.setex(`idempotency:${idempotency_key}`, 86400, JSON.stringify(finalTx));
-        }
-      }
+      await this.capturePayment(transactionId, merchantAccountId, clientInfo);
 
       return {
         id: transactionId,
@@ -229,18 +344,65 @@ export class PaymentService {
   }
 
   /**
+   * Authorizes payment with external processor using circuit breaker.
+   *
+   * WHY CIRCUIT BREAKER: Payment processors can experience outages.
+   * Without protection:
+   * - All requests queue up waiting for timeouts
+   * - Connection pools exhaust
+   * - Cascading failures affect the entire system
+   *
+   * With circuit breaker:
+   * - Fail fast after threshold (5 consecutive failures)
+   * - System remains responsive for other operations
+   * - Automatic recovery when processor comes back
+   */
+  private async authorizeWithProcessor(
+    amount: number,
+    paymentMethod: CreatePaymentRequest['payment_method']
+  ): Promise<boolean> {
+    try {
+      return await processorCircuitBreaker.policy.execute(async () => {
+        return this.simulateProcessorAuth(amount, paymentMethod);
+      });
+    } catch (error) {
+      logger.error(
+        { error, amount },
+        'Payment processor authorization failed (circuit breaker may be open)'
+      );
+      return false;
+    }
+  }
+
+  /**
    * Captures funds from an authorized payment, making them available for settlement.
    * Records double-entry ledger entries for the captured amount and platform fee.
+   *
+   * IDEMPOTENCY: Capture operations use transaction-level idempotency.
+   * Capturing an already-captured transaction returns the existing state.
+   *
    * @param transactionId - UUID of the authorized transaction to capture
    * @param merchantAccountId - UUID of the merchant's ledger account
+   * @param clientInfo - Optional client info for audit logging
    * @returns Updated transaction with 'captured' status
    * @throws Error if transaction not found or not in 'authorized' status
    */
-  async capturePayment(transactionId: string, merchantAccountId: string): Promise<Transaction> {
+  async capturePayment(
+    transactionId: string,
+    merchantAccountId: string,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
+  ): Promise<Transaction> {
+    const startTime = Date.now();
     const transaction = await this.getTransaction(transactionId);
 
     if (!transaction) {
       throw new Error('Transaction not found');
+    }
+
+    // Idempotent: already captured, return current state
+    if (transaction.status === 'captured') {
+      logger.info({ transactionId }, 'Transaction already captured, returning current state');
+      return transaction;
     }
 
     if (transaction.status !== 'authorized') {
@@ -268,21 +430,49 @@ export class PaymentService {
       );
     });
 
+    // Audit log: payment captured
+    await auditPaymentCaptured(
+      transactionId,
+      transaction.merchant_id,
+      transaction.amount,
+      clientInfo?.ipAddress,
+      clientInfo?.userAgent
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    paymentProcessingDuration.labels('capture', 'captured').observe(duration);
+    paymentTransactionsTotal.labels('captured', transaction.currency).inc();
+
     return (await this.getTransaction(transactionId))!;
   }
 
   /**
    * Cancels an authorized payment before capture, releasing the hold on customer funds.
    * No ledger entries are created since no money was moved.
+   *
+   * IDEMPOTENCY: Voiding an already-voided transaction returns current state.
+   *
    * @param transactionId - UUID of the authorized transaction to void
+   * @param clientInfo - Optional client info for audit logging
    * @returns Updated transaction with 'voided' status
    * @throws Error if transaction not found or not in 'authorized' status
    */
-  async voidPayment(transactionId: string): Promise<Transaction> {
+  async voidPayment(
+    transactionId: string,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
+  ): Promise<Transaction> {
+    const startTime = Date.now();
     const transaction = await this.getTransaction(transactionId);
 
     if (!transaction) {
       throw new Error('Transaction not found');
+    }
+
+    // Idempotent: already voided, return current state
+    if (transaction.status === 'voided') {
+      logger.info({ transactionId }, 'Transaction already voided, returning current state');
+      return transaction;
     }
 
     if (transaction.status !== 'authorized') {
@@ -293,6 +483,19 @@ export class PaymentService {
       `UPDATE transactions SET status = 'voided', updated_at = NOW(), version = version + 1 WHERE id = $1`,
       [transactionId]
     );
+
+    // Audit log: payment voided
+    await auditPaymentVoided(
+      transactionId,
+      transaction.merchant_id,
+      clientInfo?.ipAddress,
+      clientInfo?.userAgent
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    paymentProcessingDuration.labels('void', 'voided').observe(duration);
+    paymentTransactionsTotal.labels('voided', transaction.currency).inc();
 
     return (await this.getTransaction(transactionId))!;
   }

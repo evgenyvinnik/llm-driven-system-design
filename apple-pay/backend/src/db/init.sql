@@ -131,3 +131,42 @@ VALUES (
   'SE_DEMO_001',
   'active'
 ) ON CONFLICT DO NOTHING;
+
+-- Audit Logs Table
+-- Stores immutable audit trail for compliance (PCI-DSS, SOX)
+-- All financial and security-critical operations are logged here
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  user_email VARCHAR(255),
+  action VARCHAR(100) NOT NULL, -- e.g., 'payment.approved', 'card.suspended'
+  resource_type VARCHAR(50) NOT NULL, -- e.g., 'transaction', 'card', 'user'
+  resource_id VARCHAR(100), -- The ID of the affected resource
+  result VARCHAR(20) NOT NULL, -- 'success', 'failure', 'error'
+  ip_address VARCHAR(45), -- IPv6 compatible
+  user_agent TEXT,
+  session_id VARCHAR(100),
+  request_id VARCHAR(100), -- For correlation with application logs
+  metadata JSONB DEFAULT '{}', -- Additional context (redacted of sensitive data)
+  error_message TEXT, -- Error details if result is failure/error
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for audit log queries
+-- These support common compliance queries and investigations
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_result ON audit_logs(result, created_at DESC);
+
+-- Token ATC (Application Transaction Counter) table
+-- Stores the last known ATC for replay attack prevention
+-- Write-through caching: updated in both Redis and PostgreSQL
+CREATE TABLE IF NOT EXISTS token_atc (
+  token_ref VARCHAR(100) PRIMARY KEY,
+  last_atc INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_atc_updated ON token_atc(updated_at DESC);

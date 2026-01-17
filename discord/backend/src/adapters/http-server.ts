@@ -478,7 +478,7 @@ export class HTTPServer {
     // GET /api/rooms/:room/history - Get message history for a room
     this.app.get('/api/rooms/:room/history', async (req: Request, res: Response) => {
       try {
-        const roomName = req.params.room;
+        const roomName = req.params.room as string;
         const room = await roomManager.getRoom(roomName);
 
         if (!room) {
@@ -512,7 +512,7 @@ export class HTTPServer {
 
     // GET /api/messages/:room - SSE endpoint for real-time messages
     this.app.get('/api/messages/:room', (req: Request, res: Response) => {
-      const roomName = req.params.room;
+      const roomName = req.params.room as string;
       const sessionId = req.query.sessionId as string;
 
       if (!sessionId) {
@@ -579,7 +579,7 @@ export class HTTPServer {
 
     // GET /api/session/:sessionId - Get session details
     this.app.get('/api/session/:sessionId', (req: Request, res: Response) => {
-      const { sessionId } = req.params;
+      const sessionId = req.params.sessionId as string;
       const session = connectionManager.getSession(sessionId);
 
       if (!session) {

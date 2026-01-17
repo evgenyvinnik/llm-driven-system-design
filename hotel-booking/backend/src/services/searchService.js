@@ -1,10 +1,29 @@
+/**
+ * Search Service
+ *
+ * Handles hotel search with:
+ * - Elasticsearch for fast text/geo queries
+ * - PostgreSQL for accurate availability
+ * - Metrics for monitoring search performance
+ */
+
 const elasticsearch = require('../models/elasticsearch');
 const bookingService = require('./bookingService');
 const db = require('../models/db');
 
+// Import shared modules
+const { logger, metrics } = require('../shared');
+
 class SearchService {
   async searchHotels(params) {
+    const startTime = Date.now();
     const { checkIn, checkOut, guests, rooms = 1, ...esParams } = params;
+
+    // Track search request
+    metrics.searchRequestsTotal.inc({
+      has_dates: checkIn && checkOut ? 'true' : 'false',
+      city: esParams.city || 'unknown',
+    });
 
     // First, get matching hotels from Elasticsearch
     const esResult = await elasticsearch.searchHotels({
@@ -14,6 +33,10 @@ class SearchService {
 
     if (!checkIn || !checkOut) {
       // No dates specified, return ES results as-is
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      metrics.searchDurationSeconds.observe(durationSeconds);
+      metrics.searchResultsCount.observe(esResult.hotels.length);
+
       return esResult;
     }
 
@@ -59,13 +82,32 @@ class SearchService {
           }
           return null;
         } catch (error) {
-          console.error(`Error checking availability for hotel ${hotel.hotel_id}:`, error);
+          logger.error(
+            { error, hotelId: hotel.hotel_id },
+            'Error checking availability for hotel'
+          );
           return null;
         }
       })
     );
 
     const filteredHotels = hotelsWithAvailability.filter((h) => h !== null);
+
+    // Record metrics
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    metrics.searchDurationSeconds.observe(durationSeconds);
+    metrics.searchResultsCount.observe(filteredHotels.length);
+
+    logger.debug(
+      {
+        city: esParams.city,
+        checkIn,
+        checkOut,
+        resultsCount: filteredHotels.length,
+        durationSeconds,
+      },
+      'Search completed'
+    );
 
     return {
       ...esResult,

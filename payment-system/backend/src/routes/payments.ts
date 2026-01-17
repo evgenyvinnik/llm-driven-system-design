@@ -4,17 +4,33 @@ import { PaymentService } from '../services/payment.service.js';
 import { RefundService, ChargebackService } from '../services/refund.service.js';
 import { LedgerService } from '../services/ledger.service.js';
 import type { CreatePaymentRequest, RefundRequest, TransactionListParams } from '../types/index.js';
+import { logger } from '../shared/index.js';
 
 /**
  * Payment routes module.
  * Provides REST endpoints for the full payment lifecycle:
  * creation, retrieval, capture, void, and refund operations.
+ *
+ * All endpoints include:
+ * - Idempotency support via Idempotency-Key header
+ * - Audit logging for compliance
+ * - Prometheus metrics collection
  */
 const router = Router();
 const paymentService = new PaymentService();
 const refundService = new RefundService();
 const chargebackService = new ChargebackService();
 const ledgerService = new LedgerService();
+
+/**
+ * Extracts client information from request for audit logging.
+ */
+function getClientInfo(req: Request): { ipAddress?: string; userAgent?: string } {
+  return {
+    ipAddress: (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.ip,
+    userAgent: req.headers['user-agent'],
+  };
+}
 
 /**
  * Creates a new payment transaction.
@@ -54,12 +70,13 @@ router.post('/', async (req: Request, res: Response) => {
     const result = await paymentService.createPayment(
       req.merchant.id,
       req.merchant.account_id,
-      paymentRequest
+      paymentRequest,
+      getClientInfo(req)
     );
 
     res.status(201).json(result);
   } catch (error) {
-    console.error('Create payment error:', error);
+    logger.error({ error, merchantId: req.merchant?.id }, 'Create payment error');
     res.status(500).json({
       error: 'Failed to create payment',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -94,7 +111,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json(transaction);
   } catch (error) {
-    console.error('Get payment error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Get payment error');
     res.status(500).json({ error: 'Failed to get payment' });
   }
 });
@@ -128,7 +145,7 @@ router.get('/', async (req: Request, res: Response) => {
       offset: params.offset,
     });
   } catch (error) {
-    console.error('List payments error:', error);
+    logger.error({ error, merchantId: req.merchant?.id }, 'List payments error');
     res.status(500).json({ error: 'Failed to list payments' });
   }
 });
@@ -136,6 +153,9 @@ router.get('/', async (req: Request, res: Response) => {
 /**
  * Captures funds from an authorized payment.
  * Moves payment from 'authorized' to 'captured' status and records ledger entries.
+ *
+ * IDEMPOTENCY: Capturing an already-captured payment returns success without changes.
+ *
  * POST /api/v1/payments/:id/capture
  */
 router.post('/:id/capture', async (req: Request, res: Response) => {
@@ -157,11 +177,15 @@ router.post('/:id/capture', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await paymentService.capturePayment(req.params.id, req.merchant.account_id);
+    const result = await paymentService.capturePayment(
+      req.params.id,
+      req.merchant.account_id,
+      getClientInfo(req)
+    );
 
     res.json(result);
   } catch (error) {
-    console.error('Capture payment error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Capture payment error');
     res.status(400).json({
       error: 'Failed to capture payment',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -172,6 +196,9 @@ router.post('/:id/capture', async (req: Request, res: Response) => {
 /**
  * Voids an authorized payment before capture.
  * Cancels the authorization and releases the hold on customer funds.
+ *
+ * IDEMPOTENCY: Voiding an already-voided payment returns success without changes.
+ *
  * POST /api/v1/payments/:id/void
  */
 router.post('/:id/void', async (req: Request, res: Response) => {
@@ -193,11 +220,14 @@ router.post('/:id/void', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await paymentService.voidPayment(req.params.id);
+    const result = await paymentService.voidPayment(
+      req.params.id,
+      getClientInfo(req)
+    );
 
     res.json(result);
   } catch (error) {
-    console.error('Void payment error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Void payment error');
     res.status(400).json({
       error: 'Failed to void payment',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -208,6 +238,10 @@ router.post('/:id/void', async (req: Request, res: Response) => {
 /**
  * Creates a full or partial refund for a captured payment.
  * Validates refund amount and creates reversing ledger entries.
+ *
+ * IDEMPOTENCY: If Idempotency-Key is provided, duplicate requests return
+ * the cached refund response.
+ *
  * POST /api/v1/payments/:id/refund
  */
 router.post('/:id/refund', async (req: Request, res: Response) => {
@@ -239,12 +273,13 @@ router.post('/:id/refund', async (req: Request, res: Response) => {
       req.params.id,
       req.merchant.id,
       req.merchant.account_id,
-      refundRequest
+      refundRequest,
+      getClientInfo(req)
     );
 
     res.status(201).json(result);
   } catch (error) {
-    console.error('Create refund error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Create refund error');
     res.status(400).json({
       error: 'Failed to create refund',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -280,7 +315,7 @@ router.get('/:id/refunds', async (req: Request, res: Response) => {
 
     res.json({ data: refunds });
   } catch (error) {
-    console.error('Get refunds error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Get refunds error');
     res.status(500).json({ error: 'Failed to get refunds' });
   }
 });
@@ -313,7 +348,7 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
 
     res.json({ data: entries });
   } catch (error) {
-    console.error('Get ledger entries error:', error);
+    logger.error({ error, paymentId: req.params.id }, 'Get ledger entries error');
     res.status(500).json({ error: 'Failed to get ledger entries' });
   }
 });

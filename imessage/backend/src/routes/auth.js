@@ -1,8 +1,12 @@
 import { Router } from 'express';
 import { register, login, logout, getUserDevices, deactivateDevice } from '../services/auth.js';
 import { authenticateRequest } from '../middleware/auth.js';
+import { loginRateLimiter, deviceRegistrationRateLimiter } from '../shared/rate-limiter.js';
+import { createLogger } from '../shared/logger.js';
+import { authAttempts } from '../shared/metrics.js';
 
 const router = Router();
+const logger = createLogger('auth-routes');
 
 router.post('/register', async (req, res) => {
   try {
@@ -13,9 +17,13 @@ router.post('/register', async (req, res) => {
     }
 
     const result = await register(username, email, password, displayName, deviceName, deviceType);
+
+    logger.info({ userId: result.user.id, username }, 'User registered');
+    authAttempts.inc({ result: 'success' });
+
     res.status(201).json(result);
   } catch (error) {
-    console.error('Registration error:', error);
+    logger.error({ error }, 'Registration error');
     if (error.code === '23505') {
       return res.status(409).json({ error: 'Username or email already exists' });
     }
@@ -23,7 +31,8 @@ router.post('/register', async (req, res) => {
   }
 });
 
-router.post('/login', async (req, res) => {
+// Rate limited: 5 attempts per 15 minutes per IP
+router.post('/login', loginRateLimiter, async (req, res) => {
   try {
     const { usernameOrEmail, password, deviceName, deviceType } = req.body;
 
@@ -32,12 +41,18 @@ router.post('/login', async (req, res) => {
     }
 
     const result = await login(usernameOrEmail, password, deviceName, deviceType);
+
+    logger.info({ userId: result.user.id }, 'User logged in');
+    authAttempts.inc({ result: 'success' });
+
     res.json(result);
   } catch (error) {
-    console.error('Login error:', error);
     if (error.message === 'Invalid credentials') {
+      logger.warn({ usernameOrEmail, ip: req.ip }, 'Failed login attempt');
+      authAttempts.inc({ result: 'failure' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    logger.error({ error }, 'Login error');
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -46,9 +61,12 @@ router.post('/logout', authenticateRequest, async (req, res) => {
   try {
     const token = req.headers.authorization?.substring(7);
     await logout(token);
+
+    logger.info({ userId: req.user.id }, 'User logged out');
+
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    console.error('Logout error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Logout error');
     res.status(500).json({ error: 'Logout failed' });
   }
 });
@@ -65,7 +83,7 @@ router.get('/devices', authenticateRequest, async (req, res) => {
     const devices = await getUserDevices(req.user.id);
     res.json({ devices });
   } catch (error) {
-    console.error('Get devices error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Get devices error');
     res.status(500).json({ error: 'Failed to get devices' });
   }
 });
@@ -73,9 +91,12 @@ router.get('/devices', authenticateRequest, async (req, res) => {
 router.delete('/devices/:deviceId', authenticateRequest, async (req, res) => {
   try {
     await deactivateDevice(req.user.id, req.params.deviceId);
+
+    logger.info({ userId: req.user.id, deviceId: req.params.deviceId }, 'Device deactivated');
+
     res.json({ message: 'Device deactivated' });
   } catch (error) {
-    console.error('Deactivate device error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Deactivate device error');
     res.status(500).json({ error: 'Failed to deactivate device' });
   }
 });

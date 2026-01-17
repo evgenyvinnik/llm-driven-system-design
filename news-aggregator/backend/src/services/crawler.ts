@@ -2,6 +2,13 @@
  * RSS feed crawler service.
  * Responsible for fetching RSS feeds from news sources, parsing articles,
  * detecting duplicates via SimHash, and clustering articles into stories.
+ *
+ * Features:
+ * - Circuit breaker pattern for protecting against slow/unavailable sources
+ * - Retry logic with exponential backoff for transient failures
+ * - Rate limiting per domain to be a good citizen
+ * - Metrics for observability
+ * @module services/crawler
  */
 
 import { query, queryOne, execute } from '../db/postgres.js';
@@ -10,6 +17,20 @@ import { computeSimHash } from '../utils/simhash.js';
 import { extractTopics, extractEntities } from '../utils/topics.js';
 import { indexArticle } from '../db/elasticsearch.js';
 import { v4 as uuid } from 'uuid';
+
+// Shared modules
+import { logger } from '../shared/logger.js';
+import { config } from '../shared/config.js';
+import { createCircuitBreaker, globalFetchBreaker } from '../shared/circuit-breaker.js';
+import { withRetry, RetryStrategies } from '../shared/retry.js';
+import {
+  articlesFetchedTotal,
+  articlesStoredTotal,
+  crawlerFetchTotal,
+  crawlerFetchDuration,
+  activeCrawlJobs,
+} from '../shared/metrics.js';
+import { invalidateGlobalCaches } from '../shared/cache.js';
 
 /** Represents a news source configuration */
 interface Source {
@@ -49,7 +70,41 @@ interface CrawlResult {
 const domainLastCrawl: Map<string, number> = new Map();
 
 /** Minimum delay in milliseconds between requests to the same domain */
-const CRAWL_DELAY_MS = 1000;
+const CRAWL_DELAY_MS = config.crawler.domainDelayMs;
+
+/** Per-source circuit breakers for isolating failures */
+const sourceCircuitBreakers: Map<string, ReturnType<typeof createCircuitBreaker>> = new Map();
+
+/**
+ * Get or create a circuit breaker for a specific source.
+ * Each source gets its own breaker to isolate failures.
+ * @param sourceId - The source ID
+ * @param sourceName - The source name for logging
+ * @returns Circuit breaker for the source
+ */
+function getSourceCircuitBreaker(sourceId: string, sourceName: string) {
+  let breaker = sourceCircuitBreakers.get(sourceId);
+  if (!breaker) {
+    breaker = createCircuitBreaker(
+      async (url: string, options?: RequestInit) => {
+        const response = await fetch(url, options);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return response;
+      },
+      {
+        name: `source:${sourceName}`,
+        timeout: config.circuitBreaker.timeoutMs,
+        errorThresholdPercentage: config.circuitBreaker.errorThresholdPercentage,
+        resetTimeout: config.circuitBreaker.resetTimeoutMs,
+        volumeThreshold: config.circuitBreaker.volumeThreshold,
+      }
+    );
+    sourceCircuitBreakers.set(sourceId, breaker);
+  }
+  return breaker;
+}
 
 /**
  * Enforce rate limiting per domain.
@@ -68,8 +123,85 @@ async function respectRateLimit(domain: string): Promise<void> {
 }
 
 /**
+ * Fetch RSS feed with circuit breaker and retry logic.
+ * Provides resilient fetching with proper failure handling.
+ * @param source - The source to fetch
+ * @returns XML content of the feed
+ */
+async function fetchFeedWithResilience(source: Source): Promise<string> {
+  const domain = new URL(source.feed_url).hostname;
+  await respectRateLimit(domain);
+
+  const breaker = getSourceCircuitBreaker(source.id, source.name);
+  const fetchStart = Date.now();
+
+  try {
+    // Use circuit breaker with retry logic inside
+    const response = await breaker.fire(
+      source.feed_url,
+      {
+        headers: {
+          'User-Agent': config.crawler.userAgent,
+          'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml',
+        },
+        signal: AbortSignal.timeout(config.crawler.requestTimeoutMs),
+      }
+    ) as Response;
+
+    const duration = (Date.now() - fetchStart) / 1000;
+    crawlerFetchDuration.observe({ source_id: source.id }, duration);
+    crawlerFetchTotal.inc({ status: 'success' });
+
+    return await response.text();
+  } catch (error) {
+    const duration = (Date.now() - fetchStart) / 1000;
+    crawlerFetchDuration.observe({ source_id: source.id }, duration);
+
+    // Log the failure
+    logger.warn({
+      sourceId: source.id,
+      sourceName: source.name,
+      error: (error as Error).message,
+    }, 'Feed fetch failed');
+
+    // If circuit is open, retry with exponential backoff using global breaker
+    if ((error as Error).message?.includes('circuit open')) {
+      logger.info({ sourceId: source.id }, 'Circuit open, trying with retry strategy');
+
+      return withRetry(
+        async () => {
+          const response = await globalFetchBreaker.fire(
+            source.feed_url,
+            {
+              headers: {
+                'User-Agent': config.crawler.userAgent,
+                'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml',
+              },
+              signal: AbortSignal.timeout(config.crawler.requestTimeoutMs),
+            }
+          ) as Response;
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return response.text();
+        },
+        {
+          ...RetryStrategies.rssFeed,
+          operationName: `fetch:${source.name}`,
+        }
+      );
+    }
+
+    crawlerFetchTotal.inc({ status: 'error' });
+    throw error;
+  }
+}
+
+/**
  * Crawl a single news source.
  * Fetches the RSS feed, parses articles, deduplicates, and stores new content.
+ * Uses circuit breaker and retry logic for resilience.
  * @param source - The source configuration to crawl
  * @returns Result containing counts of found/new articles and any errors
  */
@@ -81,33 +213,20 @@ export async function crawlSource(source: Source): Promise<CrawlResult> {
     errors: [],
   };
 
+  const childLogger = logger.child({ sourceId: source.id, sourceName: source.name });
+  activeCrawlJobs.inc();
+
   try {
-    // Respect rate limiting
-    const domain = new URL(source.feed_url).hostname;
-    await respectRateLimit(domain);
+    childLogger.info('Starting crawl');
 
-    // Fetch the feed
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-
-    const response = await fetch(source.feed_url, {
-      headers: {
-        'User-Agent': 'NewsAggregator/1.0 (Learning Project)',
-        'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml',
-      },
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const xml = await response.text();
+    // Fetch the feed with resilience
+    const xml = await fetchFeedWithResilience(source);
     const feed = parseRSS(xml);
 
     result.articles_found = feed.items.length;
+    articlesFetchedTotal.inc({ source_id: source.id, status: 'success' }, feed.items.length);
+
+    childLogger.info({ articlesFound: feed.items.length }, 'Feed parsed');
 
     // Process each item
     for (const item of feed.items) {
@@ -115,9 +234,12 @@ export async function crawlSource(source: Source): Promise<CrawlResult> {
         const inserted = await processArticle(source, item);
         if (inserted) {
           result.articles_new++;
+          articlesStoredTotal.inc();
         }
       } catch (err) {
-        result.errors.push(`Article "${item.title}": ${err}`);
+        const errorMsg = `Article "${item.title}": ${err}`;
+        result.errors.push(errorMsg);
+        childLogger.warn({ article: item.title, error: err }, 'Failed to process article');
       }
     }
 
@@ -132,8 +254,20 @@ export async function crawlSource(source: Source): Promise<CrawlResult> {
       'UPDATE crawl_schedule SET next_crawl = NOW() + ($1 || \' minutes\')::interval WHERE source_id = $2',
       [source.crawl_frequency_minutes, source.id]
     );
+
+    childLogger.info({
+      articlesFound: result.articles_found,
+      articlesNew: result.articles_new,
+      errors: result.errors.length,
+    }, 'Crawl completed');
+
   } catch (err) {
-    result.errors.push(`Feed error: ${err}`);
+    const errorMsg = `Feed error: ${err}`;
+    result.errors.push(errorMsg);
+    articlesFetchedTotal.inc({ source_id: source.id, status: 'error' });
+    childLogger.error({ error: err }, 'Crawl failed');
+  } finally {
+    activeCrawlJobs.dec();
   }
 
   return result;
@@ -201,21 +335,27 @@ async function processArticle(source: Source, item: RSSItem): Promise<boolean> {
   // Assign to story (deduplication)
   await assignToStory(articleId, fingerprint, title, summary, topics, entities);
 
-  // Index in Elasticsearch
+  // Index in Elasticsearch with retry
   try {
-    await indexArticle({
-      id: articleId,
-      title,
-      summary,
-      body,
-      topics,
-      entities,
-      published_at: publishedAt,
-      source_id: source.id,
-      fingerprint,
-    });
+    await withRetry(
+      () => indexArticle({
+        id: articleId,
+        title,
+        summary,
+        body,
+        topics,
+        entities,
+        published_at: publishedAt,
+        source_id: source.id,
+        fingerprint,
+      }),
+      {
+        ...RetryStrategies.fast,
+        operationName: 'index-article',
+      }
+    );
   } catch (err) {
-    console.error('Failed to index article:', err);
+    logger.error({ articleId, error: err }, 'Failed to index article after retries');
   }
 
   return true;
@@ -331,25 +471,35 @@ export async function getSourcesToCrawl(): Promise<Source[]> {
 
 /**
  * Crawl all sources that are due for refresh.
- * Logs progress to console and returns results for each source.
+ * Logs progress and returns results for each source.
+ * Invalidates feed caches after crawling new articles.
  * @returns Array of crawl results for all processed sources
  */
 export async function crawlAllDueSources(): Promise<CrawlResult[]> {
   const sources = await getSourcesToCrawl();
-  console.log(`Found ${sources.length} sources due for crawling`);
+  logger.info({ sourceCount: sources.length }, 'Starting crawl of due sources');
 
   const results: CrawlResult[] = [];
+  let totalNew = 0;
 
   for (const source of sources) {
-    console.log(`Crawling: ${source.name} (${source.feed_url})`);
     const result = await crawlSource(source);
     results.push(result);
-
-    console.log(`  Found: ${result.articles_found}, New: ${result.articles_new}`);
-    if (result.errors.length > 0) {
-      console.log(`  Errors: ${result.errors.length}`);
-    }
+    totalNew += result.articles_new;
   }
+
+  // Invalidate caches if we got new articles
+  if (totalNew > 0) {
+    await invalidateGlobalCaches();
+    logger.info({ newArticles: totalNew }, 'Invalidated global caches after crawl');
+  }
+
+  logger.info({
+    sourcesCount: results.length,
+    totalArticlesFound: results.reduce((sum, r) => sum + r.articles_found, 0),
+    totalArticlesNew: totalNew,
+    totalErrors: results.reduce((sum, r) => sum + r.errors.length, 0),
+  }, 'Crawl batch completed');
 
   return results;
 }
@@ -395,12 +545,14 @@ export async function addSource(
     [id]
   );
 
+  logger.info({ sourceId: id, sourceName: name, feedUrl }, 'Added new source');
+
   return {
     id,
     name,
     domain,
     feed_url: feedUrl,
     category,
-    crawl_frequency_minutes: 15,
+    crawl_frequency_minutes: config.crawler.defaultCrawlIntervalMinutes,
   };
 }

@@ -7,11 +7,18 @@ import {
   CancelBookingSchema,
 } from '../types/index.js';
 import { isValidTimezone } from '../utils/time.js';
+import { IDEMPOTENCY_CONFIG } from '../shared/config.js';
+import { logger } from '../shared/logger.js';
 import { z } from 'zod';
 
 /**
  * Express router for booking management.
  * Handles booking creation, retrieval, rescheduling, and cancellation.
+ *
+ * IDEMPOTENCY:
+ * The POST /api/bookings endpoint supports idempotent requests via the
+ * X-Idempotency-Key header. When provided, duplicate requests with the
+ * same key will return the cached result from the first request.
  */
 const router = Router();
 
@@ -98,6 +105,17 @@ router.get('/:id', async (req: Request, res: Response) => {
  * POST /api/bookings - Create a new booking.
  * Public endpoint for invitees. Implements double-booking prevention.
  * Sends confirmation emails on success.
+ *
+ * IDEMPOTENCY:
+ * Include the X-Idempotency-Key header to ensure idempotent behavior.
+ * If the same key is used for multiple requests, only the first request
+ * will create a booking. Subsequent requests will return the cached result.
+ *
+ * Even without the header, the system generates an automatic idempotency
+ * key based on meeting_type_id + start_time + invitee_email to prevent
+ * accidental duplicates.
+ *
+ * @header {X-Idempotency-Key} - Optional idempotency key (recommended)
  * @body {meeting_type_id, start_time, invitee_name, invitee_email, invitee_timezone, notes}
  * @returns {Booking} The newly created booking
  */
@@ -114,11 +132,30 @@ router.post('/', async (req: Request, res: Response) => {
       return;
     }
 
-    const booking = await bookingService.createBooking(input);
+    // Extract idempotency key from header
+    const idempotencyKey = req.headers[IDEMPOTENCY_CONFIG.HEADER_NAME.toLowerCase()] as
+      | string
+      | undefined;
+
+    // Create booking with idempotency support
+    const result = await bookingService.createBooking(input, idempotencyKey);
+
+    // If result was cached (idempotent replay), still return 201
+    // but log that it was a duplicate request
+    if (result.cached) {
+      logger.info(
+        {
+          bookingId: result.booking.id,
+          idempotencyKey,
+        },
+        'Returned cached booking result (idempotent replay)'
+      );
+    }
 
     res.status(201).json({
       success: true,
-      data: booking,
+      data: result.booking,
+      cached: result.cached,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

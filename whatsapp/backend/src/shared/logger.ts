@@ -15,9 +15,13 @@
  */
 
 import pino from 'pino';
-import pinoHttp from 'pino-http';
+import pinoHttpModule from 'pino-http';
 import { config } from '../config.js';
 import crypto from 'crypto';
+import { IncomingMessage, ServerResponse } from 'http';
+
+// Handle both ESM and CJS module exports
+const pinoHttp = (pinoHttpModule as any).default || pinoHttpModule;
 
 /**
  * Base logger instance configured for the application.
@@ -53,7 +57,7 @@ export const logger = pino({
 export const httpLogger = pinoHttp({
   logger,
   // Generate unique request IDs for tracing
-  genReqId: (req) => {
+  genReqId: (req: IncomingMessage) => {
     const existingId = req.headers['x-trace-id'];
     if (existingId && typeof existingId === 'string') {
       return existingId;
@@ -61,12 +65,12 @@ export const httpLogger = pinoHttp({
     return crypto.randomUUID();
   },
   // Customize what gets logged
-  customProps: (req) => ({
+  customProps: (req: IncomingMessage) => ({
     user_id: (req as any).session?.userId,
   }),
   // Don't log health checks at info level (too noisy)
   autoLogging: {
-    ignore: (req) => req.url === '/health' || req.url === '/metrics',
+    ignore: (req: IncomingMessage) => req.url === '/health' || req.url === '/metrics',
   },
   // Redact sensitive headers
   redact: ['req.headers.cookie', 'req.headers.authorization'],

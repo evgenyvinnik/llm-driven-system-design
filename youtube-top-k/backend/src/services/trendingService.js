@@ -2,9 +2,38 @@ import { WindowedViewCounter, getRedisClient } from './redis.js';
 import { query } from '../models/database.js';
 import { TopK } from '../utils/topk.js';
 
+// Import shared modules
+import { WINDOW_CONFIG, TOP_K_CONFIG, CACHE_CONFIG, RETENTION_CONFIG } from '../shared/config.js';
+import logger, { logTrendingCalculation, logCacheAccess, logViewEvent, logError } from '../shared/logger.js';
+import {
+  viewEventsTotal,
+  viewEventLatency,
+  trendingCalculationsTotal,
+  trendingCalculationLatency,
+  trendingVideosCount,
+  lastTrendingUpdate,
+  recordCacheAccess,
+  sseClientsConnected,
+  sseConnectionsTotal,
+  redisBucketKeyCount,
+} from '../shared/metrics.js';
+
 /**
  * TrendingService manages trending video calculations
  * It periodically computes top K videos across different time windows and categories
+ *
+ * WHY SLIDING WINDOW RETENTION BALANCES TRENDING ACCURACY VS MEMORY:
+ * - Shorter windows (e.g., 15 min) capture immediate viral content but are noisy
+ * - Longer windows (e.g., 24 hours) are stable but miss fast-rising content
+ * - The default 60-minute window balances these tradeoffs
+ * - Time bucketing (1-min buckets) enables efficient sliding window computation
+ * - Redis TTL automatically cleans up old buckets, preventing memory growth
+ *
+ * WHY CACHE HIT RATES DRIVE TOP-K UPDATE FREQUENCY:
+ * - High cache hit rate (>95%) means clients mostly read cached data
+ * - This allows us to reduce update frequency without impacting freshness
+ * - Low hit rate suggests update interval may be too long
+ * - Metrics help tune the balance between accuracy and compute cost
  */
 export class TrendingService {
   static instance = null;
@@ -18,14 +47,28 @@ export class TrendingService {
 
   constructor() {
     this.viewCounter = new WindowedViewCounter(
-      parseInt(process.env.WINDOW_SIZE_MINUTES || '60', 10),
-      1 // 1-minute buckets
+      WINDOW_CONFIG.windowSizeMinutes,
+      WINDOW_CONFIG.bucketSizeMinutes
     );
-    this.topK = parseInt(process.env.TOP_K_SIZE || '10', 10);
-    this.updateInterval = parseInt(process.env.UPDATE_INTERVAL_SECONDS || '5', 10) * 1000;
+    this.topK = TOP_K_CONFIG.defaultK;
+    this.updateInterval = TOP_K_CONFIG.updateIntervalSeconds * 1000;
     this.trendingCache = new Map(); // category -> { videos, updatedAt }
+    this.trendingCacheTimestamps = new Map(); // category -> last access time
     this.sseClients = new Set();
     this.intervalId = null;
+
+    // Cache access tracking for hit rate calculation
+    this.cacheAccesses = { hits: 0, misses: 0 };
+
+    logger.info(
+      {
+        windowMinutes: WINDOW_CONFIG.windowSizeMinutes,
+        bucketMinutes: WINDOW_CONFIG.bucketSizeMinutes,
+        topK: this.topK,
+        updateIntervalMs: this.updateInterval,
+      },
+      'TrendingService initialized with configuration'
+    );
   }
 
   /**
@@ -40,11 +83,14 @@ export class TrendingService {
       try {
         await this.updateTrending();
       } catch (error) {
-        console.error('Error updating trending:', error);
+        logError(error, { context: 'trending_update' });
       }
     }, this.updateInterval);
 
-    console.log(`Trending service started (update interval: ${this.updateInterval / 1000}s)`);
+    logger.info(
+      { updateIntervalSeconds: this.updateInterval / 1000 },
+      'Trending service started'
+    );
   }
 
   /**
@@ -54,6 +100,7 @@ export class TrendingService {
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+      logger.info('Trending service stopped');
     }
   }
 
@@ -61,13 +108,38 @@ export class TrendingService {
    * Record a view for a video
    */
   async recordView(videoId, category = 'all') {
-    await this.viewCounter.recordView(videoId, category);
+    const start = process.hrtime.bigint();
 
-    // Also update PostgreSQL total count
-    await query(
-      'UPDATE videos SET total_views = total_views + 1, updated_at = NOW() WHERE id = $1',
-      [videoId]
-    );
+    try {
+      await this.viewCounter.recordView(videoId, category);
+
+      // Also update PostgreSQL total count
+      await query(
+        'UPDATE videos SET total_views = total_views + 1, updated_at = NOW() WHERE id = $1',
+        [videoId]
+      );
+
+      // Optionally log view event to PostgreSQL (based on retention config)
+      if (RETENTION_CONFIG.enableViewEventLogging) {
+        // Sample views to reduce storage
+        if (Math.random() < RETENTION_CONFIG.viewEventSampleRate) {
+          await query(
+            'INSERT INTO view_events (video_id, viewed_at) VALUES ($1, NOW())',
+            [videoId]
+          );
+        }
+      }
+
+      // Record metrics
+      const duration = Number(process.hrtime.bigint() - start) / 1e9;
+      viewEventsTotal.inc({ category: category || 'all', status: 'success' });
+      viewEventLatency.observe({ category: category || 'all' }, duration);
+
+      logViewEvent(videoId, category, { durationMs: duration * 1000 });
+    } catch (error) {
+      viewEventsTotal.inc({ category: category || 'all', status: 'error' });
+      throw error;
+    }
   }
 
   /**
@@ -78,14 +150,37 @@ export class TrendingService {
 
     for (const category of categories) {
       try {
+        const start = process.hrtime.bigint();
+
         const trending = await this.calculateTrending(category);
         this.trendingCache.set(category, {
           videos: trending,
           updatedAt: new Date(),
         });
+
+        // Record metrics
+        const duration = Number(process.hrtime.bigint() - start) / 1e9;
+        trendingCalculationsTotal.inc({ category });
+        trendingCalculationLatency.observe({ category }, duration);
+        trendingVideosCount.set({ category }, trending.length);
+        lastTrendingUpdate.set({ category }, Date.now() / 1000);
+
+        logTrendingCalculation(category, trending.length, duration * 1000);
       } catch (error) {
-        console.error(`Error calculating trending for ${category}:`, error);
+        logError(error, { context: 'trending_calculation', category });
       }
+    }
+
+    // Update Redis bucket key counts for monitoring
+    try {
+      const client = await getRedisClient();
+      for (const category of categories) {
+        const pattern = `views:bucket:${category}:*`;
+        const keys = await client.keys(pattern);
+        redisBucketKeyCount.set({ category }, keys.length);
+      }
+    } catch (error) {
+      logError(error, { context: 'redis_key_count' });
     }
 
     // Notify SSE clients
@@ -139,9 +234,23 @@ export class TrendingService {
    */
   getTrending(category = 'all') {
     const cached = this.trendingCache.get(category);
+
     if (cached) {
+      // Check if cache is still fresh
+      const age = Date.now() - cached.updatedAt.getTime();
+      const isFresh = age < CACHE_CONFIG.trendingCacheTtlSeconds * 1000;
+
+      // Record cache access
+      recordCacheAccess('trending', true);
+      logCacheAccess('trending', true, category);
+
       return cached;
     }
+
+    // Cache miss
+    recordCacheAccess('trending', false);
+    logCacheAccess('trending', false, category);
+
     return { videos: [], updatedAt: null };
   }
 
@@ -150,11 +259,25 @@ export class TrendingService {
    */
   registerSSEClient(res) {
     this.sseClients.add(res);
-    console.log(`SSE client connected. Total: ${this.sseClients.size}`);
+
+    // Update metrics
+    sseClientsConnected.set(this.sseClients.size);
+    sseConnectionsTotal.inc({ status: 'connected' });
+
+    logger.info(
+      { clientCount: this.sseClients.size },
+      'SSE client connected'
+    );
 
     res.on('close', () => {
       this.sseClients.delete(res);
-      console.log(`SSE client disconnected. Total: ${this.sseClients.size}`);
+      sseClientsConnected.set(this.sseClients.size);
+      sseConnectionsTotal.inc({ status: 'disconnected' });
+
+      logger.info(
+        { clientCount: this.sseClients.size },
+        'SSE client disconnected'
+      );
     });
   }
 
@@ -173,13 +296,20 @@ export class TrendingService {
       ),
     });
 
+    let errorCount = 0;
     for (const client of this.sseClients) {
       try {
         client.write(`data: ${data}\n\n`);
       } catch (error) {
-        console.error('Error sending SSE:', error);
+        logError(error, { context: 'sse_send' });
         this.sseClients.delete(client);
+        sseConnectionsTotal.inc({ status: 'error' });
+        errorCount++;
       }
+    }
+
+    if (errorCount > 0) {
+      sseClientsConnected.set(this.sseClients.size);
     }
   }
 
@@ -209,12 +339,24 @@ export class TrendingService {
     // Get unique videos with views
     const uniqueVideos = Object.keys(totalViewsHash).length;
 
+    // Calculate cache hit rate
+    const totalAccesses = this.cacheAccesses.hits + this.cacheAccesses.misses;
+    const cacheHitRate = totalAccesses > 0
+      ? this.cacheAccesses.hits / totalAccesses
+      : 0;
+
     return {
       totalViews,
       uniqueVideos,
       activeCategories: this.trendingCache.size,
       connectedClients: this.sseClients.size,
       lastUpdate: this.trendingCache.get('all')?.updatedAt || null,
+      cacheHitRate: cacheHitRate.toFixed(3),
+      config: {
+        windowMinutes: WINDOW_CONFIG.windowSizeMinutes,
+        topK: this.topK,
+        updateIntervalSeconds: TOP_K_CONFIG.updateIntervalSeconds,
+      },
     };
   }
 }

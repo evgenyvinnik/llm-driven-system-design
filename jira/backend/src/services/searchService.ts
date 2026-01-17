@@ -1,5 +1,7 @@
-import { esClient, ISSUE_INDEX, searchIssues } from '../config/elasticsearch.js';
-import { jqlParser, JQLNode } from './jqlParser.js';
+import { esClient, ISSUE_INDEX } from '../config/elasticsearch.js';
+import { logger } from '../config/logger.js';
+import { searchQueriesCounter, searchLatencyHistogram } from '../config/metrics.js';
+import { jqlParser } from './jqlParser.js';
 
 /**
  * Options for issue search queries.
@@ -46,8 +48,12 @@ export async function searchIssuesWithJQL(
   options: SearchOptions,
   currentUserId?: string
 ): Promise<SearchResult> {
+  const log = logger.child({ operation: 'searchIssuesWithJQL' });
   const startTime = Date.now();
   const must: Record<string, unknown>[] = [];
+
+  // Determine query type for metrics
+  const queryType = options.jql ? 'jql' : options.text ? 'text' : 'filter';
 
   // Parse JQL if provided
   if (options.jql && options.jql.trim()) {
@@ -56,7 +62,7 @@ export async function searchIssuesWithJQL(
       const esQuery = jqlParser.toElasticsearch(ast, { currentUserId });
       must.push(esQuery);
     } catch (error) {
-      console.error('JQL parse error:', error);
+      log.warn({ err: error, jql: options.jql }, 'JQL parse error');
       throw new Error(`Invalid JQL: ${(error as Error).message}`);
     }
   }
@@ -104,16 +110,24 @@ export async function searchIssuesWithJQL(
       ? result.hits.total
       : result.hits.total?.value || 0;
 
+    const duration = Date.now() - startTime;
+
+    // Record metrics
+    searchQueriesCounter.inc({ query_type: queryType });
+    searchLatencyHistogram.observe({ query_type: queryType }, duration / 1000);
+
+    log.debug({ queryType, total, duration_ms: duration }, 'Search completed');
+
     return {
       issues: result.hits.hits.map((hit) => ({
         ...hit._source as Record<string, unknown>,
         _score: hit._score,
       })),
       total,
-      took: Date.now() - startTime,
+      took: duration,
     };
   } catch (error) {
-    console.error('Elasticsearch search error:', error);
+    log.error({ err: error }, 'Elasticsearch search error');
     throw new Error('Search failed');
   }
 }
@@ -170,7 +184,7 @@ export async function getSearchSuggestions(
     const buckets = (result.aggregations?.suggestions as { buckets: { key: string }[] })?.buckets || [];
     return buckets.map((b) => b.key);
   } catch (error) {
-    console.error('Suggestions error:', error);
+    logger.error({ err: error }, 'Suggestions error');
     return [];
   }
 }
@@ -221,7 +235,7 @@ export async function getFilterAggregations(
       labels: parseAgg(result.aggregations?.labels),
     };
   } catch (error) {
-    console.error('Aggregations error:', error);
+    logger.error({ err: error }, 'Aggregations error');
     return {};
   }
 }
@@ -241,6 +255,8 @@ export async function quickSearch(
   projectId?: string,
   limit: number = 10
 ): Promise<Record<string, unknown>[]> {
+  const startTime = Date.now();
+
   const must: Record<string, unknown>[] = [
     {
       multi_match: {
@@ -266,12 +282,18 @@ export async function quickSearch(
       },
     });
 
+    const duration = Date.now() - startTime;
+
+    // Record metrics
+    searchQueriesCounter.inc({ query_type: 'quick' });
+    searchLatencyHistogram.observe({ query_type: 'quick' }, duration / 1000);
+
     return result.hits.hits.map((hit) => ({
       ...hit._source as Record<string, unknown>,
       _score: hit._score,
     }));
   } catch (error) {
-    console.error('Quick search error:', error);
+    logger.error({ err: error }, 'Quick search error');
     return [];
   }
 }

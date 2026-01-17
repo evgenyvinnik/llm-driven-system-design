@@ -121,7 +121,7 @@ app.post('/api/inference/classify', async (req, res) => {
     }
 
     // Check if we have an active model
-    let activeModel: { id: string; version: string; model_path: string } | null = null
+    let activeModel: { id: string; version: string; model_path: string }
     try {
       const modelResult = await postgresCircuitBreaker.execute(async () => {
         return trackExternalCall('postgres', 'select_active_model', async () => {

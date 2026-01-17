@@ -7,6 +7,11 @@ import { createRefundEntries } from '../services/ledger.js';
 import { refund as processRefund } from '../services/cardNetwork.js';
 import { sendWebhook } from '../services/webhooks.js';
 
+// Import shared modules for observability
+import logger from '../shared/logger.js';
+import { auditLogger } from '../shared/audit.js';
+import { refundsTotal, refundAmountCents } from '../shared/metrics.js';
+
 const router = Router();
 
 // All routes require authentication
@@ -146,6 +151,28 @@ router.post('/', idempotencyMiddleware, async (req, res) => {
 
     // Get the created refund
     const refundData = await query(`SELECT * FROM refunds WHERE id = $1`, [id]);
+    const refund = refundData.rows[0];
+
+    // Record metrics
+    refundsTotal.inc({ status: 'succeeded', reason: reason || 'none' });
+    refundAmountCents.observe(refundAmount);
+
+    // Audit log: Refund created
+    await auditLogger.logRefundCreated(refund, chargeRecord, {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      traceId: req.headers['x-trace-id'],
+    });
+
+    // Log the event
+    logger.info({
+      event: 'refund_created',
+      refund_id: id,
+      charge_id: chargeRecord.id,
+      amount: refundAmount,
+      reason,
+      merchant_id: req.merchantId,
+    });
 
     // Send webhook
     await sendWebhook(req.merchantId, 'charge.refunded', {
@@ -154,9 +181,29 @@ router.post('/', idempotencyMiddleware, async (req, res) => {
       amount_refunded: refundAmount,
     });
 
-    res.status(201).json(formatRefund(refundData.rows[0]));
+    res.status(201).json(formatRefund(refund));
   } catch (error) {
-    console.error('Create refund error:', error);
+    // Check for circuit breaker errors
+    if (error.name === 'CardNetworkUnavailableError') {
+      logger.warn({
+        event: 'refund_processor_unavailable',
+        error_message: error.message,
+      });
+
+      return res.status(503).json({
+        error: {
+          type: 'api_error',
+          code: 'payment_processor_unavailable',
+          message: 'Refund processor is temporarily unavailable. Please try again.',
+        },
+      });
+    }
+
+    logger.error({
+      event: 'refund_create_error',
+      error_message: error.message,
+      merchant_id: req.merchantId,
+    });
     res.status(500).json({
       error: {
         type: 'api_error',

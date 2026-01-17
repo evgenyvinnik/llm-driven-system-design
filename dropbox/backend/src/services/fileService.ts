@@ -2,6 +2,19 @@
  * File and folder management service.
  * Handles file uploads with chunking and deduplication, folder operations,
  * file versioning, and storage hierarchy navigation.
+ *
+ * Features:
+ * - Chunked uploads with deduplication
+ * - File versioning with restore capability
+ * - Prometheus metrics for all operations
+ * - Structured logging for observability
+ *
+ * WHY sync metrics enable client optimization:
+ * - Clients can measure actual sync latency vs. perceived latency
+ * - Server-side metrics reveal bottlenecks in the sync pipeline
+ * - Deduplication metrics inform storage efficiency decisions
+ * - Upload/download metrics help tune chunk sizes and parallelism
+ *
  * @module services/fileService
  */
 
@@ -11,6 +24,16 @@ import { uploadChunk, chunkExists, downloadChunk, BUCKET_NAME } from '../utils/s
 import { calculateHash, calculateContentHash, CHUNK_SIZE, getMimeType } from '../utils/chunking.js';
 import { publishSync, deleteCache } from '../utils/redis.js';
 import { v4 as uuidv4 } from 'uuid';
+import { logger, logFileOperation } from '../shared/logger.js';
+import {
+  uploadSessionsTotal,
+  uploadSessionsActive,
+  fileOperationsTotal,
+  folderOperationsTotal,
+  fileDownloadsTotal,
+  syncEventsTotal,
+  storageUsedBytes,
+} from '../shared/metrics.js';
 
 /**
  * Creates a new upload session for chunked file uploads.
@@ -30,34 +53,70 @@ export async function createUploadSession(
   parentId: string | null,
   chunkHashes: string[]
 ): Promise<{ uploadSessionId: string; chunksNeeded: string[]; totalChunks: number }> {
-  // Check which chunks already exist (deduplication)
-  const existingChunks = await query<{ hash: string }>(
-    `SELECT hash FROM chunks WHERE hash = ANY($1)`,
-    [chunkHashes]
-  );
+  const startTime = Date.now();
 
-  const existingHashes = new Set(existingChunks.map(c => c.hash));
-  const chunksNeeded = chunkHashes.filter(h => !existingHashes.has(h));
+  try {
+    // Check which chunks already exist (deduplication)
+    const existingChunks = await query<{ hash: string }>(
+      `SELECT hash FROM chunks WHERE hash = ANY($1)`,
+      [chunkHashes]
+    );
 
-  // Create upload session
-  const sessionId = uuidv4();
-  await query(
-    `INSERT INTO upload_sessions (id, user_id, file_name, file_size, parent_id, total_chunks, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-    [sessionId, userId, fileName, fileSize, parentId, chunkHashes.length]
-  );
+    const existingHashes = new Set(existingChunks.map((c) => c.hash));
+    const chunksNeeded = chunkHashes.filter((h) => !existingHashes.has(h));
 
-  return {
-    uploadSessionId: sessionId,
-    chunksNeeded,
-    totalChunks: chunkHashes.length,
-  };
+    // Create upload session
+    const sessionId = uuidv4();
+    await query(
+      `INSERT INTO upload_sessions (id, user_id, file_name, file_size, parent_id, total_chunks, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+      [sessionId, userId, fileName, fileSize, parentId, chunkHashes.length]
+    );
+
+    // Update metrics
+    uploadSessionsTotal.labels('created').inc();
+    uploadSessionsActive.inc();
+
+    logger.info(
+      {
+        userId,
+        uploadSessionId: sessionId,
+        fileName,
+        fileSize,
+        totalChunks: chunkHashes.length,
+        chunksNeeded: chunksNeeded.length,
+        chunksDeduped: existingHashes.size,
+        durationMs: Date.now() - startTime,
+      },
+      'Upload session created'
+    );
+
+    return {
+      uploadSessionId: sessionId,
+      chunksNeeded,
+      totalChunks: chunkHashes.length,
+    };
+  } catch (error) {
+    uploadSessionsTotal.labels('failed').inc();
+    logger.error(
+      { userId, fileName, error: (error as Error).message },
+      'Failed to create upload session'
+    );
+    throw error;
+  }
 }
 
 /**
  * Uploads a single chunk of a file.
  * Verifies the chunk hash matches the data for integrity.
  * Increments reference count for existing chunks (deduplication).
+ *
+ * WHY idempotency enables reliable chunked uploads:
+ * - Network failures are common during large uploads
+ * - Clients may not receive confirmation even when upload succeeded
+ * - Retry with same chunk hash is safe - content-addressed storage is idempotent
+ * - Reference counts are updated correctly even with retries
+ *
  * @param userId - ID of uploading user
  * @param uploadSessionId - Active upload session ID
  * @param chunkIndex - Position of this chunk in the file
@@ -73,6 +132,8 @@ export async function uploadFileChunk(
   chunkHash: string,
   data: Buffer
 ): Promise<{ uploaded: boolean }> {
+  const startTime = Date.now();
+
   // Verify upload session
   const session = await queryOne<UploadSession>(
     `SELECT * FROM upload_sessions WHERE id = $1 AND user_id = $2`,
@@ -86,6 +147,10 @@ export async function uploadFileChunk(
   // Calculate hash and verify
   const actualHash = calculateHash(data);
   if (actualHash !== chunkHash) {
+    logger.warn(
+      { uploadSessionId, chunkIndex, expectedHash: chunkHash, actualHash },
+      'Chunk hash mismatch'
+    );
     throw new Error('Chunk hash mismatch');
   }
 
@@ -105,10 +170,9 @@ export async function uploadFileChunk(
     );
   } else {
     // Increment reference count
-    await query(
-      `UPDATE chunks SET reference_count = reference_count + 1 WHERE hash = $1`,
-      [chunkHash]
-    );
+    await query(`UPDATE chunks SET reference_count = reference_count + 1 WHERE hash = $1`, [
+      chunkHash,
+    ]);
   }
 
   // Update upload session
@@ -117,6 +181,18 @@ export async function uploadFileChunk(
      SET uploaded_chunks = uploaded_chunks + 1, status = 'uploading'
      WHERE id = $1`,
     [uploadSessionId]
+  );
+
+  logger.debug(
+    {
+      uploadSessionId,
+      chunkIndex,
+      chunkHash,
+      chunkSize: data.length,
+      deduplicated: exists,
+      durationMs: Date.now() - startTime,
+    },
+    'Chunk uploaded'
   );
 
   return { uploaded: true };
@@ -137,6 +213,8 @@ export async function completeUpload(
   uploadSessionId: string,
   chunkHashes: string[]
 ): Promise<FileItem> {
+  const startTime = Date.now();
+
   const session = await queryOne<{
     id: string;
     user_id: string;
@@ -171,11 +249,13 @@ export async function completeUpload(
 
     let fileId: string;
     let version: number;
+    let isUpdate = false;
 
     if (existing.rows.length > 0) {
       // Update existing file - create new version
       fileId = existing.rows[0].id;
       version = existing.rows[0].version + 1;
+      isUpdate = true;
 
       // Save current version to history
       const oldChunks = await client.query(
@@ -218,17 +298,22 @@ export async function completeUpload(
         `INSERT INTO files (user_id, parent_id, name, is_folder, size, mime_type, content_hash, version, sync_status)
          VALUES ($1, $2, $3, false, $4, $5, $6, $7, 'synced')
          RETURNING id`,
-        [userId, session.parent_id, session.file_name, session.file_size, mimeType, contentHash, version]
+        [
+          userId,
+          session.parent_id,
+          session.file_name,
+          session.file_size,
+          mimeType,
+          contentHash,
+          version,
+        ]
       );
       fileId = result.rows[0].id;
     }
 
     // Insert file chunks
     for (let i = 0; i < chunkHashes.length; i++) {
-      const chunk = await client.query(
-        `SELECT size FROM chunks WHERE hash = $1`,
-        [chunkHashes[i]]
-      );
+      const chunk = await client.query(`SELECT size FROM chunks WHERE hash = $1`, [chunkHashes[i]]);
 
       await client.query(
         `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size)
@@ -238,16 +323,16 @@ export async function completeUpload(
     }
 
     // Update user storage usage
-    await client.query(
-      `UPDATE users SET used_bytes = used_bytes + $1 WHERE id = $2`,
-      [session.file_size, userId]
-    );
+    await client.query(`UPDATE users SET used_bytes = used_bytes + $1 WHERE id = $2`, [
+      session.file_size,
+      userId,
+    ]);
 
     // Mark upload session as completed
-    await client.query(
-      `UPDATE upload_sessions SET status = 'completed', file_id = $1 WHERE id = $2`,
-      [fileId, uploadSessionId]
-    );
+    await client.query(`UPDATE upload_sessions SET status = 'completed', file_id = $1 WHERE id = $2`, [
+      fileId,
+      uploadSessionId,
+    ]);
 
     // Get the created/updated file
     const fileResult = await client.query(
@@ -258,14 +343,45 @@ export async function completeUpload(
       [fileId]
     );
 
-    return fileResult.rows[0] as FileItem;
+    return { file: fileResult.rows[0] as FileItem, isUpdate };
   });
 
+  // Update metrics
+  uploadSessionsTotal.labels('completed').inc();
+  uploadSessionsActive.dec();
+  fileOperationsTotal.labels('upload', 'success').inc();
+  storageUsedBytes.inc(session.file_size);
+
   // Notify other clients
-  await publishSync(userId, { type: 'file_created', file });
+  const eventType = file.isUpdate ? 'file_updated' : 'file_created';
+  await publishSync(userId, { type: eventType, file: file.file });
+  syncEventsTotal.labels(eventType).inc();
   await deleteCache(`folder:${userId}:${session.parent_id || 'root'}`);
 
-  return file;
+  logFileOperation(
+    {
+      fileId: file.file.id,
+      fileName: session.file_name,
+      fileSize: session.file_size,
+      userId,
+      operation: 'upload',
+    },
+    `File ${file.isUpdate ? 'updated' : 'created'} successfully`
+  );
+
+  logger.info(
+    {
+      fileId: file.file.id,
+      fileName: session.file_name,
+      fileSize: session.file_size,
+      version: file.file.version,
+      isUpdate: file.isUpdate,
+      durationMs: Date.now() - startTime,
+    },
+    'Upload completed'
+  );
+
+  return file.file;
 }
 
 /**
@@ -301,8 +417,22 @@ export async function createFolder(
     [userId, parentId, name]
   );
 
+  // Update metrics
+  folderOperationsTotal.labels('create', 'success').inc();
+
   await publishSync(userId, { type: 'folder_created', folder: result[0] });
+  syncEventsTotal.labels('folder_created').inc();
   await deleteCache(`folder:${userId}:${parentId || 'root'}`);
+
+  logFileOperation(
+    {
+      fileId: result[0].id,
+      fileName: name,
+      userId,
+      operation: 'sync',
+    },
+    'Folder created'
+  );
 
   return result[0];
 }
@@ -406,7 +536,11 @@ export async function getFileChunks(fileId: string): Promise<FileChunk[]> {
  * @returns File data buffer and file metadata
  * @throws Error if file not found or is a folder
  */
-export async function downloadFile(userId: string, fileId: string): Promise<{ data: Buffer; file: FileItem }> {
+export async function downloadFile(
+  userId: string,
+  fileId: string
+): Promise<{ data: Buffer; file: FileItem }> {
+  const startTime = Date.now();
   const file = await getFile(userId, fileId);
 
   if (!file || file.isFolder) {
@@ -421,7 +555,35 @@ export async function downloadFile(userId: string, fileId: string): Promise<{ da
     chunkBuffers.push(data);
   }
 
-  return { data: Buffer.concat(chunkBuffers), file };
+  const data = Buffer.concat(chunkBuffers);
+
+  // Update metrics
+  fileDownloadsTotal.labels('direct').inc();
+  fileOperationsTotal.labels('download', 'success').inc();
+
+  logFileOperation(
+    {
+      fileId,
+      fileName: file.name,
+      fileSize: file.size,
+      userId,
+      operation: 'download',
+    },
+    'File downloaded'
+  );
+
+  logger.info(
+    {
+      fileId,
+      fileName: file.name,
+      fileSize: data.length,
+      chunks: chunks.length,
+      durationMs: Date.now() - startTime,
+    },
+    'File download completed'
+  );
+
+  return { data, file };
 }
 
 /**
@@ -459,8 +621,23 @@ export async function renameItem(userId: string, itemId: string, newName: string
     [newName, itemId, userId]
   );
 
+  // Update metrics
+  const operationType = item.isFolder ? folderOperationsTotal : fileOperationsTotal;
+  operationType.labels('rename', 'success').inc();
+
   await publishSync(userId, { type: 'item_renamed', item: result[0] });
+  syncEventsTotal.labels('item_renamed').inc();
   await deleteCache(`folder:${userId}:${item.parentId || 'root'}`);
+
+  logFileOperation(
+    {
+      fileId: itemId,
+      fileName: newName,
+      userId,
+      operation: 'rename',
+    },
+    `${item.isFolder ? 'Folder' : 'File'} renamed`
+  );
 
   return result[0];
 }
@@ -474,7 +651,11 @@ export async function renameItem(userId: string, itemId: string, newName: string
  * @returns Updated item
  * @throws Error if item or destination not found, or invalid move
  */
-export async function moveItem(userId: string, itemId: string, newParentId: string | null): Promise<FileItem> {
+export async function moveItem(
+  userId: string,
+  itemId: string,
+  newParentId: string | null
+): Promise<FileItem> {
   const item = await getFile(userId, itemId);
 
   if (!item) {
@@ -526,9 +707,24 @@ export async function moveItem(userId: string, itemId: string, newParentId: stri
     [newParentId, itemId, userId]
   );
 
+  // Update metrics
+  const operationType = item.isFolder ? folderOperationsTotal : fileOperationsTotal;
+  operationType.labels('move', 'success').inc();
+
   await publishSync(userId, { type: 'item_moved', item: result[0] });
+  syncEventsTotal.labels('item_moved').inc();
   await deleteCache(`folder:${userId}:${oldParentId || 'root'}`);
   await deleteCache(`folder:${userId}:${newParentId || 'root'}`);
+
+  logFileOperation(
+    {
+      fileId: itemId,
+      fileName: item.name,
+      userId,
+      operation: 'move',
+    },
+    `${item.isFolder ? 'Folder' : 'File'} moved`
+  );
 
   return result[0];
 }
@@ -562,15 +758,31 @@ export async function deleteItem(userId: string, itemId: string): Promise<void> 
 
     // Update user storage (for files, not folders)
     if (!item.isFolder) {
-      await client.query(
-        `UPDATE users SET used_bytes = used_bytes - $1 WHERE id = $2`,
-        [item.size, userId]
-      );
+      await client.query(`UPDATE users SET used_bytes = used_bytes - $1 WHERE id = $2`, [
+        item.size,
+        userId,
+      ]);
+      storageUsedBytes.dec(item.size);
     }
   });
 
+  // Update metrics
+  const operationType = item.isFolder ? folderOperationsTotal : fileOperationsTotal;
+  operationType.labels('delete', 'success').inc();
+
   await publishSync(userId, { type: 'item_deleted', itemId });
+  syncEventsTotal.labels('item_deleted').inc();
   await deleteCache(`folder:${userId}:${item.parentId || 'root'}`);
+
+  logFileOperation(
+    {
+      fileId: itemId,
+      fileName: item.name,
+      userId,
+      operation: 'delete',
+    },
+    `${item.isFolder ? 'Folder' : 'File'} deleted`
+  );
 }
 
 /**
@@ -605,7 +817,11 @@ export async function getFileVersions(userId: string, fileId: string): Promise<F
  * @returns Updated file with restored content
  * @throws Error if file or version not found
  */
-export async function restoreFileVersion(userId: string, fileId: string, versionId: string): Promise<FileItem> {
+export async function restoreFileVersion(
+  userId: string,
+  fileId: string,
+  versionId: string
+): Promise<FileItem> {
   const file = await getFile(userId, fileId);
 
   if (!file) {
@@ -621,7 +837,7 @@ export async function restoreFileVersion(userId: string, fileId: string, version
     throw new Error('Version not found');
   }
 
-  return transaction(async (client) => {
+  const restoredFile = await transaction(async (client) => {
     // Get version chunks
     const versionChunks = await client.query(
       `SELECT chunk_index, chunk_hash, chunk_size FROM file_version_chunks
@@ -669,10 +885,16 @@ export async function restoreFileVersion(userId: string, fileId: string, version
 
     // Update user storage
     const sizeDiff = version.size - file.size;
-    await client.query(
-      `UPDATE users SET used_bytes = used_bytes + $1 WHERE id = $2`,
-      [sizeDiff, userId]
-    );
+    await client.query(`UPDATE users SET used_bytes = used_bytes + $1 WHERE id = $2`, [
+      sizeDiff,
+      userId,
+    ]);
+
+    if (sizeDiff > 0) {
+      storageUsedBytes.inc(sizeDiff);
+    } else {
+      storageUsedBytes.dec(Math.abs(sizeDiff));
+    }
 
     // Get updated file
     const result = await client.query(
@@ -685,4 +907,19 @@ export async function restoreFileVersion(userId: string, fileId: string, version
 
     return result.rows[0] as FileItem;
   });
+
+  // Update metrics
+  fileOperationsTotal.labels('restore', 'success').inc();
+
+  logFileOperation(
+    {
+      fileId,
+      fileName: file.name,
+      userId,
+      operation: 'version',
+    },
+    `File restored to version ${version.version}`
+  );
+
+  return restoredFile;
 }

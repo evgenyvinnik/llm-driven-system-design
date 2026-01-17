@@ -838,3 +838,199 @@ const pool = new Pool({
 3. **GraphQL**: Consider for admin dashboard to reduce over-fetching
 4. **Event sourcing**: If audit requirements become complex, consider full event log
 5. **Multi-region**: Active-passive setup with PostgreSQL logical replication
+
+---
+
+## Implementation Notes
+
+This section documents the critical implementation decisions and explains WHY each feature is essential for a production payment system.
+
+### Idempotency - CRITICAL for Payment Systems
+
+**WHY idempotency prevents double-charging:**
+
+Payment operations are NOT inherently idempotent. Without explicit idempotency handling:
+
+1. **Network Timeouts**: A payment request can timeout AFTER the server processed it but BEFORE the client received the response. The client retries, and the customer is charged twice.
+
+2. **Client Retries**: Mobile apps and browsers automatically retry failed HTTP requests. Each retry without idempotency protection = potential duplicate charge.
+
+3. **Load Balancer Retries**: Some load balancers retry requests on 5xx errors, potentially causing double-processing.
+
+**Implementation approach:**
+
+```
+Client sends: POST /v1/payments
+Headers: Idempotency-Key: order_12345
+
+Server logic:
+1. Check Redis for key "idempotency:payment:{merchant}:{key}"
+2. If exists: return cached response immediately (no processing)
+3. If not: acquire distributed lock, process payment
+4. On success: cache response with 24h TTL
+5. On failure: release lock (allows retry)
+```
+
+**Key files:**
+- `/backend/src/shared/idempotency.ts` - Idempotency key management
+- `/backend/src/services/payment.service.ts` - Uses `withIdempotency()` wrapper
+
+### Audit Logging - Required for PCI Compliance
+
+**WHY audit logging is required for PCI-DSS:**
+
+PCI-DSS Requirement 10 mandates:
+- Log all access to cardholder data
+- Track all changes to system components
+- Retain logs for at least 1 year
+- Logs must be immutable and queryable
+
+**What we log:**
+
+| Event | Data Captured |
+|-------|---------------|
+| Payment created | Transaction ID, merchant, amount, currency, IP, user-agent |
+| Payment authorized | Transaction ID, processor reference |
+| Payment captured | Transaction ID, captured amount |
+| Refund processed | Refund ID, original transaction, amount, full/partial |
+| Chargeback created | Chargeback ID, reason code, evidence due date |
+
+**Dual logging strategy:**
+1. **PostgreSQL `audit_log` table**: Queryable, long-term retention, compliance
+2. **Pino structured logs**: Real-time monitoring, log aggregation (ELK, Splunk, Datadog)
+
+**Key files:**
+- `/backend/src/shared/audit.ts` - Audit logging functions
+- `/backend/src/shared/logger.ts` - Pino structured logger
+
+### Circuit Breakers - Protection Against Processor Outages
+
+**WHY circuit breakers protect the system:**
+
+Payment processors experience outages. Without circuit breakers:
+
+1. **Connection Pool Exhaustion**: All requests queue up waiting for processor timeouts (30+ seconds each)
+2. **Cascading Failures**: Database connections exhaust, Redis connections exhaust, entire system becomes unresponsive
+3. **Poor User Experience**: Users wait 30+ seconds only to see failures
+
+**Circuit breaker behavior:**
+
+```
+State: CLOSED (normal operation)
+  |
+  v (5 consecutive failures)
+State: OPEN (fail fast - 30 seconds)
+  |
+  v (30 seconds elapsed)
+State: HALF-OPEN (test with single request)
+  |
+  v (success)
+State: CLOSED
+```
+
+**Benefits:**
+- Fail fast (milliseconds instead of 30-second timeouts)
+- System remains responsive for other operations
+- Automatic recovery when processor comes back online
+
+**Key files:**
+- `/backend/src/shared/circuit-breaker.ts` - Circuit breaker implementation
+- Uses `cockatiel` library for battle-tested resilience patterns
+
+### Transaction Metrics - Enabling Fraud Detection
+
+**WHY transaction metrics are critical:**
+
+Prometheus metrics enable real-time fraud detection and SLO monitoring:
+
+1. **Fraud Velocity Detection**:
+   - Sudden spike in transactions from one merchant = potential compromised credentials
+   - Unusual transaction amount distributions = potential card testing attack
+   - High decline rates from specific BINs = potential fraud ring
+
+2. **SLO Monitoring**:
+   - p99 latency tracking ensures payment response times stay within SLA
+   - Success rate monitoring enables immediate alerts on payment processor issues
+
+3. **Business Intelligence**:
+   - Transaction volume by currency helps treasury planning
+   - Refund rate by merchant identifies problematic merchants
+
+**Key metrics exposed at `/metrics`:**
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `payment_transactions_total{status,currency}` | Counter | Volume tracking, fraud detection |
+| `payment_processing_duration_seconds` | Histogram | SLO monitoring |
+| `fraud_score` | Histogram | Risk distribution analysis |
+| `circuit_breaker_state` | Gauge | Processor health |
+| `refund_transactions_total{type}` | Counter | Refund rate monitoring |
+
+**Key files:**
+- `/backend/src/shared/metrics.ts` - Prometheus metric definitions
+- `/backend/src/index.ts` - `/metrics` endpoint
+
+### Retry Logic with Exponential Backoff
+
+**WHY exponential backoff is essential:**
+
+Fixed-interval retries can overwhelm recovering services. Exponential backoff:
+
+1. **Gives services time to recover**: Each retry waits longer
+2. **Prevents thundering herd**: Jitter spreads out retry attempts
+3. **Fails gracefully**: Maximum retry limit prevents infinite loops
+
+**Configuration:**
+- Max attempts: 3
+- Initial delay: 100ms
+- Max delay: 10 seconds
+- Backoff factor: 2x
+
+**Usage:**
+- Webhook delivery (up to 5 retries: 1s, 5s, 30s, 2min, 10min)
+- Payment processor calls (combined with circuit breaker)
+- Database connection retries
+
+### Health Check Endpoints
+
+**Endpoint design:**
+
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `GET /health` | Full health check | PostgreSQL, Redis, circuit breaker states |
+| `GET /health/live` | Kubernetes liveness | Process is running |
+| `GET /health/ready` | Kubernetes readiness | Database connectivity |
+| `GET /metrics` | Prometheus scraping | All collected metrics |
+
+**Response format:**
+
+```json
+{
+  "status": "healthy|degraded|unhealthy",
+  "checks": {
+    "postgres": { "status": "healthy", "latency_ms": 2 },
+    "redis": { "status": "healthy", "latency_ms": 1 },
+    "circuit_breaker_processor": { "status": "healthy" }
+  },
+  "uptime_seconds": 3600
+}
+```
+
+### Shared Module Architecture
+
+All resilience and observability code is centralized in `/backend/src/shared/`:
+
+```
+shared/
+├── index.ts           # Re-exports all shared modules
+├── logger.ts          # Pino structured logging + audit logger
+├── metrics.ts         # Prometheus metrics definitions
+├── circuit-breaker.ts # Circuit breaker + retry policies
+├── idempotency.ts     # Idempotency key management
+└── audit.ts           # Compliance audit logging
+```
+
+This centralization ensures:
+- Consistent behavior across all services
+- Single point of configuration
+- Easy testing and mocking

@@ -173,7 +173,7 @@ export async function idempotentStatusUpdate(
           [messageId, recipientId, newStatus]
         );
 
-        const wasUpdated = result.rowCount > 0;
+        const wasUpdated = (result.rowCount ?? 0) > 0;
 
         if (wasUpdated) {
           // Track the status change

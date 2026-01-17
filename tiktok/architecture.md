@@ -840,3 +840,245 @@ FROM videos v
 LEFT JOIN video_embeddings ve ON v.id = ve.video_id
 WHERE ve.video_id IS NULL AND v.status = 'published';
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the reasoning behind key implementation decisions for the production-ready features added to the TikTok backend.
+
+### Why Rate Limiting Protects Video Processing Infrastructure
+
+**The Problem:**
+Video processing (transcoding, thumbnail generation, content analysis) is the most resource-intensive operation in a TikTok-like platform. A single video upload triggers:
+- Transcoding to multiple resolutions (1080p, 720p, 480p, 360p)
+- Thumbnail extraction at multiple timestamps
+- Audio extraction for sound matching
+- Content fingerprinting for deduplication
+- ML-based content moderation
+
+Each upload can consume 2-5 minutes of CPU time across worker nodes, costing real infrastructure dollars.
+
+**Without Rate Limiting:**
+- A malicious actor could upload 1000 videos/hour, overwhelming transcoding queues
+- Legitimate creators experience degraded processing times
+- Infrastructure costs spike unpredictably
+- System becomes vulnerable to denial-of-service via resource exhaustion
+
+**Our Implementation:**
+```javascript
+// 10 uploads per hour per creator
+upload: createRateLimiter(redisClient, {
+  windowMs: 60 * 60 * 1000,  // 1 hour
+  max: 10,
+  prefix: 'rl:upload:',
+})
+```
+
+**Why 10/hour:**
+- Average TikTok creator uploads 1-3 videos/day
+- 10/hour allows burst activity (filming session) without abuse
+- Creates predictable infrastructure load for capacity planning
+- Redis-backed for distributed enforcement across API instances
+
+**Additional Rate Limits Implemented:**
+| Endpoint | Limit | Rationale |
+|----------|-------|-----------|
+| Login | 5/15min | Brute-force protection |
+| Register | 3/hour | Prevent account farming |
+| Comments | 30/min | Stop comment spam |
+| Likes | 100/min | Prevent engagement manipulation |
+| Feed | 60/min | Allow scrolling, prevent scraping |
+| Search | 30/min | Prevent data harvesting |
+
+### Why Circuit Breakers Prevent Recommendation Service Failures from Cascading
+
+**The Problem:**
+The recommendation service (`/api/feed/fyp`) is the highest-traffic endpoint and the most complex:
+1. **Candidate Generation**: 3 parallel database queries (followed creators, hashtag matches, trending)
+2. **User Preference Lookup**: Fetch user embeddings from PostgreSQL
+3. **Ranking**: Score 50+ candidates using engagement metrics and personalization
+
+If any component fails (database timeout, OOM, deadlock), the entire FYP becomes unavailable. Without protection, failures cascade:
+- User refreshes -> more requests -> more failures -> complete outage
+- Downstream services (analytics, view tracking) pile up waiting
+- Recovery becomes impossible under sustained load
+
+**Our Circuit Breaker Configuration:**
+```javascript
+const recommendationBreaker = createCircuitBreaker(
+  'recommendation',
+  async (userId, limit, offset) => getPersonalizedFeedInternal(userId, limit, offset),
+  {
+    timeout: 5000,                    // Fail fast if >5s
+    errorThresholdPercentage: 50,     // Open at 50% failure rate
+    resetTimeout: 15000,              // Test recovery after 15s
+    volumeThreshold: 20,              // Need 20 requests before tripping
+  }
+);
+```
+
+**Why These Parameters:**
+- **5s timeout**: Recommendations must be fast; users abandon after 3s
+- **50% threshold**: Aggressive enough to protect, not so sensitive to cause flapping
+- **15s reset**: Long enough for database connection recovery
+- **20 volume threshold**: Prevents single slow query from opening circuit
+
+**Graceful Degradation:**
+When the circuit opens, we fall back to trending videos:
+```javascript
+if (error.message === 'Breaker is open') {
+  videos = await getTrendingFeed(limit, offset);  // Simple, reliable fallback
+}
+```
+
+Users still see content, just not personalized. This is acceptable degradation vs. complete failure.
+
+**Metrics for Alerting:**
+```javascript
+circuitBreakerStateGauge.labels('recommendation').set(state);
+// 0 = closed (healthy), 1 = half-open (testing), 2 = open (failing)
+```
+
+Grafana alert triggers at state >= 2 for > 30 seconds.
+
+### Why Retention Policies Balance Viral Content Preservation vs Storage Costs
+
+**The Problem:**
+Video storage is the largest cost center:
+- 1M videos/day * average 15MB = 15TB/day raw storage
+- With 4 resolutions: 60TB/day
+- In 1 year: ~22PB of video data
+
+Not all videos are equal:
+- **Viral videos** (1M+ views): Drive platform engagement, must stay available forever
+- **Moderate videos** (10K-1M views): Still valuable, standard retention
+- **Low-engagement videos** (< 1K views): Rarely accessed after 30 days
+- **Deleted videos**: Must be retained 30 days for legal compliance, then purged
+
+**Our Retention Strategy:**
+```javascript
+export const retentionConfig = {
+  videos: {
+    active: {
+      hotStorage: Infinity,  // Viral videos always in fast storage
+    },
+    deleted: {
+      hotStorage: 0,         // Move immediately to archive
+      archiveAfter: 0,       // Archive right away
+      deleteAfter: 30 * 24 * 60 * 60 * 1000,  // 30-day legal hold
+    },
+    viralThresholds: {
+      viewCount: 1000000,    // 1M views = never archive
+      likeCount: 100000,     // 100K likes = cultural artifact
+      shareCount: 10000,     // 10K shares = high distribution
+    },
+  },
+};
+```
+
+**Storage Tier Economics:**
+| Tier | Cost/GB/Month | Use Case |
+|------|---------------|----------|
+| Hot (S3 Standard) | $0.023 | Active videos, recent content |
+| Warm (S3 IA) | $0.0125 | Older videos, moderate access |
+| Cold (Glacier) | $0.004 | Deleted content, compliance archive |
+| Deep Archive | $0.00099 | 7-year audit logs |
+
+**Implementation:**
+- `getVideoStorageTier(video)` determines tier based on engagement + last access time
+- Background job moves videos between tiers
+- Viral content (`isViralVideo(video)`) never moves to cold storage
+
+**Why 30-Day Legal Hold:**
+- DMCA takedown appeals have 14-day window
+- User account recovery requests need access to content
+- Law enforcement requests may require evidence preservation
+- After 30 days, permanent deletion is safe
+
+### Why Metrics Enable Algorithm Optimization
+
+**The Problem:**
+The recommendation algorithm's effectiveness is invisible without measurement:
+- Are users finding content they like?
+- Is personalization working better than trending?
+- Are we showing too much exploration (random) content?
+- Is the ranking model's scoring accurate?
+
+**Key Metrics Implemented:**
+
+**1. FYP Latency Histogram**
+```javascript
+fypLatencyHistogram.labels(userType).observe(durationSeconds);
+// Tracks: authenticated vs anonymous latency distribution
+```
+**Why:** Personalized feeds require more queries. If authenticated latency exceeds anonymous by >2x, optimization is needed.
+
+**2. Recommendation Phase Timing**
+```javascript
+recommendationLatencyHistogram.labels({ phase: 'candidate_generation' }).observe(duration);
+recommendationLatencyHistogram.labels({ phase: 'ranking' }).observe(duration);
+```
+**Why:** Pinpoints bottlenecks. If candidate_generation is slow, add DB indexes. If ranking is slow, simplify scoring model.
+
+**3. Video Engagement Counters**
+```javascript
+videoViewsCounter.labels(source).inc();  // source: fyp, following, hashtag, search
+videoLikesCounter.inc();
+videoUploadsCounter.labels(status).inc();  // status: success, failure
+```
+**Why:** Measures content discovery paths. If FYP views >> following views, users rely on algorithm. If following is high, social graph is strong.
+
+**4. Circuit Breaker State**
+```javascript
+circuitBreakerStateGauge.labels('recommendation').set(STATES.OPEN);
+```
+**Why:** Immediate visibility into system degradation. Alert on state change.
+
+**5. Rate Limit Hits**
+```javascript
+rateLimitHitsCounter.labels(endpoint, userType).inc();
+```
+**Why:** Identifies abuse patterns. Spike in `video_upload` hits = potential spam attack. Spike in `login` hits = credential stuffing.
+
+**Grafana Dashboard Queries:**
+```promql
+# P99 FYP latency by user type
+histogram_quantile(0.99, rate(tiktok_fyp_latency_seconds_bucket[5m]))
+
+# Recommendation service health
+rate(tiktok_http_request_duration_seconds_count{route="/api/feed/fyp", status_code="200"}[5m])
+/ rate(tiktok_http_request_duration_seconds_count{route="/api/feed/fyp"}[5m])
+
+# Upload success rate
+rate(tiktok_video_uploads_total{status="success"}[1h])
+/ rate(tiktok_video_uploads_total[1h])
+```
+
+**Algorithm Optimization Loop:**
+1. Observe: FYP latency P99 is 2.5s (target: <1s)
+2. Investigate: `candidate_generation` phase is 2s
+3. Root cause: Hashtag query scanning full table
+4. Fix: Add GIN index on `videos.hashtags`
+5. Validate: P99 drops to 400ms
+6. Repeat
+
+Without Prometheus metrics, this optimization loop is impossible. The algorithm would degrade invisibly.
+
+---
+
+## Summary of Production Features Added
+
+| Feature | Implementation | Purpose |
+|---------|----------------|---------|
+| Session-based Auth | Redis-backed sessions | Simple, revocable authentication |
+| RBAC | 4-tier role hierarchy | User < Creator < Moderator < Admin |
+| Rate Limiting | Redis-backed, per-endpoint | Protect infrastructure, prevent abuse |
+| Circuit Breakers | Opossum library | Graceful degradation, prevent cascading failures |
+| Retry with Backoff | Exponential + jitter | Handle transient failures |
+| Prometheus Metrics | prom-client | Observability, alerting, optimization |
+| Structured Logging | Pino JSON logger | Searchable logs, debugging |
+| Health Checks | `/health`, `/health/ready`, `/health/live` | Kubernetes probes, monitoring |
+| Retention Policies | Tiered storage config | Cost optimization, compliance |
+
+All features are implemented in `/tiktok/backend/src/shared/` and integrated into route handlers.

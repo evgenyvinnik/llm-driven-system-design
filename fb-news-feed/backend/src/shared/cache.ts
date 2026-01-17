@@ -165,14 +165,27 @@ export async function getFeedFromCache(
   const key = `${CACHE_KEYS.FEED}:${userId}`;
 
   try {
-    const args: (string | number)[] = [key];
-    if (maxScore !== undefined) {
-      args.push(maxScore.toString(), '-inf', 'LIMIT', '0', limit.toString());
-    } else {
-      args.push('+inf', '-inf', 'LIMIT', '0', limit.toString());
-    }
+    let postIds: string[];
 
-    const postIds = await redis.zrevrangebyscore(key, ...args);
+    if (maxScore !== undefined) {
+      postIds = await redis.zrevrangebyscore(
+        key,
+        maxScore.toString(),
+        '-inf',
+        'LIMIT',
+        0,
+        limit
+      );
+    } else {
+      postIds = await redis.zrevrangebyscore(
+        key,
+        '+inf',
+        '-inf',
+        'LIMIT',
+        0,
+        limit
+      );
+    }
 
     if (postIds.length > 0) {
       cacheOperationsTotal.labels('feed', 'hit').inc();

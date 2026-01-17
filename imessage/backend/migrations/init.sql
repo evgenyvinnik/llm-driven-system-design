@@ -178,3 +178,18 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id)
 -- Key: presence:{user_id}
 -- Value: { status: 'online', last_seen: timestamp, device_id: uuid }
 -- TTL: 60 seconds (refreshed by heartbeat)
+
+-- Idempotency keys for preventing duplicate message delivery
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key VARCHAR(255) PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  result_id UUID, -- The resulting message ID
+  status VARCHAR(50) DEFAULT 'completed',
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
+CREATE INDEX IF NOT EXISTS idx_idempotency_user ON idempotency_keys(user_id);
+
+-- Clean up old idempotency keys (run periodically)
+-- DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours';

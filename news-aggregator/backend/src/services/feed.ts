@@ -2,10 +2,30 @@
  * Feed service for generating personalized news feeds.
  * Implements multi-signal ranking combining relevance, freshness, quality, and trending.
  * Provides feeds for personalized content, topic filtering, breaking news, and trending stories.
+ *
+ * Features:
+ * - Redis caching with configurable TTL
+ * - Cache metrics for observability
+ * - Efficient cache invalidation
+ * @module services/feed
  */
 
 import { query, queryOne } from '../db/postgres.js';
-import { getCache, setCache } from '../db/redis.js';
+
+// Shared modules
+import { logger } from '../shared/logger.js';
+import { config } from '../shared/config.js';
+import {
+  getOrSet,
+  CacheKeys,
+  CacheTTL,
+  getFromCache,
+  setInCache,
+} from '../shared/cache.js';
+import {
+  feedGenerationsTotal,
+  feedGenerationDuration,
+} from '../shared/metrics.js';
 
 /** Represents a clustered news story with multiple article sources */
 interface Story {
@@ -58,7 +78,7 @@ interface FeedResponse {
  * Get personalized feed for a user.
  * Applies multi-signal ranking (relevance, freshness, quality, trending)
  * with diversity penalties to avoid topic clustering.
- * Results are cached for 2 minutes.
+ * Results are cached for 60 seconds (configurable).
  * @param userId - User ID for personalization (null for anonymous)
  * @param cursor - Pagination cursor from previous response
  * @param limit - Number of stories to return (default: 20)
@@ -69,13 +89,51 @@ export async function getPersonalizedFeed(
   cursor: string | null = null,
   limit: number = 20
 ): Promise<FeedResponse> {
-  // Try to get from cache first
-  const cacheKey = `feed:${userId || 'anonymous'}:${cursor || '0'}:${limit}`;
-  const cached = await getCache<FeedResponse>(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  const startTime = process.hrtime.bigint();
+  const feedType = userId ? 'personalized' : 'anonymous';
+  const cursorKey = cursor || '0';
 
+  // Build cache key
+  const cacheKey = userId
+    ? CacheKeys.userFeed(userId, cursorKey, limit)
+    : CacheKeys.globalFeed(cursorKey, limit);
+
+  try {
+    const { value, cached } = await getOrSet<FeedResponse>(
+      cacheKey,
+      config.cache.feedTtl,
+      'feed',
+      async () => {
+        return await computePersonalizedFeed(userId, cursor, limit);
+      }
+    );
+
+    // Record metrics
+    const durationNs = Number(process.hrtime.bigint() - startTime);
+    const durationSec = durationNs / 1e9;
+    feedGenerationDuration.observe({ type: feedType, cached: String(cached) }, durationSec);
+    feedGenerationsTotal.inc({ type: feedType, cached: String(cached) });
+
+    if (cached) {
+      logger.debug({ userId, cursor, limit, cached: true }, 'Feed served from cache');
+    }
+
+    return value;
+  } catch (error) {
+    logger.error({ userId, cursor, limit, error }, 'Failed to get personalized feed');
+    throw error;
+  }
+}
+
+/**
+ * Compute personalized feed (called on cache miss).
+ * This is the expensive operation that fetches from DB and ranks.
+ */
+async function computePersonalizedFeed(
+  userId: string | null,
+  cursor: string | null,
+  limit: number
+): Promise<FeedResponse> {
   // Get user profile
   let profile: UserProfile | null = null;
   if (userId) {
@@ -109,21 +167,17 @@ export async function getPersonalizedFeed(
     }))
   );
 
-  const result: FeedResponse = {
+  return {
     stories: enriched,
     next_cursor: offset + limit < diversified.length ? String(offset + limit) : null,
     has_more: offset + limit < diversified.length,
   };
-
-  // Cache for 2 minutes
-  await setCache(cacheKey, result, 120);
-
-  return result;
 }
 
 /**
  * Get feed filtered by a specific topic.
  * Returns stories matching the topic, ordered by velocity and recency.
+ * Results are cached for 60 seconds.
  * @param topic - Topic name to filter by
  * @param cursor - Pagination cursor from previous response
  * @param limit - Number of stories to return (default: 20)
@@ -133,6 +187,41 @@ export async function getTopicFeed(
   topic: string,
   cursor: string | null = null,
   limit: number = 20
+): Promise<FeedResponse> {
+  const startTime = process.hrtime.bigint();
+  const cursorKey = cursor || '0';
+  const cacheKey = CacheKeys.topicFeed(topic, cursorKey, limit);
+
+  try {
+    const { value, cached } = await getOrSet<FeedResponse>(
+      cacheKey,
+      config.cache.feedTtl,
+      'topic_feed',
+      async () => {
+        return await computeTopicFeed(topic, cursor, limit);
+      }
+    );
+
+    // Record metrics
+    const durationNs = Number(process.hrtime.bigint() - startTime);
+    const durationSec = durationNs / 1e9;
+    feedGenerationDuration.observe({ type: 'topic', cached: String(cached) }, durationSec);
+    feedGenerationsTotal.inc({ type: 'topic', cached: String(cached) });
+
+    return value;
+  } catch (error) {
+    logger.error({ topic, cursor, limit, error }, 'Failed to get topic feed');
+    throw error;
+  }
+}
+
+/**
+ * Compute topic feed (called on cache miss).
+ */
+async function computeTopicFeed(
+  topic: string,
+  cursor: string | null,
+  limit: number
 ): Promise<FeedResponse> {
   const offset = cursor ? parseInt(cursor, 10) : 0;
 
@@ -171,10 +260,41 @@ export async function getTopicFeed(
 /**
  * Get breaking news stories.
  * Returns stories marked as breaking or with high velocity (> 0.5 articles/min).
+ * Results are cached for 30 seconds for real-time updates.
  * @param limit - Maximum number of stories to return (default: 10)
  * @returns Array of breaking news stories with their articles
  */
 export async function getBreakingNews(limit: number = 10): Promise<FeedItem[]> {
+  const startTime = process.hrtime.bigint();
+  const cacheKey = CacheKeys.breakingNews();
+
+  try {
+    const { value, cached } = await getOrSet<FeedItem[]>(
+      cacheKey,
+      config.cache.breakingTtl,
+      'breaking',
+      async () => {
+        return await computeBreakingNews(limit);
+      }
+    );
+
+    // Record metrics
+    const durationNs = Number(process.hrtime.bigint() - startTime);
+    const durationSec = durationNs / 1e9;
+    feedGenerationDuration.observe({ type: 'breaking', cached: String(cached) }, durationSec);
+    feedGenerationsTotal.inc({ type: 'breaking', cached: String(cached) });
+
+    return value;
+  } catch (error) {
+    logger.error({ limit, error }, 'Failed to get breaking news');
+    throw error;
+  }
+}
+
+/**
+ * Compute breaking news (called on cache miss).
+ */
+async function computeBreakingNews(limit: number): Promise<FeedItem[]> {
   const stories = await query<Story>(
     `SELECT id, title, summary, primary_topic, topics, article_count, source_count,
             velocity, is_breaking, created_at, updated_at
@@ -198,10 +318,41 @@ export async function getBreakingNews(limit: number = 10): Promise<FeedItem[]> {
 /**
  * Get trending stories based on article coverage.
  * Returns stories from the last 24 hours with the most article coverage.
+ * Results are cached for 60 seconds.
  * @param limit - Maximum number of stories to return (default: 10)
  * @returns Array of trending stories with their articles
  */
 export async function getTrendingStories(limit: number = 10): Promise<FeedItem[]> {
+  const startTime = process.hrtime.bigint();
+  const cacheKey = CacheKeys.trending();
+
+  try {
+    const { value, cached } = await getOrSet<FeedItem[]>(
+      cacheKey,
+      config.cache.trendingTtl,
+      'trending',
+      async () => {
+        return await computeTrendingStories(limit);
+      }
+    );
+
+    // Record metrics
+    const durationNs = Number(process.hrtime.bigint() - startTime);
+    const durationSec = durationNs / 1e9;
+    feedGenerationDuration.observe({ type: 'trending', cached: String(cached) }, durationSec);
+    feedGenerationsTotal.inc({ type: 'trending', cached: String(cached) });
+
+    return value;
+  } catch (error) {
+    logger.error({ limit, error }, 'Failed to get trending stories');
+    throw error;
+  }
+}
+
+/**
+ * Compute trending stories (called on cache miss).
+ */
+async function computeTrendingStories(limit: number): Promise<FeedItem[]> {
   const stories = await query<Story>(
     `SELECT id, title, summary, primary_topic, topics, article_count, source_count,
             velocity, is_breaking, created_at, updated_at
@@ -224,10 +375,19 @@ export async function getTrendingStories(limit: number = 10): Promise<FeedItem[]
 /**
  * Get a single story with all its articles.
  * Returns full story details with up to 20 article sources.
+ * Results are cached for 2 minutes.
  * @param storyId - The story UUID to retrieve
  * @returns Story with articles, or null if not found
  */
 export async function getStory(storyId: string): Promise<Story | null> {
+  const cacheKey = CacheKeys.story(storyId);
+
+  // Try cache first
+  const cached = await getFromCache<Story>(cacheKey, 'story');
+  if (cached) {
+    return cached;
+  }
+
   const story = await queryOne<Story>(
     `SELECT id, title, summary, primary_topic, topics, article_count, source_count,
             velocity, is_breaking, created_at, updated_at
@@ -241,6 +401,10 @@ export async function getStory(storyId: string): Promise<Story | null> {
   }
 
   story.articles = await getStoryArticles(storyId, 20);
+
+  // Cache the result
+  await setInCache(cacheKey, story, CacheTTL.story);
+
   return story;
 }
 
@@ -283,10 +447,30 @@ async function getCandidateStories(limit: number): Promise<Story[]> {
 /**
  * Get user profile for personalization.
  * Combines explicit preferences with learned topic weights from reading behavior.
+ * Results are cached for 5 minutes.
  * @param userId - The user's UUID
  * @returns User profile with topic weights and source preferences
  */
 async function getUserProfile(userId: string): Promise<UserProfile | null> {
+  const cacheKey = CacheKeys.userPrefs(userId);
+
+  // Try cache first
+  const cached = await getFromCache<{
+    preferred_topics: string[];
+    preferred_sources: string[];
+    blocked_sources: string[];
+    topic_weights: Record<string, number>;
+  }>(cacheKey, 'user_prefs');
+
+  if (cached) {
+    return {
+      user_id: userId,
+      topic_weights: new Map(Object.entries(cached.topic_weights)),
+      preferred_sources: cached.preferred_sources,
+      blocked_sources: cached.blocked_sources,
+    };
+  }
+
   const prefs = await queryOne<{
     preferred_topics: string[];
     preferred_sources: string[];
@@ -314,12 +498,26 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
     }
   }
 
-  return {
+  const profile: UserProfile = {
     user_id: userId,
     topic_weights: topicWeights,
     preferred_sources: prefs?.preferred_sources || [],
     blocked_sources: prefs?.blocked_sources || [],
   };
+
+  // Cache the profile (convert Map to object for JSON serialization)
+  await setInCache(
+    cacheKey,
+    {
+      preferred_topics: prefs?.preferred_topics || [],
+      preferred_sources: profile.preferred_sources,
+      blocked_sources: profile.blocked_sources,
+      topic_weights: Object.fromEntries(topicWeights),
+    },
+    config.cache.userPrefsTtl
+  );
+
+  return profile;
 }
 
 /**

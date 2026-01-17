@@ -1,6 +1,6 @@
 import pg from 'pg';
 import Redis from 'ioredis';
-import * as Minio from '@minio/minio-js';
+import * as Minio from 'minio';
 
 const { Pool } = pg;
 
@@ -32,31 +32,36 @@ export const minioClient = new Minio.Client({
   secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin123',
 });
 
-// Test connections
+// Test connections - dynamically import logger to avoid circular dependencies
 export async function testConnections() {
+  // Lazy load logger to avoid circular dependency during startup
+  const { default: logger } = await import('./shared/logger.js');
+
   try {
     // Test PostgreSQL
     const pgResult = await pool.query('SELECT NOW()');
-    console.log('PostgreSQL connected:', pgResult.rows[0].now);
+    logger.info({ time: pgResult.rows[0].now }, 'PostgreSQL connected');
 
     // Test Redis
     await redis.ping();
-    console.log('Redis connected');
+    logger.info('Redis connected');
 
     // Test MinIO
     const buckets = await minioClient.listBuckets();
-    console.log('MinIO connected, buckets:', buckets.map(b => b.name).join(', '));
+    logger.info({ buckets: buckets.map(b => b.name) }, 'MinIO connected');
 
     return true;
   } catch (error) {
-    console.error('Connection test failed:', error);
+    logger.error({ error: error.message }, 'Connection test failed');
     return false;
   }
 }
 
 // Graceful shutdown
 export async function closeConnections() {
+  const { default: logger } = await import('./shared/logger.js');
+
   await pool.end();
   await redis.quit();
-  console.log('All connections closed');
+  logger.info('All connections closed');
 }

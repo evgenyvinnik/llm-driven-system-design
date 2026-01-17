@@ -800,6 +800,232 @@ CREATE TABLE backfill_jobs (
 );
 ```
 
+## Implementation Notes
+
+This section documents the reliability and observability patterns implemented in the backend services, explaining the rationale behind each design decision.
+
+### Idempotency Middleware
+
+**What it does:** Prevents duplicate submissions by tracking processed requests in Redis with TTL-based keys.
+
+**Why it matters:**
+- **Network failures cause retries:** When a client submits a drawing but doesn't receive a response (network timeout, server restart), it will retry. Without idempotency, this creates duplicate drawings in the database.
+- **User double-clicks:** Users may accidentally click "Submit" multiple times before the UI disables the button.
+- **Client-side retry logic:** Modern HTTP clients (Axios, fetch with retry) automatically retry on network errors.
+
+**How it works:**
+1. Client sends request with `X-Idempotency-Key` header (or one is generated from request body hash)
+2. Middleware checks Redis for existing response with that key
+3. If found, returns cached response immediately (no re-processing)
+4. If not found, marks as "processing" and forwards to handler
+5. After handler completes, caches the response with configurable TTL (default: 1 hour)
+
+**Trade-offs:**
+- Requires Redis dependency (already in use for caching)
+- Adds ~1-2ms latency per request for Redis check
+- TTL must balance between catching retries (short enough) and not growing unbounded (long enough)
+
+```typescript
+// Usage in collection service
+app.post('/api/drawings',
+  idempotencyMiddleware('drawing', { ttlSeconds: 3600 }),
+  async (req, res) => { ... }
+)
+```
+
+### Circuit Breakers
+
+**What it does:** Detects when external services (PostgreSQL, MinIO, RabbitMQ) are failing and "opens" to reject requests immediately, giving the service time to recover.
+
+**Why it matters:**
+- **Prevents cascade failures:** When MinIO is down, continuing to call it wastes resources, increases latency, and may exhaust connection pools. Circuit breakers fail fast with a clear error.
+- **Enables graceful degradation:** When the circuit opens, the service returns HTTP 503 with `Retry-After` header, allowing load balancers and clients to retry intelligently.
+- **Protects downstream services:** A struggling database doesn't need 10,000 new connections per second. Circuit breakers reduce load during recovery.
+
+**How it works:**
+1. **Closed state (normal):** All requests pass through. Failures are counted.
+2. **Open state (failing):** After N consecutive failures, requests are rejected immediately without calling the service.
+3. **Half-open state (testing):** After a reset timeout, a few requests are allowed through. If they succeed, the circuit closes. If they fail, it reopens.
+
+**Configuration per service:**
+
+| Service    | Failure Threshold | Reset Timeout | Rationale |
+|------------|------------------|---------------|-----------|
+| PostgreSQL | 3 failures       | 15 seconds    | Critical dependency, fast recovery detection |
+| MinIO      | 5 failures       | 30 seconds    | More tolerant, object storage is async |
+| RabbitMQ   | 5 failures       | 60 seconds    | Longer timeout, messages can queue in dead-letter table |
+
+```typescript
+// Usage with circuit breaker
+const result = await minioCircuitBreaker.execute(async () => {
+  return uploadDrawing(drawingId, strokeData)
+})
+```
+
+### Retry Logic with Exponential Backoff
+
+**What it does:** Automatically retries failed operations with increasing delays between attempts.
+
+**Why it matters:**
+- **Transient failures are common:** Network hiccups, brief resource contention, and temporary overloads resolve themselves quickly.
+- **Exponential backoff prevents thundering herd:** If 1000 requests fail simultaneously and all retry after 1 second, you create a spike. Exponential delays spread retries over time.
+- **Jitter prevents synchronized retries:** Adding randomness to delays prevents all clients from retrying at exactly the same moment.
+
+**Retry presets:**
+
+| Operation  | Max Retries | Initial Delay | Max Delay | Backoff |
+|------------|------------|---------------|-----------|---------|
+| MinIO      | 4          | 100ms         | 2000ms    | 2x      |
+| PostgreSQL | 3          | 50ms          | 500ms     | 2x      |
+| RabbitMQ   | 5          | 500ms         | 5000ms    | 2x      |
+
+```typescript
+// Example: Upload with retry
+const result = await withRetry(
+  () => minio.putObject(bucket, key, data),
+  { maxRetries: 4, initialDelayMs: 100, operationName: 'minio-upload' }
+)
+```
+
+### Structured Logging with Pino
+
+**What it does:** Outputs JSON-formatted logs with consistent structure for log aggregation and analysis.
+
+**Why it matters:**
+- **Debuggability:** When investigating a bug, you can filter logs by `requestId`, `userId`, or `endpoint` to trace a single request across services.
+- **Alerting:** Log aggregation tools (Loki, Elasticsearch, CloudWatch) can parse JSON logs and trigger alerts on error patterns.
+- **Performance:** Pino is one of the fastest Node.js loggers, with minimal overhead even at high log volumes.
+
+**Log structure:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "collection",
+  "requestId": "abc-123",
+  "msg": "Drawing saved successfully",
+  "drawingId": "uuid-...",
+  "shape": "circle",
+  "processingTimeMs": 45
+}
+```
+
+**Child loggers for request context:**
+```typescript
+const reqLogger = createChildLogger({
+  requestId: req.headers['x-request-id'],
+  userId: session?.userId,
+})
+reqLogger.info({ msg: 'Processing request', endpoint: '/api/drawings' })
+```
+
+### Prometheus Metrics
+
+**What it does:** Exposes a `/metrics` endpoint with Prometheus-formatted metrics for scraping.
+
+**Why it matters:**
+- **Visibility:** Metrics show request rates, error rates, latencies, and resource usage in real-time.
+- **Alerting:** Set alerts on error rate > 1%, p99 latency > 500ms, or circuit breaker open.
+- **Capacity planning:** Historical metrics show traffic patterns and help predict when to scale.
+
+**Key metrics exposed:**
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `http_requests_total` | Counter | method, route, status_code | Request volume and success rate |
+| `http_request_duration_seconds` | Histogram | method, route | Latency percentiles |
+| `drawings_total` | Counter | shape, status | Business metric for drawing submissions |
+| `external_service_calls_total` | Counter | service, operation, status | Dependency health |
+| `circuit_breaker_state` | Gauge | service | 0=closed, 1=half-open, 2=open |
+
+```
+# Example /metrics output
+http_requests_total{method="POST",route="/api/drawings",status_code="201"} 12345
+http_request_duration_seconds_bucket{method="POST",route="/api/drawings",le="0.1"} 11000
+drawings_total{shape="circle",status="success"} 3456
+circuit_breaker_state{service="minio"} 0
+```
+
+### Health Check Endpoints
+
+**What it does:** Provides `/health`, `/health/live`, and `/health/ready` endpoints for container orchestration.
+
+**Why it matters:**
+- **Container orchestration:** Kubernetes uses liveness probes to restart unhealthy containers and readiness probes to route traffic only to ready instances.
+- **Load balancer integration:** Load balancers use health checks to remove unhealthy backends from rotation.
+- **Debugging:** The full `/health` endpoint shows dependency status and circuit breaker states for troubleshooting.
+
+**Endpoint semantics:**
+
+| Endpoint | Purpose | Returns 200 when... |
+|----------|---------|---------------------|
+| `/health/live` | Liveness probe | Process is running (always 200) |
+| `/health/ready` | Readiness probe | All dependencies are healthy |
+| `/health` | Full status | Always (but body shows status details) |
+
+```json
+// GET /health response
+{
+  "status": "healthy",
+  "service": "collection",
+  "version": "0.1.0",
+  "uptime": 3600,
+  "dependencies": [
+    { "name": "postgres", "status": "healthy", "latencyMs": 2 },
+    { "name": "redis", "status": "healthy", "latencyMs": 1 },
+    { "name": "minio", "status": "healthy", "latencyMs": 5 }
+  ],
+  "circuitBreakers": [
+    { "name": "minio", "state": "closed", "failures": 0 }
+  ]
+}
+```
+
+### Data Lifecycle Management
+
+**What it does:** Scheduled jobs clean up old data based on configurable retention policies.
+
+**Why it matters:**
+- **Storage cost control:** Without cleanup, storage grows indefinitely. Old flagged drawings waste space.
+- **Performance:** Large tables slow down queries. Archiving old data keeps the hot dataset manageable.
+- **Compliance:** Some data may need deletion after retention periods expire.
+
+**Cleanup jobs:**
+
+| Job | Retention | Action |
+|-----|-----------|--------|
+| Soft-deleted drawings | 30 days | Permanently delete (DB + MinIO) |
+| Flagged drawings | 90 days | Soft-delete (archive) |
+| Orphaned data | N/A | Detect MinIO objects without DB records or vice versa |
+
+**Configuration via environment variables:**
+```bash
+CLEANUP_INTERVAL_HOURS=24          # How often to run cleanup
+CLEANUP_DRY_RUN=false              # Set to true to log without deleting
+SOFT_DELETE_RETENTION_DAYS=30     # Days before permanent deletion
+FLAGGED_RETENTION_DAYS=90         # Days before flagged drawings are archived
+```
+
+**Manual cleanup trigger (admin API):**
+```bash
+POST /api/admin/cleanup/run
+{ "dryRun": true, "batchSize": 100 }
+```
+
+### Summary: Defense in Depth
+
+These patterns work together to create a resilient system:
+
+1. **Idempotency** prevents duplicate data from client retries
+2. **Retries** handle transient failures automatically
+3. **Circuit breakers** prevent cascade failures when retries aren't enough
+4. **Health checks** enable orchestrators to route around unhealthy instances
+5. **Metrics** provide visibility into system health
+6. **Structured logs** enable debugging when things go wrong
+7. **Cleanup jobs** maintain system hygiene over time
+
+Each pattern addresses a specific failure mode, and together they provide defense in depth against the inevitable failures of distributed systems.
+
 ## Future Enhancements
 
 1. **Active Learning:** Prioritize collecting drawings for underperforming classes

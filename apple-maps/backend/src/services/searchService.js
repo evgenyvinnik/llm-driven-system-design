@@ -1,40 +1,56 @@
 import pool from '../db.js';
 import redis from '../redis.js';
+import logger from '../shared/logger.js';
+import {
+  createCircuitBreaker,
+  geocodingCircuitBreakerOptions,
+} from '../shared/circuitBreaker.js';
+import { cacheHits, cacheMisses } from '../shared/metrics.js';
 
 /**
  * Search and Geocoding Service
+ * Enhanced with circuit breakers, caching, and structured logging
  */
 class SearchService {
+  constructor() {
+    // Circuit breaker for geocoding operations
+    this.geocodeBreaker = createCircuitBreaker(
+      'geocoding',
+      this._geocodeInternal.bind(this),
+      geocodingCircuitBreakerOptions
+    );
+
+    // Circuit breaker for reverse geocoding
+    this.reverseGeocodeBreaker = createCircuitBreaker(
+      'reverse_geocoding',
+      this._reverseGeocodeInternal.bind(this),
+      geocodingCircuitBreakerOptions
+    );
+  }
+
   /**
    * Search for places by name or category
    */
   async searchPlaces(query, options = {}) {
     const { lat, lng, radius = 5000, limit = 20, category } = options;
 
+    // Try cache for common searches
+    const cacheKey = `search:${query}:${lat}:${lng}:${radius}:${category}:${limit}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      cacheHits.inc({ cache_name: 'search' });
+      logger.debug({ query, cached: true }, 'Search cache hit');
+      return JSON.parse(cached);
+    }
+
+    cacheMisses.inc({ cache_name: 'search' });
+
     let sql;
     let params;
 
     if (lat && lng) {
       // Search near a location
-      sql = `
-        SELECT
-          id, name, category, lat, lng, address, phone, rating, review_count,
-          ST_Distance(location, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography) as distance
-        FROM pois
-        WHERE
-          ($1 = '' OR to_tsvector('english', name) @@ plainto_tsquery('english', $1))
-          ${category ? 'AND category = $5' : ''}
-          AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography, $4)
-        ORDER BY
-          CASE WHEN $1 != '' THEN ts_rank(to_tsvector('english', name), plainto_tsquery('english', $1)) ELSE 0 END DESC,
-          distance ASC
-        LIMIT $6
-      `;
-      params = category
-        ? [query || '', lat, lng, radius, category, limit]
-        : [query || '', lat, lng, radius, limit];
-
-      // Adjust query for category filtering
       if (category) {
         sql = `
           SELECT
@@ -69,16 +85,6 @@ class SearchService {
       }
     } else {
       // Global search
-      sql = `
-        SELECT id, name, category, lat, lng, address, phone, rating, review_count
-        FROM pois
-        WHERE to_tsvector('english', name) @@ plainto_tsquery('english', $1)
-        ${category ? 'AND category = $3' : ''}
-        ORDER BY rating DESC NULLS LAST, review_count DESC
-        LIMIT $2
-      `;
-      params = category ? [query, limit, category] : [query, limit];
-
       if (category) {
         sql = `
           SELECT id, name, category, lat, lng, address, phone, rating, review_count
@@ -103,7 +109,7 @@ class SearchService {
 
     const result = await pool.query(sql, params);
 
-    return result.rows.map(row => ({
+    const places = result.rows.map(row => ({
       id: row.id,
       name: row.name,
       category: row.category,
@@ -114,12 +120,23 @@ class SearchService {
       reviewCount: row.review_count,
       distance: row.distance ? parseFloat(row.distance) : null,
     }));
+
+    // Cache for 5 minutes
+    await redis.setex(cacheKey, 300, JSON.stringify(places));
+
+    logger.debug({
+      query,
+      resultCount: places.length,
+      hasLocation: !!(lat && lng),
+    }, 'Search completed');
+
+    return places;
   }
 
   /**
-   * Geocode an address to coordinates
+   * Internal geocode implementation (for circuit breaker)
    */
-  async geocode(address) {
+  async _geocodeInternal(address) {
     // First try to find a matching POI
     const result = await pool.query(`
       SELECT id, name, lat, lng, address, category
@@ -161,9 +178,41 @@ class SearchService {
   }
 
   /**
-   * Reverse geocode coordinates to address
+   * Geocode an address to coordinates (with circuit breaker)
    */
-  async reverseGeocode(lat, lng) {
+  async geocode(address) {
+    // Check cache first
+    const cacheKey = `geocode:${address.toLowerCase().trim()}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      cacheHits.inc({ cache_name: 'geocode' });
+      logger.debug({ address, cached: true }, 'Geocode cache hit');
+      return JSON.parse(cached);
+    }
+
+    cacheMisses.inc({ cache_name: 'geocode' });
+
+    // Use circuit breaker for DB operation
+    const results = await this.geocodeBreaker.fire(address);
+
+    // Cache for 1 hour (geocoding results are stable)
+    if (results.length > 0) {
+      await redis.setex(cacheKey, 3600, JSON.stringify(results));
+    }
+
+    logger.debug({
+      address,
+      resultCount: results.length,
+    }, 'Geocode completed');
+
+    return results;
+  }
+
+  /**
+   * Internal reverse geocode implementation (for circuit breaker)
+   */
+  async _reverseGeocodeInternal(lat, lng) {
     // Find nearest POI
     const poiResult = await pool.query(`
       SELECT
@@ -212,9 +261,55 @@ class SearchService {
   }
 
   /**
+   * Reverse geocode coordinates to address (with circuit breaker)
+   */
+  async reverseGeocode(lat, lng) {
+    // Check cache (round coordinates for better cache hits)
+    const roundedLat = Math.round(lat * 10000) / 10000;
+    const roundedLng = Math.round(lng * 10000) / 10000;
+    const cacheKey = `reverse_geocode:${roundedLat}:${roundedLng}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      cacheHits.inc({ cache_name: 'reverse_geocode' });
+      logger.debug({ lat, lng, cached: true }, 'Reverse geocode cache hit');
+      return JSON.parse(cached);
+    }
+
+    cacheMisses.inc({ cache_name: 'reverse_geocode' });
+
+    // Use circuit breaker for DB operation
+    const result = await this.reverseGeocodeBreaker.fire(lat, lng);
+
+    // Cache for 1 hour
+    if (result) {
+      await redis.setex(cacheKey, 3600, JSON.stringify(result));
+    }
+
+    logger.debug({
+      lat,
+      lng,
+      resultType: result?.type,
+    }, 'Reverse geocode completed');
+
+    return result;
+  }
+
+  /**
    * Get POI details
    */
   async getPlaceDetails(placeId) {
+    // Check cache
+    const cacheKey = `place:${placeId}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      cacheHits.inc({ cache_name: 'place_details' });
+      return JSON.parse(cached);
+    }
+
+    cacheMisses.inc({ cache_name: 'place_details' });
+
     const result = await pool.query(`
       SELECT id, name, category, lat, lng, address, phone, hours, rating, review_count
       FROM pois
@@ -226,7 +321,7 @@ class SearchService {
     }
 
     const row = result.rows[0];
-    return {
+    const place = {
       id: row.id,
       name: row.name,
       category: row.category,
@@ -237,12 +332,28 @@ class SearchService {
       rating: row.rating ? parseFloat(row.rating) : null,
       reviewCount: row.review_count,
     };
+
+    // Cache for 10 minutes
+    await redis.setex(cacheKey, 600, JSON.stringify(place));
+
+    return place;
   }
 
   /**
    * Get available categories
    */
   async getCategories() {
+    // Check cache
+    const cacheKey = 'categories:all';
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      cacheHits.inc({ cache_name: 'categories' });
+      return JSON.parse(cached);
+    }
+
+    cacheMisses.inc({ cache_name: 'categories' });
+
     const result = await pool.query(`
       SELECT category, COUNT(*) as count
       FROM pois
@@ -251,10 +362,15 @@ class SearchService {
       ORDER BY count DESC
     `);
 
-    return result.rows.map(row => ({
+    const categories = result.rows.map(row => ({
       name: row.category,
       count: parseInt(row.count),
     }));
+
+    // Cache for 1 hour (categories don't change often)
+    await redis.setex(cacheKey, 3600, JSON.stringify(categories));
+
+    return categories;
   }
 }
 

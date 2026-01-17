@@ -1434,3 +1434,238 @@ async function testPointInTimeRecovery() {
 | Webhook endpoint down | HTTP error | Exponential backoff retry | Manual merchant fix |
 | Ledger imbalance | Balance check failure | Halt writes, alert critical | Manual investigation |
 | Fraud service down | Circuit breaker | Rule-based fallback | Auto after reset |
+
+---
+
+## Implementation Notes
+
+This section documents the critical observability and reliability implementations added to the codebase.
+
+### WHY Idempotency is CRITICAL for Payment Systems
+
+Idempotency is the single most important concept in payment system design. Here's why:
+
+**The Problem: Network Unreliability**
+```
+Customer clicks "Pay" -> Request sent -> Network timeout -> Did the charge happen?
+                                                          -> Customer retries
+                                                          -> DOUBLE CHARGE!
+```
+
+**The Solution: Idempotency Keys**
+```javascript
+// Client sends unique key with each logical payment attempt
+POST /v1/payment_intents
+Headers: {
+  'Idempotency-Key': 'order_12345_payment_attempt_1'
+}
+
+// Server behavior:
+// 1. First request: Process payment, cache result with key
+// 2. Retry (same key): Return cached result without reprocessing
+// 3. Different key: Process as new payment
+```
+
+**Implementation Details:**
+- Keys are namespaced per-merchant to prevent cross-merchant conflicts
+- Redis provides sub-millisecond lookup with automatic TTL expiration (24 hours)
+- Lock acquisition prevents concurrent duplicate requests (returns 409 Conflict)
+- Response caching includes status code and body for exact replay
+- Keys are validated (max 255 chars) to prevent abuse
+
+**Files:**
+- `/backend/src/middleware/idempotency.js` - Express middleware
+- `/backend/src/db/redis.js` - Redis helpers for key storage and locking
+
+---
+
+### WHY Audit Logging is Required for Financial Compliance
+
+Audit logging isn't optional for payment systems - it's a legal and regulatory requirement.
+
+**Regulatory Requirements:**
+1. **PCI DSS Requirement 10**: "Track and monitor all access to network resources and cardholder data"
+2. **SOX Compliance**: Financial records must be immutable and auditable
+3. **GDPR Article 30**: Processing activities must be documented
+4. **Dispute Resolution**: Evidence for chargeback disputes
+
+**What We Log:**
+```javascript
+// Every financial operation creates an immutable audit record
+{
+  id: 'uuid',
+  timestamp: '2024-01-15T10:30:00Z',
+  actor_type: 'merchant',           // Who performed the action
+  actor_id: 'merch_abc123',
+  action: 'payment_intent.confirmed', // What action was taken
+  resource_type: 'payment_intent',
+  resource_id: 'pi_xyz789',
+  old_value: { status: 'requires_confirmation' },
+  new_value: { status: 'succeeded', auth_code: 'ABC123' },
+  ip_address: '192.168.1.1',        // Where it came from
+  trace_id: 'trace_123',            // For distributed tracing correlation
+  metadata: { charge_id: 'ch_456' }
+}
+```
+
+**Key Design Decisions:**
+- **Append-only table**: No UPDATE or DELETE operations allowed
+- **Separate from operational data**: Audit logs are stored in dedicated table
+- **Indexed for common queries**: By timestamp, actor, resource, and action
+- **Privacy-aware**: IP addresses can be hashed if needed
+
+**Files:**
+- `/backend/src/shared/audit.js` - Audit logging service
+- `/backend/src/db/init.sql` - `audit_log` table definition
+
+---
+
+### WHY Circuit Breakers Protect Against Payment Processor Outages
+
+Payment systems depend on external services (card networks, fraud services) that can fail. Circuit breakers prevent cascading failures.
+
+**The Problem: Cascade Failure**
+```
+Card Network Slow -> All requests queue -> Thread pool exhausted
+                  -> Database connections exhaust -> Entire API down
+                  -> Other merchants affected -> Widespread outage
+```
+
+**The Solution: Circuit Breaker Pattern**
+```
+CLOSED (normal) ─── failures exceed threshold ──> OPEN (failing fast)
+      ^                                                 │
+      │                                         wait timeout
+      │                                                 │
+      └────── successes restore confidence ──── HALF-OPEN (testing)
+```
+
+**Implementation:**
+```javascript
+// Using cockatiel library for circuit breaker
+const cardNetworkBreaker = createPaymentCircuitBreaker('card_network', {
+  halfOpenAfterMs: 30000,        // Try again after 30 seconds
+  breaker: new ConsecutiveBreaker(5), // Open after 5 consecutive failures
+});
+
+// Usage in card authorization
+export async function authorize(params) {
+  return cardNetworkBreaker.execute(async () => {
+    return authorizeInternal(params);
+  });
+}
+```
+
+**Circuit Breaker Configuration by Service:**
+| Service | Failure Threshold | Reset Timeout | Fallback |
+|---------|-------------------|---------------|----------|
+| Card Network | 5 consecutive | 30 seconds | Return 503, merchant retries |
+| Fraud ML | 3 consecutive | 15 seconds | Rule-based scoring only |
+| Webhook Delivery | 10 consecutive | 60 seconds | Queue for later |
+| GeoIP Service | 5 consecutive | 60 seconds | Skip geo checks |
+
+**Files:**
+- `/backend/src/shared/circuitBreaker.js` - Circuit breaker implementation
+- `/backend/src/services/cardNetwork.js` - Card network with circuit breaker
+
+---
+
+### WHY Metrics Enable Fraud Detection
+
+Metrics aren't just for operations - they're essential for detecting and preventing fraud in real-time.
+
+**Fraud Detection via Metrics:**
+```javascript
+// Key fraud indicators tracked in Prometheus
+fraud_score_distribution        // Distribution shows unusual spikes
+fraud_blocked_total             // Sudden increase = attack
+payment_failure_total           // High decline rate = card testing
+payment_amount_cents            // Unusual amounts = anomaly
+```
+
+**Alert-Based Fraud Detection:**
+| Metric Pattern | Potential Fraud | Action |
+|---------------|-----------------|--------|
+| 10x normal decline rate in 5 min | Card testing attack | Block IP, alert |
+| Fraud score spike (>50% high-risk) | Credential stuffing | Enable 3DS, review |
+| Many small payments to same merchant | Carding | Velocity limits |
+| Payments from unusual geographies | Account takeover | Step-up authentication |
+
+**Key Metrics for Fraud:**
+```javascript
+// Collected in /backend/src/shared/metrics.js
+fraud_score_distribution    // Histogram of risk scores
+fraud_blocked_total         // Counter by rule and risk level
+fraud_check_duration        // Latency of fraud checks
+payment_failure_total       // Failures by decline code
+payment_success_total       // Success by currency and method
+```
+
+**SLIs That Indicate Fraud:**
+- Decline rate > 10% (normal: 2-3%)
+- Fraud block rate > 5% (normal: 0.1-0.5%)
+- 3DS challenge rate spike
+- Unusual geographic distribution
+
+**Files:**
+- `/backend/src/shared/metrics.js` - Prometheus metrics definitions
+- `/backend/src/routes/paymentIntents.js` - Metrics collection in payment flow
+
+---
+
+### Implemented Observability Stack
+
+**1. Structured Logging (Pino)**
+```javascript
+// JSON logs with consistent fields
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "stripe-payment-api",
+  "trace_id": "abc123",
+  "event": "payment_succeeded",
+  "intent_id": "pi_xyz",
+  "amount": 2500,
+  "duration_ms": 145.23
+}
+```
+
+**2. Prometheus Metrics (/metrics endpoint)**
+```
+# Payment metrics
+payment_requests_total{method="POST",endpoint="/v1/payment_intents"} 1234
+payment_request_duration_seconds_bucket{le="0.5"} 980
+payment_success_total{currency="usd"} 890
+payment_failure_total{decline_code="insufficient_funds"} 45
+
+# Infrastructure metrics
+db_connection_pool_size{state="active"} 5
+redis_memory_bytes 52428800
+circuit_breaker_state{service="card_network"} 0
+```
+
+**3. Health Check Endpoints**
+- `GET /health` - Basic health (for load balancer)
+- `GET /health/detailed` - Full dependency checks
+- `GET /ready` - Readiness probe (Kubernetes)
+- `GET /live` - Liveness probe (Kubernetes)
+
+**4. Graceful Shutdown**
+- SIGTERM/SIGINT handling
+- Drain in-flight requests (30 second timeout)
+- Close database and Redis connections cleanly
+
+---
+
+### File Summary
+
+| File | Purpose |
+|------|---------|
+| `/backend/src/shared/logger.js` | Pino-based structured JSON logging |
+| `/backend/src/shared/metrics.js` | Prometheus metrics collection |
+| `/backend/src/shared/audit.js` | Financial operation audit logging |
+| `/backend/src/shared/circuitBreaker.js` | Circuit breaker and retry logic |
+| `/backend/src/services/cardNetwork.js` | Card network with circuit breaker |
+| `/backend/src/routes/paymentIntents.js` | Payment routes with full observability |
+| `/backend/src/index.js` | Main app with health checks and metrics endpoint |
+| `/backend/src/db/init.sql` | Database schema including audit_log table |

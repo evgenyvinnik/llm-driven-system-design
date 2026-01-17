@@ -2,6 +2,9 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../utils/db.js';
 import { authenticate } from '../middleware/auth.js';
+import { idempotency } from '../middleware/idempotency.js';
+import { requireEdit, requireShare, requireDelete, getDocumentAccess } from '../shared/rbac.js';
+import logger from '../shared/logger.js';
 import type { DocumentListItem, DocumentWithPermission, PermissionLevel } from '../types/index.js';
 
 /**
@@ -43,12 +46,14 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 
     const documents: DocumentListItem[] = result.rows;
 
+    logger.debug({ userId, documentCount: documents.length }, 'Listed documents');
+
     res.json({
       success: true,
       data: { documents },
     });
   } catch (error) {
-    console.error('List documents error:', error);
+    logger.error({ error, userId: req.user?.id }, 'List documents error');
     res.status(500).json({ success: false, error: 'Failed to list documents' });
   }
 });
@@ -58,11 +63,12 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
  * Creates a new document with the authenticated user as owner.
  * Initializes document with empty ProseMirror content structure.
  * Creates initial version (version 0) for version history.
+ * Supports idempotency via Idempotency-Key header.
  *
  * @param req.body.title - Optional document title (defaults to "Untitled Document")
  * @returns {ApiResponse<{document: Document}>} Newly created document
  */
-router.post('/', authenticate, async (req: Request, res: Response) => {
+router.post('/', authenticate, idempotency, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const { title } = req.body;
@@ -93,12 +99,14 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       [document.id, 0, JSON.stringify(defaultContent), userId]
     );
 
+    logger.info({ userId, documentId: document.id, title: document.title }, 'Document created');
+
     res.status(201).json({
       success: true,
       data: { document },
     });
   } catch (error) {
-    console.error('Create document error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Create document error');
     res.status(500).json({ success: false, error: 'Failed to create document' });
   }
 });
@@ -138,6 +146,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
     const doc = result.rows[0];
 
     if (!doc.permission_level) {
+      logger.warn({ userId, documentId }, 'Access denied to document');
       res.status(403).json({ success: false, error: 'Access denied' });
       return;
     }
@@ -161,12 +170,14 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
       },
     };
 
+    logger.debug({ userId, documentId, permission: doc.permission_level }, 'Document accessed');
+
     res.json({
       success: true,
       data: { document },
     });
   } catch (error) {
-    console.error('Get document error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Get document error');
     res.status(500).json({ success: false, error: 'Failed to get document' });
   }
 });
@@ -174,38 +185,17 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 /**
  * PATCH /api/documents/:id
  * Updates document metadata (currently only title).
- * Requires owner or edit permission.
+ * Requires owner or edit permission (enforced by RBAC middleware).
  *
  * @param req.params.id - Document UUID
  * @param req.body.title - New document title
  * @returns {ApiResponse<{document: Document}>} Updated document
  */
-router.patch('/:id', authenticate, async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, requireEdit, idempotency, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const documentId = req.params.id;
     const { title } = req.body;
-
-    // Check permission
-    const permCheck = await pool.query(
-      `SELECT d.owner_id, dp.permission_level
-       FROM documents d
-       LEFT JOIN document_permissions dp ON d.id = dp.document_id AND dp.user_id = $2
-       WHERE d.id = $1`,
-      [documentId, userId]
-    );
-
-    if (permCheck.rows.length === 0) {
-      res.status(404).json({ success: false, error: 'Document not found' });
-      return;
-    }
-
-    const { owner_id, permission_level } = permCheck.rows[0];
-
-    if (owner_id !== userId && permission_level !== 'edit') {
-      res.status(403).json({ success: false, error: 'Edit permission required' });
-      return;
-    }
 
     const result = await pool.query(
       `UPDATE documents SET title = $1, updated_at = NOW()
@@ -214,12 +204,14 @@ router.patch('/:id', authenticate, async (req: Request, res: Response) => {
       [title, documentId]
     );
 
+    logger.info({ userId, documentId, newTitle: title }, 'Document updated');
+
     res.json({
       success: true,
       data: { document: result.rows[0] },
     });
   } catch (error) {
-    console.error('Update document error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Update document error');
     res.status(500).json({ success: false, error: 'Failed to update document' });
   }
 });
@@ -227,36 +219,31 @@ router.patch('/:id', authenticate, async (req: Request, res: Response) => {
 /**
  * DELETE /api/documents/:id
  * Soft deletes a document (sets is_deleted flag).
- * Only the document owner can delete.
+ * Only the document owner can delete (enforced by RBAC middleware).
  * Document remains in database for potential recovery.
  *
  * @param req.params.id - Document UUID
  * @returns {ApiResponse<void>} Success message
  */
-router.delete('/:id', authenticate, async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, requireDelete, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const documentId = req.params.id;
 
-    // Only owner can delete
-    const result = await pool.query(
+    await pool.query(
       `UPDATE documents SET is_deleted = true, updated_at = NOW()
-       WHERE id = $1 AND owner_id = $2
-       RETURNING id`,
-      [documentId, userId]
+       WHERE id = $1`,
+      [documentId]
     );
 
-    if (result.rows.length === 0) {
-      res.status(403).json({ success: false, error: 'Only owner can delete document' });
-      return;
-    }
+    logger.info({ userId, documentId }, 'Document deleted');
 
     res.json({
       success: true,
       message: 'Document deleted',
     });
   } catch (error) {
-    console.error('Delete document error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Delete document error');
     res.status(500).json({ success: false, error: 'Failed to delete document' });
   }
 });
@@ -265,14 +252,14 @@ router.delete('/:id', authenticate, async (req: Request, res: Response) => {
  * POST /api/documents/:id/share
  * Shares a document with another user by email.
  * Creates permission record by user_id if user exists, or by email for future users.
- * Only the document owner can share.
+ * Only the document owner can share (enforced by RBAC middleware).
  *
  * @param req.params.id - Document UUID
  * @param req.body.email - Email of user to share with
  * @param req.body.permission_level - Permission level: 'view', 'comment', or 'edit'
  * @returns {ApiResponse<void>} Success message
  */
-router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
+router.post('/:id/share', authenticate, requireShare, idempotency, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const documentId = req.params.id;
@@ -285,22 +272,6 @@ router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
 
     if (!['view', 'comment', 'edit'].includes(permission_level)) {
       res.status(400).json({ success: false, error: 'Invalid permission level' });
-      return;
-    }
-
-    // Check if user is owner
-    const docCheck = await pool.query(
-      'SELECT owner_id FROM documents WHERE id = $1',
-      [documentId]
-    );
-
-    if (docCheck.rows.length === 0) {
-      res.status(404).json({ success: false, error: 'Document not found' });
-      return;
-    }
-
-    if (docCheck.rows[0].owner_id !== userId) {
-      res.status(403).json({ success: false, error: 'Only owner can share document' });
       return;
     }
 
@@ -318,6 +289,8 @@ router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
          ON CONFLICT (document_id, email) DO UPDATE SET permission_level = $3`,
         [documentId, email, permission_level]
       );
+
+      logger.info({ userId, documentId, sharedWithEmail: email, permission_level }, 'Document shared with email');
     } else {
       const targetUserId = userResult.rows[0].id;
 
@@ -327,6 +300,8 @@ router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
          ON CONFLICT (document_id, user_id) DO UPDATE SET permission_level = $3`,
         [documentId, targetUserId, permission_level]
       );
+
+      logger.info({ userId, documentId, sharedWithUserId: targetUserId, permission_level }, 'Document shared with user');
     }
 
     res.json({
@@ -334,7 +309,7 @@ router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
       message: 'Document shared successfully',
     });
   } catch (error) {
-    console.error('Share document error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Share document error');
     res.status(500).json({ success: false, error: 'Failed to share document' });
   }
 });
@@ -342,32 +317,15 @@ router.post('/:id/share', authenticate, async (req: Request, res: Response) => {
 /**
  * GET /api/documents/:id/permissions
  * Lists all permission grants for a document.
- * Only the document owner can view permissions.
+ * Only the document owner can view permissions (enforced by RBAC middleware).
  * Includes user names and avatar colors for granted users.
  *
  * @param req.params.id - Document UUID
  * @returns {ApiResponse<{permissions: DocumentPermission[]}>} List of permission records
  */
-router.get('/:id/permissions', authenticate, async (req: Request, res: Response) => {
+router.get('/:id/permissions', authenticate, requireShare, async (req: Request, res: Response) => {
   try {
-    const userId = req.user!.id;
     const documentId = req.params.id;
-
-    // Check if user is owner
-    const docCheck = await pool.query(
-      'SELECT owner_id FROM documents WHERE id = $1',
-      [documentId]
-    );
-
-    if (docCheck.rows.length === 0) {
-      res.status(404).json({ success: false, error: 'Document not found' });
-      return;
-    }
-
-    if (docCheck.rows[0].owner_id !== userId) {
-      res.status(403).json({ success: false, error: 'Only owner can view permissions' });
-      return;
-    }
 
     const result = await pool.query(
       `SELECT dp.*, u.name, u.avatar_color
@@ -382,7 +340,7 @@ router.get('/:id/permissions', authenticate, async (req: Request, res: Response)
       data: { permissions: result.rows },
     });
   } catch (error) {
-    console.error('Get permissions error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Get permissions error');
     res.status(500).json({ success: false, error: 'Failed to get permissions' });
   }
 });
@@ -390,46 +348,32 @@ router.get('/:id/permissions', authenticate, async (req: Request, res: Response)
 /**
  * DELETE /api/documents/:id/permissions/:permissionId
  * Removes a specific permission grant from a document.
- * Only the document owner can modify permissions.
+ * Only the document owner can modify permissions (enforced by RBAC middleware).
  * Revokes the user's access to the document.
  *
  * @param req.params.id - Document UUID
  * @param req.params.permissionId - Permission record UUID to remove
  * @returns {ApiResponse<void>} Success message
  */
-router.delete('/:id/permissions/:permissionId', authenticate, async (req: Request, res: Response) => {
+router.delete('/:id/permissions/:permissionId', authenticate, requireShare, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const documentId = req.params.id;
     const permissionId = req.params.permissionId;
-
-    // Check if user is owner
-    const docCheck = await pool.query(
-      'SELECT owner_id FROM documents WHERE id = $1',
-      [documentId]
-    );
-
-    if (docCheck.rows.length === 0) {
-      res.status(404).json({ success: false, error: 'Document not found' });
-      return;
-    }
-
-    if (docCheck.rows[0].owner_id !== userId) {
-      res.status(403).json({ success: false, error: 'Only owner can modify permissions' });
-      return;
-    }
 
     await pool.query(
       'DELETE FROM document_permissions WHERE id = $1 AND document_id = $2',
       [permissionId, documentId]
     );
 
+    logger.info({ userId, documentId, permissionId }, 'Permission removed');
+
     res.json({
       success: true,
       message: 'Permission removed',
     });
   } catch (error) {
-    console.error('Remove permission error:', error);
+    logger.error({ error, userId: req.user?.id, documentId: req.params.id }, 'Remove permission error');
     res.status(500).json({ success: false, error: 'Failed to remove permission' });
   }
 });

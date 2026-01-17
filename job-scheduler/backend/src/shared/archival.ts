@@ -179,7 +179,7 @@ export async function runCleanup(): Promise<CleanupStats> {
     executionTime: Date.now() - startTime,
   };
 
-  logger.info(stats, 'Data cleanup completed');
+  logger.info({ ...stats }, 'Data cleanup completed');
 
   return stats;
 }

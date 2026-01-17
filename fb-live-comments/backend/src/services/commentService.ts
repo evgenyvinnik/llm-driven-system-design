@@ -2,8 +2,9 @@
  * Comment Service Module
  *
  * Handles all comment operations for live streams including creation, retrieval,
- * deletion, and moderation actions. Implements rate limiting and content filtering
- * to prevent spam and abuse during high-traffic broadcasts.
+ * deletion, and moderation actions. Implements rate limiting, content filtering,
+ * idempotency, and observability to prevent spam and ensure reliability during
+ * high-traffic broadcasts.
  *
  * @module services/commentService
  */
@@ -13,13 +14,24 @@ import { Comment, CommentWithUser } from '../types/index.js';
 import { snowflake } from '../utils/snowflake.js';
 import { redis, checkRateLimit } from '../utils/redis.js';
 import { streamService } from './streamService.js';
+import {
+  logger,
+  commentsPostedCounter,
+  commentLatencyHistogram,
+  rateLimitExceededCounter,
+  checkIdempotencyKey,
+  storeIdempotencyResult,
+  generateIdempotencyKey,
+} from '../shared/index.js';
+
+const commentLogger = logger.child({ module: 'comment-service' });
 
 /** Simple word filter for basic content moderation (production should use ML-based filtering) */
 const BANNED_WORDS = ['spam', 'scam', 'fake'];
 
 /**
  * Service class for comment management operations.
- * Handles real-time comment posting with rate limiting and caching.
+ * Handles real-time comment posting with rate limiting, idempotency, and caching.
  */
 export class CommentService {
   /** Maximum comments per user globally per minute */
@@ -38,20 +50,23 @@ export class CommentService {
   }
 
   /**
-   * Creates a new comment on a stream.
+   * Creates a new comment on a stream with idempotency support.
    *
    * Performs the following steps:
-   * 1. Checks global and per-stream rate limits
-   * 2. Filters for banned words
-   * 3. Generates a Snowflake ID for time-ordering
-   * 4. Persists to database
-   * 5. Updates stream comment count
-   * 6. Caches for real-time delivery
+   * 1. Checks idempotency key for duplicate prevention
+   * 2. Checks global and per-stream rate limits
+   * 3. Filters for banned words
+   * 4. Generates a Snowflake ID for time-ordering
+   * 5. Persists to database
+   * 6. Updates stream comment count
+   * 7. Caches for real-time delivery
+   * 8. Stores idempotency result
    *
    * @param streamId - Target stream ID
    * @param userId - Author's user ID
    * @param content - Comment text content
    * @param parentId - Optional parent comment ID for replies
+   * @param idempotencyKey - Optional client-provided idempotency key
    * @returns Created comment with user information
    * @throws Error if rate limited or content contains banned words
    */
@@ -59,15 +74,32 @@ export class CommentService {
     streamId: string,
     userId: string,
     content: string,
-    parentId?: string
+    parentId?: string,
+    idempotencyKey?: string
   ): Promise<CommentWithUser> {
-    // 1. Check rate limits
+    const startTime = Date.now();
+    const reqLogger = commentLogger.child({ streamId, userId });
+
+    // 0. Generate or use provided idempotency key
+    const effectiveKey = idempotencyKey || generateIdempotencyKey(userId, streamId, content);
+
+    // 1. Check for duplicate via idempotency
+    const { isDuplicate, storedResult } = await checkIdempotencyKey<CommentWithUser>(effectiveKey);
+    if (isDuplicate && storedResult) {
+      reqLogger.info({ idempotencyKey: effectiveKey }, 'Returning cached comment (duplicate request)');
+      return storedResult;
+    }
+
+    // 2. Check rate limits
     const globalAllowed = await checkRateLimit(
       `ratelimit:global:${userId}`,
       this.rateLimitGlobal,
       60
     );
     if (!globalAllowed) {
+      reqLogger.warn('Global rate limit exceeded');
+      rateLimitExceededCounter.labels('global', userId).inc();
+      commentsPostedCounter.labels(streamId, 'rate_limited').inc();
       throw new Error('Rate limit exceeded: too many comments globally');
     }
 
@@ -77,21 +109,26 @@ export class CommentService {
       30
     );
     if (!streamAllowed) {
+      reqLogger.warn('Per-stream rate limit exceeded');
+      rateLimitExceededCounter.labels('stream', userId).inc();
+      commentsPostedCounter.labels(streamId, 'rate_limited').inc();
       throw new Error('Rate limit exceeded: too many comments in this stream');
     }
 
-    // 2. Check for banned words
+    // 3. Check for banned words
     const lowerContent = content.toLowerCase();
     for (const word of BANNED_WORDS) {
       if (lowerContent.includes(word)) {
+        reqLogger.warn({ word }, 'Comment rejected due to banned word');
+        commentsPostedCounter.labels(streamId, 'filtered').inc();
         throw new Error('Comment contains prohibited content');
       }
     }
 
-    // 3. Generate Snowflake ID
+    // 4. Generate Snowflake ID
     const commentId = snowflake.generate();
 
-    // 4. Insert into database
+    // 5. Insert into database
     const rows = await query<CommentWithUser>(
       `INSERT INTO comments (id, stream_id, user_id, content, parent_id)
        VALUES ($1, $2, $3, $4, $5)
@@ -103,7 +140,7 @@ export class CommentService {
 
     const comment = rows[0];
 
-    // 5. Get user info
+    // 6. Get user info
     const userRows = await query<{
       username: string;
       display_name: string;
@@ -119,16 +156,26 @@ export class CommentService {
       throw new Error('User not found');
     }
 
-    // 6. Update stream comment count
+    // 7. Update stream comment count
     await streamService.incrementCommentCount(streamId);
 
-    // 7. Add to recent comments cache
+    // 8. Build result and cache
     const commentWithUser: CommentWithUser = {
       ...comment,
       user,
     };
 
     await this.cacheComment(streamId, commentWithUser);
+
+    // 9. Store idempotency result
+    await storeIdempotencyResult(effectiveKey, commentWithUser);
+
+    // 10. Record metrics
+    const latency = Date.now() - startTime;
+    commentLatencyHistogram.observe(latency);
+    commentsPostedCounter.labels(streamId, 'success').inc();
+
+    reqLogger.info({ commentId: commentId.toString(), latency }, 'Comment created successfully');
 
     return commentWithUser;
   }
@@ -145,6 +192,7 @@ export class CommentService {
     // Try cache first
     const cached = await redis.lrange(`recent:stream:${streamId}`, 0, limit - 1);
     if (cached.length > 0) {
+      commentLogger.debug({ streamId, count: cached.length, source: 'cache' }, 'Retrieved comments from cache');
       return cached.map((c) => JSON.parse(c) as CommentWithUser);
     }
 
@@ -167,6 +215,7 @@ export class CommentService {
       [streamId, limit]
     );
 
+    commentLogger.debug({ streamId, count: rows.length, source: 'database' }, 'Retrieved comments from database');
     return rows;
   }
 
@@ -189,7 +238,14 @@ export class CommentService {
       [commentId, userId]
     );
 
-    return result.length > 0;
+    const success = result.length > 0;
+    if (success) {
+      commentLogger.info({ commentId, userId }, 'Comment deleted');
+    } else {
+      commentLogger.warn({ commentId, userId }, 'Comment deletion failed - not found or unauthorized');
+    }
+
+    return success;
   }
 
   /**
@@ -211,7 +267,12 @@ export class CommentService {
       [commentId, userId]
     );
 
-    return result.length > 0;
+    const success = result.length > 0;
+    if (success) {
+      commentLogger.info({ commentId, userId }, 'Comment pinned');
+    }
+
+    return success;
   }
 
   /**
@@ -233,7 +294,12 @@ export class CommentService {
       [commentId, userId]
     );
 
-    return result.length > 0;
+    const success = result.length > 0;
+    if (success) {
+      commentLogger.info({ commentId, userId }, 'Comment highlighted');
+    }
+
+    return success;
   }
 
   /**

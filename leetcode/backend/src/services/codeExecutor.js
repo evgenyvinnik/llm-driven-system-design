@@ -4,6 +4,12 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 
+// Shared modules
+const { createModuleLogger } = require('../shared/logger');
+const { metrics } = require('../shared/metrics');
+const { createExecutionCircuitBreaker, createFallback } = require('../shared/circuitBreaker');
+
+const logger = createModuleLogger('code-executor');
 const docker = new Docker();
 
 // Resource limits per language
@@ -27,14 +33,24 @@ const LANGUAGE_CONFIG = {
 class CodeExecutor {
   constructor() {
     this.tempDir = path.join(os.tmpdir(), 'leetcode-sandbox');
+    this.circuitBreaker = null;
   }
 
   async init() {
     try {
       await fs.mkdir(this.tempDir, { recursive: true });
-      console.log(`Code executor initialized, temp dir: ${this.tempDir}`);
+      logger.info({ tempDir: this.tempDir }, 'Code executor initialized');
+
+      // Initialize circuit breaker wrapping the container execution
+      this.circuitBreaker = createExecutionCircuitBreaker(
+        this._runInContainerInternal.bind(this)
+      );
+
+      // Set up fallback for when circuit breaker is open
+      this.circuitBreaker.fallback(createFallback());
+
     } catch (error) {
-      console.error('Failed to initialize code executor:', error);
+      logger.error({ error: error.message }, 'Failed to initialize code executor');
     }
   }
 
@@ -63,24 +79,63 @@ class CodeExecutor {
 
       const startTime = Date.now();
 
-      // Execute in Docker container
+      // Track active container
+      metrics.activeContainers.inc();
+
+      // Execute in Docker container (through circuit breaker)
       const result = await this.runInContainer({
         image: config.image,
         workDir,
         codeFile,
         command: config.command(`/code/${codeFile}`),
         timeout: Math.min(timeLimit, config.timeout),
-        memoryMb: Math.min(memoryLimit, config.memoryMb)
+        memoryMb: Math.min(memoryLimit, config.memoryMb),
+        language
       });
 
       const executionTime = Date.now() - startTime;
+
+      // Record execution metrics
+      metrics.codeExecutionsTotal.inc({
+        status: result.status,
+        language
+      });
+
+      metrics.codeExecutionDuration.observe(
+        { language, status: result.status },
+        executionTime / 1000
+      );
+
+      // Decrement active container count
+      metrics.activeContainers.dec();
+
+      logger.debug({
+        executionId,
+        language,
+        status: result.status,
+        executionTimeMs: executionTime
+      }, 'Code execution completed');
 
       return {
         ...result,
         executionTime
       };
     } catch (error) {
-      console.error('Execution error:', error);
+      logger.error({
+        error: error.message,
+        executionId,
+        language
+      }, 'Execution error');
+
+      // Decrement active container on error
+      metrics.activeContainers.dec();
+
+      // Record error metric
+      metrics.codeExecutionsTotal.inc({
+        status: 'system_error',
+        language
+      });
+
       return {
         status: 'system_error',
         error: error.message,
@@ -91,12 +146,34 @@ class CodeExecutor {
       try {
         await fs.rm(workDir, { recursive: true, force: true });
       } catch (e) {
-        console.error('Cleanup error:', e);
+        logger.warn({ error: e.message, workDir }, 'Cleanup error');
       }
     }
   }
 
-  async runInContainer({ image, workDir, codeFile, command, timeout, memoryMb }) {
+  async runInContainer(options) {
+    // Use circuit breaker to protect against sandbox failures
+    if (this.circuitBreaker) {
+      try {
+        return await this.circuitBreaker.fire(options);
+      } catch (error) {
+        // Circuit breaker is open or execution failed
+        if (error.code === 'EOPENBREAKER') {
+          return {
+            status: 'system_error',
+            error: 'Code execution temporarily unavailable. Please try again later.',
+            isCircuitBreakerOpen: true
+          };
+        }
+        throw error;
+      }
+    }
+
+    // Fallback if circuit breaker not initialized
+    return await this._runInContainerInternal(options);
+  }
+
+  async _runInContainerInternal({ image, workDir, codeFile, command, timeout, memoryMb, language }) {
     let container = null;
 
     try {
@@ -104,7 +181,7 @@ class CodeExecutor {
       try {
         await docker.getImage(image).inspect();
       } catch {
-        console.log(`Pulling image: ${image}`);
+        logger.info({ image }, 'Pulling Docker image');
         await new Promise((resolve, reject) => {
           docker.pull(image, (err, stream) => {
             if (err) return reject(err);
@@ -163,6 +240,7 @@ class CodeExecutor {
       const { stdout, stderr, timedOut } = await this.collectOutput(container, stream, timeout);
 
       if (timedOut) {
+        logger.warn({ timeout }, 'Code execution timed out');
         return {
           status: 'time_limit_exceeded',
           stdout: stdout.substring(0, 1000),
@@ -188,7 +266,7 @@ class CodeExecutor {
         stderr: stderr.substring(0, 1000)
       };
     } catch (error) {
-      console.error('Container error:', error);
+      logger.error({ error: error.message }, 'Container error');
 
       // Check for OOM
       if (error.message && error.message.includes('OOMKilled')) {
@@ -198,10 +276,8 @@ class CodeExecutor {
         };
       }
 
-      return {
-        status: 'system_error',
-        error: error.message
-      };
+      // Re-throw for circuit breaker to track
+      throw error;
     } finally {
       // Ensure container is stopped and removed
       if (container) {
@@ -296,6 +372,24 @@ class CodeExecutor {
     }
 
     return false;
+  }
+
+  // Get circuit breaker status for monitoring
+  getCircuitBreakerStatus() {
+    if (!this.circuitBreaker) {
+      return { status: 'not_initialized' };
+    }
+
+    return {
+      status: this.circuitBreaker.status.name,
+      stats: {
+        fires: this.circuitBreaker.stats.fires,
+        successes: this.circuitBreaker.stats.successes,
+        failures: this.circuitBreaker.stats.failures,
+        rejects: this.circuitBreaker.stats.rejects,
+        timeouts: this.circuitBreaker.stats.timeouts
+      }
+    };
   }
 }
 

@@ -5,9 +5,80 @@ import { preferencesService } from './preferences.js';
 import { rateLimiter } from './rateLimiter.js';
 import { templateService } from './templates.js';
 import { deduplicationService, deliveryTracker } from './delivery.js';
+import { createLogger } from '../utils/logger.js';
+import { idempotencyService, IdempotencyConflictError } from '../utils/idempotency.js';
+import {
+  notificationsSentCounter,
+  rateLimitedCounter,
+  deduplicatedCounter,
+} from '../utils/metrics.js';
+
+const log = createLogger('notification-service');
 
 export class NotificationService {
+  /**
+   * Send a notification to a user with idempotency support.
+   *
+   * If an idempotency key is provided, the request will be deduplicated:
+   * - Same key with completed request: returns cached result
+   * - Same key with in-progress request: returns 409 Conflict
+   *
+   * @param {Object} request - Notification request
+   * @param {string} request.idempotencyKey - Optional client-provided idempotency key
+   * @returns {Promise<Object>} - Notification result
+   */
   async sendNotification(request) {
+    const {
+      idempotencyKey,
+      userId,
+      templateId,
+      data = {},
+      channels = ['push', 'email'],
+      priority = 'normal',
+      scheduledAt,
+      deduplicationWindow = 60,
+    } = request;
+
+    const logContext = { userId, templateId, priority, channels };
+
+    // If idempotency key provided, use idempotency service
+    if (idempotencyKey) {
+      log.debug({ ...logContext, idempotencyKey }, 'Processing request with idempotency key');
+
+      try {
+        const { result, cached } = await idempotencyService.executeWithIdempotency(
+          idempotencyKey,
+          () => this.processNotification(request)
+        );
+
+        if (cached) {
+          log.info({ ...logContext, idempotencyKey }, 'Returning cached result for idempotent request');
+        }
+
+        return result;
+      } catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          log.warn({ ...logContext, idempotencyKey }, 'Idempotency conflict - request already processing');
+          return {
+            notificationId: null,
+            status: 'conflict',
+            reason: 'Request with this idempotency key is already being processed',
+            retryAfter: 5, // Suggest client retry after 5 seconds
+          };
+        }
+        throw error;
+      }
+    }
+
+    // No idempotency key - process normally
+    return this.processNotification(request);
+  }
+
+  /**
+   * Internal method to process the notification.
+   * Separated from sendNotification to support idempotency wrapping.
+   */
+  async processNotification(request) {
     const {
       userId,
       templateId,
@@ -18,14 +89,20 @@ export class NotificationService {
       deduplicationWindow = 60,
     } = request;
 
+    const logContext = { userId, templateId, priority, channels };
+
     // Validate request
     await this.validate(request);
 
     // Generate notification ID for tracking
     const notificationId = uuidv4();
+    logContext.notificationId = notificationId;
 
-    // Check for duplicates
+    // Check for duplicates using content-based deduplication
     if (await deduplicationService.checkDuplicate(userId, templateId, data, deduplicationWindow)) {
+      log.info(logContext, 'Notification deduplicated');
+      deduplicatedCounter.inc();
+
       return {
         notificationId: null,
         status: 'deduplicated',
@@ -36,6 +113,14 @@ export class NotificationService {
     // Check rate limits
     const rateLimitResult = await rateLimiter.checkLimit(userId, channels);
     if (rateLimitResult.limited) {
+      log.warn({
+        ...logContext,
+        reason: rateLimitResult.reason,
+        channel: rateLimitResult.channel,
+      }, 'Notification rate limited');
+
+      rateLimitedCounter.labels(rateLimitResult.reason, rateLimitResult.channel).inc();
+
       return {
         notificationId: null,
         status: 'rate_limited',
@@ -52,6 +137,8 @@ export class NotificationService {
     const allowedChannels = preferencesService.filterChannels(channels, preferences);
 
     if (allowedChannels.length === 0) {
+      log.info(logContext, 'Notification suppressed by user preferences');
+
       return {
         notificationId,
         status: 'suppressed',
@@ -79,6 +166,11 @@ export class NotificationService {
         ]
       );
 
+      log.info({
+        ...logContext,
+        scheduledFor: endOfQuietHours,
+      }, 'Notification scheduled for after quiet hours');
+
       return {
         notificationId,
         status: 'scheduled',
@@ -96,7 +188,7 @@ export class NotificationService {
           try {
             content[channel] = templateService.renderTemplate(template, channel, data);
           } catch (e) {
-            // Channel not supported by template, skip
+            log.debug({ channel, templateId }, 'Channel not supported by template');
           }
         }
       }
@@ -131,6 +223,14 @@ export class NotificationService {
       }
     }
 
+    log.info({
+      ...logContext,
+      channels: allowedChannels,
+      scheduled: !!scheduledAt,
+    }, 'Notification queued successfully');
+
+    notificationsSentCounter.labels('all', priority, 'queued').inc();
+
     return {
       notificationId,
       status: scheduledAt ? 'scheduled' : 'queued',
@@ -152,6 +252,13 @@ export class NotificationService {
 
     // Create delivery status record
     await deliveryTracker.updateStatus(notificationId, channel, 'pending');
+
+    log.debug({
+      notificationId,
+      channel,
+      priority,
+      queueName,
+    }, 'Notification routed to channel queue');
   }
 
   async validate(request) {
@@ -237,6 +344,10 @@ export class NotificationService {
        RETURNING id`,
       [notificationId, userId]
     );
+
+    if (result.rows.length > 0) {
+      log.info({ notificationId, userId }, 'Notification cancelled');
+    }
 
     return result.rows.length > 0;
   }

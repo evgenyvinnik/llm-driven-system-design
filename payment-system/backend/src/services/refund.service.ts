@@ -12,10 +12,26 @@ import type {
 import { LedgerService } from './ledger.service.js';
 import { redis } from '../db/connection.js';
 
+// Import shared modules for observability and resilience
+import {
+  logger,
+  withIdempotency,
+  refundTransactionsTotal,
+  chargebackEventsTotal,
+  paymentProcessingDuration,
+  auditRefundCreated,
+  auditChargebackCreated,
+} from '../shared/index.js';
+
 /**
  * Service for processing refunds on captured payments.
  * Handles full and partial refunds with idempotency support.
  * Coordinates with the ledger service to reverse financial entries.
+ *
+ * CRITICAL FEATURES:
+ * - Idempotency: Prevents duplicate refunds on network retries
+ * - Audit Logging: Required for PCI-DSS compliance
+ * - Metrics: Enables refund rate monitoring and fraud detection
  */
 export class RefundService {
   private ledgerService: LedgerService;
@@ -29,6 +45,7 @@ export class RefundService {
    * Prevents duplicate refunds when clients retry requests.
    * @param key - Unique idempotency key for the refund request
    * @returns Existing refund if found, null otherwise
+   * @deprecated Use withIdempotency from shared/idempotency.ts instead
    */
   async checkIdempotency(key: string): Promise<Refund | null> {
     const cached = await redis.get(`refund_idempotency:${key}`);
@@ -52,10 +69,15 @@ export class RefundService {
    * Creates a full or partial refund for a captured transaction.
    * Validates refund amount against remaining refundable balance.
    * Creates reversing ledger entries and updates transaction status.
+   *
+   * IDEMPOTENCY: If idempotency_key is provided, duplicate requests return
+   * the cached response without reprocessing.
+   *
    * @param transactionId - UUID of the original captured transaction
    * @param merchantId - UUID of the merchant for ownership verification
    * @param merchantAccountId - UUID of the merchant's ledger account
    * @param request - Refund details including optional amount and reason
+   * @param clientInfo - Optional client info for audit logging
    * @returns Created refund record with completed status
    * @throws Error if transaction not refundable or amount exceeds limit
    */
@@ -63,17 +85,54 @@ export class RefundService {
     transactionId: string,
     merchantId: string,
     merchantAccountId: string,
-    request: RefundRequest
+    request: RefundRequest,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
   ): Promise<Refund> {
+    const startTime = Date.now();
     const { amount, reason, idempotency_key } = request;
 
-    // Check idempotency
-    if (idempotency_key) {
-      const existing = await this.checkIdempotency(idempotency_key);
-      if (existing) {
-        return existing;
+    // Use shared idempotency wrapper for refund operations
+    const { result, fromCache } = await withIdempotency<Refund>(
+      'refund',
+      merchantId,
+      idempotency_key,
+      async () => {
+        return this.processRefund(
+          transactionId,
+          merchantId,
+          merchantAccountId,
+          request,
+          clientInfo
+        );
       }
+    );
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    paymentProcessingDuration.labels('refund', result.status).observe(duration);
+
+    if (fromCache) {
+      logger.info(
+        { merchantId, idempotencyKey: idempotency_key, refundId: result.id },
+        'Returned cached refund response'
+      );
     }
+
+    return result;
+  }
+
+  /**
+   * Internal refund processing logic.
+   * Called by createRefund after idempotency check.
+   */
+  private async processRefund(
+    transactionId: string,
+    merchantId: string,
+    merchantAccountId: string,
+    request: RefundRequest,
+    clientInfo?: { ipAddress?: string; userAgent?: string }
+  ): Promise<Refund> {
+    const { amount, reason, idempotency_key } = request;
 
     // Get original transaction
     const transaction = await queryOne<Transaction>(
@@ -146,19 +205,36 @@ export class RefundService {
       return refundResult.rows[0];
     });
 
-    // Update refund status and cache
+    // Get completed refund
     const completedRefund = await queryOne<Refund>(
       'SELECT * FROM refunds WHERE id = $1',
       [refundId]
     );
 
-    if (idempotency_key && completedRefund) {
-      await redis.setex(
-        `refund_idempotency:${idempotency_key}`,
-        86400,
-        JSON.stringify(completedRefund)
-      );
-    }
+    // Audit log: refund created
+    await auditRefundCreated(
+      refundId,
+      transactionId,
+      merchantId,
+      refundAmount,
+      isFullRefund,
+      clientInfo?.ipAddress,
+      clientInfo?.userAgent
+    );
+
+    // Record metrics
+    refundTransactionsTotal.labels(isFullRefund ? 'full' : 'partial', 'completed').inc();
+
+    logger.info(
+      {
+        refundId,
+        transactionId,
+        merchantId,
+        amount: refundAmount,
+        isFullRefund,
+      },
+      'Refund processed successfully'
+    );
 
     return completedRefund!;
   }
@@ -217,6 +293,10 @@ export class RefundService {
  * Service for handling chargebacks initiated by card issuers.
  * Chargebacks occur when customers dispute transactions with their bank.
  * Includes additional fees charged to merchants for chargeback processing.
+ *
+ * CRITICAL FEATURES:
+ * - Audit Logging: Required for dispute resolution and compliance
+ * - Metrics: Enables chargeback rate monitoring
  */
 export class ChargebackService {
   private ledgerService: LedgerService;
@@ -247,6 +327,8 @@ export class ChargebackService {
     reasonCode: string,
     reasonDescription: string
   ): Promise<Chargeback> {
+    const startTime = Date.now();
+
     const transaction = await queryOne<Transaction>(
       'SELECT * FROM transactions WHERE id = $1 AND merchant_id = $2',
       [transactionId, merchantId]
@@ -288,6 +370,32 @@ export class ChargebackService {
 
       return result.rows[0];
     });
+
+    // Audit log: chargeback created
+    await auditChargebackCreated(
+      chargebackId,
+      transactionId,
+      merchantId,
+      amount,
+      reasonCode
+    );
+
+    // Record metrics
+    chargebackEventsTotal.labels('open').inc();
+    const duration = (Date.now() - startTime) / 1000;
+    paymentProcessingDuration.labels('chargeback', 'open').observe(duration);
+
+    logger.warn(
+      {
+        chargebackId,
+        transactionId,
+        merchantId,
+        amount,
+        reasonCode,
+        evidenceDueDate,
+      },
+      'Chargeback created'
+    );
 
     return chargeback;
   }
@@ -336,11 +444,27 @@ export class ChargebackService {
           [chargebackId]
         );
       });
+
+      // Record metrics
+      chargebackEventsTotal.labels('won').inc();
+
+      logger.info(
+        { chargebackId, merchantId, amount: chargeback.amount },
+        'Chargeback won - funds returned to merchant'
+      );
     } else {
       // Just update status to lost
       await query(
         `UPDATE chargebacks SET status = 'lost', updated_at = NOW() WHERE id = $1`,
         [chargebackId]
+      );
+
+      // Record metrics
+      chargebackEventsTotal.labels('lost').inc();
+
+      logger.info(
+        { chargebackId, merchantId, amount: chargeback.amount },
+        'Chargeback lost - funds not returned'
       );
     }
 

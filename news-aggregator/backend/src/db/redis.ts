@@ -4,7 +4,7 @@ import Redis from 'ioredis';
  * Redis client instance for caching and session storage.
  * Provides fast in-memory data storage for feed caching and user sessions.
  */
-export const redis = new Redis({
+export const redis = new Redis.default({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
   maxRetriesPerRequest: 3,

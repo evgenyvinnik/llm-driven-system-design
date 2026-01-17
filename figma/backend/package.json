@@ -11,7 +11,13 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "db:migrate": "tsx src/db/migrate.ts migrate",
+    "db:migrate:status": "tsx src/db/migrate.ts status",
+    "db:migrate:rollback": "tsx src/db/migrate.ts rollback",
+    "db:backup": "pg_dump -h localhost -U figma figma_db > ./backups/backup_$(date +%Y%m%d_%H%M%S).sql",
+    "db:restore": "psql -h localhost -U figma figma_db < ",
+    "cleanup": "tsx -e \"import { runAllCleanupTasks } from './src/shared/retention.js'; runAllCleanupTasks().then(() => process.exit(0));\""
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -32,6 +38,7 @@
     "@types/express-session": "^1.18.0",
     "@types/node": "^22.5.0",
     "@types/node-cron": "^3.0.11",
+    "@types/opossum": "^8.1.9",
     "@types/pg": "^8.11.8",
     "@types/uuid": "^10.0.0",
     "@types/ws": "^8.5.12",

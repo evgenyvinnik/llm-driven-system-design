@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
+import logger from '../utils/logger.js';
 
 /**
  * Global error handler middleware.
@@ -13,10 +14,18 @@ export function errorHandler(
   err: Error,
   req: Request,
   res: Response,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   next: NextFunction
 ): void {
-  console.error('Error:', err.message);
-  console.error('Stack:', err.stack);
+  logger.error(
+    {
+      err,
+      method: req.method,
+      path: req.path,
+      user_id: req.user?.id,
+    },
+    'Unhandled error'
+  );
 
   res.status(500).json({
     error: 'Internal server error',
@@ -31,6 +40,7 @@ export function errorHandler(
  * @param res - Express response object
  */
 export function notFoundHandler(req: Request, res: Response): void {
+  logger.debug({ method: req.method, path: req.path }, 'Route not found');
   res.status(404).json({ error: 'Not found' });
 }
 
@@ -51,6 +61,7 @@ export function asyncHandler(
 /**
  * Request logging middleware.
  * Logs HTTP method, path, status code, and response time for each request.
+ * Note: This is now superseded by pino-http in index.ts, but kept for compatibility.
  * @param req - Express request object
  * @param res - Express response object
  * @param next - Express next function
@@ -64,8 +75,14 @@ export function requestLogger(
 
   res.on('finish', () => {
     const duration = Date.now() - start;
-    console.log(
-      `${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`
+    logger.info(
+      {
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        duration_ms: duration,
+      },
+      'Request completed'
     );
   });
 

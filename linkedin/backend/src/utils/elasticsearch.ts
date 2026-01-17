@@ -1,5 +1,8 @@
 import { Client } from '@elastic/elasticsearch';
 
+// Using type alias for Elasticsearch query container
+type EsQueryContainer = { [key: string]: unknown };
+
 /**
  * Elasticsearch client configuration.
  * Elasticsearch powers full-text search for users and jobs with fuzzy matching.
@@ -173,7 +176,7 @@ export async function searchJobs(
   },
   limit = 20
 ): Promise<number[]> {
-  const must: unknown[] = [
+  const must: EsQueryContainer[] = [
     {
       multi_match: {
         query,
@@ -183,7 +186,7 @@ export async function searchJobs(
     },
   ];
 
-  const filter: unknown[] = [{ term: { status: 'active' } }];
+  const filter: EsQueryContainer[] = [{ term: { status: 'active' } }];
 
   if (filters?.location) {
     filter.push({ term: { location: filters.location } });

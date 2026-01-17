@@ -12,7 +12,7 @@
  */
 
 import session from 'express-session';
-import RedisStore from 'connect-redis';
+import { RedisStore } from 'connect-redis';
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { redis } from '../models/redis.js';

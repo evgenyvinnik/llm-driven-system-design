@@ -1401,3 +1401,158 @@ For local development, focus on:
 1. Regular backups (daily for PostgreSQL, before major changes for SQLite)
 2. Tested restore procedures (monthly manual test)
 3. Service health checks to detect failures quickly
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key operational patterns implemented in the backend. Understanding these trade-offs helps inform future optimization decisions.
+
+### Why Search Latency Metrics Drive Index Optimization
+
+**The Problem**: Search systems can silently degrade over time as index size grows, query patterns change, or infrastructure resources become constrained. Without visibility into latency distributions, teams cannot identify:
+- Slow queries that need optimization
+- Index segments requiring compaction
+- Memory pressure from oversized caches
+- Network latency to Elasticsearch clusters
+
+**The Solution**: We instrument every search operation with Prometheus histograms (`spotlight_search_latency_seconds`) that capture:
+- P50, P95, P99 latency by source (local, provider, cloud)
+- Result count distribution (`spotlight_search_result_count`)
+- Query type breakdown (`spotlight_search_requests_total`)
+
+**Why This Matters**:
+1. **Data-Driven Optimization**: When P99 latency exceeds SLI targets (100ms), metrics reveal whether the bottleneck is in Elasticsearch query execution, result serialization, or network round-trips
+2. **Proactive Alerting**: Prometheus alerts fire before users notice degradation, enabling index rebalancing or query optimization during low-traffic periods
+3. **Capacity Planning**: Latency trends correlated with index size inform decisions about sharding, hardware upgrades, or architectural changes
+4. **A/B Testing**: Comparing latency distributions between query strategies (fuzzy vs exact, boosting weights) quantifies which approach best serves users
+
+**Implementation**:
+```javascript
+// Record search latency for every query
+searchLatency.labels('all').observe(searchDuration);
+searchResultCount.observe(results.length);
+```
+
+### Why Rate Limiting Prevents Resource Exhaustion
+
+**The Problem**: Unbounded request rates can cascade into system-wide failures:
+- A single client bug (infinite loop, retry storm) can saturate Elasticsearch connections
+- Search abuse can starve legitimate users of query capacity
+- Index operations at high volume can cause Elasticsearch segment explosion
+- Memory exhaustion from queued requests leads to OOM kills
+
+**The Solution**: Token bucket rate limiting with tiered limits:
+- **Search**: 100 requests per 10 seconds (burst) with 10/sec sustained
+- **Suggestions**: 30 requests per 10 seconds (lower due to keyboard typing patterns)
+- **Index Operations**: 50 requests per minute (higher latency tolerance)
+- **Bulk Operations**: 5 requests per minute (expensive, reserved for batch jobs)
+
+**Why This Matters**:
+1. **Graceful Degradation**: When limits are hit, clients receive 429 responses with `Retry-After` headers, enabling exponential backoff rather than cascading failures
+2. **Fair Resource Allocation**: Per-user/IP limits ensure one abusive client cannot monopolize search capacity
+3. **Protection During Incidents**: Rate limits act as circuit breakers at the edge, preventing thundering herds after outages
+4. **Audit Trail**: Rate limit events are logged and tracked in metrics, enabling identification of misconfigured clients or attack patterns
+
+**Implementation**:
+```javascript
+// Rate limiter with audit logging
+const searchRateLimiter = rateLimit({
+  windowMs: 10 * 1000,
+  max: 100,
+  handler: (req, res) => {
+    rateLimitHitsTotal.labels('/api/search').inc();
+    logAuditEvent({ eventType: 'RATE_LIMIT_EXCEEDED', ... });
+    res.status(429).json({ error: 'Too many requests' });
+  }
+});
+```
+
+### Why Circuit Breakers Protect Index Consistency
+
+**The Problem**: Elasticsearch failures during index operations create dangerous scenarios:
+- Partial writes leave PostgreSQL and Elasticsearch out of sync
+- Retry storms during outages can corrupt index state
+- Slow operations (network partitions, GC pauses) block request threads
+- Cascading failures propagate from one index to all indices
+
+**The Solution**: Per-index-type circuit breakers using the Opossum library:
+- **Threshold**: Open after 30% of requests fail within a 10-second window
+- **Timeout**: 5 seconds per operation (prevents thread starvation)
+- **Recovery**: Half-open after 30 seconds, allowing test requests
+- **Isolation**: Separate breakers for files, apps, contacts, web indices
+
+**Why This Matters**:
+1. **Fail Fast**: When Elasticsearch is struggling, circuit breakers immediately reject new requests rather than queuing them, preserving system resources
+2. **Index Isolation**: A failure indexing contacts (e.g., mapping conflict) does not block file indexing operations
+3. **Self-Healing**: The half-open state automatically tests recovery without manual intervention
+4. **Visibility**: Circuit breaker state is exposed in `/health` and metrics, enabling operational awareness
+
+**How It Protects Consistency**:
+- When the breaker opens, PostgreSQL writes still succeed (durable primary storage)
+- Elasticsearch updates are skipped (eventual consistency)
+- The idempotency layer ensures retry safety when the breaker closes
+- Bulk operations gracefully skip items when the breaker is open rather than failing entirely
+
+**Implementation**:
+```javascript
+const fileIndexBreaker = createCircuitBreaker('es_index_files', async (params) => {
+  return indexDocument('files', params.id, params.document);
+}, {
+  timeout: 5000,
+  errorThresholdPercentage: 30,
+  resetTimeout: 30000
+});
+```
+
+### Why Idempotency Enables Safe Index Rebuilds
+
+**The Problem**: Index operations in distributed systems face inherent challenges:
+- Network timeouts leave clients uncertain whether the operation succeeded
+- Retry logic can create duplicate documents or corrupted state
+- Bulk reindexing during recovery can apply the same update multiple times
+- Race conditions between concurrent updates lead to lost writes
+
+**The Solution**: Request-level idempotency with cached results:
+- Clients provide an `Idempotency-Key` header (or one is generated from request content)
+- First request executes the operation and caches the result (24-hour TTL)
+- Subsequent requests with the same key return the cached result
+- In-progress requests are tracked to prevent concurrent execution
+
+**Why This Matters**:
+1. **Safe Retries**: Clients can retry failed requests without fear of duplicates, simplifying error handling
+2. **Bulk Rebuild Safety**: Running a full reindex job multiple times produces the same result, enabling fearless recovery procedures
+3. **Network Partition Tolerance**: When a client times out but the server succeeds, the retry returns the original success response
+4. **Debugging**: Idempotency keys in logs correlate duplicate requests, revealing retry patterns
+
+**Implementation**:
+```javascript
+// Idempotent index operation
+const result = await withIdempotency(
+  idempotencyKey,
+  async () => {
+    await pool.query('INSERT INTO indexed_files ...');
+    await executeIndexOperation(fileIndexBreaker, 'files', path, document, 'add');
+    return { success: true, path };
+  },
+  'index_file'
+);
+```
+
+### Operational Dashboard Design
+
+These patterns combine into a coherent observability strategy:
+
+| Metric | Purpose | Alert Threshold |
+|--------|---------|-----------------|
+| `spotlight_search_latency_seconds` | Query performance SLI | P95 > 100ms for 2 min |
+| `spotlight_rate_limit_hits_total` | Abuse detection | > 100 hits/min from single IP |
+| `spotlight_circuit_breaker_state` | Elasticsearch health | Any breaker OPEN > 1 min |
+| `spotlight_idempotency_cache_hits_total` | Retry patterns | > 10% cache hit rate |
+| `spotlight_index_operation_latency_seconds` | Index performance | P95 > 500ms for 5 min |
+
+This combination ensures that:
+1. Performance degradation is detected before users complain
+2. Abuse is identified and mitigated automatically
+3. Infrastructure failures fail fast and recover automatically
+4. Recovery operations are safe to retry

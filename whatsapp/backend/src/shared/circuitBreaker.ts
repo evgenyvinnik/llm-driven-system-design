@@ -65,7 +65,7 @@ export function createCircuitBreaker<T extends (...args: any[]) => Promise<any>>
   name: string,
   fn: T,
   options: Partial<CircuitBreaker.Options> = {}
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
+): CircuitBreaker {
   const breaker = new CircuitBreaker(fn, {
     ...defaultOptions,
     ...options,
@@ -171,7 +171,7 @@ export async function withRedisCircuit<T>(
   fallback?: T
 ): Promise<T> {
   try {
-    return await redisCircuit.fire(operation);
+    return await redisCircuit.fire(operation) as T;
   } catch (error) {
     if (fallback !== undefined) {
       logger.warn({
@@ -196,7 +196,7 @@ export async function withDbCircuit<T>(
   fallback?: T
 ): Promise<T> {
   try {
-    return await dbCircuit.fire(operation);
+    return await dbCircuit.fire(operation) as T;
   } catch (error) {
     if (fallback !== undefined) {
       logger.warn({

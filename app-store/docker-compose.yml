@@ -49,6 +49,23 @@ services:
       timeout: 10s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: appstore-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: appstore
+      RABBITMQ_DEFAULT_PASS: appstore_pass
+    ports:
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
   minio:
     image: minio/minio:latest
     container_name: appstore-minio
@@ -89,4 +106,5 @@ volumes:
   postgres_data:
   redis_data:
   elasticsearch_data:
+  rabbitmq_data:
   minio_data:

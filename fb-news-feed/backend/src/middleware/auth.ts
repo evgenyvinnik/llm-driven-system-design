@@ -2,11 +2,15 @@
  * @fileoverview Authentication middleware for protecting API routes.
  * Implements session-based authentication with Redis caching for performance.
  * Sessions are validated against both Redis cache and PostgreSQL database.
+ * Includes structured logging for authentication events.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { pool, redis } from '../db/connection.js';
+import { componentLoggers, cacheOperationsTotal } from '../shared/index.js';
 import type { User } from '../types/index.js';
+
+const log = componentLoggers.auth;
 
 // Extend Express Request type
 declare global {
@@ -47,6 +51,8 @@ export async function authMiddleware(
     const cachedUserId = await redis.get(`session:${token}`);
 
     if (cachedUserId) {
+      cacheOperationsTotal.labels('session', 'hit').inc();
+
       // Get user from database
       const userResult = await pool.query(
         'SELECT * FROM users WHERE id = $1',
@@ -54,6 +60,7 @@ export async function authMiddleware(
       );
 
       if (userResult.rows.length === 0) {
+        log.warn({ cachedUserId }, 'User not found for cached session');
         res.status(401).json({ error: 'User not found' });
         return;
       }
@@ -63,6 +70,8 @@ export async function authMiddleware(
       next();
       return;
     }
+
+    cacheOperationsTotal.labels('session', 'miss').inc();
 
     // Check database for session
     const sessionResult = await pool.query(
@@ -74,6 +83,7 @@ export async function authMiddleware(
     );
 
     if (sessionResult.rows.length === 0) {
+      log.debug('Invalid or expired token');
       res.status(401).json({ error: 'Invalid or expired token' });
       return;
     }
@@ -102,7 +112,7 @@ export async function authMiddleware(
 
     next();
   } catch (error) {
-    console.error('Auth middleware error:', error);
+    log.error({ error }, 'Auth middleware error');
     res.status(500).json({ error: 'Internal server error' });
   }
 }

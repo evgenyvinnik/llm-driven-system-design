@@ -660,3 +660,169 @@ Cost guardrails for cloud deployment:
 4. **Challenges**: Time-based competitive events
 5. **Heat maps**: Aggregate route visualization
 6. **Training load**: Fitness and fatigue tracking
+
+## Implementation Notes
+
+This section explains the reasoning behind key implementation decisions for operability and reliability.
+
+### Why Idempotency Prevents Duplicate Activity Uploads
+
+**Problem:**
+GPS devices and mobile apps frequently retry uploads due to:
+- Network timeouts during large GPX file transfers
+- User impatience leading to multiple "Upload" button clicks
+- Device firmware bugs causing duplicate sync requests
+- App crashes mid-upload with automatic retry on restart
+
+Without idempotency, these retries create duplicate activities in the athlete's feed, corrupt statistics, and unfairly count segment efforts multiple times.
+
+**Solution:**
+The idempotency service (`src/shared/idempotency.js`) implements a two-layer approach:
+
+1. **Content-based hashing**: SHA-256 hash of `userId + GPX content + start timestamp` creates a unique fingerprint. The same GPX file uploaded twice by the same user produces the same hash.
+
+2. **Client-provided idempotency keys**: The `X-Idempotency-Key` header allows mobile apps to generate their own unique upload IDs, enabling retry logic that returns the original response.
+
+**Implementation details:**
+```javascript
+// Key structure: idem:activity:<sha256-hash>
+// TTL: 24 hours (covers delayed retries)
+// On duplicate: Return cached activity with 200 OK (not 409 Conflict)
+```
+
+Returning 200 OK for duplicates (instead of an error) is intentional - the client's goal was achieved (activity exists), so the response should indicate success.
+
+### Why Activity Archival Balances Athlete History vs Storage Costs
+
+**Problem:**
+GPS data is the largest storage consumer:
+- Each GPS point: ~50 bytes (lat, lng, altitude, timestamp, heart_rate)
+- Average activity: 1,000-10,000 points (50KB-500KB)
+- Active athlete: 50-200 activities/year
+- 10,000 users = 500GB-5TB GPS data annually
+
+Athletes expect to view their complete history, but full-resolution GPS data from 5 years ago has diminishing value.
+
+**Solution:**
+The retention policy (`src/shared/config.js`) implements tiered storage:
+
+| Age | Resolution | Rationale |
+|-----|------------|-----------|
+| 0-1 year | Full | Recent activities need detailed analysis |
+| 1+ years | 1/5 points | Route shape preserved, 80% storage savings |
+
+**Why downsampling works:**
+- Polyline (encoded route for display) is stored separately and never modified
+- Segment matching uses real-time GPS during upload, not historical data
+- Downsampled points still support basic route replay
+
+**Trade-off acknowledged:**
+Athletes who want to re-analyze historical heart rate data at full resolution will lose granularity. This is acceptable because:
+1. Such analysis is rare for old activities
+2. Athletes can export GPX before downsampling
+3. Storage costs compound while usage decreases
+
+### Why Segment Metrics Enable Leaderboard Optimization
+
+**Problem:**
+Leaderboard queries are among the most frequent:
+- Segment detail page loads top 10 on every view
+- Athletes check their rank after each activity
+- "Friends leaderboard" requires filtering and re-ranking
+
+PostgreSQL `ORDER BY elapsed_time LIMIT 10` is O(N log N) - acceptable for small segments, problematic for popular ones with 100K+ efforts.
+
+**Solution:**
+The metrics module (`src/shared/metrics.js`) tracks segment performance:
+
+```javascript
+// Segment matching duration histogram
+segmentMatchDuration.observe({ matched: true }, duration);
+
+// Leaderboard query latency
+leaderboardQueryDuration.observe({}, queryDuration);
+
+// Track effort counts per segment
+segmentMatchesTotal.inc({ segment_id: segmentId });
+```
+
+**How metrics enable optimization:**
+
+1. **Identify slow segments**: `segmentMatchDuration` P99 > 5s triggers investigation
+2. **Cache hot leaderboards**: High `segmentMatchesTotal` segments get Redis pre-warming
+3. **Right-size Redis**: `leaderboardQueryDuration` validates Redis is faster than PostgreSQL
+
+**Redis sorted set optimization:**
+```javascript
+// O(log N) insertion vs O(N log N) re-sort
+await redis.zadd(`leaderboard:${segmentId}`, elapsedTime, oderId);
+
+// O(1) rank lookup vs O(N) table scan
+const rank = await redis.zrank(`leaderboard:${segmentId}`, oderId);
+```
+
+The `leaderboardUpdatesTotal` metric with `is_pr` and `is_podium` labels reveals how often leaderboards actually change, informing cache invalidation strategy.
+
+### Why Health Checks Enable GPS Sync Reliability
+
+**Problem:**
+GPS device sync is often "fire and forget":
+- Athlete ends workout, device attempts background sync
+- If sync fails silently, athlete believes activity was saved
+- Discovery of missing data may come hours/days later
+
+The athlete experience depends on knowing sync succeeded or failed immediately.
+
+**Solution:**
+The health check service (`src/shared/health.js`) provides graduated checks:
+
+| Endpoint | Use Case | Checks |
+|----------|----------|--------|
+| `GET /health` | Kubernetes liveness | Process running |
+| `GET /health/ready` | Kubernetes readiness | PostgreSQL + Redis connected |
+| `GET /health/detailed` | Debugging | Connection pools, memory, latency |
+
+**How health checks enable sync reliability:**
+
+1. **Load balancer integration**: Only route to instances where `/health/ready` returns 200
+2. **Client retry logic**: Mobile apps can ping `/health` before upload to avoid wasted bandwidth
+3. **Graceful degradation**: If Redis is down, activities still save to PostgreSQL (feeds reconstruct later)
+
+**Startup sequence:**
+```javascript
+// Server starts accepting requests only after dependencies verified
+const health = await checkReadiness();
+if (health.status === HealthStatus.UNHEALTHY) {
+  log.warn('Dependencies unhealthy at startup');
+}
+```
+
+**Metrics integration:**
+Health checks update Prometheus metrics for alerting:
+```javascript
+// Redis connection status (for Grafana alerts)
+redisConnectionStatus.set(connected ? 1 : 0);
+
+// Database pool saturation
+dbConnectionsActive.set(pool.totalCount - pool.idleCount);
+```
+
+When `redisConnectionStatus` drops to 0, the alert fires before athletes notice feed delays.
+
+### Observability Stack Summary
+
+The implementation adds three observability pillars:
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| Metrics | Prometheus (`/metrics`) | Quantitative health: latencies, counts, rates |
+| Logging | Pino (JSON) | Qualitative context: request IDs, error stacks |
+| Health | HTTP endpoints | Binary availability: up/down decisions |
+
+**Key files:**
+- `src/shared/metrics.js` - Prometheus counters, histograms, gauges
+- `src/shared/logger.js` - Pino structured logging with request correlation
+- `src/shared/health.js` - Liveness and readiness endpoints
+- `src/shared/config.js` - Alert thresholds and retention policies
+- `src/shared/idempotency.js` - Duplicate upload prevention
+- `src/db/migrate.js` - Versioned schema migrations

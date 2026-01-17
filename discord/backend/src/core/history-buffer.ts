@@ -57,7 +57,7 @@ export class HistoryBuffer {
       this.initialized = true;
       logger.info('History buffer initialized from database');
     } catch (error) {
-      logger.error('Failed to load history from database', { error });
+      logger.error({ err: error }, 'Failed to load history from database');
       throw error;
     }
   }
@@ -106,11 +106,7 @@ export class HistoryBuffer {
       buffer.shift(); // Remove oldest message
     }
 
-    logger.debug('Message added to buffer', {
-      roomName,
-      userId,
-      messageId: message.id,
-    });
+    logger.debug({ roomName, userId, messageId: message.id }, 'Message added to buffer');
 
     return message;
   }

@@ -507,3 +507,220 @@ For local development, console logging with timestamps is sufficient. Production
 - [ ] Adaptive batching intervals based on stream activity
 - [ ] Comment compression for high-volume streams
 - [ ] CDN for avatar images
+
+## Implementation Notes
+
+This section documents the **WHY** behind key implementation decisions, explaining how each feature addresses specific challenges in live commenting systems.
+
+### Rate Limiting Prevents Comment Spam During Live Events
+
+**Problem**: During high-engagement moments (goals, announcements, controversies), users may intentionally or unintentionally flood the chat with messages. A single malicious user could send thousands of comments per minute, drowning out legitimate conversation and degrading the experience for everyone.
+
+**Solution**: Tiered rate limiting with two layers:
+1. **Global limit (30 comments/minute per user)**: Prevents any single user from monopolizing the comment stream across all streams they participate in.
+2. **Per-stream limit (5 comments/30 seconds per user)**: Ensures fair distribution of comment slots within a single stream.
+
+**Implementation Details**:
+- Uses Redis `INCR` with `EXPIRE` for atomic sliding window counters
+- Rate limit violations are logged with `rate_limit_exceeded_total` Prometheus counter
+- Allows tuning limits via environment variables without code changes
+- Returns clear error messages so clients can implement backoff
+
+**Why Not Just Moderation?**
+Post-hoc moderation can't undo the damage of a comment flood. By the time a moderator sees the spam, thousands of messages have already pushed legitimate comments off-screen. Rate limiting is a preventive measure that works at scale without human intervention.
+
+### Idempotency Prevents Duplicate Comments
+
+**Problem**: Network unreliability is inherent in real-time systems. When a user posts a comment during a network hiccup:
+1. The request may succeed but the response is lost
+2. The client retries, creating a duplicate comment
+3. The user sees their comment posted twice (or more)
+
+This is especially common during high-traffic live events when servers are under load and network congestion is higher.
+
+**Solution**: Idempotency keys that uniquely identify each comment submission:
+1. **Client-provided key**: If the client sends an `X-Idempotency-Key` header, we use it
+2. **Auto-generated key**: Otherwise, we generate a key from `userId:streamId:contentHash:timestampBucket`
+
+**Implementation Details**:
+- Keys are stored in Redis with 5-minute TTL (long enough for retries, short enough for reuse)
+- Duplicate requests return the cached result immediately, maintaining exactly-once semantics
+- `idempotency_duplicates_total` metric tracks how often duplicates are detected
+- Works for both WebSocket and HTTP comment endpoints
+
+**Why This Approach?**
+- **Snowflake IDs alone aren't enough**: While Snowflake IDs ensure unique database records, they don't help when the client retries before receiving confirmation of the first request
+- **Content hashing catches rapid resubmits**: Even if a user legitimately wants to post the same content, a 1-second bucket prevents accidental double-posts from rapid clicking
+- **Silent deduplication**: Users don't see error messages for retries; they just see their comment appear once
+
+### Connection Metrics Enable Capacity Planning
+
+**Problem**: Scaling a real-time system requires understanding:
+1. How many concurrent connections each server can handle
+2. When to add more instances before users experience degradation
+3. Which streams are drawing the most viewers
+4. Whether connection churn is abnormal (indicating client issues)
+
+Without metrics, you're flying blind, scaling reactively after problems occur rather than proactively before they do.
+
+**Solution**: Comprehensive Prometheus metrics for WebSocket connections:
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `ws_connections_total` | Gauge | Current connections per stream (capacity utilization) |
+| `ws_connections_opened_total` | Counter | Connection rate (load prediction) |
+| `ws_connections_closed_total` | Counter | Disconnection rate by reason (health indicator) |
+| `peak_viewers` | Gauge | Peak viewers per stream (capacity planning) |
+| `ws_message_size_bytes` | Histogram | Bandwidth requirements |
+
+**Implementation Details**:
+- Metrics are exposed at `/metrics` in Prometheus text format
+- Labels allow filtering by stream_id for per-stream analysis
+- Close reasons (normal, abnormal, error) help diagnose client issues
+- Default Node.js metrics (CPU, memory, event loop) included for full observability
+
+**Why These Specific Metrics?**
+- **`ws_connections_total` by stream**: Identifies "hot" streams that may need dedicated resources
+- **Peak viewers**: Helps size infrastructure for expected maximum load
+- **Close reasons**: Abnormal closes may indicate network issues or bugs
+- **Message sizes**: Validates that batching is keeping messages small
+
+### Graceful Shutdown Prevents Message Loss
+
+**Problem**: During deployments or scaling events, servers receive termination signals. Without proper handling:
+1. In-flight comments in batch buffers are lost forever
+2. Clients receive connection errors with no warning
+3. Users may think their comments were posted when they weren't
+4. WebSocket connections are terminated abruptly, causing client reconnection storms
+
+**Solution**: A coordinated shutdown sequence that ensures zero message loss:
+
+```
+1. isShuttingDown = true (reject new connections)
+       |
+       v
+2. Flush all CommentBatchers (publish pending comments to Redis)
+       |
+       v
+3. Flush all ReactionAggregators (publish pending reactions)
+       |
+       v
+4. Wait 500ms for Redis publish propagation
+       |
+       v
+5. Send SERVER_SHUTDOWN message to all clients
+       |
+       v
+6. Close connections with code 1001 (Going Away)
+       |
+       v
+7. Wait for clients to acknowledge close (1s timeout)
+       |
+       v
+8. Terminate any remaining connections
+       |
+       v
+9. Close WebSocket server, Redis, database pools
+       |
+       v
+10. Exit process
+```
+
+**Implementation Details**:
+- Overall shutdown timeout of 30 seconds (configurable via `SHUTDOWN_TIMEOUT_MS`)
+- Each step has individual timeouts to prevent blocking
+- Clients receive a notification allowing them to reconnect to another instance
+- Batchers call `stop()` which flushes remaining buffers before stopping
+- Force exit if graceful shutdown takes too long
+
+**Why Not Just Kill the Process?**
+- **Comment batching creates a window**: Comments added in the last 100ms before shutdown would be lost if we don't flush
+- **Client reconnection storms**: Abrupt termination causes all clients to reconnect simultaneously to remaining servers, potentially overloading them
+- **User experience**: A "server shutting down" message allows clients to show appropriate UI instead of generic errors
+
+### Circuit Breaker Protects Against Cascading Failures
+
+**Problem**: When the database becomes slow or unavailable:
+1. Request threads block waiting for responses
+2. Thread pool exhaustion affects all requests, not just database ones
+3. Retries multiply the load on an already struggling database
+4. The entire system degrades even though only one component failed
+
+**Solution**: The circuit breaker pattern using the `opossum` library:
+
+```
+         Failures < threshold
+               |
+               v
++----------+  success   +----------+
+|  CLOSED  | ---------> |  CLOSED  |
+|  (normal)|            |  (normal)|
++----------+            +----------+
+     |
+     | failures >= threshold
+     v
++----------+
+|   OPEN   | ---------> Fail fast (no DB call)
+| (protect)|
++----------+
+     |
+     | resetTimeout expires
+     v
++----------+
+|HALF-OPEN | ---------> Try one request
+|  (probe) |
++----------+
+     |
+     +---> Success: go to CLOSED
+     +---> Failure: go back to OPEN
+```
+
+**Implementation Details**:
+- Database operations wrapped with `createDatabaseCircuitBreaker()`
+- Opens after 5 failures at 50% error rate
+- Stays open for 10 seconds before probing
+- `circuit_breaker_state` gauge tracks state (0=closed, 1=open, 2=half-open)
+- `circuit_breaker_failures_total` counter tracks failure patterns
+
+**Why Circuit Breaker vs. Simple Retries?**
+- **Retries amplify problems**: If the database is overloaded, retries make it worse
+- **Fail fast saves resources**: An open circuit returns immediately instead of waiting for timeout
+- **Recovery detection**: Half-open state automatically detects when the database recovers
+- **Metrics visibility**: Teams can alert on circuit breaker state changes
+
+### Structured Logging Enables Debugging at Scale
+
+**Problem**: Console.log debugging doesn't scale:
+1. Logs are unstructured text, requiring regex to parse
+2. No consistent format across modules
+3. No correlation between related log entries
+4. Log aggregation systems can't efficiently index or query
+
+**Solution**: Structured JSON logging with `pino`:
+
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "fb-live-comments",
+  "module": "comment-service",
+  "streamId": "abc123",
+  "userId": "user456",
+  "commentId": "7891011",
+  "latency": 45,
+  "msg": "Comment created successfully"
+}
+```
+
+**Implementation Details**:
+- Child loggers add context (module, streamId, userId) to all log entries in scope
+- Development mode uses `pino-pretty` for human-readable output
+- Production mode outputs raw JSON for log aggregation (ELK, Splunk, etc.)
+- Log levels are configurable via `LOG_LEVEL` environment variable
+- Fatal logs trigger graceful shutdown
+
+**Why Pino?**
+- **Fastest Node.js logger**: Important for high-throughput comment processing
+- **Structured by default**: No string concatenation or formatting
+- **Child loggers**: Context propagation without passing logger instances everywhere
+- **Pretty-printing in dev**: Best of both worlds for development experience

@@ -2,13 +2,17 @@
  * @fileoverview Click ingestion API routes.
  * Handles single and batch click event submissions from ad delivery systems.
  * Validates input, extracts client metadata, and delegates to ingestion service.
+ *
+ * Supports Idempotency-Key header for exactly-once request processing.
  */
 
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { processClickEvent, processBatchClickEvents } from '../services/click-ingestion.js';
+import { logger } from '../shared/logger.js';
 
 const router = Router();
+const log = logger.child({ route: 'clicks' });
 
 /**
  * Zod validation schema for individual click events.
@@ -42,6 +46,11 @@ const batchClickEventSchema = z.object({
  * Records a single click event in the aggregation system.
  * Performs validation, fraud detection, and returns processing status.
  *
+ * Supports Idempotency-Key header for exactly-once semantics.
+ * If the same Idempotency-Key is sent multiple times, the cached response
+ * is returned without re-processing the click.
+ *
+ * @header Idempotency-Key - Optional unique key for request deduplication
  * @returns 202 for new clicks, 200 for duplicates
  */
 router.post('/', async (req: Request, res: Response): Promise<void> => {
@@ -56,17 +65,25 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Extract Idempotency-Key from header
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+
     // Extract IP hash from request if not provided
     const clickData = {
       ...validation.data,
       ip_hash: validation.data.ip_hash || hashIp(req.ip || req.socket.remoteAddress || 'unknown'),
     };
 
-    const result = await processClickEvent(clickData);
+    const result = await processClickEvent(clickData, idempotencyKey);
+
+    // Set Idempotency-Key in response for client tracking
+    if (idempotencyKey) {
+      res.setHeader('Idempotency-Key', idempotencyKey);
+    }
 
     res.status(result.is_duplicate ? 200 : 202).json(result);
   } catch (error) {
-    console.error('Error processing click:', error);
+    log.error({ error }, 'Error processing click');
     res.status(500).json({
       error: 'Internal server error',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -110,7 +127,7 @@ router.post('/batch', async (req: Request, res: Response): Promise<void> => {
       results,
     });
   } catch (error) {
-    console.error('Error processing batch clicks:', error);
+    log.error({ error }, 'Error processing batch clicks');
     res.status(500).json({
       error: 'Internal server error',
       message: error instanceof Error ? error.message : 'Unknown error',

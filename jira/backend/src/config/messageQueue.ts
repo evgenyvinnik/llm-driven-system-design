@@ -1,4 +1,4 @@
-import amqplib, { Channel, Connection, ConsumeMessage } from 'amqplib';
+import amqplib from 'amqplib';
 import { config } from './index.js';
 import { logger } from './logger.js';
 import { messagesPublishedCounter, messagesConsumedCounter } from './metrics.js';
@@ -28,8 +28,10 @@ export const EXCHANGES = {
   ISSUE_EVENTS: 'jira.issue.events.fanout',
 } as const;
 
-let connection: Connection | null = null;
-let channel: Channel | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let connection: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let channel: any = null;
 let isConnecting = false;
 let connectionRetries = 0;
 const MAX_RETRIES = 5;
@@ -40,7 +42,8 @@ const MAX_RETRIES = 5;
  *
  * @returns Promise resolving to the channel, or null if connection fails
  */
-export async function initializeMessageQueue(): Promise<Channel | null> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function initializeMessageQueue(): Promise<any | null> {
   if (channel) return channel;
   if (isConnecting) return null;
 
@@ -77,7 +80,7 @@ export async function initializeMessageQueue(): Promise<Channel | null> {
     await channel.bindQueue(QUEUES.NOTIFICATIONS, EXCHANGES.ISSUE_EVENTS, '');
     await channel.bindQueue(QUEUES.WEBHOOKS, EXCHANGES.ISSUE_EVENTS, '');
 
-    connection.on('error', (err) => {
+    connection.on('error', (err: Error) => {
       logger.error({ err }, 'RabbitMQ connection error');
     });
 
@@ -212,7 +215,8 @@ export async function publishToQueue(
 /**
  * Message handler function type.
  */
-export type MessageHandler = (message: Record<string, unknown>, msg: ConsumeMessage) => Promise<void>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type MessageHandler = (message: Record<string, unknown>, msg: any) => Promise<void>;
 
 /**
  * Starts consuming messages from a queue.
@@ -232,38 +236,41 @@ export async function consumeQueue(
   }
 
   const maxRetries = options.maxRetries ?? 3;
+  const ch = channel; // Capture for closure
 
-  await channel.consume(
+  await ch.consume(
     queueName,
-    async (msg) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async (msg: any) => {
       if (!msg) return;
 
       try {
         const content = JSON.parse(msg.content.toString());
         await handler(content, msg);
-        channel!.ack(msg);
+        ch.ack(msg);
         messagesConsumedCounter.inc({ queue_name: queueName, status: 'success' });
       } catch (error) {
-        const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+        const headers = msg.properties.headers || {};
+        const retryCount = ((headers['x-retry-count'] as number) || 0) + 1;
         logger.error({ err: error, queue: queueName, retryCount }, 'Error processing message');
 
         if (retryCount >= maxRetries) {
           // Send to dead-letter queue
-          channel!.reject(msg, false);
+          ch.reject(msg, false);
           messagesConsumedCounter.inc({ queue_name: queueName, status: 'error' });
         } else {
           // Requeue with incremented retry count
           setTimeout(() => {
-            channel!.publish(
+            ch.publish(
               '',
               queueName,
               msg.content,
               {
                 ...msg.properties,
-                headers: { ...msg.properties.headers, 'x-retry-count': retryCount },
+                headers: { ...headers, 'x-retry-count': retryCount },
               }
             );
-            channel!.ack(msg);
+            ch.ack(msg);
           }, Math.pow(2, retryCount - 1) * 1000); // Exponential backoff
         }
       }
@@ -292,7 +299,8 @@ export async function closeMessageQueue(): Promise<void> {
 /**
  * Gets the current channel for direct access.
  */
-export function getChannel(): Channel | null {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getChannel(): any | null {
   return channel;
 }
 

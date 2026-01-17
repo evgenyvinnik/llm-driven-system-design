@@ -10,7 +10,11 @@
     "dev:server2": "PORT=3002 node --watch src/index.js",
     "dev:server3": "PORT=3003 node --watch src/index.js",
     "start": "node src/index.js",
-    "db:migrate": "node src/db/migrate.js",
+    "db:migrate": "node src/db/migrateRunner.js up",
+    "db:migrate:status": "node src/db/migrateRunner.js status",
+    "db:migrate:create": "node src/db/migrateRunner.js create",
+    "db:migrate:verify": "node src/db/migrateRunner.js verify",
+    "db:migrate:legacy": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js"
   },
   "dependencies": {

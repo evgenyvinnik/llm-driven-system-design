@@ -1,11 +1,21 @@
 /**
  * Min-Heap implementation for Top K algorithm
  * Used to efficiently maintain the top K elements from a stream
+ *
+ * Includes Prometheus metrics for monitoring heap operations.
  */
+
+import {
+  heapOperationsTotal,
+  heapOperationLatency,
+  heapSize as heapSizeMetric,
+} from '../shared/metrics.js';
+
 export class MinHeap {
-  constructor(compareFn = (a, b) => a.score - b.score) {
+  constructor(compareFn = (a, b) => a.score - b.score, heapName = 'default') {
     this.heap = [];
     this.compare = compareFn;
+    this.heapName = heapName;
   }
 
   get size() {
@@ -17,17 +27,39 @@ export class MinHeap {
   }
 
   push(item) {
+    const start = process.hrtime.bigint();
+
     this.heap.push(item);
     this._bubbleUp(this.heap.length - 1);
+
+    // Record metrics
+    const duration = Number(process.hrtime.bigint() - start) / 1e9;
+    heapOperationsTotal.inc({ operation: 'push' });
+    heapOperationLatency.observe({ operation: 'push' }, duration);
+    heapSizeMetric.set({ type: this.heapName }, this.heap.length);
   }
 
   pop() {
+    const start = process.hrtime.bigint();
+
     if (this.heap.length === 0) return undefined;
-    if (this.heap.length === 1) return this.heap.pop();
+    if (this.heap.length === 1) {
+      const result = this.heap.pop();
+      heapOperationsTotal.inc({ operation: 'pop' });
+      heapSizeMetric.set({ type: this.heapName }, 0);
+      return result;
+    }
 
     const min = this.heap[0];
     this.heap[0] = this.heap.pop();
     this._bubbleDown(0);
+
+    // Record metrics
+    const duration = Number(process.hrtime.bigint() - start) / 1e9;
+    heapOperationsTotal.inc({ operation: 'pop' });
+    heapOperationLatency.observe({ operation: 'pop' }, duration);
+    heapSizeMetric.set({ type: this.heapName }, this.heap.length);
+
     return min;
   }
 
@@ -81,11 +113,24 @@ export class MinHeap {
  *
  * Time complexity: O(log K) per update
  * Space complexity: O(K)
+ *
+ * WHY HEAP OPERATION METRICS ENABLE ALGORITHM OPTIMIZATION:
+ * By tracking the duration and frequency of heap operations, we can:
+ * 1. Detect when the heap is becoming a bottleneck (high latency)
+ * 2. Understand operation distribution (push vs pop vs rebuild)
+ * 3. Identify when to switch to SpaceSaving for high-cardinality streams
+ * 4. Tune K value based on memory and performance tradeoffs
+ *
+ * Example insights from metrics:
+ * - High rebuild count suggests frequent updates to existing items
+ * - Push/pop ratio indicates churn in the top K
+ * - Latency spikes may correlate with heap size
  */
 export class TopK {
-  constructor(k = 10) {
+  constructor(k = 10, category = 'all') {
     this.k = k;
-    this.heap = new MinHeap((a, b) => a.score - b.score);
+    this.category = category;
+    this.heap = new MinHeap((a, b) => a.score - b.score, `topk-${category}`);
     this.itemMap = new Map(); // Track items in heap for updates
   }
 
@@ -95,18 +140,26 @@ export class TopK {
   update(id, score) {
     // If item is already in heap, we need to handle update
     if (this.itemMap.has(id)) {
+      const start = process.hrtime.bigint();
+
       // For simplicity, rebuild when updating
       // In production, use a more efficient data structure like indexed heap
       const items = this.heap.toArray().filter(item => item.id !== id);
       items.push({ id, score });
 
-      this.heap = new MinHeap((a, b) => a.score - b.score);
+      this.heap = new MinHeap((a, b) => a.score - b.score, `topk-${this.category}`);
       this.itemMap.clear();
 
       // Re-add all items
       for (const item of items) {
         this._addItem(item);
       }
+
+      // Record rebuild operation
+      const duration = Number(process.hrtime.bigint() - start) / 1e9;
+      heapOperationsTotal.inc({ operation: 'rebuild' });
+      heapOperationLatency.observe({ operation: 'rebuild' }, duration);
+
       return;
     }
 
@@ -136,8 +189,8 @@ export class TopK {
   /**
    * Build top K from a map of id -> score
    */
-  static fromMap(scoreMap, k = 10) {
-    const topK = new TopK(k);
+  static fromMap(scoreMap, k = 10, category = 'all') {
+    const topK = new TopK(k, category);
     for (const [id, score] of scoreMap.entries()) {
       topK.update(id, score);
     }

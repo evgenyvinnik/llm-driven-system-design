@@ -6,20 +6,20 @@ const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
  * Primary Redis client for general operations (caching, session storage).
  * Used for publishing messages to Redis pub/sub channels.
  */
-export const redis = new Redis(redisUrl);
+export const redis = new Redis.default(redisUrl);
 
 /**
  * Dedicated Redis client for pub/sub subscriptions.
  * Requires a separate connection because Redis clients in subscribe mode
  * cannot execute regular commands.
  */
-export const redisSub = new Redis(redisUrl);
+export const redisSub = new Redis.default(redisUrl);
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   console.error('Redis error:', err);
 });
 
-redisSub.on('error', (err) => {
+redisSub.on('error', (err: Error) => {
   console.error('Redis subscriber error:', err);
 });
 
@@ -79,7 +79,7 @@ export function publishToSpreadsheet(spreadsheetId: string, message: object) {
  */
 export function subscribeToSpreadsheet(spreadsheetId: string, callback: (message: object) => void) {
   redisSub.subscribe(`spreadsheet:${spreadsheetId}`);
-  redisSub.on('message', (channel, message) => {
+  redisSub.on('message', (channel: string, message: string) => {
     if (channel === `spreadsheet:${spreadsheetId}`) {
       try {
         callback(JSON.parse(message));

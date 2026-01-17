@@ -7,6 +7,17 @@ import {
 } from '../types/index.js';
 import { meetingTypeService } from './meetingTypeService.js';
 import { emailService } from './emailService.js';
+import { logger } from '../shared/logger.js';
+import {
+  bookingOperationsTotal,
+  bookingCreationDuration,
+  activeBookingsGauge,
+  doubleBookingPrevented,
+  emailNotificationsTotal,
+  recordBookingOperation,
+} from '../shared/metrics.js';
+import { idempotencyService, IdempotencyService } from '../shared/idempotency.js';
+import { IDEMPOTENCY_CONFIG } from '../shared/config.js';
 import { v4 as uuidv4 } from 'uuid';
 import { parseISO, addMinutes, startOfWeek, endOfWeek, startOfMonth, endOfMonth } from 'date-fns';
 
@@ -15,19 +26,73 @@ import { parseISO, addMinutes, startOfWeek, endOfWeek, startOfMonth, endOfMonth 
  * Handles the full booking lifecycle: creation, retrieval, rescheduling, and cancellation.
  * Implements double-booking prevention using PostgreSQL row-level locking and
  * optimistic concurrency control via version fields.
+ *
+ * Also implements idempotency to prevent duplicate bookings from network retries.
  */
 export class BookingService {
   /**
-   * Creates a new booking with double-booking prevention.
-   * Uses SELECT FOR UPDATE to lock the host's row during the booking transaction,
-   * ensuring concurrent booking attempts are serialized.
-   * Also enforces max bookings per day limits if configured.
-   * Sends confirmation emails asynchronously after successful booking.
+   * Creates a new booking with double-booking prevention and idempotency handling.
+   *
+   * IDEMPOTENCY:
+   * If a client-provided idempotency key is present, the system will:
+   * 1. Check if this request was already processed
+   * 2. Return the cached result if found
+   * 3. Otherwise process the request and cache the result
+   *
+   * This prevents duplicate bookings when clients retry failed requests.
+   *
    * @param input - Booking details including meeting type, time, and invitee info
-   * @returns The newly created booking
+   * @param idempotencyKey - Optional client-provided idempotency key
+   * @returns The newly created booking or cached result
    * @throws Error if slot is unavailable, meeting type not found, or limit reached
    */
-  async createBooking(input: CreateBookingInput): Promise<Booking> {
+  async createBooking(
+    input: CreateBookingInput,
+    idempotencyKey?: string
+  ): Promise<{ booking: Booking; cached: boolean }> {
+    const startTimer = Date.now();
+    const bookingLogger = logger.child({
+      operation: 'createBooking',
+      meetingTypeId: input.meeting_type_id,
+      startTime: input.start_time,
+      inviteeEmail: input.invitee_email,
+    });
+
+    // Generate idempotency key if not provided
+    const effectiveIdempotencyKey =
+      idempotencyKey ||
+      IdempotencyService.generateBookingKey(
+        input.meeting_type_id,
+        input.start_time,
+        input.invitee_email
+      );
+
+    // Check for existing result with this idempotency key
+    const existingResult = await idempotencyService.checkIdempotency(effectiveIdempotencyKey);
+    if (existingResult.found && existingResult.result) {
+      bookingLogger.info('Returning cached booking result (idempotent)');
+      return {
+        booking: existingResult.result as Booking,
+        cached: true,
+      };
+    }
+
+    // Acquire lock to prevent concurrent processing of same request
+    const lockAcquired = await idempotencyService.acquireLock(effectiveIdempotencyKey);
+    if (!lockAcquired) {
+      bookingLogger.warn('Could not acquire idempotency lock, another request is processing');
+      // Wait briefly and check for result again
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const retryResult = await idempotencyService.checkIdempotency(effectiveIdempotencyKey);
+      if (retryResult.found && retryResult.result) {
+        return {
+          booking: retryResult.result as Booking,
+          cached: true,
+        };
+      }
+      throw new Error('Request is being processed. Please wait and try again.');
+    }
+
     const client = await pool.connect();
 
     try {
@@ -66,6 +131,10 @@ export class BookingService {
       );
 
       if (conflicts.rows.length > 0) {
+        // Track prevented double-booking
+        doubleBookingPrevented.inc();
+        recordBookingOperation('create', 'conflict');
+        bookingLogger.warn('Double booking prevented - slot no longer available');
         throw new Error('Time slot is no longer available. Please select another time.');
       }
 
@@ -86,17 +155,18 @@ export class BookingService {
         );
 
         if (parseInt(dayBookings.rows[0].count) >= meetingType.max_bookings_per_day) {
+          recordBookingOperation('create', 'failure');
           throw new Error('Maximum bookings for this day has been reached.');
         }
       }
 
-      // Create the booking
+      // Create the booking with idempotency key
       const id = uuidv4();
       const result = await client.query(
         `INSERT INTO bookings
          (id, meeting_type_id, host_user_id, invitee_name, invitee_email,
-          start_time, end_time, invitee_timezone, status, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed', $9)
+          start_time, end_time, invitee_timezone, status, notes, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed', $9, $10)
          RETURNING *`,
         [
           id,
@@ -108,6 +178,7 @@ export class BookingService {
           endTime.toISOString(),
           input.invitee_timezone,
           input.notes || null,
+          effectiveIdempotencyKey,
         ]
       );
 
@@ -115,18 +186,42 @@ export class BookingService {
 
       const booking = result.rows[0];
 
+      // Record success metrics
+      const duration = (Date.now() - startTimer) / 1000;
+      bookingCreationDuration.observe({ status: 'success' }, duration);
+      recordBookingOperation('create', 'success');
+
+      // Store result for idempotency
+      await idempotencyService.storeResult(effectiveIdempotencyKey, booking, 201);
+
       // Invalidate availability cache
       await this.invalidateAvailabilityCache(meetingType.user_id, input.meeting_type_id);
 
-      // Send confirmation emails (async, don't block)
-      this.sendConfirmationEmails(booking, meetingType).catch(console.error);
+      // Update active bookings gauge
+      await this.updateActiveBookingsGauge();
 
-      return booking;
+      // Send confirmation emails (async, don't block)
+      this.sendConfirmationEmails(booking, meetingType).catch((error) => {
+        bookingLogger.error({ error }, 'Failed to send confirmation emails');
+        emailNotificationsTotal.inc({ type: 'confirmation', status: 'failure' });
+      });
+
+      bookingLogger.info({ bookingId: booking.id, duration }, 'Booking created successfully');
+
+      return { booking, cached: false };
     } catch (error) {
       await client.query('ROLLBACK');
+
+      // Record failure metrics
+      const duration = (Date.now() - startTimer) / 1000;
+      bookingCreationDuration.observe({ status: 'failure' }, duration);
+
+      bookingLogger.error({ error }, 'Failed to create booking');
       throw error;
     } finally {
       client.release();
+      // Release idempotency lock
+      await idempotencyService.releaseLock(effectiveIdempotencyKey);
     }
   }
 
@@ -251,6 +346,7 @@ export class BookingService {
     newStartTime: string,
     userId?: string
   ): Promise<Booking> {
+    const rescheduleLogger = logger.child({ operation: 'reschedule', bookingId: id });
     const client = await pool.connect();
 
     try {
@@ -297,6 +393,7 @@ export class BookingService {
       );
 
       if (conflicts.rows.length > 0) {
+        recordBookingOperation('reschedule', 'conflict');
         throw new Error('New time slot is not available');
       }
 
@@ -318,15 +415,24 @@ export class BookingService {
 
       const booking = result.rows[0];
 
+      // Record success metric
+      recordBookingOperation('reschedule', 'success');
+
       // Invalidate cache
       await this.invalidateAvailabilityCache(existing.host_user_id, existing.meeting_type_id);
 
       // Send reschedule notification
-      emailService.sendRescheduleNotification(booking).catch(console.error);
+      emailService.sendRescheduleNotification(booking).catch((error) => {
+        rescheduleLogger.error({ error }, 'Failed to send reschedule notification');
+        emailNotificationsTotal.inc({ type: 'reschedule', status: 'failure' });
+      });
+
+      rescheduleLogger.info({ newStartTime }, 'Booking rescheduled successfully');
 
       return booking;
     } catch (error) {
       await client.query('ROLLBACK');
+      rescheduleLogger.error({ error }, 'Failed to reschedule booking');
       throw error;
     } finally {
       client.release();
@@ -344,6 +450,7 @@ export class BookingService {
    * @throws Error if booking not found or already cancelled
    */
   async cancel(id: string, reason?: string, userId?: string): Promise<Booking> {
+    const cancelLogger = logger.child({ operation: 'cancel', bookingId: id });
     const client = await pool.connect();
 
     try {
@@ -383,15 +490,27 @@ export class BookingService {
 
       const booking = result.rows[0];
 
+      // Record success metric
+      recordBookingOperation('cancel', 'success');
+
       // Invalidate cache
       await this.invalidateAvailabilityCache(existing.host_user_id, existing.meeting_type_id);
 
+      // Update active bookings gauge
+      await this.updateActiveBookingsGauge();
+
       // Send cancellation notification
-      emailService.sendCancellationNotification(booking, reason).catch(console.error);
+      emailService.sendCancellationNotification(booking, reason).catch((error) => {
+        cancelLogger.error({ error }, 'Failed to send cancellation notification');
+        emailNotificationsTotal.inc({ type: 'cancellation', status: 'failure' });
+      });
+
+      cancelLogger.info({ reason }, 'Booking cancelled successfully');
 
       return booking;
     } catch (error) {
       await client.query('ROLLBACK');
+      cancelLogger.error({ error }, 'Failed to cancel booking');
       throw error;
     } finally {
       client.release();
@@ -448,6 +567,22 @@ export class BookingService {
   }
 
   /**
+   * Updates the active bookings Prometheus gauge.
+   * Called after booking creation or cancellation.
+   */
+  private async updateActiveBookingsGauge(): Promise<void> {
+    try {
+      const result = await pool.query(
+        `SELECT COUNT(*) as count FROM bookings
+         WHERE status = 'confirmed' AND start_time > NOW()`
+      );
+      activeBookingsGauge.set(parseInt(result.rows[0].count));
+    } catch (error) {
+      logger.error({ error }, 'Failed to update active bookings gauge');
+    }
+  }
+
+  /**
    * Sends confirmation emails to both invitee and host.
    * Called asynchronously after booking creation.
    * @param booking - The newly created booking
@@ -459,9 +594,11 @@ export class BookingService {
   ): Promise<void> {
     // Send to invitee
     await emailService.sendBookingConfirmation(booking, meetingType, 'invitee');
+    emailNotificationsTotal.inc({ type: 'confirmation', status: 'success' });
 
     // Send to host
     await emailService.sendBookingConfirmation(booking, meetingType, 'host');
+    emailNotificationsTotal.inc({ type: 'confirmation', status: 'success' });
   }
 
   /**

@@ -91,9 +91,9 @@ router.get('/campaign/:campaignId/summary', async (req: Request, res: Response):
     }
 
     const result = await getCampaignSummary(
-      campaignId,
-      new Date(start_time as string),
-      new Date(end_time as string)
+      String(campaignId),
+      new Date(String(start_time)),
+      new Date(String(end_time))
     );
 
     res.json(result);
@@ -162,7 +162,7 @@ router.get('/realtime/global', async (_req: Request, res: Response): Promise<voi
 router.get('/realtime/campaign/:campaignId', async (req: Request, res: Response): Promise<void> => {
   try {
     const { campaignId } = req.params;
-    const clicks = await getRealTimeCampaignClicks(campaignId);
+    const clicks = await getRealTimeCampaignClicks(String(campaignId));
     res.json({ campaign_id: campaignId, clicks });
   } catch (error) {
     console.error('Error getting real-time campaign clicks:', error);
@@ -182,7 +182,7 @@ router.get('/realtime/campaign/:campaignId', async (req: Request, res: Response)
 router.get('/realtime/ad/:adId', async (req: Request, res: Response): Promise<void> => {
   try {
     const { adId } = req.params;
-    const clicks = await getRealTimeAdClicks(adId);
+    const clicks = await getRealTimeAdClicks(String(adId));
     res.json({ ad_id: adId, clicks });
   } catch (error) {
     console.error('Error getting real-time ad clicks:', error);

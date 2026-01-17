@@ -1,11 +1,18 @@
 import { Router, Response } from 'express';
+import { v4 as uuidv4 } from 'uuid';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js';
-import { orderService, PlaceOrderRequest } from '../services/orderService.js';
+import { orderService, PlaceOrderRequest, OrderContext } from '../services/orderService.js';
+import { logger } from '../shared/logger.js';
 
 /**
  * Express router for order management endpoints.
  * All routes require authentication.
  * Handles order placement, retrieval, and cancellation.
+ *
+ * Enhanced with:
+ * - Idempotency key support via X-Idempotency-Key header
+ * - Request tracing via X-Request-ID header
+ * - Structured logging
  */
 const router = Router();
 
@@ -13,11 +20,45 @@ const router = Router();
 router.use(authMiddleware);
 
 /**
+ * Extracts order context from request headers.
+ * @param req - Express request
+ * @returns Order context with idempotency key and tracing info
+ */
+function extractOrderContext(req: AuthenticatedRequest): OrderContext {
+  return {
+    idempotencyKey: req.headers['x-idempotency-key'] as string | undefined,
+    requestId: (req.headers['x-request-id'] as string) || uuidv4(),
+    ipAddress: req.ip || req.socket.remoteAddress,
+    userAgent: req.headers['user-agent'],
+  };
+}
+
+/**
  * POST /api/orders
  * Places a new buy or sell order.
  * Supports market, limit, stop, and stop-limit order types.
+ *
+ * Headers:
+ * - X-Idempotency-Key: Optional unique key to prevent duplicate orders
+ * - X-Request-ID: Optional request ID for tracing
+ *
+ * Body:
+ * - symbol: Stock ticker symbol (required)
+ * - side: 'buy' or 'sell' (required)
+ * - orderType: 'market', 'limit', 'stop', 'stop_limit' (default: 'market')
+ * - quantity: Number of shares (required)
+ * - limitPrice: Price for limit orders
+ * - stopPrice: Price for stop orders
+ * - timeInForce: 'day', 'gtc', 'ioc', 'fok' (default: 'day')
  */
 router.post('/', async (req: AuthenticatedRequest, res: Response) => {
+  const context = extractOrderContext(req);
+  const routeLogger = logger.child({
+    route: 'POST /api/orders',
+    userId: req.user!.id,
+    requestId: context.requestId,
+  });
+
   try {
     const userId = req.user!.id;
     const orderRequest: PlaceOrderRequest = {
@@ -30,11 +71,23 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
       time_in_force: req.body.timeInForce || 'day',
     };
 
-    const result = await orderService.placeOrder(userId, orderRequest);
+    routeLogger.info({ orderRequest }, 'Processing order placement request');
+
+    const result = await orderService.placeOrder(userId, orderRequest, context);
+
+    // If this was an idempotent response, indicate it in headers
+    if (result.idempotent) {
+      res.setHeader('X-Idempotent-Response', 'true');
+    }
+
+    res.setHeader('X-Request-ID', context.requestId!);
     res.status(201).json(result);
   } catch (error) {
-    console.error('Order placement error:', error);
-    res.status(400).json({ error: (error as Error).message });
+    routeLogger.error({ error: (error as Error).message }, 'Order placement error');
+    res.status(400).json({
+      error: (error as Error).message,
+      requestId: context.requestId,
+    });
   }
 });
 
@@ -44,14 +97,17 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
  * Optionally filter by status with ?status=filled|pending|cancelled
  */
 router.get('/', async (req: AuthenticatedRequest, res: Response) => {
+  const requestId = (req.headers['x-request-id'] as string) || uuidv4();
+
   try {
     const userId = req.user!.id;
     const status = req.query.status as string | undefined;
     const orders = await orderService.getOrders(userId, status);
+    res.setHeader('X-Request-ID', requestId);
     res.json(orders);
   } catch (error) {
-    console.error('Get orders error:', error);
-    res.status(500).json({ error: 'Failed to fetch orders' });
+    logger.error({ error, requestId }, 'Get orders error');
+    res.status(500).json({ error: 'Failed to fetch orders', requestId });
   }
 });
 
@@ -60,19 +116,22 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
  * Returns details for a specific order.
  */
 router.get('/:orderId', async (req: AuthenticatedRequest, res: Response) => {
+  const requestId = (req.headers['x-request-id'] as string) || uuidv4();
+
   try {
     const userId = req.user!.id;
     const order = await orderService.getOrder(userId, req.params.orderId);
 
     if (!order) {
-      res.status(404).json({ error: 'Order not found' });
+      res.status(404).json({ error: 'Order not found', requestId });
       return;
     }
 
+    res.setHeader('X-Request-ID', requestId);
     res.json(order);
   } catch (error) {
-    console.error('Get order error:', error);
-    res.status(500).json({ error: 'Failed to fetch order' });
+    logger.error({ error, requestId }, 'Get order error');
+    res.status(500).json({ error: 'Failed to fetch order', requestId });
   }
 });
 
@@ -82,20 +141,23 @@ router.get('/:orderId', async (req: AuthenticatedRequest, res: Response) => {
  * An order may have multiple executions for partial fills.
  */
 router.get('/:orderId/executions', async (req: AuthenticatedRequest, res: Response) => {
+  const requestId = (req.headers['x-request-id'] as string) || uuidv4();
+
   try {
     const userId = req.user!.id;
     const order = await orderService.getOrder(userId, req.params.orderId);
 
     if (!order) {
-      res.status(404).json({ error: 'Order not found' });
+      res.status(404).json({ error: 'Order not found', requestId });
       return;
     }
 
     const executions = await orderService.getExecutions(order.id);
+    res.setHeader('X-Request-ID', requestId);
     res.json(executions);
   } catch (error) {
-    console.error('Get executions error:', error);
-    res.status(500).json({ error: 'Failed to fetch executions' });
+    logger.error({ error, requestId }, 'Get executions error');
+    res.status(500).json({ error: 'Failed to fetch executions', requestId });
   }
 });
 
@@ -105,13 +167,28 @@ router.get('/:orderId/executions', async (req: AuthenticatedRequest, res: Respon
  * Returns error if order is already filled, cancelled, or expired.
  */
 router.delete('/:orderId', async (req: AuthenticatedRequest, res: Response) => {
+  const context = extractOrderContext(req);
+  const routeLogger = logger.child({
+    route: 'DELETE /api/orders/:orderId',
+    userId: req.user!.id,
+    orderId: req.params.orderId,
+    requestId: context.requestId,
+  });
+
   try {
     const userId = req.user!.id;
-    const order = await orderService.cancelOrder(userId, req.params.orderId);
+    routeLogger.info('Processing order cancellation request');
+
+    const order = await orderService.cancelOrder(userId, req.params.orderId, context);
+
+    res.setHeader('X-Request-ID', context.requestId!);
     res.json({ message: 'Order cancelled', order });
   } catch (error) {
-    console.error('Cancel order error:', error);
-    res.status(400).json({ error: (error as Error).message });
+    routeLogger.error({ error: (error as Error).message }, 'Cancel order error');
+    res.status(400).json({
+      error: (error as Error).message,
+      requestId: context.requestId,
+    });
   }
 });
 

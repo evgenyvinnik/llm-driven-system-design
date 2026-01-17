@@ -1,8 +1,54 @@
+/**
+ * WebSocket server for real-time spreadsheet collaboration.
+ * Handles connection lifecycle, message routing, room management,
+ * and broadcasts cell changes to all connected clients.
+ *
+ * Features:
+ * - Heartbeat mechanism for detecting stale connections
+ * - Prometheus metrics for connection and message tracking
+ * - Circuit breaker for Redis pub/sub resilience
+ * - Idempotency for cell edit operations
+ * - Redis caching for spreadsheet data
+ *
+ * @module websocket/server
+ */
+
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
 import { pool } from '../shared/db.js';
-import { publishToSpreadsheet } from '../shared/redis.js';
+import { redis, publishToSpreadsheet } from '../shared/redis.js';
 import { v4 as uuidv4 } from 'uuid';
+import logger, { createChildLogger } from '../shared/logger.js';
+import {
+  wsConnectionsActive,
+  wsMessagesReceived,
+  wsMessagesSent,
+  wsMessageLatency,
+  cellEditsTotal,
+  cellEditLatency,
+  formulaCalculationsTotal,
+  formulaCalculationDuration,
+  errorsTotal,
+  dbQueryDuration,
+} from '../shared/metrics.js';
+import { createPubSubBreaker, getCircuitState } from '../shared/circuitBreaker.js';
+import {
+  checkIdempotency,
+  storeIdempotencyResult,
+  generateCellIdempotencyKey,
+} from '../shared/idempotency.js';
+import {
+  getCachedSpreadsheet,
+  setCachedSpreadsheet,
+  getCachedCells,
+  setCachedCells,
+  updateCachedCell,
+  setCachedCollaborator,
+  removeCachedCollaborator,
+} from '../shared/cache.js';
+
+/** Logger for WebSocket operations */
+const wsLogger = createChildLogger({ component: 'websocket' });
 
 /**
  * Extended WebSocket interface with user and session properties.
@@ -42,6 +88,14 @@ const COLORS = [
 ];
 
 let colorIndex = 0;
+
+/**
+ * Circuit breaker for Redis pub/sub operations.
+ * Protects against Redis failures during collaborative sync.
+ */
+const pubSubBreaker = createPubSubBreaker(
+  async (channel: string, message: string) => redis.publish(channel, message)
+);
 
 /**
  * Returns the next available color from the color palette.
@@ -112,7 +166,20 @@ export function setupWebSocket(server: any) {
     const room = rooms.get(spreadsheetId)!;
     room.clients.add(ws);
 
-    console.log(`User ${ws.userName} joined spreadsheet ${spreadsheetId}`);
+    // Update metrics
+    wsConnectionsActive.inc();
+
+    wsLogger.info(
+      { userId: ws.userId, userName: ws.userName, spreadsheetId },
+      'User connected'
+    );
+
+    // Cache collaborator info
+    await setCachedCollaborator(spreadsheetId, ws.userId!, {
+      userId: ws.userId,
+      name: ws.userName,
+      color: ws.userColor,
+    });
 
     // Send current state to new client
     await sendInitialState(ws, spreadsheetId);
@@ -127,11 +194,18 @@ export function setupWebSocket(server: any) {
 
     // Handle messages
     ws.on('message', async (data) => {
+      const start = Date.now();
       try {
         const message = JSON.parse(data.toString());
+        wsMessagesReceived.labels(message.type || 'unknown').inc();
+
         await handleMessage(ws, message);
+
+        const duration = Date.now() - start;
+        wsMessageLatency.labels(message.type || 'unknown').observe(duration);
       } catch (e) {
-        console.error('Error handling message:', e);
+        errorsTotal.labels('message_parse', 'websocket').inc();
+        wsLogger.error({ error: e, userId: ws.userId }, 'Error handling message');
         ws.send(JSON.stringify({ type: 'ERROR', message: 'Invalid message format' }));
       }
     });
@@ -141,7 +215,8 @@ export function setupWebSocket(server: any) {
     });
 
     ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      errorsTotal.labels('ws_connection', 'websocket').inc();
+      wsLogger.error({ error, userId: ws.userId }, 'WebSocket error');
       handleDisconnect(ws);
     });
   });
@@ -152,53 +227,81 @@ export function setupWebSocket(server: any) {
 /**
  * Sends the complete spreadsheet state to a newly connected client.
  * Includes spreadsheet metadata, sheets, cells, dimensions, and active collaborators.
- * Creates a new spreadsheet if the requested one doesn't exist.
+ * Uses caching to improve performance for frequently accessed spreadsheets.
  *
  * @param ws - The WebSocket connection to send state to
  * @param spreadsheetId - The spreadsheet to load state for
  */
 async function sendInitialState(ws: ExtendedWebSocket, spreadsheetId: string) {
-  try {
-    // Get spreadsheet info
-    const spreadsheetResult = await pool.query(
-      'SELECT * FROM spreadsheets WHERE id = $1',
-      [spreadsheetId]
-    );
+  const start = Date.now();
 
-    if (spreadsheetResult.rows.length === 0) {
-      // Create new spreadsheet if doesn't exist
-      await pool.query(
-        'INSERT INTO spreadsheets (id, title) VALUES ($1, $2)',
-        [spreadsheetId, 'Untitled Spreadsheet']
+  try {
+    // Try to get spreadsheet from cache first
+    let spreadsheetData = await getCachedSpreadsheet(spreadsheetId);
+
+    if (!spreadsheetData) {
+      // Cache miss - fetch from database
+      const dbStart = Date.now();
+      const spreadsheetResult = await pool.query(
+        'SELECT * FROM spreadsheets WHERE id = $1',
+        [spreadsheetId]
       );
-      await pool.query(
-        'INSERT INTO sheets (spreadsheet_id, name, sheet_index) VALUES ($1, $2, 0)',
-        [spreadsheetId, 'Sheet1']
-      );
+      dbQueryDuration.labels('select_spreadsheet').observe(Date.now() - dbStart);
+
+      if (spreadsheetResult.rows.length === 0) {
+        // Create new spreadsheet if doesn't exist
+        const createStart = Date.now();
+        await pool.query(
+          'INSERT INTO spreadsheets (id, title) VALUES ($1, $2)',
+          [spreadsheetId, 'Untitled Spreadsheet']
+        );
+        await pool.query(
+          'INSERT INTO sheets (spreadsheet_id, name, sheet_index) VALUES ($1, $2, 0)',
+          [spreadsheetId, 'Sheet1']
+        );
+        dbQueryDuration.labels('create_spreadsheet').observe(Date.now() - createStart);
+      }
+
+      spreadsheetData = spreadsheetResult.rows[0] || { id: spreadsheetId, title: 'Untitled Spreadsheet' };
     }
 
     // Get sheets
+    const sheetsStart = Date.now();
     const sheetsResult = await pool.query(
       'SELECT * FROM sheets WHERE spreadsheet_id = $1 ORDER BY sheet_index',
       [spreadsheetId]
     );
+    dbQueryDuration.labels('select_sheets').observe(Date.now() - sheetsStart);
 
-    // Get cells for first sheet
-    const cells: Record<string, any> = {};
+    // Get cells for first sheet (with caching)
+    let cells: Record<string, any> = {};
     if (sheetsResult.rows.length > 0) {
       const sheetId = sheetsResult.rows[0].id;
-      const cellsResult = await pool.query(
-        'SELECT row_index, col_index, raw_value, computed_value, format FROM cells WHERE sheet_id = $1',
-        [sheetId]
-      );
 
-      for (const cell of cellsResult.rows) {
-        const key = `${cell.row_index}-${cell.col_index}`;
-        cells[key] = {
-          rawValue: cell.raw_value,
-          computedValue: cell.computed_value,
-          format: cell.format,
-        };
+      // Try cache first
+      const cachedCells = await getCachedCells(sheetId);
+      if (cachedCells) {
+        cells = cachedCells;
+      } else {
+        // Cache miss - fetch from database
+        const cellsStart = Date.now();
+        const cellsResult = await pool.query(
+          'SELECT row_index, col_index, raw_value, computed_value, format FROM cells WHERE sheet_id = $1',
+          [sheetId]
+        );
+        dbQueryDuration.labels('select_cells').observe(Date.now() - cellsStart);
+
+        for (const cell of cellsResult.rows) {
+          const key = `${cell.row_index}-${cell.col_index}`;
+          cells[key] = {
+            rawValue: cell.raw_value,
+            computedValue: cell.computed_value,
+            format: cell.format,
+          };
+        }
+
+        // Cache the cells
+        await setCachedCells(sheetId, cells);
       }
     }
 
@@ -226,7 +329,7 @@ async function sendInitialState(ws: ExtendedWebSocket, spreadsheetId: string) {
       }
     }
 
-    // Get current collaborators
+    // Get current collaborators from room
     const collaborators: any[] = [];
     const room = rooms.get(spreadsheetId);
     if (room) {
@@ -241,9 +344,15 @@ async function sendInitialState(ws: ExtendedWebSocket, spreadsheetId: string) {
       }
     }
 
-    ws.send(JSON.stringify({
+    // Cache spreadsheet metadata for future connections
+    await setCachedSpreadsheet(spreadsheetId, {
+      ...spreadsheetData,
+      sheets: sheetsResult.rows,
+    });
+
+    const stateMessage = {
       type: 'STATE_SYNC',
-      spreadsheet: spreadsheetResult.rows[0] || { id: spreadsheetId, title: 'Untitled Spreadsheet' },
+      spreadsheet: spreadsheetData,
       sheets: sheetsResult.rows,
       activeSheetId: sheetsResult.rows[0]?.id,
       cells,
@@ -255,9 +364,19 @@ async function sendInitialState(ws: ExtendedWebSocket, spreadsheetId: string) {
         name: ws.userName,
         color: ws.userColor,
       },
-    }));
+    };
+
+    ws.send(JSON.stringify(stateMessage));
+    wsMessagesSent.labels('STATE_SYNC').inc();
+
+    const duration = Date.now() - start;
+    wsLogger.info(
+      { spreadsheetId, userId: ws.userId, cellCount: Object.keys(cells).length, duration },
+      'Initial state sent'
+    );
   } catch (error) {
-    console.error('Error sending initial state:', error);
+    errorsTotal.labels('initial_state', 'websocket').inc();
+    wsLogger.error({ error, spreadsheetId }, 'Error sending initial state');
     ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to load spreadsheet' }));
   }
 }
@@ -298,61 +417,152 @@ async function handleMessage(ws: ExtendedWebSocket, message: any) {
       break;
 
     default:
-      console.log('Unknown message type:', type);
+      wsLogger.debug({ type, userId: ws.userId }, 'Unknown message type');
   }
 }
 
 /**
  * Handles cell edit operations from clients.
+ * Implements idempotency to prevent duplicate writes from retries.
  * Persists the change to the database and broadcasts to all room members.
- * Evaluates formulas if the value starts with '='.
+ * Uses circuit breaker for Redis pub/sub operations.
  *
  * @param ws - The WebSocket connection that made the edit
- * @param payload - Contains sheetId, row, col, and value
+ * @param payload - Contains sheetId, row, col, value, and optional requestId
  */
 async function handleCellEdit(ws: ExtendedWebSocket, payload: any) {
-  const { sheetId, row, col, value } = payload;
+  const start = Date.now();
+  const { sheetId, row, col, value, requestId } = payload;
+
+  // Check idempotency if requestId is provided
+  if (requestId && ws.spreadsheetId) {
+    const idempotencyKey = generateCellIdempotencyKey(
+      ws.spreadsheetId,
+      sheetId,
+      row,
+      col,
+      requestId
+    );
+
+    const check = await checkIdempotency<any>(idempotencyKey);
+    if (check.isReplay && check.cachedResult) {
+      wsLogger.debug(
+        { sheetId, row, col, requestId, userId: ws.userId },
+        'Cell edit replayed from cache'
+      );
+
+      // Send cached response
+      ws.send(JSON.stringify({
+        type: 'CELL_EDIT_ACK',
+        requestId,
+        ...check.cachedResult,
+      }));
+      return;
+    }
+  }
 
   try {
     // Compute value (in production, use HyperFormula)
     let computedValue = value;
     if (value && value.startsWith('=')) {
-      // Simple formula evaluation for demo
+      formulaCalculationsTotal.inc();
+      const formulaStart = Date.now();
       computedValue = evaluateFormula(value);
+      formulaCalculationDuration.observe(Date.now() - formulaStart);
     }
 
-    // Upsert cell
+    // Upsert cell in database
+    const dbStart = Date.now();
     await pool.query(`
       INSERT INTO cells (sheet_id, row_index, col_index, raw_value, computed_value)
       VALUES ($1, $2, $3, $4, $5)
       ON CONFLICT (sheet_id, row_index, col_index)
       DO UPDATE SET raw_value = $4, computed_value = $5, updated_at = NOW()
     `, [sheetId, row, col, value, computedValue]);
+    dbQueryDuration.labels('upsert_cell').observe(Date.now() - dbStart);
+
+    // Update cache
+    await updateCachedCell(sheetId, row, col, {
+      rawValue: value,
+      computedValue,
+    });
+
+    // Record metrics
+    cellEditsTotal.inc();
+    const duration = Date.now() - start;
+    cellEditLatency.observe(duration);
+
+    const updateMessage = {
+      type: 'CELL_UPDATED',
+      sheetId,
+      row,
+      col,
+      rawValue: value,
+      computedValue,
+      userId: ws.userId,
+    };
 
     // Broadcast to all clients in room
-    broadcastToRoom(ws.spreadsheetId!, {
-      type: 'CELL_UPDATED',
-      sheetId,
-      row,
-      col,
-      rawValue: value,
-      computedValue,
-      userId: ws.userId,
-    });
+    broadcastToRoom(ws.spreadsheetId!, updateMessage);
 
-    // Also publish to Redis for multi-server support
-    publishToSpreadsheet(ws.spreadsheetId!, {
-      type: 'CELL_UPDATED',
+    // Publish to Redis for multi-server support (with circuit breaker)
+    const pubSubState = getCircuitState(pubSubBreaker);
+    if (pubSubState === 'closed' || pubSubState === 'half-open') {
+      try {
+        await pubSubBreaker.fire(
+          `spreadsheet:${ws.spreadsheetId}`,
+          JSON.stringify(updateMessage)
+        );
+      } catch (e) {
+        // Circuit breaker handled the failure, log for visibility
+        wsLogger.warn(
+          { error: e, spreadsheetId: ws.spreadsheetId, circuitState: pubSubState },
+          'Pub/sub failed, operating in single-server mode'
+        );
+      }
+    }
+
+    // Store idempotency result if requestId was provided
+    if (requestId && ws.spreadsheetId) {
+      const idempotencyKey = generateCellIdempotencyKey(
+        ws.spreadsheetId,
+        sheetId,
+        row,
+        col,
+        requestId
+      );
+      await storeIdempotencyResult(idempotencyKey, 'cell_edit', {
+        sheetId,
+        row,
+        col,
+        rawValue: value,
+        computedValue,
+      });
+    }
+
+    // Send acknowledgment to the client that made the edit
+    ws.send(JSON.stringify({
+      type: 'CELL_EDIT_ACK',
+      requestId,
       sheetId,
       row,
       col,
       rawValue: value,
       computedValue,
-      userId: ws.userId,
-    });
+    }));
+
+    wsLogger.debug(
+      { sheetId, row, col, duration, userId: ws.userId },
+      'Cell edit processed'
+    );
   } catch (error) {
-    console.error('Error handling cell edit:', error);
-    ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to save cell' }));
+    errorsTotal.labels('cell_edit', 'websocket').inc();
+    wsLogger.error({ error, sheetId, row, col }, 'Error handling cell edit');
+    ws.send(JSON.stringify({
+      type: 'ERROR',
+      message: 'Failed to save cell',
+      requestId,
+    }));
   }
 }
 
@@ -406,12 +616,14 @@ async function handleResizeColumn(ws: ExtendedWebSocket, payload: any) {
   const { sheetId, col, width } = payload;
 
   try {
+    const dbStart = Date.now();
     await pool.query(`
       INSERT INTO column_widths (sheet_id, col_index, width)
       VALUES ($1, $2, $3)
       ON CONFLICT (sheet_id, col_index)
       DO UPDATE SET width = $3
     `, [sheetId, col, width]);
+    dbQueryDuration.labels('upsert_column_width').observe(Date.now() - dbStart);
 
     broadcastToRoom(ws.spreadsheetId!, {
       type: 'COLUMN_RESIZED',
@@ -420,8 +632,11 @@ async function handleResizeColumn(ws: ExtendedWebSocket, payload: any) {
       width,
       userId: ws.userId,
     });
+
+    wsMessagesSent.labels('COLUMN_RESIZED').inc();
   } catch (error) {
-    console.error('Error resizing column:', error);
+    errorsTotal.labels('resize_column', 'websocket').inc();
+    wsLogger.error({ error, sheetId, col }, 'Error resizing column');
   }
 }
 
@@ -436,12 +651,14 @@ async function handleResizeRow(ws: ExtendedWebSocket, payload: any) {
   const { sheetId, row, height } = payload;
 
   try {
+    const dbStart = Date.now();
     await pool.query(`
       INSERT INTO row_heights (sheet_id, row_index, height)
       VALUES ($1, $2, $3)
       ON CONFLICT (sheet_id, row_index)
       DO UPDATE SET height = $3
     `, [sheetId, row, height]);
+    dbQueryDuration.labels('upsert_row_height').observe(Date.now() - dbStart);
 
     broadcastToRoom(ws.spreadsheetId!, {
       type: 'ROW_RESIZED',
@@ -450,8 +667,11 @@ async function handleResizeRow(ws: ExtendedWebSocket, payload: any) {
       height,
       userId: ws.userId,
     });
+
+    wsMessagesSent.labels('ROW_RESIZED').inc();
   } catch (error) {
-    console.error('Error resizing row:', error);
+    errorsTotal.labels('resize_row', 'websocket').inc();
+    wsLogger.error({ error, sheetId, row }, 'Error resizing row');
   }
 }
 
@@ -466,7 +686,9 @@ async function handleRenameSheet(ws: ExtendedWebSocket, payload: any) {
   const { sheetId, name } = payload;
 
   try {
+    const dbStart = Date.now();
     await pool.query('UPDATE sheets SET name = $1 WHERE id = $2', [name, sheetId]);
+    dbQueryDuration.labels('update_sheet_name').observe(Date.now() - dbStart);
 
     broadcastToRoom(ws.spreadsheetId!, {
       type: 'SHEET_RENAMED',
@@ -474,8 +696,11 @@ async function handleRenameSheet(ws: ExtendedWebSocket, payload: any) {
       name,
       userId: ws.userId,
     });
+
+    wsMessagesSent.labels('SHEET_RENAMED').inc();
   } catch (error) {
-    console.error('Error renaming sheet:', error);
+    errorsTotal.labels('rename_sheet', 'websocket').inc();
+    wsLogger.error({ error, sheetId, name }, 'Error renaming sheet');
   }
 }
 
@@ -486,12 +711,20 @@ async function handleRenameSheet(ws: ExtendedWebSocket, payload: any) {
  *
  * @param ws - The WebSocket connection that disconnected
  */
-function handleDisconnect(ws: ExtendedWebSocket) {
+async function handleDisconnect(ws: ExtendedWebSocket) {
   if (!ws.spreadsheetId) return;
+
+  // Update metrics
+  wsConnectionsActive.dec();
 
   const room = rooms.get(ws.spreadsheetId);
   if (room) {
     room.clients.delete(ws);
+
+    // Remove from collaborator cache
+    if (ws.userId) {
+      await removeCachedCollaborator(ws.spreadsheetId, ws.userId);
+    }
 
     if (room.clients.size === 0) {
       rooms.delete(ws.spreadsheetId);
@@ -504,7 +737,10 @@ function handleDisconnect(ws: ExtendedWebSocket) {
     }
   }
 
-  console.log(`User ${ws.userName} left spreadsheet ${ws.spreadsheetId}`);
+  wsLogger.info(
+    { userId: ws.userId, userName: ws.userName, spreadsheetId: ws.spreadsheetId },
+    'User disconnected'
+  );
 }
 
 /**
@@ -520,10 +756,17 @@ function broadcastToRoom(spreadsheetId: string, message: any, exclude?: Extended
   if (!room) return;
 
   const data = JSON.stringify(message);
+  let sentCount = 0;
+
   for (const client of room.clients) {
     if (client !== exclude && client.readyState === WebSocket.OPEN) {
       client.send(data);
+      sentCount++;
     }
+  }
+
+  if (message.type) {
+    wsMessagesSent.labels(message.type).inc(sentCount);
   }
 }
 

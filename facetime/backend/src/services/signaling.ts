@@ -1,3 +1,19 @@
+/**
+ * WebSocket Signaling Service for FaceTime.
+ *
+ * Handles real-time call signaling including:
+ * - Device registration and presence
+ * - Call initiation with idempotency
+ * - Answer/decline/end call flows
+ * - WebRTC offer/answer/ICE candidate exchange
+ *
+ * Features:
+ * - Idempotency for call initiation (prevents duplicate calls)
+ * - Circuit breaker for database operations
+ * - Prometheus metrics for call quality monitoring
+ * - Structured logging for debugging
+ */
+
 import { WebSocket, WebSocketServer } from 'ws';
 import { IncomingMessage } from 'http';
 import { v4 as uuidv4 } from 'uuid';
@@ -11,14 +27,54 @@ import {
 } from './redis.js';
 import type {
   User,
-  Call,
-  CallParticipant,
   WebSocketMessage,
   CallInitiateData,
-  SignalingOffer,
-  SignalingAnswer,
-  ICECandidate,
 } from '../types/index.js';
+
+// Shared modules
+import {
+  logger,
+  createWebSocketLogger,
+  logCallEvent,
+  logAudit,
+  logSignalingEvent,
+} from '../shared/logger.js';
+import {
+  callsInitiated,
+  callsAnswered,
+  callsEnded,
+  callDuration,
+  callSetupLatency,
+  activeCalls,
+  activeConnections,
+  connectionsTotal,
+  connectionErrors,
+  signalingLatency,
+  signalingErrors,
+} from '../shared/metrics.js';
+import { withCircuitBreaker } from '../shared/circuit-breaker.js';
+import {
+  checkIdempotencyKey,
+  storeIdempotencyKey,
+  checkICECandidateDedup,
+  generateICECandidateHash,
+} from '../shared/idempotency.js';
+import {
+  updatePresence,
+  removePresence,
+  getCachedUserProfile,
+  setCachedUserProfile,
+} from '../shared/cache.js';
+
+/**
+ * Simplified user profile for signaling operations.
+ */
+interface UserProfile {
+  id: string;
+  username: string;
+  display_name: string;
+  avatar_url: string | null;
+}
 
 /**
  * Represents a connected WebSocket client for signaling.
@@ -31,6 +87,7 @@ interface ConnectedClient {
   deviceId: string;
   deviceType: string;
   lastPing: number;
+  log: ReturnType<typeof createWebSocketLogger>;
 }
 
 /** Map of clientId to ConnectedClient for all active WebSocket connections */
@@ -42,6 +99,9 @@ const userClients = new Map<string, Set<string>>();
 /** Map of callId to timeout handle for ring timeout management */
 const ringTimeouts = new Map<string, NodeJS.Timeout>();
 
+/** Map of callId to creation timestamp for setup latency tracking */
+const callCreationTimes = new Map<string, number>();
+
 /**
  * Initializes WebSocket signaling server with event handlers.
  * This is the core of the real-time communication system, handling
@@ -52,18 +112,29 @@ const ringTimeouts = new Map<string, NodeJS.Timeout>();
 export function setupWebSocketServer(wss: WebSocketServer): void {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const clientId = uuidv4();
-    console.log(`WebSocket client connected: ${clientId}`);
+    const clientLog = createWebSocketLogger(clientId);
+
+    clientLog.info('WebSocket client connected');
+    connectionsTotal.inc();
+    activeConnections.inc();
 
     let currentClient: ConnectedClient | null = null;
 
     ws.on('message', async (data: Buffer) => {
+      const messageStart = Date.now();
       try {
         const message: WebSocketMessage = JSON.parse(data.toString());
-        console.log(`Received message from ${clientId}:`, message.type);
+        const messageType = message.type;
+
+        if (currentClient) {
+          currentClient.log.debug({ messageType }, 'Received message');
+        } else {
+          clientLog.debug({ messageType }, 'Received message');
+        }
 
         switch (message.type) {
           case 'register':
-            currentClient = await handleRegister(ws, clientId, message);
+            currentClient = await handleRegister(ws, clientId, message, clientLog);
             break;
 
           case 'call_initiate':
@@ -105,24 +176,31 @@ export function setupWebSocketServer(wss: WebSocketServer): void {
             }
             break;
         }
+
+        // Track signaling latency
+        signalingLatency.observe({ message_type: message.type }, (Date.now() - messageStart) / 1000);
       } catch (error) {
-        console.error('Error processing message:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        clientLog.error({ error }, 'Error processing message');
+        signalingErrors.inc({ error_type: 'processing_error' });
         sendToClient(ws, {
           type: 'error',
-          data: { message: 'Failed to process message' },
+          data: { message: 'Failed to process message', detail: errorMessage },
         });
       }
     });
 
     ws.on('close', async () => {
-      console.log(`WebSocket client disconnected: ${clientId}`);
+      clientLog.info('WebSocket client disconnected');
+      activeConnections.dec();
       if (currentClient) {
         await handleDisconnect(clientId, currentClient);
       }
     });
 
     ws.on('error', (error) => {
-      console.error(`WebSocket error for ${clientId}:`, error);
+      clientLog.error({ error }, 'WebSocket error');
+      connectionErrors.inc({ error_type: 'connection_error' });
     });
   });
 
@@ -133,7 +211,7 @@ export function setupWebSocketServer(wss: WebSocketServer): void {
 
     for (const [clientId, client] of clients) {
       if (now - client.lastPing > timeout) {
-        console.log(`Client ${clientId} timed out`);
+        client.log.warn('Client timed out');
         client.ws.terminate();
         handleDisconnect(clientId, client);
       }
@@ -146,15 +224,19 @@ export function setupWebSocketServer(wss: WebSocketServer): void {
  * Verifies user exists, creates client tracking entry, updates presence
  * in Redis, and records the device in the database.
  *
+ * Uses circuit breaker for database operations to prevent cascade failures.
+ *
  * @param ws - The WebSocket connection
  * @param clientId - Unique ID for this connection
  * @param message - The registration message containing userId and deviceId
+ * @param log - Logger instance for this client
  * @returns The created ConnectedClient or null if registration failed
  */
 async function handleRegister(
   ws: WebSocket,
   clientId: string,
-  message: WebSocketMessage
+  message: WebSocketMessage,
+  log: ReturnType<typeof createWebSocketLogger>
 ): Promise<ConnectedClient | null> {
   const { userId, deviceId, data } = message;
   const deviceType = (data as { deviceType?: string })?.deviceType || 'desktop';
@@ -167,21 +249,53 @@ async function handleRegister(
     return null;
   }
 
-  // Verify user exists
-  const user = await queryOne<User>(
-    'SELECT * FROM users WHERE id = $1',
-    [userId]
-  );
+  // Check cache first for user profile
+  const cachedUser = await getCachedUserProfile(userId);
+  let userProfile: UserProfile | null = cachedUser ? {
+    id: cachedUser.id,
+    username: cachedUser.username,
+    display_name: cachedUser.display_name,
+    avatar_url: cachedUser.avatar_url,
+  } : null;
 
-  if (!user) {
-    sendToClient(ws, {
-      type: 'error',
-      data: { message: 'User not found' },
-    });
-    return null;
+  if (!userProfile) {
+    // Cache miss - fetch from database with circuit breaker
+    try {
+      const dbUser = await withCircuitBreaker(
+        'db-user-lookup',
+        async () => queryOne<User>('SELECT * FROM users WHERE id = $1', [userId]),
+        [userId, deviceId],
+        null // Fallback to null if circuit is open
+      );
+
+      if (!dbUser) {
+        sendToClient(ws, {
+          type: 'error',
+          data: { message: 'User not found' },
+        });
+        return null;
+      }
+
+      // Cache the user profile
+      userProfile = {
+        id: dbUser.id,
+        username: dbUser.username,
+        display_name: dbUser.display_name,
+        avatar_url: dbUser.avatar_url,
+      };
+      await setCachedUserProfile(userId, userProfile);
+    } catch (error) {
+      log.error({ error }, 'Failed to lookup user');
+      sendToClient(ws, {
+        type: 'error',
+        data: { message: 'Service temporarily unavailable' },
+      });
+      return null;
+    }
   }
 
   const finalDeviceId = deviceId || uuidv4();
+  const clientLogger = createWebSocketLogger(clientId, userId, finalDeviceId);
 
   const client: ConnectedClient = {
     ws,
@@ -189,6 +303,7 @@ async function handleRegister(
     deviceId: finalDeviceId,
     deviceType,
     lastPing: Date.now(),
+    log: clientLogger,
   };
 
   clients.set(clientId, client);
@@ -199,16 +314,32 @@ async function handleRegister(
   }
   userClients.get(userId)!.add(clientId);
 
-  // Update Redis presence
-  await setUserOnline(userId, finalDeviceId);
+  // Update Redis presence (write-through)
+  await Promise.all([
+    setUserOnline(userId, finalDeviceId),
+    updatePresence(userId, finalDeviceId, deviceType),
+  ]);
 
-  // Update device last_seen in database
-  await query(
-    `INSERT INTO user_devices (id, user_id, device_name, device_type, is_active, last_seen)
-     VALUES ($1, $2, $3, $4, true, NOW())
-     ON CONFLICT (id) DO UPDATE SET last_seen = NOW(), is_active = true`,
-    [finalDeviceId, userId, `${deviceType} Device`, deviceType]
-  );
+  // Update device last_seen in database (fire-and-forget with circuit breaker)
+  withCircuitBreaker(
+    'db-device-upsert',
+    async () => query(
+      `INSERT INTO user_devices (id, user_id, device_name, device_type, is_active, last_seen)
+       VALUES ($1, $2, $3, $4, true, NOW())
+       ON CONFLICT (id) DO UPDATE SET last_seen = NOW(), is_active = true`,
+      [finalDeviceId, userId, `${deviceType} Device`, deviceType]
+    )
+  ).catch((err) => clientLogger.error({ err }, 'Failed to update device record'));
+
+  // Audit log for device registration
+  logAudit({
+    timestamp: new Date().toISOString(),
+    action: 'device.registered',
+    actor: { userId, deviceId: finalDeviceId },
+    resource: { type: 'device', id: finalDeviceId },
+    outcome: 'success',
+    details: { deviceType },
+  });
 
   sendToClient(ws, {
     type: 'register',
@@ -217,32 +348,40 @@ async function handleRegister(
       userId,
       deviceId: finalDeviceId,
       user: {
-        id: user.id,
-        username: user.username,
-        display_name: user.display_name,
-        avatar_url: user.avatar_url,
+        id: userProfile.id,
+        username: userProfile.username,
+        display_name: userProfile.display_name,
+        avatar_url: userProfile.avatar_url,
       },
     },
   });
 
-  console.log(`User ${userId} registered with device ${finalDeviceId}`);
+  clientLogger.info('User registered');
   return client;
 }
 
 /**
+ * Extended call initiate data with idempotency key.
+ */
+interface CallInitiateDataWithIdempotency extends CallInitiateData {
+  idempotencyKey?: string;
+}
+
+/**
  * Handles call initiation from a caller to one or more callees.
+ * Implements idempotency to prevent duplicate call creation.
  * Creates call record in database, stores state in Redis,
  * rings all callee devices, and sets a 30-second ring timeout.
  *
  * @param client - The caller's connected client
- * @param message - Message containing calleeIds and callType
+ * @param message - Message containing calleeIds, callType, and optional idempotencyKey
  */
 async function handleCallInitiate(
   client: ConnectedClient,
   message: WebSocketMessage
 ): Promise<void> {
-  const data = message.data as CallInitiateData;
-  const { calleeIds, callType } = data;
+  const data = message.data as CallInitiateDataWithIdempotency;
+  const { calleeIds, callType, idempotencyKey } = data;
 
   if (!calleeIds || calleeIds.length === 0) {
     sendToClient(client.ws, {
@@ -252,22 +391,71 @@ async function handleCallInitiate(
     return;
   }
 
+  // Check idempotency - prevent duplicate call creation
+  if (idempotencyKey) {
+    const idempotencyResult = await checkIdempotencyKey(idempotencyKey);
+    if (idempotencyResult.isDuplicate && idempotencyResult.existingCallId) {
+      client.log.info(
+        { idempotencyKey, existingCallId: idempotencyResult.existingCallId },
+        'Duplicate call initiation prevented'
+      );
+
+      // Return existing call instead of creating duplicate
+      sendToClient(client.ws, {
+        type: 'call_initiate',
+        callId: idempotencyResult.existingCallId,
+        data: {
+          success: true,
+          calleeIds,
+          callType,
+          deduplicated: true,
+        },
+      });
+      return;
+    }
+  }
+
   const callId = uuidv4();
   const isGroup = calleeIds.length > 1;
+  const callCreatedAt = Date.now();
 
-  // Create call in database
-  await query(
-    `INSERT INTO calls (id, initiator_id, call_type, state, max_participants, created_at)
-     VALUES ($1, $2, $3, 'ringing', $4, NOW())`,
-    [callId, client.userId, isGroup ? 'group' : callType, calleeIds.length + 1]
-  );
+  // Track call creation time for setup latency
+  callCreationTimes.set(callId, callCreatedAt);
 
-  // Add initiator as participant
-  await query(
-    `INSERT INTO call_participants (call_id, user_id, device_id, state, is_initiator, joined_at)
-     VALUES ($1, $2, $3, 'connected', true, NOW())`,
-    [callId, client.userId, client.deviceId]
-  );
+  // Store idempotency key BEFORE creating call (for crash safety)
+  if (idempotencyKey) {
+    await storeIdempotencyKey(idempotencyKey, callId);
+  }
+
+  try {
+    // Create call in database with circuit breaker
+    await withCircuitBreaker(
+      'db-call-create',
+      async () => query(
+        `INSERT INTO calls (id, initiator_id, call_type, state, max_participants, created_at)
+         VALUES ($1, $2, $3, 'ringing', $4, NOW())`,
+        [callId, client.userId, isGroup ? 'group' : callType, calleeIds.length + 1]
+      )
+    );
+
+    // Add initiator as participant
+    await withCircuitBreaker(
+      'db-participant-add',
+      async () => query(
+        `INSERT INTO call_participants (call_id, user_id, device_id, state, is_initiator, joined_at)
+         VALUES ($1, $2, $3, 'connected', true, NOW())`,
+        [callId, client.userId, client.deviceId]
+      )
+    );
+  } catch (error) {
+    client.log.error({ error, callId }, 'Failed to create call in database');
+    signalingErrors.inc({ error_type: 'db_error' });
+    sendToClient(client.ws, {
+      type: 'error',
+      data: { message: 'Failed to create call' },
+    });
+    return;
+  }
 
   // Store call state in Redis
   await setCallState(callId, {
@@ -278,14 +466,53 @@ async function handleCallInitiate(
     callType,
     state: 'ringing',
     participants: [{ userId: client.userId, deviceId: client.deviceId }],
-    createdAt: Date.now(),
+    createdAt: callCreatedAt,
   });
 
-  // Get caller info
-  const caller = await queryOne<User>(
-    'SELECT id, username, display_name, avatar_url FROM users WHERE id = $1',
-    [client.userId]
-  );
+  // Track metrics
+  callsInitiated.inc({ call_type: isGroup ? 'group' : callType });
+  activeCalls.inc({ call_type: isGroup ? 'group' : callType });
+
+  // Log call event
+  logCallEvent(callId, 'initiated', {
+    initiator: client.userId,
+    participants: calleeIds.length,
+    callType,
+    idempotencyKey,
+  });
+
+  // Audit log
+  logAudit({
+    timestamp: new Date().toISOString(),
+    action: 'call.initiated',
+    actor: { userId: client.userId, deviceId: client.deviceId },
+    resource: { type: 'call', id: callId },
+    outcome: 'success',
+    details: { callType, calleeIds, isGroup },
+  });
+
+  // Get caller info from cache
+  const cachedCaller = await getCachedUserProfile(client.userId);
+  let caller: UserProfile | null = cachedCaller ? {
+    id: cachedCaller.id,
+    username: cachedCaller.username,
+    display_name: cachedCaller.display_name,
+    avatar_url: cachedCaller.avatar_url,
+  } : null;
+  if (!caller) {
+    const dbCaller = await queryOne<User>(
+      'SELECT id, username, display_name, avatar_url FROM users WHERE id = $1',
+      [client.userId]
+    );
+    if (dbCaller) {
+      caller = {
+        id: dbCaller.id,
+        username: dbCaller.username,
+        display_name: dbCaller.display_name,
+        avatar_url: dbCaller.avatar_url,
+      };
+    }
+  }
 
   // Ring all callees
   for (const calleeId of calleeIds) {
@@ -306,12 +533,7 @@ async function handleCallInitiate(
             type: 'call_ring',
             callId,
             data: {
-              caller: {
-                id: caller?.id,
-                username: caller?.username,
-                display_name: caller?.display_name,
-                avatar_url: caller?.avatar_url,
-              },
+              caller: caller || { id: client.userId },
               callType,
               isGroup,
             },
@@ -377,7 +599,18 @@ async function handleCallAnswer(
     ringTimeouts.delete(callId);
   }
 
-  // Update call state
+  // Calculate setup latency
+  const createdAt = callCreationTimes.get(callId);
+  if (createdAt) {
+    const setupLatencySeconds = (Date.now() - createdAt) / 1000;
+    callSetupLatency.observe(
+      { call_type: callState.callType as string },
+      setupLatencySeconds
+    );
+    callCreationTimes.delete(callId);
+  }
+
+  // Update call state in database
   await query(
     `UPDATE calls SET state = 'connected', started_at = NOW() WHERE id = $1`,
     [callId]
@@ -399,6 +632,25 @@ async function handleCallAnswer(
     state: 'connected',
     participants,
     answeredAt: Date.now(),
+  });
+
+  // Track metrics
+  callsAnswered.inc({ call_type: callState.callType as string });
+
+  // Log call event
+  logCallEvent(callId, 'answered', {
+    answeredBy: client.userId,
+    deviceId: client.deviceId,
+    ringDurationMs: createdAt ? Date.now() - createdAt : undefined,
+  });
+
+  // Audit log
+  logAudit({
+    timestamp: new Date().toISOString(),
+    action: 'call.answered',
+    actor: { userId: client.userId, deviceId: client.deviceId },
+    resource: { type: 'call', id: callId },
+    outcome: 'success',
   });
 
   // Stop ringing on other devices of the same user
@@ -470,6 +722,11 @@ async function handleCallDecline(
     [callId, client.userId]
   );
 
+  // Log call event
+  logCallEvent(callId, 'declined', {
+    declinedBy: client.userId,
+  });
+
   // Check if all callees declined
   const calleeIds = callState.calleeIds as string[];
   const remainingCallees = await query<{ user_id: string; state: string }>(
@@ -517,6 +774,7 @@ async function handleCallEnd(
 
   if (!callId) return;
 
+  client.log.info({ callId }, 'Call end requested');
   await endCall(callId, 'ended');
 }
 
@@ -539,6 +797,9 @@ async function endCall(callId: string, reason: string): Promise<void> {
     ringTimeouts.delete(callId);
   }
 
+  // Clean up creation time tracking
+  callCreationTimes.delete(callId);
+
   // Calculate duration
   const startedAt = callState.answeredAt as number | undefined;
   const duration = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
@@ -554,8 +815,33 @@ async function endCall(callId: string, reason: string): Promise<void> {
     [callId]
   );
 
+  // Track metrics
+  const callType = callState.callType as string;
+  callsEnded.inc({ call_type: callType, reason });
+  activeCalls.dec({ call_type: callType });
+
+  if (duration > 0) {
+    callDuration.observe({ call_type: callType }, duration);
+  }
+
+  // Log call event
+  logCallEvent(callId, 'ended', {
+    reason,
+    duration,
+    callType,
+  });
+
+  // Audit log
+  logAudit({
+    timestamp: new Date().toISOString(),
+    action: 'call.ended',
+    actor: { userId: callState.initiatorId as string },
+    resource: { type: 'call', id: callId },
+    outcome: 'success',
+    details: { reason, duration },
+  });
+
   // Notify all participants
-  const participants = callState.participants as { userId: string; deviceId: string }[];
   const calleeIds = callState.calleeIds as string[];
   const allUserIds = new Set([callState.initiatorId as string, ...calleeIds]);
 
@@ -589,7 +875,8 @@ async function handleRingTimeout(callId: string): Promise<void> {
   const callState = await getCallState(callId);
   if (!callState || callState.state !== 'ringing') return;
 
-  console.log(`Call ${callId} ring timeout`);
+  logger.info({ callId }, 'Call ring timeout');
+  logCallEvent(callId, 'missed', { reason: 'ring_timeout' });
   await endCall(callId, 'missed');
 }
 
@@ -597,6 +884,8 @@ async function handleRingTimeout(callId: string): Promise<void> {
  * Forwards WebRTC signaling messages between call participants.
  * Routes offer, answer, and ICE candidate messages to enable
  * peer-to-peer connection establishment.
+ *
+ * ICE candidates are deduplicated to handle network retries.
  *
  * @param client - The sender's connected client
  * @param message - The signaling message to forward
@@ -611,6 +900,22 @@ async function handleSignaling(
 
   const callState = await getCallState(callId);
   if (!callState) return;
+
+  // Deduplicate ICE candidates
+  if (type === 'ice_candidate' && data) {
+    const candidateData = data as { candidate?: string };
+    if (candidateData.candidate) {
+      const hash = generateICECandidateHash(callId, client.deviceId, candidateData.candidate);
+      const isNew = await checkICECandidateDedup(callId, hash);
+      if (!isNew) {
+        // Duplicate candidate, skip forwarding
+        return;
+      }
+    }
+  }
+
+  // Log signaling event
+  logSignalingEvent(callId, type, client.userId);
 
   // Forward signaling message to other participants
   const participants = callState.participants as { userId: string; deviceId: string }[];
@@ -657,13 +962,21 @@ async function handleDisconnect(clientId: string, client: ConnectedClient): Prom
   }
 
   // Update Redis presence
-  await setUserOffline(client.userId, client.deviceId);
+  await Promise.all([
+    setUserOffline(client.userId, client.deviceId),
+    removePresence(client.userId, client.deviceId),
+  ]);
 
-  // Update device in database
-  await query(
-    `UPDATE user_devices SET is_active = false, last_seen = NOW() WHERE id = $1`,
-    [client.deviceId]
-  );
+  // Update device in database (fire-and-forget with circuit breaker)
+  withCircuitBreaker(
+    'db-device-offline',
+    async () => query(
+      `UPDATE user_devices SET is_active = false, last_seen = NOW() WHERE id = $1`,
+      [client.deviceId]
+    )
+  ).catch((err) => client.log.error({ err }, 'Failed to update device offline status'));
+
+  client.log.info('Client disconnected and cleaned up');
 }
 
 /**

@@ -3,46 +3,67 @@ import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { requireAuth } from '../middleware/auth.js';
 import { fanoutTweet } from '../services/fanout.js';
+import logger from '../shared/logger.js';
+import { tweetIdempotencyMiddleware } from '../shared/idempotency.js';
+import {
+  tweetCounter,
+  tweetCreationDuration,
+} from '../shared/metrics.js';
 
 const router = express.Router();
 
+// Apply idempotency middleware to tweet creation
+const tweetIdempotency = tweetIdempotencyMiddleware(redis);
+
 // Helper to extract hashtags and mentions from content
 function extractHashtagsAndMentions(content) {
-  const hashtags = content.match(/#\w+/g)?.map(h => h.toLowerCase().slice(1)) || [];
-  const mentionUsernames = content.match(/@\w+/g)?.map(m => m.toLowerCase().slice(1)) || [];
+  const hashtags = content.match(/#\w+/g)?.map((h) => h.toLowerCase().slice(1)) || [];
+  const mentionUsernames = content.match(/@\w+/g)?.map((m) => m.toLowerCase().slice(1)) || [];
   return { hashtags, mentionUsernames };
 }
 
 // POST /api/tweets - Create a new tweet
-router.post('/', requireAuth, async (req, res, next) => {
+router.post('/', requireAuth, tweetIdempotency, async (req, res, next) => {
+  const startTime = Date.now();
+  const tweetLog = logger.child({
+    requestId: req.requestId,
+    userId: req.session.userId,
+    idempotencyKey: req.idempotencyKey,
+  });
+
   try {
     const { content, mediaUrls, replyTo, quoteOf } = req.body;
     const authorId = req.session.userId;
 
     if (!content || content.trim().length === 0) {
+      tweetCounter.inc({ status: 'validation_error' });
       return res.status(400).json({ error: 'Tweet content is required' });
     }
 
     if (content.length > 280) {
+      tweetCounter.inc({ status: 'validation_error' });
       return res.status(400).json({ error: 'Tweet content must be 280 characters or less' });
     }
 
     const { hashtags, mentionUsernames } = extractHashtagsAndMentions(content);
+
+    tweetLog.debug({ hashtags, mentionUsernames }, 'Extracted hashtags and mentions');
 
     // Resolve mentions to user IDs
     let mentions = [];
     if (mentionUsernames.length > 0) {
       const mentionResult = await pool.query(
         'SELECT id FROM users WHERE username = ANY($1)',
-        [mentionUsernames]
+        [mentionUsernames],
       );
-      mentions = mentionResult.rows.map(r => r.id);
+      mentions = mentionResult.rows.map((r) => r.id);
     }
 
     // Validate replyTo tweet exists
     if (replyTo) {
       const replyCheck = await pool.query('SELECT id FROM tweets WHERE id = $1', [replyTo]);
       if (replyCheck.rows.length === 0) {
+        tweetCounter.inc({ status: 'validation_error' });
         return res.status(400).json({ error: 'Reply-to tweet not found' });
       }
     }
@@ -51,6 +72,7 @@ router.post('/', requireAuth, async (req, res, next) => {
     if (quoteOf) {
       const quoteCheck = await pool.query('SELECT id FROM tweets WHERE id = $1', [quoteOf]);
       if (quoteCheck.rows.length === 0) {
+        tweetCounter.inc({ status: 'validation_error' });
         return res.status(400).json({ error: 'Quote tweet not found' });
       }
     }
@@ -60,16 +82,18 @@ router.post('/', requireAuth, async (req, res, next) => {
       `INSERT INTO tweets (author_id, content, media_urls, hashtags, mentions, reply_to, quote_of)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [authorId, content.trim(), mediaUrls || [], hashtags, mentions, replyTo || null, quoteOf || null]
+      [authorId, content.trim(), mediaUrls || [], hashtags, mentions, replyTo || null, quoteOf || null],
     );
 
     const tweet = result.rows[0];
+
+    tweetLog.info({ tweetId: tweet.id }, 'Tweet created');
 
     // Record hashtag activity for trending
     for (const hashtag of hashtags) {
       await pool.query(
         'INSERT INTO hashtag_activity (hashtag, tweet_id) VALUES ($1, $2)',
-        [hashtag, tweet.id]
+        [hashtag, tweet.id],
       );
       // Increment Redis trend counter (sliding window)
       const bucket = Math.floor(Date.now() / 1000 / 60); // 1-minute bucket
@@ -77,15 +101,23 @@ router.post('/', requireAuth, async (req, res, next) => {
       await redis.expire(`trend:${hashtag}:${bucket}`, 3600); // 1 hour expiry
     }
 
-    // Fanout tweet to followers' timelines
-    await fanoutTweet(tweet.id, authorId);
+    // Fanout tweet to followers' timelines (async, non-blocking)
+    // We don't await this to avoid blocking the response
+    fanoutTweet(tweet.id, authorId).catch((err) => {
+      tweetLog.error({ error: err.message, tweetId: tweet.id }, 'Fanout error (non-blocking)');
+    });
 
     // Get author info for response
     const authorResult = await pool.query(
       'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
-      [authorId]
+      [authorId],
     );
     const author = authorResult.rows[0];
+
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    tweetCounter.inc({ status: 'success' });
+    tweetCreationDuration.observe({ status: 'success' }, duration);
 
     res.status(201).json({
       tweet: {
@@ -111,6 +143,11 @@ router.post('/', requireAuth, async (req, res, next) => {
       },
     });
   } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    tweetCounter.inc({ status: 'error' });
+    tweetCreationDuration.observe({ status: 'error' }, duration);
+
+    tweetLog.error({ error: error.message }, 'Tweet creation failed');
     next(error);
   }
 });
@@ -126,7 +163,7 @@ router.get('/:id', async (req, res, next) => {
        FROM tweets t
        JOIN users u ON t.author_id = u.id
        WHERE t.id = $1 AND t.is_deleted = false`,
-      [tweetId]
+      [tweetId],
     );
 
     if (result.rows.length === 0) {
@@ -141,13 +178,13 @@ router.get('/:id', async (req, res, next) => {
     if (req.session && req.session.userId) {
       const likeCheck = await pool.query(
         'SELECT 1 FROM likes WHERE user_id = $1 AND tweet_id = $2',
-        [req.session.userId, tweetId]
+        [req.session.userId, tweetId],
       );
       isLiked = likeCheck.rows.length > 0;
 
       const retweetCheck = await pool.query(
         'SELECT 1 FROM retweets WHERE user_id = $1 AND tweet_id = $2',
-        [req.session.userId, tweetId]
+        [req.session.userId, tweetId],
       );
       isRetweeted = retweetCheck.rows.length > 0;
     }
@@ -160,7 +197,7 @@ router.get('/:id', async (req, res, next) => {
          FROM tweets t
          JOIN users u ON t.author_id = u.id
          WHERE t.id = $1`,
-        [tweet.retweet_of]
+        [tweet.retweet_of],
       );
       if (originalResult.rows.length > 0) {
         const orig = originalResult.rows[0];
@@ -186,7 +223,7 @@ router.get('/:id', async (req, res, next) => {
          FROM tweets t
          JOIN users u ON t.author_id = u.id
          WHERE t.id = $1`,
-        [tweet.quote_of]
+        [tweet.quote_of],
       );
       if (quotedResult.rows.length > 0) {
         const quoted = quotedResult.rows[0];
@@ -235,8 +272,14 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /api/tweets/:id - Delete a tweet
+// DELETE /api/tweets/:id - Delete a tweet (soft delete)
 router.delete('/:id', requireAuth, async (req, res, next) => {
+  const deleteLog = logger.child({
+    requestId: req.requestId,
+    userId: req.session.userId,
+    tweetId: req.params.id,
+  });
+
   try {
     const tweetId = req.params.id;
     const userId = req.session.userId;
@@ -244,7 +287,7 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
     // Check if tweet exists and belongs to user
     const tweetCheck = await pool.query(
       'SELECT author_id FROM tweets WHERE id = $1',
-      [tweetId]
+      [tweetId],
     );
 
     if (tweetCheck.rows.length === 0) {
@@ -252,17 +295,21 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
     }
 
     if (tweetCheck.rows[0].author_id !== userId && req.session.role !== 'admin') {
+      deleteLog.warn('Unauthorized delete attempt');
       return res.status(403).json({ error: 'Not authorized to delete this tweet' });
     }
 
-    // Soft delete the tweet
+    // Soft delete the tweet with timestamp
     await pool.query(
-      'UPDATE tweets SET is_deleted = true WHERE id = $1',
-      [tweetId]
+      'UPDATE tweets SET is_deleted = true, deleted_at = NOW() WHERE id = $1',
+      [tweetId],
     );
+
+    deleteLog.info('Tweet soft deleted');
 
     res.json({ message: 'Tweet deleted successfully' });
   } catch (error) {
+    deleteLog.error({ error: error.message }, 'Tweet deletion failed');
     next(error);
   }
 });
@@ -282,7 +329,7 @@ router.post('/:id/like', requireAuth, async (req, res, next) => {
     // Check if already liked
     const likeCheck = await pool.query(
       'SELECT 1 FROM likes WHERE user_id = $1 AND tweet_id = $2',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     if (likeCheck.rows.length > 0) {
@@ -292,13 +339,13 @@ router.post('/:id/like', requireAuth, async (req, res, next) => {
     // Create like
     await pool.query(
       'INSERT INTO likes (user_id, tweet_id) VALUES ($1, $2)',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     // Get updated like count
     const countResult = await pool.query(
       'SELECT like_count FROM tweets WHERE id = $1',
-      [tweetId]
+      [tweetId],
     );
 
     res.status(201).json({
@@ -318,7 +365,7 @@ router.delete('/:id/like', requireAuth, async (req, res, next) => {
 
     const result = await pool.query(
       'DELETE FROM likes WHERE user_id = $1 AND tweet_id = $2 RETURNING *',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     if (result.rowCount === 0) {
@@ -328,7 +375,7 @@ router.delete('/:id/like', requireAuth, async (req, res, next) => {
     // Get updated like count
     const countResult = await pool.query(
       'SELECT like_count FROM tweets WHERE id = $1',
-      [tweetId]
+      [tweetId],
     );
 
     res.json({
@@ -342,6 +389,12 @@ router.delete('/:id/like', requireAuth, async (req, res, next) => {
 
 // POST /api/tweets/:id/retweet - Retweet a tweet
 router.post('/:id/retweet', requireAuth, async (req, res, next) => {
+  const retweetLog = logger.child({
+    requestId: req.requestId,
+    userId: req.session.userId,
+    tweetId: req.params.id,
+  });
+
   try {
     const tweetId = req.params.id;
     const userId = req.session.userId;
@@ -355,7 +408,7 @@ router.post('/:id/retweet', requireAuth, async (req, res, next) => {
     // Check if already retweeted
     const retweetCheck = await pool.query(
       'SELECT 1 FROM retweets WHERE user_id = $1 AND tweet_id = $2',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     if (retweetCheck.rows.length > 0) {
@@ -365,7 +418,7 @@ router.post('/:id/retweet', requireAuth, async (req, res, next) => {
     // Create retweet record
     await pool.query(
       'INSERT INTO retweets (user_id, tweet_id) VALUES ($1, $2)',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     // Create a retweet tweet entry
@@ -373,18 +426,22 @@ router.post('/:id/retweet', requireAuth, async (req, res, next) => {
       `INSERT INTO tweets (author_id, content, retweet_of)
        VALUES ($1, '', $2)
        RETURNING *`,
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     const retweet = retweetResult.rows[0];
 
-    // Fanout retweet to followers
-    await fanoutTweet(retweet.id, userId);
+    retweetLog.info({ retweetId: retweet.id }, 'Retweet created');
+
+    // Fanout retweet to followers (async, non-blocking)
+    fanoutTweet(retweet.id, userId).catch((err) => {
+      retweetLog.error({ error: err.message }, 'Retweet fanout error (non-blocking)');
+    });
 
     // Get updated retweet count
     const countResult = await pool.query(
       'SELECT retweet_count FROM tweets WHERE id = $1',
-      [tweetId]
+      [tweetId],
     );
 
     res.status(201).json({
@@ -392,6 +449,7 @@ router.post('/:id/retweet', requireAuth, async (req, res, next) => {
       retweetCount: countResult.rows[0].retweet_count,
     });
   } catch (error) {
+    retweetLog.error({ error: error.message }, 'Retweet failed');
     next(error);
   }
 });
@@ -405,7 +463,7 @@ router.delete('/:id/retweet', requireAuth, async (req, res, next) => {
     // Delete retweet record
     const result = await pool.query(
       'DELETE FROM retweets WHERE user_id = $1 AND tweet_id = $2 RETURNING *',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     if (result.rowCount === 0) {
@@ -415,13 +473,13 @@ router.delete('/:id/retweet', requireAuth, async (req, res, next) => {
     // Delete the retweet tweet entry
     await pool.query(
       'DELETE FROM tweets WHERE author_id = $1 AND retweet_of = $2',
-      [userId, tweetId]
+      [userId, tweetId],
     );
 
     // Get updated retweet count
     const countResult = await pool.query(
       'SELECT retweet_count FROM tweets WHERE id = $1',
-      [tweetId]
+      [tweetId],
     );
 
     res.json({
@@ -447,35 +505,35 @@ router.get('/:id/replies', async (req, res, next) => {
        WHERE t.reply_to = $1 AND t.is_deleted = false
        ORDER BY t.created_at ASC
        LIMIT $2 OFFSET $3`,
-      [tweetId, limit, offset]
+      [tweetId, limit, offset],
     );
 
     // Get like/retweet status for current user
     let likeStatus = {};
     let retweetStatus = {};
     if (req.session && req.session.userId) {
-      const tweetIds = result.rows.map(t => t.id);
+      const tweetIds = result.rows.map((t) => t.id);
       if (tweetIds.length > 0) {
         const likeCheck = await pool.query(
           'SELECT tweet_id FROM likes WHERE user_id = $1 AND tweet_id = ANY($2)',
-          [req.session.userId, tweetIds]
+          [req.session.userId, tweetIds],
         );
-        likeCheck.rows.forEach(row => {
+        likeCheck.rows.forEach((row) => {
           likeStatus[row.tweet_id] = true;
         });
 
         const retweetCheck = await pool.query(
           'SELECT tweet_id FROM retweets WHERE user_id = $1 AND tweet_id = ANY($2)',
-          [req.session.userId, tweetIds]
+          [req.session.userId, tweetIds],
         );
-        retweetCheck.rows.forEach(row => {
+        retweetCheck.rows.forEach((row) => {
           retweetStatus[row.tweet_id] = true;
         });
       }
     }
 
     res.json({
-      tweets: result.rows.map(tweet => ({
+      tweets: result.rows.map((tweet) => ({
         id: tweet.id.toString(),
         content: tweet.content,
         mediaUrls: tweet.media_urls,

@@ -1,7 +1,6 @@
 import { pool } from './index.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from '../shared/logger.js';
 
 /**
@@ -10,8 +9,11 @@ import { logger } from '../shared/logger.js';
  * Supports up (apply) and down (rollback) migrations.
  */
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Get the migrations directory relative to current working directory
+// This works with tsx which runs from the backend directory
+function getMigrationsDir(): string {
+  return path.join(process.cwd(), 'src', 'db', 'migrations');
+}
 
 /**
  * Creates the schema_migrations table if it doesn't exist.
@@ -43,7 +45,7 @@ async function getAppliedMigrations(): Promise<Set<number>> {
  * Down migrations should be named: NNN_description.down.sql
  */
 function getMigrationFiles(direction: 'up' | 'down' = 'up'): string[] {
-  const migrationsDir = path.join(__dirname, 'migrations');
+  const migrationsDir = getMigrationsDir();
 
   if (!fs.existsSync(migrationsDir)) {
     logger.warn('Migrations directory does not exist');
@@ -85,7 +87,7 @@ export async function migrateUp(targetVersion?: number): Promise<void> {
 
   const applied = await getAppliedMigrations();
   const migrationFiles = getMigrationFiles('up');
-  const migrationsDir = path.join(__dirname, 'migrations');
+  const migrationsDir = getMigrationsDir();
 
   let appliedCount = 0;
 
@@ -139,7 +141,7 @@ export async function migrateDown(targetVersion?: number): Promise<void> {
 
   const applied = await getAppliedMigrations();
   const migrationFiles = getMigrationFiles('down');
-  const migrationsDir = path.join(__dirname, 'migrations');
+  const migrationsDir = getMigrationsDir();
 
   if (applied.size === 0) {
     logger.info('No migrations to roll back');

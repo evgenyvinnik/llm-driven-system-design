@@ -40,16 +40,16 @@ const STATE_VALUES = {
  * @param options - Optional overrides for circuit breaker configuration
  * @returns Circuit breaker instance wrapping the function
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
-  fn: T,
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
+  fn: (...args: TArgs) => Promise<TResult>,
   name: string,
   options?: Partial<CircuitBreaker.Options>
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
+): CircuitBreaker<TArgs, TResult> {
   const breaker = new CircuitBreaker(fn, {
     ...DEFAULT_OPTIONS,
     ...options,
     name,
-  });
+  }) as CircuitBreaker<TArgs, TResult>;
 
   // Set initial state metric
   circuitBreakerState.labels(name).set(STATE_VALUES.closed);

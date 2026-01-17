@@ -5,6 +5,10 @@
  */
 
 import { Pool, PoolClient } from 'pg';
+import { logger, logHelpers } from '../shared/logger.js';
+import { dbMetrics } from '../shared/metrics.js';
+
+const log = logger.child({ service: 'database' });
 
 /**
  * PostgreSQL connection pool configured from environment variables.
@@ -23,8 +27,22 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
+  log.error({ error: err.message }, 'Unexpected error on idle client');
+  dbMetrics.errors.inc({ operation: 'idle', error_type: 'unexpected_error' });
 });
+
+pool.on('connect', () => {
+  log.debug('New database client connected');
+});
+
+/**
+ * Updates pool size metrics for monitoring
+ */
+function updatePoolMetrics(): void {
+  dbMetrics.poolSize.set({ state: 'total' }, pool.totalCount);
+  dbMetrics.poolSize.set({ state: 'idle' }, pool.idleCount);
+  dbMetrics.poolSize.set({ state: 'waiting' }, pool.waitingCount);
+}
 
 /**
  * Executes a parameterized SQL query and returns typed results.
@@ -37,10 +55,53 @@ pool.on('error', (err) => {
  */
 export async function query<T = unknown>(text: string, params?: unknown[]): Promise<T[]> {
   const start = Date.now();
-  const result = await pool.query(text, params);
-  const duration = Date.now() - start;
-  console.log('Executed query', { text: text.substring(0, 100), duration, rows: result.rowCount });
-  return result.rows as T[];
+  const operation = extractOperation(text);
+  const table = extractTable(text);
+
+  try {
+    const result = await pool.query(text, params);
+    const duration = Date.now() - start;
+    const durationSeconds = duration / 1000;
+
+    // Update metrics
+    dbMetrics.queryLatency.observe({ operation, table }, durationSeconds);
+    updatePoolMetrics();
+
+    // Log query execution
+    logHelpers.queryExecuted(log, text, duration, result.rowCount);
+
+    return result.rows as T[];
+  } catch (error) {
+    const duration = Date.now() - start;
+    log.error({ error, query: text.substring(0, 100), duration }, 'Query failed');
+    dbMetrics.errors.inc({ operation, error_type: 'query_error' });
+    throw error;
+  }
+}
+
+/**
+ * Extracts the SQL operation type from a query string
+ */
+function extractOperation(query: string): string {
+  const normalized = query.trim().toUpperCase();
+  if (normalized.startsWith('SELECT')) return 'select';
+  if (normalized.startsWith('INSERT')) return 'insert';
+  if (normalized.startsWith('UPDATE')) return 'update';
+  if (normalized.startsWith('DELETE')) return 'delete';
+  return 'other';
+}
+
+/**
+ * Extracts the table name from a query string (best effort)
+ */
+function extractTable(query: string): string {
+  const normalized = query.toLowerCase();
+
+  // Match FROM table or INTO table
+  const fromMatch = normalized.match(/(?:from|into|update)\s+(\w+)/);
+  if (fromMatch) return fromMatch[1];
+
+  return 'unknown';
 }
 
 /**
@@ -85,11 +146,16 @@ export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Pr
  * @returns True if connection succeeds, false otherwise
  */
 export async function testConnection(): Promise<boolean> {
+  const start = Date.now();
   try {
     await pool.query('SELECT NOW()');
+    const duration = (Date.now() - start) / 1000;
+    dbMetrics.queryLatency.observe({ operation: 'select', table: 'health' }, duration);
+    updatePoolMetrics();
     return true;
   } catch (error) {
-    console.error('Database connection failed:', error);
+    log.error({ error }, 'Database connection failed');
+    dbMetrics.errors.inc({ operation: 'health', error_type: 'connection_error' });
     return false;
   }
 }

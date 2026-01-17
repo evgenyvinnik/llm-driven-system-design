@@ -17,9 +17,19 @@ vi.mock('../shared/db.js', () => ({
 vi.mock('../shared/storage.js', () => ({
   uploadDrawing: vi.fn().mockResolvedValue('drawings/test-id.json'),
   ensureBuckets: vi.fn().mockResolvedValue(undefined),
+  minioClient: {
+    bucketExists: vi.fn().mockResolvedValue(true),
+  },
+  DRAWINGS_BUCKET: 'drawings',
 }))
 
 vi.mock('../shared/cache.js', () => ({
+  redis: {
+    get: vi.fn().mockResolvedValue(null),
+    setex: vi.fn().mockResolvedValue('OK'),
+    del: vi.fn().mockResolvedValue(1),
+    ping: vi.fn().mockResolvedValue('PONG'),
+  },
   cacheGet: vi.fn().mockResolvedValue(null),
   cacheSet: vi.fn().mockResolvedValue(undefined),
   cacheDelete: vi.fn().mockResolvedValue(undefined),
@@ -29,6 +39,74 @@ vi.mock('../shared/cache.js', () => ({
     userStats: (sessionId: string) => `user:stats:${sessionId}`,
     drawing: (id: string) => `drawing:${id}`,
   },
+}))
+
+// Mock circuit breakers to pass through
+vi.mock('../shared/circuitBreaker.js', () => ({
+  minioCircuitBreaker: {
+    execute: vi.fn().mockImplementation(async (fn: () => Promise<unknown>) => fn()),
+    getStatus: vi.fn().mockReturnValue({ name: 'minio', state: 'closed', failures: 0, lastFailureTime: null }),
+  },
+  postgresCircuitBreaker: {
+    execute: vi.fn().mockImplementation(async (fn: () => Promise<unknown>) => fn()),
+    getStatus: vi.fn().mockReturnValue({ name: 'postgres', state: 'closed', failures: 0, lastFailureTime: null }),
+  },
+  rabbitCircuitBreaker: {
+    execute: vi.fn().mockImplementation(async (fn: () => Promise<unknown>) => fn()),
+    getStatus: vi.fn().mockReturnValue({ name: 'rabbitmq', state: 'closed', failures: 0, lastFailureTime: null }),
+  },
+  CircuitBreakerOpenError: class CircuitBreakerOpenError extends Error {
+    constructor(message: string, public circuitName: string, public retryAfterMs: number) {
+      super(message)
+      this.name = 'CircuitBreakerOpenError'
+    }
+  },
+  getAllCircuitBreakerStatus: vi.fn().mockReturnValue([
+    { name: 'minio', state: 'closed', failures: 0, lastFailureTime: null },
+    { name: 'postgres', state: 'closed', failures: 0, lastFailureTime: null },
+    { name: 'rabbitmq', state: 'closed', failures: 0, lastFailureTime: null },
+  ]),
+}))
+
+// Mock retry to pass through immediately
+vi.mock('../shared/retry.js', () => ({
+  withRetry: vi.fn().mockImplementation(async (fn: () => Promise<unknown>) => {
+    const result = await fn()
+    return { result, attempts: 1, totalTimeMs: 1 }
+  }),
+  RetryPresets: {
+    minio: { maxRetries: 4, initialDelayMs: 100 },
+    postgres: { maxRetries: 3, initialDelayMs: 50 },
+    rabbitmq: { maxRetries: 5, initialDelayMs: 500 },
+  },
+}))
+
+// Mock metrics to no-op
+vi.mock('../shared/metrics.js', () => ({
+  metricsMiddleware: vi.fn().mockReturnValue((_req: unknown, _res: unknown, next: () => void) => next()),
+  metricsHandler: vi.fn().mockImplementation((_req: unknown, res: { send: (s: string) => void }) => res.send('# metrics')),
+  drawingsTotal: {
+    labels: vi.fn().mockReturnValue({ inc: vi.fn() }),
+  },
+  drawingProcessingDuration: {
+    labels: vi.fn().mockReturnValue({ observe: vi.fn() }),
+  },
+  trackExternalCall: vi.fn().mockImplementation(async (_service: string, _op: string, fn: () => Promise<unknown>) => fn()),
+}))
+
+// Mock health check router
+vi.mock('../shared/healthCheck.js', () => ({
+  healthCheckRouter: vi.fn().mockReturnValue((req: { path: string }, res: { json: (data: unknown) => void }, next: () => void) => {
+    if (req.path === '/health') {
+      res.json({ status: 'ok', service: 'collection' })
+    } else if (req.path === '/health/live') {
+      res.json({ status: 'alive', service: 'collection' })
+    } else if (req.path === '/health/ready') {
+      res.json({ status: 'ready', service: 'collection' })
+    } else {
+      next()
+    }
+  }),
 }))
 
 // Import after mocking

@@ -1064,6 +1064,260 @@ app.get('/live', (req, res) => {
 
 ---
 
+## Implementation Notes
+
+This section explains the reasoning behind key implementation decisions in the codebase.
+
+### Why Idempotency Prevents Duplicate Tweets on Retry
+
+**The Problem**: Network failures are inevitable. When a user clicks "Tweet" and experiences a timeout:
+- Did the server receive and process the request?
+- Did the server crash before persisting the tweet?
+- Did the response get lost on the way back?
+
+The user doesn't know, so they click "Tweet" again. Without idempotency, this creates duplicate tweets.
+
+**The Solution**: The client generates a unique idempotency key (UUID) and sends it with the request:
+
+```javascript
+// Client sends:
+POST /api/tweets
+Headers: Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+Body: { content: "Hello world!" }
+```
+
+The server workflow:
+1. Check Redis for the idempotency key
+2. If found: return the cached response (request already processed)
+3. If not found: process the request, cache the response with 24-hour TTL
+
+**Why This Works**:
+- **Same key = same outcome**: Retries with the same key are idempotent
+- **User context isolation**: Keys are scoped to user ID, preventing cross-user conflicts
+- **TTL-based cleanup**: 24-hour TTL balances storage vs protection window
+- **Graceful degradation**: On Redis failure, we allow potential duplicates rather than blocking all requests
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/idempotency.js`
+
+### Why Circuit Breakers Protect the Timeline Service During Fanout Storms
+
+**The Problem**: When a popular user tweets, the fanout service must write to potentially millions of follower timelines. If Redis becomes slow or unresponsive:
+- Fanout operations queue up, consuming memory
+- Request threads block, reducing capacity for other requests
+- Timeouts cascade, causing user-facing latency spikes
+- Retry storms amplify the load when Redis partially recovers
+
+**The Solution**: Circuit breakers act like electrical fuses:
+
+```
+CLOSED (normal) --[failures exceed threshold]--> OPEN (fail fast)
+     ^                                              |
+     |                                              v
+     +--[success after reset timeout]------ HALF_OPEN (testing)
+```
+
+When the circuit is OPEN:
+- Requests fail immediately without waiting for timeout
+- Failed fanouts are queued for later retry
+- System resources are preserved for healthy paths
+- Users still get their tweets created (fanout happens async)
+
+**Why This Works**:
+- **Fail fast**: OPEN circuit returns immediately, freeing resources
+- **Graceful degradation**: Tweet creation succeeds; fanout catches up later
+- **Automatic recovery**: HALF_OPEN state tests if service recovered
+- **Fallback behavior**: Failed fanouts queue in Redis for background processing
+
+**Configuration**:
+```javascript
+// Fanout circuit breaker settings
+{
+  timeout: 30000,           // 30 second timeout for bulk operations
+  errorThresholdPercentage: 60,  // Trip after 60% failures
+  resetTimeout: 60000,      // Try again after 1 minute
+  volumeThreshold: 5,       // Minimum requests before tripping
+}
+```
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/circuitBreaker.js`
+
+### Why Retention Policies Balance Storage Costs vs User Experience
+
+**The Problem**: Every tweet, timeline entry, and trend bucket consumes storage. At scale:
+- PostgreSQL storage costs increase with tweet volume
+- Redis memory is expensive (in-memory pricing)
+- Old data provides diminishing value to users
+- Compliance may require keeping or deleting specific data
+
+**The Solution**: Define retention policies that balance these concerns:
+
+| Data Type | Retention | Rationale |
+|-----------|-----------|-----------|
+| Active tweets | Forever | Core user content, never auto-delete |
+| Soft-deleted tweets | 30 days | Allow recovery, then hard delete |
+| Timeline cache | 7 days | Users rarely scroll beyond a week |
+| Trend buckets | 2 hours | Trends are about recency, not history |
+| Idempotency keys | 24 hours | Protect against same-day retries |
+| Hashtag activity | 90 days | Historical trend analysis |
+
+**Why These Numbers**:
+- **30-day soft delete**: Gives users time to request recovery (GDPR considerations)
+- **7-day timeline cache**: Covers typical user behavior while limiting Redis memory
+- **2-hour trend buckets**: Trends should be "what's happening now", not yesterday
+- **24-hour idempotency**: Covers retry scenarios without infinite storage
+
+**Storage Savings Calculation** (hypothetical 1M users):
+```
+Without retention:
+- Timeline cache: 1M users * 800 tweets * 8 bytes = 6.4 GB Redis
+
+With 7-day TTL:
+- Only active users have data in Redis
+- Inactive users auto-expire
+- Typical: 10% active = 640 MB Redis
+```
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/retention.js`
+
+### Why Health Checks Enable Zero-Downtime Deployments
+
+**The Problem**: During deployment, we need to:
+1. Start new instances without dropping traffic
+2. Drain old instances gracefully
+3. Detect unhealthy instances before routing traffic
+4. Recover from dependency failures
+
+**The Solution**: Three-tier health check strategy:
+
+| Endpoint | Purpose | Used By |
+|----------|---------|---------|
+| `/live` | Is the process alive? | Process manager (systemd, PM2) |
+| `/ready` | Can it accept traffic? | Load balancer |
+| `/health` | Detailed status | Monitoring, debugging |
+
+**Liveness Probe** (`/live`):
+```javascript
+app.get('/live', (req, res) => {
+  res.status(200).send('alive');
+});
+```
+- Always returns 200 if the process is running
+- Process manager restarts if this fails
+- No dependency checks (avoids false positives)
+
+**Readiness Probe** (`/ready`):
+```javascript
+app.get('/ready', async (req, res) => {
+  await pool.query('SELECT 1');  // Check PostgreSQL
+  await redis.ping();            // Check Redis
+  res.status(200).send('ready');
+});
+```
+- Returns 200 only if dependencies are healthy
+- Load balancer removes instance from rotation if 503
+- Instance can recover and re-enter rotation
+
+**Zero-Downtime Deployment Flow**:
+```
+1. Start new instance (green)
+2. Wait for /ready to return 200
+3. Load balancer adds green to rotation
+4. Drain old instance (blue):
+   - Stop sending new requests
+   - Wait for in-flight requests to complete (graceful shutdown)
+5. Terminate blue instance
+```
+
+**Graceful Shutdown**:
+```javascript
+const gracefulShutdown = async (signal) => {
+  server.close(async () => {
+    await pool.end();     // Close DB connections
+    await redis.quit();   // Close Redis connection
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 30000);  // Force after 30s
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+```
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/index.js`
+
+### Why Structured Logging with Pino
+
+**The Problem**: `console.log` debugging doesn't scale:
+- No machine-parseable format for log aggregation
+- No log levels for filtering in production
+- No context (request ID, user ID) for tracing
+- Performance overhead from string concatenation
+
+**The Solution**: Structured JSON logging with Pino:
+
+```javascript
+logger.info({
+  requestId: 'abc-123',
+  userId: 42,
+  tweetId: 12345,
+  durationMs: 45,
+}, 'Tweet created successfully');
+```
+
+Output:
+```json
+{
+  "level": 30,
+  "time": "2024-01-15T10:30:00.000Z",
+  "requestId": "abc-123",
+  "userId": 42,
+  "tweetId": 12345,
+  "durationMs": 45,
+  "msg": "Tweet created successfully"
+}
+```
+
+**Why Pino**:
+- **Fastest**: 10x faster than Winston/Bunyan
+- **JSON by default**: Machine-readable for ELK, Datadog
+- **Pretty print in dev**: Human-readable during development
+- **Child loggers**: Attach context once, use everywhere
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/logger.js`
+
+### Why Prometheus Metrics for Observability
+
+**The Problem**: Without metrics, you're flying blind:
+- Is latency increasing gradually before users notice?
+- Are certain endpoints failing more than others?
+- Is the fanout queue backing up?
+
+**The Solution**: Export Prometheus metrics on `/metrics`:
+
+```
+# HELP twitter_timeline_latency_seconds Home timeline fetch latency
+# TYPE twitter_timeline_latency_seconds histogram
+twitter_timeline_latency_seconds_bucket{timeline_type="home",cache_hit="true",le="0.1"} 950
+twitter_timeline_latency_seconds_bucket{timeline_type="home",cache_hit="false",le="0.1"} 200
+
+# HELP twitter_fanout_queue_depth Current depth of the fanout queue
+# TYPE twitter_fanout_queue_depth gauge
+twitter_fanout_queue_depth 0
+
+# HELP twitter_circuit_breaker_state Circuit breaker state: 0=closed, 1=half-open, 2=open
+# TYPE twitter_circuit_breaker_state gauge
+twitter_circuit_breaker_state{circuit_name="redis-fanout"} 0
+```
+
+**Key Metrics**:
+- **Tweet throughput**: Tweets created per second, error rate
+- **Timeline latency**: P50, P95, P99 by timeline type and cache hit
+- **Fanout queue depth**: Detect backup before it causes problems
+- **Circuit breaker state**: Know when protection is active
+
+**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/metrics.js`
+
+---
+
 ## Future Optimizations
 
 1. **GraphQL** for flexible client queries

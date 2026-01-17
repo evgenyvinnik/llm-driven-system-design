@@ -7,6 +7,7 @@
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { query, queryOne } from './database.js';
+import { logger } from '../shared/logger.js';
 import type { User, Session } from '../types/index.js';
 
 /** Number of bcrypt hashing rounds for password security. */
@@ -39,6 +40,7 @@ export class AuthService {
       );
 
       if (existing) {
+        logger.info({ username }, 'Registration failed: username already exists');
         return { success: false, error: 'Username already exists' };
       }
 
@@ -53,12 +55,14 @@ export class AuthService {
         [userId, username, passwordHash]
       );
 
+      logger.info({ userId, username }, 'User registered successfully');
+
       return {
         success: true,
         user: { id: userId, username, role: 'user' },
       };
     } catch (error) {
-      console.error('Registration error:', error);
+      logger.error({ error, username }, 'Registration error');
       return { success: false, error: 'Registration failed' };
     }
   }
@@ -85,11 +89,13 @@ export class AuthService {
       ]);
 
       if (!dbUser) {
+        logger.info({ username }, 'Login failed: user not found');
         return { success: false, error: 'Invalid credentials' };
       }
 
       const passwordValid = await bcrypt.compare(password, dbUser.password_hash);
       if (!passwordValid) {
+        logger.info({ username, userId: dbUser.id }, 'Login failed: invalid password');
         return { success: false, error: 'Invalid credentials' };
       }
 
@@ -103,13 +109,15 @@ export class AuthService {
         [sessionId, dbUser.id, expiresAt]
       );
 
+      logger.info({ userId: dbUser.id, username }, 'User logged in successfully');
+
       return {
         success: true,
         session: { id: sessionId, userId: dbUser.id, expiresAt },
         user: { id: dbUser.id, username: dbUser.username, role: dbUser.role },
       };
     } catch (error) {
-      console.error('Login error:', error);
+      logger.error({ error, username }, 'Login error');
       return { success: false, error: 'Login failed' };
     }
   }
@@ -143,6 +151,7 @@ export class AuthService {
       if (new Date() > result.expires_at) {
         // Session expired, delete it
         await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
+        logger.debug({ sessionId }, 'Session expired and deleted');
         return null;
       }
 
@@ -152,7 +161,7 @@ export class AuthService {
         role: result.role,
       };
     } catch (error) {
-      console.error('Session validation error:', error);
+      logger.error({ error, sessionId }, 'Session validation error');
       return null;
     }
   }
@@ -164,6 +173,7 @@ export class AuthService {
    */
   async logout(sessionId: string): Promise<void> {
     await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
+    logger.debug({ sessionId }, 'User logged out');
   }
 
   /**
@@ -191,6 +201,8 @@ export class AuthService {
        VALUES ($1, $2, $3)`,
       [sessionId, userId, expiresAt]
     );
+
+    logger.info({ userId, username }, 'Anonymous user created');
 
     return {
       user: { id: userId, username, role: 'user' },

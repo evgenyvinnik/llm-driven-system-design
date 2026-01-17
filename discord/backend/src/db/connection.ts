@@ -3,14 +3,25 @@
  *
  * Provides a PostgreSQL connection pool for the Baby Discord application.
  * Uses the pg library with connection pooling for efficient database access.
- * The pool is configured via DATABASE_URL environment variable or defaults
- * to local development settings.
+ * The pool is configured via environment variables or the shared config module.
  */
 
 import pg from 'pg';
-import { logger } from '../utils/logger.js';
+import { database } from '../shared/config.js';
 
 const { Pool } = pg;
+
+// Lazy logger initialization to avoid circular dependencies
+let logger: any = null;
+function getLogger() {
+  if (!logger) {
+    // Dynamic import to break circular dependency
+    import('../utils/logger.js').then((mod) => {
+      logger = mod.dbLogger || mod.logger;
+    });
+  }
+  return logger;
+}
 
 /**
  * PostgreSQL connection pool instance.
@@ -20,20 +31,26 @@ const { Pool } = pg;
  * - connectionTimeoutMillis: 2s (fast failure on connection issues)
  */
 const pool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ||
-    'postgresql://discord:discord@localhost:5432/babydiscord',
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionString: database.url,
+  max: database.poolMax,
+  idleTimeoutMillis: database.idleTimeout,
+  connectionTimeoutMillis: database.connectionTimeout,
 });
 
 pool.on('error', (err) => {
-  logger.error('Unexpected error on idle database client', err);
+  const log = getLogger();
+  if (log) {
+    log.error({ err }, 'Unexpected error on idle database client');
+  } else {
+    console.error('Unexpected error on idle database client', err);
+  }
 });
 
 pool.on('connect', () => {
-  logger.debug('New database connection established');
+  const log = getLogger();
+  if (log) {
+    log.debug('New database connection established');
+  }
 });
 
 /**

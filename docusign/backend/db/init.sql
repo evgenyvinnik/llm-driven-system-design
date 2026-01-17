@@ -140,6 +140,17 @@ CREATE TABLE templates (
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Idempotency keys for preventing duplicate operations
+-- Critical for legal document signing to prevent double-signing
+CREATE TABLE idempotency_keys (
+  key VARCHAR(255) PRIMARY KEY,
+  response JSONB NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Index for cleaning up old idempotency keys
+CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
+
 -- Indexes
 CREATE INDEX idx_envelopes_sender ON envelopes(sender_id);
 CREATE INDEX idx_envelopes_status ON envelopes(status);

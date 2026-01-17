@@ -892,3 +892,233 @@ volumes:
 | Key rotation | 15 minutes | Hourly | Privacy vs. battery |
 | Anti-stalking | Proactive alerts | Manual check | Safety |
 | Precision | UWB | BLE only | Accuracy |
+
+---
+
+## Implementation Notes
+
+This section documents the backend implementation improvements and explains **WHY** each change makes the system more reliable, observable, and scalable.
+
+### 1. Structured Logging with Pino
+
+**What**: Replaced `console.log` with Pino structured JSON logging.
+
+**Why This Improves the System**:
+
+1. **Log Aggregation**: JSON logs are machine-parseable, enabling ingestion into ELK Stack, Splunk, or CloudWatch Logs. This allows searching across all server instances with a single query like `component:locationService AND level:error`.
+
+2. **Request Correlation**: Each request gets a unique ID (`req.id`) that flows through all log entries. When investigating an issue, you can filter by request ID to see the complete request lifecycle across services.
+
+3. **Performance**: Pino is 5x faster than Winston/Bunyan because it uses asynchronous I/O and avoids expensive string interpolation. In a high-throughput system processing 100k+ location reports/minute, logging overhead matters.
+
+4. **Context Propagation**: Child loggers inherit parent context, so a log entry from `locationService` automatically includes `component: "locationService"` without manual annotation.
+
+**Files**: `src/shared/logger.ts`, `src/index.ts`
+
+```typescript
+// Before (hard to search, no context)
+console.error('Submit report error:', error);
+
+// After (structured, searchable, with context)
+log.error(
+  { error, identifierHash: data.identifier_hash },
+  'Failed to submit location report'
+);
+```
+
+---
+
+### 2. Prometheus Metrics for Observability
+
+**What**: Added Prometheus metrics collection with a `/metrics` endpoint.
+
+**Why This Improves the System**:
+
+1. **SLO Monitoring**: Track the four golden signals (latency, traffic, errors, saturation). Example alert: "P99 latency > 200ms for 5 minutes" triggers before users notice degradation.
+
+2. **Capacity Planning**: `location_reports_total` counter shows ingestion rate over time. If reports increase 10x during a product launch, you know to scale before saturation.
+
+3. **Cache Efficiency**: `cache_operations_total{result="hit|miss"}` reveals cache hit rate. If hit rate drops below 80%, investigate TTL settings or cache invalidation bugs.
+
+4. **Rate Limit Tuning**: `rate_limit_hits_total` shows how often limits are hit per endpoint. If auth limits trigger frequently, either increase limits or investigate credential stuffing attacks.
+
+5. **Database Performance**: `db_query_duration_seconds` histogram with percentiles identifies slow queries. A query with P99 > 100ms is a candidate for indexing.
+
+**Files**: `src/shared/metrics.ts`, `src/index.ts`
+
+**Key Metrics**:
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds` | Histogram | Latency SLOs, percentile tracking |
+| `location_reports_total` | Counter | Ingestion throughput, regional breakdown |
+| `cache_operations_total` | Counter | Cache efficiency (hit/miss ratio) |
+| `db_query_duration_seconds` | Histogram | Slow query detection |
+| `rate_limit_hits_total` | Counter | Abuse detection, limit tuning |
+
+---
+
+### 3. Redis Caching with Cache-Aside Pattern
+
+**What**: Added Redis caching for location queries and device lookups.
+
+**Why This Improves the System**:
+
+1. **Read Scalability**: Location queries involve: (1) device lookup, (2) identifier hash generation for time range, (3) report query, (4) decryption. Caching the final result eliminates all four steps for repeated queries.
+
+2. **Latency Reduction**: Cache hit: ~1ms. Database query + decryption: ~50-200ms. For a user refreshing the map every 30 seconds, caching provides 50x latency improvement.
+
+3. **Database Protection**: During "lost device" scenarios, users may refresh obsessively. Cache absorbs this traffic, protecting PostgreSQL from connection exhaustion.
+
+4. **TTL Alignment**: Cache TTL (15 minutes) matches key rotation period. This ensures cached data expires around the same time new reports become available, balancing freshness vs. efficiency.
+
+**Files**: `src/shared/cache.ts`, `src/services/locationService.ts`
+
+**Cache Strategy**:
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Location Query │────▶│   Redis Check   │────▶│  PostgreSQL     │
+│                 │     │   (1ms RTT)     │     │  (50-200ms)     │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+         │                      │                       │
+         │     Cache HIT        │                       │
+         │◀─────────────────────│                       │
+         │                      │      Cache MISS       │
+         │◀─────────────────────┼───────────────────────│
+         │                      │                       │
+         │                      │  Populate cache       │
+         │                      │◀──────────────────────│
+```
+
+---
+
+### 4. Idempotency for Location Report Submissions
+
+**What**: Added idempotency layer using Redis to prevent duplicate location reports.
+
+**Why This Improves the System**:
+
+1. **Network Reliability**: Mobile devices on cellular networks experience packet loss. Clients retry failed requests, potentially creating duplicate reports. Idempotency ensures retries are safe.
+
+2. **At-Least-Once Delivery**: When we add RabbitMQ for async processing, message redelivery is expected. Idempotent handlers ensure reports are processed exactly once.
+
+3. **Replay Attack Prevention**: An attacker capturing a location report cannot replay it after 7 days (timestamp validation) or within 24 hours (duplicate detection).
+
+4. **Consistent Responses**: Duplicate requests return the same response (same `report_id`), maintaining client-side invariants.
+
+**Files**: `src/shared/idempotency.ts`, `src/services/locationService.ts`
+
+**Idempotency Key Generation**:
+```typescript
+// Key = hash(identifier + timestamp_rounded + payload_hash)
+// - Timestamp rounded to minute: handles clock drift
+// - Payload hash: catches identical content
+const idempotencyKey = generateIdempotencyKey(
+  data.identifier_hash,
+  timestamp,
+  data.encrypted_payload
+);
+```
+
+---
+
+### 5. Rate Limiting for API Protection
+
+**What**: Added Redis-backed rate limiting with different limits per endpoint.
+
+**Why This Improves the System**:
+
+1. **DoS Mitigation**: Without rate limits, a single client can exhaust database connections or CPU. Rate limits bound the damage from malicious or buggy clients.
+
+2. **Fair Usage**: In a crowd-sourced network, one device shouldn't consume all server capacity. Rate limits ensure all devices get fair access.
+
+3. **Brute Force Prevention**: Auth endpoint limit (10/min) makes password brute-forcing impractical. At 10 attempts/minute, testing 1000 passwords takes 100 minutes.
+
+4. **Cost Control**: Each API request has a cost (compute, database, bandwidth). Rate limits prevent runaway costs from misconfigured clients or scrapers.
+
+5. **Distributed Enforcement**: Redis-backed limits work across multiple server instances. A client can't bypass limits by hitting different servers.
+
+**Files**: `src/shared/rateLimit.ts`, `src/index.ts`
+
+**Rate Limit Tiers**:
+| Endpoint | Limit | Rationale |
+|----------|-------|-----------|
+| Location Reports | 100/min | High throughput for crowd-sourced ingestion |
+| Location Queries | 60/min | Normal user refresh rate (~1/min per device) |
+| Authentication | 10/min | Prevent brute force attacks |
+| Device Registration | 20/min | Setup-only, prevents device farming |
+| Admin | 20/min | Sensitive operations, should be infrequent |
+
+---
+
+### 6. Comprehensive Health Checks
+
+**What**: Added `/health/ready` endpoint that checks PostgreSQL and Redis connectivity.
+
+**Why This Improves the System**:
+
+1. **Kubernetes Integration**: Readiness probes determine if a pod should receive traffic. If Redis is down, the pod is marked unhealthy and removed from the load balancer.
+
+2. **Rolling Deployments**: During deploys, new pods only receive traffic after dependencies are ready. This prevents 503 errors during startup.
+
+3. **Graceful Degradation**: The health check reports "degraded" status if some (but not all) checks fail. This allows traffic to continue while alerting operators.
+
+4. **Dependency Monitoring**: Health checks provide latency measurements for each dependency. Slow Redis response (>10ms) may indicate network issues or memory pressure.
+
+**Files**: `src/shared/health.ts`, `src/index.ts`
+
+**Health Check Endpoints**:
+| Endpoint | Type | Use Case |
+|----------|------|----------|
+| `/health` | Shallow | Kubernetes liveness probe |
+| `/health/live` | Shallow | Alias for liveness |
+| `/health/ready` | Deep | Kubernetes readiness probe |
+| `/metrics` | N/A | Prometheus scraping |
+
+---
+
+### 7. Shared Module Architecture
+
+**What**: Organized infrastructure code into `src/shared/` with a barrel export.
+
+**Why This Improves the System**:
+
+1. **Separation of Concerns**: Business logic (services) is separate from infrastructure (logging, caching, metrics). Services import what they need from `shared/index.js`.
+
+2. **Testability**: Shared modules can be mocked in unit tests. Services don't need real Redis or Prometheus connections during testing.
+
+3. **Reusability**: When adding new services (e.g., anti-stalking worker), they import the same infrastructure. Consistent logging, metrics, and caching across all services.
+
+4. **Configuration Centralization**: Cache TTLs, rate limits, and log levels are defined in one place. Changing a TTL affects all consumers.
+
+**Directory Structure**:
+```
+src/shared/
+├── index.ts       # Barrel export for all shared modules
+├── logger.ts      # Pino structured logging
+├── metrics.ts     # Prometheus metrics
+├── cache.ts       # Redis caching with cache-aside
+├── idempotency.ts # Duplicate request prevention
+├── rateLimit.ts   # Rate limiting middleware
+└── health.ts      # Health check endpoints
+```
+
+---
+
+### Summary: Before vs. After
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Logging | `console.log` (unstructured) | Pino JSON (structured, searchable) |
+| Metrics | None | Prometheus (latency, throughput, errors) |
+| Caching | None | Redis cache-aside (15-min TTL) |
+| Idempotency | None | Redis-based duplicate detection (24h window) |
+| Rate Limiting | None | Redis-backed, per-endpoint limits |
+| Health Checks | Basic `/health` | Dependency-aware `/health/ready` |
+| Error Handling | Generic 500 | Structured logging with context |
+
+These changes transform the backend from a simple CRUD server into a production-ready service that can:
+- Scale horizontally behind a load balancer
+- Survive dependency failures gracefully
+- Be monitored and alerted on via Grafana dashboards
+- Handle network retries and duplicate submissions safely
+- Protect itself from abuse and misconfigured clients

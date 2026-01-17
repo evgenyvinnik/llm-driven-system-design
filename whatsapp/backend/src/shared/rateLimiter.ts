@@ -110,7 +110,7 @@ export function createRateLimiter(options: {
       },
       init: () => {},
     },
-    keyGenerator: options.keyGenerator || ((req) => req.session?.userId || req.ip),
+    keyGenerator: options.keyGenerator || ((req) => req.session?.userId || req.ip || 'unknown'),
     skip: (req) => {
       // Skip rate limiting for health checks
       return req.path === '/health' || req.path === '/metrics';

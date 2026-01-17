@@ -1,4 +1,4 @@
-import pg from 'pg';
+import pg, { type QueryResultRow } from 'pg';
 import type { User, Document, DocumentSnapshot, OperationRecord, OperationData } from '../types/index.js';
 
 const { Pool } = pg;
@@ -36,8 +36,8 @@ export const db = {
    * @param params - Array of parameter values
    * @returns The query result
    */
-  async query<T = unknown>(text: string, params?: unknown[]): Promise<pg.QueryResult<T>> {
-    return pool.query(text, params);
+  async query<T extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]): Promise<pg.QueryResult<T>> {
+    return pool.query<T>(text, params);
   },
 
   /**

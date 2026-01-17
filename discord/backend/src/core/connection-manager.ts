@@ -64,12 +64,7 @@ export class ConnectionManager {
     }
     this.userIdToSessions.get(userId)!.add(sessionId);
 
-    logger.info('Session connected', {
-      sessionId,
-      userId,
-      nickname,
-      transport,
-    });
+    logger.info({ sessionId, userId, nickname, transport }, 'Session connected');
 
     return session;
   }
@@ -96,11 +91,7 @@ export class ConnectionManager {
       }
     }
 
-    logger.info('Session disconnected', {
-      sessionId,
-      userId: session.userId,
-      nickname: session.nickname,
-    });
+    logger.info({ sessionId, userId: session.userId, nickname: session.nickname }, 'Session disconnected');
 
     return session;
   }

@@ -10,7 +10,10 @@
     "dev:server2": "PORT=3002 node --watch src/index.js",
     "dev:server3": "PORT=3003 node --watch src/index.js",
     "start": "node src/index.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "db:migrate": "node src/db/migrate.js migrate",
+    "db:migrate:status": "node src/db/migrate.js status",
+    "db:migrate:rollback": "node src/db/migrate.js rollback"
   },
   "dependencies": {
     "cors": "^2.8.5",

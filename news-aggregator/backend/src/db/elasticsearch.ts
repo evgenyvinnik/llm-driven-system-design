@@ -1,11 +1,12 @@
 import { Client } from '@elastic/elasticsearch';
+import { config } from '../shared/config.js';
 
 /**
  * Elasticsearch client for full-text search capabilities.
  * Enables fast, relevance-ranked searching across articles and stories.
  */
 export const esClient = new Client({
-  node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200',
+  node: config.elasticsearch.url,
 });
 
 /**
@@ -213,7 +214,7 @@ export async function searchArticles(
   });
 
   return result.hits.hits.map((hit) => ({
-    id: hit._id,
+    id: hit._id!,
     score: hit._score || 0,
   }));
 }

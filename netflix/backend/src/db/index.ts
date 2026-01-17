@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { DB_CONFIG } from '../config.js';
 
 /**
@@ -65,7 +65,7 @@ export async function queryOne<T>(text: string, params?: unknown[]): Promise<T |
  * @returns Promise resolving to the callback's return value
  */
 export async function transaction<T>(
-  callback: (client: ReturnType<typeof pool.connect> extends Promise<infer C> ? C : never) => Promise<T>
+  callback: (client: PoolClient) => Promise<T>
 ): Promise<T> {
   const client = await pool.connect();
   try {

@@ -1,0 +1,30 @@
+# Prometheus configuration for Notion clone
+# This file is used when running with the observability profile:
+# docker-compose --profile observability up -d
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Scrape the Notion API server(s)
+  - job_name: 'notion-api'
+    static_configs:
+      # When running locally, use host.docker.internal
+      # When running in Docker network, use service names
+      - targets: ['host.docker.internal:3001']
+        labels:
+          instance: 'server1'
+      - targets: ['host.docker.internal:3002']
+        labels:
+          instance: 'server2'
+      - targets: ['host.docker.internal:3003']
+        labels:
+          instance: 'server3'
+    metrics_path: /metrics
+    scrape_timeout: 10s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

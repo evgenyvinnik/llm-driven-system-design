@@ -293,7 +293,7 @@ export class FrontierService {
     const delaySeconds = Math.ceil(delayMs / 1000);
 
     // Try to acquire lock with NX (only if not exists) and EX (expiry)
-    const result = await redis.set(lockKey, workerId, 'NX', 'EX', delaySeconds);
+    const result = await redis.set(lockKey, workerId, 'EX', delaySeconds, 'NX');
 
     return result === 'OK';
   }

@@ -619,10 +619,193 @@ watch -n 30 'redis-cli INFO memory | grep used_memory_human'
 
 ## Future Optimizations
 
-- [ ] Add Prometheus + Grafana for monitoring
+- [x] Add Prometheus + Grafana for monitoring (Prometheus metrics implemented)
 - [ ] Implement surge pricing based on demand/supply
 - [ ] Add multi-stop route optimization (TSP)
 - [ ] Machine learning for demand prediction
 - [ ] Implement push notifications
 - [ ] Add payment integration (Stripe)
 - [ ] Performance testing with k6 or Artillery
+
+## Implementation Notes
+
+This section documents the rationale behind key operational features implemented in the codebase.
+
+### WHY Idempotency Prevents Duplicate Orders and Charges
+
+**Problem:** Network failures during order placement create a critical risk. If a customer submits an order, the server processes it successfully, but the response is lost due to a network timeout, the client will retry. Without idempotency protection, this retry creates a duplicate order and potentially a double charge.
+
+**Solution:** The idempotency service (`src/shared/idempotency.ts`) implements exactly-once semantics:
+
+```typescript
+// Client sends unique key with each order request
+const result = await withIdempotency(
+  req.headers['x-idempotency-key'],  // e.g., "ord-uuid-12345"
+  userId,
+  'create_order',
+  async () => createOrder(userId, orderData)
+);
+```
+
+**How it works:**
+1. Client generates a unique UUID before submitting the order
+2. Server checks `idempotency_keys` table for existing key
+3. If key exists with `status=completed`, return cached response (no duplicate)
+4. If key doesn't exist, create it with `status=pending`, execute order, update to `completed`
+5. If key exists with `status=pending`, another request is in progress (race condition protection)
+6. Keys expire after 24 hours to prevent unbounded table growth
+
+**Benefits:**
+- Zero duplicate orders on network retries
+- Zero double charges (payment would be part of the idempotent operation)
+- Safe for aggressive client retry policies
+- Audit trail of all order attempts
+
+**Implementation files:**
+- `/backend/src/shared/idempotency.ts` - Core idempotency logic
+- `/backend/src/routes/orders.ts` - Integration with order creation
+- `/backend/src/db/migrations/001_add_idempotency_keys.sql` - Database schema
+
+### WHY Delivery Retention Balances History vs Storage
+
+**Problem:** A delivery service generates massive amounts of data: orders, driver location history, offer records, ratings. Keeping everything forever leads to:
+- Unbounded database growth (100K orders/day = 36M orders/year)
+- Slower queries as tables grow
+- Higher infrastructure costs
+- Compliance risks (GDPR right to erasure)
+
+**Solution:** The retention service (`src/shared/retention.ts`) implements tiered data lifecycle:
+
+| Data Type | Hot (Fast Access) | Warm (Queryable) | Archive (Cold) | Delete |
+|-----------|-------------------|------------------|----------------|--------|
+| Orders | 30 days | 1 year | 7 years (MinIO) | After 7 years |
+| Driver locations | Current only | 7 days | 30 days aggregated | After 30 days |
+| Sessions | 24 hours | - | - | Auto-expire |
+| Idempotency keys | 24 hours | - | - | Daily cleanup |
+
+**Rationale by data type:**
+
+1. **Orders (30 days hot, 7 years archive)**
+   - Hot: Recent orders for customer support, refunds, disputes
+   - Archive: Legal compliance, financial auditing, fraud investigation
+   - 7 years: Standard financial record retention period
+
+2. **Driver location history (7 days hot, 30 days warm)**
+   - Hot: Route optimization analysis, ETA accuracy tuning
+   - Warm: Weekly aggregated analytics, driver performance review
+   - Delete: Individual GPS points have no long-term value after aggregation
+
+3. **Sessions (24 hours)**
+   - Functional requirement only (authentication)
+   - No business value in historical sessions
+   - Auto-expire via Redis TTL
+
+**Implementation files:**
+- `/backend/src/shared/retention.ts` - Cleanup jobs and policy management
+- `/backend/src/db/migrations/002_add_retention_policies.sql` - Configuration table
+
+### WHY Driver Metrics Enable Route Optimization
+
+**Problem:** Without visibility into driver behavior and delivery patterns, the system cannot:
+- Identify underperforming drivers
+- Optimize matching algorithm weights
+- Predict demand surges
+- Detect systematic issues (e.g., certain zones always have delayed deliveries)
+
+**Solution:** Prometheus metrics (`src/shared/metrics.ts`) track key driver and delivery KPIs:
+
+```typescript
+// Driver assignment metrics
+driverAssignmentsCounter.inc({ result: 'accepted' });  // or 'rejected', 'expired', 'no_driver'
+driverMatchingDurationHistogram.observe(duration);     // Time to find a driver
+offersPerAssignmentHistogram.observe(offerCount);      // Offers before acceptance
+
+// Delivery performance
+deliveryTimeHistogram.observe(deliverySeconds);        // Pickup to delivery time
+deliveryDistanceHistogram.observe(distanceKm);         // Delivery distance distribution
+```
+
+**How metrics enable optimization:**
+
+1. **Matching algorithm tuning:**
+   - If `offers_per_assignment` is consistently high, drivers are rejecting orders
+   - Analyze by zone to find areas with driver shortages
+   - Adjust scoring weights based on what actually predicts acceptance
+
+2. **Route optimization:**
+   - `delivery_time` histogram reveals slow zones (traffic, building access issues)
+   - `delivery_distance` distribution shows if matching prefers close drivers effectively
+   - Correlation with `vehicle_type` reveals which vehicles are optimal for which zones
+
+3. **Capacity planning:**
+   - `online_drivers` gauge by time-of-day shows driver availability patterns
+   - `driver_acceptance_rate` histogram identifies reliable vs. flaky drivers
+   - `active_orders` by status shows system throughput bottlenecks
+
+**Prometheus endpoint:** `GET /metrics` returns all metrics in Prometheus text format.
+
+**Implementation files:**
+- `/backend/src/shared/metrics.ts` - Metric definitions
+- `/backend/src/services/orderService.ts` - Driver matching metrics
+- `/backend/src/index.ts` - HTTP request metrics and `/metrics` endpoint
+
+### WHY Circuit Breakers Protect Matching Service
+
+**Problem:** The driver matching service depends on multiple external systems:
+- Redis for geo queries (finding nearby drivers)
+- PostgreSQL for driver details and offer records
+- Network I/O for each driver offer/response cycle
+
+If any dependency is slow or unavailable:
+- Matching requests pile up, consuming memory
+- Workers block waiting for timeouts
+- System becomes unresponsive to all requests
+- Cascading failure affects unrelated features
+
+**Solution:** Circuit breaker pattern (`src/shared/circuitBreaker.ts`) wraps the matching service:
+
+```typescript
+const driverMatchingCircuitBreaker = createCircuitBreaker(
+  'driver-matching',
+  async (orderId: string) => startDriverMatching(orderId),
+  {
+    timeout: 180000,              // 3 minutes per matching attempt
+    errorThresholdPercentage: 50, // Open after 50% failures
+    volumeThreshold: 3,           // Minimum 3 requests before tripping
+    resetTimeout: 30000,          // Try again after 30 seconds
+  }
+);
+```
+
+**Circuit breaker states:**
+
+1. **Closed (Normal):** All requests pass through. Failures are counted.
+2. **Open (Tripped):** All requests fail immediately with fallback. No matching attempted.
+3. **Half-Open (Testing):** One request allowed through to test recovery.
+
+**Fallback behavior:**
+```typescript
+driverMatchingCircuitBreaker.fallback(async (orderId: string) => {
+  // Order stays in 'pending' status
+  // Logged for manual intervention or retry queue
+  return false;
+});
+```
+
+**Why this matters:**
+
+1. **Fail fast:** Instead of waiting 3 minutes per order during an outage, orders fail in <1ms
+2. **System stability:** Other endpoints (order history, login) remain responsive
+3. **Auto-recovery:** Half-open state automatically tests when the matching service recovers
+4. **Observability:** Circuit state exposed in `/health` and Prometheus metrics
+
+**Circuit breaker metrics:**
+```typescript
+circuitBreakerState.set({ name: 'driver-matching' }, 1);  // 0=closed, 0.5=half-open, 1=open
+circuitBreakerEvents.inc({ name: 'driver-matching', event: 'open' });
+```
+
+**Implementation files:**
+- `/backend/src/shared/circuitBreaker.ts` - Generic circuit breaker factory
+- `/backend/src/services/orderService.ts` - Driver matching circuit breaker
+- `/backend/src/index.ts` - Health check includes circuit breaker status

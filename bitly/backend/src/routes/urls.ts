@@ -8,6 +8,8 @@ import {
   updateUrl,
   deleteUrl,
 } from '../services/urlService.js';
+import logger from '../utils/logger.js';
+import { urlShorteningTotal } from '../utils/metrics.js';
 
 /**
  * URL management router.
@@ -28,6 +30,7 @@ router.post(
     const { long_url, custom_code, expires_in } = req.body;
 
     if (!long_url) {
+      urlShorteningTotal.inc({ status: 'error' });
       res.status(400).json({ error: 'long_url is required' });
       return;
     }
@@ -40,9 +43,28 @@ router.post(
         user_id: req.user?.id,
       });
 
+      urlShorteningTotal.inc({ status: 'success' });
+      logger.info(
+        {
+          short_code: url.short_code,
+          user_id: req.user?.id,
+          is_custom: !!custom_code,
+        },
+        'URL created successfully'
+      );
+
       res.status(201).json(url);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to create URL';
+
+      // Track different error types
+      if (message.includes('already taken')) {
+        urlShorteningTotal.inc({ status: 'duplicate' });
+      } else {
+        urlShorteningTotal.inc({ status: 'error' });
+      }
+
+      logger.warn({ err: error, long_url: long_url.substring(0, 100) }, 'URL creation failed');
       res.status(400).json({ error: message });
     }
   })
@@ -110,6 +132,7 @@ router.patch(
       return;
     }
 
+    logger.info({ short_code: shortCode, user_id: req.user!.id }, 'URL updated');
     res.json(url);
   })
 );
@@ -132,6 +155,7 @@ router.delete(
       return;
     }
 
+    logger.info({ short_code: shortCode, user_id: req.user!.id }, 'URL deleted');
     res.status(204).send();
   })
 );

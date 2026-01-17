@@ -31,7 +31,7 @@ router.get('/channel/:channelId', requireAuth, requireWorkspace, async (req: Req
     const { before, limit = '50' } = req.query;
 
     // Verify channel access
-    const channelCheck = await query(
+    const channelCheck = await query<{ id: string; is_private: boolean }>(
       `SELECT c.id, c.is_private FROM channels c
        WHERE c.id = $1 AND c.workspace_id = $2`,
       [channelId, req.session.workspaceId]

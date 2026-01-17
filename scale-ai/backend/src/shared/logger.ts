@@ -6,6 +6,7 @@
  */
 
 import pino from 'pino'
+import { Request, Response, NextFunction } from 'express'
 
 /**
  * Log level from environment or default to 'info'.
@@ -67,44 +68,6 @@ export const logger = pino({
  */
 export function createChildLogger(context: Record<string, unknown>): pino.Logger {
   return logger.child(context)
-}
-
-/**
- * Express middleware for request logging.
- * Logs request start and completion with timing information.
- * Adds request ID to the logger context for correlation.
- */
-export function requestLogger() {
-  return (req: Express.Request, res: Express.Response, next: () => void) => {
-    const requestId = (req.headers['x-request-id'] as string) || generateRequestId()
-    const startTime = Date.now()
-
-    // Attach logger to request for use in handlers
-    ;(req as unknown as { log: pino.Logger }).log = createChildLogger({ requestId })
-
-    // Log request start
-    ;(req as unknown as { log: pino.Logger }).log.info({
-      msg: 'Request started',
-      method: (req as unknown as { method: string }).method,
-      path: (req as unknown as { path: string }).path,
-      ip: (req as unknown as { ip: string }).ip,
-    })
-
-    // Log on response finish
-    res.on('finish', () => {
-      const duration = Date.now() - startTime
-      const statusCode = (res as unknown as { statusCode: number }).statusCode
-      const level = statusCode >= 500 ? 'error' : statusCode >= 400 ? 'warn' : 'info'
-
-      ;(req as unknown as { log: pino.Logger }).log[level]({
-        msg: 'Request completed',
-        statusCode,
-        duration,
-      })
-    })
-
-    next()
-  }
 }
 
 /**

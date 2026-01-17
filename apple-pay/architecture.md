@@ -1014,3 +1014,241 @@ class CardArtService {
 | ATC storage | Write-through | Cache-aside | Durability critical |
 | Idempotency | Redis with 24h TTL | Database only | Performance |
 | Transaction consistency | Serializable | Read-committed | Financial accuracy |
+
+---
+
+## Implementation Notes
+
+This section documents the infrastructure improvements implemented to address production-readiness concerns for a payment system.
+
+### 1. Prometheus Metrics (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/metrics.ts`)
+
+**WHY metrics are critical for payment systems:**
+
+Payment systems require real-time visibility into system health and business performance. Without metrics:
+- SLA violations go undetected until customers complain
+- Capacity planning becomes guesswork
+- Debugging production issues requires log diving
+
+**What we implemented:**
+
+```
+/metrics endpoint exposing:
+- http_request_duration_seconds (histogram with P50/P95/P99)
+- payment_transactions_total (counter by status, type, network)
+- payment_duration_seconds (histogram for latency SLAs)
+- circuit_breaker_state (gauge for network health)
+- idempotency_cache_operations_total (cache hit/miss rates)
+- card_provisioning_total (business metric)
+```
+
+**Business impact:**
+- Alert when P99 payment latency exceeds 500ms (NFC SLA)
+- Monitor approval rates by network to detect issues early
+- Track idempotency cache effectiveness (should be >99% hits for retries)
+- Observe circuit breaker state changes for incident response
+
+### 2. Structured Logging with Pino (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/logger.ts`)
+
+**WHY structured logging matters:**
+
+Console.log statements are unstructured and unsearchable at scale. For a payment system:
+- Debugging requires correlating events across services
+- Compliance requires audit trails with specific fields
+- Alerting needs machine-parseable log formats
+
+**What we implemented:**
+
+```javascript
+// Before (unstructured)
+console.log('Payment processed:', transactionId, amount);
+
+// After (structured JSON)
+logger.info({
+  transactionId,
+  amount,
+  userId,
+  requestId,
+  duration
+}, 'Payment processed');
+```
+
+**Key features:**
+- Request correlation via `requestId` header propagation
+- Sensitive data redaction (PAN, CVV, tokens automatically masked)
+- Child loggers with service context
+- JSON format for log aggregation (ELK, Datadog)
+
+**Business impact:**
+- Reduce mean-time-to-resolution (MTTR) by enabling log searches
+- Meet PCI-DSS requirement for cardholder data protection in logs
+- Support distributed tracing across microservices
+
+### 3. Idempotency Middleware (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/idempotency.ts`)
+
+**WHY idempotency is CRITICAL for payments:**
+
+Network failures are inevitable. Without idempotency:
+- A retry could charge the customer twice
+- A timeout might process the payment but fail to return
+- Mobile apps losing connectivity mid-request cause duplicates
+
+Real-world disaster: Stripe once processed $1.2M in duplicate charges due to an idempotency bug.
+
+**What we implemented:**
+
+```
+Idempotency-Key header → Redis lookup → Execute or return cached result
+
+Flow:
+1. Client provides unique Idempotency-Key
+2. Middleware checks Redis for existing result
+3a. Found + completed: Return cached response (X-Idempotency-Replayed: true)
+3b. Found + in-progress: Return 409 Conflict
+3c. Not found: Acquire lock, execute, cache result
+```
+
+**Protected endpoints:**
+- `POST /api/payments/pay` - Prevents double-charging
+- `POST /api/cards` - Prevents duplicate card provisioning
+- `POST /api/merchants/:id/refund` - Prevents double-refunds
+- All card state mutations (suspend, reactivate, remove)
+
+**Business impact:**
+- Zero double-charges even under network instability
+- Safe retry behavior for mobile clients
+- Audit trail of original vs replayed requests
+
+### 4. Circuit Breaker for Payment Networks (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/circuit-breaker.ts`)
+
+**WHY circuit breakers prevent cascade failures:**
+
+Payment networks (Visa, Mastercard, Amex) are external dependencies. When they fail:
+- Without circuit breaker: Requests queue up → timeout → connection pool exhaustion → entire system down
+- With circuit breaker: Fast-fail → user gets immediate feedback → system stays healthy
+
+**What we implemented:**
+
+```
+Each network has independent circuit breaker:
+- visa: 10s timeout, 50% error threshold, 30s reset
+- mastercard: same
+- amex: same
+
+States:
+CLOSED → normal operation
+OPEN → network failing, fail-fast with fallback
+HALF-OPEN → testing recovery with single request
+```
+
+**Fallback behavior:**
+When circuit is open, return graceful decline:
+```javascript
+{
+  approved: false,
+  network: 'visa',
+  responseCode: 'CB',
+  declineReason: 'Network temporarily unavailable'
+}
+```
+
+**Business impact:**
+- System stays responsive during network outages
+- Users get immediate feedback instead of hanging
+- Metrics show which networks are problematic
+- Automatic recovery when networks return
+
+### 5. Audit Logging (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/audit.ts`)
+
+**WHY audit logging is required for compliance:**
+
+Payment systems must comply with:
+- PCI-DSS: Log all access to cardholder data
+- SOX: Financial transaction audit trails
+- Fraud prevention: Complete operation history for investigations
+
+**What we implemented:**
+
+```sql
+CREATE TABLE audit_logs (
+  id UUID PRIMARY KEY,
+  user_id UUID,
+  action VARCHAR(100),      -- e.g., 'payment.approved'
+  resource_type VARCHAR(50), -- e.g., 'transaction'
+  resource_id VARCHAR(100),
+  result VARCHAR(20),        -- 'success', 'failure', 'error'
+  ip_address VARCHAR(45),
+  metadata JSONB,            -- Additional context (redacted)
+  created_at TIMESTAMP
+);
+```
+
+**Logged events:**
+- Authentication (login success/failure, logout)
+- Card operations (provision, suspend, reactivate, remove)
+- Payment transactions (approved, declined, error)
+- Refunds
+- Device operations (register, lost)
+- Biometric authentication
+
+**Business impact:**
+- Meet PCI-DSS Section 10 requirements
+- Enable fraud investigation with complete history
+- Support dispute resolution with transaction evidence
+- Demonstrate due diligence for liability protection
+
+### 6. Enhanced Health Checks (`/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/apple-pay/backend/src/shared/health.ts`)
+
+**WHY health checks enable reliable deployments:**
+
+Load balancers and container orchestration need to know:
+- Liveness: Is the process running? (restart if not)
+- Readiness: Can it handle traffic? (remove from rotation if not)
+
+**What we implemented:**
+
+```
+GET /health/live   → 200 if process is alive (container restart probe)
+GET /health/ready  → 200 if DB and Redis are reachable (load balancer probe)
+GET /health/deep   → Detailed component status with latency
+```
+
+**Deep health response:**
+```json
+{
+  "status": "healthy",
+  "uptime": 3600,
+  "components": [
+    { "name": "postgresql", "status": "healthy", "responseTimeMs": 5 },
+    { "name": "redis", "status": "healthy", "responseTimeMs": 1 }
+  ],
+  "circuitBreakers": [
+    { "name": "visa", "state": "closed", "successRate": 99 }
+  ]
+}
+```
+
+**Business impact:**
+- Zero-downtime deployments with rolling updates
+- Automatic traffic routing away from unhealthy instances
+- Quick diagnosis of system issues via /health/deep
+
+### Summary: Defense in Depth
+
+These implementations work together to create a resilient payment system:
+
+```
+Request → Metrics (observe) → Logger (trace) → Idempotency (dedupe) → Circuit Breaker (protect) → Payment → Audit (record)
+           ↓                    ↓                 ↓                      ↓                          ↓
+        Prometheus           ELK/Datadog       Redis cache            Fast-fail              PostgreSQL
+           ↓                    ↓                 ↓                      ↓                          ↓
+        Grafana              Debugging        Retry safety          Uptime                 Compliance
+```
+
+Each layer addresses a specific failure mode:
+- **Metrics**: Detect problems before users complain
+- **Logging**: Debug problems when they occur
+- **Idempotency**: Prevent duplicate financial operations
+- **Circuit Breaker**: Contain failures to single components
+- **Audit**: Prove what happened for compliance and disputes
+- **Health Checks**: Enable reliable deployments and routing

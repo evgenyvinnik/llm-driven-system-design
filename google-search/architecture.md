@@ -1395,6 +1395,118 @@ backup_test_checklist:
 
 ---
 
+## Implementation Notes
+
+This section documents the rationale behind key observability, resilience, and performance features implemented in the backend.
+
+### Why Result Caching Reduces Index Load for Popular Queries
+
+Search queries follow a power-law distribution: a small percentage of queries account for a large percentage of total search volume. By caching search results in Redis:
+
+1. **Popular queries hit cache**: The top 20% of queries (by frequency) often account for 80% of search traffic. These queries are served from Redis (sub-millisecond) instead of hitting Elasticsearch.
+
+2. **Elasticsearch load reduction**: Each cached query avoids:
+   - Network round-trip to Elasticsearch cluster
+   - Query parsing and analysis
+   - Index segment reads and scoring
+   - Result aggregation and highlighting
+
+3. **Cost efficiency**: Elasticsearch cluster sizing can be based on unique query volume rather than total query volume. A 70% cache hit rate effectively reduces required ES capacity by 70%.
+
+4. **Freshness trade-off**: Cached results may be up to 5 minutes stale (configurable via `SEARCH_CACHE_TTL`). For most searches, slightly stale results are acceptable. Time-sensitive queries can bypass cache.
+
+**Implementation**: See `src/shared/rateLimiter.js` for Redis-backed caching and `src/services/search.js` for cache-aside pattern.
+
+### Why Rate Limiting Prevents Resource Exhaustion
+
+Rate limiting protects the search infrastructure from both malicious attacks and accidental overload:
+
+1. **Elasticsearch protection**: ES queries are expensive operations:
+   - Each query consumes CPU for scoring
+   - Memory for loading segments and building results
+   - Network bandwidth for cluster coordination
+   - Too many concurrent queries can cause GC pressure and cluster instability
+
+2. **Fair resource allocation**: Without rate limits, a single misbehaving client could:
+   - Exhaust connection pools
+   - Queue up requests causing latency spikes for all users
+   - Trigger circuit breakers affecting legitimate traffic
+
+3. **Defense in depth**: Multiple rate limit layers:
+   - Per-endpoint limits (search: 60/min, autocomplete: 120/min)
+   - Per-IP global limit (200/min total)
+   - Admin endpoints more restrictive (10/min)
+
+4. **Graceful degradation**: Rate-limited requests get 429 responses with `Retry-After` headers, allowing clients to back off gracefully.
+
+**Implementation**: See `src/shared/rateLimiter.js` using Redis for distributed rate limiting across multiple backend instances.
+
+### Why Circuit Breakers Protect Index Availability
+
+Circuit breakers prevent cascading failures when Elasticsearch or other dependencies are struggling:
+
+1. **Fail-fast pattern**: When ES is overloaded:
+   - Without circuit breaker: Requests queue up, timeout, retry, making overload worse
+   - With circuit breaker: After N failures, immediately reject new requests, letting ES recover
+
+2. **States explained**:
+   - **CLOSED** (normal): All requests pass through
+   - **OPEN** (failing): Requests fail immediately without hitting ES
+   - **HALF-OPEN** (testing): Allow limited requests to test if ES has recovered
+
+3. **Prevent cascade failures**:
+   - If indexing circuit breaker trips, search can still work
+   - Separate breakers for bulk indexing vs. single document operations
+   - Granular failure isolation
+
+4. **Metrics integration**: Circuit breaker state is exposed via Prometheus metrics:
+   - `search_circuit_breaker_state` (0=closed, 1=half_open, 2=open)
+   - `search_circuit_breaker_trips_total` (count of times breaker opened)
+
+**Implementation**: See `src/shared/circuitBreaker.js` using opossum library, integrated into `src/services/indexer.js`.
+
+### Why Query Metrics Enable Ranking Optimization
+
+Prometheus metrics on queries provide signals for improving search quality:
+
+1. **Latency analysis**:
+   - `search_query_latency_seconds` histogram with cache hit/miss labels
+   - Identify slow queries for index optimization
+   - Track p50/p95/p99 for SLO monitoring
+
+2. **Zero-result queries**:
+   - `search_query_results_count` histogram
+   - High zero-result rate indicates index gaps or query parsing issues
+   - Can drive crawl prioritization for missing content
+
+3. **Cache effectiveness**:
+   - `search_cache_hit_ratio` gauge
+   - Low hit rate may indicate TTL too short or query diversity too high
+   - High hit rate validates caching strategy
+
+4. **Query patterns**:
+   - Audit logs capture query text and result counts
+   - Enable analysis of popular queries for pre-warming cache
+   - Identify queries where ranking could be improved
+
+5. **Ranking feedback loop**:
+   - Track which queries return few results
+   - Correlate with user behavior (if click tracking added)
+   - Inform BM25 parameter tuning and boost factor adjustments
+
+**Implementation**: See `src/shared/metrics.js` for Prometheus metrics and `src/routes/search.js` for metric collection.
+
+### Endpoint Summary
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | Comprehensive health check with dependency status |
+| `GET /healthz` | Kubernetes liveness probe |
+| `GET /ready` | Kubernetes readiness probe |
+| `GET /metrics` | Prometheus metrics scraping endpoint |
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |

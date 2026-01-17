@@ -156,24 +156,26 @@ app.post(
       // Get or create user with circuit breaker protection
       let userId: string
       try {
-        userId = await postgresCircuitBreaker.execute(async () => {
-          return await withRetry(async () => {
+        const userIdResult = await postgresCircuitBreaker.execute(async () => {
+          const retryResult = await withRetry(async () => {
             const userResult = await pool.query(
               'SELECT id FROM users WHERE session_id = $1',
               [submission.sessionId]
             )
 
             if (userResult.rows.length > 0) {
-              return userResult.rows[0].id
+              return userResult.rows[0].id as string
             } else {
               const newUser = await pool.query(
                 'INSERT INTO users (session_id) VALUES ($1) RETURNING id',
                 [submission.sessionId]
               )
-              return newUser.rows[0].id
+              return newUser.rows[0].id as string
             }
           }, RetryPresets.postgres)
+          return retryResult.result
         })
+        userId = userIdResult
       } catch (error) {
         if (error instanceof CircuitBreakerOpenError) {
           reqLogger.warn({ msg: 'Database circuit breaker open' })
@@ -216,8 +218,8 @@ app.post(
       // Upload to MinIO with circuit breaker and retry
       let objectPath: string
       try {
-        objectPath = await minioCircuitBreaker.execute(async () => {
-          return await withRetry(
+        const uploadResult = await minioCircuitBreaker.execute(async () => {
+          const retryResult = await withRetry(
             async () => {
               return trackExternalCall('minio', 'putObject', async () => {
                 return uploadDrawing(drawingId, strokeData)
@@ -225,7 +227,9 @@ app.post(
             },
             { ...RetryPresets.minio, operationName: 'minio-upload' }
           )
+          return retryResult.result
         })
+        objectPath = uploadResult
       } catch (error) {
         if (error instanceof CircuitBreakerOpenError) {
           reqLogger.warn({ msg: 'MinIO circuit breaker open' })

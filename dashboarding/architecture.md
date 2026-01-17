@@ -854,3 +854,126 @@ cd frontend && npm run dev  # Port 5173
 | Redis | Memcached | Redis has more data structures (sorted sets for rate limiting) |
 | Polling | WebSocket | Simpler, good enough for 10s refresh |
 | Session auth | JWT | Simpler, immediate revocation |
+
+## Implementation Notes
+
+This section documents the key implementation decisions and explains WHY each pattern was chosen.
+
+### Why Query Caching Reduces Database Load
+
+Dashboard panels typically refresh every 10-30 seconds, and multiple users often view the same dashboard simultaneously. Without caching, each panel refresh triggers a full database query against large time-series tables, which can have millions of rows.
+
+**Query caching provides:**
+
+1. **Reduced database load**: Identical queries within the TTL window share results. If 10 users view the same dashboard, only 1 database query is executed instead of 10.
+
+2. **Improved latency**: Cache hits return in <1ms compared to 100-500ms for database queries. This dramatically improves perceived dashboard responsiveness.
+
+3. **Better scalability**: Redis can handle 10-100x more read operations than the database. Caching transforms database-bound scaling limits into memory-bound limits.
+
+4. **Protection during traffic spikes**: When a popular dashboard goes viral (e.g., during an incident), the cache absorbs the sudden load increase, preventing database overload.
+
+**Implementation details** (`src/shared/cache.ts`):
+- Cache-aside pattern with `getOrLoad()` helper
+- Deterministic cache keys from query parameters
+- TTL strategy: 10s for live data (freshness), 5 minutes for historical data (performance)
+- Size limits prevent caching extremely large results
+- SHA-256 hash for fixed-length cache keys
+
+### Why RBAC Enables Dashboard Sharing
+
+Role-Based Access Control (RBAC) separates authorization from authentication, enabling fine-grained control over who can view versus edit dashboards.
+
+**The problem without RBAC:**
+- Either everyone can edit dashboards (risky - accidental modifications)
+- Or dashboards are private-only (no sharing)
+
+**How RBAC solves this:**
+
+1. **Safe sharing across teams**: A DevOps engineer creates a critical production dashboard and shares it with the entire engineering team. Team members can VIEW but not accidentally modify or delete the dashboard.
+
+2. **Separation of concerns**:
+   - `viewer` role: Read-only access to public dashboards and metrics
+   - `editor` role: Create/modify own dashboards and alerts
+   - `admin` role: Manage any resource, system configuration
+
+3. **Ownership model**: Dashboard creators maintain control. Only the owner (or admin) can modify or delete a dashboard, even when shared publicly.
+
+**Implementation details** (`src/shared/auth.ts`):
+- Permission-based authorization (e.g., `dashboard:update:own` vs `dashboard:update:any`)
+- `requireOwnerOrAdmin()` middleware checks resource ownership
+- Session stores role for fast authorization checks without database lookups
+
+### Why Circuit Breakers Protect Against Slow Queries
+
+Time-series databases can experience performance degradation under certain conditions: complex queries over long time ranges, high cardinality, or infrastructure issues. Without protection, these slow queries cause cascading failures.
+
+**The cascade failure scenario:**
+1. Database becomes slow (high load, complex query, network issue)
+2. Queries accumulate, waiting for responses
+3. Connection pool exhausts (all connections waiting on slow queries)
+4. New requests can't get database connections
+5. Entire API becomes unresponsive
+6. Users retry, creating more load
+7. System completely fails
+
+**How circuit breakers prevent this:**
+
+1. **Fast failure**: When the circuit opens, requests fail immediately instead of waiting for timeout. Users get an error in 1ms instead of 30 seconds.
+
+2. **Database recovery time**: While the circuit is open, the database has time to complete pending queries and recover without new load.
+
+3. **Automatic testing**: Half-open state periodically tests if the database recovered, automatically restoring normal operation.
+
+4. **Metrics visibility**: Circuit breaker state is exposed via Prometheus metrics, enabling alerts before complete failure.
+
+**Implementation details** (`src/shared/circuitBreaker.ts`):
+- Opossum library provides battle-tested circuit breaker
+- Separate breakers for different operation types (query, ingest, dashboard)
+- Configurable thresholds: timeout (10s), error percentage (40%), reset timeout (60s)
+- Fallback returns empty results instead of error when appropriate
+
+### Why Ingestion Metrics Enable Capacity Planning
+
+Ingestion metrics provide visibility into the data flow rate, which is essential for:
+
+1. **Capacity planning**: By tracking points/second, operators can predict storage growth and plan infrastructure scaling before running out of capacity.
+
+   Example calculation:
+   - Current ingestion: 1,000 points/second
+   - Point size: ~24 bytes
+   - Daily storage: 1,000 * 86,400 * 24 = 2 GB/day
+   - 30-day projection: 60 GB
+
+2. **Anomaly detection**: A sudden drop in ingestion rate indicates data source failures. If monitoring agents stop sending metrics, the ingestion rate drops - this is often the first sign of infrastructure problems.
+
+3. **Rate limiting decisions**: When ingestion rate approaches capacity limits, operators can make informed decisions about throttling or scaling.
+
+4. **Cost forecasting**: In cloud environments, storage costs directly correlate with ingestion rate. Tracking ingestion enables accurate cost predictions.
+
+**Implementation details** (`src/shared/metrics.ts` and `src/services/metricsService.ts`):
+- `ingest_points_total`: Counter for total data points (throughput)
+- `ingest_requests_total`: Counter with status label (success/error)
+- `ingest_latency_seconds`: Histogram for batch write timing
+- Prometheus `/metrics` endpoint for scraping
+- Database connection pool metrics for capacity monitoring
+
+### Shared Module Architecture
+
+The implementation follows a shared module pattern for cross-cutting concerns:
+
+```
+backend/src/shared/
+├── logger.ts         # Structured JSON logging with pino
+├── metrics.ts        # Prometheus metrics and /metrics endpoint
+├── health.ts         # Health check endpoints (/health, /health/live, /health/ready)
+├── auth.ts           # Session auth and RBAC middleware
+├── cache.ts          # Query result caching with Redis
+└── circuitBreaker.ts # Database query protection
+```
+
+**Benefits:**
+- Single source of truth for each concern
+- Consistent behavior across all routes and services
+- Easy to test and modify independently
+- Clear separation between business logic and infrastructure

@@ -778,6 +778,138 @@ upstream api {
 }
 ```
 
+## Implementation Notes
+
+This section documents the key infrastructure patterns implemented in the backend and explains their purpose.
+
+### Prometheus Metrics (`/metrics` endpoint)
+
+**WHY metrics enable content recommendation optimization:**
+
+Metrics provide quantitative insights into user behavior and system performance that directly feed into recommendation algorithms:
+
+1. **View patterns**: `video_views_total` and `video_watch_duration_seconds` track which videos are being watched and for how long. Videos with high completion rates (watch duration / total duration) are likely higher quality content worth promoting.
+
+2. **Popular content identification**: Real-time metrics on view counts, likes, and engagement allow the trending algorithm to surface content that's gaining traction. The `transcode_queue_depth` metric helps prioritize processing of videos from channels with historically high engagement.
+
+3. **User engagement signals**: Metrics on comments, reactions, and subscriptions provide implicit feedback signals. A video generating many comments quickly likely deserves recommendation boost.
+
+4. **Capacity planning**: Metrics like `http_request_duration_seconds` and `db_query_duration_seconds` help identify bottlenecks before they impact recommendations (slow API = users abandon before engagement data is captured).
+
+**Implemented metrics:**
+- `video_views_total{video_id, channel_id}` - Total views per video
+- `video_watch_duration_seconds` - Watch time histogram
+- `video_uploads_total{status}` - Upload success/failure counts
+- `transcode_queue_depth` - Current transcoding backlog
+- `transcode_job_duration_seconds{resolution, status}` - Processing time per resolution
+- `http_requests_total{method, endpoint, status_code}` - Request counts
+- `http_request_duration_seconds` - API latency histogram
+
+### Rate Limiting
+
+**WHY rate limiting prevents abuse and protects transcoding resources:**
+
+Transcoding is the most expensive operation in a video platform. A single video upload can consume CPU for 10-60 minutes depending on length and quality. Rate limiting serves multiple purposes:
+
+1. **Resource protection**: Without limits, a malicious actor could queue hundreds of transcode jobs, blocking legitimate uploads for hours. The upload rate limit (5/minute) ensures the queue stays manageable.
+
+2. **Fair access**: Rate limiting ensures one heavy user can't monopolize shared resources. If the transcode queue has capacity for 100 jobs/hour, limiting uploads prevents one creator from consuming the entire quota.
+
+3. **Cost control**: Cloud transcoding costs scale with usage. Rate limits provide a predictable ceiling on infrastructure costs.
+
+4. **Abuse prevention**: Limits on auth endpoints (10/minute) prevent brute-force attacks. Limits on comments (20/minute) prevent spam.
+
+5. **Quality of service**: By rejecting excess requests with 429 status, rate limiting prevents system overload that would degrade performance for everyone.
+
+**Implemented rate limits:**
+- Auth endpoints: 10 requests/minute (prevents brute force)
+- Upload endpoints: 5 uploads/minute (protects transcoding)
+- Write operations: 20 requests/minute (prevents spam)
+- Read operations: 100 requests/minute (generous for UX)
+
+### Circuit Breakers
+
+**WHY circuit breakers prevent cascade failures:**
+
+In a distributed system, one failing service can bring down the entire platform through cascading failures. Circuit breakers act as automatic safety switches:
+
+1. **Failure isolation**: When MinIO (storage) becomes unresponsive, the circuit opens. Instead of every request waiting 30 seconds before timing out (blocking threads, exhausting connection pools), requests fail immediately with a meaningful error.
+
+2. **Fast recovery**: The half-open state periodically tests if the service recovered. When MinIO comes back, the circuit closes and normal operation resumes automatically---no manual intervention needed.
+
+3. **Graceful degradation**: With circuit breakers, the API can return cached video metadata even when storage is down. Users can browse (degraded mode) rather than seeing complete failure.
+
+4. **Resource conservation**: Without circuit breakers, a slow storage service causes thread pool exhaustion, database connection timeouts, and memory pressure from queued requests. Breaking the circuit early prevents this domino effect.
+
+5. **Visibility**: Circuit breaker state changes are logged and exposed via metrics (`circuit_breaker_state`), enabling alerting when services are struggling.
+
+**Implemented circuit breakers:**
+- Storage operations (MinIO): Opens after 5 failures within threshold
+- 30-second reset timeout before retrying
+- Metrics track circuit state and failure counts
+
+### Structured Logging with Pino
+
+**WHY structured logging enables debugging distributed systems:**
+
+Plain text logs (`console.log`) become unusable in distributed systems. Structured JSON logging solves critical debugging challenges:
+
+1. **Request correlation**: Every request gets a `requestId` that's included in all log entries and returned in the `X-Request-ID` header. When a user reports "upload failed," you can search logs for that specific request ID and trace the entire flow across services.
+
+2. **Machine parsing**: JSON logs can be ingested by log aggregation tools (ELK stack, Grafana Loki) for searching, filtering, and alerting. Finding all transcode failures in the last hour becomes a simple query rather than grep gymnastics.
+
+3. **Context preservation**: Structured logs include contextual fields (userId, videoId, duration, error code) that would be lost in text logs. When debugging, you see the full picture without reconstructing context from surrounding lines.
+
+4. **Performance analysis**: Logs include timing information. Aggregating the `duration` field from request logs reveals slow endpoints. Finding patterns like "all slow requests have userId=X" becomes trivial.
+
+5. **Error categorization**: Structured error logs include error codes and types, enabling automatic categorization (operational vs. programmer errors) and smart alerting (alert on new error types, not volume).
+
+**Log structure example:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "requestId": "abc-123",
+  "userId": "user-456",
+  "event": "video_uploaded",
+  "videoId": "vid-789",
+  "fileSize": 52428800,
+  "duration": 1523
+}
+```
+
+### RBAC (Role-Based Access Control)
+
+**Implemented roles:**
+- `viewer`: Default role. Can watch videos, comment, subscribe.
+- `creator`: Can upload videos, manage own channel and content.
+- `admin`: Full access including content moderation and user management.
+
+**Permission enforcement:**
+- Role checks via `requireRole()` middleware
+- Ownership checks via `requireOwnership()` for resource-specific access
+- Role hierarchy: admin permissions supersede creator, which supersede viewer
+
+### Retry with Exponential Backoff
+
+**Implementation details:**
+- Base delay: 1 second, doubles each attempt (1s, 2s, 4s, 8s...)
+- Max delay cap: 30 seconds (prevents unreasonably long waits)
+- Jitter: 20% randomization prevents thundering herd after outages
+- Configurable presets for different operation types (cache, database, storage)
+
+### Health Checks
+
+**Endpoints:**
+- `GET /health` - Liveness check (is the process running?)
+- `GET /health/ready` - Readiness check (are dependencies healthy?)
+- `GET /health/detailed` - Full status including circuit breaker states, queue depths, memory usage
+
+**Dependency checks:**
+- PostgreSQL: Simple query test
+- Redis: Ping command
+- MinIO: Head object request
+
 ## Future Optimizations
 
 1. **Real FFmpeg Integration**: Replace simulated transcoding with actual video processing

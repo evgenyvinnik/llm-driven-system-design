@@ -985,3 +985,242 @@ scrape_configs:
       - targets: ['host.docker.internal:3000']
     metrics_path: '/metrics'
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions for caching, idempotency, audit logging, and metrics.
+
+### Why Caching Reduces Load for Popular Repositories
+
+**Problem**: Popular repositories (e.g., React, Linux kernel) receive millions of requests daily. Each request to view files, branches, or commits triggers expensive git operations and database queries.
+
+**Solution**: Redis cache-aside pattern with tiered TTLs:
+
+```javascript
+// Cache TTLs based on data volatility
+CACHE_TTL = {
+  REPO_METADATA: 300,      // 5 minutes - changes infrequently
+  FILE_TREE: 600,          // 10 minutes - changes on push
+  FILE_CONTENT: 3600,      // 1 hour - immutable by SHA
+  PR_DIFF: 600,            // 10 minutes - changes on commits
+  BRANCHES: 60,            // 1 minute - changes frequently
+}
+```
+
+**Benefits**:
+1. **Reduces database load by 80-90%** for read-heavy workloads (most repository views are reads)
+2. **Reduces git operation overhead** - `git ls-tree` and `git show` are expensive for large repos
+3. **Improves latency** - Redis response time (~1ms) vs database (~10-50ms) vs git operations (~100-500ms)
+4. **Enables horizontal scaling** - Cache absorbs traffic spikes from trending repositories
+
+**Cache Invalidation Strategy**:
+- Push events trigger invalidation of repository caches via `/api/repos/:owner/:repo/push`
+- PR merges invalidate both PR diff cache and repository caches
+- Settings changes invalidate repository metadata cache
+- Pattern-based deletion using SCAN (not KEYS) for production safety
+
+### Why Idempotency Prevents Duplicate Issues from Webhook Retries
+
+**Problem**: Webhooks follow at-least-once delivery semantics. When a webhook delivery times out:
+1. The receiver may have processed the request
+2. The sender retries the delivery
+3. Result: Duplicate issues/PRs created
+
+**Example Scenario**:
+```
+1. User clicks "Create Issue" button
+2. Request succeeds on server, issue #42 created
+3. Network timeout before response reaches client
+4. Client retries with same data
+5. Without idempotency: Issue #43 created (duplicate!)
+6. With idempotency: Cached response for #42 returned
+```
+
+**Solution**: Idempotency keys stored in PostgreSQL with 24-hour TTL:
+
+```javascript
+// Client includes idempotency key in header
+POST /api/owner/repo/issues
+Headers:
+  Idempotency-Key: abc123-unique-request-id
+
+// Server checks for existing key before creating resource
+const { cached, response } = await withIdempotencyTransaction(
+  idempotencyKey,
+  'issue_create',
+  async (tx) => {
+    // Create issue atomically with idempotency key storage
+    const issue = await tx.query('INSERT INTO issues...');
+    return { resourceId: issue.id, response: issue };
+  }
+);
+
+if (cached) {
+  // Return cached response instead of creating duplicate
+  return res.status(200).json(response);
+}
+```
+
+**Benefits**:
+1. **Prevents duplicate resources** from webhook retries, network issues, or double-clicks
+2. **Transactional consistency** - idempotency key stored atomically with resource
+3. **Automatic cleanup** - keys expire after 24 hours
+4. **Metrics visibility** - `github_idempotency_duplicates_total` tracks deduplication rate
+
+### Why Audit Logging Enables Security Investigations
+
+**Problem**: Security incidents require answering questions like:
+- "Who deleted this repository and when?"
+- "What permissions did user X have access to before the breach?"
+- "Which IP addresses accessed sensitive repositories in the last 24 hours?"
+
+**Solution**: Comprehensive audit logging for security-sensitive operations:
+
+```sql
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  timestamp TIMESTAMP DEFAULT NOW(),
+  user_id INTEGER REFERENCES users(id),
+  action VARCHAR(100) NOT NULL,        -- e.g., 'repo.delete', 'collaborator.add'
+  resource_type VARCHAR(50) NOT NULL,  -- e.g., 'repository', 'user'
+  resource_id VARCHAR(100),
+  ip_address INET,
+  user_agent TEXT,
+  request_id VARCHAR(64),              -- For distributed tracing
+  details JSONB,                       -- Additional context
+  outcome VARCHAR(20)                  -- 'success', 'denied', 'error'
+);
+```
+
+**Audited Actions**:
+- Repository: create, delete, visibility change, settings change
+- Pull Requests: create, merge, close
+- Issues: create, close
+- Permissions: collaborator add/remove, permission changes
+- Authentication: login, logout, failed login attempts
+- Webhooks: create, delete, update
+
+**Benefits**:
+1. **Security investigations** - Full audit trail of who did what, when, from where
+2. **Compliance** - SOC 2, GDPR, HIPAA require audit logs for access control
+3. **Forensics** - Request ID enables correlation with application logs and traces
+4. **Access patterns** - Detect unusual access patterns (e.g., bulk downloads)
+
+**Query Examples**:
+```sql
+-- Who accessed this repository in the last 24 hours?
+SELECT * FROM audit_logs
+WHERE resource_type = 'repository'
+  AND resource_id = '123'
+  AND timestamp > NOW() - INTERVAL '24 hours';
+
+-- What sensitive actions did this user perform?
+SELECT * FROM audit_logs
+WHERE user_id = 456
+  AND action IN ('repo.delete', 'collaborator.permission_change')
+ORDER BY timestamp DESC;
+```
+
+### Why Metrics Enable CI/CD Optimization
+
+**Problem**: CI/CD pipelines are black boxes without metrics. Teams cannot answer:
+- "Why did build times increase this week?"
+- "Which repositories have the slowest merge times?"
+- "Are our webhooks being delivered reliably?"
+
+**Solution**: Prometheus metrics for all key operations:
+
+```javascript
+// Metrics exposed at /metrics endpoint
+github_http_request_duration_seconds    // API latency histogram
+github_git_operation_duration_seconds   // Git operation latency
+github_prs_created_total                // PR creation rate
+github_prs_merged_total                 // PR merge rate by strategy
+github_ci_runs_total                    // CI run counts by status
+github_ci_run_duration_seconds          // CI run duration
+github_webhook_deliveries_total         // Webhook success/failure rate
+github_cache_hits_total                 // Cache hit rate
+github_circuit_breaker_state            // Circuit breaker status
+```
+
+**SLI Examples**:
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| API Availability | 99.9% | < 99.5% over 5 min |
+| API Latency (p95) | < 200ms | > 500ms over 5 min |
+| PR Merge Time (p95) | < 5s | > 10s over 5 min |
+| Webhook Delivery Rate | 99% | < 95% over 15 min |
+| Cache Hit Rate | > 80% | < 60% over 15 min |
+
+**Benefits**:
+1. **Identify bottlenecks** - High git_operation_duration indicates storage issues
+2. **Capacity planning** - Track growth in CI runs, PRs, and repository size
+3. **Incident detection** - Circuit breaker trips indicate systemic failures
+4. **Performance optimization** - Low cache hit rate suggests ineffective caching
+5. **Business metrics** - Track adoption (PRs created, issues resolved)
+
+### Circuit Breaker Pattern for Git Operations
+
+**Problem**: Git operations can fail when:
+- Storage is overloaded
+- Repository is corrupted
+- Disk is full
+- Network issues to distributed storage
+
+Without protection, failures cascade:
+1. Request waits for slow git operation
+2. Connection pool exhausted
+3. All requests start failing
+4. System becomes unresponsive
+
+**Solution**: Opossum circuit breaker for all git operations:
+
+```javascript
+const CIRCUIT_OPTIONS = {
+  timeout: 30000,                // Fail after 30 seconds
+  errorThresholdPercentage: 50,  // Open if 50% fail
+  resetTimeout: 30000,           // Try again after 30 seconds
+  volumeThreshold: 5,            // Need 5+ requests to evaluate
+};
+
+// Wrap git operations
+const tree = await withCircuitBreaker('git_tree', () =>
+  gitService.getTree(owner, repo, ref, treePath)
+);
+```
+
+**States**:
+- **Closed**: Normal operation, requests go through
+- **Open**: Requests fail immediately (fast failure)
+- **Half-Open**: Allow one request to test recovery
+
+**Benefits**:
+1. **Fast failure** - Users see error immediately instead of waiting 30s
+2. **Prevent cascade** - Connection pool stays healthy
+3. **Allow recovery** - Storage has time to recover without load
+4. **Visibility** - `github_circuit_breaker_state` metric shows current state
+5. **Admin control** - Manual reset endpoint for operators
+
+---
+
+## Shared Module Architecture
+
+The implementation adds these shared modules under `backend/src/shared/`:
+
+```
+shared/
+├── logger.js           # Pino structured logging with request context
+├── metrics.js          # Prometheus metrics and middleware
+├── cache.js            # Redis cache-aside pattern implementation
+├── audit.js            # Security audit logging
+├── idempotency.js      # Idempotency key handling
+└── circuitBreaker.js   # Opossum circuit breaker for git operations
+```
+
+Each module is:
+- **Self-contained** - Single responsibility
+- **Configurable** - Environment-based settings
+- **Observable** - Emits metrics and logs
+- **Testable** - Can be mocked in unit tests

@@ -2,10 +2,13 @@
  * @fileoverview User visibility service for privacy-aware search.
  * Computes and caches visibility sets that determine which posts a user can see.
  * Central to the privacy model - ensures users only see posts they have permission to view.
+ * Includes cache hit/miss metrics for monitoring.
  */
 
 import { query } from '../config/database.js';
 import { getCache, setCache, cacheKeys } from '../config/redis.js';
+import { recordCacheAccess, logger } from '../shared/index.js';
+import { RETENTION_THRESHOLDS } from '../shared/alertThresholds.js';
 
 /**
  * Represents a user's visibility set - the fingerprints of posts they can access.
@@ -23,7 +26,7 @@ interface VisibilitySet {
  * - Public posts (everyone can see)
  * - Their own private posts
  * - Posts from their friends (friends-only visibility)
- * Results are cached in Redis for 5 minutes to reduce database load.
+ * Results are cached in Redis for 15 minutes to reduce database load.
  * @param userId - The user's ID
  * @returns Promise resolving to the user's visibility set with fingerprints and friend IDs
  */
@@ -31,8 +34,13 @@ export async function getUserVisibilitySet(userId: string): Promise<VisibilitySe
   // Try cache first
   const cached = await getCache<VisibilitySet>(cacheKeys.userVisibility(userId));
   if (cached) {
+    recordCacheAccess('visibility', true);
+    logger.debug({ userId }, 'Visibility set cache hit');
     return cached;
   }
+
+  recordCacheAccess('visibility', false);
+  logger.debug({ userId }, 'Visibility set cache miss - computing');
 
   // Compute visibility set
   const fingerprints: string[] = [];
@@ -70,8 +78,12 @@ export async function getUserVisibilitySet(userId: string): Promise<VisibilitySe
     updatedAt: new Date().toISOString(),
   };
 
-  // Cache for 5 minutes (visibility can change when friendships change)
-  await setCache(cacheKeys.userVisibility(userId), visibilitySet, 300);
+  // Cache for configured TTL (visibility can change when friendships change)
+  await setCache(
+    cacheKeys.userVisibility(userId),
+    visibilitySet,
+    RETENTION_THRESHOLDS.VISIBILITY_CACHE_TTL_SECONDS
+  );
 
   return visibilitySet;
 }
@@ -85,6 +97,7 @@ export async function getUserVisibilitySet(userId: string): Promise<VisibilitySe
 export async function invalidateVisibilityCache(userId: string): Promise<void> {
   const { deleteCache } = await import('../config/redis.js');
   await deleteCache(cacheKeys.userVisibility(userId));
+  logger.info({ userId }, 'Visibility cache invalidated');
 }
 
 /**

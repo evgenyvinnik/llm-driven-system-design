@@ -835,7 +835,260 @@ npm run archive:import      # Import archived data for testing
 - Multi-tenancy with tenant isolation
 - Job rate limiting per type/tenant
 - Webhook notifications for job events
-- Prometheus metrics endpoint
 - Grafana dashboards
 - Job timeout warnings
 - Scheduled maintenance windows
+
+## Implementation Notes
+
+This section documents the WHY behind key implementation decisions, explaining the rationale for each pattern.
+
+### Idempotency for Job Creation
+
+**Why idempotency prevents duplicate job scheduling:**
+
+Idempotency ensures that submitting the same job creation request multiple times produces the same result as a single submission. This is critical in distributed systems where:
+
+1. **Network Reliability**: Clients may retry requests due to timeouts or network failures, even when the server successfully processed the original request. Without idempotency, each retry creates a duplicate job.
+
+2. **User Experience**: Users may accidentally double-click submit buttons or refresh pages, triggering multiple submissions.
+
+3. **System Integration**: External systems triggering jobs via API may have their own retry logic, leading to duplicate scheduling.
+
+**Implementation approach:**
+
+```typescript
+// Two-layer idempotency protection:
+
+// 1. Request-level: Idempotency-Key header for HTTP requests
+// Caches response for duplicate requests within TTL window
+app.post('/api/v1/jobs', idempotencyMiddleware(), ...)
+
+// 2. Entity-level: Job name uniqueness check
+const existingJob = await db.getJobByName(input.name);
+if (existingJob) {
+  return res.status(409).json({ error: 'Job already exists' });
+}
+```
+
+**Trade-offs:**
+- Redis storage overhead for idempotency keys (mitigated by TTL)
+- Slightly higher latency for cache lookups
+- Benefits: Prevents duplicate jobs, simplifies client error handling
+
+### Role-Based Access Control (RBAC)
+
+**Why RBAC separates job owners from administrators:**
+
+RBAC provides security boundaries that protect system integrity while enabling appropriate access levels:
+
+1. **Principle of Least Privilege**: Users should only have access to perform their required tasks. Job creators need to view status and trigger their jobs, but should not be able to modify system-wide settings or other users' jobs.
+
+2. **Audit Trail**: RBAC enables clear accountability. When a job is paused or deleted, logs show which admin performed the action.
+
+3. **Operational Safety**: Administrators can pause/resume/delete jobs, which are potentially destructive operations. Separating these permissions prevents accidental or unauthorized changes.
+
+4. **Multi-Team Environments**: Different teams may share the scheduler. RBAC prevents one team from interfering with another's jobs.
+
+**Permission matrix:**
+
+| Operation | User Role | Admin Role |
+|-----------|-----------|------------|
+| View own jobs | Yes | Yes |
+| Trigger own jobs | Yes | Yes |
+| Create jobs | No | Yes |
+| Update/Delete jobs | No | Yes |
+| Pause/Resume jobs | No | Yes |
+| View system metrics | Limited | Full |
+| Manage users | No | Yes |
+
+**Implementation:**
+
+```typescript
+// Middleware chain for protected routes
+app.post('/api/v1/jobs',
+  authenticate,           // Verify session
+  authorize('admin'),     // Check role
+  createJobHandler
+);
+```
+
+### Job History Archival
+
+**Why job history archival balances debugging vs storage:**
+
+Execution history is valuable for debugging and auditing, but unbounded retention leads to:
+
+1. **Storage Costs**: At 1KB per execution, 10,000 executions/day = 3.6GB/year in PostgreSQL alone, not counting indexes and logs.
+
+2. **Query Performance**: Large tables slow down queries. Even with indexes, counting millions of rows or scanning for recent data degrades performance.
+
+3. **Backup/Recovery Time**: Larger databases take longer to backup and restore, increasing RTO/RPO metrics.
+
+**Retention strategy:**
+
+| Data Type | Hot Storage | Cold Storage | Rationale |
+|-----------|-------------|--------------|-----------|
+| Job definitions | Indefinite | N/A | Always needed for scheduling |
+| Active executions | 30 days | 1 year | Recent history for debugging |
+| Execution logs | 7 days | N/A | Verbose, primarily for immediate debugging |
+| Dead letter items | 30 days | N/A | Failed jobs need investigation window |
+
+**Implementation:**
+
+```typescript
+// Scheduled maintenance job runs daily at 3 AM
+const maintenanceJob = {
+  name: 'system:data-cleanup',
+  schedule: '0 3 * * *',
+  handler: 'system.maintenance',
+};
+
+// Cleanup logic
+async function runCleanup() {
+  await deleteOldExecutions(30); // days
+  await deleteOldLogs(7);        // days
+}
+```
+
+**Trade-offs:**
+- Data older than retention period is lost (unless archived to cold storage)
+- Archival adds complexity but enables long-term analysis
+- Benefits: Consistent performance, predictable storage costs
+
+### Execution Metrics and SLA Monitoring
+
+**Why execution metrics enable SLA monitoring:**
+
+Prometheus metrics provide the observability needed to measure and maintain Service Level Agreements:
+
+1. **SLA Definition**: Common SLAs include:
+   - 99.9% of jobs start within 5 seconds of scheduled time
+   - 95% of jobs complete within expected duration
+   - Error rate below 1%
+
+2. **Real-time Visibility**: Metrics enable dashboards showing current system health, not just post-mortem analysis.
+
+3. **Alerting**: Prometheus integrates with Alertmanager to notify teams when SLA thresholds are breached.
+
+4. **Capacity Planning**: Metrics like queue depth and execution duration inform scaling decisions.
+
+**Key metrics implemented:**
+
+```typescript
+// Job lifecycle metrics
+job_scheduler_jobs_scheduled_total     // Counter: jobs enqueued
+job_scheduler_jobs_completed_total     // Counter: successful completions
+job_scheduler_jobs_failed_total        // Counter: failures (with retry label)
+job_scheduler_job_execution_duration_seconds  // Histogram: execution time
+
+// Queue metrics
+job_scheduler_queue_depth              // Gauge: pending jobs
+job_scheduler_processing_count         // Gauge: in-flight jobs
+job_scheduler_dead_letter_queue_size   // Gauge: failed jobs
+
+// System health
+job_scheduler_active_workers           // Gauge: worker count
+job_scheduler_scheduler_is_leader      // Gauge: leader election status
+job_scheduler_circuit_breaker_state    // Gauge: per-handler circuit state
+```
+
+**SLA alerting examples (Prometheus rules):**
+
+```yaml
+# Alert if queue depth exceeds threshold for 5 minutes
+- alert: JobSchedulerQueueBacklog
+  expr: job_scheduler_queue_depth > 1000
+  for: 5m
+  labels:
+    severity: warning
+
+# Alert if error rate exceeds 10%
+- alert: JobSchedulerHighErrorRate
+  expr: |
+    rate(job_scheduler_jobs_failed_total[5m]) /
+    rate(job_scheduler_jobs_completed_total[5m]) > 0.1
+  for: 5m
+  labels:
+    severity: critical
+```
+
+### Circuit Breaker for Job Execution
+
+**Why circuit breakers prevent cascading failures:**
+
+When a job handler depends on an external service (database, API, etc.) that becomes unavailable, naive retry behavior can:
+
+1. **Exhaust Resources**: Workers continuously retry failing jobs, consuming CPU/memory while accomplishing nothing.
+
+2. **Overload Recovering Services**: When the external service recovers, it may be overwhelmed by backed-up retry traffic.
+
+3. **Mask Root Causes**: High failure rates in logs make it harder to identify the original failure.
+
+**Circuit breaker states:**
+
+```
+CLOSED ──────► OPEN ──────► HALF-OPEN ──────► CLOSED
+(healthy)      (failing)    (testing)          (recovered)
+     ▲                           │
+     └───────────────────────────┘
+         (failures continue)
+```
+
+**Implementation:**
+
+```typescript
+const breaker = new CircuitBreaker(handler, {
+  timeout: 60000,            // 60s before considering failed
+  errorThresholdPercentage: 50,  // Trip at 50% failure rate
+  resetTimeout: 30000,       // Wait 30s before testing
+  volumeThreshold: 5,        // Need 5 requests to calculate percentage
+});
+
+// When circuit opens, jobs are requeued for later
+if (error instanceof CircuitBreakerOpenError) {
+  await queue.requeue(executionId, jobId, priority);
+  return; // Don't count as failure
+}
+```
+
+**Benefits:**
+- Failing fast preserves worker capacity for healthy handlers
+- Automatic recovery when external services return
+- Visibility via metrics (`circuit_breaker_state`, `circuit_breaker_trips_total`)
+
+### Structured JSON Logging with Pino
+
+**Why structured logging improves observability:**
+
+1. **Machine Parseable**: JSON logs can be ingested by log aggregation systems (ELK, Loki, Datadog) without custom parsing.
+
+2. **Contextual Correlation**: Each log entry includes structured fields (jobId, executionId, workerId) enabling trace-like correlation:
+
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "job-scheduler",
+  "instance": "worker-1",
+  "jobId": "abc-123",
+  "executionId": "def-456",
+  "msg": "Job completed successfully",
+  "duration": 1523
+}
+```
+
+3. **Performance**: Pino is one of the fastest Node.js loggers, using lazy serialization and async I/O to minimize overhead.
+
+4. **Development Experience**: In development, pino-pretty renders human-readable colored output while maintaining JSON structure in production.
+
+**Log levels and usage:**
+
+| Level | Usage |
+|-------|-------|
+| trace | Detailed debugging (disabled in production) |
+| debug | Internal state, query execution |
+| info | Normal operations, job completions |
+| warn | Recoverable issues, retries scheduled |
+| error | Failures, exceptions |
+| fatal | Unrecoverable errors, process exit |

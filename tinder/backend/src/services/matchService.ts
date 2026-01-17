@@ -1,55 +1,79 @@
 import { pool, redis } from '../db/index.js';
 import type { Match, MatchWithUser } from '../types/index.js';
+import { retentionConfig } from '../shared/config.js';
+import { logger } from '../shared/logger.js';
+import { cacheHitsTotal, cacheMissesTotal } from '../shared/metrics.js';
 
 /**
  * Service responsible for swipe processing, match detection, and match management.
  * Handles the core matching logic: storing swipes, detecting mutual likes, and creating matches.
  * Uses Redis for fast mutual-like detection and PostgreSQL for persistence.
+ *
+ * Features:
+ * - Idempotency support via optional idempotency keys
+ * - Configurable cache TTLs from retention config
+ * - Metrics for cache hit/miss tracking
  */
 export class MatchService {
   /**
    * Processes a swipe action and checks for mutual match.
    * If both users have liked each other, creates a match and returns match data.
    * Caches swipes in Redis for fast subsequent lookups.
+   *
    * @param swiperId - The user who is swiping
    * @param swipedId - The user being swiped on
    * @param direction - 'like' or 'pass'
+   * @param idempotencyKey - Optional client-provided unique request identifier for idempotency
    * @returns Object with match data (if mutual like) and isNewMatch flag
    */
   async processSwipe(
     swiperId: string,
     swipedId: string,
-    direction: 'like' | 'pass'
+    direction: 'like' | 'pass',
+    idempotencyKey?: string
   ): Promise<{ match: Match | null; isNewMatch: boolean }> {
-    // Record the swipe in database
-    await pool.query(
-      `INSERT INTO swipes (swiper_id, swiped_id, direction)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (swiper_id, swiped_id) DO UPDATE SET direction = $3`,
-      [swiperId, swipedId, direction]
-    );
+    // Record the swipe in database with optional idempotency key
+    const insertQuery = idempotencyKey
+      ? `INSERT INTO swipes (swiper_id, swiped_id, direction, idempotency_key)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (swiper_id, swiped_id) DO UPDATE SET direction = $3, idempotency_key = COALESCE(swipes.idempotency_key, $4)`
+      : `INSERT INTO swipes (swiper_id, swiped_id, direction)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (swiper_id, swiped_id) DO UPDATE SET direction = $3`;
 
-    // Add to Redis seen set
+    const insertParams = idempotencyKey
+      ? [swiperId, swipedId, direction, idempotencyKey]
+      : [swiperId, swipedId, direction];
+
+    await pool.query(insertQuery, insertParams);
+
+    // Add to Redis seen set with configurable TTL
     const redisKey = direction === 'like' ? `swipes:${swiperId}:liked` : `swipes:${swiperId}:passed`;
     await redis.sadd(redisKey, swipedId);
-    await redis.expire(redisKey, 86400);
+    await redis.expire(redisKey, retentionConfig.swipeCacheTTL);
 
     // If it's a like, check for mutual match
     if (direction === 'like') {
       // Add to received likes for the swiped user
       await redis.sadd(`likes:received:${swipedId}`, swiperId);
-      await redis.expire(`likes:received:${swipedId}`, 86400);
+      await redis.expire(`likes:received:${swipedId}`, retentionConfig.likesReceivedTTL);
 
-      // Check if they liked us back
+      // Check if they liked us back (Redis first for speed)
       const mutualLike = await redis.sismember(`swipes:${swipedId}:liked`, swiperId);
 
       if (mutualLike) {
+        // Cache hit - found mutual like in Redis
+        cacheHitsTotal.inc({ cache_type: 'swipe_history' });
+        logger.debug({ swiperId, swipedId }, 'Mutual like found in Redis cache');
+
         // It's a match!
         const match = await this.createMatch(swiperId, swipedId);
         return { match, isNewMatch: true };
       }
 
-      // Check database as fallback
+      // Cache miss - check database as fallback
+      cacheMissesTotal.inc({ cache_type: 'swipe_history' });
+
       const dbResult = await pool.query(
         `SELECT id FROM swipes
          WHERE swiper_id = $1 AND swiped_id = $2 AND direction = 'like'`,
@@ -57,6 +81,7 @@ export class MatchService {
       );
 
       if (dbResult.rows.length > 0) {
+        logger.debug({ swiperId, swipedId }, 'Mutual like found in database fallback');
         const match = await this.createMatch(swiperId, swipedId);
         return { match, isNewMatch: true };
       }

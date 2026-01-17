@@ -3,13 +3,16 @@
  *
  * Provides a configurable middleware factory that can be applied to any Express route.
  * The middleware integrates with the rate limiter algorithms and automatically sets
- * standard rate limit headers on responses.
+ * standard rate limit headers on responses. Includes circuit breaker protection
+ * and graceful degradation.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { RateLimiterFactory } from '../algorithms/index.js';
 import { Algorithm, RateLimitResult } from '../types/index.js';
 import { recordMetric } from '../utils/redis.js';
+import { logger, prometheusMetrics } from '../shared/index.js';
+import { config } from '../config/index.js';
 import Redis from 'ioredis';
 
 /**
@@ -98,7 +101,7 @@ export function createRateLimitMiddleware(
       );
 
       const latencyMs = Date.now() - startTime;
-      await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs);
+      await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs, algorithm);
 
       // Set standard rate limit headers (compatible with RFC 6585)
       res.set({
@@ -110,6 +113,16 @@ export function createRateLimitMiddleware(
 
       if (!result.allowed) {
         res.set('Retry-After', (result.retryAfter || 1).toString());
+
+        logger.debug(
+          {
+            identifier: id,
+            algorithm,
+            remaining: result.remaining,
+            latencyMs,
+          },
+          'Rate limit exceeded'
+        );
 
         if (onRateLimited) {
           onRateLimited(req, res, result);
@@ -127,9 +140,21 @@ export function createRateLimitMiddleware(
 
       next();
     } catch (error) {
-      console.error('Rate limit check failed:', error);
-      // Fail open - allow request on error to prevent blocking during outages
-      next();
+      logger.error(
+        { error: (error as Error).message, identifier: id },
+        'Rate limit check failed'
+      );
+
+      // Graceful degradation based on configuration
+      if (config.degradation.mode === 'allow') {
+        prometheusMetrics.recordFallback('middleware_error');
+        next();
+      } else {
+        return res.status(503).json({
+          error: 'Service Unavailable',
+          message: 'Rate limiting temporarily unavailable',
+        });
+      }
     }
   };
 }

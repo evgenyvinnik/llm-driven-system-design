@@ -1,10 +1,22 @@
 /**
- * @fileoverview Dashboard and panel API routes.
+ * @fileoverview Dashboard and panel API routes with RBAC.
  *
  * Exposes REST endpoints for:
  * - Dashboard CRUD operations (list, get, create, update, delete)
  * - Panel management within dashboards
  * - Panel data fetching for rendering visualizations
+ *
+ * Implements Role-Based Access Control (RBAC):
+ * - Viewers: Can view public dashboards and query panel data
+ * - Editors: Can create/edit own dashboards, create panels
+ * - Admins: Can edit/delete any dashboard
+ *
+ * WHY RBAC enables dashboard sharing:
+ * RBAC separates authorization from authentication, allowing fine-grained
+ * control over who can view vs edit dashboards. Viewers can see shared
+ * dashboards without risk of accidental modifications, while editors
+ * maintain control over their own content. This separation enables
+ * safe sharing across teams while protecting dashboard integrity.
  */
 
 import { Router, Request, Response } from 'express';
@@ -23,6 +35,9 @@ import {
   getDashboardWithPanels,
 } from '../services/dashboardService.js';
 import { queryMetrics } from '../services/queryService.js';
+import logger from '../shared/logger.js';
+import { requireAuth, optionalAuth, requireRole, requireOwnerOrAdmin } from '../shared/auth.js';
+import { dashboardRendersTotal, panelDataFetchTotal } from '../shared/metrics.js';
 import type { PanelQuery } from '../types/index.js';
 
 const router = Router();
@@ -124,13 +139,13 @@ const UpdatePanelSchema = z.object({
  *
  * @returns {dashboards: Dashboard[]} - Array of dashboards
  */
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', optionalAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.session?.userId;
     const dashboards = await getDashboards({ userId, includePublic: true });
     res.json({ dashboards });
   } catch (error) {
-    console.error('Get dashboards error:', error);
+    logger.error({ error }, 'Get dashboards error');
     res.status(500).json({ error: 'Failed to get dashboards' });
   }
 });
@@ -138,19 +153,37 @@ router.get('/', async (req: Request, res: Response) => {
 /**
  * GET /:id
  * Retrieves a single dashboard with all its panels.
+ * Public dashboards are accessible to everyone.
+ * Private dashboards require authentication and ownership.
  *
  * @param id - Dashboard UUID
  * @returns Dashboard with panels array
  */
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', optionalAuth, async (req: Request, res: Response) => {
   try {
     const dashboard = await getDashboardWithPanels(req.params.id);
     if (!dashboard) {
       return res.status(404).json({ error: 'Dashboard not found' });
     }
+
+    // Check access permissions
+    const userId = req.session?.userId;
+    if (!dashboard.is_public && dashboard.user_id !== userId) {
+      // Not public and not owner
+      if (!userId) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      // Check if admin
+      if (req.session?.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    dashboardRendersTotal.inc({ status: 'success' });
     res.json(dashboard);
   } catch (error) {
-    console.error('Get dashboard error:', error);
+    dashboardRendersTotal.inc({ status: 'error' });
+    logger.error({ error, dashboardId: req.params.id }, 'Get dashboard error');
     res.status(500).json({ error: 'Failed to get dashboard' });
   }
 });
@@ -158,11 +191,12 @@ router.get('/:id', async (req: Request, res: Response) => {
 /**
  * POST /
  * Creates a new dashboard.
+ * Requires editor or admin role.
  *
  * @body {name, description?, layout?, is_public?}
  * @returns The newly created dashboard
  */
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireAuth, requireRole('editor', 'admin'), async (req: Request, res: Response) => {
   try {
     const validation = CreateDashboardSchema.safeParse(req.body);
     if (!validation.success) {
@@ -182,9 +216,10 @@ router.post('/', async (req: Request, res: Response) => {
       isPublic: is_public,
     });
 
+    logger.info({ dashboardId: dashboard.id, userId, name }, 'Dashboard created');
     res.status(201).json(dashboard);
   } catch (error) {
-    console.error('Create dashboard error:', error);
+    logger.error({ error }, 'Create dashboard error');
     res.status(500).json({ error: 'Failed to create dashboard' });
   }
 });
@@ -192,52 +227,73 @@ router.post('/', async (req: Request, res: Response) => {
 /**
  * PUT /:id
  * Updates an existing dashboard's properties.
+ * Only the owner or admin can update.
  *
  * @param id - Dashboard UUID
  * @body Partial dashboard properties to update
  * @returns The updated dashboard
  */
-router.put('/:id', async (req: Request, res: Response) => {
-  try {
-    const validation = UpdateDashboardSchema.safeParse(req.body);
-    if (!validation.success) {
-      return res.status(400).json({
-        error: 'Invalid request body',
-        details: validation.error.errors,
-      });
-    }
+router.put(
+  '/:id',
+  requireAuth,
+  requireOwnerOrAdmin(async (req) => {
+    const dashboard = await getDashboard(req.params.id);
+    return dashboard?.user_id;
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const validation = UpdateDashboardSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({
+          error: 'Invalid request body',
+          details: validation.error.errors,
+        });
+      }
 
-    const dashboard = await updateDashboard(req.params.id, validation.data);
-    if (!dashboard) {
-      return res.status(404).json({ error: 'Dashboard not found' });
-    }
+      const dashboard = await updateDashboard(req.params.id, validation.data);
+      if (!dashboard) {
+        return res.status(404).json({ error: 'Dashboard not found' });
+      }
 
-    res.json(dashboard);
-  } catch (error) {
-    console.error('Update dashboard error:', error);
-    res.status(500).json({ error: 'Failed to update dashboard' });
+      logger.info({ dashboardId: dashboard.id, userId: req.session?.userId }, 'Dashboard updated');
+      res.json(dashboard);
+    } catch (error) {
+      logger.error({ error, dashboardId: req.params.id }, 'Update dashboard error');
+      res.status(500).json({ error: 'Failed to update dashboard' });
+    }
   }
-});
+);
 
 /**
  * DELETE /:id
  * Deletes a dashboard and all its panels.
+ * Only the owner or admin can delete.
  *
  * @param id - Dashboard UUID
  * @returns 204 No Content on success
  */
-router.delete('/:id', async (req: Request, res: Response) => {
-  try {
-    const deleted = await deleteDashboard(req.params.id);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Dashboard not found' });
+router.delete(
+  '/:id',
+  requireAuth,
+  requireOwnerOrAdmin(async (req) => {
+    const dashboard = await getDashboard(req.params.id);
+    return dashboard?.user_id;
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const deleted = await deleteDashboard(req.params.id);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Dashboard not found' });
+      }
+
+      logger.info({ dashboardId: req.params.id, userId: req.session?.userId }, 'Dashboard deleted');
+      res.status(204).send();
+    } catch (error) {
+      logger.error({ error, dashboardId: req.params.id }, 'Delete dashboard error');
+      res.status(500).json({ error: 'Failed to delete dashboard' });
     }
-    res.status(204).send();
-  } catch (error) {
-    console.error('Delete dashboard error:', error);
-    res.status(500).json({ error: 'Failed to delete dashboard' });
   }
-});
+);
 
 /**
  * GET /:dashboardId/panels
@@ -246,12 +302,23 @@ router.delete('/:id', async (req: Request, res: Response) => {
  * @param dashboardId - Parent dashboard UUID
  * @returns {panels: Panel[]} - Array of panels
  */
-router.get('/:dashboardId/panels', async (req: Request, res: Response) => {
+router.get('/:dashboardId/panels', optionalAuth, async (req: Request, res: Response) => {
   try {
+    // Check dashboard access first
+    const dashboard = await getDashboard(req.params.dashboardId);
+    if (!dashboard) {
+      return res.status(404).json({ error: 'Dashboard not found' });
+    }
+
+    const userId = req.session?.userId;
+    if (!dashboard.is_public && dashboard.user_id !== userId && req.session?.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     const panels = await getPanelsByDashboard(req.params.dashboardId);
     res.json({ panels });
   } catch (error) {
-    console.error('Get panels error:', error);
+    logger.error({ error, dashboardId: req.params.dashboardId }, 'Get panels error');
     res.status(500).json({ error: 'Failed to get panels' });
   }
 });
@@ -264,7 +331,7 @@ router.get('/:dashboardId/panels', async (req: Request, res: Response) => {
  * @param panelId - Panel UUID
  * @returns The panel if found
  */
-router.get('/:dashboardId/panels/:panelId', async (req: Request, res: Response) => {
+router.get('/:dashboardId/panels/:panelId', optionalAuth, async (req: Request, res: Response) => {
   try {
     const panel = await getPanel(req.params.panelId);
     if (!panel || panel.dashboard_id !== req.params.dashboardId) {
@@ -272,7 +339,7 @@ router.get('/:dashboardId/panels/:panelId', async (req: Request, res: Response) 
     }
     res.json(panel);
   } catch (error) {
-    console.error('Get panel error:', error);
+    logger.error({ error, panelId: req.params.panelId }, 'Get panel error');
     res.status(500).json({ error: 'Failed to get panel' });
   }
 });
@@ -280,98 +347,139 @@ router.get('/:dashboardId/panels/:panelId', async (req: Request, res: Response) 
 /**
  * POST /:dashboardId/panels
  * Creates a new panel on a dashboard.
+ * Requires editor role and ownership of the dashboard.
  *
  * @param dashboardId - Parent dashboard UUID
  * @body {title, panel_type, query, position, options?}
  * @returns The newly created panel
  */
-router.post('/:dashboardId/panels', async (req: Request, res: Response) => {
-  try {
-    const validation = CreatePanelSchema.safeParse(req.body);
-    if (!validation.success) {
-      return res.status(400).json({
-        error: 'Invalid request body',
-        details: validation.error.errors,
+router.post(
+  '/:dashboardId/panels',
+  requireAuth,
+  requireOwnerOrAdmin(async (req) => {
+    const dashboard = await getDashboard(req.params.dashboardId);
+    return dashboard?.user_id;
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const validation = CreatePanelSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({
+          error: 'Invalid request body',
+          details: validation.error.errors,
+        });
+      }
+
+      const { title, panel_type, query, position, options } = validation.data;
+
+      const panel = await createPanel(req.params.dashboardId, {
+        title,
+        panelType: panel_type,
+        query,
+        position,
+        panelOptions: options,
       });
+
+      logger.info({
+        panelId: panel.id,
+        dashboardId: req.params.dashboardId,
+        userId: req.session?.userId,
+      }, 'Panel created');
+
+      res.status(201).json(panel);
+    } catch (error) {
+      logger.error({ error, dashboardId: req.params.dashboardId }, 'Create panel error');
+      res.status(500).json({ error: 'Failed to create panel' });
     }
-
-    const { title, panel_type, query, position, options } = validation.data;
-
-    const panel = await createPanel(req.params.dashboardId, {
-      title,
-      panelType: panel_type,
-      query,
-      position,
-      panelOptions: options,
-    });
-
-    res.status(201).json(panel);
-  } catch (error) {
-    console.error('Create panel error:', error);
-    res.status(500).json({ error: 'Failed to create panel' });
   }
-});
+);
 
 /**
  * PUT /:dashboardId/panels/:panelId
  * Updates an existing panel's properties.
+ * Requires ownership of the parent dashboard.
  *
  * @param dashboardId - Parent dashboard UUID
  * @param panelId - Panel UUID
  * @body Partial panel properties to update
  * @returns The updated panel
  */
-router.put('/:dashboardId/panels/:panelId', async (req: Request, res: Response) => {
-  try {
-    const validation = UpdatePanelSchema.safeParse(req.body);
-    if (!validation.success) {
-      return res.status(400).json({
-        error: 'Invalid request body',
-        details: validation.error.errors,
+router.put(
+  '/:dashboardId/panels/:panelId',
+  requireAuth,
+  requireOwnerOrAdmin(async (req) => {
+    const dashboard = await getDashboard(req.params.dashboardId);
+    return dashboard?.user_id;
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const validation = UpdatePanelSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({
+          error: 'Invalid request body',
+          details: validation.error.errors,
+        });
+      }
+
+      const { title, panel_type, query, position, options } = validation.data;
+
+      const panel = await updatePanel(req.params.panelId, {
+        title,
+        panelType: panel_type,
+        query,
+        position,
+        options,
       });
+
+      if (!panel) {
+        return res.status(404).json({ error: 'Panel not found' });
+      }
+
+      logger.info({ panelId: panel.id, userId: req.session?.userId }, 'Panel updated');
+      res.json(panel);
+    } catch (error) {
+      logger.error({ error, panelId: req.params.panelId }, 'Update panel error');
+      res.status(500).json({ error: 'Failed to update panel' });
     }
-
-    const { title, panel_type, query, position, options } = validation.data;
-
-    const panel = await updatePanel(req.params.panelId, {
-      title,
-      panelType: panel_type,
-      query,
-      position,
-      options,
-    });
-
-    if (!panel) {
-      return res.status(404).json({ error: 'Panel not found' });
-    }
-
-    res.json(panel);
-  } catch (error) {
-    console.error('Update panel error:', error);
-    res.status(500).json({ error: 'Failed to update panel' });
   }
-});
+);
 
 /**
  * DELETE /:dashboardId/panels/:panelId
  * Deletes a panel from a dashboard.
+ * Requires ownership of the parent dashboard.
  *
  * @param dashboardId - Parent dashboard UUID
  * @param panelId - Panel UUID
  * @returns 204 No Content on success
  */
-router.delete('/:dashboardId/panels/:panelId', async (req: Request, res: Response) => {
-  try {
-    const deleted = await deletePanel(req.params.panelId);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Panel not found' });
+router.delete(
+  '/:dashboardId/panels/:panelId',
+  requireAuth,
+  requireOwnerOrAdmin(async (req) => {
+    const dashboard = await getDashboard(req.params.dashboardId);
+    return dashboard?.user_id;
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const deleted = await deletePanel(req.params.panelId);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Panel not found' });
+      }
+
+      logger.info({
+        panelId: req.params.panelId,
+        dashboardId: req.params.dashboardId,
+        userId: req.session?.userId,
+      }, 'Panel deleted');
+
+      res.status(204).send();
+    } catch (error) {
+      logger.error({ error, panelId: req.params.panelId }, 'Delete panel error');
+      res.status(500).json({ error: 'Failed to delete panel' });
     }
-    res.status(204).send();
-  } catch (error) {
-    console.error('Delete panel error:', error);
-    res.status(500).json({ error: 'Failed to delete panel' });
   }
-});
+);
 
 /**
  * POST /:dashboardId/panels/:panelId/data
@@ -383,11 +491,22 @@ router.delete('/:dashboardId/panels/:panelId', async (req: Request, res: Respons
  * @body {start_time?, end_time?} - Optional time range (defaults to last hour)
  * @returns {results: QueryResult[]} - Time-series data for the panel
  */
-router.post('/:dashboardId/panels/:panelId/data', async (req: Request, res: Response) => {
+router.post('/:dashboardId/panels/:panelId/data', optionalAuth, async (req: Request, res: Response) => {
   try {
     const panel = await getPanel(req.params.panelId);
     if (!panel || panel.dashboard_id !== req.params.dashboardId) {
+      panelDataFetchTotal.inc({ panel_type: 'unknown', status: 'not_found' });
       return res.status(404).json({ error: 'Panel not found' });
+    }
+
+    // Check dashboard access
+    const dashboard = await getDashboard(req.params.dashboardId);
+    if (dashboard && !dashboard.is_public) {
+      const userId = req.session?.userId;
+      if (dashboard.user_id !== userId && req.session?.role !== 'admin') {
+        panelDataFetchTotal.inc({ panel_type: panel.panel_type, status: 'forbidden' });
+        return res.status(403).json({ error: 'Access denied' });
+      }
     }
 
     const { start_time, end_time } = req.body;
@@ -403,9 +522,11 @@ router.post('/:dashboardId/panels/:panelId/data', async (req: Request, res: Resp
       group_by: panelQuery.group_by,
     });
 
+    panelDataFetchTotal.inc({ panel_type: panel.panel_type, status: 'success' });
     res.json({ results });
   } catch (error) {
-    console.error('Get panel data error:', error);
+    panelDataFetchTotal.inc({ panel_type: 'unknown', status: 'error' });
+    logger.error({ error, panelId: req.params.panelId }, 'Get panel data error');
     res.status(500).json({ error: 'Failed to get panel data' });
   }
 });

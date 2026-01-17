@@ -29,12 +29,12 @@ const defaultOptions: CircuitBreaker.Options = {
  * @param options - Optional circuit breaker configuration overrides
  * @returns Circuit breaker instance wrapping the function
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
-  fn: T,
+export function createCircuitBreaker<TArgs extends unknown[], TReturn>(
+  fn: (...args: TArgs) => Promise<TReturn>,
   name: string,
   options: Partial<CircuitBreaker.Options> = {}
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
-  const breaker = new CircuitBreaker(fn, {
+): CircuitBreaker<TArgs, TReturn> {
+  const breaker = new CircuitBreaker<TArgs, TReturn>(fn, {
     ...defaultOptions,
     ...options,
     name,

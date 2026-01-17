@@ -1,6 +1,20 @@
 import { pool } from '../database.js';
+import { PoolClient } from 'pg';
 import { quoteService } from './quoteService.js';
 import type { Position, Order, Execution } from '../types/index.js';
+import { logger } from '../shared/logger.js';
+import { auditLogger } from '../shared/audit.js';
+import { idempotencyService } from '../shared/idempotency.js';
+import {
+  ordersPlacedTotal,
+  ordersFilledTotal,
+  ordersCancelledTotal,
+  ordersRejectedTotal,
+  orderExecutionDurationMs,
+  executionValueTotal,
+  executionSharesTotal,
+  portfolioUpdatesTotal,
+} from '../shared/metrics.js';
 
 /**
  * Request payload for placing a new order.
@@ -22,6 +36,22 @@ export interface OrderResult {
   order: Order;
   execution?: Execution;
   message: string;
+  /** Indicates if this result was returned from idempotency cache */
+  idempotent?: boolean;
+}
+
+/**
+ * Context for order placement including idempotency and tracing.
+ */
+export interface OrderContext {
+  /** Idempotency key to prevent duplicate orders */
+  idempotencyKey?: string;
+  /** Request ID for tracing */
+  requestId?: string;
+  /** Client IP address */
+  ipAddress?: string;
+  /** Client user agent */
+  userAgent?: string;
 }
 
 /**
@@ -29,21 +59,70 @@ export interface OrderResult {
  * Handles order placement, validation, execution, and cancellation.
  * Implements fund/share reservation to ensure transaction integrity.
  * Includes a background limit order matcher for non-market orders.
+ *
+ * Enhanced with:
+ * - Idempotency to prevent duplicate trades
+ * - Audit logging for SEC compliance
+ * - Prometheus metrics for monitoring
  */
 export class OrderService {
   private executionInterval: NodeJS.Timeout | null = null;
 
   /**
-   * Places a new order for a user.
-   * Validates the order, reserves funds or shares, and executes
-   * market orders immediately. Limit/stop orders are queued.
+   * Places a new order for a user with idempotency support.
+   * If an idempotency key is provided and a matching order exists,
+   * returns the cached result instead of placing a duplicate order.
+   *
    * @param userId - ID of the user placing the order
    * @param request - Order details including symbol, side, type, and quantity
+   * @param context - Optional context including idempotency key and request tracing
    * @returns Promise resolving to order result with execution details
    * @throws Error if validation fails (insufficient funds, invalid symbol, etc.)
    */
-  async placeOrder(userId: string, request: PlaceOrderRequest): Promise<OrderResult> {
+  async placeOrder(
+    userId: string,
+    request: PlaceOrderRequest,
+    context: OrderContext = {}
+  ): Promise<OrderResult> {
+    const orderLogger = logger.child({
+      userId,
+      symbol: request.symbol,
+      side: request.side,
+      orderType: request.order_type,
+      quantity: request.quantity,
+      requestId: context.requestId,
+    });
+
+    const startTime = Date.now();
+
+    // Check idempotency if key provided
+    if (context.idempotencyKey) {
+      const existing = await idempotencyService.check<OrderResult>(context.idempotencyKey, userId);
+
+      if (existing) {
+        if (existing.status === 'completed' && existing.result) {
+          orderLogger.info({ idempotencyKey: context.idempotencyKey }, 'Returning cached order result (idempotent)');
+          return { ...existing.result, idempotent: true };
+        }
+
+        if (existing.status === 'pending') {
+          // Another request is in progress - wait or return error
+          orderLogger.warn({ idempotencyKey: context.idempotencyKey }, 'Order placement already in progress');
+          throw new Error('Order placement already in progress. Please wait and retry.');
+        }
+
+        // If failed, allow retry
+      }
+
+      // Acquire idempotency lock
+      const locked = await idempotencyService.start(context.idempotencyKey, userId);
+      if (!locked) {
+        throw new Error('Order placement already in progress. Please wait and retry.');
+      }
+    }
+
     const client = await pool.connect();
+    let orderId: string | undefined;
 
     try {
       await client.query('BEGIN');
@@ -69,6 +148,7 @@ export class OrderService {
       );
 
       const order = orderResult.rows[0];
+      orderId = order.id;
 
       // Reserve funds or shares
       if (request.side === 'buy') {
@@ -91,14 +171,73 @@ export class OrderService {
 
       await client.query('COMMIT');
 
+      // Track metrics
+      ordersPlacedTotal.inc({ side: request.side, order_type: request.order_type });
+
+      // Audit log the order placement
+      await auditLogger.logOrderPlaced(userId, order.id, {
+        symbol: request.symbol.toUpperCase(),
+        side: request.side,
+        orderType: request.order_type,
+        quantity: request.quantity,
+        limitPrice: request.limit_price,
+        stopPrice: request.stop_price,
+        timeInForce: request.time_in_force || 'day',
+      }, {
+        requestId: context.requestId,
+        ipAddress: context.ipAddress,
+        userAgent: context.userAgent,
+        idempotencyKey: context.idempotencyKey,
+      });
+
+      orderLogger.info({ orderId: order.id }, 'Order placed successfully');
+
+      let result: OrderResult;
+
       // For market orders, execute immediately (simulation)
       if (request.order_type === 'market') {
-        return await this.executeOrderImmediately(order);
+        result = await this.executeOrderImmediately(order, context);
+      } else {
+        result = { order, message: 'Order placed successfully' };
       }
 
-      return { order, message: 'Order placed successfully' };
+      // Track execution duration for market orders
+      const duration = Date.now() - startTime;
+      orderExecutionDurationMs.observe({ order_type: request.order_type }, duration);
+
+      // Cache result for idempotency
+      if (context.idempotencyKey) {
+        await idempotencyService.complete(context.idempotencyKey, userId, result);
+      }
+
+      return result;
     } catch (error) {
       await client.query('ROLLBACK');
+
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      orderLogger.error({ error: errorMessage }, 'Order placement failed');
+
+      // Track rejection metrics
+      ordersRejectedTotal.inc({ reason: errorMessage.substring(0, 50) });
+
+      // Audit log the rejection if we got far enough to have an order ID
+      if (orderId) {
+        await auditLogger.logOrderRejected(userId, orderId, errorMessage, {
+          symbol: request.symbol.toUpperCase(),
+          side: request.side,
+          orderType: request.order_type,
+          quantity: request.quantity,
+        }, {
+          requestId: context.requestId,
+          idempotencyKey: context.idempotencyKey,
+        });
+      }
+
+      // Mark idempotency as failed
+      if (context.idempotencyKey) {
+        await idempotencyService.fail(context.idempotencyKey, userId, errorMessage);
+      }
+
       throw error;
     } finally {
       client.release();
@@ -116,7 +255,7 @@ export class OrderService {
    * @throws Error with descriptive message if validation fails
    */
   private async validateOrder(
-    client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
+    client: PoolClient,
     userId: string,
     request: PlaceOrderRequest
   ): Promise<void> {
@@ -181,10 +320,11 @@ export class OrderService {
   /**
    * Executes a market order immediately at current market price.
    * @param order - Order to execute
+   * @param context - Order context for tracing
    * @returns Promise resolving to order result with execution
    * @throws Error if quote is not available
    */
-  private async executeOrderImmediately(order: Order): Promise<OrderResult> {
+  private async executeOrderImmediately(order: Order, context: OrderContext = {}): Promise<OrderResult> {
     const quote = quoteService.getQuote(order.symbol);
     if (!quote) {
       throw new Error('Quote not available');
@@ -192,7 +332,7 @@ export class OrderService {
 
     const fillPrice = order.side === 'buy' ? quote.ask : quote.bid;
 
-    return await this.fillOrder(order, fillPrice, order.quantity);
+    return await this.fillOrder(order, fillPrice, order.quantity, context);
   }
 
   /**
@@ -202,10 +342,20 @@ export class OrderService {
    * @param order - Order to fill
    * @param price - Execution price per share
    * @param quantity - Number of shares to fill
+   * @param context - Order context for tracing
    * @returns Promise resolving to order result with execution details
    */
-  async fillOrder(order: Order, price: number, quantity: number): Promise<OrderResult> {
+  async fillOrder(order: Order, price: number, quantity: number, context: OrderContext = {}): Promise<OrderResult> {
     const client = await pool.connect();
+    const fillLogger = logger.child({
+      orderId: order.id,
+      userId: order.user_id,
+      symbol: order.symbol,
+      side: order.side,
+      fillPrice: price,
+      fillQuantity: quantity,
+      requestId: context.requestId,
+    });
 
     try {
       await client.query('BEGIN');
@@ -242,8 +392,10 @@ export class OrderService {
       // Update position
       if (order.side === 'buy') {
         await this.updatePositionForBuy(client, order.user_id, order.symbol, quantity, price);
+        portfolioUpdatesTotal.inc({ type: 'buy' });
       } else {
         await this.updatePositionForSell(client, order.user_id, order.symbol, quantity, price);
+        portfolioUpdatesTotal.inc({ type: 'sell' });
       }
 
       // Adjust buying power for actual fill
@@ -271,6 +423,25 @@ export class OrderService {
 
       await client.query('COMMIT');
 
+      // Track metrics
+      ordersFilledTotal.inc({ side: order.side, order_type: order.order_type });
+      executionValueTotal.inc({ side: order.side }, price * quantity);
+      executionSharesTotal.inc({ side: order.side }, quantity);
+
+      // Audit log the fill
+      await auditLogger.logOrderFilled(order.user_id, order.id, {
+        executionId: execution.id,
+        symbol: order.symbol,
+        side: order.side,
+        quantity,
+        price,
+        totalValue: price * quantity,
+        isFullyFilled,
+        avgFillPrice: newAvgPrice,
+      }, { requestId: context.requestId });
+
+      fillLogger.info({ executionId: execution.id }, `Order ${isFullyFilled ? 'filled' : 'partially filled'}`);
+
       // Fetch updated order
       const updatedOrderResult = await pool.query<Order>(
         'SELECT * FROM orders WHERE id = $1',
@@ -284,6 +455,7 @@ export class OrderService {
       };
     } catch (error) {
       await client.query('ROLLBACK');
+      fillLogger.error({ error }, 'Order fill failed');
       throw error;
     } finally {
       client.release();
@@ -300,7 +472,7 @@ export class OrderService {
    * @param price - Purchase price per share
    */
   private async updatePositionForBuy(
-    client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
+    client: PoolClient,
     userId: string,
     symbol: string,
     quantity: number,
@@ -345,7 +517,7 @@ export class OrderService {
    * @param _price - Sale price per share (unused, for signature consistency)
    */
   private async updatePositionForSell(
-    client: ReturnType<typeof pool.connect> extends Promise<infer T> ? T : never,
+    client: PoolClient,
     userId: string,
     symbol: string,
     quantity: number,
@@ -381,11 +553,17 @@ export class OrderService {
    * Releases reserved funds (buy) or shares (sell) back to the user.
    * @param userId - ID of the order owner
    * @param orderId - ID of the order to cancel
+   * @param context - Optional context for tracing
    * @returns Promise resolving to the cancelled order
    * @throws Error if order not found or cannot be cancelled
    */
-  async cancelOrder(userId: string, orderId: string): Promise<Order> {
+  async cancelOrder(userId: string, orderId: string, context: OrderContext = {}): Promise<Order> {
     const client = await pool.connect();
+    const cancelLogger = logger.child({
+      userId,
+      orderId,
+      requestId: context.requestId,
+    });
 
     try {
       await client.query('BEGIN');
@@ -434,6 +612,21 @@ export class OrderService {
 
       await client.query('COMMIT');
 
+      // Track metrics
+      ordersCancelledTotal.inc();
+
+      // Audit log the cancellation
+      await auditLogger.logOrderCancelled(userId, orderId, {
+        symbol: order.symbol,
+        side: order.side,
+        orderType: order.order_type,
+        originalQuantity: order.quantity,
+        filledQuantity: order.filled_quantity,
+        remainingQuantity: remainingQty,
+      }, { requestId: context.requestId });
+
+      cancelLogger.info('Order cancelled successfully');
+
       const updatedResult = await pool.query<Order>(
         'SELECT * FROM orders WHERE id = $1',
         [orderId]
@@ -442,6 +635,7 @@ export class OrderService {
       return updatedResult.rows[0];
     } catch (error) {
       await client.query('ROLLBACK');
+      cancelLogger.error({ error }, 'Order cancellation failed');
       throw error;
     } finally {
       client.release();
@@ -508,7 +702,7 @@ export class OrderService {
       await this.matchLimitOrders();
     }, 2000);
 
-    console.log('Limit order matcher started');
+    logger.info('Limit order matcher started');
   }
 
   /**
@@ -518,6 +712,7 @@ export class OrderService {
     if (this.executionInterval) {
       clearInterval(this.executionInterval);
       this.executionInterval = null;
+      logger.info('Limit order matcher stopped');
     }
   }
 
@@ -566,14 +761,14 @@ export class OrderService {
           const remainingQty = order.quantity - parseFloat(String(order.filled_quantity));
           try {
             await this.fillOrder(order, fillPrice, remainingQty);
-            console.log(`Filled order ${order.id} at $${fillPrice}`);
+            logger.info({ orderId: order.id, fillPrice }, 'Limit order filled');
           } catch (error) {
-            console.error(`Error filling order ${order.id}:`, error);
+            logger.error({ orderId: order.id, error }, 'Error filling limit order');
           }
         }
       }
     } catch (error) {
-      console.error('Error matching limit orders:', error);
+      logger.error({ error }, 'Error matching limit orders');
     }
   }
 }

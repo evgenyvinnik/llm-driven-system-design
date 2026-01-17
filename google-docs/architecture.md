@@ -741,3 +741,162 @@ Trace context propagated through:
 | Sticky sessions | Distributed OT | Complexity not justified for learning project |
 | Session cookies | JWT | Simpler revocation, no refresh token dance |
 | WebSocket | SSE | Bidirectional needed for operations and acks |
+
+---
+
+## Implementation Notes
+
+This section documents the rationale for key implementation decisions in the backend codebase. Each pattern addresses specific challenges in building a reliable, observable, and secure collaborative editing system.
+
+### Idempotency for Document Operations
+
+**Implementation Location**: `src/shared/idempotency.ts`, `src/middleware/idempotency.ts`, `src/services/collaboration.ts`
+
+**WHY Idempotency Enables Reliable OT Conflict Resolution:**
+
+1. **Network Reliability Problem**: In real-time collaboration, network connections are inherently unreliable. Clients must retry operations when they don't receive acknowledgments, but without idempotency, retries can cause data corruption:
+   - User types "hello" at position 10
+   - Network drops before ACK received
+   - Client retries the same operation
+   - Without idempotency: "hellohello" appears at position 10
+
+2. **OT Version Vector Integrity**: Operational Transformation relies on version vectors to order operations. Duplicate operations corrupt this ordering:
+   - Client sends operation at version 5
+   - Server transforms and increments to version 6
+   - Duplicate arrives, server increments to version 7
+   - Document state becomes inconsistent across clients
+
+3. **Implementation Strategy**:
+   - Clients include a unique `operationId` in each WebSocket message
+   - Server checks Redis for existing result before processing
+   - If found, returns cached ACK without re-applying operation
+   - Key format: `op:{userId}:{documentId}:{operationId}`
+   - TTL: 1 hour (long enough for retries, short enough to not waste memory)
+
+4. **HTTP Request Idempotency**:
+   - Clients can include `Idempotency-Key` header for POST/PUT/PATCH/DELETE
+   - Server caches response and returns it for duplicate requests
+   - Enables safe retries for document creation, sharing, etc.
+
+### Role-Based Access Control (RBAC) for Documents
+
+**Implementation Location**: `src/shared/rbac.ts`, integrated into route handlers
+
+**WHY RBAC Enables Document Sharing Permissions:**
+
+1. **Collaboration Requires Granular Access**: Unlike single-user applications, collaborative editing requires nuanced permission levels:
+   - **Owner**: Full control (edit, share, delete, transfer ownership)
+   - **Editor**: Edit content, add comments, view history
+   - **Commenter**: Add comments and suggestions, view content
+   - **Viewer**: Read-only access to content and comments
+
+2. **Security at Multiple Layers**:
+   - **REST API**: RBAC middleware (`requireEdit`, `requireShare`, `requireDelete`) validates permissions before handlers execute
+   - **WebSocket**: Permission checked on subscription, stored in client connection state
+   - **Database Queries**: Include permission joins to enforce access at data layer
+
+3. **Capability-Based Design**:
+   ```typescript
+   const PERMISSION_CAPABILITIES = {
+     owner: { canView: true, canComment: true, canEdit: true, canShare: true, canDelete: true },
+     edit: { canView: true, canComment: true, canEdit: true, canShare: false, canDelete: false },
+     comment: { canView: true, canComment: true, canEdit: false, canShare: false, canDelete: false },
+     view: { canView: true, canComment: false, canEdit: false, canShare: false, canDelete: false },
+   };
+   ```
+   - Decouples permission levels from capability checks
+   - Easy to add new capabilities without modifying permission levels
+   - Centralized permission logic reduces security bugs
+
+4. **Pending Share Invitations**: Email-based permissions allow sharing with users who haven't signed up yet, enabling external collaboration workflows.
+
+### Circuit Breakers for OT Sync Operations
+
+**Implementation Location**: `src/shared/circuitBreaker.ts`, `src/services/collaboration.ts`
+
+**WHY Circuit Breakers Protect Real-Time Collaboration:**
+
+1. **Cascading Failure Prevention**: In collaborative editing, a slow database or Redis can create cascading failures:
+   - Database query takes 10 seconds instead of 50ms
+   - All WebSocket handlers block waiting for database
+   - Connection backlog grows, clients disconnect
+   - Reconnection storms overwhelm the server
+
+2. **Fail-Fast for Real-Time UX**: Users expect sub-100ms latency for keystrokes. Circuit breakers provide predictable failure:
+   - Instead of 10-second timeout, fail after 2 seconds
+   - Client can show "temporarily unavailable" immediately
+   - Server remains responsive for other documents
+
+3. **Configuration Optimized for Collaboration**:
+   ```typescript
+   const OT_SYNC_OPTIONS = {
+     timeout: 2000,          // 2 seconds - tight for real-time
+     errorThresholdPercentage: 50,
+     resetTimeout: 5000,     // Quick recovery attempt
+     volumeThreshold: 3,     // Open after 3 failures in a row
+   };
+   ```
+
+4. **Graceful Degradation Modes**:
+   - **Database circuit open**: Operations still broadcast to connected clients, persist queued for retry
+   - **Redis circuit open**: Fall back to PostgreSQL for sessions, skip cross-server broadcast
+   - **Both open**: Document remains editable locally, sync resumes when services recover
+
+5. **Observable Failure**:
+   - Circuit state exposed via Prometheus gauge (`google_docs_circuit_breaker_state`)
+   - Events tracked via counter (`google_docs_circuit_breaker_events_total`)
+   - Enables alerting before user impact
+
+### Sync Latency Metrics for UX Optimization
+
+**Implementation Location**: `src/shared/metrics.ts`, `src/services/collaboration.ts`
+
+**WHY Sync Latency Metrics Enable UX Optimization:**
+
+1. **User Perception Thresholds**: Research shows users perceive latency differently at various thresholds:
+   - < 50ms: Feels instantaneous
+   - 50-100ms: Slight delay, still acceptable
+   - 100-250ms: Noticeable lag, frustrating for rapid typing
+   - > 250ms: Disrupts flow, causes confusion with cursor positions
+
+2. **Metric Design**:
+   ```
+   # Histogram: OT operation sync latency in milliseconds
+   google_docs_sync_latency_ms{operation_type="insert"} bucket_le_50ms=1234
+   google_docs_sync_latency_ms{operation_type="insert"} bucket_le_100ms=1345
+   ```
+   - Buckets aligned with perception thresholds: 5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 1000ms
+   - Labeled by operation type (insert, delete, format) to identify problematic transforms
+   - p95 latency used for SLI: target < 100ms
+
+3. **Optimization Opportunities Exposed**:
+   - **High insert latency**: OT transform function needs optimization
+   - **High delete latency**: Large selection deletions need batching
+   - **Latency spikes correlated with active users**: Need more server instances
+   - **Latency increases over document size**: Need operation log compaction
+
+4. **SLI/SLO Integration**:
+   - SLI: p95 sync latency < 100ms
+   - Alert threshold: > 250ms over 5 minutes
+   - Dashboard shows latency distribution by operation type and document size
+
+### Additional Implementation Details
+
+**Structured Logging with Pino** (`src/shared/logger.ts`):
+- JSON format for easy parsing by log aggregators (ELK, Loki)
+- Request correlation via trace IDs
+- Log levels: trace (cursor positions) -> fatal (application crash)
+- Pretty printing in development, JSON in production
+
+**Prometheus Metrics Endpoint** (`/metrics`):
+- Active documents gauge: Helps size WebSocket connection pools
+- Active collaborators gauge: Monitors real-time load
+- HTTP request histograms: SLI for API latency
+- Cache hit/miss counters: Tunes Redis TTLs
+- Circuit breaker state: Indicates degraded operation
+
+**Enhanced Health Check** (`/health`):
+- Performs actual connectivity checks (PostgreSQL SELECT 1, Redis PING)
+- Returns component-level status with latency
+- Returns 503 when any dependency is unhealthy
+- Includes collaboration stats for debugging

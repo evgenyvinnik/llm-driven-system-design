@@ -6,6 +6,14 @@ import {
 } from '../types/index.js';
 import { meetingTypeService } from './meetingTypeService.js';
 import { bookingService } from './bookingService.js';
+import { logger } from '../shared/logger.js';
+import {
+  availabilityChecksTotal,
+  availabilityCalculationDuration,
+  recordAvailabilityCheck,
+  recordCacheOperation,
+} from '../shared/metrics.js';
+import { RETENTION_CONFIG } from '../shared/config.js';
 import {
   createDateWithTime,
   getDayOfWeekInTimezone,
@@ -24,6 +32,17 @@ import { parseISO, addDays } from 'date-fns';
  * This is the core scheduling engine that determines when invitees can book meetings.
  * Handles weekly recurring availability rules and integrates with booking data
  * to prevent double-booking.
+ *
+ * WHY METRICS ENABLE AVAILABILITY OPTIMIZATION:
+ * Tracking availability calculations provides insights into:
+ * 1. Cache effectiveness - Are we serving most requests from cache?
+ * 2. Calculation latency - How long do complex availability queries take?
+ * 3. Popular time slots - Which dates are queried most frequently?
+ *
+ * This data enables proactive optimization:
+ * - Adjust cache TTL based on hit rate
+ * - Pre-warm cache for high-traffic users
+ * - Identify performance bottlenecks in slot calculation
  */
 export class AvailabilityService {
   /**
@@ -45,6 +64,11 @@ export class AvailabilityService {
 
     // Invalidate cache
     await this.invalidateCache(userId);
+
+    logger.info(
+      { userId, dayOfWeek: input.day_of_week },
+      'Created availability rule'
+    );
 
     return result.rows[0];
   }
@@ -86,6 +110,11 @@ export class AvailabilityService {
       // Invalidate cache
       await this.invalidateCache(userId);
 
+      logger.info(
+        { userId, ruleCount: rules.length },
+        'Updated availability rules'
+      );
+
       return insertedRules;
     } catch (error) {
       await client.query('ROLLBACK');
@@ -97,7 +126,7 @@ export class AvailabilityService {
 
   /**
    * Retrieves all active availability rules for a user.
-   * Results are cached in Redis for 5 minutes.
+   * Results are cached in Redis for the configured TTL.
    * @param userId - The UUID of the user
    * @returns Array of availability rules sorted by day and time
    */
@@ -106,8 +135,11 @@ export class AvailabilityService {
     const cached = await redis.get(cacheKey);
 
     if (cached) {
+      recordCacheOperation('hit', 'availability');
       return JSON.parse(cached);
     }
+
+    recordCacheOperation('miss', 'availability');
 
     const result = await pool.query(
       `SELECT * FROM availability_rules
@@ -116,7 +148,9 @@ export class AvailabilityService {
       [userId]
     );
 
-    await redis.setex(cacheKey, 300, JSON.stringify(result.rows));
+    const ttl = RETENTION_CONFIG.AVAILABILITY_CACHE_TTL_MINUTES * 60;
+    await redis.setex(cacheKey, ttl, JSON.stringify(result.rows));
+    recordCacheOperation('set', 'availability');
 
     return result.rows;
   }
@@ -128,7 +162,12 @@ export class AvailabilityService {
    * 2. Fetches existing bookings to identify busy periods
    * 3. Computes gaps and generates bookable slots with buffer times
    * 4. Filters out past slots and enforces daily booking limits
-   * Results are cached for 5 minutes.
+   * Results are cached for the configured TTL.
+   *
+   * METRICS:
+   * - Tracks cache hit/miss rates
+   * - Records calculation duration for performance monitoring
+   *
    * @param meetingTypeId - The UUID of the meeting type
    * @param dateStr - Date in YYYY-MM-DD format
    * @param inviteeTimezone - The invitee's timezone for display purposes
@@ -140,6 +179,13 @@ export class AvailabilityService {
     dateStr: string,
     inviteeTimezone: string
   ): Promise<TimeSlot[]> {
+    const startTime = Date.now();
+    const slotLogger = logger.child({
+      operation: 'getAvailableSlots',
+      meetingTypeId,
+      date: dateStr,
+    });
+
     // Get the meeting type
     const meetingType = await meetingTypeService.findByIdWithUser(meetingTypeId);
     if (!meetingType) {
@@ -153,8 +199,14 @@ export class AvailabilityService {
     const cacheKey = `slots:${meetingTypeId}:${dateStr}`;
     const cached = await redis.get(cacheKey);
     if (cached) {
+      const duration = (Date.now() - startTime) / 1000;
+      availabilityCalculationDuration.observe({ cache_hit: 'true' }, duration);
+      recordAvailabilityCheck(true);
+      slotLogger.debug({ duration, cached: true }, 'Returning cached slots');
       return JSON.parse(cached);
     }
+
+    recordAvailabilityCheck(false);
 
     // Get the day of week in host's timezone
     const date = parseISO(dateStr);
@@ -165,6 +217,9 @@ export class AvailabilityService {
     const dayRules = rules.filter((r) => r.day_of_week === dayOfWeek);
 
     if (dayRules.length === 0) {
+      const duration = (Date.now() - startTime) / 1000;
+      availabilityCalculationDuration.observe({ cache_hit: 'false' }, duration);
+      slotLogger.debug({ duration }, 'No availability rules for this day');
       return [];
     }
 
@@ -230,6 +285,9 @@ export class AvailabilityService {
       ).length;
 
       if (confirmedBookingsCount >= meetingType.max_bookings_per_day) {
+        const duration = (Date.now() - startTime) / 1000;
+        availabilityCalculationDuration.observe({ cache_hit: 'false' }, duration);
+        slotLogger.debug({ duration }, 'Max bookings per day reached');
         return [];
       }
 
@@ -240,8 +298,18 @@ export class AvailabilityService {
       }
     }
 
-    // Cache for 5 minutes
-    await redis.setex(cacheKey, 300, JSON.stringify(allSlots));
+    // Cache for configured TTL
+    const ttl = RETENTION_CONFIG.AVAILABILITY_CACHE_TTL_MINUTES * 60;
+    await redis.setex(cacheKey, ttl, JSON.stringify(allSlots));
+    recordCacheOperation('set', 'slots');
+
+    const duration = (Date.now() - startTime) / 1000;
+    availabilityCalculationDuration.observe({ cache_hit: 'false' }, duration);
+
+    slotLogger.debug(
+      { duration, slotCount: allSlots.length },
+      'Calculated available slots'
+    );
 
     return allSlots;
   }
@@ -290,6 +358,7 @@ export class AvailabilityService {
 
     if (result.rowCount && result.rowCount > 0) {
       await this.invalidateCache(userId);
+      logger.info({ userId, ruleId: id }, 'Deleted availability rule');
       return true;
     }
 
@@ -314,6 +383,7 @@ export class AvailabilityService {
 
     if (keys.length > 0) {
       await redis.del(...keys);
+      recordCacheOperation('delete', 'availability');
     }
   }
 }

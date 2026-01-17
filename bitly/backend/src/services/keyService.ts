@@ -1,6 +1,7 @@
 import { query, withTransaction } from '../utils/database.js';
 import { URL_CONFIG, SERVER_ID } from '../config.js';
 import { KeyPoolEntry } from '../models/types.js';
+import logger from '../utils/logger.js';
 
 /**
  * Local key cache for this server instance.
@@ -57,7 +58,7 @@ async function ensureKeysAvailable(): Promise<void> {
   if (localKeyCache.length < URL_CONFIG.keyPoolMinThreshold) {
     const newKeys = await fetchKeyBatch();
     localKeyCache.push(...newKeys);
-    console.log(`Fetched ${newKeys.length} keys, total in cache: ${localKeyCache.length}`);
+    logger.info({ fetched: newKeys.length, total: localKeyCache.length }, 'Keys fetched into local cache');
   }
 }
 
@@ -72,7 +73,7 @@ export async function getNextKey(): Promise<string> {
 
   if (localKeyCache.length === 0) {
     // Fallback: generate a random key if pool is empty
-    console.warn('Key pool empty, generating random key');
+    logger.warn('Key pool empty, generating random key');
     return generateRandomCode(URL_CONFIG.shortCodeLength);
   }
 
@@ -180,7 +181,7 @@ export async function repopulateKeyPool(count: number = 1000): Promise<number> {
  */
 export async function initKeyService(): Promise<void> {
   await ensureKeysAvailable();
-  console.log(`Key service initialized with ${localKeyCache.length} keys`);
+  logger.info({ keys: localKeyCache.length }, 'Key service initialized');
 }
 
 /**

@@ -3,6 +3,11 @@ import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getFollowedCelebrities } from '../services/fanout.js';
+import logger from '../shared/logger.js';
+import {
+  timelineLatency,
+  timelineRequestsTotal,
+} from '../shared/metrics.js';
 
 const router = express.Router();
 
@@ -34,6 +39,15 @@ function formatTweet(tweet, likeStatus = {}, retweetStatus = {}) {
 
 // GET /api/timeline/home - Get home timeline (hybrid push/pull)
 router.get('/home', requireAuth, async (req, res, next) => {
+  const startTime = Date.now();
+  const timelineLog = logger.child({
+    requestId: req.requestId,
+    userId: req.session.userId,
+    timelineType: 'home',
+  });
+
+  let cacheHit = false;
+
   try {
     const userId = req.session.userId;
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -42,10 +56,23 @@ router.get('/home', requireAuth, async (req, res, next) => {
     // Step 1: Get cached timeline (pushed tweets from non-celebrities)
     const timelineKey = `timeline:${userId}`;
     let cachedTweetIds = await redis.lrange(timelineKey, 0, limit * 2);
-    cachedTweetIds = cachedTweetIds.map(id => parseInt(id));
+    cachedTweetIds = cachedTweetIds.map((id) => parseInt(id));
+
+    // Track if we got data from cache
+    cacheHit = cachedTweetIds.length > 0;
+
+    timelineLog.debug(
+      { cachedCount: cachedTweetIds.length, cacheHit },
+      'Retrieved cached timeline IDs',
+    );
 
     // Step 2: Get followed celebrities for pull
     const celebrityIds = await getFollowedCelebrities(userId);
+
+    timelineLog.debug(
+      { celebrityCount: celebrityIds.length },
+      'Retrieved followed celebrities',
+    );
 
     // Step 3: Fetch tweets from celebrities (pull strategy)
     let celebrityTweets = [];
@@ -59,7 +86,7 @@ router.get('/home', requireAuth, async (req, res, next) => {
            AND t.reply_to IS NULL
          ORDER BY t.created_at DESC
          LIMIT $2`,
-        [celebrityIds, limit]
+        [celebrityIds, limit],
       );
       celebrityTweets = celebrityResult.rows;
     }
@@ -72,7 +99,7 @@ router.get('/home', requireAuth, async (req, res, next) => {
          FROM tweets t
          JOIN users u ON t.author_id = u.id
          WHERE t.id = ANY($1) AND t.is_deleted = false`,
-        [cachedTweetIds]
+        [cachedTweetIds],
       );
       cachedTweets = cachedResult.rows;
     }
@@ -94,7 +121,7 @@ router.get('/home', requireAuth, async (req, res, next) => {
 
     // Apply cursor-based pagination
     if (before) {
-      const beforeIndex = allTweets.findIndex(t => t.id.toString() === before);
+      const beforeIndex = allTweets.findIndex((t) => t.id.toString() === before);
       if (beforeIndex !== -1) {
         allTweets = allTweets.slice(beforeIndex + 1);
       }
@@ -103,32 +130,30 @@ router.get('/home', requireAuth, async (req, res, next) => {
     allTweets = allTweets.slice(0, limit);
 
     // Step 7: Get like/retweet status for current user
-    const tweetIds = allTweets.map(t => t.id);
+    const tweetIds = allTweets.map((t) => t.id);
     let likeStatus = {};
     let retweetStatus = {};
 
     if (tweetIds.length > 0) {
       const likeCheck = await pool.query(
         'SELECT tweet_id FROM likes WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [userId, tweetIds]
+        [userId, tweetIds],
       );
-      likeCheck.rows.forEach(row => {
+      likeCheck.rows.forEach((row) => {
         likeStatus[row.tweet_id] = true;
       });
 
       const retweetCheck = await pool.query(
         'SELECT tweet_id FROM retweets WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [userId, tweetIds]
+        [userId, tweetIds],
       );
-      retweetCheck.rows.forEach(row => {
+      retweetCheck.rows.forEach((row) => {
         retweetStatus[row.tweet_id] = true;
       });
     }
 
     // Step 8: Fetch original tweets for retweets
-    const retweetOfIds = allTweets
-      .filter(t => t.retweet_of)
-      .map(t => t.retweet_of);
+    const retweetOfIds = allTweets.filter((t) => t.retweet_of).map((t) => t.retweet_of);
 
     let originalTweets = {};
     if (retweetOfIds.length > 0) {
@@ -137,9 +162,9 @@ router.get('/home', requireAuth, async (req, res, next) => {
          FROM tweets t
          JOIN users u ON t.author_id = u.id
          WHERE t.id = ANY($1)`,
-        [retweetOfIds]
+        [retweetOfIds],
       );
-      origResult.rows.forEach(tweet => {
+      origResult.rows.forEach((tweet) => {
         originalTweets[tweet.id] = {
           id: tweet.id.toString(),
           content: tweet.content,
@@ -159,8 +184,25 @@ router.get('/home', requireAuth, async (req, res, next) => {
       });
     }
 
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe(
+      { timeline_type: 'home', cache_hit: cacheHit ? 'true' : 'false' },
+      duration,
+    );
+    timelineRequestsTotal.inc({ timeline_type: 'home', status: 'success' });
+
+    timelineLog.info(
+      {
+        tweetCount: allTweets.length,
+        cacheHit,
+        durationMs: Date.now() - startTime,
+      },
+      'Home timeline fetched',
+    );
+
     res.json({
-      tweets: allTweets.map(tweet => {
+      tweets: allTweets.map((tweet) => {
         const formatted = formatTweet(tweet, likeStatus, retweetStatus);
         if (tweet.retweet_of && originalTweets[tweet.retweet_of]) {
           formatted.originalTweet = originalTweets[tweet.retweet_of];
@@ -170,12 +212,27 @@ router.get('/home', requireAuth, async (req, res, next) => {
       nextCursor: allTweets.length > 0 ? allTweets[allTweets.length - 1].id.toString() : null,
     });
   } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe(
+      { timeline_type: 'home', cache_hit: cacheHit ? 'true' : 'false' },
+      duration,
+    );
+    timelineRequestsTotal.inc({ timeline_type: 'home', status: 'error' });
+
+    timelineLog.error({ error: error.message }, 'Home timeline fetch failed');
     next(error);
   }
 });
 
 // GET /api/timeline/user/:username - Get user's tweets (profile timeline)
 router.get('/user/:username', async (req, res, next) => {
+  const startTime = Date.now();
+  const timelineLog = logger.child({
+    requestId: req.requestId,
+    timelineType: 'user',
+    targetUsername: req.params.username,
+  });
+
   try {
     const { username } = req.params;
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -184,10 +241,11 @@ router.get('/user/:username', async (req, res, next) => {
     // Get user
     const userResult = await pool.query(
       'SELECT id FROM users WHERE username = $1',
-      [username.toLowerCase()]
+      [username.toLowerCase()],
     );
 
     if (userResult.rows.length === 0) {
+      timelineRequestsTotal.inc({ timeline_type: 'user', status: 'not_found' });
       return res.status(404).json({ error: 'User not found' });
     }
 
@@ -213,32 +271,30 @@ router.get('/user/:username', async (req, res, next) => {
     const result = await pool.query(query, params);
 
     // Get like/retweet status for current user
-    const tweetIds = result.rows.map(t => t.id);
+    const tweetIds = result.rows.map((t) => t.id);
     let likeStatus = {};
     let retweetStatus = {};
 
     if (req.session && req.session.userId && tweetIds.length > 0) {
       const likeCheck = await pool.query(
         'SELECT tweet_id FROM likes WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      likeCheck.rows.forEach(row => {
+      likeCheck.rows.forEach((row) => {
         likeStatus[row.tweet_id] = true;
       });
 
       const retweetCheck = await pool.query(
         'SELECT tweet_id FROM retweets WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      retweetCheck.rows.forEach(row => {
+      retweetCheck.rows.forEach((row) => {
         retweetStatus[row.tweet_id] = true;
       });
     }
 
     // Fetch original tweets for retweets
-    const retweetOfIds = result.rows
-      .filter(t => t.retweet_of)
-      .map(t => t.retweet_of);
+    const retweetOfIds = result.rows.filter((t) => t.retweet_of).map((t) => t.retweet_of);
 
     let originalTweets = {};
     if (retweetOfIds.length > 0) {
@@ -247,9 +303,9 @@ router.get('/user/:username', async (req, res, next) => {
          FROM tweets t
          JOIN users u ON t.author_id = u.id
          WHERE t.id = ANY($1)`,
-        [retweetOfIds]
+        [retweetOfIds],
       );
-      origResult.rows.forEach(tweet => {
+      origResult.rows.forEach((tweet) => {
         originalTweets[tweet.id] = {
           id: tweet.id.toString(),
           content: tweet.content,
@@ -264,8 +320,18 @@ router.get('/user/:username', async (req, res, next) => {
       });
     }
 
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'user', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'user', status: 'success' });
+
+    timelineLog.debug(
+      { tweetCount: result.rows.length, durationMs: Date.now() - startTime },
+      'User timeline fetched',
+    );
+
     res.json({
-      tweets: result.rows.map(tweet => {
+      tweets: result.rows.map((tweet) => {
         const formatted = formatTweet(tweet, likeStatus, retweetStatus);
         if (tweet.retweet_of && originalTweets[tweet.retweet_of]) {
           formatted.originalTweet = originalTweets[tweet.retweet_of];
@@ -275,12 +341,23 @@ router.get('/user/:username', async (req, res, next) => {
       nextCursor: result.rows.length > 0 ? result.rows[result.rows.length - 1].id.toString() : null,
     });
   } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'user', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'user', status: 'error' });
+
+    timelineLog.error({ error: error.message }, 'User timeline fetch failed');
     next(error);
   }
 });
 
 // GET /api/timeline/explore - Get explore/public timeline
 router.get('/explore', async (req, res, next) => {
+  const startTime = Date.now();
+  const timelineLog = logger.child({
+    requestId: req.requestId,
+    timelineType: 'explore',
+  });
+
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const before = req.query.before;
@@ -305,39 +382,61 @@ router.get('/explore', async (req, res, next) => {
     const result = await pool.query(query, params);
 
     // Get like/retweet status for current user
-    const tweetIds = result.rows.map(t => t.id);
+    const tweetIds = result.rows.map((t) => t.id);
     let likeStatus = {};
     let retweetStatus = {};
 
     if (req.session && req.session.userId && tweetIds.length > 0) {
       const likeCheck = await pool.query(
         'SELECT tweet_id FROM likes WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      likeCheck.rows.forEach(row => {
+      likeCheck.rows.forEach((row) => {
         likeStatus[row.tweet_id] = true;
       });
 
       const retweetCheck = await pool.query(
         'SELECT tweet_id FROM retweets WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      retweetCheck.rows.forEach(row => {
+      retweetCheck.rows.forEach((row) => {
         retweetStatus[row.tweet_id] = true;
       });
     }
 
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'explore', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'explore', status: 'success' });
+
+    timelineLog.debug(
+      { tweetCount: result.rows.length, durationMs: Date.now() - startTime },
+      'Explore timeline fetched',
+    );
+
     res.json({
-      tweets: result.rows.map(tweet => formatTweet(tweet, likeStatus, retweetStatus)),
+      tweets: result.rows.map((tweet) => formatTweet(tweet, likeStatus, retweetStatus)),
       nextCursor: result.rows.length > 0 ? result.rows[result.rows.length - 1].id.toString() : null,
     });
   } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'explore', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'explore', status: 'error' });
+
+    timelineLog.error({ error: error.message }, 'Explore timeline fetch failed');
     next(error);
   }
 });
 
 // GET /api/timeline/hashtag/:tag - Get tweets by hashtag
 router.get('/hashtag/:tag', async (req, res, next) => {
+  const startTime = Date.now();
+  const timelineLog = logger.child({
+    requestId: req.requestId,
+    timelineType: 'hashtag',
+    hashtag: req.params.tag,
+  });
+
   try {
     const hashtag = req.params.tag.toLowerCase();
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -362,34 +461,49 @@ router.get('/hashtag/:tag', async (req, res, next) => {
     const result = await pool.query(query, params);
 
     // Get like/retweet status for current user
-    const tweetIds = result.rows.map(t => t.id);
+    const tweetIds = result.rows.map((t) => t.id);
     let likeStatus = {};
     let retweetStatus = {};
 
     if (req.session && req.session.userId && tweetIds.length > 0) {
       const likeCheck = await pool.query(
         'SELECT tweet_id FROM likes WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      likeCheck.rows.forEach(row => {
+      likeCheck.rows.forEach((row) => {
         likeStatus[row.tweet_id] = true;
       });
 
       const retweetCheck = await pool.query(
         'SELECT tweet_id FROM retweets WHERE user_id = $1 AND tweet_id = ANY($2)',
-        [req.session.userId, tweetIds]
+        [req.session.userId, tweetIds],
       );
-      retweetCheck.rows.forEach(row => {
+      retweetCheck.rows.forEach((row) => {
         retweetStatus[row.tweet_id] = true;
       });
     }
 
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'hashtag', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'hashtag', status: 'success' });
+
+    timelineLog.debug(
+      { tweetCount: result.rows.length, durationMs: Date.now() - startTime },
+      'Hashtag timeline fetched',
+    );
+
     res.json({
       hashtag,
-      tweets: result.rows.map(tweet => formatTweet(tweet, likeStatus, retweetStatus)),
+      tweets: result.rows.map((tweet) => formatTweet(tweet, likeStatus, retweetStatus)),
       nextCursor: result.rows.length > 0 ? result.rows[result.rows.length - 1].id.toString() : null,
     });
   } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    timelineLatency.observe({ timeline_type: 'hashtag', cache_hit: 'false' }, duration);
+    timelineRequestsTotal.inc({ timeline_type: 'hashtag', status: 'error' });
+
+    timelineLog.error({ error: error.message }, 'Hashtag timeline fetch failed');
     next(error);
   }
 });

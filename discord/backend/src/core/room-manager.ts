@@ -50,7 +50,7 @@ export class RoomManager {
     this.roomMembers.set(name, new Set());
     historyBuffer.initRoom(name);
 
-    logger.info('Room created', { name, createdBy });
+    logger.info({ name, createdBy }, 'Room created');
     return room;
   }
 
@@ -107,7 +107,7 @@ export class RoomManager {
     }
     this.roomMembers.get(roomName)!.add(userId);
 
-    logger.debug('User joined room', { roomName, userId });
+    logger.debug({ roomName, userId }, 'User joined room');
     return room;
   }
 
@@ -132,7 +132,7 @@ export class RoomManager {
       members.delete(userId);
     }
 
-    logger.debug('User left room', { roomName, userId });
+    logger.debug({ roomName, userId }, 'User left room');
     return true;
   }
 
@@ -150,7 +150,7 @@ export class RoomManager {
 
     // Update database
     await dbOps.leaveAllRooms(userId);
-    logger.debug('User left all rooms', { userId });
+    logger.debug({ userId }, 'User left all rooms');
   }
 
   /**

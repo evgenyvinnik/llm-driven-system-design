@@ -41,3 +41,7 @@ coverage/
 
 # Misc
 *.tsbuildinfo
+
+# Snapshot data (persistence)
+backend/data/
+data/

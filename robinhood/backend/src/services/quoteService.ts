@@ -1,5 +1,8 @@
 import { redis } from '../redis.js';
 import type { Quote } from '../types/index.js';
+import { logger } from '../shared/logger.js';
+import { createCircuitBreaker, CircuitBreakerState, getCircuitBreakerState } from '../shared/circuitBreaker.js';
+import CircuitBreaker from 'opossum';
 
 /**
  * Mock stock data for price simulation.
@@ -32,6 +35,9 @@ const STOCKS: Record<string, { name: string; basePrice: number; volatility: numb
 /** In-memory cache for current simulated stock prices */
 const currentPrices: Map<string, Quote> = new Map();
 
+/** Last known good quotes for fallback when circuit breaker is open */
+let lastKnownQuotes: Map<string, Quote> = new Map();
+
 /**
  * Initializes stock prices with realistic market data.
  * Sets up bid/ask spreads, open/high/low values, and volume.
@@ -58,6 +64,8 @@ function initializePrices(): void {
     quote.changePercent = (quote.change / quote.open) * 100;
     currentPrices.set(symbol, quote);
   }
+  // Initialize last known quotes
+  lastKnownQuotes = new Map(currentPrices);
 }
 
 /**
@@ -88,20 +96,106 @@ function simulatePriceMovement(quote: Quote, volatility: number): Quote {
 }
 
 /**
+ * Simulated external market data fetch.
+ * In production, this would call an external API like IEX Cloud, Alpha Vantage, etc.
+ * Wrapped with circuit breaker for resilience.
+ */
+async function fetchMarketData(_symbol: string): Promise<Quote | null> {
+  // Simulate external API call
+  // In production, this would be:
+  // const response = await axios.get(`https://api.marketdata.com/v1/quote/${symbol}`);
+  // return response.data;
+
+  // Simulate occasional failures for testing circuit breaker
+  if (Math.random() < 0.001) {
+    throw new Error('Market data provider timeout');
+  }
+
+  return null; // Using simulated data instead
+}
+
+/**
+ * Publishes quotes to Redis.
+ * Wrapped with circuit breaker to handle Redis outages.
+ */
+async function publishQuotesToRedis(quotes: Quote[]): Promise<void> {
+  for (const quote of quotes) {
+    await redis.hset(`quote:${quote.symbol}`, 'data', JSON.stringify(quote));
+  }
+  await redis.publish('quote_updates', JSON.stringify(quotes));
+}
+
+/**
  * Service for managing real-time stock quotes.
  * Simulates market data with configurable update intervals and
  * supports pub/sub for distributing quotes to WebSocket clients.
+ *
+ * Enhanced with:
+ * - Circuit breaker for external market data calls
+ * - Circuit breaker for Redis publishing
+ * - Fallback to last known good quotes
+ * - Structured logging
+ *
  * In a production system, this would integrate with real market data providers.
  */
 export class QuoteService {
   private updateInterval: NodeJS.Timeout | null = null;
   private subscribers: Map<string, Set<(quotes: Quote[]) => void>> = new Map();
 
+  /** Circuit breaker for external market data API */
+  private marketDataBreaker: CircuitBreaker<[string], Quote | null>;
+
+  /** Circuit breaker for Redis operations */
+  private redisBreaker: CircuitBreaker<[Quote[]], void>;
+
   /**
    * Creates a new QuoteService instance and initializes stock prices.
    */
   constructor() {
     initializePrices();
+
+    // Create circuit breaker for market data fetching
+    this.marketDataBreaker = createCircuitBreaker(fetchMarketData, {
+      name: 'market-data',
+      timeout: 5000, // 5 second timeout
+      errorThresholdPercentage: 50,
+      volumeThreshold: 10,
+      resetTimeout: 30000, // 30 seconds before trying again
+    });
+
+    // Fallback: return last known quote when circuit is open
+    this.marketDataBreaker.fallback((symbol: string) => {
+      logger.warn({ symbol }, 'Using fallback quote data - market data circuit open');
+      return lastKnownQuotes.get(symbol.toUpperCase()) || null;
+    });
+
+    // Create circuit breaker for Redis publishing
+    this.redisBreaker = createCircuitBreaker(publishQuotesToRedis, {
+      name: 'redis-publish',
+      timeout: 3000, // 3 second timeout
+      errorThresholdPercentage: 50,
+      volumeThreshold: 5,
+      resetTimeout: 10000, // 10 seconds
+    });
+
+    // Fallback: log warning when Redis is unavailable
+    this.redisBreaker.fallback(() => {
+      logger.warn('Redis publish circuit open - quotes not persisted');
+    });
+  }
+
+  /**
+   * Gets the current state of the market data circuit breaker.
+   */
+  getMarketDataCircuitState(): CircuitBreakerState {
+    return getCircuitBreakerState(this.marketDataBreaker);
+  }
+
+  /**
+   * Gets the current state of the Redis circuit breaker.
+   */
+  getRedisCircuitState(): CircuitBreakerState {
+    return getCircuitBreakerState(this.redisBreaker);
   }
 
   /**
@@ -120,25 +214,23 @@ export class QuoteService {
         if (stock) {
           const newQuote = simulatePriceMovement(quote, stock.volatility);
           currentPrices.set(symbol, newQuote);
+          lastKnownQuotes.set(symbol, newQuote); // Update fallback cache
           updatedQuotes.push(newQuote);
-
-          // Store in Redis
-          await redis.hset(
-            `quote:${symbol}`,
-            'data',
-            JSON.stringify(newQuote)
-          );
         }
       }
 
-      // Notify all subscribers
+      // Notify all subscribers (in-process, always works)
       this.notifySubscribers(updatedQuotes);
 
-      // Publish to Redis pub/sub for other processes
-      await redis.publish('quote_updates', JSON.stringify(updatedQuotes));
+      // Publish to Redis with circuit breaker protection
+      try {
+        await this.redisBreaker.fire(updatedQuotes);
+      } catch (error) {
+        // Circuit breaker fallback handles this
+      }
     }, intervalMs);
 
-    console.log(`Quote service started with ${intervalMs}ms interval`);
+    logger.info({ intervalMs }, 'Quote service started');
   }
 
   /**
@@ -148,16 +240,40 @@ export class QuoteService {
     if (this.updateInterval) {
       clearInterval(this.updateInterval);
       this.updateInterval = null;
+      logger.info('Quote service stopped');
     }
   }
 
   /**
    * Gets the current quote for a single stock symbol.
+   * Uses circuit breaker when fetching from external source.
    * @param symbol - Stock ticker symbol (case-insensitive)
    * @returns Quote object or null if symbol not found
    */
   getQuote(symbol: string): Quote | null {
     return currentPrices.get(symbol.toUpperCase()) || null;
+  }
+
+  /**
+   * Gets a quote with circuit breaker protection for external data.
+   * Falls back to cached data if external source is unavailable.
+   * @param symbol - Stock ticker symbol
+   * @returns Quote object or null
+   */
+  async getQuoteWithFallback(symbol: string): Promise<Quote | null> {
+    try {
+      // Try external market data first (with circuit breaker)
+      const externalQuote = await this.marketDataBreaker.fire(symbol);
+      if (externalQuote) {
+        currentPrices.set(symbol.toUpperCase(), externalQuote);
+        return externalQuote;
+      }
+    } catch (error) {
+      // Circuit breaker fallback handles this
+    }
+
+    // Fall back to simulated/cached data
+    return this.getQuote(symbol);
   }
 
   /**
@@ -245,7 +361,7 @@ export class QuoteService {
         try {
           callback(quotes);
         } catch (error) {
-          console.error('Error notifying subscriber:', error);
+          logger.error({ error }, 'Error notifying subscriber');
         }
       }
     }

@@ -46,13 +46,13 @@ const defaultOptions: Required<CircuitBreakerOptions> = {
  * @param name - Name for logging and metrics
  * @param fn - Async function to protect
  * @param options - Circuit breaker configuration
- * @returns Wrapped function with circuit breaker protection
+ * @returns CircuitBreaker instance
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
   name: string,
-  fn: T,
+  fn: (...args: TArgs) => Promise<TResult>,
   options: CircuitBreakerOptions = {}
-): CircuitBreaker<Parameters<T>, ReturnType<T>> {
+): CircuitBreaker<TArgs, TResult> {
   const opts = { ...defaultOptions, ...options };
 
   const breaker = new CircuitBreaker(fn, {

@@ -145,7 +145,7 @@ export async function idempotencyMiddleware(
         request_method: req.method,
       };
 
-      redis.setex(cacheKey, IDEMPOTENCY_TTL, JSON.stringify(storedResponse)).catch((err) => {
+      redis.setex(cacheKey, IDEMPOTENCY_TTL, JSON.stringify(storedResponse)).catch((err: Error) => {
         logger.error({ err, idempotencyKey }, 'Failed to store idempotent response');
       });
 

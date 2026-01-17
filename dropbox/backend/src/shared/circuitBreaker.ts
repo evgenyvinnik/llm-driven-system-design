@@ -158,12 +158,14 @@ export function createRetryPolicy(options: RetryOptions): IPolicy {
 
   retryPolicy.onRetry((result) => {
     retryAttemptsTotal.labels(name, String(result.attempt)).inc();
+    // cockatiel provides error directly on result for retry events
+    const error = (result as unknown as { error?: Error }).error;
     logger.warn(
       {
         operation: name,
         attempt: result.attempt,
         delay: result.delay,
-        error: result.reason?.message,
+        error: error?.message,
       },
       `Retrying ${name} - attempt ${result.attempt}`
     );
@@ -177,10 +179,12 @@ export function createRetryPolicy(options: RetryOptions): IPolicy {
 
   retryPolicy.onFailure((result) => {
     retryExhaustedTotal.labels(name).inc();
+    // cockatiel provides error directly on result for failure events
+    const error = (result as unknown as { error?: Error }).error;
     logger.error(
       {
         operation: name,
-        error: result.reason?.message,
+        error: error?.message,
       },
       `${name} failed after all retries`
     );

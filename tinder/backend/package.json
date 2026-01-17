@@ -10,7 +10,11 @@
     "dev:server3": "PORT=3003 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "seed": "tsx src/db/seed.ts"
+    "seed": "tsx src/db/seed.ts",
+    "db:migrate": "tsx src/db/migrate.ts up",
+    "db:migrate:down": "tsx src/db/migrate.ts down",
+    "db:migrate:status": "tsx src/db/migrate.ts status",
+    "db:cleanup": "tsx src/scripts/cleanup.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.11.0",

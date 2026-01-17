@@ -4,12 +4,37 @@ import { query } from '../services/db.js';
 import { processAndUploadImage } from '../services/storage.js';
 import { storyTrayGet, storyTraySet, cacheGet, cacheSet } from '../services/redis.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { storyRateLimiter } from '../services/rateLimiter.js';
+import { createCircuitBreaker, fallbackWithError } from '../services/circuitBreaker.js';
+import logger from '../services/logger.js';
+import { storiesCreatedTotal, storyViewsTotal, imageProcessingDuration } from '../services/metrics.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
+// Circuit breaker for story image processing
+const storyImageBreaker = createCircuitBreaker(
+  'story_image_processing',
+  async (fileBuffer, originalName, filterName) => {
+    const startTime = Date.now();
+    const result = await processAndUploadImage(fileBuffer, originalName, filterName);
+    imageProcessingDuration.labels('story').observe((Date.now() - startTime) / 1000);
+    return result;
+  },
+  {
+    timeout: 30000,
+    errorThresholdPercentage: 50,
+    resetTimeout: 60000,
+    volumeThreshold: 3,
+  }
+);
+
+storyImageBreaker.fallback(
+  fallbackWithError('Story upload is temporarily unavailable. Please try again later.')
+);
+
 // Create story
-router.post('/', requireAuth, upload.single('media'), async (req, res) => {
+router.post('/', requireAuth, storyRateLimiter, upload.single('media'), async (req, res) => {
   try {
     const userId = req.session.userId;
     const { filter } = req.body;
@@ -18,8 +43,8 @@ router.post('/', requireAuth, upload.single('media'), async (req, res) => {
       return res.status(400).json({ error: 'Media file is required' });
     }
 
-    // Process and upload image
-    const mediaResult = await processAndUploadImage(req.file.buffer, req.file.originalname, filter || 'none');
+    // Process and upload image using circuit breaker
+    const mediaResult = await storyImageBreaker.fire(req.file.buffer, req.file.originalname, filter || 'none');
 
     // Create story with 24h expiration
     const result = await query(
@@ -30,6 +55,15 @@ router.post('/', requireAuth, upload.single('media'), async (req, res) => {
     );
 
     const story = result.rows[0];
+
+    // Track metrics
+    storiesCreatedTotal.inc();
+
+    logger.info({
+      type: 'story_created',
+      storyId: story.id,
+      userId,
+    }, `Story created: ${story.id}`);
 
     res.status(201).json({
       story: {
@@ -45,7 +79,14 @@ router.post('/', requireAuth, upload.single('media'), async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Create story error:', error);
+    if (error.code === 'SERVICE_UNAVAILABLE') {
+      return res.status(503).json({ error: error.message });
+    }
+    logger.error({
+      type: 'story_create_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Create story error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -95,7 +136,11 @@ router.get('/tray', requireAuth, async (req, res) => {
 
     res.json({ users });
   } catch (error) {
-    console.error('Get story tray error:', error);
+    logger.error({
+      type: 'story_tray_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Get story tray error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -148,12 +193,16 @@ router.get('/user/:userId', requireAuth, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Get user stories error:', error);
+    logger.error({
+      type: 'get_user_stories_error',
+      error: error.message,
+      targetUserId: req.params.userId,
+    }, `Get user stories error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// View story (track view)
+// View story (track view) - idempotent operation
 router.post('/:storyId/view', requireAuth, async (req, res) => {
   try {
     const { storyId } = req.params;
@@ -174,15 +223,30 @@ router.post('/:storyId/view', requireAuth, async (req, res) => {
       return res.json({ message: 'View not tracked for own story' });
     }
 
-    // Insert view (ignore if already viewed)
-    await query(
-      'INSERT INTO story_views (story_id, viewer_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+    // Insert view (ignore if already viewed) - idempotent
+    const result = await query(
+      'INSERT INTO story_views (story_id, viewer_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
       [storyId, viewerId]
     );
 
+    if (result.rows.length > 0) {
+      // New view - track metric
+      storyViewsTotal.inc();
+
+      logger.debug({
+        type: 'story_viewed',
+        storyId,
+        viewerId,
+      }, `Story viewed: ${storyId}`);
+    }
+
     res.json({ message: 'Story viewed' });
   } catch (error) {
-    console.error('View story error:', error);
+    logger.error({
+      type: 'story_view_error',
+      error: error.message,
+      storyId: req.params.storyId,
+    }, `View story error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -235,7 +299,11 @@ router.get('/:storyId/viewers', requireAuth, async (req, res) => {
       nextCursor: hasMore ? viewers[viewers.length - 1].viewed_at : null,
     });
   } catch (error) {
-    console.error('Get story viewers error:', error);
+    logger.error({
+      type: 'get_story_viewers_error',
+      error: error.message,
+      storyId: req.params.storyId,
+    }, `Get story viewers error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -257,9 +325,19 @@ router.delete('/:storyId', requireAuth, async (req, res) => {
 
     await query('DELETE FROM stories WHERE id = $1', [storyId]);
 
+    logger.info({
+      type: 'story_deleted',
+      storyId,
+      userId,
+    }, `Story deleted: ${storyId}`);
+
     res.json({ message: 'Story deleted' });
   } catch (error) {
-    console.error('Delete story error:', error);
+    logger.error({
+      type: 'story_delete_error',
+      error: error.message,
+      storyId: req.params.storyId,
+    }, `Delete story error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -287,7 +365,11 @@ router.get('/me', requireAuth, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Get my stories error:', error);
+    logger.error({
+      type: 'get_my_stories_error',
+      error: error.message,
+      userId: req.session.userId,
+    }, `Get my stories error: ${error.message}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

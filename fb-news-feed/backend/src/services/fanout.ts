@@ -3,9 +3,18 @@
  * Implements a hybrid push/pull strategy to optimize for different user types:
  * - Regular users (< 10K followers): Push model for low-latency feed updates
  * - Celebrities (>= 10K followers): Pull model to avoid write amplification
+ * Includes comprehensive metrics for monitoring fanout operations.
  */
 
 import { pool, redis } from '../db/connection.js';
+import {
+  componentLoggers,
+  fanoutOperationsTotal,
+  fanoutFollowersCount,
+  fanoutDuration,
+} from '../shared/index.js';
+
+const log = componentLoggers.fanout;
 
 /**
  * Threshold for classifying users as celebrities.
@@ -44,6 +53,8 @@ export async function fanoutPost(
   authorId: string,
   createdAt: Date
 ): Promise<FanoutResult> {
+  const startTime = Date.now();
+
   try {
     // Check if author is a celebrity
     const authorResult = await pool.query(
@@ -67,6 +78,17 @@ export async function fanoutPost(
       );
       // Keep only recent 100 posts for celebrities
       await redis.zremrangebyrank(`celebrity_posts:${authorId}`, 0, -101);
+
+      // Record metrics
+      const duration = (Date.now() - startTime) / 1000;
+      fanoutOperationsTotal.labels('celebrity').inc();
+      fanoutFollowersCount.observe(0);
+      fanoutDuration.observe(duration);
+
+      log.info(
+        { postId, authorId, authorType: 'celebrity', duration_ms: Date.now() - startTime },
+        'Fanout complete (celebrity - stored in cache)'
+      );
 
       return { success: true, followersNotified: 0 };
     }
@@ -123,9 +145,26 @@ export async function fanoutPost(
       [authorId, postId, score, createdAt]
     );
 
+    // Record metrics
+    const duration = (Date.now() - startTime) / 1000;
+    fanoutOperationsTotal.labels('regular').inc();
+    fanoutFollowersCount.observe(followers.length);
+    fanoutDuration.observe(duration);
+
+    log.info(
+      {
+        postId,
+        authorId,
+        authorType: 'regular',
+        followersNotified: followers.length,
+        duration_ms: Date.now() - startTime,
+      },
+      'Fanout complete'
+    );
+
     return { success: true, followersNotified: followers.length };
   } catch (error) {
-    console.error('Fan-out error:', error);
+    log.error({ error, postId, authorId }, 'Fanout error');
     return { success: false, followersNotified: 0 };
   }
 }
@@ -161,8 +200,10 @@ export async function removeFanout(postId: string, authorId: string): Promise<vo
 
     // Remove from celebrity posts if applicable
     await redis.zrem(`celebrity_posts:${authorId}`, postId);
+
+    log.info({ postId, authorId }, 'Fanout removed');
   } catch (error) {
-    console.error('Remove fan-out error:', error);
+    log.error({ error, postId, authorId }, 'Remove fanout error');
   }
 }
 
@@ -204,8 +245,13 @@ export async function updateAffinity(
 
     // Cache in Redis
     await redis.zincrby(`affinity:${userId}`, scoreIncrease, targetUserId);
+
+    log.debug(
+      { userId, targetUserId, interactionType, scoreIncrease },
+      'Affinity updated'
+    );
   } catch (error) {
-    console.error('Update affinity error:', error);
+    log.error({ error, userId, targetUserId, interactionType }, 'Update affinity error');
   }
 }
 

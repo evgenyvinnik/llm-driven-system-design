@@ -700,6 +700,220 @@ echo "=== End Health Check ==="
 
 ---
 
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions. These notes explain "why" certain approaches were chosen and how they affect system behavior.
+
+### WHY Idempotency Prevents Duplicate View Counting
+
+**Problem Statement:**
+In a distributed system with network unreliability, the same view event can be processed multiple times:
+1. **Network retries**: Client retries a request on timeout, but the server already processed it
+2. **Double-clicks**: User accidentally triggers multiple view events
+3. **Client-side bugs**: Frontend code fires the same event multiple times
+4. **Load balancer retries**: Some LBs retry failed requests to different backends
+
+Without idempotency, a video could accumulate 2x, 3x, or more views from a single legitimate watch, leading to:
+- Inaccurate trending rankings
+- Inflated view counts
+- Loss of user trust in the trending algorithm
+
+**Solution: Redis-Based Idempotency Keys**
+
+```javascript
+// Generate key from request context
+const key = `idem:view:${videoId}:${sessionId}:${timeBucket}`;
+
+// Atomic check-and-set using SETNX
+const result = await redis.set(key, '1', { NX: true, EX: 3600 });
+if (result === null) {
+  // Duplicate request - skip processing
+  return { duplicate: true };
+}
+// Process the view normally
+```
+
+**Key Design Decisions:**
+- **Time bucketing (10-second windows)**: Allows for clock drift while preventing abuse
+- **Session-based keys**: Same user can watch again after TTL expires
+- **Redis SETNX**: Atomic operation prevents race conditions in distributed servers
+- **1-hour TTL**: Balances memory usage with protection window
+
+**Metrics to Monitor:**
+- `youtube_topk_duplicate_views_total`: Tracks prevented duplicates
+- High duplicate rate may indicate client bugs or abuse
+
+---
+
+### WHY Sliding Window Retention Balances Trending Accuracy vs Memory
+
+**The Tradeoff:**
+- **Shorter windows (15 min)**: Capture immediate viral content, but are noisy and volatile
+- **Longer windows (24 hours)**: Stable rankings, but miss fast-rising content
+- **Memory usage**: Each time bucket consumes Redis memory (O(videos * categories * buckets))
+
+**Our Approach: 60-Minute Window with 1-Minute Buckets**
+
+```
+Time: ────────────────────────────────────────────────>
+       │ bucket 1 │ bucket 2 │ ... │ bucket 59 │ bucket 60 │
+       └──────────┴──────────┴─────┴───────────┴───────────┘
+                       60-minute sliding window
+
+Each bucket expires after 70 minutes (window + buffer)
+```
+
+**Why This Works:**
+1. **Granularity**: 1-minute buckets provide smooth score changes (not jumpy)
+2. **Memory bound**: ~70 keys per category, predictable Redis usage
+3. **Automatic cleanup**: TTL ensures old buckets expire without manual intervention
+4. **Aggregation efficiency**: ZUNIONSTORE combines buckets in O(N log N)
+
+**Configuration Options (via environment):**
+```bash
+WINDOW_SIZE_MINUTES=60    # Longer = more stable, shorter = more reactive
+BUCKET_SIZE_MINUTES=1     # Larger = fewer keys, less granular
+EXPIRATION_BUFFER_MINUTES=10  # Safety margin for aggregation
+```
+
+**When to Adjust:**
+- High memory pressure → Increase bucket size to 5 minutes
+- Need fresher trends → Decrease window to 30 minutes
+- Very high traffic → Consider approximate algorithms (CountMinSketch)
+
+---
+
+### WHY Heap Operation Metrics Enable Algorithm Optimization
+
+**The Challenge:**
+The min-heap-based Top K algorithm has known performance characteristics (O(log K) per operation), but real-world behavior depends on:
+- Actual data distribution (how often top K changes)
+- Update patterns (new items vs updates to existing items)
+- System load (contention, memory pressure)
+
+**Metrics We Track:**
+
+```javascript
+// Operation counters and latency histograms
+heapOperationsTotal.inc({ operation: 'push' });
+heapOperationsTotal.inc({ operation: 'pop' });
+heapOperationsTotal.inc({ operation: 'rebuild' });
+heapOperationLatency.observe({ operation }, duration);
+```
+
+**What These Metrics Tell Us:**
+
+| Metric Pattern | Interpretation | Action |
+|----------------|----------------|--------|
+| High `rebuild` count | Many updates to existing top K items | Consider indexed heap structure |
+| Push/pop ratio near 1:1 | High churn in top K | Top K is volatile, may need smoothing |
+| Latency spikes | Possible memory pressure or GC | Monitor heap size, consider smaller K |
+| Low operation count | Top K is stable | Can reduce update frequency |
+
+**Algorithm Selection Guidance:**
+- **Current (MinHeap)**: Best for K < 100, exact counts
+- **SpaceSaving**: Better for high cardinality, bounded error acceptable
+- **CountMinSketch + TopK**: Best for extreme scale, approximate counts OK
+
+**Prometheus Queries for Analysis:**
+```promql
+# Operations per second by type
+rate(youtube_topk_heap_operations_total[5m])
+
+# Average operation latency
+rate(youtube_topk_heap_operation_duration_seconds_sum[5m])
+  / rate(youtube_topk_heap_operation_duration_seconds_count[5m])
+
+# Rebuild ratio (should be low)
+rate(youtube_topk_heap_operations_total{operation="rebuild"}[5m])
+  / rate(youtube_topk_heap_operations_total[5m])
+```
+
+---
+
+### WHY Cache Hit Rates Drive Top-K Update Frequency
+
+**The Balancing Act:**
+
+```
+Update Frequency
+     High ────────────────────────────────────────> Low
+     │                                              │
+     │ More compute                    Less compute │
+     │ Fresher data                    Staler data  │
+     │ More Redis load                 Less Redis   │
+     │                                              │
+     ▼                                              ▼
+```
+
+**How Cache Hit Rate Informs Decisions:**
+
+The trending cache stores computed Top K results and serves requests without re-querying Redis:
+
+```javascript
+// Cache structure
+trendingCache = {
+  'all': { videos: [...], updatedAt: timestamp },
+  'music': { videos: [...], updatedAt: timestamp },
+  // ...
+}
+```
+
+**Interpreting Cache Metrics:**
+
+| Hit Rate | Update Interval | Interpretation | Recommendation |
+|----------|-----------------|----------------|----------------|
+| > 99% | 5 seconds | Data very fresh, but compute is wasted | Increase to 10-15s |
+| 95-99% | 5 seconds | Good balance | Keep current settings |
+| 90-95% | 5 seconds | Many requests hit stale data | Decrease to 3s |
+| < 90% | 5 seconds | Serious freshness issues | Check for problems |
+
+**Metrics Implementation:**
+
+```javascript
+// Track cache accesses
+recordCacheAccess('trending', true);  // hit
+recordCacheAccess('trending', false); // miss
+
+// Prometheus gauge shows current hit rate
+youtube_topk_cache_hit_rate{cache_type="trending"}
+```
+
+**Adaptive Tuning (Future Enhancement):**
+```javascript
+// Pseudo-code for dynamic update frequency
+const hitRate = getCacheHitRate('trending');
+if (hitRate > 0.99 && updateInterval < 30000) {
+  updateInterval *= 1.5; // Slow down updates
+} else if (hitRate < 0.90 && updateInterval > 1000) {
+  updateInterval *= 0.7; // Speed up updates
+}
+```
+
+**Configuration:**
+```bash
+UPDATE_INTERVAL_SECONDS=5     # How often to recompute trending
+TRENDING_CACHE_TTL_SECONDS=5  # How long cache is considered fresh
+CACHE_HIT_RATE_TARGET=0.95    # Alert if below this
+```
+
+---
+
+### Implementation File Locations
+
+These concepts are implemented in the following files:
+
+| Feature | File | Key Functions |
+|---------|------|---------------|
+| Idempotency | `src/services/idempotency.js` | `processViewWithIdempotency()`, `checkAndMarkProcessed()` |
+| Window Config | `src/shared/config.js` | `WINDOW_CONFIG`, `RETENTION_CONFIG` |
+| Heap Metrics | `src/utils/topk.js` | `MinHeap.push()`, `MinHeap.pop()` |
+| Cache Metrics | `src/shared/metrics.js` | `recordCacheAccess()`, `cacheHitRate` |
+| Trending Service | `src/services/trendingService.js` | `updateTrending()`, `getTrending()` |
+| Prometheus Export | `src/index.js` | `GET /metrics` |
+
+---
+
 ## Future Optimizations
 
 1. **Geographic trending**: Trending by region

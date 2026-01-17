@@ -1,8 +1,9 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { IncomingMessage } from 'http';
-import { pool } from '../database.js';
-import { quoteService } from '../services/quoteService.js';
-import type { Quote, User } from '../types/index.js';
+import { pool } from './database.js';
+import { quoteService } from './services/quoteService.js';
+import type { Quote, User } from './types/index.js';
+import { logger } from './shared/logger.js';
 
 /**
  * Extended WebSocket with user context and subscription state.
@@ -88,7 +89,7 @@ export class WebSocketHandler {
         const message = JSON.parse(data.toString());
         this.handleMessage(ws, message);
       } catch (error) {
-        console.error('WebSocket message error:', error);
+        logger.error({ error }, 'WebSocket message error');
       }
     });
 
@@ -99,7 +100,7 @@ export class WebSocketHandler {
     });
 
     ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      logger.error({ error }, 'WebSocket error');
     });
 
     // Send initial connection acknowledgment
@@ -124,7 +125,7 @@ export class WebSocketHandler {
       );
       return result.rows[0] || null;
     } catch (error) {
-      console.error('WebSocket auth error:', error);
+      logger.error({ error }, 'WebSocket auth error');
       return null;
     }
   }
@@ -161,7 +162,7 @@ export class WebSocketHandler {
         break;
 
       case 'subscribe_all':
-        quoteService.getAllSymbols().forEach((symbol) => {
+        quoteService.getAllSymbols().forEach((symbol: string) => {
           ws.subscribedSymbols.add(symbol);
         });
         const allQuotes = quoteService.getAllQuotes();
@@ -180,7 +181,7 @@ export class WebSocketHandler {
         break;
 
       default:
-        console.log('Unknown message type:', message.type);
+        logger.debug({ messageType: message.type }, 'Unknown message type');
     }
   }
 

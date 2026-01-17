@@ -1574,3 +1574,298 @@ mc mirror minio/icloud-chunks ./backup-chunks/
 # Restore MinIO bucket
 mc mirror ./backup-chunks/ minio/icloud-chunks
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of the observability, caching, and failure handling patterns described above. Each implementation addresses specific production concerns.
+
+### Structured Logging with Pino
+
+**File:** `backend/src/shared/logger.js`
+
+**Why Pino:** Pino is the fastest JSON logger for Node.js, essential for high-throughput sync operations. Structured JSON logs enable:
+
+- **Log Aggregation:** Tools like ELK, Loki, or CloudWatch can parse and query logs efficiently
+- **Correlation IDs:** Each request gets a unique ID, making it easy to trace a sync operation across services
+- **Audit Trail:** Security-relevant events (file shares, device registrations) are logged separately for compliance
+
+**Key Features:**
+- Development mode uses `pino-pretty` for human-readable console output
+- Production mode outputs raw JSON for log aggregators
+- Request middleware attaches `req.log` with correlation ID for all routes
+- Separate audit logger for compliance events with longer retention
+
+**Example Log Output:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "correlationId": "abc-123",
+  "event": "sync.push_completed",
+  "userId": "user-456",
+  "applied": 5,
+  "conflicts": 1,
+  "errors": 0
+}
+```
+
+### Prometheus Metrics
+
+**File:** `backend/src/shared/metrics.js`
+
+**Why Prometheus:** Industry-standard for cloud-native monitoring. RED method (Rate, Errors, Duration) metrics enable SLO tracking.
+
+**Metrics Categories:**
+
+| Category | Metric | Type | Purpose |
+|----------|--------|------|---------|
+| HTTP | `icloud_http_request_duration_seconds` | Histogram | API latency by endpoint |
+| Sync | `icloud_sync_duration_seconds` | Histogram | Sync operation timing |
+| Sync | `icloud_conflicts_total` | Counter | Track conflict frequency |
+| Storage | `icloud_chunk_operation_duration_seconds` | Histogram | MinIO latency |
+| Storage | `icloud_dedup_hits_total` | Counter | Deduplication effectiveness |
+| Cache | `icloud_cache_hits_total` | Counter | Cache hit rate |
+| Circuit | `icloud_circuit_breaker_state` | Gauge | Breaker open/closed status |
+
+**Grafana Queries for SLI Dashboard:**
+```promql
+# Sync Success Rate (SLO: 99.9%)
+sum(rate(icloud_sync_operations_total{result="success"}[5m])) /
+sum(rate(icloud_sync_operations_total[5m]))
+
+# P95 Sync Latency (SLO: <5s)
+histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m]))
+
+# Cache Hit Rate (Target: >85%)
+rate(icloud_cache_hits_total[5m]) /
+(rate(icloud_cache_hits_total[5m]) + rate(icloud_cache_misses_total[5m]))
+```
+
+**Endpoint:** `GET /metrics` returns Prometheus-formatted metrics for scraping.
+
+### Redis Caching Strategy
+
+**File:** `backend/src/shared/cache.js`
+
+**Why Two Patterns:**
+
+1. **Cache-Aside (Read-Heavy Data):** Used for file metadata and storage quotas. Tolerates stale reads for 1 hour. On cache miss, fetches from PostgreSQL and populates cache.
+
+2. **Write-Through (Critical Data):** Used for device sync state. Writes to both cache and database atomically. Ensures consistency for sync cursor (losing this could cause duplicate syncs).
+
+**TTL Configuration:**
+
+| Data Type | TTL | Pattern | Rationale |
+|-----------|-----|---------|-----------|
+| File Metadata | 1 hour | Cache-aside | Files change infrequently |
+| User Storage | 5 min | Cache-aside | Updates on upload/delete |
+| Sync State | 24 hours | Write-through | Critical, must be consistent |
+| Chunk Exists | 1 hour | Cache-aside | Dedup check optimization |
+| Idempotency Keys | 24 hours | Cache-aside | Retry window |
+
+**Cache Invalidation:** On file update, we invalidate:
+- `file:meta:{fileId}` - The specific file
+- `user:storage:{userId}` - Storage quota (may have changed)
+
+### Circuit Breaker for Storage
+
+**File:** `backend/src/shared/circuitBreaker.js`
+
+**Why Circuit Breaker:** MinIO/S3 failures can cascade to the entire sync service. Without protection:
+- Requests pile up waiting for timeout
+- Thread pool exhaustion
+- User-visible latency spikes
+
+**How It Works:**
+
+```
+         Requests
+             │
+             ▼
+      ┌─────────────┐
+      │   CLOSED    │ ─── Normal operation
+      └─────────────┘
+             │
+        5 failures
+             │
+             ▼
+      ┌─────────────┐
+      │    OPEN     │ ─── Fail fast (30s)
+      └─────────────┘
+             │
+        30s timeout
+             │
+             ▼
+      ┌─────────────┐
+      │  HALF-OPEN  │ ─── Test recovery
+      └─────────────┘
+             │
+        3 successes
+             │
+             ▼
+      ┌─────────────┐
+      │   CLOSED    │ ─── Resume normal
+      └─────────────┘
+```
+
+**Configuration:**
+- `errorThresholdPercentage: 50` - Open when 50% of requests fail
+- `resetTimeout: 30000` - Try again after 30 seconds
+- `timeout: 30000` - Individual request timeout for uploads
+
+**Separate Breakers:** We use different breakers for different operations:
+- `storage_put` - Longer timeout (30s) for large uploads
+- `storage_get` - Medium timeout (15s) for downloads
+- `storage_stat` - Short timeout (5s) for existence checks
+
+### Idempotency for Sync Operations
+
+**File:** `backend/src/shared/idempotency.js`
+
+**Why Idempotency:** Sync operations are particularly vulnerable to duplicate processing:
+
+1. Client times out after 30 seconds
+2. Server actually processed the request
+3. Client retries with same changes
+4. Without idempotency: duplicate files or incorrect version vectors
+
+**How It Works:**
+
+```
+Client Request (with Idempotency-Key header)
+             │
+             ▼
+      ┌──────────────────┐
+      │ Check Redis for  │
+      │ existing result  │
+      └──────────────────┘
+             │
+     ┌───────┴───────┐
+     │               │
+   Found          Not Found
+     │               │
+     ▼               ▼
+ Return          Acquire Lock
+ Cached          (5 min TTL)
+ Result              │
+                     ▼
+              Execute Handler
+                     │
+                     ▼
+              Save Result
+              (24 hour TTL)
+                     │
+                     ▼
+              Release Lock
+```
+
+**Key Design Decisions:**
+
+1. **Lock with TTL:** If server crashes, lock auto-expires after 5 minutes
+2. **Result Caching:** Store full response for 24 hours for exact replay
+3. **Conflict Handling:** If another request is processing, wait up to 30s or return 409
+4. **Opt-in:** Routes use `withIdempotency()` wrapper for operations that need it
+
+**Client Integration:**
+```javascript
+// Client generates key from content
+const idempotencyKey = sha256(userId + operation + JSON.stringify(changes));
+
+fetch('/api/v1/sync/push', {
+  method: 'POST',
+  headers: {
+    'Idempotency-Key': idempotencyKey,
+  },
+  body: JSON.stringify({ changes }),
+});
+```
+
+### Health Checks
+
+**File:** `backend/src/shared/health.js`
+
+**Three Endpoints for Different Purposes:**
+
+| Endpoint | Purpose | Checks | Use Case |
+|----------|---------|--------|----------|
+| `/health/live` | Liveness | None | Kubernetes restart probe |
+| `/health/ready` | Readiness | DB + Redis | Load balancer routing |
+| `/health` | Full status | All components | Debugging, dashboards |
+
+**Full Health Response:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "uptime": 3600,
+  "version": "1.0.0",
+  "components": {
+    "postgres": {
+      "status": "healthy",
+      "latencyMs": 2,
+      "poolInfo": {
+        "totalCount": 20,
+        "idleCount": 18,
+        "waitingCount": 0
+      }
+    },
+    "redis": {
+      "status": "healthy",
+      "latencyMs": 1,
+      "memoryUsedBytes": 1048576
+    },
+    "storage": {
+      "status": "healthy",
+      "latencyMs": 15,
+      "bucketsCount": 3
+    },
+    "circuitBreakers": {
+      "status": "healthy",
+      "breakers": {
+        "put": { "state": "closed", "stats": {...} },
+        "get": { "state": "closed", "stats": {...} }
+      }
+    }
+  }
+}
+```
+
+### Running the Implementation
+
+**Start Infrastructure:**
+```bash
+docker-compose up -d
+```
+
+**Start Backend with Observability:**
+```bash
+cd backend
+npm run dev
+```
+
+**Verify Health:**
+```bash
+curl http://localhost:3001/health
+```
+
+**View Metrics:**
+```bash
+curl http://localhost:3001/metrics
+```
+
+**Test Idempotency:**
+```bash
+# First request
+curl -X POST http://localhost:3001/api/v1/sync/push \
+  -H "Idempotency-Key: test-key-123" \
+  -H "Content-Type: application/json" \
+  -d '{"changes": []}'
+
+# Duplicate request returns same result without re-processing
+curl -X POST http://localhost:3001/api/v1/sync/push \
+  -H "Idempotency-Key: test-key-123" \
+  -H "Content-Type: application/json" \
+  -d '{"changes": []}'
+```

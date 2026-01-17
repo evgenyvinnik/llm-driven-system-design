@@ -10,11 +10,16 @@
     "dev:server2": "PORT=3002 nodemon src/index.js",
     "dev:server3": "PORT=3003 nodemon src/index.js",
     "start": "node src/index.js",
+    "db:migrate": "node src/db/migrate.js migrate",
+    "db:rollback": "node src/db/migrate.js rollback",
+    "db:status": "node src/db/migrate.js status",
+    "db:create-migration": "node src/db/migrate.js create",
     "migrate": "node src/migrate.js",
     "seed": "node src/seed.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "connect-redis": "^7.1.0",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "crypto-js": "^4.2.0",
@@ -26,6 +31,7 @@
     "multer": "^1.4.5-lts.1",
     "pg": "^8.11.3",
     "pino": "^10.2.0",
+    "pino-pretty": "^11.0.0",
     "polyline": "^0.2.0",
     "prom-client": "^15.1.3",
     "uuid": "^9.0.1"

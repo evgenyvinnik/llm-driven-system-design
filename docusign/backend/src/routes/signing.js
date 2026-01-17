@@ -1,11 +1,26 @@
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../utils/db.js';
-import { uploadSignature, getSignatureUrl, getDocumentBuffer } from '../utils/minio.js';
+import { uploadSignature, getSignatureUrl } from '../shared/storageWithBreaker.js';
+import { getDocumentBuffer } from '../utils/minio.js';
 import { setSigningSession } from '../utils/redis.js';
 import { authenticateSigner } from '../middleware/auth.js';
 import { auditService } from '../services/auditService.js';
 import { workflowEngine } from '../services/workflowEngine.js';
+import {
+  executeWithIdempotency,
+  generateSignatureIdempotencyKey,
+  generateCompletionIdempotencyKey,
+} from '../shared/idempotency.js';
+import {
+  logSignatureCapture,
+  logDuplicateSignatureBlocked,
+  logAuthEvent,
+  AUDIT_EVENTS,
+  logAuditEvent,
+} from '../shared/auditLogger.js';
+import { signaturesCaptured, signaturesCompleted } from '../shared/metrics.js';
+import logger from '../shared/logger.js';
 
 const router = Router();
 
@@ -71,6 +86,14 @@ router.get('/session/:accessToken', async (req, res) => {
       status: recipient.status
     });
 
+    // Log successful authentication
+    await logAuthEvent(recipient.envelope_id, true, {
+      recipientId: recipient.id,
+      authMethod: 'email_link',
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent'),
+    });
+
     res.json({
       recipient: {
         id: recipient.id,
@@ -90,7 +113,7 @@ router.get('/session/:accessToken', async (req, res) => {
       authenticationRequired: recipient.authentication_level !== 'email'
     });
   } catch (error) {
-    console.error('Get signing session error:', error);
+    logger.error({ error: error.message }, 'Get signing session error');
     res.status(500).json({ error: 'Failed to get signing session' });
   }
 });
@@ -127,7 +150,18 @@ router.get('/document/:accessToken/:documentId', async (req, res) => {
 
     const document = docResult.rows[0];
 
-    // Log document view
+    // Log document view with enhanced audit
+    await logAuditEvent(recipient.envelope_id, AUDIT_EVENTS.DOCUMENT_VIEWED, {
+      recipientId: recipient.id,
+      recipientEmail: recipient.email,
+      documentId,
+      documentName: document.name,
+    }, {
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent'),
+    });
+
+    // Also use legacy audit service for backward compatibility
     await auditService.log(recipient.envelope_id, 'signing_started', {
       recipientId: recipient.id,
       recipientEmail: recipient.email,
@@ -144,12 +178,12 @@ router.get('/document/:accessToken/:documentId', async (req, res) => {
     res.setHeader('Content-Disposition', `inline; filename="${document.name}"`);
     res.send(buffer);
   } catch (error) {
-    console.error('Get signing document error:', error);
+    logger.error({ error: error.message }, 'Get signing document error');
     res.status(500).json({ error: 'Failed to get document' });
   }
 });
 
-// Capture signature
+// Capture signature - WITH IDEMPOTENCY FOR LEGAL COMPLIANCE
 router.post('/sign/:accessToken', authenticateSigner, async (req, res) => {
   try {
     const { fieldId, signatureData, type = 'draw' } = req.body;
@@ -185,59 +219,106 @@ router.post('/sign/:accessToken', authenticateSigner, async (req, res) => {
       return res.status(400).json({ error: 'This field has already been completed' });
     }
 
-    // Process signature image
-    let signatureBuffer;
-    if (signatureData.startsWith('data:image')) {
-      // Base64 encoded image
-      const base64Data = signatureData.split(',')[1];
-      signatureBuffer = Buffer.from(base64Data, 'base64');
-    } else {
-      signatureBuffer = Buffer.from(signatureData, 'base64');
+    // Generate idempotency key for this signature operation
+    // CRITICAL: This prevents duplicate signatures due to network retries
+    const idempotencyKey = req.headers['x-idempotency-key'] ||
+      generateSignatureIdempotencyKey(fieldId, recipient.id);
+
+    // Execute with idempotency protection
+    const { data: result, cached } = await executeWithIdempotency(
+      idempotencyKey,
+      async () => {
+        // Process signature image
+        let signatureBuffer;
+        if (signatureData.startsWith('data:image')) {
+          const base64Data = signatureData.split(',')[1];
+          signatureBuffer = Buffer.from(base64Data, 'base64');
+        } else {
+          signatureBuffer = Buffer.from(signatureData, 'base64');
+        }
+
+        // Store signature in MinIO (with circuit breaker)
+        const signatureId = uuid();
+        const s3Key = `signatures/${signatureId}.png`;
+        await uploadSignature(s3Key, signatureBuffer, 'image/png');
+
+        // Create signature record
+        await query(
+          `INSERT INTO signatures (id, recipient_id, field_id, s3_key, type, ip_address, user_agent)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [signatureId, recipient.id, fieldId, s3Key, type, ipAddress, userAgent]
+        );
+
+        // Update field as completed
+        await query(
+          `UPDATE document_fields
+           SET completed = true, signature_id = $2
+           WHERE id = $1`,
+          [fieldId, signatureId]
+        );
+
+        // Log enhanced audit event for legal compliance
+        await logSignatureCapture({
+          envelopeId: field.envelope_id,
+          recipientId: recipient.id,
+          recipientEmail: recipient.email,
+          recipientName: recipient.name,
+          fieldId,
+          signatureId,
+          signatureType: type,
+          ipAddress,
+          userAgent,
+        });
+
+        // Also use legacy audit service
+        await auditService.log(field.envelope_id, 'signature_captured', {
+          recipientId: recipient.id,
+          recipientEmail: recipient.email,
+          fieldId,
+          signatureId,
+          type,
+          ipAddress,
+          userAgent,
+          timestamp: new Date().toISOString()
+        }, recipient.id);
+
+        // Update metrics
+        signaturesCaptured.inc();
+
+        // Check if recipient has completed all required fields
+        const isComplete = await workflowEngine.checkRecipientCompletion(recipient.id);
+
+        return {
+          signatureId,
+          fieldId,
+          completed: true,
+          recipientComplete: isComplete
+        };
+      },
+      'signature'
+    );
+
+    // If this was a duplicate request, log it for security monitoring
+    if (cached) {
+      await logDuplicateSignatureBlocked({
+        envelopeId: field.envelope_id,
+        recipientId: recipient.id,
+        fieldId,
+        idempotencyKey,
+        ipAddress,
+        userAgent,
+      });
+
+      logger.info({
+        idempotencyKey,
+        fieldId,
+        recipientId: recipient.id,
+      }, 'Duplicate signature request blocked by idempotency');
     }
 
-    // Store signature in MinIO
-    const signatureId = uuid();
-    const s3Key = `signatures/${signatureId}.png`;
-    await uploadSignature(s3Key, signatureBuffer, 'image/png');
-
-    // Create signature record
-    await query(
-      `INSERT INTO signatures (id, recipient_id, field_id, s3_key, type, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [signatureId, recipient.id, fieldId, s3Key, type, ipAddress, userAgent]
-    );
-
-    // Update field as completed
-    await query(
-      `UPDATE document_fields
-       SET completed = true, signature_id = $2
-       WHERE id = $1`,
-      [fieldId, signatureId]
-    );
-
-    // Log audit event
-    await auditService.log(field.envelope_id, 'signature_captured', {
-      recipientId: recipient.id,
-      recipientEmail: recipient.email,
-      fieldId,
-      signatureId,
-      type,
-      ipAddress,
-      userAgent,
-      timestamp: new Date().toISOString()
-    }, recipient.id);
-
-    // Check if recipient has completed all required fields
-    const isComplete = await workflowEngine.checkRecipientCompletion(recipient.id);
-
-    res.json({
-      signatureId,
-      fieldId,
-      completed: true,
-      recipientComplete: isComplete
-    });
+    res.json(result);
   } catch (error) {
-    console.error('Capture signature error:', error);
+    logger.error({ error: error.message }, 'Capture signature error');
     res.status(500).json({ error: 'Failed to capture signature' });
   }
 });
@@ -301,7 +382,19 @@ router.post('/complete-field/:accessToken', authenticateSigner, async (req, res)
       [fieldId, fieldValue]
     );
 
-    // Log audit event
+    // Log enhanced audit event
+    await logAuditEvent(field.envelope_id, AUDIT_EVENTS.FIELD_COMPLETED, {
+      recipientId: recipient.id,
+      recipientEmail: recipient.email,
+      fieldId,
+      fieldType: field.type,
+      value: fieldValue,
+    }, {
+      ipAddress,
+      userAgent,
+    });
+
+    // Also use legacy audit service
     await auditService.log(field.envelope_id, 'field_completed', {
       recipientId: recipient.id,
       recipientEmail: recipient.email,
@@ -322,12 +415,12 @@ router.post('/complete-field/:accessToken', authenticateSigner, async (req, res)
       recipientComplete: isComplete
     });
   } catch (error) {
-    console.error('Complete field error:', error);
+    logger.error({ error: error.message }, 'Complete field error');
     res.status(500).json({ error: 'Failed to complete field' });
   }
 });
 
-// Finish signing (mark recipient as complete)
+// Finish signing (mark recipient as complete) - WITH IDEMPOTENCY
 router.post('/finish/:accessToken', authenticateSigner, async (req, res) => {
   try {
     const recipient = req.signer;
@@ -353,15 +446,38 @@ router.post('/finish/:accessToken', authenticateSigner, async (req, res) => {
       });
     }
 
-    // Mark recipient as complete
-    await workflowEngine.completeRecipient(recipient.id, ipAddress, userAgent);
+    // Generate idempotency key for completion
+    const idempotencyKey = req.headers['x-idempotency-key'] ||
+      generateCompletionIdempotencyKey(recipient.id);
 
-    res.json({
-      message: 'Signing completed successfully',
-      recipientId: recipient.id
-    });
+    // Execute with idempotency protection
+    const { data: result, cached } = await executeWithIdempotency(
+      idempotencyKey,
+      async () => {
+        // Mark recipient as complete
+        await workflowEngine.completeRecipient(recipient.id, ipAddress, userAgent);
+
+        // Update metrics
+        signaturesCompleted.inc();
+
+        return {
+          message: 'Signing completed successfully',
+          recipientId: recipient.id
+        };
+      },
+      'completion'
+    );
+
+    if (cached) {
+      logger.info({
+        idempotencyKey,
+        recipientId: recipient.id,
+      }, 'Duplicate completion request blocked by idempotency');
+    }
+
+    res.json(result);
   } catch (error) {
-    console.error('Finish signing error:', error);
+    logger.error({ error: error.message }, 'Finish signing error');
     res.status(500).json({ error: 'Failed to complete signing' });
   }
 });
@@ -381,7 +497,7 @@ router.post('/decline/:accessToken', authenticateSigner, async (req, res) => {
       recipientId: recipient.id
     });
   } catch (error) {
-    console.error('Decline signing error:', error);
+    logger.error({ error: error.message }, 'Decline signing error');
     res.status(500).json({ error: 'Failed to decline' });
   }
 });
@@ -404,7 +520,7 @@ router.get('/signature-image/:signatureId/:accessToken', authenticateSigner, asy
 
     res.json({ url: signatureUrl });
   } catch (error) {
-    console.error('Get signature image error:', error);
+    logger.error({ error: error.message }, 'Get signature image error');
     res.status(500).json({ error: 'Failed to get signature image' });
   }
 });

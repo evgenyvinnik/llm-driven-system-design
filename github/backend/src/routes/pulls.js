@@ -3,6 +3,14 @@ import { query } from '../db/index.js';
 import * as gitService from '../services/git.js';
 import { requireAuth } from '../middleware/auth.js';
 
+// Import shared modules
+import logger from '../shared/logger.js';
+import { auditLog, AUDITED_ACTIONS } from '../shared/audit.js';
+import { getPRDiffFromCache, setPRDiffInCache, invalidatePRDiffCache, invalidateRepoCaches } from '../shared/cache.js';
+import { withCircuitBreaker } from '../shared/circuitBreaker.js';
+import { getIdempotencyKey, withIdempotencyTransaction } from '../shared/idempotency.js';
+import { prsCreated, prsMerged } from '../shared/metrics.js';
+
 const router = Router();
 
 /**
@@ -102,11 +110,15 @@ router.get('/:owner/:repo/pulls/:number', async (req, res) => {
 
   const pr = result.rows[0];
 
-  // Get commits
-  const commits = await gitService.getCommitsBetween(owner, repo, pr.base_branch, pr.head_branch);
+  // Get commits with circuit breaker
+  const commits = await withCircuitBreaker('git_commits_between', () =>
+    gitService.getCommitsBetween(owner, repo, pr.base_branch, pr.head_branch)
+  );
 
-  // Get diff summary
-  const diff = await gitService.getDiff(owner, repo, pr.base_branch, pr.head_branch);
+  // Get diff summary with circuit breaker
+  const diff = await withCircuitBreaker('git_diff', () =>
+    gitService.getDiff(owner, repo, pr.base_branch, pr.head_branch)
+  );
 
   // Get reviews
   const reviews = await query(
@@ -136,13 +148,13 @@ router.get('/:owner/:repo/pulls/:number', async (req, res) => {
 });
 
 /**
- * Get PR diff
+ * Get PR diff (with caching)
  */
 router.get('/:owner/:repo/pulls/:number/diff', async (req, res) => {
   const { owner, repo, number } = req.params;
 
   const result = await query(
-    `SELECT p.head_branch, p.base_branch
+    `SELECT p.id, p.head_branch, p.base_branch
      FROM pull_requests p
      JOIN repositories r ON p.repo_id = r.id
      JOIN users u ON r.owner_id = u.id
@@ -155,17 +167,30 @@ router.get('/:owner/:repo/pulls/:number/diff', async (req, res) => {
   }
 
   const pr = result.rows[0];
-  const diff = await gitService.getDiff(owner, repo, pr.base_branch, pr.head_branch);
+
+  // Try cache first
+  let diff = await getPRDiffFromCache(pr.id);
+
+  if (!diff) {
+    // Cache miss - fetch with circuit breaker
+    diff = await withCircuitBreaker('git_diff', () =>
+      gitService.getDiff(owner, repo, pr.base_branch, pr.head_branch)
+    );
+
+    // Cache the result
+    await setPRDiffInCache(pr.id, diff);
+  }
 
   res.json(diff);
 });
 
 /**
- * Create pull request
+ * Create pull request (with idempotency)
  */
 router.post('/:owner/:repo/pulls', requireAuth, async (req, res) => {
   const { owner, repo } = req.params;
   const { title, body, headBranch, baseBranch, isDraft } = req.body;
+  const idempotencyKey = getIdempotencyKey(req);
 
   if (!title || !headBranch || !baseBranch) {
     return res.status(400).json({ error: 'Title, head branch, and base branch required' });
@@ -184,9 +209,13 @@ router.post('/:owner/:repo/pulls', requireAuth, async (req, res) => {
 
   const repoId = repoResult.rows[0].id;
 
-  // Verify branches exist
-  const headExists = await gitService.branchExists(owner, repo, headBranch);
-  const baseExists = await gitService.branchExists(owner, repo, baseBranch);
+  // Verify branches exist with circuit breaker
+  const headExists = await withCircuitBreaker('git_branch_exists', () =>
+    gitService.branchExists(owner, repo, headBranch)
+  );
+  const baseExists = await withCircuitBreaker('git_branch_exists', () =>
+    gitService.branchExists(owner, repo, baseBranch)
+  );
 
   if (!headExists) {
     return res.status(400).json({ error: 'Head branch does not exist' });
@@ -195,40 +224,92 @@ router.post('/:owner/:repo/pulls', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Base branch does not exist' });
   }
 
-  // Get SHAs
-  const headSha = await gitService.getHeadSha(owner, repo, headBranch);
-  const baseSha = await gitService.getHeadSha(owner, repo, baseBranch);
+  try {
+    // Use idempotency transaction
+    const { cached, response } = await withIdempotencyTransaction(
+      idempotencyKey,
+      'pr_create',
+      async (tx) => {
+        // Get SHAs with circuit breaker
+        const headSha = await withCircuitBreaker('git_head_sha', () =>
+          gitService.getHeadSha(owner, repo, headBranch)
+        );
+        const baseSha = await withCircuitBreaker('git_head_sha', () =>
+          gitService.getHeadSha(owner, repo, baseBranch)
+        );
 
-  // Get diff stats
-  const diff = await gitService.getDiff(owner, repo, baseBranch, headBranch);
+        // Get diff stats with circuit breaker
+        const diff = await withCircuitBreaker('git_diff', () =>
+          gitService.getDiff(owner, repo, baseBranch, headBranch)
+        );
 
-  // Get next number
-  const number = await getNextNumber(repoId);
+        // Get next number (use transaction client)
+        const prMax = await tx.query(
+          'SELECT COALESCE(MAX(number), 0) as max_num FROM pull_requests WHERE repo_id = $1',
+          [repoId]
+        );
+        const issueMax = await tx.query(
+          'SELECT COALESCE(MAX(number), 0) as max_num FROM issues WHERE repo_id = $1',
+          [repoId]
+        );
+        const number = Math.max(
+          parseInt(prMax.rows[0].max_num),
+          parseInt(issueMax.rows[0].max_num)
+        ) + 1;
 
-  const result = await query(
-    `INSERT INTO pull_requests
-     (repo_id, number, title, body, head_branch, head_sha, base_branch, base_sha,
-      author_id, additions, deletions, changed_files, is_draft)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-     RETURNING *`,
-    [
-      repoId,
-      number,
-      title,
-      body || null,
-      headBranch,
-      headSha,
-      baseBranch,
-      baseSha,
-      req.user.id,
-      diff.stats.additions,
-      diff.stats.deletions,
-      diff.stats.files.length,
-      isDraft || false,
-    ]
-  );
+        // Insert PR
+        const result = await tx.query(
+          `INSERT INTO pull_requests
+           (repo_id, number, title, body, head_branch, head_sha, base_branch, base_sha,
+            author_id, additions, deletions, changed_files, is_draft)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           RETURNING *`,
+          [
+            repoId,
+            number,
+            title,
+            body || null,
+            headBranch,
+            headSha,
+            baseBranch,
+            baseSha,
+            req.user.id,
+            diff.stats.additions,
+            diff.stats.deletions,
+            diff.stats.files.length,
+            isDraft || false,
+          ]
+        );
 
-  res.status(201).json(result.rows[0]);
+        const pr = result.rows[0];
+
+        return { resourceId: pr.id, response: pr };
+      }
+    );
+
+    if (cached) {
+      // Return cached response for duplicate request
+      prsCreated.inc({ status: 'duplicate' });
+      req.log?.info({ idempotencyKey }, 'PR creation request deduplicated');
+      return res.status(200).json(response);
+    }
+
+    // Audit log
+    await auditLog(
+      AUDITED_ACTIONS.PR_CREATE,
+      'pull_request',
+      response.id,
+      { title, headBranch, baseBranch, isDraft },
+      req
+    );
+
+    prsCreated.inc({ status: 'success' });
+    res.status(201).json(response);
+  } catch (err) {
+    req.log?.error({ err }, 'Create PR error');
+    prsCreated.inc({ status: 'error' });
+    res.status(500).json({ error: 'Failed to create pull request' });
+  }
 });
 
 /**
@@ -274,6 +355,9 @@ router.patch('/:owner/:repo/pulls/:number', requireAuth, async (req, res) => {
     if (state === 'closed') {
       params.push(new Date());
       updates.push(`closed_at = $${params.length}`);
+
+      // Audit log for close
+      await auditLog(AUDITED_ACTIONS.PR_CLOSE, 'pull_request', pr.id, { number }, req);
     }
   }
 
@@ -290,6 +374,9 @@ router.patch('/:owner/:repo/pulls/:number', requireAuth, async (req, res) => {
     `UPDATE pull_requests SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
     params
   );
+
+  // Invalidate diff cache if PR was updated
+  await invalidatePRDiffCache(pr.id);
 
   res.json(result.rows[0]);
 });
@@ -319,29 +406,52 @@ router.post('/:owner/:repo/pulls/:number/merge', requireAuth, async (req, res) =
     return res.status(400).json({ error: 'Pull request is not open' });
   }
 
-  // Perform merge
-  const mergeResult = await gitService.mergeBranches(
-    owner,
-    repo,
-    pr.base_branch,
-    pr.head_branch,
-    strategy,
-    message || `Merge pull request #${number}`
-  );
+  try {
+    // Perform merge with circuit breaker
+    const mergeResult = await withCircuitBreaker('git_merge', () =>
+      gitService.mergeBranches(
+        owner,
+        repo,
+        pr.base_branch,
+        pr.head_branch,
+        strategy,
+        message || `Merge pull request #${number}`
+      )
+    );
 
-  if (!mergeResult.success) {
-    return res.status(400).json({ error: mergeResult.error || 'Merge failed' });
+    if (!mergeResult.success) {
+      return res.status(400).json({ error: mergeResult.error || 'Merge failed' });
+    }
+
+    // Update PR
+    await query(
+      `UPDATE pull_requests
+       SET state = 'merged', merged_by = $1, merged_at = NOW(), updated_at = NOW()
+       WHERE id = $2`,
+      [req.user.id, pr.id]
+    );
+
+    // Invalidate caches
+    await invalidatePRDiffCache(pr.id);
+    await invalidateRepoCaches(pr.repo_id);
+
+    // Audit log
+    await auditLog(
+      AUDITED_ACTIONS.PR_MERGE,
+      'pull_request',
+      pr.id,
+      { number, strategy, mergeCommit: mergeResult.sha },
+      req
+    );
+
+    // Update metrics
+    prsMerged.inc({ strategy });
+
+    res.json({ merged: true, sha: mergeResult.sha });
+  } catch (err) {
+    req.log?.error({ err }, 'Merge PR error');
+    res.status(500).json({ error: 'Merge failed' });
   }
-
-  // Update PR
-  await query(
-    `UPDATE pull_requests
-     SET state = 'merged', merged_by = $1, merged_at = NOW(), updated_at = NOW()
-     WHERE id = $2`,
-    [req.user.id, pr.id]
-  );
-
-  res.json({ merged: true, sha: mergeResult.sha });
 });
 
 /**

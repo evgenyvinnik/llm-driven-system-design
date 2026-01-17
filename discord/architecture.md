@@ -1391,3 +1391,190 @@ Baby Discord is designed to teach:
 The architecture prioritizes **learning** over production readiness, with clear migration paths to more advanced patterns.
 
 **Next Steps**: See [README.md](./README.md) for implementation phases and [claude.md](./claude.md) for development discussion.
+
+---
+
+## Implementation Notes
+
+This section documents key implementation decisions with rationale for operational excellence.
+
+### WHY Message Retention Policies Prevent Unbounded Storage Costs
+
+**Problem**: Without retention policies, the `messages` table grows indefinitely:
+- Storage costs increase linearly with message volume
+- Database queries slow down as table size increases
+- Backup/restore operations become slower and more expensive
+- Index maintenance overhead grows with table size
+
+**Solution**: Configurable retention policies in `shared/config.ts`:
+
+```typescript
+export const messageRetention = {
+  maxMessagesPerRoom: 10,      // Keep only N messages per room
+  maxMessageAgeHours: 0,       // Optional age-based cleanup
+  cleanupIntervalMinutes: 5,   // Periodic cleanup job
+};
+```
+
+**Implementation** (`utils/cleanup.ts`):
+- Periodic cleanup job runs every `cleanupIntervalMinutes`
+- Count-based cleanup: Deletes messages beyond `maxMessagesPerRoom` per room
+- Age-based cleanup: Deletes messages older than `maxMessageAgeHours` (if > 0)
+- Metrics track cleanup job runs and messages deleted
+
+**Trade-offs**:
+- **Accepted**: Older messages are permanently deleted
+- **Mitigated**: Archive-before-delete option for compliance requirements
+- **Benefit**: Bounded storage, predictable database performance
+
+### WHY Metrics with Alert Thresholds Enable Proactive Monitoring
+
+**Problem**: Without metrics, issues are discovered when users complain:
+- Capacity problems go unnoticed until outage
+- Performance regressions are detected late
+- Incident diagnosis is slow without data
+- Capacity planning is guesswork
+
+**Solution**: Prometheus metrics in `shared/metrics.ts` with thresholds in `shared/config.ts`:
+
+```typescript
+// Metrics exposed at GET /metrics
+export const messagesSent = new client.Counter({...});
+export const activeConnections = new client.Gauge({...});
+export const pubsubPublishLatency = new client.Histogram({...});
+
+// Alert thresholds
+export const alertThresholds = {
+  pubsubLatency: { warning: 100, critical: 500 },
+  queueDepth: { warning: 100, critical: 500 },
+  dbConnectionWait: { warning: 50, critical: 200 },
+};
+```
+
+**Key Metrics**:
+| Category | Metric | Purpose |
+|----------|--------|---------|
+| Connections | `babydiscord_active_connections` | Capacity monitoring |
+| Throughput | `babydiscord_messages_sent_total` | Load tracking |
+| Latency | `babydiscord_pubsub_publish_latency_seconds` | Performance monitoring |
+| Cache | `babydiscord_history_buffer_hits_total` | Cache effectiveness |
+| Cleanup | `babydiscord_messages_deleted_total` | Retention enforcement |
+
+**Endpoints**:
+- `GET /metrics` - Prometheus-format metrics
+- `GET /health` - Comprehensive health check with status of all dependencies
+
+**Trade-offs**:
+- **Cost**: Small performance overhead for metric collection (~1-2%)
+- **Benefit**: Early warning of issues, data-driven capacity planning
+- **Integration**: Compatible with Prometheus/Grafana, Datadog, etc.
+
+### WHY Graceful Shutdown Prevents Message Loss
+
+**Problem**: Abrupt shutdown causes:
+- In-flight messages are lost
+- Database writes may be incomplete
+- Connected clients experience errors without warning
+- Load balancers continue routing to dead instance
+
+**Solution**: Multi-phase graceful shutdown in `index.ts`:
+
+```typescript
+async function shutdown(signal: string) {
+  // Phase 1: Stop accepting new connections (drain mode)
+  await tcpServer.stop(gracePeriodMs);
+  await httpServer.stop(gracePeriodMs);
+
+  // Phase 2: Stop background jobs
+  stopCleanupJob();
+
+  // Phase 3: Close external connections
+  await pubsubManager.disconnect();
+  await db.close();
+
+  // Phase 4: Flush logs and exit
+  await flushLogs();
+}
+```
+
+**Shutdown Sequence**:
+1. **Enter drain mode**: Stop accepting new connections
+2. **Notify clients**: Send shutdown warning to connected SSE/TCP clients
+3. **Grace period**: Wait for in-flight requests to complete (configurable, default 10s)
+4. **Stop jobs**: Halt cleanup job to prevent partial operations
+5. **Disconnect dependencies**: Close Redis and database connections cleanly
+6. **Flush logs**: Ensure all log entries are written before exit
+
+**Client Behavior**:
+- SSE clients receive `event: shutdown` and can reconnect to another instance
+- TCP clients receive `[SYSTEM] Server is shutting down` message
+- New connections during drain are rejected with appropriate error
+
+**Configuration** (`.env`):
+```bash
+SHUTDOWN_GRACE_PERIOD_MS=10000    # 10 second grace period
+SHUTDOWN_WARNING_INTERVAL_MS=2000  # Log remaining connections every 2s
+DRAIN_CONNECTIONS=true             # Enable connection draining
+```
+
+**Trade-offs**:
+- **Cost**: Slower shutdown (up to 10s vs immediate)
+- **Benefit**: Zero message loss, clean client experience, safe rolling deploys
+
+### WHY Migration Scripts Enable Safe Schema Changes
+
+**Problem**: Manual schema changes are error-prone:
+- No record of what changes were applied
+- Risk of applying same change twice
+- No way to rollback failed changes
+- Different environments can drift out of sync
+
+**Solution**: Versioned migrations in `db/migrate.ts`:
+
+```typescript
+// Migration files: 001_initial_schema.sql, 002_add_index.sql, etc.
+class MigrationRunner {
+  async migrate(): Promise<{ applied: string[]; skipped: string[] }>;
+  async status(): Promise<void>;
+  async rollback(): Promise<string | null>;
+}
+```
+
+**Migration Features**:
+- **Version tracking**: `schema_migrations` table tracks applied migrations
+- **Checksum validation**: Detects if applied migrations were modified
+- **Transactional**: Each migration runs in a transaction (rollback on failure)
+- **Rollback support**: Down migrations via `NNN_description.down.sql` files
+- **Backwards compatible**: Runs legacy `init.sql` on first migration
+
+**Usage**:
+```bash
+npm run db:migrate          # Apply pending migrations
+npm run db:migrate:status   # Show migration status
+npm run db:migrate:rollback # Rollback last migration
+```
+
+**Best Practices**:
+1. Always add columns as nullable first, then backfill, then add NOT NULL
+2. Create indexes with `CONCURRENTLY` when possible
+3. Test migrations on copy of production data before deploying
+4. Keep migrations small and focused (one logical change per file)
+
+**Trade-offs**:
+- **Cost**: Additional infrastructure (migrations table, tooling)
+- **Benefit**: Safe, auditable, reversible schema changes
+
+---
+
+### Implementation File Summary
+
+| File | Purpose |
+|------|---------|
+| `shared/config.ts` | Centralized configuration with retention policies and alert thresholds |
+| `shared/metrics.ts` | Prometheus metrics for monitoring |
+| `utils/logger.ts` | Structured JSON logging with Pino |
+| `utils/cleanup.ts` | Message retention cleanup job |
+| `db/migrate.ts` | Versioned database migration runner |
+| `adapters/http-server.ts` | HTTP server with `/metrics` and `/health` endpoints |
+| `adapters/tcp-server.ts` | TCP server with graceful shutdown |
+| `index.ts` | Application entry point with full graceful shutdown |

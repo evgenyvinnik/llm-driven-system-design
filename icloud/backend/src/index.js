@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 
-import { testConnections, closeConnections } from './db.js';
+import { pool, redis, minioClient, testConnections, closeConnections } from './db.js';
 import { authMiddleware, adminMiddleware } from './middleware/auth.js';
 
 import authRoutes from './routes/auth.js';
@@ -17,9 +17,26 @@ import adminRoutes from './routes/admin.js';
 
 import { setupWebSocket } from './services/websocket.js';
 
+// Import shared modules for observability and resilience
+import logger, { requestLogger } from './shared/logger.js';
+import { metricsMiddleware, metricsHandler, websocketConnections } from './shared/metrics.js';
+import { createCaches } from './shared/cache.js';
+import { StorageCircuitBreakers } from './shared/circuitBreaker.js';
+import { createIdempotencyMiddleware } from './shared/idempotency.js';
+import { HealthChecker } from './shared/health.js';
+
 const app = express();
 const server = createServer(app);
 const port = parseInt(process.env.PORT || '3001');
+
+// Initialize shared infrastructure
+const caches = createCaches(redis, pool);
+const storageBreakers = new StorageCircuitBreakers(minioClient);
+const healthChecker = new HealthChecker({ pool, redis, minioClient, storageBreakers });
+
+// Attach to app.locals for access in routes
+app.locals.caches = caches;
+app.locals.storageBreakers = storageBreakers;
 
 // Middleware
 app.use(cors({
@@ -28,6 +45,13 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
+
+// Observability middleware
+app.use(requestLogger);
+app.use(metricsMiddleware);
+
+// Idempotency middleware for sync operations
+app.use(createIdempotencyMiddleware(redis));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -38,14 +62,23 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Health check
+// Health check endpoints
 app.get('/health', async (req, res) => {
-  const healthy = await testConnections();
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'healthy' : 'unhealthy',
-    timestamp: new Date().toISOString(),
-  });
+  const health = await healthChecker.getFullHealth();
+  res.status(health.status === 'healthy' ? 200 : 503).json(health);
 });
+
+app.get('/health/live', (req, res) => {
+  res.json(healthChecker.getLiveness());
+});
+
+app.get('/health/ready', async (req, res) => {
+  const health = await healthChecker.getReadiness();
+  res.status(health.status === 'ready' ? 200 : 503).json(health);
+});
+
+// Metrics endpoint for Prometheus scraping
+app.get('/metrics', metricsHandler);
 
 // Public routes
 app.use('/api/v1/auth', authRoutes);
@@ -59,9 +92,15 @@ app.use('/api/v1/devices', authMiddleware, devicesRoutes);
 // Admin routes
 app.use('/api/v1/admin', authMiddleware, adminMiddleware, adminRoutes);
 
-// Error handler
+// Error handler with structured logging
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
+  const log = req.log || logger;
+  log.error({
+    error: err.message,
+    stack: err.stack,
+    statusCode: err.status || 500,
+  }, 'Request error');
+
   res.status(err.status || 500).json({
     error: err.message || 'Internal server error',
     ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
@@ -72,12 +111,21 @@ app.use((err, req, res, next) => {
 const wss = new WebSocketServer({ server, path: '/ws' });
 setupWebSocket(wss);
 
+// Track WebSocket connections for metrics
+wss.on('connection', () => {
+  websocketConnections.inc();
+});
+
+wss.on('close', () => {
+  websocketConnections.dec();
+});
+
 // Graceful shutdown
 const shutdown = async () => {
-  console.log('Shutting down...');
+  logger.info('Shutting down...');
   await closeConnections();
   server.close(() => {
-    console.log('Server closed');
+    logger.info('Server closed');
     process.exit(0);
   });
 };
@@ -87,8 +135,13 @@ process.on('SIGINT', shutdown);
 
 // Start server
 server.listen(port, async () => {
-  console.log(`iCloud Sync Backend running on port ${port}`);
-  await testConnections();
+  logger.info({ port }, 'iCloud Sync Backend starting');
+  const healthy = await testConnections();
+  if (healthy) {
+    logger.info('All connections established successfully');
+  } else {
+    logger.error('Failed to establish some connections');
+  }
 });
 
 export default app;

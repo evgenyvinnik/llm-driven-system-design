@@ -98,7 +98,7 @@ export class ChatHandler {
           return { success: false, message: 'Unknown command' };
       }
     } catch (error) {
-      logger.error('Error executing command', { command, error });
+      logger.error({ command, err: error }, 'Error executing command');
       return {
         success: false,
         message: error instanceof Error ? error.message : 'An error occurred',

@@ -1,7 +1,8 @@
 import { query, queryOne } from '../db/pool.js';
 import { publishAlert, cacheDelete } from '../db/redis.js';
 import { Alert, UserProduct, Product } from '../types/index.js';
-import logger from '../utils/logger.js';
+import logger, { logAlert } from '../utils/logger.js';
+import { alertsTriggered, alertsSent } from '../shared/metrics.js';
 
 /**
  * Represents a price change event to be processed for alert generation.
@@ -75,7 +76,15 @@ export async function processPriceChange(event: PriceChangeEvent): Promise<void>
   // Batch create alerts
   if (alertsToCreate.length > 0) {
     await createAlerts(alertsToCreate);
-    logger.info(`Created ${alertsToCreate.length} alerts for product ${product_id}`);
+    logger.info(
+      {
+        action: 'alerts_created',
+        count: alertsToCreate.length,
+        productId: product_id,
+        alertTypes: alertsToCreate.map(a => a.alert_type),
+      },
+      `Created ${alertsToCreate.length} alerts for product ${product_id}`
+    );
   }
 }
 
@@ -103,6 +112,12 @@ async function createAlerts(
     );
 
     if (created) {
+      // Track alert metric
+      alertsTriggered.labels(alert.alert_type).inc();
+
+      // Log the alert with structured data
+      logAlert(alert.user_id, alert.product_id, alert.alert_type, alert.old_price, alert.new_price);
+
       // Publish for real-time notification
       await publishAlert({
         userId: alert.user_id,
@@ -110,6 +125,9 @@ async function createAlerts(
         type: alert.alert_type,
         newPrice: alert.new_price,
       });
+
+      // Track sent metric
+      alertsSent.labels('pubsub', 'success').inc();
 
       // Invalidate user alerts cache
       await cacheDelete(`user:${alert.user_id}:alerts`);

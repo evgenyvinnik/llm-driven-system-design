@@ -45,7 +45,7 @@ export const redis = new Redis({
   port: config.redis.port,
   password: config.redis.password,
   maxRetriesPerRequest: 3,
-  retryDelayOnFailover: 100,
+  retryStrategy: (times) => Math.min(times * 100, 3000),
 });
 
 /**

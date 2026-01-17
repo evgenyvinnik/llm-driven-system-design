@@ -675,4 +675,173 @@ psql -c "VACUUM ANALYZE metrics_hourly;"
 2. **Rule Engine**: Dynamic rules from PostgreSQL with caching
 3. **Analytics**: Historical analysis of rate limit patterns
 4. **Distributed Tracing**: OpenTelemetry integration
-5. **Prometheus Export**: Native Prometheus metrics endpoint
+5. ~~**Prometheus Export**: Native Prometheus metrics endpoint~~ (Implemented)
+
+## Implementation Notes
+
+This section explains the rationale behind key implementation decisions in the codebase.
+
+### Why Circuit Breakers Prevent Rate Limiter from Blocking All Requests
+
+Without a circuit breaker, a Redis failure would cause every rate limit check to wait for the connection timeout (typically 3-30 seconds) before failing. In a high-traffic system handling thousands of requests per second, this causes:
+
+1. **Thread/Connection Pool Exhaustion**: Each blocked request holds a connection, quickly exhausting the pool
+2. **Cascading Latency**: Request latency spikes from milliseconds to seconds
+3. **Timeout Storms**: All requests eventually fail simultaneously, creating thundering herd problems
+
+The circuit breaker solves this by:
+
+```typescript
+// After 5 failures in 30 seconds, circuit OPENS
+// All subsequent requests IMMEDIATELY fail/fallback - no waiting
+// After 10 seconds, circuit goes HALF-OPEN and tests 3 requests
+// If successful, circuit CLOSES and normal operation resumes
+```
+
+**Key insight**: It's better to allow some potentially rate-limited requests through immediately than to block ALL requests waiting for a dead Redis. The circuit breaker trades accuracy for availability.
+
+Our implementation (`src/shared/circuit-breaker.ts`) uses opossum with these defaults:
+- **Timeout**: 3 seconds (fails fast if Redis is slow)
+- **Error Threshold**: 50% (opens after half the requests fail)
+- **Reset Timeout**: 10 seconds (tests recovery quickly)
+- **Volume Threshold**: 5 requests minimum before opening
+
+### Why Graceful Degradation Decisions Matter (Fail-Open vs Fail-Closed)
+
+The choice between fail-open and fail-closed has significant business implications:
+
+**Fail-Open (Default, Recommended for Rate Limiting)**
+```
+Redis Down → Allow all requests
+```
+- **Rationale**: Rate limiting protects against sustained abuse (bots, scrapers, DoS), not individual requests
+- **Risk**: Temporary abuse during outage (minutes to hours)
+- **Mitigation**: Aggressive alerting, quick recovery, Redis HA
+- **Business Impact**: Users experience normal service during infrastructure issues
+
+**Fail-Closed (Alternative for Security-Critical Systems)**
+```
+Redis Down → Deny all requests
+```
+- **Use Case**: Financial transactions, authentication endpoints, compliance-regulated APIs
+- **Risk**: Complete service outage during Redis failure
+- **Mitigation**: Multi-region Redis, local fallback cache
+- **Business Impact**: Users blocked but no unauthorized access possible
+
+Our implementation (`src/config/index.ts`) makes this configurable:
+```typescript
+config.degradation.mode = process.env.DEGRADATION_MODE || 'allow';
+```
+
+The middleware (`src/middleware/rate-limit.ts`) respects this setting:
+- `allow`: Logs warning, increments fallback metric, continues request
+- `deny`: Returns 503 Service Unavailable immediately
+
+### Why TTL Prevents Unbounded Memory Growth
+
+Redis stores all rate limit state in memory. Without TTL, memory grows until:
+1. **OOM Killer**: Linux kills Redis process
+2. **Eviction**: Redis starts evicting keys randomly (losing rate limit data)
+3. **Swap Thrashing**: Performance degrades catastrophically
+
+**Problem Scenario Without TTL:**
+- 1 million unique API keys
+- Each key stores ~200 bytes of state
+- Fixed window: 1 key per window × 2 windows = 400 bytes/key
+- Sliding log: Could store thousands of timestamps per key
+- After 1 year: Inactive keys accumulate, memory grows unbounded
+
+**Solution with TTL:**
+```typescript
+// From src/config/index.ts
+config.ttl = {
+  windowMultiplier: 2,        // Key TTL = windowSeconds × 2
+  bucketStateTtl: 86400,      // Token/leaky bucket: 24 hours
+  metricsTtl: 3600,           // Metrics: 1 hour
+  latencyDetailsTtl: 900,     // Latency samples: 15 minutes
+};
+```
+
+**Why 2x Window Size?**
+For sliding window algorithm, we need both current AND previous window counts:
+```
+Window 1 (12:00-12:01) ← Need this for weighted calculation
+Window 2 (12:01-12:02) ← Current window
+```
+At 12:01:30, we're 50% into Window 2 but need 50% weight from Window 1.
+TTL = 2x window ensures previous window data is available.
+
+**Implementation** (`src/utils/redis.ts`):
+```typescript
+export function calculateKeyTtl(windowSeconds: number): number {
+  return Math.ceil(windowSeconds * config.ttl.windowMultiplier);
+}
+```
+
+### Why Metrics Enable Rate Limit Tuning
+
+Without metrics, rate limiting is a black box:
+- Are limits too restrictive (blocking legitimate users)?
+- Are limits too permissive (allowing abuse)?
+- Which endpoints need different limits?
+- What's the actual request distribution?
+
+**Key Metrics Exposed** (`src/shared/metrics.ts`):
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `ratelimiter_checks_total{result, algorithm}` | Counter | Allowed vs denied ratio per algorithm |
+| `ratelimiter_check_duration_seconds` | Histogram | Latency distribution for tuning timeouts |
+| `ratelimiter_active_identifiers` | Gauge | Memory pressure indicator |
+| `ratelimiter_circuit_breaker_state` | Gauge | Redis health visibility |
+| `ratelimiter_fallback_activations_total` | Counter | Degradation frequency |
+
+**Tuning Workflow:**
+1. **High Denial Rate** (>10%): Limits may be too restrictive
+   - Check `ratelimiter_checks_total{result="denied"}` / total
+   - Consider increasing limits for specific endpoints
+
+2. **Low Denial Rate** (<1%): Limits may be too permissive
+   - Attackers might not be hitting limits
+   - Consider tightening limits or adding per-endpoint rules
+
+3. **Latency Spikes**: Redis performance issues
+   - Check `ratelimiter_check_duration_seconds` p99
+   - Should be <5ms for healthy operation
+
+4. **Memory Growth**: Too many active identifiers
+   - Check `ratelimiter_active_identifiers`
+   - May need shorter TTLs or key cleanup
+
+**Prometheus Endpoint**: `GET /metrics`
+```
+# HELP ratelimiter_checks_total Total number of rate limit checks performed
+# TYPE ratelimiter_checks_total counter
+ratelimiter_checks_total{result="allowed",algorithm="sliding_window"} 15234
+ratelimiter_checks_total{result="denied",algorithm="sliding_window"} 127
+```
+
+**Alerting Rules Example (Prometheus):**
+```yaml
+groups:
+  - name: rate-limiter
+    rules:
+      - alert: HighDenialRate
+        expr: |
+          sum(rate(ratelimiter_checks_total{result="denied"}[5m])) /
+          sum(rate(ratelimiter_checks_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limiter denial rate above 10%"
+
+      - alert: CircuitBreakerOpen
+        expr: ratelimiter_circuit_breaker_state{state="open"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis circuit breaker is open"
+```
+

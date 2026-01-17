@@ -181,14 +181,14 @@ export function resetAllCircuitBreakers(): void {
  * @param options - Circuit breaker options
  * @returns Wrapped handler function
  */
-export function withCircuitBreaker<T extends unknown[], R>(
+export function withCircuitBreaker<R>(
   handlerName: string,
-  handler: (...args: T) => Promise<R>,
+  handler: (...args: unknown[]) => Promise<R>,
   options?: CircuitBreakerOptions
-): (...args: T) => Promise<R> {
+): (...args: unknown[]) => Promise<R> {
   const breaker = createCircuitBreaker(handlerName, handler, options);
 
-  return async (...args: T): Promise<R> => {
+  return async (...args: unknown[]): Promise<R> => {
     try {
       return await breaker.fire(...args) as R;
     } catch (error) {

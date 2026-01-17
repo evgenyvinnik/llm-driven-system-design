@@ -1018,3 +1018,214 @@ CREATE TABLE articles_2024_01 PARTITION OF articles
 | Resource usage | Minimal | 256 MB+ |
 
 **Rationale**: Redis Lists sufficient for simple indexing queue; RabbitMQ overkill for local dev.
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key implementation decisions for resilience, performance, and observability.
+
+### Feed Caching with Redis
+
+**Implementation**: Aggregated feeds are cached in Redis with configurable TTL (default: 60 seconds).
+
+**Why feed caching reduces source API calls**:
+
+1. **Eliminates redundant computation**: Without caching, every feed request requires:
+   - PostgreSQL queries to fetch candidate stories (200+ rows)
+   - User preference lookups
+   - Ranking algorithm execution
+   - Multiple sub-queries for article enrichment
+
+2. **Protects the database**: With 10-20 concurrent users refreshing feeds every 30 seconds, that's 20-40 RPS hitting the database. Caching reduces this to ~0.5 RPS (one miss per 60s TTL).
+
+3. **Improves p95 latency**: Cached responses return in <20ms vs 100-200ms for computed feeds. This directly supports our SLO of p95 < 200ms for feed retrieval.
+
+4. **Cache key strategy**:
+   - `feed:user:{userId}:{cursor}:{limit}` for personalized feeds
+   - `feed:global:{cursor}:{limit}` for anonymous users
+   - `feed:topic:{topic}:{cursor}:{limit}` for topic-filtered feeds
+   - Short TTL (30-60s) balances freshness with performance
+
+5. **Invalidation approach**: TTL-based expiry is sufficient because:
+   - News content changes slowly (15-minute crawl interval)
+   - Users tolerate 60-second staleness for non-breaking news
+   - Explicit invalidation after crawls ensures new articles appear promptly
+
+### Circuit Breakers for RSS/API Fetches
+
+**Implementation**: Each RSS source gets its own circuit breaker using the opossum library.
+
+**Why circuit breakers protect against slow/down sources**:
+
+1. **Prevents cascade failures**: A single slow or unresponsive source (e.g., 30s timeout) can:
+   - Block the crawler thread
+   - Exhaust connection pool slots
+   - Delay crawling of healthy sources
+   - Eventually exhaust server resources
+
+   Circuit breakers "fail fast" after detecting problems, protecting the system.
+
+2. **Self-healing behavior**: Circuit breakers automatically:
+   - **Close** (normal): Allow requests through
+   - **Open** (after failures): Reject requests immediately for 30 seconds
+   - **Half-open** (testing): Allow one request to test recovery
+
+   This allows temporary outages to recover without manual intervention.
+
+3. **Isolation per source**: Each source has its own breaker so:
+   - One failing source doesn't affect others
+   - Metrics show which sources are problematic
+   - Recovery is tracked individually
+
+4. **Configuration choices**:
+   ```
+   timeout: 10 seconds (match SLO for source response time)
+   errorThresholdPercentage: 50% (trip after half requests fail)
+   resetTimeout: 30 seconds (test recovery after 30s)
+   volumeThreshold: 5 requests (need enough samples before tripping)
+   ```
+
+5. **Observability**: Circuit state is exposed via:
+   - Prometheus gauge: `circuit_breaker_state` (0=closed, 1=open, 2=half-open)
+   - Structured logs on state transitions
+   - `/health/detailed` endpoint for debugging
+
+### Retry Logic with Exponential Backoff
+
+**Implementation**: Failed fetch operations are retried with exponential delays (1s, 5s, 30s) plus jitter.
+
+**Why retry logic handles transient source failures**:
+
+1. **Most failures are transient**: Network blips, DNS hiccups, and brief overloads often resolve within seconds. Immediate retry would fail; delayed retry often succeeds.
+
+2. **Exponential backoff prevents thundering herd**:
+   - First retry: 1 second (quick recovery for brief issues)
+   - Second retry: 5 seconds (moderate wait for longer issues)
+   - Third retry: 30 seconds (substantial wait before giving up)
+
+   This prevents all crawlers from hammering a recovering source simultaneously.
+
+3. **Jitter prevents synchronization**: Adding random variation (up to 25% of delay) prevents:
+   - Multiple crawlers retrying at exactly the same time
+   - Periodic load spikes that could overwhelm recovering sources
+   - Request correlation that makes debugging harder
+
+4. **Idempotent operations are safe to retry**:
+   - Article insertion uses `ON CONFLICT DO NOTHING`
+   - Elasticsearch indexing uses upsert semantics
+   - No side effects from duplicate processing
+
+5. **Retry budgets respect resources**:
+   - Maximum 3 retries prevents infinite loops
+   - Total worst-case time: ~36 seconds per source
+   - Failures are logged for observability
+
+### Article Retention Configuration
+
+**Implementation**: Configurable retention periods via environment variables with sensible defaults.
+
+**Why article retention balances freshness vs storage**:
+
+1. **Storage grows linearly without bounds**: At 50 MB/day, unlimited retention means:
+   - 1.5 GB after 30 days
+   - 4.5 GB after 90 days
+   - 18 GB after 1 year
+
+   Local development should not require unbounded storage.
+
+2. **News value decays exponentially**: Most news articles have value for:
+   - 24-48 hours: High relevance, likely to appear in feeds
+   - 7-30 days: Moderate relevance, useful for search
+   - 30-90 days: Low relevance, archival value only
+   - 90+ days: Historical only, rarely accessed
+
+   Default 90-day retention matches this value curve.
+
+3. **Different data has different retention needs**:
+   ```
+   articles: 90 days (high volume, time-sensitive)
+   stories: 180 days (lower volume, useful for trends)
+   search index: 90 days (mirrors article retention)
+   user history: 365 days (low volume, personalization value)
+   ```
+
+4. **Configurable for different environments**:
+   - Development: 30 days (minimize disk usage)
+   - Staging: 90 days (production-like)
+   - Production: 90-365 days (based on storage budget)
+
+   Environment variables allow tuning without code changes.
+
+5. **Cleanup is gradual and non-blocking**:
+   - Batch deletion (1000 rows at a time)
+   - Runs during off-peak hours
+   - Can be disabled for development: `ENABLE_AUTO_CLEANUP=false`
+
+### Prometheus Metrics
+
+**Implementation**: Application metrics exposed at `/metrics` endpoint in Prometheus format.
+
+**Key metrics and their purpose**:
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds` | Histogram | Track API latency against SLOs |
+| `feed_generations_total` | Counter | Monitor feed request volume |
+| `cache_hits_total` / `cache_misses_total` | Counter | Calculate cache hit rate |
+| `crawler_fetch_total` | Counter | Track crawl success/failure rates |
+| `circuit_breaker_state` | Gauge | Monitor source health |
+| `articles_stored_total` | Counter | Track content ingestion rate |
+
+**SLO alignment**:
+- p95 latency < 200ms: `histogram_quantile(0.95, http_request_duration_seconds)`
+- Cache hit rate > 70%: `rate(cache_hits_total) / (rate(cache_hits_total) + rate(cache_misses_total))`
+- Crawl success rate > 90%: `rate(crawler_fetch_total{status="success"}) / rate(crawler_fetch_total)`
+
+### Structured Logging with Pino
+
+**Implementation**: JSON-formatted logs in production, pretty-printed in development.
+
+**Why structured logging over console.log**:
+
+1. **Machine-parseable**: JSON logs can be ingested by:
+   - Log aggregation systems (ELK, Loki, CloudWatch)
+   - Alerting systems
+   - Analysis tools
+
+2. **Consistent context**: Every log includes:
+   - Timestamp (ISO 8601)
+   - Level (debug, info, warn, error)
+   - Service name
+   - Additional context (userId, sourceId, traceId)
+
+3. **Request tracing**: Child loggers automatically include:
+   ```json
+   { "sourceId": "uuid", "sourceName": "TechCrunch", "msg": "Starting crawl" }
+   ```
+
+4. **Performance**: Pino is 5-10x faster than alternatives like Winston, important at high request volumes.
+
+### Health Check Endpoints
+
+**Implementation**: Three-tier health checks for different use cases.
+
+| Endpoint | Purpose | Checks | Response Time |
+|----------|---------|--------|---------------|
+| `/health/live` | Liveness probe | Process running | < 1ms |
+| `/health/ready` | Readiness probe | DB, Redis, ES connectivity | < 100ms |
+| `/health/detailed` | Debugging | All above + pool stats, circuit states | < 500ms |
+
+**Why multiple health endpoints**:
+
+1. **Kubernetes/load balancer compatibility**:
+   - Liveness: Restart container if this fails
+   - Readiness: Remove from rotation if this fails
+
+2. **Graceful degradation**: Elasticsearch failure marks service as "degraded" not "down" because search is optional.
+
+3. **Operational visibility**: `/health/detailed` exposes:
+   - Connection pool utilization
+   - Circuit breaker states
+   - Cache statistics
+   - Memory usage

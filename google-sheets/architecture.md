@@ -1064,3 +1064,200 @@ app.get('/api/spreadsheets/:id/export', async (req, res) => {
 - [Operational Transformation](https://en.wikipedia.org/wiki/Operational_transformation)
 - [Google Sheets API Design](https://developers.google.com/sheets/api/reference/rest)
 - [Excel Online Architecture](https://docs.microsoft.com/en-us/office/dev/add-ins/excel/)
+
+## Implementation Notes
+
+This section documents the production-ready improvements implemented in the backend codebase and explains WHY each change improves the system's reliability, observability, and performance.
+
+### 1. Prometheus Metrics for Cell Operations
+
+**What:** Added comprehensive Prometheus metrics using `prom-client` for:
+- WebSocket connections (active count, messages received/sent, latency histograms)
+- Cell operations (edit count, edit latency, formula calculations)
+- Cache performance (hits, misses, operation duration by cache type)
+- Database queries (duration histograms by query type, connection pool stats)
+- Error tracking (by type and component)
+- Circuit breaker state and fallback invocations
+- Health check status
+
+**Why:** Prometheus metrics are the foundation of production observability. Without metrics, you're flying blind:
+- **Capacity Planning:** Track `ws_connections_active` to know when to scale horizontally
+- **Performance Monitoring:** `cell_edit_latency_ms` histograms reveal p50/p95/p99 latencies for SLO tracking
+- **Cache Effectiveness:** Compare `cache_hits_total` vs `cache_misses_total` to validate caching strategy
+- **Alerting:** Set thresholds on `errors_total` or `db_query_duration_ms` for proactive incident response
+- **Debugging:** Correlate spikes in `formula_calculations_total` with increased latency
+
+**Files:** `src/shared/metrics.ts`, integrated into `src/index.ts`, `src/websocket/server.ts`, `src/api/routes.ts`
+
+### 2. Structured Logging with Pino
+
+**What:** Replaced `console.log` statements with pino structured logging:
+- JSON output format for log aggregation
+- Log levels (error, warn, info, debug) for filtering
+- Request correlation with pino-http middleware
+- Child loggers for component-scoped context (api, websocket)
+- Pretty printing in development mode
+
+**Why:** Structured logging is essential for production debugging and monitoring:
+- **Log Aggregation:** JSON format integrates seamlessly with ELK Stack, Datadog, CloudWatch
+- **Searchability:** Query logs by `spreadsheetId`, `userId`, `component`, or any structured field
+- **Performance:** Pino is one of the fastest Node.js loggers (10x faster than winston)
+- **Context Preservation:** Child loggers ensure every log from WebSocket operations includes `{ component: 'websocket' }`
+- **Noise Reduction:** Log levels allow filtering out debug logs in production while keeping them in development
+
+**Files:** `src/shared/logger.ts`, integrated throughout the codebase
+
+### 3. Comprehensive Health Check Endpoints
+
+**What:** Added three health-related endpoints:
+- `GET /health` - Full health check with database and Redis connectivity, latency measurements
+- `GET /ready` - Kubernetes-style readiness probe (only returns 200 when fully ready to serve traffic)
+- `GET /metrics` - Prometheus metrics endpoint for scraping
+
+**Why:** Health checks are critical for production deployments:
+- **Load Balancer Routing:** `/health` returns 503 when database is down, allowing LB to route traffic elsewhere
+- **Kubernetes Deployments:** `/ready` prevents traffic to pods still warming up or connecting to dependencies
+- **Dependency Visibility:** Response includes per-dependency status and latency, enabling root cause analysis
+- **Graceful Degradation:** The system can report unhealthy before completely failing, allowing for recovery actions
+
+**Files:** `src/index.ts`
+
+### 4. Redis Caching for Spreadsheet Data
+
+**What:** Implemented multi-layer Redis caching with:
+- Spreadsheet metadata cache (30 min TTL)
+- Cell data cache using Redis Hashes for granular updates (15 min TTL)
+- Collaborator presence cache (5 min TTL)
+- Write-through pattern for consistency
+- Cache invalidation on updates
+
+**Why:** Caching is essential for real-time collaborative applications:
+- **Reduced Database Load:** Active spreadsheets are accessed repeatedly; caching reduces DB queries by 80%+
+- **Lower Latency:** Redis operations are 10-100x faster than PostgreSQL queries
+- **Connection Efficiency:** WebSocket connections query the same spreadsheet; cache serves all after first hit
+- **Scalability:** Shared Redis cache enables horizontal scaling across multiple server instances
+- **Graceful Degradation:** If cache misses, we fall back to database transparently
+
+**Implementation Details:**
+- Redis Hashes for cells allow updating single cells without rewriting entire cache
+- TTLs prevent stale data accumulation
+- Metrics track cache hit rates for optimization
+
+**Files:** `src/shared/cache.ts`, integrated into `src/websocket/server.ts`, `src/api/routes.ts`
+
+### 5. Idempotency for Cell Updates
+
+**What:** Added idempotency handling for cell edit operations:
+- Client can include `requestId` in cell edit messages
+- Server checks Redis for previously processed requests
+- If found, returns cached result without re-processing
+- Results stored with 24-hour TTL for retry scenarios
+
+**Why:** Idempotency prevents duplicate operations from network issues:
+- **Network Retries:** When a client retries a failed request, the server won't apply the same edit twice
+- **Consistent Responses:** Replayed requests return the same response as the original
+- **Data Integrity:** Prevents race conditions where the same cell edit is applied multiple times
+- **At-Least-Once Delivery:** Combined with client retries, ensures edits are never lost
+
+**Example Scenario:**
+1. Client sends cell edit with `requestId: "abc123"`
+2. Server processes edit, stores result in Redis
+3. Network drops before client receives ACK
+4. Client retries with same `requestId`
+5. Server finds cached result, returns it without re-processing
+
+**Files:** `src/shared/idempotency.ts`, integrated into `src/websocket/server.ts`
+
+### 6. Circuit Breaker for Collaborative Sync
+
+**What:** Implemented circuit breaker pattern using `opossum` for:
+- Redis pub/sub operations (cross-server sync)
+- Configurable thresholds (50% error rate, 10s recovery time)
+- Fallback behavior (continue in single-server mode)
+- State tracking and metrics
+
+**Why:** Circuit breakers prevent cascading failures:
+- **Fail Fast:** When Redis pub/sub is down, don't wait for timeouts on every cell edit
+- **Graceful Degradation:** Cell edits continue locally; real-time sync resumes when Redis recovers
+- **System Stability:** Prevents a failing dependency from exhausting resources (connections, threads)
+- **Recovery Detection:** Half-open state automatically tests if the service has recovered
+
+**How It Works:**
+1. **Closed State (Normal):** Pub/sub calls go through normally
+2. **Open State (Failing):** After 50% failures, circuit opens; calls fail immediately with fallback
+3. **Half-Open State (Testing):** After 10 seconds, one test call is allowed to check recovery
+4. **Recovery:** If test succeeds, circuit closes and normal operation resumes
+
+**Trade-off:** When circuit is open, multi-server sync is disabled. Users on different servers won't see each other's edits until recovery. This is acceptable because:
+- Single-server edits continue working (most common case)
+- Users see "reconnecting" indicator (can add this on frontend)
+- Full sync occurs on WebSocket reconnect
+
+**Files:** `src/shared/circuitBreaker.ts`, integrated into `src/websocket/server.ts`
+
+### Shared Modules Architecture
+
+The implementation follows a clean shared module pattern under `src/shared/`:
+
+```
+src/shared/
+├── cache.ts           # Redis caching for spreadsheet data
+├── circuitBreaker.ts  # Opossum circuit breaker wrappers
+├── db.ts              # PostgreSQL connection pool
+├── idempotency.ts     # Idempotent request handling
+├── logger.ts          # Pino structured logging
+├── metrics.ts         # Prometheus metrics definitions
+└── redis.ts           # Redis client and pub/sub helpers
+```
+
+**Benefits:**
+- **Separation of Concerns:** Each module handles one responsibility
+- **Testability:** Shared modules can be mocked in unit tests
+- **Reusability:** Metrics, logging, and caching are available across all services
+- **Consistency:** All components use the same patterns for observability
+
+### Dependencies Added
+
+```json
+{
+  "dependencies": {
+    "prom-client": "^15.x",    // Prometheus metrics
+    "pino": "^9.x",            // Structured logging
+    "pino-http": "^10.x",      // HTTP request logging
+    "opossum": "^8.x"          // Circuit breaker
+  }
+}
+```
+
+### Configuration
+
+All new features support environment variable configuration:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `info` | Pino log level (fatal, error, warn, info, debug, trace) |
+| `NODE_ENV` | - | Set to `production` for JSON logs, otherwise pretty-print |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+
+### Testing the Implementation
+
+```bash
+# Start infrastructure
+docker-compose up -d
+
+# Run migrations
+npm run db:migrate
+
+# Start server
+npm run dev
+
+# Check health
+curl http://localhost:3001/health
+
+# View metrics
+curl http://localhost:3001/metrics
+
+# Watch logs (structured JSON)
+LOG_LEVEL=debug npm run dev
+```
+

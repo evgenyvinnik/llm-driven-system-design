@@ -918,3 +918,200 @@ Before running load tests or demos:
 - Push notifications
 - Video chat integration
 - Premium features (Super Likes, Boosts)
+
+---
+
+## Implementation Notes
+
+This section explains the architectural decisions behind key implementation choices, focusing on WHY each pattern was chosen rather than just how it works.
+
+### Idempotency for Swipe Actions
+
+**Problem:** Network unreliability and user behavior can cause duplicate swipe submissions:
+1. Users double-tap the swipe button before UI updates
+2. Network timeouts trigger automatic retries
+3. Client-side bugs submit the same swipe multiple times
+
+**Why Idempotency Prevents Duplicate Swipes:**
+
+Idempotency ensures that processing the same swipe action multiple times produces the same result as processing it once. This is critical for matching apps because:
+
+1. **Match Integrity:** Without idempotency, a duplicate "like" could trigger match detection twice, potentially creating duplicate match records or sending multiple notifications.
+
+2. **Metric Accuracy:** Duplicate swipes would inflate swipe counts and distort match rate calculations, making it impossible to optimize the matching algorithm.
+
+3. **User Experience:** Repeated match notifications for the same person would confuse users and erode trust in the platform.
+
+**Implementation:**
+```typescript
+// Client can provide an idempotency key for explicit control
+POST /api/discovery/swipe
+{
+  "userId": "target-uuid",
+  "direction": "like",
+  "idempotencyKey": "client-generated-uuid"
+}
+
+// Server checks for existing swipe before processing
+// If found, returns cached result without re-processing
+```
+
+The database enforces uniqueness on `(swiper_id, swiped_id)`, and optional `idempotency_key` allows clients to safely retry requests without side effects.
+
+### Rate Limiting for Swipe Protection
+
+**Problem:** Uncontrolled swipe volume damages the matching ecosystem:
+1. Bots can mass-like users, gaming the system
+2. Users who swipe rapidly on everyone reduce match quality
+3. Database and cache load spikes during peak usage
+
+**Why Rate Limiting Protects the Matching Algorithm:**
+
+1. **Fair Visibility Distribution:** Without limits, power users could "like" thousands of profiles per hour, monopolizing the "likes received" pool and reducing visibility for normal users.
+
+2. **Match Quality Optimization:** Rate limiting encourages thoughtful swiping. Users who consider each profile before swiping produce more meaningful matches with higher conversation rates.
+
+3. **Bot Prevention:** Automated accounts attempting to spam likes are throttled before they can significantly impact the matching pool.
+
+4. **Resource Protection:** Swipe processing involves Redis lookups, database writes, and match detection. Rate limiting ensures consistent performance during traffic spikes.
+
+**Implementation:**
+```typescript
+// Sliding window rate limit (Redis sorted set)
+// 50 swipes per 15-minute window
+swipeRateLimiter(req, res, next)
+
+// Hourly cap as secondary protection
+// 100 swipes per hour
+hourlySwipeLimiter(req, res, next)
+```
+
+Rate limit headers inform clients of their remaining quota:
+```
+X-RateLimit-Limit: 50
+X-RateLimit-Remaining: 47
+X-RateLimit-Reset: 1705435200
+```
+
+### Message Retention: Balancing Experience vs. Privacy
+
+**Problem:** Message data presents competing requirements:
+- Users expect conversation history to be available
+- Storage costs grow with message volume
+- Privacy regulations may require deletion
+- Unmatched conversations have less value
+
+**Why Current Retention Policy (365 days after unmatch):**
+
+1. **Active Conversations Preserved:** Messages in active matches are never deleted. Users can always scroll back through their conversation history with current matches.
+
+2. **Privacy After Unmatch:** When users unmatch, they've decided to end the connection. Retaining messages indefinitely feels intrusive. The 365-day window allows for:
+   - Dispute resolution if needed
+   - Compliance with potential legal requirements
+   - Gradual data minimization
+
+3. **Storage Optimization:** Messages are the highest-volume data in a matching app. Deleting old messages from ended matches significantly reduces storage costs without impacting active users.
+
+4. **User Expectations:** Dating app users generally expect temporary connections. Unlike email, users don't expect to retrieve messages from years-old unmatched conversations.
+
+**Configuration:**
+```typescript
+// Configurable via environment variables
+SWIPE_RETENTION_DAYS=90     // Old swipes (no need to track forever)
+MESSAGE_RETENTION_DAYS=365  // Messages after unmatch
+```
+
+### Metrics for Matching Algorithm Optimization
+
+**Problem:** Matching algorithm quality is hard to measure without observability:
+1. How do we know if recommended profiles are relevant?
+2. What's the conversion rate from deck view to match?
+3. Are some user segments underserved?
+
+**Why Prometheus Metrics Enable Algorithm Optimization:**
+
+1. **Funnel Visibility:**
+   ```
+   discovery_deck_requests_total  -> How many decks generated
+   swipes_total{direction="like"} -> How many likes
+   matches_total                   -> How many mutual matches
+   messages_total                  -> How many conversations started
+   ```
+   This funnel reveals where users drop off. Low like rates may indicate poor candidate selection. Low match rates after likes suggests preference misalignment.
+
+2. **Latency Tracking:**
+   ```
+   discovery_deck_duration_seconds -> Time to generate candidates
+   swipe_processing_duration_seconds -> Time to process swipe
+   ```
+   Slow deck generation causes users to close the app. These metrics help identify bottlenecks.
+
+3. **Cache Effectiveness:**
+   ```
+   cache_hits_total{cache_type="swipe_history"}
+   cache_misses_total{cache_type="swipe_history"}
+   ```
+   High cache miss rates indicate the Redis TTL may be too short, or users are swiping on profiles outside their recent activity window.
+
+4. **Rate Limiting Insights:**
+   ```
+   rate_limited_requests_total{endpoint="swipe"}
+   ```
+   Tracking rate-limited requests reveals how many users hit limits. If many legitimate users are throttled, limits may be too aggressive.
+
+5. **Algorithm A/B Testing:**
+   By labeling metrics with candidate source (e.g., `source="elasticsearch"` vs `source="ml_ranked"`), we can compare conversion rates between algorithm variants.
+
+**Dashboard Queries:**
+```promql
+# Match rate (percentage of likes that become matches)
+sum(rate(matches_total[1h])) / sum(rate(swipes_total{direction="like"}[1h]))
+
+# Swipe velocity per user
+rate(swipes_total[15m]) / count(distinct user_id)
+
+# Cache hit rate for swipe lookups
+sum(rate(cache_hits_total{cache_type="swipe_history"}[5m])) /
+(sum(rate(cache_hits_total{cache_type="swipe_history"}[5m])) +
+ sum(rate(cache_misses_total{cache_type="swipe_history"}[5m])))
+```
+
+### Summary: How These Patterns Work Together
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Swipe Request Flow                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  [Client]                                                             │
+│     │                                                                 │
+│     ▼                                                                 │
+│  [Rate Limiter] ─── Exceeded? ───► 429 Too Many Requests             │
+│     │                                                                 │
+│     ▼ Allowed                                                         │
+│  [Idempotency Check] ─── Duplicate? ───► Return cached result        │
+│     │                                                                 │
+│     ▼ New request                                                     │
+│  [Process Swipe]                                                      │
+│     │                                                                 │
+│     ├── Record in PostgreSQL (with idempotency_key)                  │
+│     ├── Update Redis cache (with configurable TTL)                   │
+│     ├── Check for mutual match                                       │
+│     └── Record metrics (swipes_total, duration, match)               │
+│     │                                                                 │
+│     ▼                                                                 │
+│  [Return Result]                                                      │
+│     │                                                                 │
+│     └── metrics: http_requests_total, http_request_duration          │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**The Observability Loop:**
+1. Metrics reveal swipe patterns and match rates
+2. Analysis identifies optimization opportunities
+3. Algorithm changes are deployed
+4. Metrics validate improvements
+5. Repeat
+
+This data-driven approach transforms matching from "hope it works" to "measure and optimize."

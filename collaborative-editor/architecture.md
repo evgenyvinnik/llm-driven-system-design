@@ -1978,3 +1978,280 @@ async function runRestoreDrill() {
 | RabbitMQ unavailable | Circuit breaker opens | Buffer publishes locally | Replay buffered messages on recovery |
 | Network partition | Timeout on cross-server RPC | Operate independently | Merge states on partition heal |
 | Data corruption | Checksum mismatch on load | Reject corrupted data; restore from backup | Point-in-time recovery from op log |
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of reliability patterns in the backend code, explaining the rationale for each design decision.
+
+### Why Async Queues Enable Multi-Server Broadcast
+
+**Problem**: When running multiple sync server instances (ports 3001, 3002, 3003), an operation received on server1 must reach clients connected to server2 and server3.
+
+**Solution**: RabbitMQ with topic exchange for operation fanout.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Operation Flow with RabbitMQ                                        │
+│                                                                      │
+│  Client A ──► Server 1 ──► RabbitMQ (doc.operations exchange)       │
+│                               │                                      │
+│              ┌────────────────┼────────────────┐                    │
+│              ▼                ▼                ▼                    │
+│         Queue:server1    Queue:server2    Queue:server3             │
+│              │                │                │                    │
+│              ▼                ▼                ▼                    │
+│         (skip self)     Broadcast to      Broadcast to              │
+│                         local clients     local clients             │
+│                               │                │                    │
+│                         Client B          Client C                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implementation Details** (see `src/shared/queue.ts`):
+
+1. **Topic Exchange**: Operations are published with routing key `doc.{documentId}`, allowing servers to subscribe to all documents or specific ones.
+
+2. **Per-Server Queues**: Each server creates its own durable queue (`op.broadcast.{serverId}`) bound to the exchange. This ensures:
+   - Operations survive RabbitMQ restarts (durable queues)
+   - Each server receives all operations independently
+   - Servers can be added/removed without reconfiguration
+
+3. **Self-Skip**: Servers include their `serverId` in messages and skip messages from themselves to avoid duplicate processing.
+
+4. **Deduplication via Redis**: Message IDs (`{documentId}-{version}`) are cached in Redis for 1 hour to handle at-least-once delivery.
+
+5. **Circuit Breaker Protection**: The `publishOperation` function is wrapped in a circuit breaker. When RabbitMQ is unavailable:
+   - Operations are buffered in-memory (up to 1000)
+   - Local clients still receive updates immediately
+   - Buffer is drained when circuit closes
+
+**Why This Works for Real-Time Collaboration**:
+- Local clients get instant updates (WebSocket broadcast happens first)
+- Cross-server propagation adds ~1-5ms latency (acceptable for collaboration)
+- System degrades gracefully if RabbitMQ fails (single-server mode)
+
+---
+
+### Why Idempotency Enables Reliable OT Operations
+
+**Problem**: Network issues cause clients to retry operations. Without idempotency, the same insert might be applied twice, corrupting the document.
+
+**Solution**: Client-generated operation IDs with server-side caching.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Idempotent Operation Flow                                           │
+│                                                                      │
+│  Client                    Server                    Redis           │
+│    │                          │                         │            │
+│    │  operation + opId ──────►│                         │            │
+│    │                          │  check idempotent:opId ─►│           │
+│    │                          │◄── miss ─────────────────│           │
+│    │                          │                         │            │
+│    │                          │  [apply OT]             │            │
+│    │                          │                         │            │
+│    │                          │  store result ─────────►│           │
+│    │◄───── ack ───────────────│                         │            │
+│    │                          │                         │            │
+│  [timeout, retry]             │                         │            │
+│    │  same operation + opId ─►│                         │            │
+│    │                          │  check idempotent:opId ─►│           │
+│    │                          │◄── hit (cached result) ──│           │
+│    │◄───── ack (from cache) ──│                         │            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implementation Details** (see `src/shared/idempotency.ts`):
+
+1. **Operation ID Format**: `{clientId}-{timestamp}-{contentHash}`
+   - Unique per operation
+   - Survives client restart (timestamp + hash)
+   - Cheap to generate
+
+2. **Cache TTL**: 1 hour (3600 seconds)
+   - Long enough for all retries to complete
+   - Short enough to not waste Redis memory
+   - After TTL, duplicate detection relies on OT (which handles conflicts correctly)
+
+3. **Cached Result**: Stores `{ version, operation }` so duplicates get the exact same response.
+
+4. **Metrics**: `collab_duplicate_operations_total` counter tracks how often deduplication saves the day.
+
+**Why This Is Critical for OT**:
+- OT algorithms assume each operation is applied exactly once
+- Applying `insert("x", pos=5)` twice creates "xx" instead of "x"
+- With idempotency, retries are safe and the user never sees corruption
+
+---
+
+### Why Circuit Breakers Protect Real-Time Collaboration
+
+**Problem**: When a dependency (PostgreSQL, Redis, RabbitMQ) becomes slow or unavailable, blocking calls cause:
+- WebSocket handlers to pile up
+- Memory exhaustion
+- Cascading failures to other documents
+
+**Solution**: Circuit breakers that fail fast and enable graceful degradation.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Circuit Breaker States                                              │
+│                                                                      │
+│  CLOSED ─────────────────► OPEN ─────────────────► HALF-OPEN        │
+│  (normal)                  (failing fast)          (testing)         │
+│     │                          │                        │            │
+│     │  50% failures            │  30s timeout           │            │
+│     │  in 5+ requests          │                        │            │
+│     ▼                          ▼                        ▼            │
+│  Requests                 Requests                 1 test            │
+│  pass through             fail immediately         request           │
+│                           with fallback                              │
+│                                                        │            │
+│                           ◄────────────────────────────┘            │
+│                           success: go to CLOSED                      │
+│                           failure: stay OPEN                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implementation Details** (see `src/shared/circuitBreaker.ts`):
+
+1. **OT-Specific Settings**: More aggressive than general settings
+   - 1s timeout (users expect instant feedback)
+   - 30% error threshold (OT must be reliable)
+   - 15s reset (recover quickly)
+
+2. **Database Settings**: More tolerant
+   - 5s timeout (batch operations can be slow)
+   - 50% error threshold
+   - 30s reset
+
+3. **RabbitMQ Fallback**: When circuit opens:
+   - Operations buffered in-memory
+   - Local broadcast still works
+   - Logged for monitoring
+
+4. **Metrics Integration**:
+   - `collab_circuit_breaker_state`: 0=closed, 0.5=half-open, 1=open
+   - `collab_circuit_breaker_trips_total`: How often breakers trip
+
+**Degraded Mode Behavior**:
+
+| Dependency Down | Impact | Mitigation |
+|-----------------|--------|------------|
+| PostgreSQL | Can't persist operations | Fail operation, request resync |
+| Redis | Can't track presence | Presence updates fail silently |
+| RabbitMQ | Cross-server sync fails | Buffer locally, sync later |
+
+---
+
+### Why Conflict Logging Enables Debugging Sync Issues
+
+**Problem**: When users report "my changes disappeared" or "document looks corrupted", it's nearly impossible to debug without detailed logs of what OT did.
+
+**Solution**: Structured logging of every conflict resolution with queryable fields.
+
+**Log Format** (see `src/shared/logger.ts`):
+
+```json
+{
+  "level": "info",
+  "event": "ot_conflict_resolved",
+  "service": "collab-editor",
+  "server_id": "server-3001",
+  "document_id": "abc-123",
+  "client_id": "xyz-789",
+  "client_version": 42,
+  "server_version": 45,
+  "concurrent_ops": 3,
+  "transformed_ops_count": 2,
+  "original_ops_count": 1
+}
+```
+
+**What Each Field Tells Us**:
+
+- **client_version vs server_version**: Gap indicates how "stale" the client was
+- **concurrent_ops**: Number of operations transformed against
+- **transformed_ops_count vs original_ops_count**: If different, transformation changed the operation
+
+**Debugging Workflow**:
+
+1. User reports issue with document `abc-123` at ~10:30 AM
+2. Query logs: `event=ot_conflict_resolved AND document_id=abc-123 AND time>10:25`
+3. Look for:
+   - Large `concurrent_ops` values (client was very stale)
+   - Repeated conflicts from same client (connection issues)
+   - `operation_apply_failed` events (bugs in transform function)
+
+**Additional Logged Events**:
+
+| Event | When | Debug Value |
+|-------|------|-------------|
+| `operation_applied` | Every successful operation | Latency trends, throughput |
+| `operation_apply_failed` | Transform produced invalid op | Bug in OT algorithm |
+| `ws_connect` / `ws_disconnect` | Client presence changes | Connection stability |
+| `document_loaded` | Server loads document | Load time, content size |
+| `snapshot_saved` | Periodic checkpoint | Backup frequency |
+
+---
+
+### Observability Endpoints
+
+The implementation provides these endpoints for monitoring:
+
+| Endpoint | Purpose | Example Use |
+|----------|---------|-------------|
+| `GET /health` | Comprehensive dependency check | Load balancer health probe |
+| `GET /metrics` | Prometheus metrics | Scrape for dashboards |
+| `GET /ready` | Quick readiness check | Kubernetes readiness probe |
+| `GET /live` | Liveness check | Kubernetes liveness probe |
+
+**Health Response Example**:
+
+```json
+{
+  "status": "ok",
+  "server_id": "server-3001",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "uptime_seconds": 3600,
+  "checks": {
+    "postgres": { "status": "ok", "latency_ms": 2 },
+    "redis": { "status": "ok", "latency_ms": 1 },
+    "rabbitmq": { "status": "ok", "latency_ms": 3 }
+  },
+  "latency_ms": 8
+}
+```
+
+**Key Metrics**:
+
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `collab_ws_connections_total` | Gauge | server_id | Active connections |
+| `collab_active_documents` | Gauge | server_id | Documents in memory |
+| `collab_operations_total` | Counter | server_id, status | Throughput, error rate |
+| `collab_operation_latency_ms` | Histogram | server_id | User-perceived latency |
+| `collab_transform_latency_ms` | Histogram | server_id, concurrent_ops | OT performance |
+| `collab_queue_depth` | Gauge | queue_name | RabbitMQ backlog |
+| `collab_circuit_breaker_state` | Gauge | service | Dependency health |
+
+---
+
+### Running with Full Observability
+
+```bash
+# Start infrastructure with monitoring stack
+docker-compose --profile monitoring up -d
+
+# Run three server instances
+PORT=3001 SERVER_ID=server1 npm run dev &
+PORT=3002 SERVER_ID=server2 npm run dev &
+PORT=3003 SERVER_ID=server3 npm run dev &
+
+# Access dashboards
+# Prometheus: http://localhost:9090
+# Grafana: http://localhost:3000 (admin/admin)
+# RabbitMQ: http://localhost:15672 (guest/guest)
+```

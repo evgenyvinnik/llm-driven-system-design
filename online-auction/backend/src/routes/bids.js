@@ -7,17 +7,48 @@ import {
   publishBidUpdate,
   scheduleAuctionEnd,
   invalidateAuctionCache,
+  getIdempotentBid,
+  setIdempotentBid,
+  markBidInProgress,
+  clearBidInProgress,
+  cacheCurrentBid,
+  getCachedBidHistory,
+  cacheBidHistory,
+  checkRateLimit,
 } from '../redis.js';
+import logger, { logBidEvent, logError } from '../shared/logger.js';
+import { bidsPlacedTotal, bidLatency, bidAmountGauge, idempotentRequestsTotal } from '../shared/metrics.js';
 
 const router = express.Router();
 
 const MIN_BID_INCREMENT = 1.0;
+const BID_RATE_LIMIT = 10; // Max bids per minute
+const BID_RATE_WINDOW = 60; // 60 seconds
+
+/**
+ * Generate idempotency key from request if not provided
+ * Uses auction ID, user ID, amount, and timestamp window
+ */
+const getIdempotencyKey = (req, auctionId, bidderId) => {
+  // Check for client-provided idempotency key
+  const clientKey = req.headers['x-idempotency-key'];
+  if (clientKey) {
+    return clientKey;
+  }
+
+  // Generate key from request fingerprint (prevents rapid duplicate clicks)
+  // Uses a 1-second window to group rapid identical requests
+  const timestamp = Math.floor(Date.now() / 1000);
+  const amount = req.body.amount;
+  return `${auctionId}:${bidderId}:${amount}:${timestamp}`;
+};
 
 // Place a bid
 router.post('/:auctionId', authenticate, async (req, res) => {
   const { auctionId } = req.params;
   const { amount } = req.body;
   const bidderId = req.user.id;
+  const startTime = Date.now();
 
   if (!amount || isNaN(parseFloat(amount))) {
     return res.status(400).json({ error: 'Valid bid amount is required' });
@@ -25,10 +56,56 @@ router.post('/:auctionId', authenticate, async (req, res) => {
 
   const bidAmount = parseFloat(amount);
 
+  // Generate or use provided idempotency key
+  const idempotencyKey = getIdempotencyKey(req, auctionId, bidderId);
+
+  // Check for duplicate request (idempotency)
+  const existingResult = await getIdempotentBid(idempotencyKey);
+  if (existingResult) {
+    idempotentRequestsTotal.inc({ status: 'duplicate' });
+    logger.info(
+      {
+        action: 'bid_duplicate',
+        auctionId,
+        bidderId,
+        idempotencyKey,
+      },
+      'Duplicate bid request detected, returning cached result'
+    );
+    return res.status(200).json({
+      ...existingResult,
+      _idempotent: true,
+      _message: 'Duplicate request - returning previously processed result',
+    });
+  }
+
+  // Mark this request as in-progress to prevent concurrent duplicates
+  const canProceed = await markBidInProgress(idempotencyKey);
+  if (!canProceed) {
+    return res.status(409).json({
+      error: 'This bid request is already being processed',
+      retry_after: 5,
+    });
+  }
+
+  idempotentRequestsTotal.inc({ status: 'new' });
+
+  // Check rate limit
+  const rateLimit = await checkRateLimit(bidderId, 'bid', BID_RATE_LIMIT, BID_RATE_WINDOW);
+  if (!rateLimit.allowed) {
+    await clearBidInProgress(idempotencyKey);
+    return res.status(429).json({
+      error: 'Rate limit exceeded',
+      message: `Maximum ${BID_RATE_LIMIT} bids per minute`,
+      retry_after: rateLimit.resetIn,
+    });
+  }
+
   // Acquire distributed lock for this auction
   const lock = await acquireLock(`auction:${auctionId}`, 5);
 
   if (!lock) {
+    await clearBidInProgress(idempotencyKey);
     return res.status(429).json({ error: 'Too many concurrent bids, please try again' });
   }
 
@@ -210,14 +287,57 @@ router.post('/:auctionId', authenticate, async (req, res) => {
       );
     }
 
-    res.status(201).json({
+    // Build success response
+    const successResponse = {
       bid: lastBid,
       current_price: finalPrice,
       is_winning: winnerId === bidderId,
+    };
+
+    // Cache the result for idempotency
+    await setIdempotentBid(idempotencyKey, successResponse);
+    await clearBidInProgress(idempotencyKey);
+
+    // Update current bid cache
+    await cacheCurrentBid(auctionId, {
+      amount: finalPrice,
+      bidder_id: winnerId,
+      timestamp: new Date().toISOString(),
     });
+
+    // Record metrics
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    bidLatency.observe({ status: 'success' }, durationSeconds);
+    bidsPlacedTotal.inc({ auction_id: auctionId, is_auto_bid: String(isAutoBid), status: 'success' });
+    bidAmountGauge.set({ auction_id: auctionId }, finalPrice);
+
+    // Log the successful bid
+    logBidEvent({
+      auctionId,
+      bidderId,
+      amount: finalPrice,
+      isAutoBid,
+      durationMs: Date.now() - startTime,
+      idempotencyKey,
+    });
+
+    res.status(201).json(successResponse);
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Error placing bid:', error);
+    await clearBidInProgress(idempotencyKey);
+
+    // Record metrics
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    bidLatency.observe({ status: 'error' }, durationSeconds);
+    bidsPlacedTotal.inc({ auction_id: auctionId, is_auto_bid: 'false', status: 'error' });
+
+    logError(error, {
+      action: 'bid_placement',
+      auctionId,
+      bidderId,
+      amount: bidAmount,
+    });
+
     res.status(500).json({ error: 'Failed to place bid' });
   } finally {
     client.release();
@@ -416,6 +536,12 @@ router.get('/:auctionId', async (req, res) => {
   const { limit = 50 } = req.query;
 
   try {
+    // Try to get from cache first
+    const cachedBids = await getCachedBidHistory(auctionId);
+    if (cachedBids) {
+      return res.json({ bids: cachedBids, _cached: true });
+    }
+
     const result = await query(
       `SELECT b.id, b.amount, b.is_auto_bid, b.created_at, u.username as bidder_name
        FROM bids b
@@ -426,9 +552,12 @@ router.get('/:auctionId', async (req, res) => {
       [auctionId, parseInt(limit)]
     );
 
+    // Cache the result
+    await cacheBidHistory(auctionId, result.rows);
+
     res.json({ bids: result.rows });
   } catch (error) {
-    console.error('Error fetching bids:', error);
+    logError(error, { action: 'fetch_bids', auctionId });
     res.status(500).json({ error: 'Failed to fetch bids' });
   }
 });

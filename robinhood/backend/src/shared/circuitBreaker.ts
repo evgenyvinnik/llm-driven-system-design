@@ -47,13 +47,13 @@ const DEFAULT_OPTIONS = {
  * @param options - Circuit breaker configuration
  * @returns Wrapped function with circuit breaker protection
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
-  fn: T,
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
+  fn: (...args: TArgs) => Promise<TResult>,
   options: CircuitBreakerOptions
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
+): CircuitBreaker<TArgs, TResult> {
   const config = { ...DEFAULT_OPTIONS, ...options };
 
-  const breaker = new CircuitBreaker(fn, {
+  const breaker = new CircuitBreaker<TArgs, TResult>(fn, {
     timeout: config.timeout,
     errorThresholdPercentage: config.errorThresholdPercentage,
     volumeThreshold: config.volumeThreshold,

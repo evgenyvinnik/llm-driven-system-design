@@ -1366,3 +1366,217 @@ async function checkDatabase() {
   }
 }
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the production-ready modules implemented in `backend/src/shared/` and explains WHY each change improves the system's reliability, observability, and maintainability.
+
+### 1. Structured Logging with Pino (`shared/logger.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| `console.log` outputs unstructured text | Pino emits JSON logs | Machine-parseable for log aggregation (ELK, Datadog) |
+| No request correlation across services | Automatic `requestId` injection | Trace requests through distributed systems |
+| Sensitive data in logs | Redaction of auth headers, passwords | HIPAA compliance, security |
+| Inconsistent log levels | Structured severity levels | Proper alerting thresholds |
+
+**Key features:**
+- Request logging middleware adds timing, status codes, and user context
+- Child loggers propagate request IDs through the call stack
+- Pretty printing in development, JSON in production
+- Redaction of sensitive fields (`authorization`, `password`, `token`)
+
+**Usage:**
+```javascript
+import { logger, requestLoggingMiddleware } from './shared/logger.js';
+
+app.use(requestLoggingMiddleware);
+logger.info({ msg: 'User logged in', userId: user.id });
+```
+
+### 2. Prometheus Metrics (`shared/metrics.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| No visibility into request performance | HTTP duration histograms | P99 latency tracking, SLO monitoring |
+| Unknown ingestion throughput | Sample counter by type/status | Capacity planning, anomaly detection |
+| Database blind spots | Query duration histograms | Identify slow queries before they cause outages |
+| No alerting data | Prometheus-compatible `/metrics` | Integrate with Grafana dashboards |
+
+**Key metrics exported:**
+- `health_pipeline_http_request_duration_seconds` - Request latency histograms
+- `health_pipeline_samples_ingested_total` - Ingestion rate by type
+- `health_pipeline_sync_duration_seconds` - Device sync performance
+- `health_pipeline_db_pool_size` - Connection pool health
+- Default Node.js metrics (CPU, memory, event loop, GC)
+
+**Usage:**
+```bash
+# Scrape metrics with curl
+curl http://localhost:3000/metrics
+
+# View in Prometheus/Grafana
+# health_pipeline_http_request_duration_seconds{route="/api/v1/devices/:id/sync"}
+```
+
+### 3. Health Check Endpoints (`shared/health.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Load balancer sends traffic to unhealthy pods | `/ready` checks dependencies | No traffic until DB + Redis are up |
+| Kubernetes restarts healthy services | `/health` is lightweight | Fast liveness checks avoid false restarts |
+| No visibility into service state | `/health/deep` with pool stats | Debug degraded services |
+
+**Endpoints:**
+- `GET /health` - Liveness probe (is process alive?)
+- `GET /ready` - Readiness probe (are dependencies healthy?)
+- `GET /health/deep` - Debugging endpoint with memory/pool stats
+
+**Kubernetes integration:**
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
+### 4. Data Retention Configuration (`shared/retention.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Unbounded storage growth | Tiered retention (hot/warm/delete) | Predictable storage costs |
+| HIPAA requires defined retention | 7-year retention for samples | Regulatory compliance |
+| Old data slows queries | 90-day hot tier, then compression | Fast dashboard queries |
+| No way to restore old data | Archive to MinIO before deletion | Disaster recovery capability |
+
+**Retention tiers:**
+| Data Type | Hot (uncompressed) | Warm (compressed) | Delete |
+|-----------|-------------------|-------------------|--------|
+| Raw samples | 90 days | 2 years | 7 years |
+| Hourly aggregates | 90 days | N/A | 2 years |
+| Daily aggregates | Forever | N/A | Never |
+| Insights | 90 days | N/A | 2 years |
+
+**Automated cleanup:**
+```javascript
+import { runRetentionCleanup, compressOldChunks } from './shared/retention.js';
+
+// Run daily via cron or scheduled job
+await runRetentionCleanup();
+await compressOldChunks();
+```
+
+### 5. Idempotency for Ingestion (`shared/idempotency.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Mobile devices retry failed syncs | Idempotency key caching | No duplicate processing |
+| Duplicate data corrupts aggregates | Content-based key generation | Accurate health metrics |
+| Wasted compute on retries | Return cached response | Lower server load |
+| Database constraint violations | Pre-check before insert | Cleaner error handling |
+
+**How it works:**
+1. Client sends `X-Idempotency-Key` header OR server generates from content hash
+2. Server checks Redis for existing key
+3. If found: return cached response immediately
+4. If new: process request, cache response with 24h TTL
+
+**Automatic key generation:**
+```javascript
+// Keys are automatically generated from:
+// userId + deviceId + hash(samples)
+// So identical payloads from the same device are detected
+const key = generateIdempotencyKey(userId, deviceId, samples);
+```
+
+### 6. Database Migration Runner (`db/migrate.js`)
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Schema changes break deployments | Version-controlled migrations | Reproducible deployments |
+| No rollback capability | DOWN sections in migrations | Quick recovery from bad changes |
+| Manual DDL is error-prone | Transaction-wrapped execution | Atomic schema changes |
+| Unknown schema state | `schema_migrations` tracking | Know exactly what's applied |
+
+**Migration workflow:**
+```bash
+# Check current status
+npm run db:migrate:status
+
+# Apply pending migrations
+npm run db:migrate
+
+# Rollback last migration
+npm run db:migrate:down
+```
+
+**Migration file format:**
+```sql
+-- db/migrations/001_add_idempotency_keys.sql
+
+-- UP
+CREATE TABLE idempotency_keys (...);
+
+-- DOWN
+DROP TABLE idempotency_keys;
+```
+
+### 7. Graceful Shutdown
+
+**WHY this improves the system:**
+
+| Problem | Solution | Benefit |
+|---------|----------|---------|
+| Requests fail during restart | Stop accepting before closing | No dropped requests |
+| Connection pool leaks | Explicit pool.end() | Clean resource cleanup |
+| Hung shutdowns block deploys | 30-second force timeout | Reliable container restarts |
+
+**Implementation in index.js:**
+```javascript
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+```
+
+---
+
+## Summary of Production Readiness Improvements
+
+| Category | Before | After |
+|----------|--------|-------|
+| **Logging** | `console.log` | Structured JSON with request IDs |
+| **Metrics** | None | Prometheus histograms + counters |
+| **Health** | Basic `/health` | Liveness + Readiness + Deep probes |
+| **Retention** | Unbounded growth | Tiered with automated cleanup |
+| **Idempotency** | `ON CONFLICT DO NOTHING` | Content-based duplicate detection |
+| **Migrations** | Manual SQL | Version-controlled with rollback |
+| **Shutdown** | None | Graceful with connection draining |
+
+These changes collectively move the health data pipeline from a development prototype to a production-ready system that can:
+- Scale horizontally behind load balancers
+- Integrate with Kubernetes for auto-healing
+- Feed monitoring dashboards for operations teams
+- Meet HIPAA data retention requirements
+- Handle unreliable mobile network conditions gracefully

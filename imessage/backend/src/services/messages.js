@@ -2,6 +2,17 @@ import { v4 as uuid } from 'uuid';
 import { query, transaction } from '../db.js';
 import { queueOfflineMessage, getUserConnections } from '../redis.js';
 import { getParticipantIds } from './conversations.js';
+import { createLogger } from '../shared/logger.js';
+import {
+  messagesTotal,
+  messageDeliveryDuration,
+  messageDeliveryStatus,
+  syncLatency,
+  dbQueryDuration,
+} from '../shared/metrics.js';
+import idempotencyService from '../shared/idempotency.js';
+
+const logger = createLogger('messages-service');
 
 export async function getMessages(conversationId, userId, options = {}) {
   const { limit = 50, before, after } = options;
@@ -88,7 +99,73 @@ export async function getMessage(messageId) {
 }
 
 export async function sendMessage(conversationId, senderId, content, options = {}) {
-  const { contentType = 'text', replyToId } = options;
+  const { contentType = 'text', replyToId, clientMessageId } = options;
+  const startTime = Date.now();
+
+  logger.debug({
+    conversationId,
+    senderId,
+    contentType,
+    hasClientMessageId: !!clientMessageId,
+  }, 'Sending message');
+
+  // Handle idempotency if client message ID is provided
+  if (clientMessageId) {
+    const idempotencyKey = idempotencyService.generateKey(senderId, conversationId, clientMessageId);
+
+    const { result, isDuplicate } = await idempotencyService.processWithIdempotency({
+      idempotencyKey,
+      userId: senderId,
+      operation: async () => {
+        return await createMessage(conversationId, senderId, content, contentType, replyToId);
+      },
+    });
+
+    if (isDuplicate) {
+      messageDeliveryStatus.inc({ status: 'duplicate' });
+      logger.info({ messageId: result.id, idempotencyKey }, 'Duplicate message detected');
+
+      // Fetch the full message for the response
+      const existingMessage = await getMessage(result.id);
+      if (existingMessage) {
+        return { ...existingMessage, isDuplicate: true };
+      }
+    }
+
+    const duration = (Date.now() - startTime) / 1000;
+    messageDeliveryDuration.observe({ status: 'success' }, duration);
+    messagesTotal.inc({ status: 'sent', content_type: contentType });
+    messageDeliveryStatus.inc({ status: 'delivered' });
+
+    return result;
+  }
+
+  // No idempotency key - proceed with normal message creation
+  try {
+    const message = await createMessage(conversationId, senderId, content, contentType, replyToId);
+
+    const duration = (Date.now() - startTime) / 1000;
+    messageDeliveryDuration.observe({ status: 'success' }, duration);
+    messagesTotal.inc({ status: 'sent', content_type: contentType });
+    messageDeliveryStatus.inc({ status: 'delivered' });
+
+    return message;
+  } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+    messageDeliveryDuration.observe({ status: 'failed' }, duration);
+    messagesTotal.inc({ status: 'failed', content_type: contentType });
+    messageDeliveryStatus.inc({ status: 'failed' });
+
+    logger.error({ error, conversationId, senderId }, 'Failed to send message');
+    throw error;
+  }
+}
+
+/**
+ * Internal function to create a message in the database
+ */
+async function createMessage(conversationId, senderId, content, contentType, replyToId) {
+  const dbStart = Date.now();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender_id, content, content_type, reply_to_id)
@@ -96,6 +173,8 @@ export async function sendMessage(conversationId, senderId, content, options = {
      RETURNING id, conversation_id, sender_id, content, content_type, reply_to_id, created_at`,
     [conversationId, senderId, content, contentType, replyToId]
   );
+
+  dbQueryDuration.observe({ operation: 'insert_message' }, (Date.now() - dbStart) / 1000);
 
   const message = result.rows[0];
 
@@ -110,6 +189,8 @@ export async function sendMessage(conversationId, senderId, content, options = {
     'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
     [senderId]
   );
+
+  logger.debug({ messageId: message.id, conversationId }, 'Message created');
 
   return {
     ...message,

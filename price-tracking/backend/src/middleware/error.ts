@@ -16,7 +16,7 @@ export function errorHandler(
   res: Response,
   next: NextFunction
 ): void {
-  logger.error(`Error: ${err.message}`, { stack: err.stack, path: req.path });
+  logger.error({ err, path: req.path, action: 'error' }, `Error: ${err.message}`);
 
   // Handle known error types
   if (err.message.includes('already')) {
@@ -51,7 +51,7 @@ export function notFoundHandler(req: Request, res: Response): void {
 /**
  * Request logging middleware for monitoring and debugging.
  * Logs method, path, status code, duration, and client IP for each request.
- * Uses Winston logger with structured output format.
+ * Uses pino logger with structured output format.
  * @param req - Express request object
  * @param res - Express response object
  * @param next - Express next function
@@ -65,11 +65,17 @@ export function requestLogger(
 
   res.on('finish', () => {
     const duration = Date.now() - start;
-    logger.info(`${req.method} ${req.path}`, {
-      status: res.statusCode,
-      duration: `${duration}ms`,
-      ip: req.ip,
-    });
+    logger.info(
+      {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durationMs: duration,
+        ip: req.ip,
+        action: 'request',
+      },
+      `${req.method} ${req.path}`
+    );
   });
 
   next();

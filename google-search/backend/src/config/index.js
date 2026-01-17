@@ -36,6 +36,8 @@ export const config = {
   search: {
     resultsPerPage: parseInt(process.env.SEARCH_RESULTS_PER_PAGE || '10', 10),
     autocompleteLimit: parseInt(process.env.AUTOCOMPLETE_LIMIT || '10', 10),
+    // Cache TTL for search results (in seconds)
+    cacheTtl: parseInt(process.env.SEARCH_CACHE_TTL || '300', 10),
   },
 
   // PageRank
@@ -43,5 +45,45 @@ export const config = {
     dampingFactor: 0.85,
     iterations: 100,
     convergenceThreshold: 0.0001,
+  },
+
+  // Rate Limiting
+  rateLimit: {
+    // Search rate limits
+    searchWindowMs: parseInt(process.env.RATE_LIMIT_SEARCH_WINDOW_MS || '60000', 10),
+    searchMaxRequests: parseInt(process.env.RATE_LIMIT_SEARCH_MAX || '60', 10),
+    // Autocomplete rate limits (more permissive)
+    autocompleteWindowMs: parseInt(process.env.RATE_LIMIT_AUTOCOMPLETE_WINDOW_MS || '60000', 10),
+    autocompleteMaxRequests: parseInt(process.env.RATE_LIMIT_AUTOCOMPLETE_MAX || '120', 10),
+    // Admin rate limits (more restrictive)
+    adminWindowMs: parseInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS || '60000', 10),
+    adminMaxRequests: parseInt(process.env.RATE_LIMIT_ADMIN_MAX || '10', 10),
+    // Global rate limit
+    globalMaxRequests: parseInt(process.env.RATE_LIMIT_GLOBAL_MAX || '200', 10),
+  },
+
+  // Circuit Breaker
+  circuitBreaker: {
+    elasticsearch: {
+      timeout: parseInt(process.env.CB_ES_TIMEOUT || '15000', 10),
+      errorThresholdPercentage: parseInt(process.env.CB_ES_ERROR_THRESHOLD || '40', 10),
+      resetTimeout: parseInt(process.env.CB_ES_RESET_TIMEOUT || '20000', 10),
+    },
+    redis: {
+      timeout: parseInt(process.env.CB_REDIS_TIMEOUT || '5000', 10),
+      errorThresholdPercentage: parseInt(process.env.CB_REDIS_ERROR_THRESHOLD || '50', 10),
+      resetTimeout: parseInt(process.env.CB_REDIS_RESET_TIMEOUT || '10000', 10),
+    },
+    postgres: {
+      timeout: parseInt(process.env.CB_PG_TIMEOUT || '10000', 10),
+      errorThresholdPercentage: parseInt(process.env.CB_PG_ERROR_THRESHOLD || '50', 10),
+      resetTimeout: parseInt(process.env.CB_PG_RESET_TIMEOUT || '30000', 10),
+    },
+  },
+
+  // Idempotency
+  idempotency: {
+    defaultTtl: parseInt(process.env.IDEMPOTENCY_TTL || '3600', 10),
+    lockTimeout: parseInt(process.env.IDEMPOTENCY_LOCK_TIMEOUT || '60', 10),
   },
 };

@@ -39,7 +39,7 @@
     "@types/node": "^20.10.0",
     "@types/pg": "^8.10.9",
     "@types/pino": "^7.0.4",
-    "@types/uuid": "^9.0.7",
+    "@types/uuid": "^9.0.8",
     "@typescript-eslint/eslint-plugin": "^6.13.1",
     "@typescript-eslint/parser": "^6.13.1",
     "eslint": "^8.55.0",

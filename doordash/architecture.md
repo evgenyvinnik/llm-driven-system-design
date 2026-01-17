@@ -900,3 +900,311 @@ groups:
 | Matching | Score-based | Auction | Simpler, predictable |
 | ETA | Multi-factor | ML model | Interpretable |
 | Events | Kafka | Direct push | Decoupling, replay |
+
+---
+
+## Implementation Notes
+
+This section documents the key implementation decisions and explains WHY each pattern was chosen.
+
+### 1. Idempotency for Order Placement
+
+**WHY idempotency prevents duplicate charges:**
+
+When a customer submits an order, network issues can cause the request to be retried (browser retry, mobile app retry, load balancer retry). Without idempotency, each retry would create a new order and charge the customer multiple times.
+
+**Implementation:**
+```javascript
+// Order creation requires X-Idempotency-Key header
+router.post('/', requireAuth, idempotencyMiddleware(IDEMPOTENCY_KEYS.ORDER_CREATE), async (req, res) => {
+  // If same key was used before, return cached response
+  // Otherwise process order and cache response for 24 hours
+});
+```
+
+**Key design decisions:**
+- **Client-generated keys**: The client creates a UUID for each order attempt. If the same UUID is sent twice, the second request returns the cached first response.
+- **24-hour TTL**: Keys expire after 24 hours, balancing storage cost with replay protection window.
+- **Validation errors clear the key**: If the request fails validation (missing fields, unavailable item), we clear the idempotency key so the client can retry with corrected data.
+- **Server errors also clear the key**: If the order fails due to a server error, the client should be able to retry.
+
+**Files:**
+- `/backend/src/shared/idempotency.js` - Core idempotency logic
+- `/backend/src/routes/orders.js` - Applied to POST /api/orders
+
+### 2. Redis Caching for Restaurant Menus
+
+**WHY menu caching reduces restaurant API load:**
+
+Restaurant and menu data is read-heavy (every customer browses menus) but rarely updated (restaurants change menus infrequently). Caching this data reduces PostgreSQL load by 10-100x during peak hours.
+
+**Implementation:**
+```javascript
+// Cache-aside pattern for restaurant with menu
+async function getRestaurantWithMenu(id) {
+  const cached = await getCachedRestaurantWithMenu(id);
+  if (cached) return cached; // Cache hit
+
+  // Cache miss - fetch from DB
+  const data = await fetchFromDatabase(id);
+  await setCachedRestaurantWithMenu(id, data);
+  return data;
+}
+```
+
+**Key design decisions:**
+- **5-minute TTL for menus**: Short enough to reflect changes quickly, long enough to provide significant load reduction.
+- **Cache-aside pattern**: Application manages cache population. This gives us control over what gets cached and when.
+- **Explicit invalidation on updates**: When a restaurant or menu item is updated, we explicitly delete the cache entry rather than waiting for TTL expiry.
+
+**Cache key structure:**
+- `cache:restaurant_full:{id}` - Restaurant with full menu
+- `cache:cuisines` - List of cuisine types (10-minute TTL)
+
+**Files:**
+- `/backend/src/shared/cache.js` - Cache utilities
+- `/backend/src/routes/restaurants.js` - Cache integration
+
+### 3. Cache Invalidation Strategy
+
+**WHY explicit invalidation ensures data freshness:**
+
+When a restaurant owner updates their menu (price change, new item, item unavailable), customers should see the change immediately, not 5 minutes later.
+
+**Implementation:**
+```javascript
+// Update menu item triggers cache invalidation
+router.put('/:restaurantId/menu/:itemId', requireAuth, async (req, res) => {
+  await query('UPDATE menu_items SET ...', [...]);
+
+  // Immediately invalidate cache
+  await invalidateMenuCache(restaurantId);
+
+  res.json({ item: result.rows[0] });
+});
+```
+
+**Invalidation triggers:**
+- Restaurant details update -> invalidate restaurant cache + nearby cache
+- Menu item add/update/delete -> invalidate menu cache
+- Restaurant open/close status change -> invalidate all related caches
+
+### 4. Delivery Time Metrics for ETA Optimization
+
+**WHY delivery time metrics enable ETA optimization:**
+
+To improve ETA predictions, we need to measure how accurate our current predictions are. By tracking the difference between estimated and actual delivery times, we can:
+1. Identify systematic biases (always 5 minutes late = add 5 minutes to estimates)
+2. Detect degradation (weather, traffic, driver shortage)
+3. Improve the ETA algorithm over time
+
+**Implementation:**
+```javascript
+// Record delivery time when order is delivered
+if (status === 'DELIVERED' && order.placed_at) {
+  const deliveryTimeMinutes = (Date.now() - new Date(order.placed_at).getTime()) / 60000;
+  deliveryDuration.observe(deliveryTimeMinutes);
+
+  // Calculate ETA accuracy
+  if (order.estimated_delivery_at) {
+    const estimatedTime = new Date(order.estimated_delivery_at).getTime();
+    const diffMinutes = (Date.now() - estimatedTime) / 60000;
+    etaAccuracy.observe(diffMinutes); // Positive = late, negative = early
+  }
+}
+```
+
+**Metrics exposed at /metrics:**
+- `delivery_duration_minutes` - Histogram of actual delivery times
+- `eta_accuracy_minutes` - Histogram of ETA vs actual (positive = late)
+- `driver_match_duration_seconds` - How long it takes to match a driver
+- `orders_total` - Counter by status
+- `orders_active` - Gauge by status
+
+**Files:**
+- `/backend/src/shared/metrics.js` - Prometheus metrics definitions
+- `/backend/src/routes/orders.js` - Metrics recording
+- `/backend/src/routes/drivers.js` - Delivery completion metrics
+
+### 5. Circuit Breaker for Driver Matching
+
+**WHY circuit breakers protect the order flow:**
+
+Driver matching involves querying Redis geo data and PostgreSQL. If these services are slow or unavailable, the matching process could hang, blocking order confirmation. A circuit breaker prevents cascade failures.
+
+**Implementation:**
+```javascript
+async function matchDriverToOrder(orderId) {
+  const breaker = getDriverMatchCircuitBreaker();
+
+  const result = await breaker.fire(async () => {
+    // Complex matching logic with Redis + PostgreSQL queries
+    return { matched: true, driverId };
+  });
+
+  // If circuit is open, returns fallback
+  // { matched: false, queued: true, message: 'Driver matching will retry shortly' }
+}
+```
+
+**Circuit breaker configuration:**
+- **Driver matching**: 10s timeout, 50% error threshold, 30s reset
+- **Payment processing**: 5s timeout, 30% error threshold (more sensitive), 60s reset
+
+**States:**
+- **Closed**: Normal operation, requests flow through
+- **Open**: Service degraded, all requests return fallback immediately
+- **Half-open**: Testing if service recovered, some requests allowed through
+
+**Files:**
+- `/backend/src/shared/circuit-breaker.js` - Circuit breaker implementation
+- `/backend/src/routes/orders.js` - Applied to driver matching
+
+### 6. Audit Logging for Order Status Changes
+
+**WHY audit logging is critical for food delivery:**
+
+In a three-sided marketplace, disputes are common:
+- Customer claims food never arrived (driver says delivered)
+- Restaurant claims order was ready on time (driver was late)
+- Driver claims restaurant took too long
+
+Audit logs provide an immutable record of who did what and when.
+
+**Implementation:**
+```javascript
+// Every status change is logged with full context
+await auditOrderStatusChange(
+  order,
+  previousStatus,
+  newStatus,
+  { type: ACTOR_TYPES.DRIVER, id: req.user.id },
+  {
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+  }
+);
+```
+
+**Audit log schema:**
+- `event_type`: ORDER_CREATED, ORDER_STATUS_CHANGED, ORDER_CANCELLED, DRIVER_ASSIGNED
+- `entity_type`: order, driver, restaurant
+- `entity_id`: The ID of the entity
+- `actor_type`: customer, driver, restaurant, admin, system
+- `actor_id`: Who performed the action
+- `changes`: JSON with before/after state
+- `metadata`: IP, user agent, additional context
+
+**Files:**
+- `/backend/src/shared/audit.js` - Audit logging utilities
+- `/backend/db/init.sql` - audit_logs table schema
+
+### 7. Structured JSON Logging with Pino
+
+**WHY structured logging improves debugging:**
+
+Plain text logs (`console.log`) are hard to search and aggregate. Structured JSON logs can be:
+- Indexed by Elasticsearch/CloudWatch Logs
+- Filtered by request ID, user ID, order ID
+- Aggregated for metrics and alerting
+
+**Implementation:**
+```javascript
+// Every request gets a unique ID and child logger
+app.use(requestLogger); // Adds req.log with request context
+
+// Business events include structured data
+logger.info({
+  orderId: order.id,
+  customerId: req.user.id,
+  restaurantId,
+  total: order.total,
+  itemCount: orderItems.length,
+}, 'Order placed');
+```
+
+**Log format:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "doordash-api",
+  "requestId": "abc-123",
+  "orderId": 456,
+  "customerId": 789,
+  "msg": "Order placed"
+}
+```
+
+**Files:**
+- `/backend/src/shared/logger.js` - Pino logger configuration
+- All route files use structured logging
+
+### 8. Health Check Endpoints
+
+**WHY multiple health check endpoints:**
+
+Different health checks serve different purposes:
+- `/health/live` - Is the process running? (Used by Kubernetes liveness probe)
+- `/health/ready` - Can it handle traffic? (Used by load balancer)
+- `/health` - Detailed status for debugging
+
+**Implementation:**
+```javascript
+// Comprehensive health check
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    checks: {
+      postgres: await checkPostgres(),
+      redis: await checkRedis(),
+    },
+    memory: process.memoryUsage(),
+  };
+  res.status(health.status === 'ok' ? 200 : 503).json(health);
+});
+```
+
+**Files:**
+- `/backend/src/index.js` - Health check endpoints
+
+---
+
+### Summary of New Dependencies
+
+```json
+{
+  "pino": "^8.x",          // Structured JSON logging
+  "prom-client": "^15.x",  // Prometheus metrics
+  "opossum": "^8.x"        // Circuit breaker
+}
+```
+
+### New Files Created
+
+```
+backend/src/shared/
+├── logger.js          # Pino logger and request logging middleware
+├── metrics.js         # Prometheus metrics and /metrics endpoint
+├── circuit-breaker.js # Opossum circuit breaker wrappers
+├── cache.js           # Redis caching utilities
+├── idempotency.js     # Idempotency key management
+└── audit.js           # Audit logging for business events
+```
+
+### New Database Table
+
+```sql
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  event_type VARCHAR(50) NOT NULL,
+  entity_type VARCHAR(50) NOT NULL,
+  entity_id INTEGER NOT NULL,
+  actor_type VARCHAR(20) NOT NULL,
+  actor_id INTEGER,
+  changes JSONB,
+  metadata JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+

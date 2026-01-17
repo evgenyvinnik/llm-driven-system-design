@@ -1,8 +1,21 @@
+import CircuitBreakerLib from 'opossum';
 import config from '../config/index.js';
 import { CircuitOpenError } from '../utils/index.js';
+import { metricsService } from './metrics.js';
+import logger from './logger.js';
 
 /**
  * Circuit Breaker implementation for protecting against cascading failures
+ *
+ * WHY circuit breakers prevent cascade failures:
+ * - When a downstream service fails, requests pile up waiting for timeouts
+ * - This exhausts connection pools and threads in the calling service
+ * - The calling service then fails, cascading to its callers
+ * - Circuit breakers "fail fast" when a service is down, preventing resource exhaustion
+ * - Half-open state allows gradual recovery testing without overwhelming the recovering service
+ *
+ * This implementation wraps the opossum library for production-grade circuit breaking
+ * while maintaining backward compatibility with our simpler implementation.
  */
 export class CircuitBreaker {
   constructor(name, options = {}) {
@@ -16,6 +29,7 @@ export class CircuitBreaker {
     this.successes = 0;
     this.lastFailure = null;
     this.halfOpenCount = 0;
+    this.log = logger.child({ circuitBreaker: name });
 
     // Statistics
     this.stats = {
@@ -84,7 +98,7 @@ export class CircuitBreaker {
     this.failures++;
     this.lastFailure = Date.now();
 
-    console.warn(`Circuit breaker ${this.name} failure #${this.failures}:`, error.message);
+    this.log.warn({ failures: this.failures, error: error.message }, 'Circuit breaker failure');
 
     if (this.state === 'half-open') {
       this.transitionTo('open');
@@ -106,7 +120,10 @@ export class CircuitBreaker {
       timestamp: new Date().toISOString(),
     });
 
-    console.log(`Circuit breaker ${this.name}: ${oldState} -> ${newState}`);
+    this.log.info({ from: oldState, to: newState }, 'Circuit breaker state change');
+
+    // Record state change in metrics
+    metricsService.recordCircuitBreakerState(this.name, newState, this.stats);
   }
 
   /**
@@ -195,5 +212,127 @@ export class CircuitBreakerRegistry {
 
 // Singleton instance
 export const circuitBreakerRegistry = new CircuitBreakerRegistry();
+
+/**
+ * Production-grade circuit breaker using opossum library
+ *
+ * Use this for downstream service calls that need more sophisticated
+ * circuit breaking features like:
+ * - Configurable timeout
+ * - Fallback functions
+ * - Volume threshold (min requests before opening)
+ * - Error percentage threshold
+ */
+export class OpossumCircuitBreaker {
+  constructor(name, action, options = {}) {
+    this.name = name;
+    this.log = logger.child({ circuitBreaker: name });
+
+    const defaultOptions = {
+      timeout: options.timeout || 10000, // 10 seconds
+      errorThresholdPercentage: options.errorThresholdPercentage || 50,
+      resetTimeout: options.resetTimeout || config.circuitBreaker.resetTimeout,
+      volumeThreshold: options.volumeThreshold || 5, // Min requests before opening
+    };
+
+    this.breaker = new CircuitBreakerLib(action, defaultOptions);
+
+    // Set up event handlers
+    this.breaker.on('open', () => {
+      this.log.warn('Circuit opened');
+      metricsService.recordCircuitBreakerState(name, 'open', this.getStats());
+    });
+
+    this.breaker.on('halfOpen', () => {
+      this.log.info('Circuit half-open');
+      metricsService.recordCircuitBreakerState(name, 'half-open', this.getStats());
+    });
+
+    this.breaker.on('close', () => {
+      this.log.info('Circuit closed');
+      metricsService.recordCircuitBreakerState(name, 'closed', this.getStats());
+    });
+
+    this.breaker.on('fallback', () => {
+      this.log.debug('Fallback executed');
+      metricsService.increment('circuit_breaker_fallbacks_total', { name });
+    });
+
+    this.breaker.on('reject', () => {
+      this.log.warn('Request rejected (circuit open)');
+      metricsService.increment('circuit_breaker_rejects_total', { name });
+    });
+
+    this.breaker.on('timeout', () => {
+      this.log.warn('Request timed out');
+      metricsService.increment('circuit_breaker_timeouts_total', { name });
+    });
+  }
+
+  /**
+   * Execute the protected action
+   */
+  async fire(...args) {
+    return this.breaker.fire(...args);
+  }
+
+  /**
+   * Set fallback function
+   */
+  fallback(fn) {
+    this.breaker.fallback(fn);
+    return this;
+  }
+
+  /**
+   * Get current state
+   */
+  get state() {
+    if (this.breaker.opened) return 'open';
+    if (this.breaker.halfOpen) return 'half-open';
+    return 'closed';
+  }
+
+  /**
+   * Get statistics
+   */
+  getStats() {
+    const stats = this.breaker.stats;
+    return {
+      totalCalls: stats.fires || 0,
+      successfulCalls: stats.successes || 0,
+      failedCalls: stats.failures || 0,
+      rejectedCalls: stats.rejects || 0,
+      timeouts: stats.timeouts || 0,
+      fallbacks: stats.fallbacks || 0,
+    };
+  }
+
+  /**
+   * Get full state for monitoring
+   */
+  getState() {
+    return {
+      name: this.name,
+      state: this.state,
+      stats: this.getStats(),
+      status: this.breaker.status,
+    };
+  }
+
+  /**
+   * Force open
+   */
+  open() {
+    this.breaker.open();
+  }
+
+  /**
+   * Force close
+   */
+  close() {
+    this.breaker.close();
+  }
+}
 
 export default CircuitBreaker;

@@ -15,11 +15,10 @@ import { authenticate, optionalAuth, requireDeveloper } from '../middleware/auth
 const router = Router();
 
 // =============================================================================
-// Health check
+// Health check (simple version for API)
 // =============================================================================
-router.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+import { simpleHealthCheck } from '../shared/health.js';
+router.get('/health', simpleHealthCheck);
 
 // =============================================================================
 // Auth routes - User authentication and profile management

@@ -1,7 +1,14 @@
 import { query, transaction } from '../utils/db.js';
-import { getObject, uploadObject, getPublicUrl } from '../utils/storage.js';
+import { uploadObject, getPublicUrl } from '../shared/resilientStorage.js';
 import { cacheSet, cacheGet } from '../utils/redis.js';
 import config from '../config/index.js';
+import logger, { logEvent } from '../shared/logger.js';
+import {
+  transcodeQueueDepth,
+  transcodeJobDuration,
+  transcodedVideosTotal,
+  videoUploadsTotal,
+} from '../shared/metrics.js';
 
 // In-memory job queue for simplicity (in production, use Redis/Kafka)
 const transcodingQueue = [];
@@ -15,7 +22,9 @@ const RESOLUTIONS = {
   '360p': { width: 640, height: 360, bitrate: 500000 },
 };
 
-// Queue a transcoding job
+/**
+ * Queue a transcoding job
+ */
 export const queueTranscodingJob = async (videoId, sourceKey, userId) => {
   const job = {
     videoId,
@@ -27,8 +36,18 @@ export const queueTranscodingJob = async (videoId, sourceKey, userId) => {
 
   transcodingQueue.push(job);
 
+  // Update queue depth metric
+  transcodeQueueDepth.set(transcodingQueue.length);
+
   // Cache job status
   await cacheSet(`transcode:${videoId}`, job, 3600);
+
+  logger.info({
+    event: 'transcode_job_queued',
+    videoId,
+    userId,
+    queueDepth: transcodingQueue.length,
+  }, `Transcoding job queued for video ${videoId}`);
 
   // Start processing if not already
   if (!isProcessing) {
@@ -38,7 +57,9 @@ export const queueTranscodingJob = async (videoId, sourceKey, userId) => {
   return job;
 };
 
-// Process the transcoding queue
+/**
+ * Process the transcoding queue
+ */
 const processQueue = async () => {
   if (isProcessing || transcodingQueue.length === 0) {
     return;
@@ -48,11 +69,30 @@ const processQueue = async () => {
 
   while (transcodingQueue.length > 0) {
     const job = transcodingQueue.shift();
+    transcodeQueueDepth.set(transcodingQueue.length);
+
+    const jobStartTime = Date.now();
 
     try {
       await processTranscodingJob(job);
+
+      // Record success metrics
+      const durationSeconds = (Date.now() - jobStartTime) / 1000;
+      transcodeJobDuration.observe({ resolution: 'all', status: 'success' }, durationSeconds);
+      videoUploadsTotal.inc({ status: 'success' });
+
     } catch (error) {
-      console.error(`Transcoding failed for video ${job.videoId}:`, error);
+      logger.error({
+        event: 'transcode_job_failed',
+        videoId: job.videoId,
+        error: error.message,
+        stack: error.stack,
+      }, `Transcoding failed for video ${job.videoId}`);
+
+      // Record failure metrics
+      const durationSeconds = (Date.now() - jobStartTime) / 1000;
+      transcodeJobDuration.observe({ resolution: 'all', status: 'failed' }, durationSeconds);
+      videoUploadsTotal.inc({ status: 'failed' });
 
       // Update video status to failed
       await query(
@@ -71,9 +111,17 @@ const processQueue = async () => {
   isProcessing = false;
 };
 
-// Process a single transcoding job (simulated)
+/**
+ * Process a single transcoding job (simulated)
+ */
 const processTranscodingJob = async (job) => {
-  console.log(`Starting transcoding for video ${job.videoId}`);
+  const startTime = Date.now();
+
+  logger.info({
+    event: 'transcode_job_started',
+    videoId: job.videoId,
+    userId: job.userId,
+  }, `Starting transcoding for video ${job.videoId}`);
 
   // Update status to processing
   await query(
@@ -94,6 +142,13 @@ const processTranscodingJob = async (job) => {
   for (let i = 0; i < totalResolutions; i++) {
     const resolution = config.transcoding.resolutions[i];
     const resConfig = RESOLUTIONS[resolution];
+    const resolutionStartTime = Date.now();
+
+    logger.debug({
+      event: 'transcode_resolution_started',
+      videoId: job.videoId,
+      resolution,
+    }, `Transcoding ${resolution} for video ${job.videoId}`);
 
     // Simulate transcoding time
     await simulateTranscoding(config.transcoding.simulatedDuration / totalResolutions);
@@ -141,6 +196,18 @@ const processTranscodingJob = async (job) => {
 
     completedResolutions.push(resolution);
 
+    // Record per-resolution metrics
+    const resolutionDuration = (Date.now() - resolutionStartTime) / 1000;
+    transcodeJobDuration.observe({ resolution, status: 'success' }, resolutionDuration);
+    transcodedVideosTotal.inc({ status: 'success', resolution });
+
+    logger.debug({
+      event: 'transcode_resolution_completed',
+      videoId: job.videoId,
+      resolution,
+      durationSeconds: resolutionDuration,
+    }, `Completed ${resolution} for video ${job.videoId}`);
+
     // Update progress
     const progress = Math.round(((i + 1) / totalResolutions) * 100);
     await cacheSet(`transcode:${job.videoId}`, {
@@ -186,23 +253,34 @@ const processTranscodingJob = async (job) => {
     );
   });
 
+  const totalDuration = (Date.now() - startTime) / 1000;
+
   await cacheSet(`transcode:${job.videoId}`, {
     ...job,
     status: 'completed',
     progress: 100,
     completedResolutions,
     completedAt: new Date(),
+    durationSeconds: totalDuration,
   }, 3600);
 
-  console.log(`Transcoding completed for video ${job.videoId}`);
+  logEvent.videoTranscoded(logger, {
+    videoId: job.videoId,
+    duration: totalDuration,
+    resolutions: completedResolutions,
+  });
 };
 
-// Helper to simulate transcoding delay
+/**
+ * Helper to simulate transcoding delay
+ */
 const simulateTranscoding = (ms) => {
   return new Promise(resolve => setTimeout(resolve, ms));
 };
 
-// Generate HLS playlist for a resolution
+/**
+ * Generate HLS playlist for a resolution
+ */
 const generateHLSPlaylist = (videoId, resolution, durationSeconds) => {
   const segmentDuration = 4; // 4 second segments
   const segmentCount = Math.ceil(durationSeconds / segmentDuration);
@@ -225,7 +303,9 @@ segment_${i.toString().padStart(3, '0')}.ts
   return playlist;
 };
 
-// Generate master HLS playlist
+/**
+ * Generate master HLS playlist
+ */
 const generateMasterPlaylist = (videoId, resolutions) => {
   let playlist = `#EXTM3U
 #EXT-X-VERSION:3
@@ -241,7 +321,9 @@ ${resolution}/playlist.m3u8
   return playlist;
 };
 
-// Generate a simple placeholder thumbnail (1x1 pixel gray JPEG)
+/**
+ * Generate a simple placeholder thumbnail (1x1 pixel gray JPEG)
+ */
 const generatePlaceholderThumbnail = () => {
   // Minimal JPEG header for a gray pixel
   const jpegBytes = Buffer.from([
@@ -277,7 +359,9 @@ const generatePlaceholderThumbnail = () => {
   return jpegBytes;
 };
 
-// Get transcoding status
+/**
+ * Get transcoding status
+ */
 export const getTranscodingStatus = async (videoId) => {
   const cached = await cacheGet(`transcode:${videoId}`);
   if (cached) {
@@ -300,7 +384,25 @@ export const getTranscodingStatus = async (videoId) => {
   };
 };
 
-// Get queue length
+/**
+ * Get queue length
+ */
 export const getQueueLength = () => {
   return transcodingQueue.length;
+};
+
+/**
+ * Get queue status for admin dashboard
+ */
+export const getQueueStatus = () => {
+  return {
+    queueLength: transcodingQueue.length,
+    isProcessing,
+    jobs: transcodingQueue.map(job => ({
+      videoId: job.videoId,
+      userId: job.userId,
+      status: job.status,
+      queuedAt: job.createdAt,
+    })),
+  };
 };

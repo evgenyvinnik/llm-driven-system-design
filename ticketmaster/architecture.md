@@ -845,3 +845,301 @@ npm run dev:lb       # nginx on port 3000
 - [ ] Bot detection with behavioral analysis
 - [ ] Mobile ticket delivery with QR codes
 - [ ] Secondary market (resale) support
+
+---
+
+## Implementation Notes
+
+This section documents key implementation patterns and explains WHY specific architectural decisions were made to address the unique challenges of high-concurrency ticket sales.
+
+### Idempotency: Preventing Double-Charging Customers
+
+**Problem**: In distributed systems with network timeouts and retries, a checkout request might be sent multiple times. Without idempotency, this could result in:
+- Customer charged twice for the same seats
+- Same seats sold to the same customer twice
+- Duplicate order records in the database
+
+**Solution**: Idempotency keys for checkout operations.
+
+```typescript
+// Every checkout includes an idempotency key
+const result = await checkoutService.checkout(
+  sessionId,
+  userId,
+  paymentMethod,
+  idempotencyKey,  // Unique per checkout attempt
+  correlationId
+);
+```
+
+**How It Works**:
+1. Client generates or provides an `Idempotency-Key` header with the checkout request
+2. Server checks Redis and PostgreSQL for a previous result with this key
+3. If found, return the cached result (no new charge, no new order)
+4. If not found, process the checkout and store the result
+
+**Why This Matters**:
+- **Network failures**: If the response is lost but the order succeeded, retrying returns the same order
+- **Double-click**: User clicking "Pay" twice uses the same key, only one charge occurs
+- **Mobile reliability**: Mobile apps on flaky networks can safely retry
+- **Payment provider resilience**: Even if payment provider confirms but our DB write fails, we can recover
+
+**Implementation Details**:
+- Keys stored in Redis (fast lookup, 24h TTL) and PostgreSQL (durability)
+- Key format: `checkout:{sessionId}:{eventId}:{sortedSeatIds}`
+- Orders table has `idempotency_key` column with unique constraint
+
+### Distributed Locking: Preventing Seat Overselling
+
+**Problem**: When 10,000 users try to buy the last 100 seats simultaneously, race conditions could cause:
+- Same seat sold to multiple customers
+- Seat inventory going negative
+- Lost revenue from failed purchases
+
+**Solution**: Two-phase distributed locking using Redis + PostgreSQL.
+
+```typescript
+// Phase 1: Acquire distributed lock in Redis (sub-millisecond)
+const locks = await acquireSeatLocks(eventId, seatIds, sessionId, HOLD_DURATION);
+
+// Phase 2: Database transaction with row-level locks
+await withTransaction(async (client) => {
+  await client.query('SELECT ... FOR UPDATE NOWAIT');  // Fail fast if locked
+  await client.query('UPDATE event_seats SET status = ...');
+});
+```
+
+**Why Two Phases**:
+
+| Phase | Technology | Purpose | Latency |
+|-------|------------|---------|---------|
+| 1 | Redis SET NX | Fast distributed exclusion across servers | ~1ms |
+| 2 | PostgreSQL FOR UPDATE | ACID compliance and durability | ~10-50ms |
+
+**Why Redis Alone Isn't Enough**:
+- Redis locks can expire during long operations
+- Redis might lose data on restart (unless AOF persistence)
+- No transactional guarantees with database state
+
+**Why PostgreSQL Alone Isn't Enough**:
+- Row-level locks require database roundtrip (~20ms)
+- Lock acquisition is serialized, creating bottleneck at scale
+- Connection pool exhaustion under high load
+
+**The Combined Approach**:
+1. Redis provides fast "intent to purchase" lock
+2. Only lock holders proceed to database
+3. Database provides ACID guarantees
+4. If Redis fails, circuit breaker falls back to PostgreSQL advisory locks
+
+**Implementation Details**:
+- Lock key format: `lock:seat:{eventId}:{seatId}`
+- Each lock has a unique token to prevent releasing someone else's lock
+- Lock release uses Lua script for atomic check-and-delete
+- Lock tokens are stored with reservations for cleanup
+
+### Caching: Enabling Flash Sale Performance
+
+**Problem**: A Taylor Swift concert on-sale generates 100x normal traffic in the first minute. Without caching:
+- Database overwhelmed by seat availability queries
+- 10,000+ queries per second for the same seat map
+- Slow response times cause abandoned carts
+
+**Solution**: Aggressive Redis caching with dynamic TTLs.
+
+```typescript
+// Cache TTL varies based on event status
+const cacheTtl = status === 'on_sale'
+  ? 5   // High accuracy during active sales
+  : 30; // Longer cache for browsing
+
+await redis.setex(cacheKey, cacheTtl, JSON.stringify(availability));
+```
+
+**Why Dynamic TTLs**:
+
+| Event Status | Cache TTL | Rationale |
+|--------------|-----------|-----------|
+| On Sale (active) | 5 seconds | Balance between accuracy and performance |
+| Upcoming | 30 seconds | Seats not changing, longer cache OK |
+| Sold Out | 60 seconds | Data is static |
+
+**Why 5 Seconds for Active Sales**:
+- 5 seconds allows ~20 cache hits per seat map request
+- Still shows "approximately" accurate availability
+- Users understand seats may be taken when they click
+
+**Cache Invalidation Strategy**:
+- Invalidate on seat status change (reserve, release, checkout)
+- Invalidate on order completion or cancellation
+- Pattern-based deletion: `availability:{eventId}:*`
+
+**Performance Impact**:
+```
+Without cache: 10,000 RPS to PostgreSQL
+With cache:    500 RPS to PostgreSQL (95% cache hit rate)
+```
+
+### Queue Metrics: Enabling Demand Prediction
+
+**Problem**: Without visibility into queue depth and processing rates, operations cannot:
+- Predict when an event will sell out
+- Identify bottlenecks in the purchase flow
+- Staff support appropriately for high-demand events
+- Detect and respond to anomalies
+
+**Solution**: Prometheus metrics for all queue and sales operations.
+
+```typescript
+// Queue metrics updated every 5 seconds
+queueLength.set({ event_id: event.id }, stats.queueLength);
+activeSessions.set({ event_id: event.id }, stats.activeCount);
+
+// Sales metrics updated on each transaction
+seatsReservedTotal.inc({ event_id: eventId }, seatCount);
+seatsSoldTotal.inc({ event_id: eventId }, seatCount);
+checkoutDuration.observe({ event_id: eventId }, durationMs / 1000);
+```
+
+**Key Metrics Exposed**:
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `queue_length{event_id}` | Gauge | Current users waiting |
+| `active_sessions{event_id}` | Gauge | Users currently shopping |
+| `seats_reserved_total{event_id}` | Counter | Seats held for checkout |
+| `seats_sold_total{event_id}` | Counter | Completed seat sales |
+| `checkout_duration_seconds{event_id}` | Histogram | Checkout latency distribution |
+| `seat_lock_attempts_total{event_id,result}` | Counter | Lock success/failure rates |
+
+**Why These Metrics Matter**:
+
+1. **Demand Forecasting**:
+   - `queue_length` trend predicts time to sell-out
+   - Historical data informs capacity planning for similar events
+
+2. **Bottleneck Detection**:
+   - High `checkout_duration` indicates payment provider issues
+   - High lock failures indicate contention (need more inventory)
+
+3. **Anomaly Detection**:
+   - Sudden queue drop might indicate site issues
+   - Unusual patterns might indicate bot attacks
+
+4. **SLO Monitoring**:
+   - `checkout_duration_seconds` p95 < 2 seconds target
+   - `seat_lock_attempts_total{result="failure"}` rate < 1%
+
+**Dashboard Queries (Prometheus/Grafana)**:
+```promql
+# Sell-out prediction: seats remaining / sale rate
+(available_seats / rate(seats_sold_total[5m])) / 60  # minutes to sellout
+
+# Checkout success rate
+rate(checkout_completed_total[1m]) / rate(http_requests_total{endpoint="/api/v1/checkout"}[1m])
+
+# P95 checkout latency
+histogram_quantile(0.95, rate(checkout_duration_seconds_bucket[5m]))
+```
+
+### Circuit Breaker: Payment Processing Resilience
+
+**Problem**: Payment providers occasionally experience outages. Without protection:
+- Requests queue up waiting for timeouts
+- Server resources exhausted
+- All checkouts fail, even when seats are available
+
+**Solution**: Circuit breaker pattern for payment processing.
+
+```typescript
+// Payment calls go through circuit breaker
+const result = await this.paymentCircuitBreaker.execute(async () => {
+  return this.processPayment(userId, amount, paymentMethod);
+});
+```
+
+**Circuit States**:
+
+| State | Behavior | Transition |
+|-------|----------|------------|
+| CLOSED | Requests pass through normally | Opens after 5 failures |
+| OPEN | Requests fail immediately | Half-opens after 30 seconds |
+| HALF_OPEN | Limited requests test recovery | Closes after 2 successes |
+
+**Why This Matters**:
+- **Fail fast**: Users get immediate error instead of 30-second timeout
+- **Auto-recovery**: System tests and recovers when provider is back
+- **Resource protection**: Server threads not blocked waiting
+- **Clear communication**: "Payment service temporarily unavailable"
+
+**Health Check Integration**:
+```json
+// /health endpoint includes circuit breaker status
+{
+  "checks": [
+    {
+      "name": "payment_circuit_breaker",
+      "status": "healthy",  // or "unhealthy" if open
+      "latencyMs": 0
+    }
+  ]
+}
+```
+
+### Summary: Defense in Depth
+
+These patterns work together to create a robust ticketing system:
+
+```
+User Request
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     RATE LIMITING                            │
+│              (Future: Token bucket per user)                 │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    WAITING ROOM QUEUE                        │
+│              (Redis ZSET, admission control)                 │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    SEAT AVAILABILITY                         │
+│            (Redis cache, 5-second TTL during sales)          │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   DISTRIBUTED LOCKING                        │
+│            (Redis locks + PostgreSQL FOR UPDATE)             │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     IDEMPOTENT CHECKOUT                      │
+│           (Idempotency keys prevent double charges)          │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    CIRCUIT BREAKER                           │
+│           (Protects against payment provider failures)       │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    OBSERVABILITY                             │
+│         (Prometheus metrics, structured logging, tracing)    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Each layer addresses a specific failure mode, and together they ensure that:
+- No customer is charged twice
+- No seat is sold twice
+- System remains responsive under extreme load
+- Operations have visibility into system health
+- Failures are isolated and recoverable
+

@@ -1524,3 +1524,194 @@ router.get('/health/ready', async (req, res) => {
   }
 });
 ```
+
+---
+
+## Implementation Notes
+
+This section explains the WHY behind key implementation decisions, connecting code choices to system design principles.
+
+### WHY Caching Reduces Backend Load
+
+**Problem**: Without caching, every API request hits the database, creating a bottleneck that limits scalability.
+
+**Solution**: Two-level caching (local + Redis) dramatically reduces database load.
+
+```
+Request Flow (without cache):
+  Client -> API -> Database -> API -> Client
+  Latency: 50-200ms per request
+  Database load: 100% of requests
+
+Request Flow (with cache):
+  Client -> API -> Local Cache (hit) -> Client
+  Latency: <1ms (local hit)
+  Database load: Only cache misses (~5-10% of requests)
+```
+
+**Implementation** (`backend/shared/services/cache.js`):
+- **Local cache (L1)**: 5-second TTL, eliminates Redis round-trips for hot data
+- **Redis cache (L2)**: Configurable TTL, shared across all API instances
+- **Cache-aside pattern**: `getOrFetch()` automatically populates cache on miss
+- **Invalidation**: Pattern-based invalidation on writes (`invalidate('resources:list:*')`)
+
+**Cost-benefit**:
+- 256MB Redis cache costs ~$5/month (managed) vs. scaling database ($100+/month)
+- 90%+ cache hit rate reduces P99 latency from 200ms to <10ms
+- Horizontal scaling works because all instances share Redis cache
+
+### WHY Request Retention Balances Debugging vs Storage
+
+**Problem**: Keeping all request logs forever is expensive; deleting them immediately makes debugging impossible.
+
+**Solution**: Tiered retention with automatic archival balances these needs.
+
+**Implementation** (`backend/shared/config/index.js`, `backend/shared/services/retention.js`):
+
+```javascript
+retention: {
+  requestLogs: {
+    hot: 7,    // 7 days in PostgreSQL - fast queries for recent debugging
+    warm: 30,  // 30 days compressed in object storage - investigation capability
+    cold: 90,  // 90 days before permanent deletion - compliance buffer
+  }
+}
+```
+
+**Why these specific values**:
+- **7 days hot**: Most production issues are debugged within 48 hours; 7 days covers weekly patterns
+- **30 days warm**: Covers monthly billing cycles and delayed customer complaints
+- **90 days cold**: Meets common compliance requirements (PCI-DSS, SOC2) without excessive storage
+
+**Storage cost comparison** (10M requests/day):
+- Hot (PostgreSQL): ~10GB/week = $50/month managed
+- Warm (compressed S3): ~2GB/month = $0.05/month
+- Without tiering: ~40GB/month in PostgreSQL = $200/month
+
+### WHY Per-Endpoint Metrics Enable Optimization
+
+**Problem**: Aggregate metrics hide which endpoints need optimization.
+
+**Solution**: Track latency percentiles per endpoint to identify bottlenecks.
+
+**Implementation** (`backend/shared/services/metrics.js`):
+
+```javascript
+// Per-endpoint tracking
+trackEndpointLatency(method, path, duration) {
+  const key = `${method}:${normalizedPath}`;
+  // Track p50, p90, p99 for each endpoint
+}
+
+// Identify slow endpoints
+getSlowEndpoints(thresholdMs = 500) {
+  // Returns endpoints where p90 > threshold
+}
+```
+
+**Why this matters**:
+- **SLO monitoring**: Different endpoints may have different latency SLOs
+  - `/api/v1/status`: P99 < 50ms (simple health check)
+  - `/api/v1/resources`: P99 < 200ms (cached list query)
+  - `/api/v1/search`: P99 < 500ms (complex query)
+- **Optimization targeting**: Focus effort on endpoints with highest impact
+- **Capacity planning**: Understand which endpoints drive load
+- **Anomaly detection**: Alert when specific endpoint latency spikes
+
+**Prometheus metrics exposed** (`/metrics`):
+```
+http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.5"} 12
+http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.9"} 45
+http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.99"} 120
+```
+
+### WHY Circuit Breakers Prevent Cascade Failures
+
+**Problem**: When a downstream service fails, requests pile up, exhausting resources.
+
+```
+Failure cascade without circuit breaker:
+  Service A -> Service B (slow/failing)
+  A's threads block waiting for B's timeout
+  A exhausts its thread pool
+  A starts failing
+  Services calling A fail
+  System-wide outage
+```
+
+**Solution**: Circuit breakers "fail fast" when a downstream service is unhealthy.
+
+**Implementation** (`backend/shared/services/circuit-breaker.js`):
+
+```javascript
+// Three states:
+// CLOSED: Normal operation, requests pass through
+// OPEN: Service is down, requests fail immediately
+// HALF-OPEN: Testing if service recovered
+
+const breaker = new CircuitBreaker('payment-service', {
+  failureThreshold: 5,     // Open after 5 failures
+  resetTimeout: 30000,     // Try again after 30 seconds
+  halfOpenRequests: 3,     // 3 successes to close
+});
+```
+
+**Why these default values**:
+- **5 failures**: Tolerates transient errors while catching real outages
+- **30 second reset**: Gives failing service time to recover without constant probing
+- **3 half-open successes**: Ensures recovery is stable before resuming full traffic
+
+**Benefits**:
+- **Fast failure**: 0ms latency vs. 30-second timeout
+- **Resource protection**: No thread/connection pool exhaustion
+- **Graceful degradation**: Return cached data or error message instead of hanging
+- **Automatic recovery**: Half-open state tests recovery without overwhelming service
+
+**Metrics recorded**:
+```
+circuit_breaker_state{name="external-service"} 0  # 0=closed, 1=half-open, 2=open
+circuit_breaker_failures{name="external-service"} 3
+circuit_breaker_rejects_total{name="external-service"} 150
+```
+
+### WHY Structured JSON Logging with Pino
+
+**Problem**: Console.log statements are hard to parse, search, and correlate.
+
+**Solution**: Structured JSON logging with request correlation.
+
+**Implementation** (`backend/shared/services/logger.js`):
+
+```javascript
+// Every log line includes:
+{
+  "level": "info",
+  "time": "2025-01-16T10:30:00.000Z",
+  "instanceId": "api-1",
+  "requestId": "abc-123",
+  "userId": "user-456",
+  "method": "GET",
+  "path": "/api/v1/resources",
+  "status": 200,
+  "duration": 45,
+  "msg": "Request completed"
+}
+```
+
+**Why this matters**:
+- **Correlation**: Filter all logs for a single request across services using `requestId`
+- **Alerting**: Query for `status >= 500` or `duration > 1000`
+- **Debugging**: Find all requests from a specific user with `userId`
+- **Performance**: Pino is 5x faster than Winston, critical at high throughput
+
+**Log aggregation query examples** (Elasticsearch/Loki):
+```
+# Find slow requests
+duration > 1000 AND level = "warn"
+
+# Find all logs for a user session
+userId = "user-456" AND requestId = "abc-123"
+
+# Error rate by endpoint
+level = "error" | stats count by path
+```

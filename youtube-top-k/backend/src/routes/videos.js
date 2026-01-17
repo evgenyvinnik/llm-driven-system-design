@@ -2,6 +2,9 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../models/database.js';
 import { TrendingService } from '../services/trendingService.js';
+import { processViewWithIdempotency, getIdempotencyStats } from '../services/idempotency.js';
+import logger, { logError } from '../shared/logger.js';
+import { viewEventsTotal } from '../shared/metrics.js';
 
 const router = express.Router();
 
@@ -51,7 +54,7 @@ router.get('/', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error listing videos:', error);
+    logError(error, { endpoint: 'GET /api/videos' });
     res.status(500).json({ error: 'Failed to list videos' });
   }
 });
@@ -77,7 +80,7 @@ router.get('/:id', async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Error getting video:', error);
+    logError(error, { endpoint: 'GET /api/videos/:id' });
     res.status(500).json({ error: 'Failed to get video' });
   }
 });
@@ -111,9 +114,10 @@ router.post('/', async (req, res) => {
       ]
     );
 
+    logger.info({ videoId: id, category }, 'New video created');
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error('Error creating video:', error);
+    logError(error, { endpoint: 'POST /api/videos' });
     res.status(500).json({ error: 'Failed to create video' });
   }
 });
@@ -121,10 +125,29 @@ router.post('/', async (req, res) => {
 /**
  * POST /api/videos/:id/view
  * Record a view for a video
+ *
+ * WHY IDEMPOTENCY PREVENTS DUPLICATE VIEW COUNTING:
+ * Without idempotency, the same view event can be counted multiple times due to:
+ * 1. Network retries: Client retries on timeout, server may have already processed
+ * 2. Double-clicks: User accidentally triggers multiple events
+ * 3. Client-side bugs: Frontend fires the same event multiple times
+ * 4. Load balancer retries: Some LBs retry failed requests
+ *
+ * Idempotency uses Redis SETNX to atomically check if a request was already
+ * processed. The key includes video ID, session ID, and time bucket to:
+ * - Prevent exact duplicates (same request retried)
+ * - Allow legitimate repeated views (user watches again after an hour)
+ * - Handle distributed servers (all servers share Redis state)
+ *
+ * Headers supported:
+ * - X-Request-Id: Unique request identifier for exact deduplication
+ * - X-Session-Id: Session identifier for time-bucketed deduplication
  */
 router.post('/:id/view', async (req, res) => {
   try {
     const { id } = req.params;
+    const requestId = req.headers['x-request-id'];
+    const sessionId = req.headers['x-session-id'] || req.body.sessionId;
 
     // Check if video exists and get category
     const videoResult = await query(
@@ -139,16 +162,41 @@ router.post('/:id/view', async (req, res) => {
     const video = videoResult.rows[0];
     const trendingService = TrendingService.getInstance();
 
-    // Record the view
-    await trendingService.recordView(id, video.category);
+    // Process with idempotency check
+    const result = await processViewWithIdempotency(
+      id,
+      video.category,
+      { sessionId, requestId },
+      async () => {
+        await trendingService.recordView(id, video.category);
+      }
+    );
+
+    if (result.duplicate) {
+      // Return success but indicate it was a duplicate
+      logger.debug(
+        { videoId: id, idempotencyKey: result.key },
+        'Duplicate view request ignored'
+      );
+
+      return res.status(200).json({
+        success: true,
+        duplicate: true,
+        videoId: id,
+        message: 'View already recorded (idempotency)',
+        idempotencyKey: result.key,
+      });
+    }
 
     res.json({
       success: true,
+      duplicate: false,
       videoId: id,
       totalViews: video.total_views + 1,
+      idempotencyKey: result.key,
     });
   } catch (error) {
-    console.error('Error recording view:', error);
+    logError(error, { endpoint: 'POST /api/videos/:id/view' });
     res.status(500).json({ error: 'Failed to record view' });
   }
 });
@@ -156,6 +204,8 @@ router.post('/:id/view', async (req, res) => {
 /**
  * POST /api/videos/batch-view
  * Record multiple views at once (for simulation/testing)
+ *
+ * Note: Batch views bypass idempotency by design (for testing purposes)
  */
 router.post('/batch-view', async (req, res) => {
   try {
@@ -182,7 +232,7 @@ router.post('/batch-view', async (req, res) => {
 
       const video = videoResult.rows[0];
 
-      // Record views
+      // Record views (bypassing idempotency for batch operations)
       for (let i = 0; i < count; i++) {
         await trendingService.recordView(videoId, video.category);
       }
@@ -190,10 +240,29 @@ router.post('/batch-view', async (req, res) => {
       results.push({ videoId, count, success: true });
     }
 
+    logger.info(
+      { viewCount: views.length, totalViews: views.reduce((sum, v) => sum + (v.count || 1), 0) },
+      'Batch views recorded'
+    );
+
     res.json({ results });
   } catch (error) {
-    console.error('Error batch recording views:', error);
+    logError(error, { endpoint: 'POST /api/videos/batch-view' });
     res.status(500).json({ error: 'Failed to batch record views' });
+  }
+});
+
+/**
+ * GET /api/videos/stats/idempotency
+ * Get idempotency statistics (for debugging/monitoring)
+ */
+router.get('/stats/idempotency', async (req, res) => {
+  try {
+    const stats = await getIdempotencyStats();
+    res.json(stats);
+  } catch (error) {
+    logError(error, { endpoint: 'GET /api/videos/stats/idempotency' });
+    res.status(500).json({ error: 'Failed to get idempotency stats' });
   }
 });
 

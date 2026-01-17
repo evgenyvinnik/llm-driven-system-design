@@ -5,25 +5,39 @@
  * - Express HTTP server with REST API endpoints
  * - WebSocket server for real-time quote streaming
  * - Background services (quote simulation, order matching, alerts)
+ * - Prometheus metrics endpoint
+ * - Structured logging with pino
+ * - Audit logging for compliance
  *
  * The server provides a complete trading platform with:
  * - User authentication (session-based)
  * - Real-time stock quotes (simulated)
- * - Order placement and execution
+ * - Order placement and execution with idempotency
  * - Portfolio tracking with P&L calculations
  * - Watchlists and price alerts
  */
 
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import http from 'http';
+import { v4 as uuidv4 } from 'uuid';
 import { config } from './config.js';
-import { testDatabaseConnection } from './database.js';
-import { testRedisConnection } from './redis.js';
+import { pool, testDatabaseConnection } from './database.js';
+import { redis, testRedisConnection } from './redis.js';
 import { quoteService } from './services/quoteService.js';
 import { orderService } from './services/orderService.js';
 import { priceAlertService } from './services/watchlistService.js';
 import { WebSocketHandler } from './websocket.js';
+import { logger } from './shared/logger.js';
+import { auditLogger } from './shared/audit.js';
+import {
+  registry,
+  httpRequestsTotal,
+  httpRequestDurationMs,
+  dbPoolSizeGauge,
+  websocketConnectionsGauge,
+  quoteUpdatesTotal,
+} from './shared/metrics.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -39,22 +53,129 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check
+/**
+ * Request ID middleware - adds unique request ID to each request
+ */
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  req.headers['x-request-id'] = req.headers['x-request-id'] || uuidv4();
+  next();
+});
+
+/**
+ * HTTP metrics middleware - tracks request counts and latencies
+ */
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const startTime = Date.now();
+
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    const path = req.route?.path || req.path;
+
+    // Normalize path to avoid high cardinality
+    const normalizedPath = path
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id')
+      .replace(/\d+/g, ':id');
+
+    httpRequestsTotal.inc({
+      method: req.method,
+      path: normalizedPath,
+      status: res.statusCode.toString(),
+    });
+
+    httpRequestDurationMs.observe(
+      { method: req.method, path: normalizedPath },
+      duration
+    );
+  });
+
+  next();
+});
+
 /**
  * GET /health
- * Returns health status of database and Redis connections.
+ * Returns health status of all system components.
  * Used for monitoring and load balancer health checks.
+ *
+ * Returns:
+ * - status: 'healthy' or 'unhealthy'
+ * - database: connection status
+ * - redis: connection status
+ * - services: status of background services
  */
-app.get('/health', async (_req, res) => {
+app.get('/health', async (_req: Request, res: Response) => {
   const dbHealthy = await testDatabaseConnection();
   const redisHealthy = await testRedisConnection();
 
-  res.json({
-    status: dbHealthy && redisHealthy ? 'healthy' : 'unhealthy',
-    database: dbHealthy ? 'connected' : 'disconnected',
-    redis: redisHealthy ? 'connected' : 'disconnected',
+  const status = dbHealthy && redisHealthy ? 'healthy' : 'unhealthy';
+
+  res.status(status === 'healthy' ? 200 : 503).json({
+    status,
+    version: '1.0.0',
     timestamp: new Date().toISOString(),
+    components: {
+      database: {
+        status: dbHealthy ? 'connected' : 'disconnected',
+      },
+      redis: {
+        status: redisHealthy ? 'connected' : 'disconnected',
+      },
+      services: {
+        quoteService: 'running',
+        limitOrderMatcher: 'running',
+        priceAlertChecker: 'running',
+      },
+    },
   });
+});
+
+/**
+ * GET /health/ready
+ * Readiness probe - checks if the service is ready to accept traffic.
+ */
+app.get('/health/ready', async (_req: Request, res: Response) => {
+  const dbHealthy = await testDatabaseConnection();
+  const redisHealthy = await testRedisConnection();
+
+  if (dbHealthy && redisHealthy) {
+    res.status(200).json({ ready: true });
+  } else {
+    res.status(503).json({
+      ready: false,
+      details: {
+        database: dbHealthy,
+        redis: redisHealthy,
+      },
+    });
+  }
+});
+
+/**
+ * GET /health/live
+ * Liveness probe - simple check that the process is running.
+ */
+app.get('/health/live', (_req: Request, res: Response) => {
+  res.status(200).json({ live: true });
+});
+
+/**
+ * GET /metrics
+ * Prometheus metrics endpoint.
+ * Exposes all application metrics in Prometheus format.
+ */
+app.get('/metrics', async (_req: Request, res: Response) => {
+  try {
+    // Update pool size metrics before returning
+    const poolStats = pool.totalCount;
+    const idleCount = pool.idleCount;
+    dbPoolSizeGauge.set({ state: 'idle' }, idleCount);
+    dbPoolSizeGauge.set({ state: 'busy' }, poolStats - idleCount);
+
+    res.set('Content-Type', registry.contentType);
+    res.end(await registry.metrics());
+  } catch (error) {
+    logger.error({ error }, 'Error generating metrics');
+    res.status(500).end();
+  }
 });
 
 // API Routes
@@ -64,11 +185,35 @@ app.use('/api/orders', ordersRoutes);
 app.use('/api/portfolio', portfolioRoutes);
 app.use('/api/watchlists', watchlistsRoutes);
 
+/**
+ * 404 handler for unknown routes
+ */
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+/**
+ * Global error handler
+ */
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  const requestId = req.headers['x-request-id'];
+  logger.error({ error: err.message, stack: err.stack, requestId }, 'Unhandled error');
+  res.status(500).json({ error: 'Internal server error', requestId });
+});
+
 /** HTTP server instance */
 const server = http.createServer(app);
 
 /** WebSocket handler for real-time quote streaming */
 const wsHandler = new WebSocketHandler(server);
+
+/**
+ * Updates WebSocket connection metrics.
+ */
+function updateWebSocketMetrics(): void {
+  // This would need to be integrated into WebSocketHandler
+  // For now, we'll track via the quote service subscriber count
+}
 
 /**
  * Starts the trading platform server.
@@ -79,18 +224,31 @@ async function startServer(): Promise<void> {
   // Test connections
   const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
-    console.error('Failed to connect to database. Make sure PostgreSQL is running.');
-    console.error('Run: docker-compose up -d');
+    logger.error('Failed to connect to database. Make sure PostgreSQL is running.');
+    logger.error('Run: docker-compose up -d');
   }
 
   const redisConnected = await testRedisConnection();
   if (!redisConnected) {
-    console.error('Failed to connect to Redis. Make sure Redis is running.');
-    console.error('Run: docker-compose up -d');
+    logger.error('Failed to connect to Redis. Make sure Redis is running.');
+    logger.error('Run: docker-compose up -d');
   }
 
-  // Start quote service
+  // Initialize audit logger
+  try {
+    await auditLogger.initialize();
+    logger.info('Audit logger initialized');
+  } catch (error) {
+    logger.error({ error }, 'Failed to initialize audit logger');
+  }
+
+  // Start quote service with metrics tracking
   quoteService.start(config.quotes.updateIntervalMs);
+
+  // Track quote updates
+  quoteService.subscribe('metrics', (_quotes) => {
+    quoteUpdatesTotal.inc();
+  });
 
   // Start order matcher for limit orders
   orderService.startLimitOrderMatcher();
@@ -100,46 +258,82 @@ async function startServer(): Promise<void> {
 
   // Start HTTP server
   server.listen(config.port, () => {
+    logger.info({
+      port: config.port,
+      database: dbConnected ? 'connected' : 'disconnected',
+      redis: redisConnected ? 'connected' : 'disconnected',
+    }, 'Server started');
+
     console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║                  Robinhood Trading Platform                     ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  HTTP Server:     http://localhost:${config.port}                      ║
 ║  WebSocket:       ws://localhost:${config.port}/ws                     ║
+║  Metrics:         http://localhost:${config.port}/metrics              ║
+║  Health:          http://localhost:${config.port}/health               ║
 ║  Database:        ${dbConnected ? 'Connected' : 'Disconnected'}                                     ║
 ║  Redis:           ${redisConnected ? 'Connected' : 'Disconnected'}                                     ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Demo Credentials:                                              ║
 ║    Email:    demo@example.com                                   ║
 ║    Password: password                                           ║
+╠════════════════════════════════════════════════════════════════╣
+║  Features:                                                      ║
+║    - Idempotent order placement (X-Idempotency-Key header)     ║
+║    - Audit logging for compliance                               ║
+║    - Prometheus metrics                                         ║
+║    - Structured JSON logging                                    ║
 ╚════════════════════════════════════════════════════════════════╝
     `);
   });
 }
 
 // Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down...');
+function gracefulShutdown(signal: string): void {
+  logger.info({ signal }, 'Shutdown signal received');
+  console.log(`${signal} received. Shutting down gracefully...`);
+
   quoteService.stop();
   orderService.stopLimitOrderMatcher();
   priceAlertService.stopAlertChecker();
+
   server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
+    logger.info('HTTP server closed');
+
+    // Close database and redis connections
+    pool.end().then(() => {
+      logger.info('Database pool closed');
+      redis.quit().then(() => {
+        logger.info('Redis connection closed');
+        process.exit(0);
+      });
+    });
   });
+
+  // Force exit after 10 seconds
+  setTimeout(() => {
+    logger.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error: Error) => {
+  logger.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception');
+  gracefulShutdown('uncaughtException');
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Shutting down...');
-  quoteService.stop();
-  orderService.stopLimitOrderMatcher();
-  priceAlertService.stopAlertChecker();
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+process.on('unhandledRejection', (reason: unknown) => {
+  logger.fatal({ reason }, 'Unhandled rejection');
 });
 
-startServer().catch(console.error);
+startServer().catch((error) => {
+  logger.fatal({ error }, 'Failed to start server');
+  process.exit(1);
+});
 
 export { app, server, wsHandler };

@@ -1,5 +1,8 @@
-import Redis from 'ioredis';
+import IORedis from 'ioredis';
 import { config } from './config.js';
+
+// IORedis is exported as default in the module
+const Redis = IORedis.default || IORedis;
 
 /**
  * Main Redis client for general operations.
@@ -9,7 +12,6 @@ export const redis = new Redis({
   host: config.redis.host,
   port: config.redis.port,
   maxRetriesPerRequest: 3,
-  retryDelayOnFailover: 100,
 });
 
 /**
@@ -35,7 +37,7 @@ redis.on('connect', () => {
   console.log('Connected to Redis');
 });
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   console.error('Redis error:', err);
 });
 

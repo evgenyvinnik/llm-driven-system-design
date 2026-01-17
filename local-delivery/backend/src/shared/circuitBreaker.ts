@@ -39,12 +39,12 @@ export const DEFAULT_CIRCUIT_BREAKER_OPTIONS: CircuitBreaker.Options = {
  * @param options - Circuit breaker options
  * @returns A circuit breaker instance
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
   name: string,
-  fn: T,
+  fn: (...args: TArgs) => Promise<TResult>,
   options: Partial<CircuitBreaker.Options> = {}
-): CircuitBreaker<Parameters<T>, ReturnType<T>> {
-  const breaker = new CircuitBreaker<Parameters<T>, ReturnType<T>>(fn, {
+): CircuitBreaker<TArgs, TResult> {
+  const breaker = new CircuitBreaker<TArgs, TResult>(fn, {
     ...DEFAULT_CIRCUIT_BREAKER_OPTIONS,
     ...options,
   });

@@ -1,12 +1,33 @@
-import express from 'express';
-import { pool } from '../shared/db.js';
-import { v4 as uuidv4 } from 'uuid';
-
 /**
  * Express router for spreadsheet REST API endpoints.
  * Provides CRUD operations for spreadsheets, sheets, and cells.
  * Works alongside WebSocket for real-time collaboration.
+ *
+ * Features:
+ * - Structured logging for all operations
+ * - Prometheus metrics for request tracking
+ * - Redis caching for improved performance
+ *
+ * @module api/routes
  */
+
+import express from 'express';
+import { pool } from '../shared/db.js';
+import { v4 as uuidv4 } from 'uuid';
+import logger, { createChildLogger } from '../shared/logger.js';
+import { dbQueryDuration, errorsTotal } from '../shared/metrics.js';
+import {
+  getCachedSpreadsheet,
+  setCachedSpreadsheet,
+  invalidateSpreadsheetCache,
+  getCachedCells,
+  setCachedCells,
+  invalidateCellsCache,
+} from '../shared/cache.js';
+
+/** Logger for API operations */
+const apiLogger = createChildLogger({ component: 'api' });
+
 const router = express.Router();
 
 /**
@@ -17,6 +38,8 @@ const router = express.Router();
  * @returns Array of spreadsheet objects with sheet counts
  */
 router.get('/spreadsheets', async (req, res) => {
+  const start = Date.now();
+
   try {
     const result = await pool.query(`
       SELECT s.*,
@@ -25,9 +48,19 @@ router.get('/spreadsheets', async (req, res) => {
       ORDER BY s.updated_at DESC
       LIMIT 100
     `);
+
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('list_spreadsheets').observe(duration);
+
+    apiLogger.info(
+      { count: result.rows.length, duration },
+      'Listed spreadsheets'
+    );
+
     res.json(result.rows);
   } catch (error) {
-    console.error('Error listing spreadsheets:', error);
+    errorsTotal.labels('list_spreadsheets', 'api').inc();
+    apiLogger.error({ error }, 'Error listing spreadsheets');
     res.status(500).json({ error: 'Failed to list spreadsheets' });
   }
 });
@@ -45,6 +78,8 @@ router.post('/spreadsheets', async (req, res) => {
   const id = uuidv4();
 
   try {
+    const start = Date.now();
+
     // Create spreadsheet
     await pool.query(
       'INSERT INTO spreadsheets (id, title) VALUES ($1, $2)',
@@ -58,13 +93,24 @@ router.post('/spreadsheets', async (req, res) => {
       [sheetId, id, 'Sheet1']
     );
 
-    res.status(201).json({
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('create_spreadsheet').observe(duration);
+
+    const spreadsheet = {
       id,
       title,
       sheets: [{ id: sheetId, name: 'Sheet1', sheet_index: 0 }],
-    });
+    };
+
+    // Cache the new spreadsheet
+    await setCachedSpreadsheet(id, spreadsheet);
+
+    apiLogger.info({ id, title, duration }, 'Created spreadsheet');
+
+    res.status(201).json(spreadsheet);
   } catch (error) {
-    console.error('Error creating spreadsheet:', error);
+    errorsTotal.labels('create_spreadsheet', 'api').inc();
+    apiLogger.error({ error, title }, 'Error creating spreadsheet');
     res.status(500).json({ error: 'Failed to create spreadsheet' });
   }
 });
@@ -72,6 +118,7 @@ router.post('/spreadsheets', async (req, res) => {
 /**
  * GET /spreadsheets/:id
  * Retrieves a spreadsheet by ID with all its sheets.
+ * Uses Redis caching for improved performance.
  *
  * @param req.params.id - The spreadsheet UUID
  * @returns The spreadsheet object with sheets array, or 404 if not found
@@ -80,6 +127,15 @@ router.get('/spreadsheets/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
+    // Try cache first
+    const cached = await getCachedSpreadsheet(id);
+    if (cached) {
+      apiLogger.debug({ id, source: 'cache' }, 'Spreadsheet retrieved');
+      return res.json(cached);
+    }
+
+    // Cache miss - fetch from database
+    const start = Date.now();
     const spreadsheetResult = await pool.query(
       'SELECT * FROM spreadsheets WHERE id = $1',
       [id]
@@ -94,12 +150,23 @@ router.get('/spreadsheets/:id', async (req, res) => {
       [id]
     );
 
-    res.json({
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('get_spreadsheet').observe(duration);
+
+    const spreadsheet = {
       ...spreadsheetResult.rows[0],
       sheets: sheetsResult.rows,
-    });
+    };
+
+    // Cache for future requests
+    await setCachedSpreadsheet(id, spreadsheet);
+
+    apiLogger.debug({ id, source: 'database', duration }, 'Spreadsheet retrieved');
+
+    res.json(spreadsheet);
   } catch (error) {
-    console.error('Error getting spreadsheet:', error);
+    errorsTotal.labels('get_spreadsheet', 'api').inc();
+    apiLogger.error({ error, id }, 'Error getting spreadsheet');
     res.status(500).json({ error: 'Failed to get spreadsheet' });
   }
 });
@@ -117,13 +184,24 @@ router.patch('/spreadsheets/:id', async (req, res) => {
   const { title } = req.body;
 
   try {
+    const start = Date.now();
     await pool.query(
       'UPDATE spreadsheets SET title = $1, updated_at = NOW() WHERE id = $2',
       [title, id]
     );
+
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('update_spreadsheet').observe(duration);
+
+    // Invalidate cache
+    await invalidateSpreadsheetCache(id);
+
+    apiLogger.info({ id, title, duration }, 'Updated spreadsheet');
+
     res.json({ id, title });
   } catch (error) {
-    console.error('Error updating spreadsheet:', error);
+    errorsTotal.labels('update_spreadsheet', 'api').inc();
+    apiLogger.error({ error, id, title }, 'Error updating spreadsheet');
     res.status(500).json({ error: 'Failed to update spreadsheet' });
   }
 });
@@ -139,10 +217,21 @@ router.delete('/spreadsheets/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
+    const start = Date.now();
     await pool.query('DELETE FROM spreadsheets WHERE id = $1', [id]);
+
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('delete_spreadsheet').observe(duration);
+
+    // Invalidate cache
+    await invalidateSpreadsheetCache(id);
+
+    apiLogger.info({ id, duration }, 'Deleted spreadsheet');
+
     res.status(204).send();
   } catch (error) {
-    console.error('Error deleting spreadsheet:', error);
+    errorsTotal.labels('delete_spreadsheet', 'api').inc();
+    apiLogger.error({ error, id }, 'Error deleting spreadsheet');
     res.status(500).json({ error: 'Failed to delete spreadsheet' });
   }
 });
@@ -161,6 +250,8 @@ router.post('/spreadsheets/:id/sheets', async (req, res) => {
   const { name = 'New Sheet' } = req.body;
 
   try {
+    const start = Date.now();
+
     // Get next sheet index
     const indexResult = await pool.query(
       'SELECT COALESCE(MAX(sheet_index), -1) + 1 as next_index FROM sheets WHERE spreadsheet_id = $1',
@@ -174,9 +265,18 @@ router.post('/spreadsheets/:id/sheets', async (req, res) => {
       [sheetId, id, name, nextIndex]
     );
 
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('create_sheet').observe(duration);
+
+    // Invalidate spreadsheet cache (sheets list changed)
+    await invalidateSpreadsheetCache(id);
+
+    apiLogger.info({ spreadsheetId: id, sheetId, name, duration }, 'Created sheet');
+
     res.status(201).json({ id: sheetId, name, sheet_index: nextIndex });
   } catch (error) {
-    console.error('Error adding sheet:', error);
+    errorsTotal.labels('create_sheet', 'api').inc();
+    apiLogger.error({ error, spreadsheetId: id, name }, 'Error adding sheet');
     res.status(500).json({ error: 'Failed to add sheet' });
   }
 });
@@ -185,6 +285,7 @@ router.post('/spreadsheets/:id/sheets', async (req, res) => {
  * GET /sheets/:sheetId/cells
  * Retrieves all cells for a specific sheet.
  * Returns a sparse map with "row-col" keys for efficient storage.
+ * Uses Redis caching for improved performance.
  *
  * @param req.params.sheetId - The sheet UUID
  * @returns Object with cell keys mapping to cell data (rawValue, computedValue, format)
@@ -193,10 +294,25 @@ router.get('/sheets/:sheetId/cells', async (req, res) => {
   const { sheetId } = req.params;
 
   try {
+    // Try cache first
+    const cached = await getCachedCells(sheetId);
+    if (cached) {
+      apiLogger.debug(
+        { sheetId, cellCount: Object.keys(cached).length, source: 'cache' },
+        'Cells retrieved'
+      );
+      return res.json(cached);
+    }
+
+    // Cache miss - fetch from database
+    const start = Date.now();
     const cellsResult = await pool.query(
       'SELECT row_index, col_index, raw_value, computed_value, format FROM cells WHERE sheet_id = $1',
       [sheetId]
     );
+
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('get_cells').observe(duration);
 
     const cells: Record<string, any> = {};
     for (const cell of cellsResult.rows) {
@@ -208,9 +324,18 @@ router.get('/sheets/:sheetId/cells', async (req, res) => {
       };
     }
 
+    // Cache for future requests
+    await setCachedCells(sheetId, cells);
+
+    apiLogger.debug(
+      { sheetId, cellCount: Object.keys(cells).length, source: 'database', duration },
+      'Cells retrieved'
+    );
+
     res.json(cells);
   } catch (error) {
-    console.error('Error getting cells:', error);
+    errorsTotal.labels('get_cells', 'api').inc();
+    apiLogger.error({ error, sheetId }, 'Error getting cells');
     res.status(500).json({ error: 'Failed to get cells' });
   }
 });
@@ -233,7 +358,9 @@ router.patch('/sheets/:sheetId/cells', async (req, res) => {
   }
 
   try {
+    const start = Date.now();
     const client = await pool.connect();
+
     try {
       await client.query('BEGIN');
 
@@ -248,6 +375,18 @@ router.patch('/sheets/:sheetId/cells', async (req, res) => {
       }
 
       await client.query('COMMIT');
+
+      const duration = Date.now() - start;
+      dbQueryDuration.labels('batch_update_cells').observe(duration);
+
+      // Invalidate cells cache
+      await invalidateCellsCache(sheetId);
+
+      apiLogger.info(
+        { sheetId, changeCount: changes.length, duration },
+        'Batch updated cells'
+      );
+
       res.json({ updated: changes.length });
     } catch (error) {
       await client.query('ROLLBACK');
@@ -256,7 +395,8 @@ router.patch('/sheets/:sheetId/cells', async (req, res) => {
       client.release();
     }
   } catch (error) {
-    console.error('Error batch updating cells:', error);
+    errorsTotal.labels('batch_update_cells', 'api').inc();
+    apiLogger.error({ error, sheetId, changeCount: changes?.length }, 'Error batch updating cells');
     res.status(500).json({ error: 'Failed to update cells' });
   }
 });
@@ -276,8 +416,10 @@ router.get('/spreadsheets/:id/export', async (req, res) => {
   const { format = 'csv', sheetId } = req.query;
 
   try {
+    const start = Date.now();
+
     // Get the sheet (first one if not specified)
-    let targetSheetId = sheetId;
+    let targetSheetId = sheetId as string | undefined;
     if (!targetSheetId) {
       const sheetResult = await pool.query(
         'SELECT id FROM sheets WHERE spreadsheet_id = $1 ORDER BY sheet_index LIMIT 1',
@@ -322,12 +464,20 @@ router.get('/spreadsheets/:id/export', async (req, res) => {
     }
 
     const csv = rows.join('\n');
+    const duration = Date.now() - start;
+    dbQueryDuration.labels('export_spreadsheet').observe(duration);
+
+    apiLogger.info(
+      { spreadsheetId: id, sheetId: targetSheetId, format, duration },
+      'Exported spreadsheet'
+    );
 
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="spreadsheet-${id}.csv"`);
     res.send(csv);
   } catch (error) {
-    console.error('Error exporting spreadsheet:', error);
+    errorsTotal.labels('export_spreadsheet', 'api').inc();
+    apiLogger.error({ error, spreadsheetId: id }, 'Error exporting spreadsheet');
     res.status(500).json({ error: 'Failed to export spreadsheet' });
   }
 });

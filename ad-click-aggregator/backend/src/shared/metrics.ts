@@ -355,14 +355,12 @@ export async function timeAsync<T>(
 
 /**
  * Calculate and return cache hit rate
+ * Note: Accurate rate should be calculated in Prometheus using rate() function
  */
 export function getCacheHitRate(): number {
-  // This is a simplified version - in production you'd track this over a window
-  const hits = (cacheMetrics.hits as client.Counter<string>).hashMap;
-  const misses = (cacheMetrics.misses as client.Counter<string>).hashMap;
-
-  // Note: This is approximate - for accurate rates, use Prometheus queries
-  return 0; // Placeholder - actual rate calculated in Prometheus
+  // This is a placeholder - actual rate calculation happens in Prometheus
+  // Example PromQL: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m]))
+  return 0;
 }
 
 export default register;

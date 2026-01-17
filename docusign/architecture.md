@@ -1514,3 +1514,211 @@ app.get('/health', async (req, res) => {
   res.status(health.status === 'healthy' ? 200 : 503).json(health)
 })
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the production-readiness features implemented in the backend to address consistency, reliability, and compliance requirements.
+
+### Why Idempotency is CRITICAL for Legal Document Signing
+
+Idempotency ensures that executing the same operation multiple times produces the same result as executing it once. For electronic signature platforms, this is not just a nice-to-have - it is legally critical:
+
+1. **Legal Validity**: Each signature must be unique and traceable. Under ESIGN Act (15 U.S.C. 7001) and UETA, an electronic signature must be "attributable to a person" and demonstrate the signer's "intent to sign." Duplicate signatures due to network retries could invalidate a document or create conflicting records.
+
+2. **Network Reliability**: Mobile and web clients frequently retry requests due to network timeouts, connection resets, or user impatience. Without idempotency protection, a single signature action could be recorded multiple times.
+
+3. **Audit Trail Integrity**: The hash-chain audit log requires exactly one entry per signing action. Duplicate entries would break chain verification and compromise legal defensibility.
+
+4. **Financial/Legal Consequences**: Double-signing contracts could have severe consequences - agreeing to terms multiple times, double-counting approvals, or creating ambiguous legal standing.
+
+**Implementation**: The `shared/idempotency.js` module provides:
+- Redis-first lookups for fast duplicate detection
+- PostgreSQL backup for durability across service restarts
+- 24-hour key TTL to balance safety with storage efficiency
+- Automatic key generation based on field ID, recipient ID, and time bucket
+
+```javascript
+// Example: Signature capture with idempotency
+const { data: result, cached } = await executeWithIdempotency(
+  generateSignatureIdempotencyKey(fieldId, recipientId),
+  async () => { /* signature capture logic */ },
+  'signature'
+);
+
+if (cached) {
+  // Duplicate request - return cached response, log security event
+}
+```
+
+### Why Audit Logging is Required for Legal Compliance
+
+Electronic signatures are legally binding only when they can be proven to meet specific requirements. Audit logging provides the evidence trail:
+
+1. **ESIGN Act (USA)**: Requires "accurate records" of electronic signatures including when and how they were captured.
+
+2. **UETA (Uniform Electronic Transactions Act)**: Mandates that electronic records demonstrate integrity and attribution to the signatory.
+
+3. **eIDAS (EU)**: Advanced electronic signatures must be "uniquely linked to the signatory," capable of identifying the signatory, and created using signature creation data under the signatory's sole control.
+
+4. **SOC 2 Compliance**: Security controls and change management require comprehensive audit trails.
+
+5. **Legal Disputes**: In contract disputes, the audit trail serves as evidence of who signed, when, from what IP address, and with what browser.
+
+**Implementation**: The `shared/auditLogger.js` module provides:
+- Hash-chain integrity (each event includes hash of previous event)
+- Comprehensive event types covering all signature lifecycle actions
+- Context capture (IP address, user agent, geolocation)
+- Tamper-evident verification function
+- Structured logging with pino for real-time monitoring
+
+```javascript
+// Example: Signature capture audit event
+await logSignatureCapture({
+  envelopeId,
+  recipientId,
+  recipientEmail,
+  fieldId,
+  signatureId,
+  signatureType: 'draw',
+  ipAddress: req.ip,
+  userAgent: req.get('User-Agent'),
+});
+```
+
+### Why Async Queues Enable Reliable Notification Delivery
+
+Synchronous notification delivery (sending emails inline with signature capture) creates several reliability issues that message queues solve:
+
+1. **Decoupling**: Separates the critical signing workflow from notification delivery. If the email service is slow or down, signatures are still captured successfully.
+
+2. **Reliability**: Messages are persisted in RabbitMQ until acknowledged. Service restarts, deployments, or temporary failures don't lose notifications.
+
+3. **Backpressure**: Queue limits (10,000 messages) prevent overwhelming downstream services. When the email service is slow, messages queue instead of causing cascading timeouts.
+
+4. **Retry with Backoff**: Failed notifications are automatically retried with exponential backoff (1s, 2s, 4s, up to 60s). Dead letter queue catches persistent failures for manual review.
+
+5. **Delivery Semantics**: At-least-once delivery ensures every notification eventually reaches recipients. Idempotent handlers on the consumer side prevent duplicates.
+
+6. **Observability**: Queue metrics (depth, consumer count, processing rate) provide visibility into notification pipeline health.
+
+**Implementation**: The `shared/queue.js` module provides:
+- RabbitMQ integration with publisher confirms
+- Dead letter exchange for failed messages
+- Graceful fallback to synchronous delivery when queue is unavailable
+- Queue health checks in the `/health` endpoint
+
+```javascript
+// Example: Async notification publish with fallback
+if (isQueueHealthy()) {
+  await publishNotification({
+    type: 'signing_request',
+    recipientId: recipient.id,
+    envelopeId: envelope.id,
+    channels: ['email'],
+  });
+} else {
+  // Fallback to synchronous delivery
+  await emailService.sendSigningRequest(recipient, envelope);
+}
+```
+
+### Why Circuit Breakers Protect Document Storage
+
+Document storage (MinIO/S3) is a critical dependency. Without protection, storage failures can cascade to bring down the entire application:
+
+1. **Prevent Cascade Failures**: If MinIO is slow or unresponsive, without a circuit breaker all API threads would block waiting for timeouts. Eventually, the connection pool exhausts, memory fills with queued requests, and the entire application becomes unresponsive.
+
+2. **Fail Fast**: When storage is known to be unavailable (circuit open), requests fail immediately instead of waiting for timeout. This preserves resources and provides better user experience (immediate error vs. hung request).
+
+3. **Automatic Recovery**: The half-open state periodically tests if storage has recovered. When it succeeds, the circuit closes and normal operation resumes automatically.
+
+4. **Graceful Degradation**: With fallback behaviors, the system can continue serving read operations from cache while writes are queued for retry.
+
+5. **Resource Protection**: Prevents thread/connection exhaustion during storage outages, keeping other system components operational.
+
+6. **Observability**: Circuit breaker state transitions are logged and exposed as Prometheus metrics, providing early warning of storage issues.
+
+**Implementation**: The `shared/circuitBreaker.js` and `shared/storageWithBreaker.js` modules provide:
+- Opossum-based circuit breakers for all storage operations
+- 50% error threshold to open circuit
+- 30-second timeout before trying half-open
+- Prometheus metrics for circuit state
+- Fallback support for non-critical operations
+
+```javascript
+// Example: Storage upload with circuit breaker
+const uploadDocumentBreaker = createCircuitBreaker(
+  'minio_upload_document',
+  async (key, buffer, contentType) => {
+    return await MinioOriginal.uploadDocument(key, buffer, contentType);
+  },
+  { timeout: 30000, errorThresholdPercentage: 50 }
+);
+
+// Usage - automatically opens circuit on repeated failures
+await uploadDocumentBreaker.fire(key, buffer, 'application/pdf');
+```
+
+### Prometheus Metrics Endpoint
+
+The `/metrics` endpoint exposes operational metrics in Prometheus format:
+
+- **Document metrics**: `docusign_documents_total`, `docusign_envelopes_by_status`
+- **Signature metrics**: `docusign_signatures_captured_total`, `docusign_signatures_pending`, `docusign_signatures_expired_total`
+- **Queue metrics**: `docusign_queue_messages_published_total`, `docusign_queue_messages_processed_total`
+- **Circuit breaker metrics**: `docusign_circuit_breaker_state`, `docusign_circuit_breaker_failures_total`
+- **Storage metrics**: `docusign_storage_operation_duration_seconds`, `docusign_storage_operation_errors_total`
+- **Idempotency metrics**: `docusign_idempotency_hits_total`, `docusign_idempotency_misses_total`
+- **Audit metrics**: `docusign_audit_events_total`
+- **HTTP metrics**: `docusign_http_request_duration_seconds`
+
+### Health Check Endpoints
+
+Three levels of health checks are available:
+
+- **`/health/live`**: Liveness probe - always returns 200 if the process is running
+- **`/health/ready`**: Readiness probe - checks PostgreSQL and Redis connectivity
+- **`/health`**: Comprehensive health - checks all dependencies (PostgreSQL, Redis, MinIO, RabbitMQ) with latency measurements and circuit breaker states
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "version": "1.0.0",
+  "uptime": 3600,
+  "checks": {
+    "postgres": { "status": "healthy", "latencyMs": 2 },
+    "redis": { "status": "healthy", "latencyMs": 1 },
+    "minio": { "status": "healthy", "latencyMs": 5, "circuitBreakers": {...} },
+    "rabbitmq": { "status": "healthy", "queues": {...} }
+  },
+  "circuitBreakers": {
+    "minio_upload_document": { "state": "closed", "stats": {...} }
+  }
+}
+```
+
+### Structured JSON Logging with Pino
+
+All application logs use structured JSON format via pino, enabling:
+
+- **Log aggregation**: Ship to ELK, Datadog, or CloudWatch
+- **Correlation**: Request ID propagated through all log entries
+- **Audit segregation**: Compliance-sensitive logs tagged with `type: "audit"`
+- **Performance tracking**: Slow query detection with timing information
+- **Development mode**: pino-pretty for human-readable output locally
+
+```javascript
+// Example log output
+{
+  "level": "info",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "service": "docusign-backend",
+  "requestId": "abc123",
+  "method": "POST",
+  "path": "/api/v1/signing/sign/token123",
+  "msg": "Signature captured successfully"
+}
+```

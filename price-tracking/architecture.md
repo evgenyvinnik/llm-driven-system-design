@@ -723,3 +723,170 @@ This section documents tradeoffs for when scaling beyond local development.
 - **Proxy rotation**: Integrate with proxy service for blocked sites
 - **WebSocket**: Real-time price updates on dashboard
 - **Multi-currency**: Currency conversion at query time using stored exchange rates
+
+## Implementation Notes
+
+This section documents the **why** behind key implementation decisions for resilience, observability, and data management.
+
+### Why Scrape Retries Handle Transient Failures
+
+Network operations are inherently unreliable. Scraping external e-commerce sites involves multiple failure points:
+
+1. **Network Issues**: DNS resolution failures, connection timeouts, socket resets
+2. **Server-Side Problems**: Load balancer hiccups, temporary service unavailability, rate limiting
+3. **Infrastructure Issues**: Proxy failures, CDN edge node problems
+
+**Why exponential backoff instead of fixed delays:**
+
+- **Thundering Herd Prevention**: If 1000 products fail simultaneously and all retry after exactly 1 second, we create a spike that can overwhelm both our scraper and the target site
+- **Natural Load Spreading**: Exponential delays (1s, 2s, 4s, 8s...) naturally spread retries over time, allowing temporary issues to resolve
+- **Proportional Wait Time**: Minor hiccups resolve quickly (caught on first retry), while major outages get progressively longer waits
+
+**Configuration rationale:**
+```
+maxRetries: 3          # Balance between resilience and giving up on truly broken URLs
+initialDelayMs: 1000   # Long enough for transient issues to clear
+maxDelayMs: 30000      # Cap to avoid indefinite waiting
+multiplier: 2          # Standard exponential growth
+```
+
+### Why Circuit Breakers Prevent Overwhelming Target Sites
+
+Without circuit breakers, a failing e-commerce site would receive continuous retry attempts from our scraper, potentially:
+
+1. **Worsening their outage** by adding load to an already stressed system
+2. **Wasting our resources** on requests destined to fail
+3. **Getting our IP blocked** for appearing to attack the site
+4. **Missing opportunities** to scrape other healthy sites while stuck retrying
+
+**The circuit breaker state machine:**
+
+```
+CLOSED (normal) --5 failures--> OPEN (blocking)
+OPEN --60s timeout--> HALF-OPEN (testing)
+HALF-OPEN --success--> CLOSED
+HALF-OPEN --failure--> OPEN
+```
+
+**Per-domain isolation:** Each e-commerce site gets its own circuit breaker. If Amazon is having issues, we don't stop scraping Best Buy. This isolation prevents cascade failures.
+
+**Why 5 consecutive failures?** Individual request failures are normal (network jitter). 5 consecutive failures strongly indicates a systemic problem worth pausing for.
+
+**Why 60-second reset timeout?** Most transient outages (deploys, brief overload) resolve within a minute. Longer issues (major outage) will trip the circuit again quickly.
+
+### Why Price History Retention Balances Analysis vs Storage
+
+Price history data has diminishing analytical value over time, but storage costs are constant:
+
+**Value decay pattern:**
+| Age | Analytical Use | Query Frequency | Resolution Needed |
+|-----|----------------|-----------------|-------------------|
+| 0-7 days | Recent trend analysis, debugging | High | Full (hourly) |
+| 7-90 days | Monthly comparisons, patterns | Medium | Daily aggregates |
+| 90+ days | Long-term trends, rare analysis | Low | Weekly/monthly |
+
+**Storage implications (10,000 products, hourly scrapes):**
+
+| Retention | Records/Product | Total Records | Estimated Size |
+|-----------|-----------------|---------------|----------------|
+| 7 days | 168 | 1.68M | ~100 MB |
+| 90 days | 2,160 | 21.6M | ~1.3 GB |
+| 365 days | 8,760 | 87.6M | ~5.3 GB |
+
+**Why tiered retention instead of delete-all-at-once:**
+
+1. **Preserves analytical value**: Daily aggregates (min, max, avg) maintain trend visibility with 24x less storage
+2. **Smoother cleanup**: Deleting in batches (10,000 records) avoids long-running transactions that block queries
+3. **Configurable**: Different deployments can tune based on available storage and analytical needs
+
+**TimescaleDB advantage**: When using TimescaleDB, chunks older than the retention period are dropped in O(1) time rather than row-by-row deletion.
+
+### Why Alert Metrics Enable Notification Optimization
+
+Tracking alert metrics serves multiple purposes beyond basic monitoring:
+
+**Operational insights:**
+
+1. **Alert Volume Tracking** (`alerts_triggered_total` by type):
+   - Identify if users are setting unrealistic target prices (too many `target_reached` alerts)
+   - Detect if price drop detection is working (`price_drop` alerts during sales events)
+   - Plan notification infrastructure capacity
+
+2. **Delivery Success Tracking** (`alerts_sent_total` by channel and status):
+   - Monitor email/push delivery failures
+   - Identify channels with reliability issues
+   - Calculate true notification success rate
+
+3. **Latency Tracking** (`alert_delivery_latency_seconds`):
+   - Ensure alerts are timely (users expect near-real-time notifications)
+   - Identify bottlenecks in the notification pipeline
+   - Set SLOs for alert delivery (e.g., 95% within 5 minutes)
+
+**Business optimization:**
+
+- **User engagement**: Correlate alert volume with user retention
+- **Feature effectiveness**: Measure which alert types drive user actions
+- **Cost management**: High alert volume = higher email/push costs; optimize thresholds
+
+**Example metrics query for Grafana:**
+
+```promql
+# Alert success rate by type
+sum(rate(price_tracker_alerts_sent_total{status="success"}[5m])) by (channel)
+/
+sum(rate(price_tracker_alerts_triggered_total[5m]))
+
+# p95 delivery latency
+histogram_quantile(0.95, rate(price_tracker_alert_delivery_latency_seconds_bucket[5m]))
+```
+
+### Why Structured JSON Logging with Pino
+
+**Performance**: Pino is one of the fastest Node.js loggers, with minimal overhead in hot paths. When scraping 10,000 products, logging overhead matters.
+
+**Structured data benefits:**
+
+1. **Machine-parseable**: JSON logs integrate directly with log aggregators (ELK, Loki, CloudWatch)
+2. **Searchable**: Query by `action`, `domain`, `productId` without parsing text
+3. **Correlation**: `requestId` field enables tracing requests across services
+4. **Filtering**: In production, filter by `level` to reduce noise
+
+**Sensitive data redaction**: Passwords, tokens, and cookies are automatically redacted to prevent accidental credential exposure in logs.
+
+**Example log output:**
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "action": "scrape",
+  "domain": "amazon.com",
+  "productId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "success",
+  "durationMs": 1250,
+  "service": "price-tracker",
+  "env": "production"
+}
+```
+
+### Why Multiple Health Check Endpoints
+
+Different consumers need different health check semantics:
+
+| Endpoint | Consumer | Purpose | Checks |
+|----------|----------|---------|--------|
+| `/health` | Load balancer | Fast liveness | Process running |
+| `/health/detailed` | Monitoring/debugging | Full status | DB, Redis, circuits |
+| `/ready` | Kubernetes | Traffic routing | Dependencies ready |
+| `/live` | Kubernetes | Process alive | Process not deadlocked |
+
+**Why `/health` is simple**: Load balancers check frequently (every 1-5 seconds). Complex health checks would add latency and database load for thousands of checks per minute.
+
+**Why `/health/detailed` includes circuit breakers**: Open circuits indicate degraded functionality. Operators need this visibility even if the service is technically "up."
+
+### Why Prometheus Metrics with Label Cardinality Control
+
+**Path normalization**: UUIDs in paths are replaced with `:id` to prevent unbounded label cardinality. Without this, each unique product/user ID creates a new time series, potentially overwhelming Prometheus.
+
+**Domain-based scrape metrics**: Per-domain metrics enable identifying problematic retailers without exposing individual product URLs.
+
+**Default Node.js metrics**: `collectDefaultMetrics()` provides event loop lag, memory usage, and GC statistics essential for performance debugging.

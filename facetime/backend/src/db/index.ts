@@ -18,6 +18,9 @@ export const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
+/** Valid parameter types for PostgreSQL queries */
+type QueryParam = string | number | boolean | null | undefined | string[] | number[];
+
 /**
  * Executes a parameterized SQL query and returns all matching rows.
  * Provides type-safe database access with support for parameterized queries
@@ -29,7 +32,7 @@ export const pool = new Pool({
  */
 export async function query<T>(
   text: string,
-  params?: (string | number | boolean | null | undefined)[]
+  params?: QueryParam[]
 ): Promise<T[]> {
   const result = await pool.query(text, params);
   return result.rows as T[];
@@ -45,7 +48,7 @@ export async function query<T>(
  */
 export async function queryOne<T>(
   text: string,
-  params?: (string | number | boolean | null | undefined)[]
+  params?: QueryParam[]
 ): Promise<T | null> {
   const result = await query<T>(text, params);
   return result.length > 0 ? result[0] : null;

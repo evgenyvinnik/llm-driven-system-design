@@ -20,6 +20,7 @@ import { createServer } from 'http';
 import session from 'express-session';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import RedisStore from 'connect-redis';
 import { config } from './config.js';
 import { redis } from './redis.js';
 import { pool, testConnection } from './db.js';
@@ -61,8 +62,7 @@ app.use(httpLogger);
 app.use(metricsMiddleware);
 
 // Session middleware with Redis store
-const RedisStoreConstructor = (await import('connect-redis')).default;
-const sessionStore = new RedisStoreConstructor({
+const sessionStore = new (RedisStore as any)({
   client: redis,
   prefix: 'sess:',
 });

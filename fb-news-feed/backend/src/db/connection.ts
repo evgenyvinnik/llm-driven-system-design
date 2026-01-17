@@ -2,10 +2,14 @@
  * @fileoverview Database connection configuration for PostgreSQL and Redis.
  * PostgreSQL stores persistent data (users, posts, friendships, etc.).
  * Redis provides session caching, feed caching, and pub/sub for real-time updates.
+ * Includes structured logging for connection events.
  */
 
 import { Pool } from 'pg';
 import Redis from 'ioredis';
+import { componentLoggers } from '../shared/logger.js';
+
+const log = componentLoggers.db;
 
 /**
  * PostgreSQL connection pool for efficient database query execution.
@@ -41,14 +45,14 @@ export async function testConnections(): Promise<void> {
   try {
     // Test PostgreSQL
     const pgClient = await pool.connect();
-    console.log('PostgreSQL connected successfully');
+    log.info('PostgreSQL connected successfully');
     pgClient.release();
 
     // Test Redis
     await redis.ping();
-    console.log('Redis connected successfully');
+    log.info('Redis connected successfully');
   } catch (error) {
-    console.error('Database connection error:', error);
+    log.error({ error }, 'Database connection error');
     throw error;
   }
 }

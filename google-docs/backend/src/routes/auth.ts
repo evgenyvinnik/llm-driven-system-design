@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import pool from '../utils/db.js';
 import redis from '../utils/redis.js';
 import { authenticate } from '../middleware/auth.js';
+import logger from '../shared/logger.js';
 import type { UserPublic } from '../types/index.js';
 
 /**
@@ -40,6 +41,7 @@ router.post('/register', async (req: Request, res: Response) => {
     );
 
     if (existingUser.rows.length > 0) {
+      logger.debug({ email }, 'Registration failed: email already exists');
       res.status(409).json({ success: false, error: 'Email already registered' });
       return;
     }
@@ -74,6 +76,8 @@ router.post('/register', async (req: Request, res: Response) => {
     // Cache session in Redis
     await redis.setex(`session:${token}`, 7 * 24 * 3600, JSON.stringify(user));
 
+    logger.info({ userId: user.id, email: user.email }, 'User registered');
+
     res.cookie('session_token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -86,7 +90,7 @@ router.post('/register', async (req: Request, res: Response) => {
       data: { user, token },
     });
   } catch (error) {
-    console.error('Register error:', error);
+    logger.error({ error }, 'Register error');
     res.status(500).json({ success: false, error: 'Registration failed' });
   }
 });
@@ -117,6 +121,7 @@ router.post('/login', async (req: Request, res: Response) => {
     );
 
     if (result.rows.length === 0) {
+      logger.debug({ email }, 'Login failed: user not found');
       res.status(401).json({ success: false, error: 'Invalid credentials' });
       return;
     }
@@ -127,6 +132,7 @@ router.post('/login', async (req: Request, res: Response) => {
     const isValid = await bcrypt.compare(password, user.password_hash);
 
     if (!isValid) {
+      logger.debug({ email }, 'Login failed: invalid password');
       res.status(401).json({ success: false, error: 'Invalid credentials' });
       return;
     }
@@ -152,6 +158,8 @@ router.post('/login', async (req: Request, res: Response) => {
     // Cache session in Redis
     await redis.setex(`session:${token}`, 7 * 24 * 3600, JSON.stringify(userPublic));
 
+    logger.info({ userId: user.id, email: user.email }, 'User logged in');
+
     res.cookie('session_token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -164,7 +172,7 @@ router.post('/login', async (req: Request, res: Response) => {
       data: { user: userPublic, token },
     });
   } catch (error) {
-    console.error('Login error:', error);
+    logger.error({ error }, 'Login error');
     res.status(500).json({ success: false, error: 'Login failed' });
   }
 });
@@ -180,6 +188,7 @@ router.post('/login', async (req: Request, res: Response) => {
 router.post('/logout', authenticate, async (req: Request, res: Response) => {
   try {
     const token = req.sessionToken;
+    const userId = req.user?.id;
 
     if (token) {
       // Delete from Redis
@@ -189,10 +198,12 @@ router.post('/logout', authenticate, async (req: Request, res: Response) => {
       await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
     }
 
+    logger.info({ userId }, 'User logged out');
+
     res.clearCookie('session_token');
     res.json({ success: true, message: 'Logged out successfully' });
   } catch (error) {
-    console.error('Logout error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Logout error');
     res.status(500).json({ success: false, error: 'Logout failed' });
   }
 });

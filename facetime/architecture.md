@@ -1394,3 +1394,201 @@ scrape_configs:
 rule_files:
   - /etc/prometheus/alerts.yml
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the key implementation decisions and their rationale based on the Codex review feedback.
+
+### Why Idempotency Prevents Duplicate Call Initiations
+
+**Problem:** Network retries, mobile app reconnects, and race conditions can cause the same call initiation request to arrive at the server multiple times. Without idempotency, each request creates a new call, resulting in:
+- Multiple ringing notifications to the callee
+- Confusing UI state with multiple incoming call dialogs
+- Wasted database and Redis resources
+- Poor user experience
+
+**Solution:** The signaling server implements idempotency using Redis with a 5-minute TTL:
+
+```typescript
+// Client sends: X-Idempotency-Key header (UUID generated once per call attempt)
+// Server flow:
+1. Check Redis: idempotency:call:{key} -> existingCallId?
+2. If exists: Return existing call (deduplicated: true)
+3. If not: Store key -> callId BEFORE creating call
+4. Create call in database
+5. Return new call
+
+// Key insight: Store idempotency mapping BEFORE the write
+// This ensures crash-safety: if we crash after Redis write but before
+// DB write, retry will find the key but no call exists (acceptable)
+// versus crash after DB write: retry creates duplicate (bad)
+```
+
+**Implementation files:**
+- `/backend/src/shared/idempotency.ts` - Idempotency key checking and storage
+- `/backend/src/services/signaling.ts` - Integration in `handleCallInitiate()`
+
+### Why Presence Caching Enables Fast Call Routing
+
+**Problem:** When initiating a call, the server must determine which devices are online to receive the ring notification. Querying PostgreSQL for every call initiation adds:
+- 5-20ms latency per device lookup
+- Database load during peak calling hours
+- Potential timeout if database is slow
+
+**Solution:** Write-through caching in Redis for user presence with 60-second TTL:
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │────>│   Redis     │────>│ PostgreSQL  │
+│  Heartbeat  │     │  (60s TTL)  │     │  (eventual) │
+└─────────────┘     └─────────────┘     └─────────────┘
+                          │
+                          │ < 1ms lookup
+                          ▼
+                    ┌─────────────┐
+                    │ Call Router │
+                    └─────────────┘
+```
+
+**Key design decisions:**
+- **Write-through:** Presence updates go to Redis immediately (not cache-aside)
+- **60-second TTL:** Matches heartbeat interval; stale presence auto-expires
+- **Heartbeat refresh:** Each ping extends TTL without updating lastSeen timestamp
+- **No database for presence:** Presence is ephemeral; PostgreSQL only stores device metadata
+
+**Implementation files:**
+- `/backend/src/shared/cache.ts` - `updatePresence()`, `getUserDevicePresence()`, `refreshPresenceTTL()`
+- `/backend/src/services/signaling.ts` - Integration in `handleRegister()` and heartbeat handler
+
+### Why Call Quality Metrics Enable Codec Optimization
+
+**Problem:** WebRTC can use multiple codecs (VP8, H.264, AV1) with different trade-offs:
+- VP8: Universal support, moderate quality
+- H.264: Hardware acceleration, good quality
+- AV1: Best compression, limited hardware support
+
+Without metrics, we cannot know:
+- Which codec performs best for our user base
+- What network conditions users experience
+- When to recommend simulcast vs single stream
+
+**Solution:** Prometheus metrics for call quality indicators:
+
+| Metric | Purpose | Optimization Action |
+|--------|---------|---------------------|
+| `call_setup_latency_seconds` | Time to connect | Optimize ICE candidate gathering |
+| `call_duration_seconds` | Engagement indicator | Identify quality issues causing early drops |
+| `ice_connection_type_total` | NAT traversal success | Tune STUN/TURN server selection |
+| `signaling_latency_seconds` | Server processing time | Identify bottlenecks |
+
+**Example optimization loop:**
+```
+1. Observe: p95 call_setup_latency > 5s
+2. Investigate: High ice_connection_type{type="relay"} rate
+3. Hypothesis: Too many users hitting TURN fallback
+4. Action: Add STUN servers in user's region
+5. Verify: call_setup_latency decreases
+```
+
+**Implementation files:**
+- `/backend/src/shared/metrics.ts` - Prometheus metric definitions
+- `/backend/src/services/signaling.ts` - Metric instrumentation points
+- `/backend/src/index.ts` - `/metrics` endpoint for Prometheus scraping
+
+### Why Circuit Breakers Protect Signaling Infrastructure
+
+**Problem:** The signaling server depends on PostgreSQL and Redis. If either becomes slow or unavailable:
+- WebSocket handlers block waiting for timeout
+- Thread pool exhaustion occurs
+- All users experience failures (cascade failure)
+- Recovery is slow even after dependency recovers
+
+**Solution:** Circuit breaker pattern using opossum library:
+
+```
+Normal Operation (Circuit CLOSED):
+  Request ──> Database ──> Response
+                 │
+                 └── Track success/failure rate
+
+Error Threshold Exceeded (Circuit OPEN):
+  Request ──> FAIL FAST ──> Fallback Response
+                 │
+                 └── No database call (prevents cascade)
+
+Recovery Attempt (Circuit HALF-OPEN):
+  Request ──> Database ──> If success, close circuit
+                 │
+                 └── Limited requests to test recovery
+```
+
+**Configuration for signaling:**
+```typescript
+{
+  timeout: 3000,              // 3s max per operation
+  errorThresholdPercentage: 50,  // Open at 50% error rate
+  resetTimeout: 10000,        // Try recovery after 10s
+  volumeThreshold: 5          // Need 5 requests before tripping
+}
+```
+
+**Protected operations:**
+- `db-user-lookup`: User verification during registration
+- `db-call-create`: Call record creation
+- `db-participant-add`: Adding participants to calls
+- `db-device-upsert`: Device registration updates
+- `db-device-offline`: Device offline status updates
+
+**Fallback behavior:**
+- User lookup: Return cached profile if available, else error
+- Device updates: Fire-and-forget (log error, continue)
+- Call creation: Error to client (no fallback for writes)
+
+**Implementation files:**
+- `/backend/src/shared/circuit-breaker.ts` - Circuit breaker factory and helpers
+- `/backend/src/services/signaling.ts` - `withCircuitBreaker()` usage
+- `/backend/src/index.ts` - Circuit breaker state in `/health` endpoint
+
+### Shared Module Architecture
+
+The implementation adds these shared modules under `/backend/src/shared/`:
+
+```
+shared/
+├── logger.ts         # Pino structured logging with request context
+├── metrics.ts        # Prometheus metrics for observability
+├── cache.ts          # Redis caching with TTL management
+├── circuit-breaker.ts # Opossum circuit breaker wrapper
+└── idempotency.ts    # Idempotency key handling for call initiation
+```
+
+**Design principles:**
+1. **Separation of concerns:** Each module handles one aspect
+2. **Consistent interfaces:** All modules export typed functions
+3. **Fail-open where safe:** Caching failures don't block operations
+4. **Metrics everywhere:** Each module tracks its own metrics
+
+### New API Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /metrics` | Prometheus metrics for scraping |
+| `GET /health` | Detailed health check with dependency status |
+| `GET /health/live` | Simple liveness probe for orchestrators |
+| `GET /health/ready` | Readiness probe checking dependencies |
+
+### Environment Variables
+
+```bash
+# Logging
+LOG_LEVEL=info              # pino log level (trace, debug, info, warn, error)
+APP_VERSION=dev             # Version tag for logs
+
+# Cache TTLs (seconds)
+CACHE_USER_TTL=3600         # User profile cache (1 hour)
+CACHE_PRESENCE_TTL=60       # Presence cache (60 seconds)
+CACHE_TURN_CREDENTIAL_TTL=300  # TURN credentials (5 minutes)
+CACHE_IDEMPOTENCY_TTL=300   # Idempotency keys (5 minutes)
+```

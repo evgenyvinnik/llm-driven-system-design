@@ -6,6 +6,11 @@
  */
 
 import Redis from 'ioredis';
+import { logger } from '../shared/logger.js';
+import { cacheMetrics } from '../shared/metrics.js';
+import { RETENTION_CONFIG, IDEMPOTENCY_CONFIG } from '../shared/config.js';
+
+const log = logger.child({ service: 'redis' });
 
 /**
  * Redis client configured from environment variables.
@@ -15,23 +20,24 @@ const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
   maxRetriesPerRequest: 3,
-  retryDelayOnFailover: 100,
+  retryStrategy: (times: number) => Math.min(times * 100, 2000),
   lazyConnect: true,
 });
 
 redis.on('error', (err) => {
-  console.error('Redis connection error:', err);
+  log.error({ error: err.message }, 'Redis connection error');
+  cacheMetrics.errors.inc({ operation: 'connection', error_type: 'connection_error' });
 });
 
 redis.on('connect', () => {
-  console.log('Connected to Redis');
+  log.info('Connected to Redis');
 });
 
-/** Deduplication TTL in seconds (5 minutes) - prevents duplicate click processing */
-const DEDUP_TTL = 300;
+/** Deduplication TTL in seconds - uses config value */
+const DEDUP_TTL = RETENTION_CONFIG.REDIS.DEDUP_TTL_SECONDS;
 
-/** Rate limiting window in seconds (1 minute) - for fraud detection thresholds */
-const RATE_LIMIT_WINDOW = 60;
+/** Rate limiting window in seconds - uses config value */
+const RATE_LIMIT_WINDOW = RETENTION_CONFIG.REDIS.RATE_LIMIT_TTL_SECONDS;
 
 /**
  * Checks if a click has already been processed within the deduplication window.
@@ -229,11 +235,88 @@ export async function getRealTimeGlobalClicks(): Promise<Record<string, number>>
  */
 export async function testConnection(): Promise<boolean> {
   try {
+    const start = Date.now();
     await redis.ping();
+    cacheMetrics.latency.observe({ operation: 'ping' }, (Date.now() - start) / 1000);
     return true;
   } catch (error) {
-    console.error('Redis connection failed:', error);
+    log.error({ error }, 'Redis connection failed');
+    cacheMetrics.errors.inc({ operation: 'ping', error_type: 'connection_error' });
     return false;
+  }
+}
+
+/**
+ * Checks if an idempotency key exists and returns its cached result.
+ * Used to return the same response for duplicate requests.
+ *
+ * @param key - Client-provided idempotency key
+ * @returns Cached result JSON string if exists, null otherwise
+ */
+export async function checkIdempotencyKey(key: string): Promise<string | null> {
+  const start = Date.now();
+  const redisKey = `${IDEMPOTENCY_CONFIG.KEY_PREFIX}${key}`;
+
+  try {
+    const result = await redis.get(redisKey);
+    const duration = (Date.now() - start) / 1000;
+    cacheMetrics.latency.observe({ operation: 'get_idempotency' }, duration);
+
+    if (result) {
+      cacheMetrics.hits.inc({ operation: 'idempotency' });
+      log.debug({ key, duration }, 'Idempotency key hit');
+    } else {
+      cacheMetrics.misses.inc({ operation: 'idempotency' });
+    }
+
+    return result;
+  } catch (error) {
+    log.error({ error, key }, 'Failed to check idempotency key');
+    cacheMetrics.errors.inc({ operation: 'get_idempotency', error_type: 'read_error' });
+    return null;
+  }
+}
+
+/**
+ * Stores an idempotency key with its result for future lookups.
+ * TTL ensures keys expire after the idempotency window.
+ *
+ * @param key - Client-provided idempotency key
+ * @param result - JSON string of the processing result to cache
+ */
+export async function setIdempotencyKey(key: string, result: string): Promise<void> {
+  const start = Date.now();
+  const redisKey = `${IDEMPOTENCY_CONFIG.KEY_PREFIX}${key}`;
+
+  try {
+    await redis.setex(redisKey, IDEMPOTENCY_CONFIG.KEY_TTL_SECONDS, result);
+    cacheMetrics.latency.observe({ operation: 'set_idempotency' }, (Date.now() - start) / 1000);
+    log.debug({ key }, 'Idempotency key stored');
+  } catch (error) {
+    log.error({ error, key }, 'Failed to store idempotency key');
+    cacheMetrics.errors.inc({ operation: 'set_idempotency', error_type: 'write_error' });
+  }
+}
+
+/**
+ * Gets Redis memory info for monitoring.
+ * Used to update Prometheus gauge for memory usage.
+ *
+ * @returns Memory usage in bytes, or -1 on error
+ */
+export async function getMemoryUsage(): Promise<number> {
+  try {
+    const info = await redis.info('memory');
+    const match = info.match(/used_memory:(\d+)/);
+    if (match) {
+      const bytes = parseInt(match[1], 10);
+      cacheMetrics.memoryUsage.set(bytes);
+      return bytes;
+    }
+    return -1;
+  } catch (error) {
+    log.error({ error }, 'Failed to get Redis memory info');
+    return -1;
   }
 }
 

@@ -3,12 +3,26 @@ import { OTTransformer } from './OTTransformer.js';
 import { db } from './database.js';
 import { presence } from './redis.js';
 import type { ClientInfo, CursorPosition, SelectionRange, OperationData } from '../types/index.js';
+import {
+  logger,
+  logOperation,
+  logConflict,
+  logError,
+  transformLatency,
+  getServerId,
+  queueSnapshot,
+} from '../shared/index.js';
 
 /**
  * Interval for saving document snapshots (in number of operations).
  * Snapshots are taken every N operations to enable efficient document loading.
  */
 const SNAPSHOT_INTERVAL = 50;
+
+/**
+ * Server ID for metrics labeling.
+ */
+const SERVER_ID = getServerId();
 
 /**
  * DocumentState manages the in-memory state of an active document
@@ -20,6 +34,7 @@ const SNAPSHOT_INTERVAL = 50;
  * - Applies incoming operations using OT transformation
  * - Persists operations to the database
  * - Periodically saves snapshots for efficient loading
+ * - Logs conflict resolution for debugging
  *
  * One instance is created per active document (documents with connected clients).
  * When the last client disconnects, the state is persisted and unloaded.
@@ -91,6 +106,14 @@ export class DocumentState {
 
     // Load presence from Redis
     this.clients = await presence.getClients(this.documentId);
+
+    logger.info({
+      event: 'document_loaded',
+      document_id: this.documentId,
+      version: this.version,
+      content_length: this.content.length,
+      client_count: this.clients.size,
+    });
   }
 
   /**
@@ -158,6 +181,8 @@ export class DocumentState {
    * Also updates all other clients' cursor positions to account for
    * the text changes.
    *
+   * Logs conflict resolution details when transformations are needed.
+   *
    * @param clientId - The ID of the client sending the operation
    * @param userId - The ID of the user who made the change
    * @param clientVersion - The server version the client's operation was based on
@@ -171,7 +196,9 @@ export class DocumentState {
     clientVersion: number,
     operation: OperationData
   ): Promise<{ version: number; operation: OperationData }> {
+    const startTime = Date.now();
     let transformedOp = TextOperation.fromJSON(operation);
+    const originalOp = transformedOp.toJSON();
 
     // Get all operations since the client's version
     const concurrentOps = await db.getOperationsSince(
@@ -180,17 +207,48 @@ export class DocumentState {
     );
 
     // Transform against all concurrent operations
+    const transformStart = Date.now();
     for (const opRecord of concurrentOps) {
       const serverOp = TextOperation.fromJSON(opRecord.operation);
       const [transformed] = OTTransformer.transform(transformedOp, serverOp);
       transformedOp = transformed;
+    }
+    const transformTime = Date.now() - transformStart;
+
+    // Record transform latency with concurrent ops bucket
+    const concurrentBucket = concurrentOps.length === 0 ? '0' :
+      concurrentOps.length <= 5 ? '1-5' :
+      concurrentOps.length <= 10 ? '6-10' : '10+';
+    transformLatency.observe(
+      { server_id: SERVER_ID, concurrent_ops: concurrentBucket },
+      transformTime
+    );
+
+    // Log conflict resolution if transformations were needed
+    if (concurrentOps.length > 0) {
+      logConflict(this.documentId, clientId, {
+        clientVersion,
+        serverVersion: this.version,
+        concurrentOpCount: concurrentOps.length,
+        transformedOp: transformedOp.toJSON(),
+        originalOp,
+      });
     }
 
     // Apply the transformed operation
     try {
       this.content = transformedOp.apply(this.content);
     } catch (error) {
-      console.error('Failed to apply operation:', error);
+      logError('operation_apply', error as Error);
+      logger.error({
+        event: 'operation_apply_failed',
+        document_id: this.documentId,
+        client_id: clientId,
+        client_version: clientVersion,
+        server_version: this.version,
+        base_length: transformedOp.baseLength,
+        content_length: this.content.length,
+      });
       throw error;
     }
 
@@ -205,9 +263,19 @@ export class DocumentState {
       transformedOp.toJSON()
     );
 
-    // Periodically save snapshots
+    // Queue snapshot asynchronously if needed
     if (this.version % SNAPSHOT_INTERVAL === 0) {
-      await this.saveSnapshot();
+      try {
+        await queueSnapshot(this.documentId, this.version, this.content);
+      } catch (error) {
+        // Fall back to synchronous snapshot if queue fails
+        logger.warn({
+          event: 'snapshot_queue_failed',
+          document_id: this.documentId,
+          error: (error as Error).message,
+        });
+        await this.saveSnapshot();
+      }
     }
 
     // Transform all client cursors
@@ -223,6 +291,15 @@ export class DocumentState {
       }
     }
 
+    const totalTime = Date.now() - startTime;
+
+    // Log the operation
+    logOperation(this.documentId, clientId, transformedOp.toJSON(), {
+      version: this.version,
+      transformCount: concurrentOps.length,
+      latencyMs: totalTime,
+    });
+
     return {
       version: this.version,
       operation: transformedOp.toJSON(),
@@ -234,7 +311,17 @@ export class DocumentState {
    * Snapshots enable efficient document loading by avoiding full replay.
    */
   async saveSnapshot(): Promise<void> {
-    await db.saveSnapshot(this.documentId, this.version, this.content);
+    try {
+      await db.saveSnapshot(this.documentId, this.version, this.content);
+      logger.info({
+        event: 'snapshot_saved',
+        document_id: this.documentId,
+        version: this.version,
+        content_length: this.content.length,
+      });
+    } catch (error) {
+      logError('snapshot_save', error as Error);
+    }
   }
 
   /**

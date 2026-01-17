@@ -933,3 +933,235 @@ await auditLog(
 | Message Queue | RabbitMQ | Kafka | Simpler for local dev, sufficient for learning |
 | Tracing | OpenTelemetry + Jaeger | Zipkin | Vendor neutral, better ecosystem |
 | Metrics | Prometheus + Grafana | Datadog | Self-hosted, free for local dev |
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of reliability patterns in the backend codebase, explaining **why** each pattern is critical for e-commerce operations.
+
+### 1. Why Idempotency Prevents Inventory Overselling
+
+**The Problem:**
+When a customer clicks "Place Order" and the network times out, they naturally retry. Without idempotency, this can create duplicate orders and decrement inventory twice, leading to overselling.
+
+```
+Customer clicks "Buy" → Network timeout → Customer retries
+Without idempotency:
+  - Order 1 created, inventory -1
+  - Order 2 created, inventory -1 (OVERSOLD!)
+
+With idempotency:
+  - Order 1 created, inventory -1
+  - Retry detected via idempotency key → Return Order 1 (no duplicate)
+```
+
+**Implementation:**
+The `withIdempotency()` wrapper in `/backend/src/services/idempotency.js`:
+1. Checks if the idempotency key already exists in the database
+2. If found with status `completed`, returns the cached result
+3. If found with status `processing`, rejects (prevents race conditions)
+4. If not found or `failed`, processes the operation and stores the result
+
+**Why PostgreSQL for Idempotency Storage:**
+- ACID guarantees prevent race conditions during key insertion
+- Unique constraint on `(idempotency_key, store_id, operation)` enforces exactly-once semantics
+- 24-hour TTL cleanup prevents unbounded growth
+
+**Critical Insight:**
+The checkout uses `SERIALIZABLE` isolation level combined with `SELECT FOR UPDATE` on inventory rows. This prevents the "lost update" problem where two concurrent transactions both read the same inventory level before either writes.
+
+### 2. Why Async Queues Enable Reliable Webhook Delivery
+
+**The Problem:**
+Synchronous webhook delivery during checkout creates fragile dependencies:
+- If the merchant's webhook endpoint is slow, checkout is slow
+- If it's down, checkout fails entirely
+- Retry logic in the critical path adds latency and complexity
+
+**Implementation:**
+RabbitMQ queues in `/backend/src/services/rabbitmq.js` decouple order creation from downstream processing:
+
+```
+Checkout (synchronous, fast):
+  1. Validate inventory (SELECT FOR UPDATE)
+  2. Process payment (circuit breaker protected)
+  3. Create order in database
+  4. Publish to RabbitMQ (non-blocking)
+  5. Return success to customer
+
+Async Workers (eventual, reliable):
+  - orders.created → Send confirmation email
+  - orders.created → Deliver merchant webhook (with retries)
+  - inventory.low → Alert merchant
+  - inventory.out → Pause product visibility
+```
+
+**Queue Delivery Semantics:**
+- `durable: true` - Messages survive RabbitMQ restarts
+- `persistent: true` - Messages written to disk
+- Manual acknowledgment - Only ack after successful processing
+- Dead Letter Queues - Failed messages preserved for investigation
+
+**Why At-Least-Once is Correct:**
+Webhooks and emails are idempotent operations (re-sending is safe). We choose at-least-once delivery over exactly-once because:
+1. Exactly-once is expensive (2-phase commit, distributed transactions)
+2. Consumers implement their own idempotency via message IDs
+3. Duplicate email is annoying but acceptable; missing email is not
+
+### 3. Why Inventory Metrics Enable Stockout Prevention
+
+**The Problem:**
+Stockouts are invisible until customers complain. By the time you notice, you've lost sales and frustrated customers who see "out of stock" on popular items.
+
+**Implementation:**
+Real-time Prometheus metrics in `/backend/src/services/metrics.js`:
+
+```
+shopify_inventory_level{store_id="1", variant_id="42", sku="TS-M-BLACK"} 5
+shopify_inventory_low_total{store_id="1", variant_id="42"} 3
+shopify_inventory_out_of_stock_total{store_id="1", variant_id="42"} 1
+```
+
+**Alerting Rules (defined in architecture.md):**
+```yaml
+# Alert when inventory approaches zero
+- alert: InventoryLow
+  expr: shopify_inventory_level < 10
+  for: 5m
+  labels:
+    severity: warning
+
+# Alert immediately when sold out
+- alert: InventoryOutOfStock
+  expr: shopify_inventory_level == 0
+  for: 1m
+  labels:
+    severity: info
+```
+
+**Dashboard Insights:**
+- **Trend Analysis:** `rate(shopify_inventory_out_of_stock_total[24h])` shows stockout frequency
+- **Reorder Point:** When `shopify_inventory_level` crosses reorder threshold, alert for purchase order
+- **Velocity Tracking:** Combine with order metrics to calculate days-of-inventory-remaining
+
+**Why Prometheus Over Database Queries:**
+- Real-time (no query latency)
+- Historical data (track trends over time)
+- Alerting built-in (PagerDuty, Slack integration)
+- Aggregation at scale (no N+1 queries across all variants)
+
+### 4. Why Audit Logging Enables Order Dispute Resolution
+
+**The Problem:**
+Customer disputes require forensic reconstruction:
+- "I was charged but never received confirmation"
+- "The inventory said 10 available but checkout said out of stock"
+- "Someone changed my order without my authorization"
+
+**Implementation:**
+Comprehensive audit trail in `/backend/src/services/audit.js`:
+
+```javascript
+// Every checkout step is logged
+await logCheckoutEvent(context, AuditAction.CHECKOUT_STARTED, { cartId, email });
+await logInventoryChange(context, variantId, oldQty, newQty, 'checkout_reserve');
+await logPaymentEvent(context, success, { amount, paymentIntentId });
+await logOrderCreated(context, order);
+
+// Query for dispute resolution
+const trail = await getOrderAuditTrail(storeId, orderId);
+// Returns chronological list:
+// - checkout.started (timestamp, IP, cart contents)
+// - inventory.adjusted (each SKU reserved)
+// - payment.processed (Stripe intent ID)
+// - order.created (final order state)
+```
+
+**What We Capture:**
+- `actor_id` + `actor_type` - Who did it (customer, merchant, admin, system)
+- `ip_address` - Where the request came from
+- `changes.before` + `changes.after` - What changed
+- `created_at` - When it happened
+
+**Retention and Compliance:**
+- Audit logs are immutable (INSERT only, no UPDATE/DELETE in application code)
+- Indexes on `(store_id, created_at)` for efficient time-range queries
+- 7+ year retention for financial records (PCI-DSS, tax compliance)
+
+**Why Database Over Log Files:**
+- Queryable (SQL WHERE clauses for investigation)
+- Relational (JOIN with orders, products for context)
+- Transactional (audit log and business operation in same transaction)
+- Secure (database-level access controls, no need for log file permissions)
+
+---
+
+## Reliability Patterns Summary
+
+| Pattern | File | Purpose |
+|---------|------|---------|
+| Idempotency | `services/idempotency.js` | Prevent duplicate orders on retry |
+| Circuit Breaker | `services/circuit-breaker.js` | Protect against payment gateway failures |
+| Async Queues | `services/rabbitmq.js` | Decouple checkout from notifications |
+| Structured Logging | `services/logger.js` | Debug production issues |
+| Prometheus Metrics | `services/metrics.js` | SLI/SLO dashboards and alerting |
+| Audit Logging | `services/audit.js` | Dispute resolution and compliance |
+
+---
+
+## Running the Implementation
+
+### Prerequisites
+```bash
+# Start infrastructure
+docker-compose up -d
+
+# Wait for services to be healthy
+docker-compose ps
+```
+
+### Starting the Backend
+```bash
+cd backend
+npm install
+npm run dev
+```
+
+### Verifying the Implementation
+
+**Health Check:**
+```bash
+curl http://localhost:3001/health
+# Returns: { status, checks: { database, redis, rabbitmq }, circuitBreakers }
+```
+
+**Prometheus Metrics:**
+```bash
+curl http://localhost:3001/metrics
+# Returns: Prometheus-formatted metrics
+```
+
+**Idempotent Checkout:**
+```bash
+# First request creates order
+curl -X POST http://localhost:3001/api/storefront/demo/checkout \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: checkout-abc123" \
+  -H "X-Cart-Session: your-cart-session" \
+  -d '{"email": "test@example.com"}'
+
+# Retry returns same order (deduplicated: true)
+curl -X POST http://localhost:3001/api/storefront/demo/checkout \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: checkout-abc123" \
+  -H "X-Cart-Session: your-cart-session" \
+  -d '{"email": "test@example.com"}'
+```
+
+### RabbitMQ Management UI
+```
+URL: http://localhost:15672
+User: shopify
+Pass: shopify_dev
+```

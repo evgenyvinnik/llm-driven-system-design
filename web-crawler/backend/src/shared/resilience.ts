@@ -30,13 +30,12 @@ import {
   circuitBreaker,
   retry,
   handleAll,
-  handleResultType,
   ExponentialBackoff,
   ConsecutiveBreaker,
   wrap,
-  Policy,
   IPolicy,
   RetryPolicy,
+  CircuitState as CockatielCircuitState,
 } from 'cockatiel';
 import { redis } from '../models/redis.js';
 import { circuitBreakerLogger } from './logger.js';
@@ -130,18 +129,18 @@ export function getCircuitBreaker(
     });
 
     // Set up event listeners for metrics and logging
-    cb.onStateChange((state) => {
+    cb.onStateChange((state: CockatielCircuitState) => {
       const stateValue =
-        state === 'closed' ? 0 : state === 'halfOpen' ? 1 : 2;
+        state === CockatielCircuitState.Closed ? 0 : state === CockatielCircuitState.HalfOpen ? 1 : 2;
       circuitBreakerStateGauge.labels(domain).set(stateValue);
 
       circuitBreakerLogger.info(
-        { domain, state },
+        { domain, state: state.toString() },
         `Circuit breaker state changed to ${state}`
       );
 
       // Store state in Redis for distributed awareness
-      storeCircuitState(domain, state).catch((err) => {
+      storeCircuitState(domain, state.toString()).catch((err) => {
         circuitBreakerLogger.error({ err, domain }, 'Failed to store circuit state');
       });
     });
@@ -289,7 +288,17 @@ export function clearCircuitBreakers(): void {
 export function getCircuitState(domain: string): 'closed' | 'open' | 'halfOpen' {
   const cb = domainCircuitBreakers.get(domain);
   if (!cb) return 'closed';
-  return cb.state;
+
+  switch (cb.state) {
+    case CockatielCircuitState.Closed:
+      return 'closed';
+    case CockatielCircuitState.Open:
+      return 'open';
+    case CockatielCircuitState.HalfOpen:
+      return 'halfOpen';
+    default:
+      return 'closed';
+  }
 }
 
 /**

@@ -1102,3 +1102,292 @@ app.get('/health/ready', async (req, res) => {
     res.status(503).json({ status: 'not ready', error: error.message })
   }
 })
+```
+
+---
+
+## Implementation Notes
+
+This section documents the key implementation decisions and explains WHY each pattern was chosen for the Twitch streaming platform.
+
+### WHY Idempotency Prevents Duplicate Chat Messages
+
+**Problem**: In a high-traffic live chat system, network instability and client retries can cause the same message to be submitted multiple times. Without deduplication:
+- Users see duplicate messages cluttering the chat
+- Database storage is wasted on repeated content
+- Message ordering becomes confusing
+- Moderators may take action on what appears to be spam
+
+**Implementation**:
+```javascript
+// Each message includes a client-generated unique ID
+const messageId = `${userId}:${Date.now()}:${randomSuffix}`;
+
+// Server tracks recent message IDs in a Redis set with 5-minute TTL
+const isNew = await redis.sAdd(`chat_dedup:${channelId}`, messageId);
+if (!isNew) {
+  // Silently drop duplicate - client may have retried
+  return;
+}
+```
+
+**Why Redis Sets?**
+- O(1) membership checks for high throughput
+- Automatic TTL cleanup prevents unbounded memory growth
+- Shared across all chat server instances
+- Fail-open design: if Redis is unavailable, allow the message through (users tolerate occasional duplicates better than lost messages)
+
+**Trade-off**: We chose server-side deduplication over client-side because:
+- Clients may be malicious or buggy
+- Server has authoritative view of what was processed
+- Centralized dedup works across all server instances
+
+### WHY Subscription Idempotency Prevents Double Charging
+
+**Problem**: Payment operations are critical and retries are common due to network timeouts. Without idempotency:
+- Users could be charged twice for the same subscription
+- Financial reconciliation becomes a nightmare
+- Refund processing creates customer support burden
+- Trust in the platform is damaged
+
+**Implementation**:
+```javascript
+// Client includes idempotency key in header
+// Idempotency-Key: sub:userId:channelId:timestamp
+
+// Server checks before processing payment
+const { isDuplicate, cachedResult } = await checkSubscriptionIdempotency(redis, key);
+if (isDuplicate) {
+  return cachedResult; // Return same response as original request
+}
+
+// Process subscription with transaction
+await withRetry(async () => {
+  const client = await getClient();
+  await client.query('BEGIN');
+  // ... create subscription, update counts ...
+  await client.query('COMMIT');
+}, { maxRetries: 3 });
+
+// Cache result for 24 hours
+await storeSubscriptionResult(redis, key, result);
+```
+
+**Why 24-hour TTL?**
+- Long enough to handle delayed retries from payment processors
+- Short enough to not bloat Redis memory indefinitely
+- Aligns with typical payment processor retry windows
+
+### WHY Circuit Breakers Protect Live Streaming Infrastructure
+
+**Problem**: Live streaming is a real-time experience where cascading failures can destroy user experience:
+- If Redis fails, all chat servers keep retrying, creating thundering herd
+- Database connection pool exhaustion affects all users, not just the failing feature
+- Transcoding service overload can cause stream drops
+- Without protection, one failing component takes down the entire platform
+
+**Implementation**:
+```javascript
+// Circuit breaker for Redis chat publishing
+const redisChatBreaker = createCircuitBreaker('redis-chat-publish', publishFn, {
+  timeout: 1000,              // Fast fail for real-time chat
+  errorThresholdPercentage: 50, // Open after 50% failures
+  resetTimeout: 5000,         // Try again after 5 seconds
+  volumeThreshold: 10         // Need 10 requests to calculate failure rate
+});
+
+// Fallback to local-only broadcast when Redis is unavailable
+redisChatBreaker.fallback((channel, message) => {
+  localBroadcast(channelId, message);
+  return { fallback: true };
+});
+```
+
+**Why These Specific Thresholds?**
+- **1000ms timeout**: Chat must feel instant; waiting longer frustrates users
+- **50% threshold**: Aggressive because chat is critical but not life-safety
+- **5s reset**: Fast recovery for transient issues; Redis usually recovers quickly
+- **Fallback to local**: Graceful degradation keeps chat working within single instances
+
+**Critical for Live Streaming Because**:
+- Viewers expect real-time interaction during live events
+- A 30-second outage during a major stream can cause massive user churn
+- Streamers depend on the platform for income; reliability is paramount
+
+### WHY Stream Start Uses Distributed Locks
+
+**Problem**: RTMP connections are unstable; streamers may reconnect multiple times:
+- OBS crashes and auto-reconnects
+- Network hiccups cause brief disconnections
+- Multiple connection attempts arrive simultaneously
+
+Without locking:
+- Multiple "go live" events are broadcast to followers
+- Duplicate stream records are created in database
+- Viewer counts are fragmented across multiple "streams"
+
+**Implementation**:
+```javascript
+async function startStream(channelId, title, categoryId) {
+  // Acquire lock to prevent duplicate go-live events
+  const { acquired } = await acquireStreamLock(redis, channelId);
+  if (!acquired) {
+    // Check if already live (reconnect scenario)
+    if (channel.is_live) {
+      return { reconnect: true };
+    }
+    throw new Error('Failed to acquire stream lock');
+  }
+
+  try {
+    // Create stream record and update channel
+    await query('UPDATE channels SET is_live = TRUE ...');
+    await query('INSERT INTO streams ...');
+  } finally {
+    await releaseStreamLock(redis, channelId);
+  }
+}
+```
+
+**Why Redis SET NX with TTL?**
+- Atomic operation prevents race conditions
+- TTL ensures locks don't persist forever if process crashes
+- 10-second TTL is long enough for the operation but short enough for recovery
+
+### WHY Moderation Audit Logging Enables Appeal Handling
+
+**Problem**: Moderation actions affect real people and their income:
+- Banned streamers lose revenue
+- Viewers may be unfairly timed out
+- Moderators may abuse their power
+- Legal compliance requires action history
+
+Without audit logging:
+- Appeals are "he said, she said" with no evidence
+- Patterns of abuse go undetected
+- Compliance audits cannot be satisfied
+- Trust and Safety team is blind
+
+**Implementation**:
+```javascript
+function logUserBan(actor, targetUserId, targetUsername, channelId, reason, expiresAt) {
+  auditLogger.info({
+    action: 'ban_user',
+    actor: { user_id: actor.userId, username: actor.username, ip: actor.ip },
+    target: { type: 'user', id: targetUserId },
+    channel_id: channelId,
+    reason,
+    metadata: {
+      target_username: targetUsername,
+      is_permanent: !expiresAt,
+      expires_at: expiresAt
+    },
+    timestamp: new Date().toISOString()
+  });
+}
+```
+
+**What We Log**:
+- **Who**: Actor user ID, username, and IP address
+- **What**: Action type (ban, unban, timeout, delete, etc.)
+- **Whom**: Target user or message ID
+- **Where**: Channel ID where action occurred
+- **Why**: Reason provided by moderator
+- **When**: ISO timestamp for timezone-agnostic sorting
+
+**Why Separate Logger?**
+- Audit logs may have different retention policies (7 years for legal)
+- Should be append-only and tamper-evident in production
+- Can be shipped to different storage (SIEM, compliance system)
+- Metrics can track moderation action rates per channel
+
+### WHY Viewer Metrics Enable Stream Quality Optimization
+
+**Problem**: Without metrics, platform operators are flying blind:
+- Cannot detect when streams have quality issues
+- Cannot optimize CDN routing
+- Cannot identify popular content for recommendations
+- Cannot measure SLA compliance
+
+**Implementation**:
+```javascript
+// Prometheus metrics exposed at /metrics
+const totalViewers = new Gauge({
+  name: 'twitch_total_viewers',
+  help: 'Total viewers across all live streams'
+});
+
+const activeStreams = new Gauge({
+  name: 'twitch_active_streams',
+  help: 'Number of currently live streams'
+});
+
+const chatMessagesTotal = new Counter({
+  name: 'twitch_chat_messages_total',
+  help: 'Total chat messages processed',
+  labelNames: ['channel_id']
+});
+
+// Updated periodically by stream simulator
+setInterval(async () => {
+  const result = await query('SELECT current_viewers FROM channels WHERE is_live = TRUE');
+  let total = 0;
+  for (const channel of result.rows) {
+    total += channel.current_viewers;
+  }
+  setTotalViewers(total);
+  setActiveStreams(result.rows.length);
+}, 30000);
+```
+
+**Key Metrics and Their Purpose**:
+
+| Metric | Purpose |
+|--------|---------|
+| `twitch_active_streams` | Capacity planning, detect stream drop events |
+| `twitch_total_viewers` | Platform health, trending analysis |
+| `twitch_chat_messages_total` | Rate limiting tuning, spam detection |
+| `twitch_websocket_connections` | Server scaling decisions |
+| `twitch_circuit_breaker_state` | Dependency health monitoring |
+| `twitch_moderation_actions_total` | Community health, moderator activity |
+
+**Why Prometheus?**
+- Pull-based model works well with dynamic scaling
+- Rich query language (PromQL) for dashboards
+- Standard format understood by Grafana, AlertManager
+- Low overhead for high-cardinality metrics
+
+### Implementation File Summary
+
+| File | Purpose |
+|------|---------|
+| `src/utils/logger.js` | Structured JSON logging with pino, request correlation |
+| `src/utils/metrics.js` | Prometheus metrics collection and exposition |
+| `src/utils/circuitBreaker.js` | Opossum-based circuit breaker with fallbacks |
+| `src/utils/retry.js` | Exponential backoff with jitter |
+| `src/utils/idempotency.js` | Chat dedup, subscription idempotency, stream locks |
+| `src/utils/audit.js` | Tamper-evident logging for moderation actions |
+| `src/utils/health.js` | Comprehensive health check endpoints |
+| `src/routes/moderation.js` | Ban/unban, message deletion, moderator management |
+
+### Endpoints Added
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /metrics` | Prometheus metrics scraping |
+| `GET /health` | Detailed health with dependency status |
+| `GET /health/live` | Kubernetes liveness probe |
+| `GET /health/ready` | Kubernetes readiness probe |
+| `POST /api/moderation/:channelId/ban` | Ban user with audit logging |
+| `DELETE /api/moderation/:channelId/ban/:userId` | Unban user with audit logging |
+| `DELETE /api/moderation/:channelId/message/:messageId` | Delete message with audit logging |
+| `POST /api/moderation/:channelId/clear` | Clear chat with audit logging |
+| `POST /api/moderation/:channelId/moderator` | Add moderator with audit logging |
+| `DELETE /api/moderation/:channelId/moderator/:userId` | Remove moderator with audit logging |
+
+### NPM Packages Added
+
+- `pino`: High-performance JSON logger
+- `pino-http`: HTTP request logging middleware
+- `prom-client`: Prometheus metrics client
+- `opossum`: Circuit breaker implementation

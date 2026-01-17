@@ -734,3 +734,347 @@ Phase 4: Move messages to Cassandra (high write volume)
 5. **Recommendations**: ML-based explore feed
 6. **CDN integration**: CloudFront/Cloudflare for image serving
 7. **Read replicas**: Separate read/write database connections
+
+## Implementation Notes
+
+This section documents the reasoning behind key implementation decisions in the backend codebase. Understanding the "why" is critical for maintaining and evolving the system.
+
+### WHY Idempotency Prevents Duplicate Likes
+
+**Problem**: Without idempotency, a user could accidentally like a post multiple times, inflating engagement metrics and creating inconsistent state.
+
+**Scenario**:
+1. User clicks "like" button on a post
+2. Network is slow, UI doesn't respond immediately
+3. User clicks "like" again (or network retries automatically)
+4. Without protection: Two `INSERT` statements execute, creating duplicate likes
+5. Post's `like_count` is incremented twice incorrectly
+
+**Solution**: PostgreSQL's `ON CONFLICT DO NOTHING` clause
+
+```sql
+INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id
+```
+
+**How it works**:
+1. The `likes` table has a `UNIQUE` constraint on `(user_id, post_id)`
+2. `ON CONFLICT DO NOTHING` silently ignores duplicate insertions
+3. `RETURNING id` tells us if an insert actually happened (rows returned) or not (no rows)
+4. The API response includes `idempotent: true/false` so clients know if their action was new
+
+**Benefits**:
+- **Safe retries**: Clients can retry failed requests without side effects
+- **No double-counting**: Like counts remain accurate
+- **Simpler client logic**: No need for complex deduplication on the frontend
+- **Race condition safe**: Concurrent requests from the same user are handled correctly
+
+**Implementation location**: `/instagram/backend/src/routes/posts.js`
+
+---
+
+### WHY Feed Caching Reduces Database Load
+
+**Problem**: Feed generation is the most expensive operation in social media applications, requiring joins across users, posts, follows, media, likes, and saved posts.
+
+**Without caching (per feed request)**:
+```
+Query 1: Get followed users (follows table)
+Query 2: Get posts from followed users (posts + users join)
+Query 3-N: Get media for each post (post_media table)
+Query N+1-2N: Check like status for each post
+Query 2N+1-3N: Check save status for each post
+```
+
+For a user following 100 accounts with 20 posts in feed:
+- ~60 database queries per feed load
+- With 10K DAU making 10 feed requests/day = 6 million queries/day just for feeds
+
+**Solution**: Two-layer caching with Redis/Valkey
+
+**Layer 1 - Timeline Cache (Redis Sorted Sets)**:
+```javascript
+// Key: timeline:{userId}
+// Value: Sorted set of post IDs ordered by timestamp
+// TTL: None (updated on post create/delete)
+ZADD timeline:user123 1704067200 post-uuid-1
+ZADD timeline:user123 1704070800 post-uuid-2
+```
+
+**Layer 2 - Feed Response Cache**:
+```javascript
+// Key: feed:{userId}:{offset}:{limit}
+// Value: Complete JSON response with posts and media
+// TTL: 60 seconds
+```
+
+**Cache hit flow**:
+1. Check `feed:user123:0:20` in Redis
+2. If hit: Return immediately (~1ms)
+3. If miss: Generate from database, cache result
+
+**Measured impact**:
+| Metric | Without Cache | With Cache |
+|--------|---------------|------------|
+| Avg latency | 200-500ms | 5-50ms |
+| DB queries/feed | ~60 | 0 (hit) or ~60 (miss) |
+| Cache hit rate | N/A | 80-90% during active use |
+| DB CPU reduction | Baseline | 80%+ reduction |
+
+**Why 60-second TTL?**
+- Short enough to show new posts quickly
+- Long enough to absorb repeated scroll/refresh
+- Balance between freshness and performance
+
+**Implementation locations**:
+- `/instagram/backend/src/routes/feed.js` - Cache check and population
+- `/instagram/backend/src/services/redis.js` - Timeline sorted sets
+
+---
+
+### WHY Rate Limiting Prevents Follow Spam
+
+**Problem**: Follow spam is a manipulation technique where users or bots rapidly follow many accounts to:
+1. Get follow-backs (inflating follower counts)
+2. Trigger notification spam (forcing brand awareness)
+3. Unfollow later (maintaining a high follower-to-following ratio)
+
+**Without rate limiting**:
+- A bot can follow 1000+ users per hour
+- Creates notification spam for all targeted users
+- Degrades platform trust (users see fake engagement)
+- Enables mass harassment campaigns
+
+**Solution**: Redis-backed sliding window rate limiting
+
+**Configuration**:
+```javascript
+{
+  keyPrefix: 'follows',
+  max: 30,           // Maximum 30 follows
+  windowMs: 3600000, // Per 1 hour window
+}
+```
+
+**How it works**:
+1. On each follow request, increment `ratelimit:follows:{userId}`
+2. If counter reaches 30, reject with 429 Too Many Requests
+3. Counter expires after 1 hour (sliding window)
+4. Distributed across all API servers via Redis
+
+**Why 30 follows/hour?**
+- Normal users: Follow 5-10 accounts when exploring
+- Power users: May follow 20-30 when discovering new interests
+- Bots: Need 100s/hour to be effective - now blocked
+
+**Rate limit categories**:
+
+| Action | Limit | Window | Rationale |
+|--------|-------|--------|-----------|
+| Follow | 30 | 1 hour | Prevent follow-bots |
+| Post | 10 | 1 hour | Prevent content spam |
+| Like | 100 | 1 hour | Allow engagement while limiting bots |
+| Comment | 50 | 1 hour | Prevent comment spam |
+| Login | 5 | 1 minute | Prevent brute force attacks |
+| General API | 1000 | 1 minute | Prevent scraping |
+
+**Metrics tracked**:
+- `instagram_rate_limit_hits_total{action="follow"}` - Prometheus counter
+- Logged as warnings for security monitoring
+
+**Implementation location**: `/instagram/backend/src/services/rateLimiter.js`
+
+---
+
+### WHY Metrics Enable Engagement Optimization
+
+**Problem**: Without metrics, you're operating blind. You can't:
+- Know if the service is healthy
+- Identify performance bottlenecks
+- Understand user behavior patterns
+- Detect anomalies (attacks, bugs, infrastructure issues)
+
+**Solution**: Prometheus metrics with `/metrics` endpoint
+
+**Key metrics categories**:
+
+#### 1. Infrastructure Health
+```prometheus
+# Are requests succeeding?
+instagram_http_requests_total{status_code="200|500"}
+
+# How long do requests take?
+instagram_http_request_duration_seconds_bucket
+
+# Is the database healthy?
+instagram_db_query_duration_seconds
+instagram_db_connection_pool_size{state="idle|total"}
+```
+
+#### 2. Business Metrics (Engagement)
+```prometheus
+# Content creation velocity
+instagram_posts_created_total
+instagram_stories_created_total
+
+# Engagement metrics
+instagram_likes_total{action="like|unlike"}
+instagram_follows_total{action="follow|unfollow"}
+instagram_story_views_total
+
+# Duplicate detection (idempotency working?)
+instagram_likes_duplicate_total
+```
+
+#### 3. Performance Optimization
+```prometheus
+# Feed performance
+instagram_feed_generation_seconds{cache_status="hit|miss"}
+instagram_feed_cache_hits_total
+instagram_feed_cache_misses_total
+
+# Image processing
+instagram_image_processing_seconds{size="all|story"}
+instagram_image_processing_errors_total{error_type="..."}
+```
+
+#### 4. Reliability (Circuit Breakers)
+```prometheus
+# Circuit breaker health
+instagram_circuit_breaker_state{name="feed_generation|image_processing"}
+instagram_circuit_breaker_events_total{name="...",event="success|failure|open"}
+```
+
+**How metrics enable optimization**:
+
+| Metric Pattern | Action |
+|----------------|--------|
+| Feed cache miss rate > 50% | Increase cache TTL or pre-warm caches |
+| Image processing p99 > 5s | Add more processing workers or resize on client |
+| Likes duplicate rate > 10% | Frontend is retrying too aggressively |
+| Circuit breaker opening frequently | Underlying service unstable, investigate |
+| Follow rate limit hits increasing | Potential bot attack, review IP patterns |
+
+**Alerting thresholds** (configure in Prometheus/Grafana):
+```yaml
+# High error rate
+alert: HighErrorRate
+expr: rate(instagram_http_requests_total{status_code=~"5.."}[5m]) / rate(instagram_http_requests_total[5m]) > 0.01
+
+# Slow feeds
+alert: SlowFeedGeneration
+expr: histogram_quantile(0.95, instagram_feed_generation_seconds_bucket) > 0.5
+
+# Circuit breaker open
+alert: CircuitBreakerOpen
+expr: instagram_circuit_breaker_state == 1
+```
+
+**Implementation locations**:
+- `/instagram/backend/src/services/metrics.js` - All metric definitions
+- `/instagram/backend/src/index.js` - `/metrics` endpoint and middleware
+
+---
+
+### WHY Circuit Breakers Prevent Cascading Failures
+
+**Problem**: When a downstream service (MinIO, image processing) fails, continued attempts can:
+1. Pile up requests, exhausting connection pools
+2. Create timeout storms that affect healthy operations
+3. Prevent the failing service from recovering
+4. Cascade failures to upstream services
+
+**Scenario without circuit breaker**:
+1. MinIO becomes slow (network issue, disk I/O)
+2. Image processing requests timeout after 30 seconds each
+3. Users keep uploading, API server threads are blocked waiting
+4. Thread pool exhausted, all endpoints become unresponsive
+5. Health checks fail, load balancer marks server as dead
+6. Cascading failure across the cluster
+
+**Solution**: Opossum circuit breaker library
+
+**States**:
+- **CLOSED** (0): Normal operation, requests flow through
+- **OPEN** (1): Too many failures, requests fail immediately with fallback
+- **HALF-OPEN** (2): Testing recovery, allowing limited requests
+
+**Configuration for image processing**:
+```javascript
+{
+  timeout: 30000,              // Fail after 30 seconds
+  errorThresholdPercentage: 50, // Open if 50% of requests fail
+  resetTimeout: 60000,          // Try again after 1 minute
+  volumeThreshold: 3,           // Need 3 requests before evaluating
+}
+```
+
+**Flow**:
+```
+Request → Circuit Breaker → [CLOSED?] → Execute function → Success/Failure
+                          → [OPEN?] → Return fallback immediately (503)
+                          → [HALF-OPEN?] → Try one request, evaluate
+```
+
+**Fallback strategies**:
+
+| Operation | Fallback Behavior |
+|-----------|-------------------|
+| Image Processing | Return 503 "temporarily unavailable" |
+| Feed Generation | Return empty feed `{ posts: [] }` |
+
+**Why fallbacks matter**:
+- Users see degraded experience, not error pages
+- System remains responsive for other operations
+- Failed service has time to recover
+- Monitoring alerts on circuit state changes
+
+**Implementation locations**:
+- `/instagram/backend/src/services/circuitBreaker.js` - Factory function
+- `/instagram/backend/src/routes/posts.js` - Image processing breaker
+- `/instagram/backend/src/routes/feed.js` - Feed generation breaker
+- `/instagram/backend/src/routes/stories.js` - Story image breaker
+
+---
+
+### RBAC (Role-Based Access Control) Implementation
+
+**Roles hierarchy**:
+```
+admin (3) > verified (2) > user (1) > anonymous (0)
+```
+
+**Role capabilities**:
+
+| Role | Create Content | Delete Own | Delete Any | View Private | Admin Panel |
+|------|---------------|------------|------------|--------------|-------------|
+| anonymous | No | No | No | No | No |
+| user | Yes | Yes | No | If following | No |
+| verified | Yes | Yes | No | If following | No |
+| admin | Yes | Yes | Yes | Yes | Yes |
+
+**Session structure** (stored in Valkey):
+```javascript
+{
+  userId: "uuid",
+  username: "johndoe",
+  role: "user" | "verified" | "admin",
+  isVerified: false | true
+}
+```
+
+**Middleware usage**:
+```javascript
+// Any authenticated user
+router.post('/posts', requireAuth, createPost);
+
+// Only verified users (e.g., for premium features)
+router.post('/live', requireVerified, startLiveStream);
+
+// Only admins
+router.delete('/admin/posts/:id', requireAdmin, deleteAnyPost);
+
+// Owner or admin
+router.delete('/posts/:id', requireAuth, requireOwnership(getPostOwner), deletePost);
+```
+
+**Implementation location**: `/instagram/backend/src/middleware/auth.js`

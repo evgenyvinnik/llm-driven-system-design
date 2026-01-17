@@ -14,7 +14,7 @@
  * - Dead letter exchange for failed messages
  */
 
-import amqp, { type Connection, type Channel, type ConsumeMessage } from 'amqplib';
+import amqp from 'amqplib';
 import { logger, logQueue } from './logger.js';
 import {
   queueDepthGauge,
@@ -25,10 +25,20 @@ import {
 import { createCircuitBreaker, RABBIT_BREAKER_OPTIONS } from './circuitBreaker.js';
 
 /**
+ * Type for RabbitMQ connection (using Awaited to get the resolved type).
+ */
+type RabbitConnection = Awaited<ReturnType<typeof amqp.connect>>;
+
+/**
+ * Type for RabbitMQ channel.
+ */
+type RabbitChannel = Awaited<ReturnType<RabbitConnection['createChannel']>>;
+
+/**
  * Singleton connection and channel.
  */
-let connection: Connection | null = null;
-let channel: Channel | null = null;
+let connection: RabbitConnection | null = null;
+let channel: RabbitChannel | null = null;
 let isConnecting = false;
 let connectionPromise: Promise<void> | null = null;
 
@@ -57,14 +67,17 @@ export interface OperationBroadcast {
  * Get or create the RabbitMQ connection and channel.
  * Uses lazy initialization and reconnection logic.
  */
-export async function getChannel(): Promise<Channel> {
+export async function getChannel(): Promise<RabbitChannel> {
   if (channel && connection) {
     return channel;
   }
 
   if (isConnecting && connectionPromise) {
     await connectionPromise;
-    return channel!;
+    if (!channel) {
+      throw new Error('RabbitMQ channel not available');
+    }
+    return channel;
   }
 
   isConnecting = true;
@@ -72,7 +85,10 @@ export async function getChannel(): Promise<Channel> {
   await connectionPromise;
   isConnecting = false;
 
-  return channel!;
+  if (!channel) {
+    throw new Error('RabbitMQ channel not available after connection');
+  }
+  return channel;
 }
 
 /**
@@ -82,41 +98,40 @@ async function connectRabbitMQ(): Promise<void> {
   const url = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 
   try {
-    connection = await amqp.connect(url);
+    const conn = await amqp.connect(url);
+    connection = conn;
     logger.info({ event: 'rabbitmq_connected', url: url.replace(/:[^:@]+@/, ':***@') });
 
-    connection.on('error', (err) => {
+    conn.on('error', (err: Error) => {
       logger.error({ event: 'rabbitmq_error', error: err.message });
     });
 
-    connection.on('close', () => {
+    conn.on('close', () => {
       logger.warn({ event: 'rabbitmq_closed' });
       connection = null;
       channel = null;
     });
 
-    channel = await connection.createChannel();
+    const ch = await conn.createChannel();
+    channel = ch;
 
     // Set up exchanges
-    await channel.assertExchange(EXCHANGES.OPERATIONS, 'topic', { durable: true });
-    await channel.assertExchange(EXCHANGES.SNAPSHOTS, 'direct', { durable: true });
-    await channel.assertExchange(EXCHANGES.DLX, 'direct', { durable: true });
+    await ch.assertExchange(EXCHANGES.OPERATIONS, 'topic', { durable: true });
+    await ch.assertExchange(EXCHANGES.SNAPSHOTS, 'direct', { durable: true });
+    await ch.assertExchange(EXCHANGES.DLX, 'direct', { durable: true });
 
     // Set up dead letter queue
-    await channel.assertQueue('doc.failed', { durable: true });
-    await channel.bindQueue('doc.failed', EXCHANGES.DLX, 'operation.failed');
-    await channel.bindQueue('doc.failed', EXCHANGES.DLX, 'snapshot.failed');
+    await ch.assertQueue('doc.failed', { durable: true });
+    await ch.bindQueue('doc.failed', EXCHANGES.DLX, 'operation.failed');
+    await ch.bindQueue('doc.failed', EXCHANGES.DLX, 'snapshot.failed');
 
     // Set up snapshot worker queue
-    await channel.assertQueue('snapshot.worker', {
+    await ch.assertQueue('snapshot.worker', {
       durable: true,
       deadLetterExchange: EXCHANGES.DLX,
       deadLetterRoutingKey: 'snapshot.failed',
     });
-    await channel.bindQueue('snapshot.worker', EXCHANGES.SNAPSHOTS, 'snapshot');
-
-    // Enable publisher confirms for reliable publishing
-    await channel.confirmSelect();
+    await ch.bindQueue('snapshot.worker', EXCHANGES.SNAPSHOTS, 'snapshot');
 
     logger.info({ event: 'rabbitmq_setup_complete' });
   } catch (error) {
@@ -243,7 +258,7 @@ export async function subscribeToOperations(
 
   logger.info({ event: 'subscribed_to_operations', queue: queueName });
 
-  ch.consume(queueName, async (msg: ConsumeMessage | null) => {
+  await ch.consume(queueName, async (msg) => {
     if (!msg) return;
 
     try {

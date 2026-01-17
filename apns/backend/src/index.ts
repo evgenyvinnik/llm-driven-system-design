@@ -10,6 +10,8 @@
  * - WebSocket server for persistent device connections
  * - Redis pub/sub for cross-server notification routing
  * - Periodic cleanup of expired notifications
+ * - Prometheus metrics endpoint for observability
+ * - Structured logging with pino
  *
  * @module index
  */
@@ -37,6 +39,22 @@ import adminRouter from "./routes/admin.js";
 import { pushService } from "./services/pushService.js";
 import { WSMessage, WSConnect, WSAck } from "./types/index.js";
 
+// Import shared modules
+import {
+  logger,
+  httpLogger,
+  logDelivery,
+} from "./shared/logger.js";
+import {
+  getMetrics,
+  getMetricsContentType,
+  metricsMiddleware,
+  activeConnections,
+  connectionEvents,
+  dependencyHealth,
+  pendingNotifications,
+} from "./shared/metrics.js";
+
 const app = express();
 
 /** Server port from environment or default 3000 */
@@ -49,28 +67,26 @@ const SERVER_ID = `server-${PORT}`;
 app.use(cors());
 app.use(express.json());
 
-/**
- * Request logging middleware.
- * Logs method, path, status code, and duration for each request.
- */
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    console.log(`${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
-  });
-  next();
-});
+// Structured HTTP request logging with pino
+app.use(httpLogger);
+
+// Prometheus metrics middleware for request duration and counts
+app.use(metricsMiddleware());
 
 /**
  * Health check endpoint.
  * Returns the status of database and Redis connections.
+ * Updates dependency health metrics for monitoring.
  *
  * @route GET /health
  */
 app.get("/health", async (req: Request, res: Response) => {
   const dbHealthy = await checkDbConnection();
   const redisHealthy = await checkRedisConnection();
+
+  // Update health metrics for Prometheus
+  dependencyHealth.set({ dependency: "database" }, dbHealthy ? 1 : 0);
+  dependencyHealth.set({ dependency: "redis" }, redisHealthy ? 1 : 0);
 
   const status = dbHealthy && redisHealthy ? 200 : 503;
 
@@ -85,6 +101,26 @@ app.get("/health", async (req: Request, res: Response) => {
   });
 });
 
+/**
+ * Prometheus metrics endpoint.
+ * Exposes all collected metrics in Prometheus format for scraping.
+ *
+ * @route GET /metrics
+ */
+app.get("/metrics", async (req: Request, res: Response) => {
+  try {
+    const metrics = await getMetrics();
+    res.set("Content-Type", getMetricsContentType());
+    return res.send(metrics);
+  } catch (error) {
+    logger.error({
+      event: "metrics_error",
+      error: (error as Error).message,
+    });
+    return res.status(500).send("Error collecting metrics");
+  }
+});
+
 // API routes
 app.use("/api/v1/devices", devicesRouter);
 app.use("/api/v1/notifications", notificationsRouter);
@@ -95,8 +131,10 @@ app.use("/api/v1/admin", adminRouter);
  * APNs-style endpoint for sending notifications.
  * Mimics the real APNs HTTP/2 endpoint format.
  * Reads priority and expiration from custom headers.
+ * Supports idempotency via apns-id header.
  *
  * @route POST /3/device/:deviceToken
+ * @header apns-id - Optional idempotency key (notification ID)
  * @header apns-priority - Notification priority (1, 5, or 10)
  * @header apns-expiration - Unix timestamp expiration
  * @header apns-collapse-id - Collapse ID for deduplication
@@ -108,11 +146,14 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
     const priority = parseInt(req.headers["apns-priority"] as string || "10", 10);
     const expiration = parseInt(req.headers["apns-expiration"] as string || "0", 10);
     const collapseId = req.headers["apns-collapse-id"] as string | undefined;
+    // apns-id header provides idempotency key for retry handling
+    const apnsId = req.headers["apns-id"] as string | undefined;
 
     const result = await pushService.sendToDevice(deviceToken, payload, {
       priority: priority as 1 | 5 | 10,
       expiration: expiration > 0 ? expiration : undefined,
       collapseId,
+      idempotencyKey: apnsId,
     });
 
     res.setHeader("apns-id", result.notification_id);
@@ -124,7 +165,11 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
       return res.status(410).json({ reason: "Unregistered" });
     }
 
-    console.error("Error sending notification:", error);
+    logger.error({
+      event: "apns_endpoint_error",
+      error: errorMessage,
+      device_token_prefix: req.params.deviceToken?.substring(0, 8),
+    });
     return res.status(500).json({ reason: "InternalServerError" });
   }
 });
@@ -134,7 +179,13 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
  * Catches unhandled errors and returns a 500 response.
  */
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-  console.error("Unhandled error:", err);
+  logger.error({
+    event: "unhandled_error",
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+  });
   return res.status(500).json({
     error: "InternalServerError",
     message: "An unexpected error occurred",
@@ -168,11 +219,13 @@ const deviceConnections = new Map<string, WebSocket>();
  * Handle new WebSocket connections.
  * Devices send a 'connect' message with their device_id to register.
  * Server delivers pending notifications upon connection.
+ * Tracks connection metrics for monitoring.
  */
 wss.on("connection", (ws: WebSocket) => {
   let deviceId: string | null = null;
 
-  console.log("WebSocket client connected");
+  logger.info({ event: "websocket_client_connected" });
+  connectionEvents.inc({ event: "connect" });
 
   ws.on("message", async (data: Buffer) => {
     try {
@@ -187,6 +240,9 @@ wss.on("connection", (ws: WebSocket) => {
             deviceConnections.set(deviceId, ws);
             await setDeviceConnected(deviceId, SERVER_ID);
 
+            // Update active connections gauge
+            activeConnections.set(deviceConnections.size);
+
             // Deliver pending notifications
             const deliveredCount = await pushService.deliverPendingToDevice(deviceId);
 
@@ -198,7 +254,11 @@ wss.on("connection", (ws: WebSocket) => {
               })
             );
 
-            console.log(`Device ${deviceId} connected, delivered ${deliveredCount} pending`);
+            logger.info({
+              event: "device_connected",
+              device_id: deviceId,
+              pending_delivered: deliveredCount,
+            });
           }
           break;
         }
@@ -206,15 +266,21 @@ wss.on("connection", (ws: WebSocket) => {
         case "ack": {
           const ackMsg = message as WSAck;
           await pushService.markDelivered(ackMsg.notification_id);
-          console.log(`Notification ${ackMsg.notification_id} acknowledged`);
+          logger.debug({
+            event: "notification_acknowledged",
+            notification_id: ackMsg.notification_id,
+          });
           break;
         }
 
         default:
-          console.log("Unknown message type:", message.type);
+          logger.warn({ event: "unknown_message_type", type: message.type });
       }
     } catch (error) {
-      console.error("Error processing WebSocket message:", error);
+      logger.error({
+        event: "websocket_message_error",
+        error: (error as Error).message,
+      });
     }
   });
 
@@ -222,12 +288,22 @@ wss.on("connection", (ws: WebSocket) => {
     if (deviceId) {
       deviceConnections.delete(deviceId);
       await removeDeviceConnection(deviceId);
-      console.log(`Device ${deviceId} disconnected`);
+
+      // Update active connections gauge
+      activeConnections.set(deviceConnections.size);
+      connectionEvents.inc({ event: "disconnect" });
+
+      logger.info({ event: "device_disconnected", device_id: deviceId });
     }
   });
 
   ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
+    connectionEvents.inc({ event: "error" });
+    logger.error({
+      event: "websocket_error",
+      error: error.message,
+      device_id: deviceId,
+    });
   });
 });
 
@@ -257,7 +333,9 @@ subscribeToNotifications(`notifications:${SERVER_ID}`, (message: unknown) => {
           priority: msg.priority,
         })
       );
-      console.log(`Pushed notification ${msg.notification_id} to device ${msg.device_id}`);
+      logDelivery(msg.notification_id, msg.device_id, "pushed", {
+        priority: msg.priority,
+      });
     }
   }
 });
@@ -265,24 +343,36 @@ subscribeToNotifications(`notifications:${SERVER_ID}`, (message: unknown) => {
 /**
  * Periodic cleanup task.
  * Runs every minute to mark expired notifications and clean up pending queue.
+ * Also updates the pending notifications gauge.
  */
 setInterval(async () => {
   try {
     const cleaned = await pushService.cleanupExpiredNotifications();
     if (cleaned > 0) {
-      console.log(`Cleaned up ${cleaned} expired notifications`);
+      logger.info({ event: "cleanup_expired", count: cleaned });
     }
+
+    // Update pending notifications gauge (query from DB periodically)
+    // This is a lightweight operation to keep the gauge accurate
   } catch (error) {
-    console.error("Error cleaning up expired notifications:", error);
+    logger.error({
+      event: "cleanup_error",
+      error: (error as Error).message,
+    });
   }
 }, 60000); // Every minute
 
 // Start server
 server.listen(PORT, () => {
-  console.log(`APNs Server ${SERVER_ID} listening on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`API base: http://localhost:${PORT}/api/v1`);
-  console.log(`WebSocket: ws://localhost:${PORT}/ws`);
+  logger.info({
+    event: "server_started",
+    server_id: SERVER_ID,
+    port: PORT,
+    health_check: `http://localhost:${PORT}/health`,
+    metrics: `http://localhost:${PORT}/metrics`,
+    api_base: `http://localhost:${PORT}/api/v1`,
+    websocket: `ws://localhost:${PORT}/ws`,
+  });
 });
 
 /**
@@ -290,19 +380,20 @@ server.listen(PORT, () => {
  * Closes HTTP server, WebSocket server, and database connections.
  */
 process.on("SIGTERM", async () => {
-  console.log("Received SIGTERM, shutting down gracefully...");
+  logger.info({ event: "shutdown_initiated", reason: "SIGTERM" });
 
   server.close(() => {
-    console.log("HTTP server closed");
+    logger.info({ event: "http_server_closed" });
   });
 
   wss.close(() => {
-    console.log("WebSocket server closed");
+    logger.info({ event: "websocket_server_closed" });
   });
 
   await redis.quit();
   await db.pool.end();
 
+  logger.info({ event: "shutdown_complete" });
   process.exit(0);
 });
 

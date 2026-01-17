@@ -1,4 +1,4 @@
-import { Pool, PoolClient } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import { DB_CONFIG } from '../config.js';
 import logger from './logger.js';
 import { dbQueryDuration, dbConnectionsActive } from './metrics.js';
@@ -72,7 +72,7 @@ export async function testConnection(): Promise<boolean> {
  * Internal query function without circuit breaker.
  * Used by the circuit breaker wrapper.
  */
-async function executeQuery<T>(text: string, params?: unknown[]): Promise<T[]> {
+async function executeQuery(text: string, params?: unknown[]): Promise<QueryResult> {
   const start = Date.now();
   const result = await pool.query(text, params);
   const duration = Date.now() - start;
@@ -87,7 +87,7 @@ async function executeQuery<T>(text: string, params?: unknown[]): Promise<T[]> {
     logger.debug({ text: text.substring(0, 50), duration, rows: result.rowCount }, 'Query executed');
   }
 
-  return result.rows as T[];
+  return result;
 }
 
 /**
@@ -113,7 +113,8 @@ queryBreaker.fallback(() => {
  * @returns Promise resolving to array of typed result rows
  */
 export async function query<T>(text: string, params?: unknown[]): Promise<T[]> {
-  return queryBreaker.fire(text, params) as Promise<T[]>;
+  const result = await queryBreaker.fire(text, params);
+  return result.rows as T[];
 }
 
 /**
@@ -124,7 +125,8 @@ export async function query<T>(text: string, params?: unknown[]): Promise<T[]> {
  * @returns Promise resolving to array of typed result rows
  */
 export async function queryDirect<T>(text: string, params?: unknown[]): Promise<T[]> {
-  return executeQuery<T>(text, params);
+  const result = await executeQuery(text, params);
+  return result.rows as T[];
 }
 
 /**

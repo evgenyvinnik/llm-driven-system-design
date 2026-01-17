@@ -959,3 +959,158 @@ REDIS_URL=redis://localhost:6379
 | Message queue | RabbitMQ | Kafka | Simpler for point-to-point, good enough for fanout |
 | Consistency | Strong (PG) + Eventual (ES) | Full eventual | Issue state must be immediately consistent |
 | Idempotency | Request-level keys | Operation log | Simpler client integration |
+
+---
+
+## Implementation Notes
+
+This section documents the WHY behind the production-ready features implemented in the backend.
+
+### Idempotency Prevents Duplicate Issues
+
+**Problem**: Webhook integrations, CI/CD pipelines, and mobile apps often retry requests on network failures or timeouts. Without idempotency, these retries create duplicate issues.
+
+**Solution**: The `X-Idempotency-Key` header system (`/backend/src/middleware/idempotency.ts`) stores request responses in Redis with a 24-hour TTL. When a duplicate request arrives:
+
+1. Check Redis for existing response
+2. If found, return cached response (replay)
+3. If not, process request and cache response
+
+**Why This Matters**:
+- **Webhook reliability**: External systems (GitHub, Slack, CI tools) retry on 5xx errors or timeouts
+- **Mobile resilience**: Apps on flaky networks may resend requests
+- **API consumer safety**: Clients can safely retry without fear of duplicates
+
+**Implementation**:
+```typescript
+// Request with idempotency key
+POST /api/issues
+X-Idempotency-Key: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+// First request: creates issue, stores response
+// Second request (same key): returns cached response immediately
+```
+
+### Caching Reduces Load for Frequently Accessed Boards
+
+**Problem**: Board views (Kanban/Scrum) are accessed constantly by team members but require expensive database joins across issues, statuses, users, and sprints.
+
+**Solution**: Cache-aside pattern (`/backend/src/services/projectService.ts`) with tiered TTLs:
+
+| Data Type | TTL | Invalidation Trigger |
+|-----------|-----|---------------------|
+| Project metadata | 15 min | Project update/delete |
+| Board configuration | 5 min | Board edit, issue changes |
+| Workflow definitions | 30 min | Workflow edit (rare) |
+
+**Why Cache-Aside (not Write-Through)**:
+- Issue data changes frequently; write-through would add latency to every update
+- Cache-aside allows brief staleness (acceptable for board views) while keeping writes fast
+- Read-heavy workload benefits more from caching reads than optimizing writes
+
+**Metrics Tracked**:
+- `jira_cache_hits_total{cache_type="board|project|workflow"}`
+- `jira_cache_misses_total{cache_type="board|project|workflow"}`
+
+### Async Queues Enable Reliable Webhook Delivery
+
+**Problem**: Synchronous webhook calls block request processing and fail silently when external services are down. Users expect immediate response when creating issues, not waiting for Slack notifications.
+
+**Solution**: RabbitMQ fanout exchange (`/backend/src/config/messageQueue.ts`) decouples issue events from downstream processing:
+
+```
+Issue Created
+     │
+     ▼
+ Fanout Exchange (jira.issue.events.fanout)
+     │
+     ├──▶ Search Index Queue ──▶ Update Elasticsearch
+     ├──▶ Notifications Queue ──▶ Send emails/in-app
+     └──▶ Webhooks Queue ──▶ Deliver to external systems
+```
+
+**Why This Matters**:
+1. **Reliability**: If Elasticsearch is down, issues still get created; indexing happens when ES recovers
+2. **Latency**: Issue creation returns immediately; async consumers handle slow operations
+3. **Backpressure**: Prefetch limit (10) prevents consumers from being overwhelmed
+4. **Retry semantics**: Failed messages retry with exponential backoff, then go to DLQ
+
+**Delivery Guarantees**:
+- At-least-once delivery (consumers must be idempotent)
+- Event deduplication via `event_id` tracked in Redis
+- Dead-letter queue for messages that fail after 3 retries
+
+### Metrics Enable Workflow Optimization
+
+**Problem**: Without observability, teams can't identify bottlenecks (slow searches, transition patterns, cache effectiveness).
+
+**Solution**: Prometheus metrics endpoint (`/metrics`) exposes operational data:
+
+**Issue Lifecycle Metrics**:
+```
+# Track issue creation by project and type
+jira_issues_created_total{project_key="PROJ", issue_type="bug"} 42
+
+# Track workflow transitions
+jira_transitions_total{project_key="PROJ", from_status="To Do", to_status="In Progress"} 156
+```
+
+**Search Performance Metrics**:
+```
+# Query counts by type
+jira_search_queries_total{query_type="jql|text|quick"}
+
+# Latency histogram (p50, p95, p99)
+jira_search_latency_seconds{query_type="jql"}
+```
+
+**Why This Matters**:
+- **Capacity planning**: Monitor issue creation rate to predict storage needs
+- **UX optimization**: High search latency indicates need for query optimization
+- **Workflow analysis**: Transition patterns reveal process bottlenecks
+- **Cache tuning**: Hit/miss ratios help adjust TTLs
+
+### Structured Logging for Debugging
+
+**Solution**: Pino JSON logger (`/backend/src/config/logger.ts`) provides:
+
+```json
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "jira-backend",
+  "operation": "createIssue",
+  "projectId": "abc-123",
+  "userId": "user-456",
+  "issueId": 789,
+  "issueKey": "PROJ-123",
+  "msg": "Issue created"
+}
+```
+
+**Benefits**:
+- Machine-parseable for log aggregation (ELK, Datadog)
+- Request correlation via operation context
+- Environment-aware (pretty-print in dev, JSON in prod)
+
+### Health Check Endpoint
+
+**Endpoint**: `GET /health`
+
+**Response**:
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "checks": {
+    "postgres": { "status": "healthy", "latency_ms": 2 },
+    "redis": { "status": "healthy", "latency_ms": 1 },
+    "elasticsearch": { "status": "healthy", "latency_ms": 15 }
+  }
+}
+```
+
+**Why**:
+- Load balancer health checks route traffic only to healthy instances
+- Degraded state (ES down) returns 200 but indicates partial functionality
+- Individual latency helps identify slow dependencies

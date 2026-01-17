@@ -18,6 +18,7 @@ import {
   getAlertInstances,
   evaluateAlertRule,
 } from '../services/alertService.js';
+import logger from '../shared/logger.js';
 
 const router = Router();
 
@@ -81,7 +82,7 @@ router.get('/rules', async (req: Request, res: Response) => {
     const rules = await getAlertRules({ enabled });
     res.json({ rules });
   } catch (error) {
-    console.error('Get alert rules error:', error);
+    logger.error({ error }, 'Get alert rules error');
     res.status(500).json({ error: 'Failed to get alert rules' });
   }
 });
@@ -101,7 +102,7 @@ router.get('/rules/:id', async (req: Request, res: Response) => {
     }
     res.json(rule);
   } catch (error) {
-    console.error('Get alert rule error:', error);
+    logger.error({ error, ruleId: req.params.id }, 'Get alert rule error');
     res.status(500).json({ error: 'Failed to get alert rule' });
   }
 });
@@ -147,9 +148,10 @@ router.post('/rules', async (req: Request, res: Response) => {
       enabled,
     });
 
+    logger.info({ ruleId: rule.id, name: rule.name }, 'Alert rule created');
     res.status(201).json(rule);
   } catch (error) {
-    console.error('Create alert rule error:', error);
+    logger.error({ error }, 'Create alert rule error');
     res.status(500).json({ error: 'Failed to create alert rule' });
   }
 });
@@ -200,9 +202,10 @@ router.put('/rules/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Alert rule not found' });
     }
 
+    logger.info({ ruleId: rule.id }, 'Alert rule updated');
     res.json(rule);
   } catch (error) {
-    console.error('Update alert rule error:', error);
+    logger.error({ error, ruleId: req.params.id }, 'Update alert rule error');
     res.status(500).json({ error: 'Failed to update alert rule' });
   }
 });
@@ -220,9 +223,10 @@ router.delete('/rules/:id', async (req: Request, res: Response) => {
     if (!deleted) {
       return res.status(404).json({ error: 'Alert rule not found' });
     }
+    logger.info({ ruleId: req.params.id }, 'Alert rule deleted');
     res.status(204).send();
   } catch (error) {
-    console.error('Delete alert rule error:', error);
+    logger.error({ error, ruleId: req.params.id }, 'Delete alert rule error');
     res.status(500).json({ error: 'Failed to delete alert rule' });
   }
 });
@@ -245,7 +249,7 @@ router.get('/instances', async (req: Request, res: Response) => {
     const instances = await getAlertInstances({ ruleId, status, limit });
     res.json({ instances });
   } catch (error) {
-    console.error('Get alert instances error:', error);
+    logger.error({ error }, 'Get alert instances error');
     res.status(500).json({ error: 'Failed to get alert instances' });
   }
 });
@@ -274,7 +278,7 @@ router.post('/rules/:id/evaluate', async (req: Request, res: Response) => {
       condition: rule.condition,
     });
   } catch (error) {
-    console.error('Evaluate alert rule error:', error);
+    logger.error({ error, ruleId: req.params.id }, 'Evaluate alert rule error');
     res.status(500).json({ error: 'Failed to evaluate alert rule' });
   }
 });

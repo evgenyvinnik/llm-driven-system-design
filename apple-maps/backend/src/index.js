@@ -2,56 +2,69 @@ import express from 'express';
 import cors from 'cors';
 import pool from './db.js';
 import redis from './redis.js';
+
+// Shared modules
+import { logger, httpLogger } from './shared/logger.js';
+import { metricsMiddleware, metricsHandler } from './shared/metrics.js';
+import { generalLimiter, routingLimiter, searchLimiter, trafficLimiter, mapDataLimiter } from './shared/rateLimit.js';
+
+// Routes
 import routesRouter from './routes/routes.js';
 import trafficRouter from './routes/traffic.js';
 import searchRouter from './routes/search.js';
+import healthRouter from './routes/health.js';
+
+// Services
 import trafficService from './services/trafficService.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// ============================================================
+// Middleware Stack
+// ============================================================
+
+// CORS
 app.use(cors());
+
+// Body parsing
 app.use(express.json());
 
-// Request logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-  next();
+// HTTP request logging (pino-http)
+app.use(httpLogger);
+
+// Prometheus metrics collection
+app.use(metricsMiddleware);
+
+// General rate limiting for all routes
+app.use(generalLimiter);
+
+// ============================================================
+// Metrics endpoint (no auth, for Prometheus scraping)
+// ============================================================
+app.get('/metrics', metricsHandler);
+
+// ============================================================
+// Health check routes (before other routes for priority)
+// ============================================================
+app.use('/health', healthRouter);
+
+// Legacy health endpoint (for backward compatibility)
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, timestamp: new Date().toISOString() });
 });
 
-// Health check
-app.get('/health', async (req, res) => {
-  try {
-    // Check database
-    await pool.query('SELECT 1');
+// ============================================================
+// API Routes with specific rate limiters
+// ============================================================
+app.use('/api/routes', routingLimiter, routesRouter);
+app.use('/api/traffic', trafficLimiter, trafficRouter);
+app.use('/api/search', searchLimiter, searchRouter);
 
-    // Check redis
-    await redis.ping();
-
-    res.json({
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      services: {
-        database: 'connected',
-        redis: 'connected',
-      },
-    });
-  } catch (error) {
-    res.status(503).json({
-      status: 'unhealthy',
-      error: error.message,
-    });
-  }
-});
-
-// API Routes
-app.use('/api/routes', routesRouter);
-app.use('/api/traffic', trafficRouter);
-app.use('/api/search', searchRouter);
-
-// Map data endpoints
-app.get('/api/map/nodes', async (req, res) => {
+// ============================================================
+// Map data endpoints with rate limiting
+// ============================================================
+app.get('/api/map/nodes', mapDataLimiter, async (req, res) => {
   try {
     const { minLat, minLng, maxLat, maxLng } = req.query;
 
@@ -72,12 +85,12 @@ app.get('/api/map/nodes', async (req, res) => {
       nodes: result.rows,
     });
   } catch (error) {
-    console.error('Nodes fetch error:', error);
+    logger.error({ error, path: '/api/map/nodes' }, 'Nodes fetch error');
     res.status(500).json({ error: 'Failed to fetch nodes' });
   }
 });
 
-app.get('/api/map/segments', async (req, res) => {
+app.get('/api/map/segments', mapDataLimiter, async (req, res) => {
   try {
     const { minLat, minLng, maxLat, maxLng } = req.query;
 
@@ -112,12 +125,12 @@ app.get('/api/map/segments', async (req, res) => {
       segments: result.rows,
     });
   } catch (error) {
-    console.error('Segments fetch error:', error);
+    logger.error({ error, path: '/api/map/segments' }, 'Segments fetch error');
     res.status(500).json({ error: 'Failed to fetch segments' });
   }
 });
 
-app.get('/api/map/pois', async (req, res) => {
+app.get('/api/map/pois', mapDataLimiter, async (req, res) => {
   try {
     const { minLat, minLng, maxLat, maxLng, category, limit = 100 } = req.query;
 
@@ -147,33 +160,74 @@ app.get('/api/map/pois', async (req, res) => {
       pois: result.rows,
     });
   } catch (error) {
-    console.error('POIs fetch error:', error);
+    logger.error({ error, path: '/api/map/pois' }, 'POIs fetch error');
     res.status(500).json({ error: 'Failed to fetch POIs' });
   }
 });
 
+// ============================================================
 // Error handler
+// ============================================================
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  logger.error({
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+  }, 'Unhandled error');
+
   res.status(500).json({
     error: 'Internal server error',
   });
 });
 
+// ============================================================
 // Start server
+// ============================================================
 app.listen(PORT, () => {
-  console.log(`Apple Maps backend running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  logger.info({
+    port: PORT,
+    nodeEnv: process.env.NODE_ENV || 'development',
+  }, 'Apple Maps backend started');
+
+  logger.info({ url: `http://localhost:${PORT}/health` }, 'Health check endpoint');
+  logger.info({ url: `http://localhost:${PORT}/metrics` }, 'Prometheus metrics endpoint');
 
   // Start traffic simulation
   trafficService.startSimulation();
 });
 
+// ============================================================
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('Shutting down...');
+// ============================================================
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
+
   trafficService.stopSimulation();
-  await pool.end();
-  redis.disconnect();
-  process.exit(0);
-});
+
+  // Wait for existing requests to complete (max 10 seconds)
+  const shutdownTimeout = setTimeout(() => {
+    logger.warn('Shutdown timeout exceeded, forcing exit');
+    process.exit(1);
+  }, 10000);
+
+  try {
+    await pool.end();
+    logger.info('Database pool closed');
+
+    redis.disconnect();
+    logger.info('Redis connection closed');
+
+    clearTimeout(shutdownTimeout);
+    logger.info('Graceful shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    logger.error({ error }, 'Error during shutdown');
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+export default app;

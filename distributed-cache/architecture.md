@@ -924,3 +924,145 @@ groups:
 5. **Pipelining**: Batch multiple operations in single request
 6. **Binary Protocol**: Switch to RESP for lower overhead
 7. **Cluster Consensus**: Use Raft for configuration management
+
+## Implementation Notes
+
+This section documents the WHY behind key implementation decisions, connecting system design theory to operational reality.
+
+### Why Hit/Miss Metrics Enable Cache Sizing Optimization
+
+Hit/miss metrics are the most critical observability signal for a cache because they directly measure cache effectiveness and guide capacity planning:
+
+1. **Right-sizing cache memory**: If hit rate is 95% with 100MB per node, adding more memory yields diminishing returns. If hit rate is 60%, the cache is too small and needs expansion. Without metrics, operators are guessing.
+
+2. **Detecting workload changes**: A sudden drop in hit rate (e.g., from 90% to 70%) indicates either:
+   - Working set grew larger than cache capacity
+   - Access patterns changed (temporal locality decreased)
+   - A deployment changed key naming conventions
+
+3. **Cost optimization**: In cloud environments, memory is expensive. Hit/miss metrics let you find the minimum cache size that maintains acceptable performance. A 1% hit rate improvement might save $10,000/month in database costs.
+
+4. **SLA validation**: If your SLA requires < 10ms P99 latency, and cache misses take 50ms (database roundtrip), you need hit rate > 80% to meet that SLA. Metrics prove compliance.
+
+**Implementation**: We use Prometheus counters (`cache_hits_total`, `cache_misses_total`) with node labels, enabling per-node and cluster-wide aggregation. The `/metrics` endpoint exposes these in Prometheus format for scraping.
+
+### Why Hot Key Detection Prevents Uneven Load
+
+Hot keys are the most common cause of cache cluster instability. A single key receiving 10% of traffic breaks the consistent hashing promise of even distribution:
+
+1. **Single node overload**: If `product:popular-item` receives 100K requests/sec but only routes to Node 1, that node saturates while Node 2 and 3 are idle. The cluster has 3x theoretical capacity but only 1x usable capacity.
+
+2. **Cascading failures**: Overloaded Node 1 starts timing out. Clients retry. Retries increase load further. Node 1 crashes. Now all hot key requests fail. This is a classic thundering herd.
+
+3. **Invisible in aggregate metrics**: Cluster-wide hit rate might be 90% (healthy), but Node 1 is at 99% CPU. Without per-key tracking, the root cause is invisible.
+
+4. **Proactive mitigation**: Once detected, hot keys can be mitigated via:
+   - Local caching at coordinator (1 second TTL)
+   - Key sharding (`product:popular-item:shard0`, `shard1`, `shard2`)
+   - Read replicas on multiple nodes
+
+**Implementation**: The `HotKeyDetector` class samples key accesses in 60-second windows. Keys exceeding 1% of total traffic are flagged. The `/hot-keys` endpoint exposes current hot keys, and `cache_hot_key_accesses` Prometheus metric enables alerting.
+
+### Why Admin Auth Protects Cluster Operations
+
+Admin endpoints can destroy the entire cache cluster in one API call. Without authentication, any network-adjacent attacker (or misconfigured script) can:
+
+1. **Flush all data**: `POST /flush` clears every key. If this hits production during peak traffic, databases receive 100% of load and collapse. Recovery takes hours.
+
+2. **Add malicious nodes**: `POST /admin/node` could add an attacker-controlled server. That server now receives a fraction of all traffic, stealing data or injecting corrupted responses.
+
+3. **Remove healthy nodes**: `DELETE /admin/node` removes nodes from the ring. With 3 nodes, removing 2 means 66% of requests fail until the ring rebalances.
+
+4. **Denial of service**: Even rate-limited, repeated `/admin/health-check` forces health probes that consume CPU and network.
+
+**Implementation**: The `requireAdminKey` middleware validates `X-Admin-Key` header using constant-time comparison (preventing timing attacks). Rate limiting (10 requests/minute) prevents brute-force. All admin operations are logged with client IP for audit trails. The key is configured via `ADMIN_KEY` environment variable, defaulting to `dev-admin-key` for local development.
+
+### Why Graceful Rebalancing Prevents Cache Storms
+
+When nodes are added or removed, consistent hashing reassigns ~1/N of keys to their new homes. Without graceful migration, those keys become "cold" (cache misses) simultaneously:
+
+1. **Cache storm scenario**: Add Node 4 to a 3-node cluster. 25% of keys now hash to Node 4. But Node 4 is empty. 25% of all requests become cache misses. Databases receive 25% more load instantly. If databases were at 60% capacity, they jump to 75%+ and latency spikes.
+
+2. **Thundering herd amplification**: Popular keys that moved to Node 4 don't just miss once; they miss for every concurrent request. 1000 concurrent users requesting the same product page all hit the database simultaneously.
+
+3. **Recovery time**: Without migration, keys only warm up when accessed. If access is uniform, 25% of cache is cold for hours. If access follows power-law (80/20 rule), popular keys warm quickly but the tail takes days.
+
+4. **Graceful migration solution**: Before adding a node to the ring, we:
+   - Identify keys that will move to the new node
+   - Copy those keys to the new node (batched, rate-limited)
+   - Only then add the node to the ring
+   - Keys are already warm when traffic arrives
+
+**Implementation**: The `RebalanceManager` handles node additions and removals. It:
+- Processes keys in batches of 100 with 50ms delays (configurable)
+- Times out after 5 minutes to prevent indefinite blocking
+- Tracks progress via `rebalance_keys_moved_total` and `rebalance_duration_seconds` metrics
+- Logs progress at 10% intervals for visibility
+
+The admin endpoint `POST /admin/rebalance` can trigger manual rebalancing, and `GET /admin/rebalance/analyze` previews impact before execution.
+
+### Why Circuit Breakers Prevent Cascading Failures
+
+When a cache node becomes unhealthy (overloaded, network partitioned, or crashed), continuing to send requests makes everything worse:
+
+1. **Connection pool exhaustion**: Each request to a slow node ties up a connection. With 100 concurrent requests and 5-second timeout, you need 100 connections waiting. This exhausts client-side resources even though the server is unresponsive.
+
+2. **Retry amplification**: Without circuit breakers, clients retry failed requests. Each retry adds load to an already struggling node. 3 retries means 3x the load.
+
+3. **Coordinator impact**: The coordinator waiting on slow nodes can't serve other requests. One bad node degrades the entire cluster.
+
+4. **Recovery prevention**: A temporarily overloaded node that could recover in 10 seconds never gets the chance because requests keep arriving.
+
+**Implementation**: We use Opossum circuit breakers with:
+- 5-second timeout per request
+- Opens after 50% failure rate (minimum 5 requests)
+- Half-open testing after 30 seconds
+- Prometheus metrics: `circuit_breaker_state`, `circuit_breaker_trips_total`
+- Structured logs on state transitions for debugging
+
+When the circuit opens, requests fail fast (< 1ms) instead of waiting for timeout (5 seconds). This preserves resources for healthy nodes and lets the failing node recover.
+
+### Why Snapshot Persistence Enables Fast Recovery
+
+In-memory caches lose all data on restart. Without persistence, a restart means:
+
+1. **Cold cache**: 100% of requests become misses until the cache warms up
+2. **Database overload**: Full traffic to databases during warmup
+3. **Extended degraded performance**: Popular keys warm quickly, but long-tail takes hours
+
+Periodic snapshots solve this:
+
+1. **Warm restart**: Load snapshot, resume with ~90% of data intact
+2. **Point-in-time recovery**: Roll back to previous snapshot if corruption detected
+3. **Disaster recovery**: Restore cache on a new server if hardware fails
+
+**Implementation**: The `PersistenceManager`:
+- Saves JSON snapshots every 60 seconds (configurable)
+- Keeps last 3 snapshots (configurable retention)
+- Filters expired entries on load (no stale data)
+- Loads most-recently-updated entries first (prioritizes active data)
+- Tracks via `snapshots_created_total`, `snapshot_entries_loaded` metrics
+
+Snapshots are stored in `./data/{nodeId}/` with timestamp-based filenames.
+
+### Why Structured Logging (Pino) Improves Debuggability
+
+Console.log statements are unusable at scale. Structured JSON logging enables:
+
+1. **Log aggregation**: Ship to ELK, Loki, or CloudWatch. Query across all nodes.
+2. **Correlation**: Request IDs let you trace a single request across coordinator and cache nodes.
+3. **Filtering**: Find all "admin_auth_failure" events, or all events from a specific node.
+4. **Alerting**: Trigger PagerDuty when "circuit_breaker_state_change" event has `state: "open"`.
+5. **Performance**: Pino is 5x faster than winston/bunyan because it avoids synchronous operations.
+
+**Implementation**: We use pino with:
+- JSON format in production, pretty-print in development
+- Automatic redaction of sensitive headers (`X-Admin-Key`, `Authorization`)
+- Component-based child loggers (`cacheLogger`, `clusterLogger`, `adminLogger`)
+- HTTP request logging via pino-http with automatic request IDs
+- Log levels configurable via `LOG_LEVEL` environment variable
+
+Example log output:
+```json
+{"level":"info","time":"2024-01-16T10:30:00.000Z","nodeId":"node-1","component":"cache","key":"user:123","hit":true,"msg":"cache_hit"}
+```

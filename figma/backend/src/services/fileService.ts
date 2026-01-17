@@ -40,14 +40,15 @@ interface VersionRow {
  */
 export class FileService {
   /**
-   * Retrieves all files, ordered by most recently updated.
+   * Retrieves all active files, ordered by most recently updated.
+   * Excludes soft-deleted files.
    * @param userId - Optional user ID to filter files (not yet implemented)
    * @returns Promise resolving to array of design files
    */
   // Get all files for a user
   async getFiles(userId?: string): Promise<DesignFile[]> {
     const files = await query<FileRow>(
-      `SELECT * FROM files ORDER BY updated_at DESC`
+      `SELECT * FROM files WHERE deleted_at IS NULL ORDER BY updated_at DESC`
     );
     return files.map(this.mapFileRow);
   }
@@ -142,6 +143,25 @@ export class FileService {
   // Delete a file
   async deleteFile(fileId: string): Promise<void> {
     await execute(`DELETE FROM files WHERE id = $1`, [fileId]);
+  }
+
+  /**
+   * Soft-deletes a file by setting deleted_at timestamp.
+   * File can be recovered within the retention period.
+   * @param fileId - The file to soft-delete
+   */
+  // Soft-delete a file
+  async softDeleteFile(fileId: string): Promise<void> {
+    await execute(`UPDATE files SET deleted_at = NOW() WHERE id = $1`, [fileId]);
+  }
+
+  /**
+   * Restores a soft-deleted file.
+   * @param fileId - The file to restore
+   */
+  // Restore a soft-deleted file
+  async restoreDeletedFile(fileId: string): Promise<void> {
+    await execute(`UPDATE files SET deleted_at = NULL WHERE id = $1`, [fileId]);
   }
 
   /**

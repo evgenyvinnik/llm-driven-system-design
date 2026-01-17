@@ -4,6 +4,7 @@ import { v4 as uuid } from 'uuid';
 import { DocumentState } from './DocumentState.js';
 import { TextOperation } from './TextOperation.js';
 import { db } from './database.js';
+import { getRedisClient } from './redis.js';
 import type {
   WSMessage,
   OperationMessage,
@@ -13,6 +14,20 @@ import type {
   CursorPosition,
   SelectionRange,
 } from '../types/index.js';
+import {
+  logger,
+  logConnection,
+  logError,
+  operationCounter,
+  operationLatency,
+  syncLatency,
+  getServerId,
+  publishOperation,
+  subscribeToOperations,
+  type OperationBroadcast,
+  checkIdempotency,
+  storeIdempotencyResult,
+} from '../shared/index.js';
 
 /**
  * Predefined colors for presence indicators.
@@ -45,6 +60,15 @@ interface ClientConnection {
   displayName: string;
   /** Assigned color for presence UI */
   color: string;
+  /** Connection start time for duration tracking */
+  connectedAt: number;
+}
+
+/**
+ * Extended operation message with optional idempotency key.
+ */
+interface ExtendedOperationMessage extends OperationMessage {
+  operationId?: string;
 }
 
 /**
@@ -56,6 +80,7 @@ interface ClientConnection {
  * - Authenticates users and validates document access
  * - Routes messages to the appropriate DocumentState
  * - Broadcasts changes to all connected clients
+ * - Publishes operations to RabbitMQ for multi-server fanout
  * - Handles disconnections and cleanup
  *
  * One SyncServer instance serves all documents. DocumentState instances
@@ -70,6 +95,10 @@ export class SyncServer {
   private clients: Map<WebSocket, ClientConnection>;
   /** Color assignment counter for presence colors */
   private colorIndex: number;
+  /** Server ID for multi-instance identification */
+  private serverId: string;
+  /** Whether RabbitMQ subscription is active */
+  private rabbitSubscribed: boolean;
 
   /**
    * Create a new SyncServer attached to an HTTP server.
@@ -81,12 +110,76 @@ export class SyncServer {
     this.documents = new Map();
     this.clients = new Map();
     this.colorIndex = 0;
+    this.serverId = getServerId();
+    this.rabbitSubscribed = false;
 
     this.wss.on('connection', (ws, req) => {
       this.handleConnection(ws, req);
     });
 
-    console.log('WebSocket server initialized');
+    // Set up RabbitMQ subscription for multi-server fanout
+    this.setupRabbitSubscription();
+
+    logger.info({ event: 'sync_server_initialized', server_id: this.serverId });
+  }
+
+  /**
+   * Set up RabbitMQ subscription to receive operations from other servers.
+   */
+  private async setupRabbitSubscription(): Promise<void> {
+    try {
+      const redis = await getRedisClient();
+
+      await subscribeToOperations(
+        async (broadcast: OperationBroadcast) => {
+          // Handle operation from another server
+          await this.handleRemoteBroadcast(broadcast);
+        },
+        {
+          get: async (key: string) => redis.get(key),
+          setex: async (key: string, ttl: number, value: string) => redis.setEx(key, ttl, value),
+        }
+      );
+
+      this.rabbitSubscribed = true;
+      logger.info({ event: 'rabbit_subscription_active', server_id: this.serverId });
+    } catch (error) {
+      logger.warn({
+        event: 'rabbit_subscription_failed',
+        error: (error as Error).message,
+        server_id: this.serverId,
+      });
+      // Will retry on next operation
+    }
+  }
+
+  /**
+   * Handle an operation broadcast received from another server via RabbitMQ.
+   */
+  private async handleRemoteBroadcast(broadcast: OperationBroadcast): Promise<void> {
+    const docState = this.documents.get(broadcast.documentId);
+    if (!docState) {
+      // Document not active on this server, ignore
+      return;
+    }
+
+    logger.debug({
+      event: 'remote_broadcast_received',
+      document_id: broadcast.documentId,
+      version: broadcast.version,
+      from_server: broadcast.serverId,
+    });
+
+    // Broadcast to local WebSocket clients
+    this.broadcast(
+      broadcast.documentId,
+      {
+        type: 'operation',
+        clientId: broadcast.clientId,
+        version: broadcast.version,
+        operation: broadcast.operation,
+      }
+    );
   }
 
   /**
@@ -143,6 +236,7 @@ export class SyncServer {
         userId,
         displayName: user.displayName,
         color,
+        connectedAt: Date.now(),
       };
 
       this.clients.set(ws, connection);
@@ -185,13 +279,13 @@ export class SyncServer {
       ws.on('message', (data) => this.handleMessage(ws, data.toString()));
       ws.on('close', () => this.handleDisconnect(ws));
       ws.on('error', (err) => {
-        console.error('WebSocket error:', err);
+        logError('websocket', err);
         this.handleDisconnect(ws);
       });
 
-      console.log(`Client ${clientId} connected to document ${documentId}`);
+      logConnection('connect', clientId, documentId, userId);
     } catch (error) {
-      console.error('Connection error:', error);
+      logError('connection', error as Error);
       ws.close(4003, 'Connection error');
     }
   }
@@ -215,7 +309,7 @@ export class SyncServer {
 
       switch (message.type) {
         case 'operation':
-          await this.handleOperation(ws, connection, docState, message as OperationMessage);
+          await this.handleOperation(ws, connection, docState, message as ExtendedOperationMessage);
           break;
         case 'cursor':
           await this.handleCursor(ws, connection, docState, message as CursorMessage);
@@ -224,10 +318,10 @@ export class SyncServer {
           await this.handleSelection(ws, connection, docState, message as SelectionMessage);
           break;
         default:
-          console.warn('Unknown message type:', message.type);
+          logger.warn({ event: 'unknown_message_type', type: message.type });
       }
     } catch (error) {
-      console.error('Message handling error:', error);
+      logError('message_handling', error as Error);
       this.send(ws, { type: 'error', message: 'Failed to process message' });
     }
   }
@@ -236,7 +330,8 @@ export class SyncServer {
    * Handle an operation message from a client.
    *
    * Applies the operation using OT, acknowledges to the sender,
-   * and broadcasts the transformed operation to other clients.
+   * broadcasts the transformed operation to other clients,
+   * and publishes to RabbitMQ for other servers.
    *
    * @param ws - The WebSocket that sent the operation
    * @param connection - The client connection metadata
@@ -247,11 +342,26 @@ export class SyncServer {
     ws: WebSocket,
     connection: ClientConnection,
     docState: DocumentState,
-    message: OperationMessage
+    message: ExtendedOperationMessage
   ): Promise<void> {
-    const { version, operation } = message;
+    const { version, operation, operationId } = message;
+    const startTime = Date.now();
 
     try {
+      // Check idempotency if operationId provided
+      if (operationId) {
+        const idempotencyCheck = await checkIdempotency<{ version: number; operation: unknown }>(operationId);
+        if (idempotencyCheck.duplicate && idempotencyCheck.result) {
+          // Return cached result
+          this.send(ws, {
+            type: 'ack',
+            version: idempotencyCheck.result.version,
+          });
+          operationCounter.inc({ server_id: this.serverId, status: 'duplicate' });
+          return;
+        }
+      }
+
       // Apply operation with OT
       const result = await docState.applyOperation(
         connection.clientId,
@@ -260,13 +370,23 @@ export class SyncServer {
         operation
       );
 
+      // Store idempotency result if operationId provided
+      if (operationId) {
+        await storeIdempotencyResult(operationId, result.version, {
+          version: result.version,
+          operation: result.operation,
+        });
+      }
+
       // Acknowledge to sender
       this.send(ws, {
         type: 'ack',
         version: result.version,
       });
 
-      // Broadcast transformed operation to others
+      const broadcastStart = Date.now();
+
+      // Broadcast transformed operation to local clients
       this.broadcast(
         connection.documentId,
         {
@@ -277,8 +397,36 @@ export class SyncServer {
         },
         ws
       );
+
+      // Publish to RabbitMQ for other servers
+      try {
+        await publishOperation({
+          documentId: connection.documentId,
+          version: result.version,
+          operation: result.operation,
+          clientId: connection.clientId,
+          timestamp: Date.now(),
+          serverId: this.serverId,
+        });
+      } catch (error) {
+        // Log but don't fail the operation - local clients are already updated
+        logger.warn({
+          event: 'rabbit_publish_failed',
+          error: (error as Error).message,
+          document_id: connection.documentId,
+        });
+      }
+
+      // Record metrics
+      const endTime = Date.now();
+      operationLatency.observe({ server_id: this.serverId }, endTime - startTime);
+      syncLatency.observe({ server_id: this.serverId }, endTime - broadcastStart);
+      operationCounter.inc({ server_id: this.serverId, status: 'success' });
+
     } catch (error) {
-      console.error('Operation error:', error);
+      logError('operation', error as Error);
+      operationCounter.inc({ server_id: this.serverId, status: 'error' });
+
       // Request client resync
       this.send(ws, {
         type: 'resync',
@@ -383,12 +531,16 @@ export class SyncServer {
         // Save snapshot before unloading
         await docState.saveSnapshot();
         this.documents.delete(connection.documentId);
-        console.log(`Document ${connection.documentId} unloaded (no active clients)`);
+        logger.info({
+          event: 'document_unloaded',
+          document_id: connection.documentId,
+          reason: 'no_active_clients',
+        });
       }
     }
 
     this.clients.delete(ws);
-    console.log(`Client ${connection.clientId} disconnected`);
+    logConnection('disconnect', connection.clientId, connection.documentId, connection.userId);
   }
 
   /**
@@ -431,10 +583,29 @@ export class SyncServer {
   }
 
   /**
+   * Get current server statistics for metrics.
+   *
+   * @returns Stats object with connection, document, and collaborator counts
+   */
+  getStats(): { connections: number; documents: number; collaborators: number } {
+    let collaborators = 0;
+    for (const docState of this.documents.values()) {
+      collaborators += docState.clients.size;
+    }
+
+    return {
+      connections: this.clients.size,
+      documents: this.documents.size,
+      collaborators,
+    };
+  }
+
+  /**
    * Close all WebSocket connections and shut down the server.
    * Should be called during graceful shutdown.
    */
   close(): void {
     this.wss.close();
+    logger.info({ event: 'sync_server_closed', server_id: this.serverId });
   }
 }

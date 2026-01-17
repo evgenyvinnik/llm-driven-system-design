@@ -843,6 +843,236 @@ docker exec uber-postgres dropdb -U uber uber_restore_test
 | Redis data loss | Application re-populates from PostgreSQL | 5 minutes |
 | Complete data center loss | Promote standby region | 5 minutes |
 
+## Implementation Notes
+
+This section documents the key resilience patterns implemented in the backend code and explains why each is critical for a ride-hailing platform.
+
+### Why Idempotency Prevents Duplicate Ride Charges
+
+The `/api/rides/request` endpoint uses idempotency keys to prevent duplicate ride bookings:
+
+```javascript
+// Client sends: POST /api/rides/request with X-Idempotency-Key: "abc123"
+idempotencyMiddleware({ operation: 'ride_request', ttl: 86400 })
+```
+
+**Problem it solves:**
+- Network timeouts can cause the client to retry a request that already succeeded
+- Mobile apps with spotty connectivity often send duplicate requests
+- Without idempotency, a rider could be charged twice for the same ride
+
+**How it works:**
+1. Client generates a unique idempotency key (UUID) for each ride request
+2. Server checks Redis for existing response with that key
+3. If found, return cached response (no duplicate charge)
+4. If not found, process request and cache response for 24 hours
+
+**Key design decisions:**
+- TTL of 24 hours allows for delayed retries after app crashes
+- Pending marker prevents concurrent duplicate processing
+- User-scoped keys prevent cross-user collisions
+- Fail-open behavior (if Redis unavailable, proceed without idempotency) prioritizes availability
+
+**Files:**
+- `/backend/src/middleware/idempotency.js` - Middleware implementation
+- `/backend/src/routes/rides.js` - Applied to ride request, cancel, and rate endpoints
+
+### Why Async Queues Enable Better Load Handling During Surge
+
+RabbitMQ decouples ride requests from driver matching:
+
+```
+[API Server] --publish--> [matching.requests queue] --consume--> [Matching Worker]
+```
+
+**Problem it solves:**
+- During surge (New Year's Eve, concerts, bad weather), ride requests spike 10-100x
+- Synchronous matching blocks API responses and causes timeouts
+- Database connections get exhausted under load
+
+**How async queues help:**
+
+1. **Backpressure handling:** Queue depth can grow to absorb spike
+   ```javascript
+   // Check queue depth before accepting new requests
+   if (queueInfo.messageCount > 100) {
+     throw new ServiceUnavailableError('High demand - please retry');
+   }
+   ```
+
+2. **Rate limiting without rejection:** Requests wait in queue rather than failing
+
+3. **Worker scaling:** Can add matching workers without changing API servers
+   ```bash
+   # Scale up during surge
+   npm run dev:matching-worker  # Instance 1
+   npm run dev:matching-worker  # Instance 2
+   ```
+
+4. **Retry with backoff:** Failed matches are re-queued with exponential delay
+   ```javascript
+   // Exponential backoff: 2s, 4s, 8s
+   const delay = Math.pow(2, retryCount) * 1000;
+   ```
+
+5. **Event fanout:** Ride events are published to multiple consumers
+   - Notifications queue (push/SMS to users)
+   - Analytics queue (event logging for data warehouse)
+   - Billing queue (payment processing)
+
+**Queue topology:**
+```
+                        [ride.events fanout exchange]
+                                    |
+           +------------------------+------------------------+
+           |                        |                        |
+   [notifications]           [analytics]               [billing]
+```
+
+**Files:**
+- `/backend/src/utils/queue.js` - RabbitMQ connection, publish, consume
+- `/backend/src/services/matchingService.js` - Queue integration
+
+### Why Circuit Breakers Prevent Cascade Failures
+
+The location service wraps Redis geo operations in a circuit breaker:
+
+```javascript
+const redisGeoCircuitBreaker = createCircuitBreakerWithFallback(
+  async (operation, ...args) => { /* Redis operation */ },
+  'redis-geo',
+  async (operation) => { /* Fallback */ },
+  { timeout: 3000, errorThresholdPercentage: 50, resetTimeout: 15000 }
+);
+```
+
+**Problem it solves:**
+- If Redis becomes slow (network issues, memory pressure), every request waits
+- Waiting requests consume threads/connections
+- API becomes unresponsive even for endpoints that don't need Redis
+- One failing dependency takes down the entire system
+
+**How circuit breakers help:**
+
+1. **Fast failure:** After 50% errors (5+ requests), circuit opens
+   - Subsequent requests fail immediately (no waiting)
+   - Error response in <1ms instead of 3s timeout
+
+2. **Graceful degradation:** Fallback returns empty driver list
+   ```javascript
+   // Fallback when circuit is open
+   if (operation === 'georadius') {
+     logger.warn('Redis geo circuit open, returning empty driver list');
+     return [];  // App shows "no drivers nearby" instead of error
+   }
+   ```
+
+3. **Self-healing:** Circuit tries again after 15 seconds
+   - If request succeeds, circuit closes
+   - Normal operation resumes automatically
+
+4. **Monitoring visibility:** Circuit state is exposed via Prometheus
+   ```
+   uber_circuit_breaker_state{circuit="redis-geo",state="open"} 1
+   uber_circuit_breaker_requests_total{circuit="redis-geo",result="rejected"} 42
+   ```
+
+**Circuit breaker states:**
+```
+CLOSED (normal) --> OPEN (failing) --> HALF-OPEN (testing) --> CLOSED
+                        ^                      |
+                        +----------------------+  (if test fails)
+```
+
+**Files:**
+- `/backend/src/utils/circuitBreaker.js` - Circuit breaker wrapper
+- `/backend/src/services/locationService.js` - Applied to geo operations
+
+### Why Metrics Enable Surge Pricing Optimization
+
+Prometheus metrics expose real-time data for pricing decisions:
+
+```javascript
+// Surge pricing metrics
+metrics.surgeMultiplierGauge.set({ geohash: 'dr5ru' }, 1.8);
+metrics.surgeEventCounter.inc({ multiplier_range: '1.6-2.0' });
+```
+
+**Problem it solves:**
+- Surge pricing balances supply and demand, but needs tuning
+- Too aggressive = riders leave, too conservative = drivers leave
+- Need data to adjust surge thresholds by zone and time
+
+**Metrics collected:**
+
+1. **Ride lifecycle:**
+   ```
+   uber_ride_requests_total{vehicle_type="economy",status="requested"} 1234
+   uber_ride_matching_duration_seconds{vehicle_type="economy",success="true"} histogram
+   uber_rides_by_status{status="matched"} 42
+   ```
+
+2. **Driver availability:**
+   ```
+   uber_drivers_online_total{vehicle_type="economy"} 50
+   uber_drivers_available_total{vehicle_type="economy"} 35
+   uber_driver_location_updates_total 98765
+   ```
+
+3. **Surge events:**
+   ```
+   uber_surge_multiplier{geohash="dr5ru"} 1.8
+   uber_surge_events_total{multiplier_range="1.6-2.0"} 89
+   ```
+
+4. **System health:**
+   ```
+   uber_circuit_breaker_state{circuit="redis-geo",state="closed"} 1
+   uber_geo_query_duration_seconds{operation="find_nearby"} histogram
+   ```
+
+**How to use for optimization:**
+
+1. **Grafana dashboard:** Visualize surge patterns by time and zone
+2. **Alert on anomalies:** Matching latency >5s triggers on-call
+3. **A/B test surge thresholds:** Compare conversion rates at different multipliers
+4. **Capacity planning:** Predict driver supply needs for upcoming events
+
+**Prometheus endpoint:** `GET /metrics`
+
+**Files:**
+- `/backend/src/utils/metrics.js` - Metric definitions
+- `/backend/src/index.js` - `/metrics` endpoint
+
+### Health Check Implementation
+
+The health check endpoints support Kubernetes probes and debugging:
+
+| Endpoint | Purpose | Returns |
+|----------|---------|---------|
+| `GET /health` | Detailed status | All service statuses, circuit breaker states, memory usage |
+| `GET /health/live` | Liveness probe | Is process running? |
+| `GET /health/ready` | Readiness probe | Are critical deps (Postgres, Redis) available? |
+
+**Example `/health` response:**
+```json
+{
+  "status": "healthy",
+  "services": {
+    "postgres": { "status": "healthy", "latency": 5 },
+    "redis": { "status": "healthy", "latency": 2 },
+    "rabbitmq": { "status": "healthy", "latency": 8 }
+  },
+  "circuitBreakers": {
+    "redis-geo": { "state": "closed", "stats": { "successes": 1000, "failures": 5 } }
+  },
+  "memory": { "heapUsed": 45, "heapTotal": 64, "rss": 78 }
+}
+```
+
+**Files:**
+- `/backend/src/utils/health.js` - Health check implementation
+
 ## Future Optimizations
 
 - [ ] Batch matching for high-demand zones

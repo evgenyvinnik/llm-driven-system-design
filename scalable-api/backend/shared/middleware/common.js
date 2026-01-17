@@ -1,5 +1,6 @@
 import { generateId } from '../utils/index.js';
 import { metricsService } from '../services/metrics.js';
+import logger, { createRequestLogger } from '../services/logger.js';
 
 /**
  * Request ID middleware - adds unique ID to each request for tracing
@@ -7,17 +8,26 @@ import { metricsService } from '../services/metrics.js';
 export function requestIdMiddleware(req, res, next) {
   req.id = req.headers['x-request-id'] || generateId();
   res.setHeader('X-Request-ID', req.id);
+  // Attach a request-scoped logger
+  req.log = createRequestLogger(req);
   next();
 }
 
 /**
- * Request logging middleware - logs requests and records metrics
+ * Request logging middleware - logs requests and records metrics using pino
+ *
+ * WHY structured logging:
+ * - Machine-parseable for log aggregation (ELK, Loki, CloudWatch)
+ * - Consistent format across all services
+ * - Enables filtering and alerting on specific fields
+ * - Correlates requests via request IDs for distributed tracing
  */
 export function requestLoggerMiddleware(req, res, next) {
   const start = Date.now();
+  const log = req.log || logger.child({ requestId: req.id });
 
-  // Log request start
-  console.log(`[${req.id}] ${req.method} ${req.path} - Started`);
+  // Log request start at debug level
+  log.debug({ method: req.method, path: req.path }, 'Request started');
 
   res.on('finish', () => {
     const duration = Date.now() - start;
@@ -30,21 +40,23 @@ export function requestLoggerMiddleware(req, res, next) {
       duration,
     });
 
-    // Log request completion
-    const logLevel = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
-    const message = `[${req.id}] ${req.method} ${req.path} - ${res.statusCode} (${duration}ms)`;
+    // Log with appropriate level based on status
+    const logData = {
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration,
+      ip: req.ip || req.headers?.['x-forwarded-for']?.split(',')[0],
+    };
 
-    if (logLevel === 'error') {
-      console.error(message);
-    } else if (logLevel === 'warn') {
-      console.warn(message);
+    if (res.statusCode >= 500) {
+      log.error(logData, 'Request failed');
+    } else if (res.statusCode >= 400) {
+      log.warn(logData, 'Request error');
+    } else if (duration > 1000) {
+      log.warn({ ...logData, slow: true }, 'Slow request');
     } else {
-      console.log(message);
-    }
-
-    // Warn about slow requests
-    if (duration > 1000) {
-      console.warn(`[${req.id}] Slow request: ${req.method} ${req.path} took ${duration}ms`);
+      log.info(logData, 'Request completed');
     }
   });
 
@@ -55,7 +67,7 @@ export function requestLoggerMiddleware(req, res, next) {
  * Error handler middleware
  */
 export function errorHandlerMiddleware(err, req, res, next) {
-  console.error(`[${req.id}] Error handling ${req.method} ${req.path}:`, err);
+  const log = req.log || logger.child({ requestId: req.id });
 
   // Record error metrics
   metricsService.recordError({
@@ -63,6 +75,14 @@ export function errorHandlerMiddleware(err, req, res, next) {
     path: req.path,
     error: err.name || 'Error',
   });
+
+  // Log error with full context
+  log.error({
+    err,
+    method: req.method,
+    path: req.path,
+    stack: err.stack,
+  }, 'Error handling request');
 
   // Handle operational errors
   if (err.isOperational) {

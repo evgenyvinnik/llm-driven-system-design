@@ -1606,3 +1606,235 @@ services:
 | Watch progress consistency | Eventual (LWW) | Strong | Low conflict, better latency |
 | Retries | Exponential backoff | Fixed interval | Avoids thundering herd |
 | Circuit breaker | Per-service | Global | Isolates failures |
+
+---
+
+## Implementation Notes
+
+This section documents the actual implementation of observability, resilience, and consistency patterns in the backend codebase. Each change addresses specific Codex feedback about production-readiness.
+
+### 1. Prometheus Metrics (`shared/metrics.js`)
+
+**Why this improves the system:**
+
+Prometheus metrics enable data-driven decision making and proactive issue detection. Without metrics, operators are blind to performance degradation until users complain.
+
+**Key metrics implemented:**
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds` | Histogram | Tracks API latency distribution for SLI monitoring |
+| `playback_start_latency_seconds` | Histogram | Measures time-to-first-frame, critical UX metric |
+| `active_streams_total` | Gauge | Real-time concurrent stream count for capacity planning |
+| `manifest_generation_duration_seconds` | Histogram | Identifies HLS manifest bottlenecks |
+| `segment_requests_total` | Counter | Tracks CDN/origin load per content |
+| `streaming_errors_total` | Counter | Error rate monitoring by type |
+| `circuit_breaker_state` | Gauge | Visualizes circuit breaker health (0=closed, 1=half-open, 2=open) |
+| `watch_progress_updates_total` | Counter | Tracks sync success/conflict/error rates |
+| `idempotent_requests_total` | Counter | Monitors idempotency cache effectiveness |
+
+**SLI targets defined:**
+- Playback start latency (p95) < 2s
+- Manifest generation (p95) < 100ms
+- API availability > 99.9%
+- Streaming availability > 99.99%
+
+**How to access:** `GET /metrics` returns Prometheus-formatted metrics.
+
+### 2. Structured Logging with Pino (`shared/logger.js`)
+
+**Why this improves the system:**
+
+Console.log statements are inadequate for production debugging. Structured logging enables:
+- Log aggregation and search (e.g., Loki, Elasticsearch)
+- Request correlation across services via `requestId`
+- Contextual debugging with user/profile/content identifiers
+- Performance (pino is 5x faster than winston)
+
+**Features implemented:**
+
+1. **Request correlation:** Every request gets a `requestId` (from `X-Request-Id` header or auto-generated UUID)
+2. **Child loggers:** Each request has a logger with pre-bound context (userId, profileId, method, path)
+3. **Automatic request logging:** Logs request completion with duration and status
+4. **Audit logging:** Separate logger for security events (login, license issuance, content access)
+
+**Audit events tracked:**
+- `drm.license.issued` / `drm.license.revoked`
+- `playback.started`
+- `content.accessed`
+- `auth.login.success` / `auth.login.failed`
+- `profile.created` / `profile.deleted`
+
+**Log format example:**
+```json
+{
+  "level": "info",
+  "time": "2025-01-16T10:30:00.000Z",
+  "requestId": "abc-123",
+  "userId": "user-456",
+  "method": "GET",
+  "path": "/api/stream/content-789/master.m3u8",
+  "statusCode": 200,
+  "duration": 45,
+  "msg": "request completed"
+}
+```
+
+### 3. Circuit Breaker Pattern (`shared/circuitBreaker.js`)
+
+**Why this improves the system:**
+
+External dependencies (CDN, transcoding service, DRM server) can fail. Without circuit breakers:
+- Failed calls block threads waiting for timeouts
+- Cascading failures bring down the entire service
+- Recovery is slow as traffic hammers the recovering service
+
+**Implementation using opossum:**
+
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| CDN | 5s | 30% | 15s |
+| Transcoding | 5min | 50% | 2min |
+| DRM | 5s | 25% | 60s |
+| Storage | 10s | 40% | 30s |
+
+**Circuit states:**
+- **Closed:** Normal operation, requests pass through
+- **Open:** Requests fail fast, fallback is used
+- **Half-Open:** Limited requests test if service recovered
+
+**Fallback strategies:**
+- CDN: Return cached content or error gracefully
+- Transcoding: Queue job for later processing
+- DRM: No fallback (license is required for playback)
+- Storage: Return cached data if available
+
+**Usage in streaming routes:**
+```javascript
+const content = await withCircuitBreaker('storage', async () => {
+  return db.query('SELECT * FROM content WHERE id = $1', [contentId]);
+});
+```
+
+### 4. Idempotency for Playback State Sync (`shared/idempotency.js`)
+
+**Why this improves the system:**
+
+Mobile clients retry requests on network failures. Without idempotency:
+- Duplicate progress updates could create inconsistent state
+- User sees "position jumping" when syncing across devices
+- Database writes are wasted on duplicate operations
+
+**Two-layer idempotency implemented:**
+
+**Layer 1: Global Idempotency Middleware**
+- Clients send `Idempotency-Key` header
+- Response cached in Redis for 24 hours
+- Concurrent duplicates receive 409 Conflict
+- Subsequent retries receive cached response
+
+**Layer 2: Last-Write-Wins for Watch Progress**
+- `client_timestamp` column added to `watch_progress` table
+- Updates only apply if `client_timestamp` is newer
+- Stale updates are acknowledged but not persisted
+- Response includes `wasUpdated: boolean`
+
+**Database schema change:**
+```sql
+ALTER TABLE watch_progress
+ADD COLUMN client_timestamp BIGINT;
+```
+
+**Conflict resolution SQL:**
+```sql
+INSERT INTO watch_progress (..., client_timestamp, ...)
+ON CONFLICT (profile_id, content_id)
+DO UPDATE SET
+  position = CASE
+    WHEN watch_progress.client_timestamp < $new_timestamp THEN $new_position
+    ELSE watch_progress.position
+  END,
+  client_timestamp = GREATEST(watch_progress.client_timestamp, $new_timestamp);
+```
+
+**Batch sync endpoint:** `POST /api/watch/progress/batch` for offline-to-online sync (max 50 updates per request).
+
+### 5. Enhanced Health Checks (`/health`, `/health/live`, `/health/ready`)
+
+**Why this improves the system:**
+
+Kubernetes and load balancers need to know service health. Simple "200 OK" checks miss partial failures.
+
+**Endpoints implemented:**
+
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `/health` | Deep health with details | DB, Redis, circuit breakers |
+| `/health/live` | Liveness probe | Process is running |
+| `/health/ready` | Readiness probe | DB + Redis connectivity |
+
+**Response format:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2025-01-16T10:30:00.000Z",
+  "uptime": 3600,
+  "version": "1.0.0",
+  "responseTime": 12,
+  "checks": {
+    "database": { "status": "healthy", "latency": 5 },
+    "redis": { "status": "healthy", "latency": 2 },
+    "circuitBreakers": {
+      "cdn": { "state": "closed", "stats": { "fires": 100, "failures": 2 } },
+      "storage": { "state": "closed" }
+    }
+  }
+}
+```
+
+### 6. Graceful Shutdown
+
+**Why this improves the system:**
+
+Abrupt termination loses in-flight requests and corrupts connections. Graceful shutdown:
+- Closes Redis connections cleanly
+- Drains database connection pool
+- Logs shutdown events for debugging
+
+**Implementation:**
+```javascript
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+async function shutdown(signal) {
+  logger.info({ signal }, 'Shutdown signal received');
+  await redisClient.quit();
+  await db.pool.end();
+  process.exit(0);
+}
+```
+
+### Summary of Files Changed/Added
+
+| File | Type | Purpose |
+|------|------|---------|
+| `src/shared/logger.js` | New | Pino structured logging with audit logging |
+| `src/shared/metrics.js` | New | Prometheus metrics definitions |
+| `src/shared/circuitBreaker.js` | New | Circuit breaker for CDN/transcoding/DRM |
+| `src/shared/idempotency.js` | New | Request idempotency and LWW conflict resolution |
+| `src/shared/index.js` | New | Exports all shared modules |
+| `src/index.js` | Modified | Integrated observability and health checks |
+| `src/routes/streaming.js` | Modified | Added metrics, circuit breaker, audit logging |
+| `src/routes/watchProgress.js` | Modified | Added idempotency, batch sync, conflict tracking |
+| `src/db/init.sql` | Modified | Added `client_timestamp` and `audit_log` table |
+
+### NPM Dependencies Added
+
+```json
+{
+  "prom-client": "^15.x",    // Prometheus metrics
+  "pino": "^9.x",            // Structured logging
+  "pino-http": "^10.x",      // HTTP request logging
+  "opossum": "^8.x"          // Circuit breaker
+}
+```

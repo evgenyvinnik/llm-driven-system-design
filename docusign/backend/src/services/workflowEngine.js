@@ -2,6 +2,18 @@ import { v4 as uuid } from 'uuid';
 import { query, getClient } from '../utils/db.js';
 import { auditService } from './auditService.js';
 import { emailService } from './emailService.js';
+import {
+  publishNotification,
+  publishWorkflowEvent,
+  isQueueHealthy,
+} from '../shared/queue.js';
+import {
+  executeWithIdempotency,
+  generateSendIdempotencyKey,
+} from '../shared/idempotency.js';
+import { logAuditEvent, AUDIT_EVENTS } from '../shared/auditLogger.js';
+import { envelopesCreated } from '../shared/metrics.js';
+import logger from '../shared/logger.js';
 
 // Valid state transitions
 const ENVELOPE_STATES = {
@@ -55,6 +67,19 @@ class WorkflowEngine {
       newState
     }, actor);
 
+    // Publish workflow event for async processing
+    try {
+      if (isQueueHealthy()) {
+        await publishWorkflowEvent({
+          eventType: `envelope_${newState}`,
+          envelopeId,
+          data: { previousState: currentState, newState },
+        });
+      }
+    } catch (error) {
+      logger.warn({ error: error.message }, 'Failed to publish workflow event');
+    }
+
     return newState;
   }
 
@@ -103,72 +128,116 @@ class WorkflowEngine {
     return true;
   }
 
-  // Send envelope to recipients
+  // Send envelope to recipients - WITH IDEMPOTENCY
   async sendEnvelope(envelopeId, senderId) {
-    const client = await getClient();
+    // Generate idempotency key for send operation
+    const idempotencyKey = generateSendIdempotencyKey(envelopeId, senderId);
 
-    try {
-      await client.query('BEGIN');
+    const { data: envelope, cached } = await executeWithIdempotency(
+      idempotencyKey,
+      async () => {
+        const client = await getClient();
 
-      const envelopeResult = await client.query(
-        'SELECT * FROM envelopes WHERE id = $1',
-        [envelopeId]
-      );
+        try {
+          await client.query('BEGIN');
 
-      if (envelopeResult.rows.length === 0) {
-        throw new Error('Envelope not found');
-      }
+          const envelopeResult = await client.query(
+            'SELECT * FROM envelopes WHERE id = $1 FOR UPDATE',
+            [envelopeId]
+          );
 
-      const envelope = envelopeResult.rows[0];
+          if (envelopeResult.rows.length === 0) {
+            throw new Error('Envelope not found');
+          }
 
-      if (envelope.status !== 'draft') {
-        throw new Error('Can only send draft envelopes');
-      }
+          const envelope = envelopeResult.rows[0];
 
-      // Validate envelope
-      await this.validateEnvelope(envelopeId);
+          if (envelope.status !== 'draft') {
+            throw new Error('Can only send draft envelopes');
+          }
 
-      // Transition state
-      await client.query(
-        `UPDATE envelopes SET status = 'sent', updated_at = NOW() WHERE id = $1`,
-        [envelopeId]
-      );
+          // Validate envelope
+          await this.validateEnvelope(envelopeId);
 
-      // Generate access tokens for recipients
-      const recipientsResult = await client.query(
-        'SELECT * FROM recipients WHERE envelope_id = $1 ORDER BY routing_order ASC',
-        [envelopeId]
-      );
+          // Transition state
+          await client.query(
+            `UPDATE envelopes SET status = 'sent', updated_at = NOW() WHERE id = $1`,
+            [envelopeId]
+          );
 
-      for (const recipient of recipientsResult.rows) {
-        const accessToken = uuid();
-        await client.query(
-          'UPDATE recipients SET access_token = $2, status = $3 WHERE id = $1',
-          [recipient.id, accessToken, 'sent']
-        );
-      }
+          // Generate access tokens for recipients
+          const recipientsResult = await client.query(
+            'SELECT * FROM recipients WHERE envelope_id = $1 ORDER BY routing_order ASC',
+            [envelopeId]
+          );
 
-      await client.query('COMMIT');
+          for (const recipient of recipientsResult.rows) {
+            const accessToken = uuid();
+            await client.query(
+              'UPDATE recipients SET access_token = $2, status = $3 WHERE id = $1',
+              [recipient.id, accessToken, 'sent']
+            );
+          }
 
-      // Log audit event
-      await auditService.log(envelopeId, 'envelope_sent', {
-        senderId,
-        recipientCount: recipientsResult.rows.length
-      }, senderId);
+          await client.query('COMMIT');
 
-      // Get first recipients and send notifications
-      const firstRecipients = await this.getNextRecipients(envelopeId);
-      for (const recipient of firstRecipients) {
-        await this.notifyRecipient(recipient, envelope);
-      }
+          // Log audit event
+          await auditService.log(envelopeId, 'envelope_sent', {
+            senderId,
+            recipientCount: recipientsResult.rows.length
+          }, senderId);
 
-      return envelope;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
+          // Log enhanced audit event
+          await logAuditEvent(envelopeId, AUDIT_EVENTS.ENVELOPE_SENT, {
+            senderId,
+            recipientCount: recipientsResult.rows.length,
+            recipients: recipientsResult.rows.map(r => ({
+              id: r.id,
+              email: r.email,
+              name: r.name,
+              routingOrder: r.routing_order,
+            })),
+          });
+
+          // Get updated envelope and recipients for notification
+          const updatedEnvelopeResult = await query(
+            'SELECT * FROM envelopes WHERE id = $1',
+            [envelopeId]
+          );
+          const updatedEnvelope = updatedEnvelopeResult.rows[0];
+
+          // Get updated recipients with access tokens
+          const updatedRecipientsResult = await query(
+            'SELECT * FROM recipients WHERE envelope_id = $1 ORDER BY routing_order ASC',
+            [envelopeId]
+          );
+
+          // Get first recipients and send notifications
+          const firstRecipients = await this.getNextRecipients(envelopeId);
+          for (const recipient of firstRecipients) {
+            // Find the updated recipient with access token
+            const updatedRecipient = updatedRecipientsResult.rows.find(
+              r => r.id === recipient.id
+            );
+            await this.notifyRecipient(updatedRecipient || recipient, updatedEnvelope);
+          }
+
+          return updatedEnvelope;
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      'send'
+    );
+
+    if (cached) {
+      logger.info({ envelopeId, senderId }, 'Duplicate send request blocked by idempotency');
     }
+
+    return envelope;
   }
 
   // Get next recipients based on routing order
@@ -189,7 +258,7 @@ class WorkflowEngine {
     return pending.filter(r => r.routing_order === nextOrder);
   }
 
-  // Notify recipient to sign
+  // Notify recipient to sign - with async queue support
   async notifyRecipient(recipient, envelope) {
     // Update recipient status to delivered
     await query(
@@ -204,13 +273,41 @@ class WorkflowEngine {
       [recipient.envelope_id]
     );
 
-    // Send email notification (simulated)
-    await emailService.sendSigningRequest(recipient, envelope);
+    // Try async notification via queue first
+    if (isQueueHealthy()) {
+      try {
+        await publishNotification({
+          type: 'signing_request',
+          recipientId: recipient.id,
+          envelopeId: recipient.envelope_id,
+          channels: ['email'],
+        });
+        logger.info({
+          recipientId: recipient.id,
+          envelopeId: recipient.envelope_id,
+        }, 'Notification queued for async delivery');
+      } catch (error) {
+        logger.warn({ error: error.message }, 'Queue publish failed, falling back to sync');
+        // Fall back to synchronous email
+        await emailService.sendSigningRequest(recipient, envelope);
+      }
+    } else {
+      // Queue not available, send synchronously
+      await emailService.sendSigningRequest(recipient, envelope);
+    }
 
+    // Log audit events
     await auditService.log(recipient.envelope_id, 'recipient_notified', {
       recipientId: recipient.id,
       recipientEmail: recipient.email,
       recipientName: recipient.name
+    });
+
+    await logAuditEvent(recipient.envelope_id, AUDIT_EVENTS.RECIPIENT_NOTIFIED, {
+      recipientId: recipient.id,
+      recipientEmail: recipient.email,
+      recipientName: recipient.name,
+      notificationChannel: 'email',
     });
   }
 
@@ -231,6 +328,18 @@ class WorkflowEngine {
       recipientEmail: recipient.email,
       recipientName: recipient.name,
       ipAddress
+    });
+
+    await logAuditEvent(recipient.envelope_id, AUDIT_EVENTS.RECIPIENT_COMPLETED, {
+      recipientId,
+      recipientEmail: recipient.email,
+      recipientName: recipient.name,
+      ipAddress,
+      userAgent,
+      completedAt: new Date().toISOString(),
+    }, {
+      ipAddress,
+      userAgent,
     });
 
     // Check if all recipients at this routing order are done
@@ -280,6 +389,10 @@ class WorkflowEngine {
       completedAt: new Date().toISOString()
     });
 
+    await logAuditEvent(envelopeId, AUDIT_EVENTS.ENVELOPE_COMPLETED, {
+      completedAt: new Date().toISOString(),
+    });
+
     // Send completion notifications to all recipients
     const recipientsResult = await query(
       'SELECT * FROM recipients WHERE envelope_id = $1',
@@ -293,7 +406,22 @@ class WorkflowEngine {
     const envelope = envelopeResult.rows[0];
 
     for (const recipient of recipientsResult.rows) {
-      await emailService.sendCompletionNotification(recipient, envelope);
+      // Try async notification via queue
+      if (isQueueHealthy()) {
+        try {
+          await publishNotification({
+            type: 'completed',
+            recipientId: recipient.id,
+            envelopeId,
+            channels: ['email'],
+          });
+        } catch (error) {
+          logger.warn({ error: error.message }, 'Queue publish failed for completion');
+          await emailService.sendCompletionNotification(recipient, envelope);
+        }
+      } else {
+        await emailService.sendCompletionNotification(recipient, envelope);
+      }
     }
 
     // Also notify sender
@@ -303,6 +431,19 @@ class WorkflowEngine {
     );
     if (senderResult.rows.length > 0) {
       await emailService.sendCompletionNotification(senderResult.rows[0], envelope);
+    }
+
+    // Publish workflow event for any downstream processing
+    if (isQueueHealthy()) {
+      try {
+        await publishWorkflowEvent({
+          eventType: 'envelope_completed',
+          envelopeId,
+          data: { completedAt: new Date().toISOString() },
+        });
+      } catch (error) {
+        logger.warn({ error: error.message }, 'Failed to publish completion event');
+      }
     }
   }
 
@@ -328,6 +469,17 @@ class WorkflowEngine {
       recipientEmail: recipient.email,
       reason,
       ipAddress
+    });
+
+    await logAuditEvent(recipient.envelope_id, AUDIT_EVENTS.ENVELOPE_DECLINED, {
+      recipientId,
+      recipientEmail: recipient.email,
+      recipientName: recipient.name,
+      reason,
+      declinedAt: new Date().toISOString(),
+    }, {
+      ipAddress,
+      userAgent,
     });
 
     // Notify sender
@@ -370,6 +522,13 @@ class WorkflowEngine {
       reason,
       voidedBy: userId
     }, userId);
+
+    await logAuditEvent(envelopeId, AUDIT_EVENTS.ENVELOPE_VOIDED, {
+      reason,
+      voidedBy: userId,
+      previousStatus: currentStatus,
+      voidedAt: new Date().toISOString(),
+    });
 
     // Notify all recipients
     const recipientsResult = await query(

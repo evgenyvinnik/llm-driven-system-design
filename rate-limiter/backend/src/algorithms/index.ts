@@ -16,7 +16,7 @@ import { TokenBucketLimiter, TokenBucketOptions } from './token-bucket.js';
 import { LeakyBucketLimiter, LeakyBucketOptions } from './leaky-bucket.js';
 
 // Re-export all algorithm classes for direct usage
-export { RateLimiter } from './base.js';
+export { RateLimiter, RateLimiterOptions } from './base.js';
 export { FixedWindowLimiter } from './fixed-window.js';
 export { SlidingWindowLimiter } from './sliding-window.js';
 export { SlidingLogLimiter } from './sliding-log.js';
@@ -25,7 +25,7 @@ export { LeakyBucketLimiter } from './leaky-bucket.js';
 
 /**
  * Options for rate limit check operations.
- * Combines options from all bucket-based algorithms.
+ * Extends base options with all bucket-based algorithm parameters.
  */
 export interface CheckOptions {
   /** Bucket capacity for token/leaky bucket algorithms */
@@ -34,6 +34,8 @@ export interface CheckOptions {
   refillRate?: number;
   /** Leak rate for leaky bucket (requests/second) */
   leakRate?: number;
+  /** Additional algorithm-specific options */
+  [key: string]: unknown;
 }
 
 /**

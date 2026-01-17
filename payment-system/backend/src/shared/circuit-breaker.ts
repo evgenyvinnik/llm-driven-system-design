@@ -1,12 +1,10 @@
 import {
-  CircuitBreaker,
   ConsecutiveBreaker,
   ExponentialBackoff,
   retry,
   handleAll,
   wrap,
   circuitBreaker,
-  SamplingBreaker,
 } from 'cockatiel';
 import { logger } from './logger.js';
 import { circuitBreakerState, circuitBreakerEvents } from './metrics.js';
@@ -202,5 +200,3 @@ export function withRetry<T extends (...args: never[]) => Promise<unknown>>(
     return retryPolicy.execute(() => fn(...args));
   }) as T;
 }
-
-export { CircuitBreaker };

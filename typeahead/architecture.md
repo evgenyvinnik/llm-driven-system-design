@@ -1772,3 +1772,214 @@ Replication Strategy:
 4. Rebuild trie from promoted database
 5. Resume Kafka consumers in secondary region
 6. Mark old primary as secondary for repair
+
+---
+
+## Implementation Notes
+
+This section documents the production-ready features implemented in the backend and explains **why** each is critical for a typeahead system.
+
+### Redis Caching for Popular Queries
+
+**Location:** `/backend/src/shared/metrics.js`, `/backend/src/services/suggestion-service.js`
+
+**WHY caching is CRITICAL for typeahead latency (<50ms):**
+
+1. **User Experience Depends on Speed**: Users type at 150-300ms per keystroke. If suggestions take >50ms, they arrive after the next keystroke, causing jarring UI updates and perceived lag.
+
+2. **Hot Prefixes Dominate Traffic**: The Zipf distribution applies to search queries. The top 1% of prefixes (like "a", "th", "wh") receive >50% of traffic. Caching these provides massive latency wins.
+
+3. **Trie Traversal is Fast but Not Free**: While trie lookups are O(prefix_length), the ranking, personalization, and trending boost calculations add latency. Caching the final ranked results avoids repeated computation.
+
+4. **Cache Effectiveness is High**: With a 60-second TTL and prefix locality, cache hit rates typically exceed 80%. This means 4 out of 5 requests skip trie operations entirely.
+
+```javascript
+// Cache key design: prefix -> ranked suggestions
+// TTL: 60 seconds balances freshness vs performance
+const cacheKey = `suggestions:${prefix}`;
+await redis.setex(cacheKey, 60, JSON.stringify(suggestions));
+```
+
+### Rate Limiting for Query Protection
+
+**Location:** `/backend/src/shared/rate-limiter.js`
+
+**WHY rate limiting prevents search abuse:**
+
+1. **Bot Protection**: Scrapers and automated tools can flood the typeahead API to extract trending data or map the entire suggestion space. Rate limiting forces them to slow down.
+
+2. **DoS Mitigation**: A single malicious user could send thousands of requests per second, degrading service for legitimate users. Per-client rate limits prevent this.
+
+3. **Resource Protection**: Each suggestion request consumes CPU (trie traversal), memory (result building), and potentially database connections (logging). Unbounded requests exhaust these resources.
+
+4. **Fair Usage**: Rate limits ensure no single user monopolizes capacity during peak times, maintaining consistent latency for everyone.
+
+```javascript
+// Tiered rate limits by endpoint sensitivity:
+// - Suggestions: 20 req/sec (fast typing)
+// - Query logging: 5 req/sec (writes to DB)
+// - Admin operations: 30 req/min (expensive)
+```
+
+### Circuit Breakers for Search Index Protection
+
+**Location:** `/backend/src/shared/circuit-breaker.js`, `/backend/src/routes/suggestions.js`
+
+**WHY circuit breakers protect the search index:**
+
+1. **Cascading Failure Prevention**: If the trie or Redis becomes slow or unresponsive, continued requests pile up, exhausting connection pools and memory. Circuit breakers fail fast when problems are detected.
+
+2. **Automatic Recovery Testing**: The half-open state allows controlled testing of recovery. Rather than flooding a recovering service, circuit breakers send limited probe requests.
+
+3. **Graceful Degradation**: When circuits open, fallback behavior returns empty suggestions or cached stale data. The user experience degrades gracefully rather than failing completely.
+
+4. **Thundering Herd Prevention**: Without circuit breakers, when a service recovers, all backed-up requests surge simultaneously. Circuit breakers' gradual reopening prevents this.
+
+```javascript
+// Circuit configuration for typeahead:
+// - 100ms timeout (fail fast, typeahead must be fast)
+// - 30% error threshold (open if 3 of 10 fail)
+// - 5 second reset (try again quickly)
+const circuit = createCircuitBreaker('suggestions', fn, {
+  timeout: 100,
+  errorThresholdPercentage: 30,
+  resetTimeout: 5000,
+});
+```
+
+### Prometheus Metrics for Ranking Optimization
+
+**Location:** `/backend/src/shared/metrics.js`, `/backend/src/routes/suggestions.js`
+
+**WHY query metrics enable ranking optimization:**
+
+1. **Latency SLO Monitoring**: Prometheus histograms track P50/P95/P99 latency. Alerts fire when P99 exceeds 50ms, enabling proactive capacity planning before users notice degradation.
+
+2. **Cache Effectiveness Tuning**: Cache hit rate metrics reveal whether TTLs are too short (low hit rate) or too long (stale data). Adjusting TTLs based on data improves both freshness and performance.
+
+3. **Query Pattern Analysis**: Prefix length distribution reveals user behavior. If most queries are 1-2 characters, prefix precomputation should focus there. If 5+ characters dominate, different optimization strategies apply.
+
+4. **Ranking Quality Signals**: By tracking which suggestions are returned and correlating with click-through data (from query logging), ranking weights can be optimized. A/B testing becomes data-driven.
+
+5. **Capacity Planning**: Request rate trends and suggestion count distributions help predict when to scale horizontally or add trie shards.
+
+```javascript
+// Key metrics for typeahead optimization:
+typeahead_suggestion_latency_seconds{endpoint, cache_hit, status}
+typeahead_suggestion_requests_total{endpoint, status}
+typeahead_cache_hit_rate{cache_type}
+typeahead_query_prefix_length (histogram)
+typeahead_suggestion_count (histogram)
+```
+
+### Structured JSON Logging with Pino
+
+**Location:** `/backend/src/shared/logger.js`
+
+**WHY structured logging is essential:**
+
+1. **Machine Parseable**: JSON logs integrate with log aggregation systems (ELK, Splunk, Datadog) for searching, filtering, and dashboards.
+
+2. **Correlation IDs**: Each request gets a unique ID that propagates through all log entries, enabling end-to-end tracing of individual requests.
+
+3. **Audit Trail**: Sensitive operations (filter changes, trie rebuilds, cache invalidations) are logged with actor information for compliance and debugging.
+
+4. **Performance Context**: Log entries include latency, cache hit status, and suggestion count, enabling performance analysis from logs alone.
+
+```javascript
+// Structured log entry example:
+{
+  "level": "info",
+  "time": "2024-01-15T10:30:00.000Z",
+  "service": "typeahead",
+  "requestId": "abc-123",
+  "event": "suggestion_request",
+  "prefix": "weat",
+  "durationMs": 12,
+  "cacheHit": true,
+  "suggestionCount": 5
+}
+```
+
+### Idempotency for Index Updates
+
+**Location:** `/backend/src/shared/idempotency.js`, `/backend/src/routes/admin.js`
+
+**WHY idempotency is critical for typeahead index updates:**
+
+1. **Safe Retries**: Network failures, timeouts, and client crashes mean requests may be sent multiple times. Without idempotency, phrase counts could be incremented multiple times erroneously.
+
+2. **Distributed Consistency**: In a multi-server deployment, the same update might arrive at different servers. Idempotency keys prevent duplicate processing regardless of which server handles retries.
+
+3. **At-Least-Once Semantics**: Kafka message consumption and webhook delivery often use at-least-once delivery. Idempotency enables exactly-once processing semantics.
+
+4. **Replay Safety**: During disaster recovery, message queues may be replayed from earlier offsets. Idempotent handlers skip already-processed messages.
+
+```javascript
+// Idempotency key generation:
+// Hash of operation + payload = deterministic key
+const key = generateIdempotencyKey('phrase_add', { phrase, count });
+
+// Check before processing:
+const cached = await idempotencyHandler.check(key);
+if (cached) {
+  return cached.result; // Skip duplicate
+}
+```
+
+### Health Check Endpoints
+
+**Location:** `/backend/src/index.js`
+
+**Implementation:**
+
+- `/health` - Basic liveness probe (always returns 200 if server is running)
+- `/health/ready` - Readiness probe checking trie, Redis, PostgreSQL
+- `/health/circuits` - Circuit breaker states for debugging
+- `/status` - Detailed system status with memory, connections, trie stats
+
+**WHY comprehensive health checks matter:**
+
+1. **Load Balancer Integration**: Kubernetes and nginx use readiness probes to route traffic only to healthy instances.
+
+2. **Graceful Rollouts**: During deployments, new instances become ready only after the trie is loaded, preventing empty-trie responses.
+
+3. **Debugging Production Issues**: Circuit breaker and connection pool visibility helps diagnose cascading failures.
+
+---
+
+## API Endpoints Summary
+
+### Metrics and Monitoring
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/metrics` | GET | Prometheus metrics endpoint |
+| `/health` | GET | Basic liveness probe |
+| `/health/ready` | GET | Readiness probe with dependency checks |
+| `/health/circuits` | GET | Circuit breaker states |
+| `/status` | GET | Detailed system status |
+
+### Suggestion API
+
+| Endpoint | Method | Rate Limit | Description |
+|----------|--------|------------|-------------|
+| `/api/v1/suggestions?q=...` | GET | 20/sec | Get suggestions for prefix |
+| `/api/v1/suggestions/log` | POST | 5/sec | Log completed search |
+| `/api/v1/suggestions/trending` | GET | - | Get trending queries |
+| `/api/v1/suggestions/popular` | GET | - | Get popular queries |
+| `/api/v1/suggestions/history?userId=...` | GET | - | Get user history |
+
+### Admin API
+
+| Endpoint | Method | Idempotent | Description |
+|----------|--------|------------|-------------|
+| `/api/v1/admin/trie/stats` | GET | N/A | Get trie statistics |
+| `/api/v1/admin/trie/rebuild` | POST | Yes | Rebuild trie from database |
+| `/api/v1/admin/phrases` | POST | Yes | Add/update phrase |
+| `/api/v1/admin/phrases/:phrase` | DELETE | Yes | Remove phrase |
+| `/api/v1/admin/filter` | POST | Yes | Add to filter list |
+| `/api/v1/admin/filter/:phrase` | DELETE | No | Remove from filter list |
+| `/api/v1/admin/filtered` | GET | N/A | List filtered phrases |
+| `/api/v1/admin/cache/clear` | POST | Yes | Clear suggestion cache |
+| `/api/v1/admin/status` | GET | N/A | System status |

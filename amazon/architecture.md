@@ -1191,3 +1191,283 @@ async function replayRecommendations(fromDate) {
 - [ ] Run integration tests
 - [ ] Update documentation with timestamp
 ```
+
+---
+
+## Implementation Notes
+
+This section documents the rationale behind key resilience and observability features implemented in the backend codebase.
+
+### Why Idempotency Prevents Duplicate Orders and Charges
+
+**Problem Statement:**
+In e-commerce, duplicate orders are a critical failure mode. They can occur from:
+- Network timeouts causing client retries
+- Users double-clicking the "Place Order" button
+- Mobile apps retrying on connection drops
+- Load balancer failovers mid-request
+
+Each duplicate order means:
+- Customer charged multiple times
+- Inventory decremented incorrectly
+- Fulfillment confusion and shipping costs
+- Customer trust erosion and support burden
+
+**Solution: Idempotency Keys**
+
+The implementation uses a client-provided `Idempotency-Key` header to ensure exactly-once order creation:
+
+```javascript
+// Client sends unique key with checkout request
+POST /api/orders
+Headers: { "Idempotency-Key": "order-user123-1705432800000-abc123" }
+
+// Server flow:
+// 1. Check Redis for existing key
+// 2. If found with status='completed', return cached response
+// 3. If not found, create record with status='processing'
+// 4. Process order
+// 5. Update record with status='completed' and response
+```
+
+**Why This Works:**
+- **Atomicity**: Redis `SETNX` ensures only one request "wins" the race
+- **Durability**: PostgreSQL backup ensures keys survive Redis failures
+- **Fast Lookups**: Redis provides sub-millisecond duplicate detection
+- **Graceful Retries**: Failed requests (status='failed') allow retries with same key
+
+**Key Design Decisions:**
+1. **24-hour TTL**: Balances storage costs against legitimate retry windows
+2. **Processing state**: Handles concurrent requests gracefully (returns 409 Conflict)
+3. **PostgreSQL fallback**: Ensures durability if Redis is temporarily unavailable
+
+See: `/backend/src/shared/idempotency.js`
+
+---
+
+### Why Circuit Breakers Protect Checkout Flow
+
+**Problem Statement:**
+E-commerce checkout depends on external services:
+- Payment gateways (Stripe, PayPal)
+- Inventory systems
+- Tax calculation services
+- Fraud detection
+
+When these services fail, naive retry logic causes:
+- **Cascade failures**: Overwhelmed services fail faster
+- **Resource exhaustion**: Threads/connections blocked waiting
+- **User frustration**: Slow failures are worse than fast failures
+
+**Solution: Circuit Breaker Pattern**
+
+```
+CLOSED (normal) ──failures exceed threshold──> OPEN (fail fast)
+     ↑                                              │
+     │                                              │ timeout expires
+     │                                              ▼
+     └────successes exceed threshold───── HALF-OPEN (test)
+```
+
+**Implementation Details:**
+
+```javascript
+// Payment circuit breaker configuration
+const paymentCircuitBreakerOptions = {
+  timeout: 30000,           // Payment can take longer
+  errorThresholdPercentage: 30,  // Trip faster for payment (critical)
+  resetTimeout: 60000,      // Wait longer before retrying
+  volumeThreshold: 3        // Trip after fewer failures
+};
+
+// Usage in checkout
+const paymentBreaker = createPaymentCircuitBreaker(processPayment, paymentFallback);
+const result = await paymentBreaker.fire(order, paymentDetails);
+```
+
+**Why This Works:**
+- **Fast Failure**: Open circuit returns immediately (no waiting)
+- **Automatic Recovery**: Half-open state tests if service recovered
+- **Fallback Support**: Graceful degradation (queue for later, use backup gateway)
+- **Metrics**: Circuit state exposed to Prometheus for alerting
+
+**Service-Specific Configurations:**
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| Payment Gateway | 30s | 30% | 60s |
+| Inventory | 5s | 50% | 15s |
+| Elasticsearch | 5s | 60% | 10s |
+
+See: `/backend/src/shared/circuitBreaker.js`
+
+---
+
+### Why Audit Logging Enables Order Dispute Resolution
+
+**Problem Statement:**
+E-commerce disputes require answering questions like:
+- "Did the customer actually place this order?"
+- "When was the order cancelled, and by whom?"
+- "What was the original price before the refund?"
+- "Was this a valid refund or potential fraud?"
+
+Without audit logs, resolving disputes requires:
+- Guessing from database state
+- Asking customers to prove claims
+- Legal liability exposure
+
+**Solution: Immutable Audit Trail**
+
+Every order/payment operation creates an audit record:
+
+```javascript
+await createAuditLog({
+  action: 'order.created',
+  actor: { id: userId, type: 'user' },
+  resource: { type: 'order', id: orderId },
+  changes: {
+    new: { total: 149.99, items: [...] }
+  },
+  context: { ip: '192.168.1.1', correlationId: 'uuid' }
+});
+```
+
+**Audit Events Captured:**
+| Event | Severity | Use Case |
+|-------|----------|----------|
+| order.created | info | Proof of purchase |
+| order.cancelled | warning | Cancellation disputes |
+| order.refunded | critical | Fraud investigation |
+| payment.completed | info | Payment verification |
+| payment.failed | warning | Debugging failures |
+| inventory.adjusted | warning | Stock discrepancy investigation |
+| admin.* | critical | Admin action accountability |
+
+**Query Capabilities:**
+```javascript
+// Get complete order history for dispute resolution
+const trail = await getOrderAuditTrail(orderId);
+// Returns chronological list of all events for this order
+
+// Find all actions by a user (fraud investigation)
+const logs = await queryAuditLogs({
+  actorId: userId,
+  startDate: '2024-01-01',
+  severity: 'critical'
+});
+```
+
+**Why This Works:**
+- **Immutability**: INSERT-only table, never UPDATE/DELETE
+- **Correlation IDs**: Link related events across services
+- **IP/User Agent**: Identify suspicious patterns
+- **Old/New Values**: Full before/after state for reversibility
+
+See: `/backend/src/shared/audit.js`
+
+---
+
+### Why Order Archival Balances History vs Storage Costs
+
+**Problem Statement:**
+E-commerce generates massive order data:
+- 1M orders/day = 365M orders/year
+- Each order has items, addresses, payment details
+- Legal requirement: Keep 7 years (2.5B+ orders)
+
+Keeping all data in PostgreSQL causes:
+- **Storage costs**: Terabytes of expensive SSD storage
+- **Query performance**: Indexes become huge, queries slow
+- **Backup time**: Full backups take hours
+- **Migration risk**: Schema changes on billion-row tables are dangerous
+
+**Solution: Tiered Storage with Lifecycle Policies**
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  HOT STORAGE    │ ──> │  WARM STORAGE   │ ──> │  COLD STORAGE   │
+│  PostgreSQL     │     │  orders_archive │     │  MinIO/S3       │
+│  < 2 years      │     │  2-7 years      │     │  > 7 years      │
+│  Full queries   │     │  JSONB blob     │     │  Anonymized     │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+**Retention Policies:**
+
+```javascript
+const RetentionPolicies = {
+  ORDERS: {
+    hotStorageDays: 730,        // 2 years in PostgreSQL
+    archiveRetentionDays: 2555, // 7 years total
+    anonymizeAfterDays: 2555    // Remove PII after 7 years
+  },
+  CART_ITEMS: {
+    reservationMinutes: 30      // Short-lived
+  },
+  AUDIT_LOGS: {
+    hotStorageDays: 365,        // 1 year queryable
+    archiveRetentionDays: 1095  // 3 years total
+  }
+};
+```
+
+**Archival Process:**
+1. **Identify**: Find orders older than 2 years with completed/cancelled status
+2. **Export**: Serialize full order with items to JSONB
+3. **Store**: Insert into `orders_archive` table
+4. **Clean**: Remove PII from original order (shipping address, notes)
+5. **Mark**: Set `archive_status = 'archived'`
+
+**Why This Works:**
+- **Query Performance**: Hot storage stays small and fast
+- **Cost Efficiency**: Cold storage is 10x cheaper per GB
+- **Legal Compliance**: 7-year retention maintained
+- **Privacy Compliance**: GDPR/CCPA anonymization after retention period
+- **Recoverability**: Archived data retrievable for disputes
+
+**Automated Jobs:**
+```javascript
+// Run daily at 3 AM
+setInterval(runArchivalJobs, 24 * 60 * 60 * 1000);
+
+// Jobs run:
+// - cleanupExpiredCartItems (every 5 minutes)
+// - cleanupIdempotencyKeys (hourly)
+// - archiveOrders (daily)
+// - anonymizeOldOrders (daily)
+```
+
+See: `/backend/src/shared/archival.js`
+
+---
+
+### Observability Stack Summary
+
+The implementation provides three pillars of observability:
+
+**1. Metrics (Prometheus)**
+- Endpoint: `GET /metrics`
+- Key metrics: `orders_total`, `order_value_dollars`, `circuit_breaker_state`
+- Dashboards: Order rates, payment success, search latency
+
+**2. Logging (Pino JSON)**
+- Structured JSON format for log aggregation
+- Correlation IDs for request tracing
+- Log levels: debug/info/warn/error
+
+**3. Health Checks**
+- `GET /api/health` - Simple liveness
+- `GET /api/health/detailed` - Full service status
+- `GET /api/health/ready` - Kubernetes readiness probe
+
+**Files Added:**
+```
+backend/src/shared/
+├── logger.js          # Pino structured logging
+├── metrics.js         # Prometheus metrics
+├── circuitBreaker.js  # Opossum circuit breakers
+├── retry.js           # Exponential backoff
+├── idempotency.js     # Duplicate order prevention
+├── audit.js           # Order/payment audit trail
+└── archival.js        # Data lifecycle management
+```

@@ -40,11 +40,11 @@ const DEFAULT_OPTIONS: CircuitBreaker.Options = {
  * @param options - Circuit breaker options (merged with defaults)
  * @returns A circuit breaker instance
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
   name: string,
-  fn: T,
+  fn: (...args: TArgs) => Promise<TResult>,
   options: Partial<CircuitBreaker.Options> = {}
-): CircuitBreaker<Parameters<T>, ReturnType<T>> {
+): CircuitBreaker<TArgs, TResult> {
   const breaker = new CircuitBreaker(fn, {
     ...DEFAULT_OPTIONS,
     ...options,
@@ -79,7 +79,7 @@ export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<u
   // Initialize state to closed
   circuitBreakerState.set({ service: name }, 0);
 
-  return breaker as CircuitBreaker<Parameters<T>, ReturnType<T>>;
+  return breaker;
 }
 
 /**

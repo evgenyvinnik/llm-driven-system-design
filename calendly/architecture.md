@@ -847,4 +847,156 @@ services:
 
 ---
 
+## Implementation Notes
+
+This section documents the reasoning behind key implementation decisions in the codebase.
+
+### Why Idempotency Prevents Double-Bookings
+
+**The Problem:**
+When a client submits a booking request, network issues or timeouts may cause them to retry the same request. Without idempotency handling, this can result in duplicate bookings:
+
+1. First request succeeds and creates booking A
+2. Client doesn't receive response (network timeout)
+3. Client retries with identical data
+4. Second request creates duplicate booking B
+5. Host now has two overlapping meetings
+
+**The Solution:**
+The booking creation endpoint (`POST /api/bookings`) implements idempotency at two levels:
+
+1. **Client-Provided Keys:** Clients can include an `X-Idempotency-Key` header. The system stores the result in Redis with this key. Subsequent requests with the same key return the cached result.
+
+2. **Automatic Key Generation:** Even without a header, the system generates a deterministic key from `meeting_type_id + start_time + invitee_email`. This prevents accidental duplicates when the same invitee books the same slot.
+
+**Implementation Details:**
+- Keys are stored in Redis with a 1-hour TTL (`IDEMPOTENCY_CONFIG.KEY_TTL_SECONDS`)
+- A distributed lock prevents race conditions during concurrent retries
+- The idempotency key is also stored in the database for audit purposes
+
+**Files:**
+- `/backend/src/shared/idempotency.ts` - Idempotency service
+- `/backend/src/services/bookingService.ts` - Integration in `createBooking()`
+- `/backend/src/routes/bookings.ts` - Header extraction
+
+### Why Meeting Archival Balances History vs Storage Costs
+
+**The Problem:**
+Scheduling systems accumulate booking data rapidly. A system with 1M users averaging 3 bookings/week generates ~157M bookings/year. Without data lifecycle management:
+- Database tables grow unbounded, slowing queries
+- Index maintenance becomes expensive
+- Backup and restore times increase
+- Storage costs escalate
+
+**The Solution:**
+A tiered retention strategy that balances operational needs with cost:
+
+| Data State | Location | Retention | Purpose |
+|------------|----------|-----------|---------|
+| Active bookings | `bookings` table | Indefinite | Fast queries for scheduling |
+| Completed (recent) | `bookings` table | 90 days | Rescheduling reference, analytics |
+| Archived | `bookings_archive` table | 2 years | Legal/audit compliance |
+| Expired | Deleted | - | Free storage |
+
+**Why These Retention Periods?**
+- **90 days in active table:** Covers most rescheduling scenarios and monthly reporting needs while keeping the working set small enough for fast queries.
+- **2 years in archive:** Meets typical legal requirements for business records and provides sufficient history for analytics.
+
+**Implementation Details:**
+- Archival is triggered by `npm run db:archive-bookings` (run as a cron job)
+- The `archived_at` timestamp tracks when data was moved
+- Archive table has the same schema plus `archived_at` column
+- Restoration is possible via `archivalService.restoreArchivedBookings()`
+
+**Files:**
+- `/backend/src/services/archivalService.ts` - Archival logic
+- `/backend/src/shared/config.ts` - Retention configuration (`RETENTION_CONFIG`)
+- `/backend/src/db/migrations/001_add_bookings_archive.sql` - Archive table schema
+
+### Why Metrics Enable Availability Optimization
+
+**The Problem:**
+Availability calculation is the hottest path in a scheduling system (100 availability checks per booking). Without visibility into this operation:
+- You can't identify performance bottlenecks
+- Cache effectiveness is unknown
+- You can't proactively optimize before users complain
+
+**The Solution:**
+Prometheus metrics at `/metrics` provide real-time observability:
+
+**Booking Metrics:**
+- `calendly_booking_operations_total{operation, status}` - Count of create/cancel/reschedule operations
+- `calendly_booking_creation_duration_seconds{status}` - Latency histogram with p50/p95/p99
+- `calendly_double_booking_prevented_total` - Should remain at zero in normal operation
+
+**Availability Metrics:**
+- `calendly_availability_checks_total{cache_hit}` - Cache effectiveness tracking
+- `calendly_availability_calculation_duration_seconds{cache_hit}` - Calculation time by cache status
+
+**Cache Metrics:**
+- `calendly_cache_operations_total{operation, cache_type}` - Hit/miss/set/delete counts
+- Target: 80% cache hit rate (minimum 70%)
+
+**How This Enables Optimization:**
+1. **Low cache hit rate?** Increase TTL or pre-warm cache for popular users
+2. **High calculation latency?** Add indexes or simplify availability rules
+3. **Many double-booking preventions?** Potential race condition in frontend
+4. **Queue lag growing?** Scale notification workers
+
+**Alert Thresholds:**
+Configured in `ALERT_THRESHOLDS` in `/backend/src/shared/config.ts`:
+- Booking p95 latency warning: 500ms
+- Cache hit rate minimum: 70%
+- Queue depth warnings at 100/500 messages
+
+**Files:**
+- `/backend/src/shared/metrics.ts` - Prometheus metric definitions
+- `/backend/src/index.ts` - `/metrics` endpoint
+- `/backend/src/shared/config.ts` - Alert thresholds
+
+### Why Health Checks Enable Calendar Sync Reliability
+
+**The Problem:**
+External calendar APIs (Google, Outlook) are third-party dependencies. If they become unavailable:
+- New bookings might conflict with external events
+- Calendar events might not be created
+- Users lose trust in the system
+
+**The Solution:**
+Multi-level health checks that detect and communicate failures:
+
+**Health Check Endpoints:**
+| Endpoint | Purpose | Response |
+|----------|---------|----------|
+| `GET /health` | Load balancer check | Quick database + Redis ping |
+| `GET /health/detailed` | Debugging | Component status with latencies |
+| `GET /health/live` | K8s liveness | Process is running |
+| `GET /health/ready` | K8s readiness | Ready to accept traffic |
+
+**Health Status Levels:**
+- `healthy` - All systems operational
+- `degraded` - Some issues but functional (e.g., elevated latency)
+- `unhealthy` - Critical failure, should not receive traffic
+
+**Calendar Sync Reliability:**
+The health check system supports calendar sync reliability by:
+1. **Detecting Redis failures** - If Redis is down, calendar cache is stale
+2. **Monitoring database connectivity** - Calendar events are persisted here
+3. **Tracking sync lag** - `calendly_calendar_sync_lag_seconds` metric
+4. **Alert thresholds** - Warning at 30 min lag, critical at 1 hour
+
+**Graceful Degradation:**
+When calendar sync is unavailable:
+- Availability calculation uses cached data
+- Booking still succeeds (with warning)
+- Calendar event creation is queued for retry
+- User is notified of potential conflicts
+
+**Files:**
+- `/backend/src/shared/health.ts` - Health check logic
+- `/backend/src/index.ts` - Health endpoints
+- `/backend/src/shared/config.ts` - `ALERT_THRESHOLDS.CALENDAR_SYNC`
+
+---
+
 *This architecture is designed for educational purposes to demonstrate key concepts in building a scheduling platform. Production systems would require additional considerations around disaster recovery, multi-region deployment, and advanced security measures.*

@@ -5,6 +5,14 @@ import {
   RegisterDeviceResponse,
 } from "../types/index.js";
 import { hashToken, generateUUID } from "../utils/index.js";
+import {
+  getTokenFromCache,
+  setTokenInCache,
+  setTokenInvalidInCache,
+  invalidateTokenCache,
+} from "../shared/cache.js";
+import { tokenOperations } from "../shared/metrics.js";
+import { logger, auditToken } from "../shared/logger.js";
 
 /**
  * Token Registry Service.
@@ -46,6 +54,16 @@ export class TokenRegistry {
         [tokenHash, deviceInfo ? JSON.stringify(deviceInfo) : null]
       );
 
+      // Invalidate cache to ensure fresh data on next lookup
+      await invalidateTokenCache(tokenHash);
+
+      tokenOperations.inc({ operation: "register_update" });
+      auditToken("registered", tokenHash.substring(0, 8), {
+        appBundleId,
+        isNew: false,
+        actor: "provider",
+      });
+
       return { device_id: existing.rows[0].device_id, is_new: false };
     }
 
@@ -57,12 +75,20 @@ export class TokenRegistry {
       [deviceId, tokenHash, appBundleId, deviceInfo ? JSON.stringify(deviceInfo) : null]
     );
 
+    tokenOperations.inc({ operation: "register" });
+    auditToken("registered", tokenHash.substring(0, 8), {
+      appBundleId,
+      isNew: true,
+      actor: "provider",
+    });
+
     return { device_id: deviceId, is_new: true };
   }
 
   /**
    * Looks up a device by its raw token.
    * Only returns valid (non-invalidated) devices.
+   * Uses cache-aside pattern for performance.
    *
    * @param token - Raw device token to look up
    * @returns Device record or null if not found/invalid
@@ -70,6 +96,14 @@ export class TokenRegistry {
   async lookup(token: string): Promise<DeviceToken | null> {
     const tokenHash = hashToken(token);
 
+    // Check cache first (cache-aside pattern)
+    const cached = await getTokenFromCache(tokenHash);
+    if (cached) {
+      tokenOperations.inc({ operation: "lookup" });
+      return cached;
+    }
+
+    // Cache miss - query database
     const result = await db.query<DeviceToken>(
       `SELECT * FROM device_tokens
        WHERE token_hash = $1 AND is_valid = true`,
@@ -77,10 +111,24 @@ export class TokenRegistry {
     );
 
     if (result.rows.length === 0) {
+      // Cache the negative result to prevent repeated DB queries
+      await setTokenInvalidInCache(tokenHash, "not_found");
+      auditToken("lookup_failed", tokenHash.substring(0, 8), {
+        reason: "not_found",
+      });
       return null;
     }
 
-    return result.rows[0];
+    // Populate cache for future lookups
+    const device = result.rows[0];
+    await setTokenInCache(tokenHash, device);
+
+    tokenOperations.inc({ operation: "lookup" });
+    auditToken("lookup_success", tokenHash.substring(0, 8), {
+      appBundleId: device.app_bundle_id,
+    });
+
+    return device;
   }
 
   /**
@@ -107,6 +155,7 @@ export class TokenRegistry {
    * Marks a device token as invalid and records the reason.
    * Adds an entry to the feedback queue for app providers to retrieve.
    * Called when a push fails with "Unregistered" or app explicitly unregisters.
+   * Invalidates the cache to ensure consistency.
    *
    * @param token - Raw device token to invalidate
    * @param reason - Reason for invalidation (e.g., "Uninstalled", "TokenExpired")
@@ -120,6 +169,9 @@ export class TokenRegistry {
        WHERE token_hash = $1`,
       [tokenHash, reason]
     );
+
+    // Invalidate cache immediately
+    await invalidateTokenCache(tokenHash);
 
     // Get token info for feedback queue
     const tokenInfo = await db.query<DeviceToken>(
@@ -140,6 +192,13 @@ export class TokenRegistry {
         ]
       );
     }
+
+    tokenOperations.inc({ operation: "invalidate" });
+    auditToken("invalidated", tokenHash.substring(0, 8), {
+      reason,
+      actor: "system",
+      appBundleId: tokenInfo.rows[0]?.app_bundle_id,
+    });
   }
 
   /**

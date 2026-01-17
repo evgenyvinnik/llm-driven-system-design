@@ -10,7 +10,7 @@
  * - Retryable error classification
  * - Idempotency key support for safe retries
  */
-import { logger } from './logger.js';
+import { logger } from '../services/logger.js';
 
 /**
  * Configuration options for retry behavior.

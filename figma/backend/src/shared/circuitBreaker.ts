@@ -3,7 +3,7 @@
  * Protects against cascading failures in database and external service calls.
  * Enables graceful degradation when dependencies are unhealthy.
  */
-import CircuitBreaker from 'opossum';
+import CircuitBreaker, { Options } from 'opossum';
 import { logger } from './logger.js';
 import { circuitBreakerCounter, circuitBreakerStateGauge } from './metrics.js';
 
@@ -83,18 +83,18 @@ enum CircuitState {
  * @param config - Circuit breaker configuration
  * @returns Wrapped function with circuit breaker protection
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+export function createCircuitBreaker<TArgs extends unknown[], TResult>(
   name: string,
-  fn: T,
+  fn: (...args: TArgs) => Promise<TResult>,
   config: CircuitBreakerConfig = defaultConfig
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
+): CircuitBreaker<TArgs, TResult> {
   const breaker = new CircuitBreaker(fn, {
     timeout: config.timeout,
     errorThresholdPercentage: config.errorThresholdPercentage,
     resetTimeout: config.resetTimeout,
     volumeThreshold: config.volumeThreshold,
     name,
-  });
+  } as Options);
 
   // Set initial state
   circuitBreakerStateGauge.set({ circuit: name }, CircuitState.CLOSED);

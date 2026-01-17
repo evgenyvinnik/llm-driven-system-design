@@ -177,7 +177,7 @@ router.get('/search', async (req: Request, res: Response) => {
     );
 
     // Preserve search result order
-    const articleMap = new Map(articles.map((a: { id: string }) => [a.id, a]));
+    const articleMap = new Map((articles as { id: string }[]).map((a) => [a.id, a]));
     const orderedArticles = articleIds
       .map(id => articleMap.get(id))
       .filter(Boolean);

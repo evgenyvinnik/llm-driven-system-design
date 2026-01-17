@@ -90,7 +90,7 @@ export async function checkIdempotency<T>(
 
     // Try to acquire lock for processing
     // NX = only set if not exists, EX = expire in seconds
-    const lockAcquired = await redis.set(lockKey, '1', 'NX', 'EX', 30);
+    const lockAcquired = await redis.set(lockKey, '1', 'EX', 30, 'NX');
 
     if (!lockAcquired) {
       // Another request is processing this key - wait and check again

@@ -12,6 +12,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { ingestMetrics, getMetricDefinitions, getMetricNames, getTagKeys, getTagValues } from '../services/metricsService.js';
 import { queryMetrics, getLatestValue, getMetricStats } from '../services/queryService.js';
+import logger from '../shared/logger.js';
 
 const router = Router();
 
@@ -64,7 +65,7 @@ router.post('/ingest', async (req: Request, res: Response) => {
 
     res.json({ accepted: count });
   } catch (error) {
-    console.error('Ingestion error:', error);
+    logger.error({ error }, 'Ingestion error');
     res.status(500).json({ error: 'Failed to ingest metrics' });
   }
 });
@@ -114,7 +115,7 @@ router.post('/query', async (req: Request, res: Response) => {
 
     res.json({ results });
   } catch (error) {
-    console.error('Query error:', error);
+    logger.error({ error }, 'Query error');
     res.status(500).json({ error: 'Failed to query metrics' });
   }
 });
@@ -140,7 +141,7 @@ router.get('/latest/:metricName', async (req: Request, res: Response) => {
 
     res.json(result);
   } catch (error) {
-    console.error('Get latest error:', error);
+    logger.error({ error, metricName: req.params.metricName }, 'Get latest error');
     res.status(500).json({ error: 'Failed to get latest value' });
   }
 });
@@ -174,7 +175,7 @@ router.get('/stats/:metricName', async (req: Request, res: Response) => {
 
     res.json(result);
   } catch (error) {
-    console.error('Get stats error:', error);
+    logger.error({ error, metricName: req.params.metricName }, 'Get stats error');
     res.status(500).json({ error: 'Failed to get statistics' });
   }
 });
@@ -196,7 +197,7 @@ router.get('/definitions', async (req: Request, res: Response) => {
 
     res.json({ definitions });
   } catch (error) {
-    console.error('Get definitions error:', error);
+    logger.error({ error }, 'Get definitions error');
     res.status(500).json({ error: 'Failed to get definitions' });
   }
 });
@@ -212,7 +213,7 @@ router.get('/names', async (req: Request, res: Response) => {
     const names = await getMetricNames();
     res.json({ names });
   } catch (error) {
-    console.error('Get names error:', error);
+    logger.error({ error }, 'Get names error');
     res.status(500).json({ error: 'Failed to get metric names' });
   }
 });
@@ -230,7 +231,7 @@ router.get('/tags/keys', async (req: Request, res: Response) => {
     const keys = await getTagKeys(metricName);
     res.json({ keys });
   } catch (error) {
-    console.error('Get tag keys error:', error);
+    logger.error({ error }, 'Get tag keys error');
     res.status(500).json({ error: 'Failed to get tag keys' });
   }
 });
@@ -250,7 +251,7 @@ router.get('/tags/values/:key', async (req: Request, res: Response) => {
     const values = await getTagValues(key, metricName);
     res.json({ values });
   } catch (error) {
-    console.error('Get tag values error:', error);
+    logger.error({ error, key: req.params.key }, 'Get tag values error');
     res.status(500).json({ error: 'Failed to get tag values' });
   }
 });

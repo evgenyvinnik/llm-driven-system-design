@@ -48,7 +48,25 @@ services:
       timeout: 10s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: jira-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: jira
+      RABBITMQ_DEFAULT_PASS: jira_dev
+    ports:
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
 volumes:
   postgres_data:
   redis_data:
   elasticsearch_data:
+  rabbitmq_data:

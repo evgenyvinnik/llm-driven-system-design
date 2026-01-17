@@ -5,12 +5,8 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import pool, { query, execute, queryOne } from './postgres.js';
 import { logger } from '../shared/logger.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 /**
  * Represents a migration file with version and SQL content.
@@ -31,8 +27,9 @@ interface MigrationRecord {
 
 /**
  * Path to the migrations directory.
+ * Uses process.cwd() to find the project root.
  */
-const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
+const MIGRATIONS_DIR = path.join(process.cwd(), 'src', 'db', 'migrations');
 
 /**
  * Parses migration files from the migrations directory.

@@ -3,8 +3,20 @@ import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
 import { getSignedDownloadUrl, getPublicUrl, BUCKETS } from '../services/minio.js';
 import { authenticate, optionalAuth } from '../middleware/auth.js';
+import { streamStartLatency, activeStreams, streamsTotal, cacheHits } from '../shared/metrics.js';
+import { logger, logStreamEvent } from '../shared/logger.js';
 
 const router = Router();
+
+/**
+ * Streaming routes with comprehensive metrics.
+ *
+ * Metrics tracked:
+ * - Stream start latency (time to first byte)
+ * - Active streams count (for capacity planning)
+ * - Total streams by quality and subscription tier
+ * - Cache hits for stream URL generation
+ */
 
 // Quality options and their settings
 const QUALITY_OPTIONS = {
@@ -50,10 +62,13 @@ function selectQuality(preferred, network, maxTierQuality) {
 
 // Get stream URL for a track
 router.get('/:trackId', authenticate, async (req, res) => {
+  const startTime = Date.now();
+
   try {
     const { trackId } = req.params;
     const { quality: preferredQuality, network = 'wifi' } = req.query;
     const userId = req.user.id;
+    const subscriptionTier = req.user.subscriptionTier || 'free';
 
     // Get track info
     const trackResult = await pool.query(
@@ -72,7 +87,7 @@ router.get('/:trackId', authenticate, async (req, res) => {
     const track = trackResult.rows[0];
 
     // Determine quality
-    const maxTierQuality = TIER_MAX_QUALITY[req.user.subscriptionTier] || '256_aac';
+    const maxTierQuality = TIER_MAX_QUALITY[subscriptionTier] || '256_aac';
     const userPreferred = preferredQuality || req.user.preferredQuality || '256_aac';
     const quality = selectQuality(userPreferred, network, maxTierQuality);
 
@@ -89,6 +104,7 @@ router.get('/:trackId', authenticate, async (req, res) => {
       audioFile = audioFileResult.rows[0];
       // Generate signed URL
       streamUrl = await getSignedDownloadUrl(BUCKETS.AUDIO, audioFile.minio_key, 3600);
+      cacheHits.inc({ cache: 'audio_file', result: 'hit' });
     } else {
       // For demo purposes, return a placeholder URL
       // In production, this would point to real audio files
@@ -102,6 +118,7 @@ router.get('/:trackId', authenticate, async (req, res) => {
         sample_rate: qualitySettings.sampleRate,
         bit_depth: qualitySettings.bitDepth
       };
+      cacheHits.inc({ cache: 'audio_file', result: 'miss' });
     }
 
     // Cache the stream info in Redis for quick access
@@ -114,6 +131,22 @@ router.get('/:trackId', authenticate, async (req, res) => {
         startedAt: Date.now()
       })
     );
+
+    // Increment active streams
+    activeStreams.inc({ quality });
+
+    // Track stream metrics
+    const latencySeconds = (Date.now() - startTime) / 1000;
+    streamStartLatency.observe({ quality, subscription_tier: subscriptionTier }, latencySeconds);
+    streamsTotal.inc({ quality, subscription_tier: subscriptionTier });
+
+    // Log stream event
+    logStreamEvent('stream_started', userId, trackId, {
+      quality,
+      subscriptionTier,
+      network,
+      latencyMs: Date.now() - startTime
+    });
 
     res.json({
       track,
@@ -128,16 +161,19 @@ router.get('/:trackId', authenticate, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get stream error:', error);
+    logger.error({ err: error, trackId: req.params.trackId }, 'Get stream error');
     res.status(500).json({ error: 'Failed to get stream' });
   }
 });
 
 // Prefetch next track (for gapless playback)
 router.post('/prefetch', authenticate, async (req, res) => {
+  const startTime = Date.now();
+
   try {
     const { trackId, quality: preferredQuality, network = 'wifi' } = req.body;
     const userId = req.user.id;
+    const subscriptionTier = req.user.subscriptionTier || 'free';
 
     // Get track info
     const trackResult = await pool.query(
@@ -156,7 +192,7 @@ router.post('/prefetch', authenticate, async (req, res) => {
     const track = trackResult.rows[0];
 
     // Determine quality
-    const maxTierQuality = TIER_MAX_QUALITY[req.user.subscriptionTier] || '256_aac';
+    const maxTierQuality = TIER_MAX_QUALITY[subscriptionTier] || '256_aac';
     const userPreferred = preferredQuality || req.user.preferredQuality || '256_aac';
     const quality = selectQuality(userPreferred, network, maxTierQuality);
 
@@ -174,6 +210,12 @@ router.post('/prefetch', authenticate, async (req, res) => {
       })
     );
 
+    // Log prefetch event
+    logStreamEvent('stream_prefetch', userId, trackId, {
+      quality,
+      latencyMs: Date.now() - startTime
+    });
+
     res.json({
       track,
       stream: {
@@ -186,7 +228,7 @@ router.post('/prefetch', authenticate, async (req, res) => {
       prefetched: true
     });
   } catch (error) {
-    console.error('Prefetch error:', error);
+    logger.error({ err: error, trackId: req.body.trackId }, 'Prefetch error');
     res.status(500).json({ error: 'Failed to prefetch' });
   }
 });
@@ -225,7 +267,7 @@ router.get('/:trackId/qualities', optionalAuth, async (req, res) => {
       }))
     });
   } catch (error) {
-    console.error('Get qualities error:', error);
+    logger.error({ err: error, trackId: req.params.trackId }, 'Get qualities error');
     res.status(500).json({ error: 'Failed to get qualities' });
   }
 });
@@ -261,11 +303,24 @@ router.post('/progress', authenticate, async (req, res) => {
         'UPDATE tracks SET play_count = play_count + 1 WHERE id = $1',
         [trackId]
       );
+
+      // Decrement active streams when playback completes
+      // Get the quality from Redis cache to decrement correctly
+      const streamInfo = await redis.get(`stream:${userId}:${trackId}`);
+      if (streamInfo) {
+        const { quality } = JSON.parse(streamInfo);
+        activeStreams.dec({ quality });
+        await redis.del(`stream:${userId}:${trackId}`);
+      }
+
+      logStreamEvent('stream_completed', userId, trackId, {
+        durationPlayedMs: position
+      });
     }
 
     res.json({ message: 'Progress updated' });
   } catch (error) {
-    console.error('Update progress error:', error);
+    logger.error({ err: error, trackId: req.body.trackId }, 'Update progress error');
     res.status(500).json({ error: 'Failed to update progress' });
   }
 });
@@ -306,8 +361,31 @@ router.get('/playback/current', authenticate, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get playback error:', error);
+    logger.error({ err: error }, 'Get playback error');
     res.status(500).json({ error: 'Failed to get playback state' });
+  }
+});
+
+// Report stream end (explicit stop/skip)
+router.post('/end', authenticate, async (req, res) => {
+  try {
+    const { trackId, reason } = req.body;
+    const userId = req.user.id;
+
+    // Get stream info and decrement active streams
+    const streamInfo = await redis.get(`stream:${userId}:${trackId}`);
+    if (streamInfo) {
+      const { quality } = JSON.parse(streamInfo);
+      activeStreams.dec({ quality });
+      await redis.del(`stream:${userId}:${trackId}`);
+    }
+
+    logStreamEvent('stream_ended', userId, trackId, { reason });
+
+    res.json({ message: 'Stream ended' });
+  } catch (error) {
+    logger.error({ err: error, trackId: req.body.trackId }, 'End stream error');
+    res.status(500).json({ error: 'Failed to end stream' });
   }
 });
 

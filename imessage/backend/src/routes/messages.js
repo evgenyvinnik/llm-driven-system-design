@@ -12,8 +12,12 @@ import {
   markAsRead,
   getReadReceipts,
 } from '../services/messages.js';
+import { messageRateLimiter } from '../shared/rate-limiter.js';
+import { idempotencyMiddleware } from '../shared/idempotency.js';
+import { createLogger } from '../shared/logger.js';
 
 const router = Router();
+const logger = createLogger('messages-routes');
 
 router.use(authenticateRequest);
 
@@ -37,7 +41,7 @@ router.get('/conversation/:conversationId', async (req, res) => {
 
     res.json({ messages });
   } catch (error) {
-    console.error('Get messages error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Get messages error');
     res.status(500).json({ error: 'Failed to get messages' });
   }
 });
@@ -58,38 +62,50 @@ router.get('/:id', async (req, res) => {
 
     res.json({ message });
   } catch (error) {
-    console.error('Get message error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Get message error');
     res.status(500).json({ error: 'Failed to get message' });
   }
 });
 
 // Send a message (REST fallback, WebSocket preferred)
-router.post('/conversation/:conversationId', async (req, res) => {
-  try {
-    const { conversationId } = req.params;
-    const { content, contentType, replyToId } = req.body;
+// Rate limited: 60 messages per minute per user
+// Supports idempotency via clientMessageId or X-Idempotency-Key header
+router.post('/conversation/:conversationId',
+  messageRateLimiter,
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const { conversationId } = req.params;
+      const { content, contentType, replyToId, clientMessageId } = req.body;
 
-    if (!content) {
-      return res.status(400).json({ error: 'Content is required' });
+      if (!content) {
+        return res.status(400).json({ error: 'Content is required' });
+      }
+
+      // Verify user is participant
+      const isParticipantResult = await isParticipant(conversationId, req.user.id);
+      if (!isParticipantResult) {
+        return res.status(403).json({ error: 'Not a participant of this conversation' });
+      }
+
+      const message = await sendMessage(conversationId, req.user.id, content, {
+        contentType,
+        replyToId,
+        clientMessageId: clientMessageId || req.headers['x-idempotency-key'],
+      });
+
+      // Return 200 if duplicate, 201 if new
+      const statusCode = message.isDuplicate ? 200 : 201;
+      res.status(statusCode).json({
+        message,
+        isDuplicate: message.isDuplicate || false,
+      });
+    } catch (error) {
+      logger.error({ error, userId: req.user?.id }, 'Send message error');
+      res.status(500).json({ error: 'Failed to send message' });
     }
-
-    // Verify user is participant
-    const isParticipantResult = await isParticipant(conversationId, req.user.id);
-    if (!isParticipantResult) {
-      return res.status(403).json({ error: 'Not a participant of this conversation' });
-    }
-
-    const message = await sendMessage(conversationId, req.user.id, content, {
-      contentType,
-      replyToId,
-    });
-
-    res.status(201).json({ message });
-  } catch (error) {
-    console.error('Send message error:', error);
-    res.status(500).json({ error: 'Failed to send message' });
   }
-});
+);
 
 // Edit a message
 router.patch('/:id', async (req, res) => {
@@ -103,7 +119,7 @@ router.patch('/:id', async (req, res) => {
     const message = await editMessage(req.params.id, req.user.id, content);
     res.json({ message });
   } catch (error) {
-    console.error('Edit message error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Edit message error');
     if (error.message.includes('not found')) {
       return res.status(404).json({ error: error.message });
     }
@@ -117,7 +133,7 @@ router.delete('/:id', async (req, res) => {
     await deleteMessage(req.params.id, req.user.id);
     res.json({ message: 'Message deleted' });
   } catch (error) {
-    console.error('Delete message error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Delete message error');
     if (error.message.includes('not found')) {
       return res.status(404).json({ error: error.message });
     }
@@ -137,7 +153,7 @@ router.post('/:id/reactions', async (req, res) => {
     const result = await addReaction(req.params.id, req.user.id, reaction);
     res.status(201).json(result);
   } catch (error) {
-    console.error('Add reaction error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Add reaction error');
     res.status(500).json({ error: 'Failed to add reaction' });
   }
 });
@@ -148,7 +164,7 @@ router.delete('/:id/reactions/:reaction', async (req, res) => {
     await removeReaction(req.params.id, req.user.id, req.params.reaction);
     res.json({ message: 'Reaction removed' });
   } catch (error) {
-    console.error('Remove reaction error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Remove reaction error');
     res.status(500).json({ error: 'Failed to remove reaction' });
   }
 });
@@ -172,7 +188,7 @@ router.post('/conversation/:conversationId/read', async (req, res) => {
     await markAsRead(conversationId, req.user.id, req.deviceId, messageId);
     res.json({ message: 'Marked as read' });
   } catch (error) {
-    console.error('Mark as read error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Mark as read error');
     res.status(500).json({ error: 'Failed to mark as read' });
   }
 });
@@ -191,7 +207,7 @@ router.get('/conversation/:conversationId/read-receipts', async (req, res) => {
     const receipts = await getReadReceipts(conversationId);
     res.json({ receipts });
   } catch (error) {
-    console.error('Get read receipts error:', error);
+    logger.error({ error, userId: req.user?.id }, 'Get read receipts error');
     res.status(500).json({ error: 'Failed to get read receipts' });
   }
 });

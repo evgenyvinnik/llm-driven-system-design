@@ -1,17 +1,19 @@
 /**
  * @fileoverview API routes for the rate limiting service.
  *
- * Defines three route groups:
+ * Defines four route groups:
  * - Rate limit routes: Check, query, and reset rate limits
- * - Metrics routes: Get aggregated metrics and health status
+ * - Metrics routes: Get aggregated metrics, Prometheus export, and health status
  * - Algorithm info routes: List available algorithms with documentation
+ * - Health routes: Comprehensive health check endpoints
  */
 
 import { Router, Request, Response } from 'express';
 import { RateLimiterFactory } from '../algorithms/index.js';
 import { Algorithm, RateLimitCheckRequest } from '../types/index.js';
-import { getMetrics, recordMetric } from '../utils/redis.js';
+import { getMetrics, recordMetric, getRedisStatus } from '../utils/redis.js';
 import { config } from '../config/index.js';
+import { logger, getMetricsText, getMetricsContentType } from '../shared/index.js';
 import Redis from 'ioredis';
 
 /**
@@ -38,6 +40,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
       const body = req.body as RateLimitCheckRequest;
 
       if (!body.identifier) {
+        logger.warn({ body }, 'Rate limit check missing identifier');
         return res.status(400).json({ error: 'identifier is required' });
       }
 
@@ -58,7 +61,19 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
       );
 
       const latencyMs = Date.now() - startTime;
-      await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs);
+      await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs, algorithm);
+
+      // Log rate limit decisions for audit
+      logger.debug(
+        {
+          identifier: body.identifier,
+          algorithm,
+          allowed: result.allowed,
+          remaining: result.remaining,
+          latencyMs,
+        },
+        'Rate limit check completed'
+      );
 
       // Set standard rate limit headers
       res.set({
@@ -83,7 +98,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
         latencyMs,
       });
     } catch (error) {
-      console.error('Rate limit check error:', error);
+      logger.error({ error: (error as Error).message, stack: (error as Error).stack }, 'Rate limit check error');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -117,7 +132,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
         ...result,
       });
     } catch (error) {
-      console.error('Get state error:', error);
+      logger.error({ error: (error as Error).message }, 'Get state error');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -137,13 +152,18 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
         await factory.resetAll(identifier);
       }
 
+      logger.info(
+        { identifier, algorithm: algorithm || 'all' },
+        'Rate limit reset'
+      );
+
       res.json({
         message: 'Rate limit reset successfully',
         identifier,
         algorithm: algorithm || 'all',
       });
     } catch (error) {
-      console.error('Reset error:', error);
+      logger.error({ error: (error as Error).message }, 'Reset error');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -160,10 +180,12 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
       const { checks } = req.body as { checks: RateLimitCheckRequest[] };
 
       if (!Array.isArray(checks) || checks.length === 0) {
+        logger.warn({ body: req.body }, 'Batch check missing checks array');
         return res.status(400).json({ error: 'checks array is required' });
       }
 
       if (checks.length > 100) {
+        logger.warn({ count: checks.length }, 'Batch check exceeded maximum');
         return res.status(400).json({ error: 'Maximum 100 checks per batch' });
       }
 
@@ -185,7 +207,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
             }
           );
 
-          await recordMetric(redis, result.allowed ? 'allowed' : 'denied', 0);
+          await recordMetric(redis, result.allowed ? 'allowed' : 'denied', 0, algorithm);
 
           return {
             identifier: check.identifier,
@@ -197,13 +219,18 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
 
       const latencyMs = Date.now() - startTime;
 
+      logger.debug(
+        { count: results.length, latencyMs },
+        'Batch check completed'
+      );
+
       res.json({
         results,
         count: results.length,
         latencyMs,
       });
     } catch (error) {
-      console.error('Batch check error:', error);
+      logger.error({ error: (error as Error).message }, 'Batch check error');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -213,7 +240,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
 
 /**
  * Create routes for metrics and health monitoring.
- * These endpoints support dashboards and monitoring systems.
+ * These endpoints support dashboards, Prometheus, and monitoring systems.
  *
  * @param redis - Redis client for fetching metrics and health checks
  * @returns Express router with metrics endpoints
@@ -230,41 +257,100 @@ export function createMetricsRoutes(redis: Redis): Router {
       const metrics = await getMetrics(redis);
       res.json(metrics);
     } catch (error) {
-      console.error('Metrics error:', error);
+      logger.error({ error: (error as Error).message }, 'Metrics error');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
 
   /**
+   * GET /prometheus - Prometheus metrics endpoint.
+   * Returns metrics in Prometheus text format for scraping.
+   */
+  router.get('/prometheus', async (_req: Request, res: Response) => {
+    try {
+      const metricsText = await getMetricsText();
+      res.set('Content-Type', getMetricsContentType());
+      res.send(metricsText);
+    } catch (error) {
+      logger.error({ error: (error as Error).message }, 'Prometheus metrics error');
+      res.status(500).send('# Error collecting metrics');
+    }
+  });
+
+  /**
    * GET /health - Health check endpoint for load balancers and monitoring.
-   * Returns Redis connection status and server uptime.
+   * Returns comprehensive health status including Redis, circuit breaker, and uptime.
    */
   router.get('/health', async (_req: Request, res: Response) => {
     try {
-      const pingStart = Date.now();
-      await redis.ping();
-      const redisPingMs = Date.now() - pingStart;
+      const redisStatus = await getRedisStatus();
+      const isHealthy = redisStatus.connected &&
+        redisStatus.circuitBreakerState !== 'open' &&
+        (redisStatus.pingMs === undefined || redisStatus.pingMs < config.health.maxRedisLatencyMs);
 
-      res.json({
-        status: 'healthy',
-        redis: {
-          connected: true,
-          pingMs: redisPingMs,
-        },
-        uptime: process.uptime(),
+      const healthResponse = {
+        status: isHealthy ? 'healthy' : 'degraded',
         timestamp: Date.now(),
-      });
+        uptime: process.uptime(),
+        version: process.env.npm_package_version || '1.0.0',
+        redis: {
+          connected: redisStatus.connected,
+          circuitBreaker: redisStatus.circuitBreakerState,
+          pingMs: redisStatus.pingMs,
+          lastError: redisStatus.lastError,
+        },
+        config: {
+          degradationMode: config.degradation.mode,
+          port: config.port,
+        },
+      };
+
+      if (isHealthy) {
+        res.json(healthResponse);
+      } else {
+        // Return 503 for degraded state but still return health info
+        res.status(503).json(healthResponse);
+      }
     } catch (error) {
+      logger.error({ error: (error as Error).message }, 'Health check error');
       res.status(503).json({
         status: 'unhealthy',
-        redis: {
-          connected: false,
-          error: (error as Error).message,
-        },
-        uptime: process.uptime(),
         timestamp: Date.now(),
+        uptime: process.uptime(),
+        error: (error as Error).message,
       });
     }
+  });
+
+  /**
+   * GET /ready - Kubernetes readiness probe.
+   * Returns 200 if the service is ready to accept traffic.
+   */
+  router.get('/ready', async (_req: Request, res: Response) => {
+    try {
+      const redisStatus = await getRedisStatus();
+
+      if (redisStatus.connected) {
+        res.json({ ready: true });
+      } else {
+        // Even if Redis is down, service may be ready if using fail-open
+        if (config.degradation.mode === 'allow') {
+          res.json({ ready: true, warning: 'Redis unavailable, using fallback' });
+        } else {
+          res.status(503).json({ ready: false, reason: 'Redis unavailable' });
+        }
+      }
+    } catch (error) {
+      res.status(503).json({ ready: false, error: (error as Error).message });
+    }
+  });
+
+  /**
+   * GET /live - Kubernetes liveness probe.
+   * Returns 200 if the service is alive.
+   */
+  router.get('/live', (_req: Request, res: Response) => {
+    res.json({ alive: true, timestamp: Date.now() });
   });
 
   return router;

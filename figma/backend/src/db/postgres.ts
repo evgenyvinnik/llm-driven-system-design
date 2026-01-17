@@ -1,4 +1,5 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
+import { logger, dbLatencyHistogram } from '../shared/index.js';
 
 /**
  * PostgreSQL connection pool for the Figma clone application.
@@ -17,6 +18,21 @@ const pool = new Pool({
 });
 
 /**
+ * Determines the query type from SQL for metrics labeling.
+ * @param sql - The SQL query string
+ * @returns Query type label
+ */
+function getQueryType(sql: string): string {
+  const trimmed = sql.trim().toUpperCase();
+  if (trimmed.startsWith('SELECT')) return 'select';
+  if (trimmed.startsWith('INSERT')) return 'insert';
+  if (trimmed.startsWith('UPDATE')) return 'update';
+  if (trimmed.startsWith('DELETE')) return 'delete';
+  if (trimmed.startsWith('CREATE') || trimmed.startsWith('ALTER') || trimmed.startsWith('DROP')) return 'ddl';
+  return 'other';
+}
+
+/**
  * Executes a SQL query and returns all matching rows.
  * Used for fetching multiple records like file lists or version history.
  * @param text - The SQL query string with optional $1, $2, etc. placeholders
@@ -24,8 +40,21 @@ const pool = new Pool({
  * @returns Promise resolving to an array of typed rows
  */
 export async function query<T>(text: string, params?: unknown[]): Promise<T[]> {
-  const result = await pool.query(text, params);
-  return result.rows as T[];
+  const start = Date.now();
+  const queryType = getQueryType(text);
+
+  try {
+    const result = await pool.query(text, params);
+    const duration = (Date.now() - start) / 1000;
+
+    dbLatencyHistogram.observe({ query_type: queryType }, duration);
+    logger.debug({ queryType, duration, rows: result.rowCount }, 'Query executed');
+
+    return result.rows as T[];
+  } catch (error) {
+    logger.error({ queryType, error, query: text.substring(0, 100) }, 'Query failed');
+    throw error;
+  }
 }
 
 /**
@@ -36,8 +65,21 @@ export async function query<T>(text: string, params?: unknown[]): Promise<T[]> {
  * @returns Promise resolving to a single typed row or null if not found
  */
 export async function queryOne<T>(text: string, params?: unknown[]): Promise<T | null> {
-  const result = await pool.query(text, params);
-  return (result.rows[0] as T) || null;
+  const start = Date.now();
+  const queryType = getQueryType(text);
+
+  try {
+    const result = await pool.query(text, params);
+    const duration = (Date.now() - start) / 1000;
+
+    dbLatencyHistogram.observe({ query_type: queryType }, duration);
+    logger.debug({ queryType, duration, found: result.rows.length > 0 }, 'Query executed');
+
+    return (result.rows[0] as T) || null;
+  } catch (error) {
+    logger.error({ queryType, error, query: text.substring(0, 100) }, 'Query failed');
+    throw error;
+  }
 }
 
 /**
@@ -48,8 +90,49 @@ export async function queryOne<T>(text: string, params?: unknown[]): Promise<T |
  * @returns Promise resolving to the number of affected rows
  */
 export async function execute(text: string, params?: unknown[]): Promise<number> {
-  const result = await pool.query(text, params);
-  return result.rowCount || 0;
+  const start = Date.now();
+  const queryType = getQueryType(text);
+
+  try {
+    const result = await pool.query(text, params);
+    const duration = (Date.now() - start) / 1000;
+
+    dbLatencyHistogram.observe({ query_type: queryType }, duration);
+    logger.debug({ queryType, duration, rowCount: result.rowCount }, 'Command executed');
+
+    return result.rowCount || 0;
+  } catch (error) {
+    logger.error({ queryType, error, query: text.substring(0, 100) }, 'Command failed');
+    throw error;
+  }
+}
+
+/**
+ * Executes a function within a database transaction.
+ * Automatically commits on success and rolls back on error.
+ * @param fn - Function to execute within the transaction
+ * @returns Promise resolving to the function's return value
+ */
+export async function withTransaction<T>(
+  fn: (client: PoolClient) => Promise<T>
+): Promise<T> {
+  const client = await pool.connect();
+  const start = Date.now();
+
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+
+    logger.debug({ duration: Date.now() - start }, 'Transaction committed');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error({ duration: Date.now() - start, error }, 'Transaction rolled back');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -60,12 +143,24 @@ export async function execute(text: string, params?: unknown[]): Promise<number>
 export async function testConnection(): Promise<boolean> {
   try {
     await pool.query('SELECT NOW()');
-    console.log('PostgreSQL connected successfully');
+    logger.info('PostgreSQL connected successfully');
     return true;
   } catch (error) {
-    console.error('PostgreSQL connection failed:', error);
+    logger.error({ error }, 'PostgreSQL connection failed');
     return false;
   }
+}
+
+/**
+ * Gets pool statistics for monitoring.
+ * @returns Pool statistics object
+ */
+export function getPoolStats() {
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+  };
 }
 
 export default pool;

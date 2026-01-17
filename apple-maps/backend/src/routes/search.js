@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import searchService from '../services/searchService.js';
+import logger from '../shared/logger.js';
 
 const router = Router();
 
@@ -30,7 +31,7 @@ router.get('/', async (req, res) => {
       results: places,
     });
   } catch (error) {
-    console.error('Search error:', error);
+    logger.error({ error: error.message, path: '/api/search' }, 'Search error');
     res.status(500).json({
       error: 'Search failed',
     });
@@ -58,7 +59,7 @@ router.get('/geocode', async (req, res) => {
       results,
     });
   } catch (error) {
-    console.error('Geocode error:', error);
+    logger.error({ error: error.message, path: '/api/search/geocode' }, 'Geocode error');
     res.status(500).json({
       error: 'Geocoding failed',
     });
@@ -89,7 +90,7 @@ router.get('/reverse', async (req, res) => {
       result,
     });
   } catch (error) {
-    console.error('Reverse geocode error:', error);
+    logger.error({ error: error.message, path: '/api/search/reverse' }, 'Reverse geocode error');
     res.status(500).json({
       error: 'Reverse geocoding failed',
     });
@@ -115,7 +116,7 @@ router.get('/places/:id', async (req, res) => {
       place,
     });
   } catch (error) {
-    console.error('Place details error:', error);
+    logger.error({ error: error.message, placeId: req.params.id }, 'Place details error');
     res.status(500).json({
       error: 'Failed to fetch place details',
     });
@@ -135,7 +136,7 @@ router.get('/categories', async (req, res) => {
       categories,
     });
   } catch (error) {
-    console.error('Categories error:', error);
+    logger.error({ error: error.message }, 'Categories error');
     res.status(500).json({
       error: 'Failed to fetch categories',
     });

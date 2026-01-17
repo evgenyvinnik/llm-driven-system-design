@@ -10,6 +10,7 @@ import { getAllUsers } from '../services/authService.js';
 import { getAllPosts, getPostStats } from '../services/postService.js';
 import { query } from '../config/database.js';
 import { esClient, POSTS_INDEX } from '../config/elasticsearch.js';
+import { performHealthCheck, logger } from '../shared/index.js';
 
 /**
  * Handles GET /api/v1/admin/stats - System statistics.
@@ -183,47 +184,20 @@ export async function reindexPosts(_req: AuthenticatedRequest, res: Response): P
  * Handles GET /api/v1/admin/health - System health check.
  * Tests connectivity to PostgreSQL, Elasticsearch, and Redis.
  * Returns 200 if all services are healthy, 503 if any are degraded.
+ * Uses the comprehensive health check service for detailed status.
  * @param _req - Request (unused)
  * @param res - Response with health status for each service
  */
 export async function healthCheck(_req: AuthenticatedRequest, res: Response): Promise<void> {
-  const health: {
-    status: string;
-    postgres: boolean;
-    elasticsearch: boolean;
-    redis: boolean;
-  } = {
-    status: 'ok',
-    postgres: false,
-    elasticsearch: false,
-    redis: false,
-  };
-
   try {
-    // Check PostgreSQL
-    await query('SELECT 1');
-    health.postgres = true;
-  } catch {
-    health.status = 'degraded';
+    const health = await performHealthCheck();
+    const statusCode = health.status === 'unhealthy' ? 503 : 200;
+    res.status(statusCode).json(health);
+  } catch (error) {
+    logger.error({ error }, 'Admin health check failed');
+    res.status(503).json({
+      status: 'unhealthy',
+      error: 'Health check failed',
+    });
   }
-
-  try {
-    // Check Elasticsearch
-    await esClient.ping();
-    health.elasticsearch = true;
-  } catch {
-    health.status = 'degraded';
-  }
-
-  try {
-    // Check Redis
-    const { redis } = await import('../config/redis.js');
-    await redis.ping();
-    health.redis = true;
-  } catch {
-    health.status = 'degraded';
-  }
-
-  const statusCode = health.status === 'ok' ? 200 : 503;
-  res.status(statusCode).json(health);
 }

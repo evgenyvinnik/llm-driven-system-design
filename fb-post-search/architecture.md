@@ -733,6 +733,118 @@ services:
 | Real-time indexing | Higher ES write load | Batch indexing option for bulk imports |
 | Full-text + engagement scoring | Complex ES queries | Query caching for popular searches |
 
+## Implementation Notes
+
+This section documents the implementation rationale for the observability and resilience features added to the backend.
+
+### Index Retention: Balancing Search Relevance vs Storage
+
+**Why:** Index retention policies balance search quality against infrastructure costs.
+
+**Implementation:**
+- **Hot tier (0-60 days):** Recent posts are most frequently searched and need fastest access. Stored on high-performance SSDs with full indexing.
+- **Warm tier (60-730 days):** Older posts receive fewer searches. Shrunk to single shard, force-merged for read optimization, moved to cheaper storage.
+- **Cold tier (730-1825 days):** Rarely searched archival data. Frozen indexes use minimal resources while remaining searchable.
+- **Delete (>5 years):** Data beyond retention period removed to control costs.
+
+**Trade-off:** Aggressive retention (e.g., 30-day hot) saves storage but degrades search experience for users looking for older content. The 60-day hot tier was chosen based on analysis showing 90%+ of searches target content less than 2 months old.
+
+**Configuration:** See `backend/src/shared/retention.ts` and `backend/src/shared/alertThresholds.ts` for retention constants.
+
+### Cache Hit Metrics: Enabling Performance Optimization
+
+**Why:** Cache hit rate is the primary indicator of cache effectiveness and directly impacts search latency and database load.
+
+**Implementation:**
+- **Visibility cache:** Tracks hits/misses for user visibility sets. Target: >90% hit rate.
+- **Suggestions cache:** Tracks typeahead cache effectiveness. Target: >85% hit rate.
+- **Prometheus metrics:** `cache_hits_total` and `cache_misses_total` counters with `cache_type` labels.
+
+**How to use:**
+```promql
+# Calculate cache hit rate over 5 minutes
+rate(cache_hits_total{cache_type="visibility"}[5m]) /
+(rate(cache_hits_total{cache_type="visibility"}[5m]) +
+ rate(cache_misses_total{cache_type="visibility"}[5m]))
+```
+
+**Optimization actions:**
+- Hit rate <80%: Increase TTL or cache size
+- Hit rate >95%: TTL may be too long (stale data risk) or cache is oversized
+
+**Configuration:** See `backend/src/shared/metrics.ts` for metric definitions.
+
+### Circuit Breakers: Protecting Search Availability
+
+**Why:** When Elasticsearch becomes unhealthy (overloaded, network issues, cluster problems), continuing to send requests causes:
+1. Thread pool exhaustion in the application
+2. Cascading failures to other services
+3. Poor user experience with timeout errors
+
+**Implementation:**
+- **Consecutive breaker:** Opens after 5 consecutive failures
+- **Half-open after 30s:** Allows test requests to check recovery
+- **Timeout:** 5s per request before counting as failure
+- **Metrics:** Circuit state transitions tracked for alerting
+
+**States:**
+- **Closed:** Normal operation, requests pass through
+- **Open:** Fast-fail mode, requests rejected immediately with helpful error
+- **Half-open:** Testing mode, limited requests allowed to probe recovery
+
+**Graceful degradation:** When circuit is open, search returns error but:
+- Suggestions can fall back to trending searches (Redis-only)
+- Health check shows degraded status
+- Load balancer can route traffic away
+
+**Configuration:** See `backend/src/shared/circuitBreaker.ts` and thresholds in `alertThresholds.ts`.
+
+### Index Lag Alerts: Enabling Freshness Monitoring
+
+**Why:** Search freshness is a key user experience metric. Users expect new posts to be searchable immediately.
+
+**Implementation:**
+- **Lag histogram:** Measures time from `post.created_at` to index completion
+- **Buckets:** 0.1s, 0.5s, 1s, 2s, 5s, 10s, 30s, 60s for p95/p99 calculation
+- **Alerting thresholds:**
+  - Warning: p99 > 5s
+  - Critical: p99 > 30s
+
+**How to monitor:**
+```promql
+# p99 indexing lag over 5 minutes
+histogram_quantile(0.99, rate(indexing_lag_seconds_bucket[5m]))
+```
+
+**Root causes to investigate:**
+- High lag: Elasticsearch cluster overloaded, network latency, bulk indexing backlog
+- Kafka consumer lag (if event-driven): Consumer processing too slow, need more partitions/consumers
+
+**Configuration:** See `backend/src/shared/metrics.ts` for histogram and `alertThresholds.ts` for thresholds.
+
+### Prometheus Metrics Summary
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `search_queries_total` | Counter | status, has_user | Track search volume and error rate |
+| `search_latency_seconds` | Histogram | status | SLA monitoring (p50, p95, p99) |
+| `cache_hits_total` | Counter | cache_type | Cache effectiveness |
+| `cache_misses_total` | Counter | cache_type | Cache effectiveness |
+| `indexing_lag_seconds` | Histogram | - | Search freshness monitoring |
+| `posts_indexed_total` | Counter | operation | Index write volume |
+| `circuit_breaker_state` | Gauge | service | Resilience monitoring |
+| `http_requests_total` | Counter | method, path, status_code | API traffic analysis |
+| `http_request_duration_seconds` | Histogram | method, path | Endpoint latency |
+
+### Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /metrics` | Prometheus metrics (Prometheus text format) |
+| `GET /health` | Comprehensive health check (JSON) |
+| `GET /livez` | Kubernetes liveness probe |
+| `GET /readyz` | Kubernetes readiness probe |
+
 ## Future Optimizations
 
 1. **Bloom Filters**: Compact visibility set representation

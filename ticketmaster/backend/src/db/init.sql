@@ -95,10 +95,14 @@ CREATE TABLE orders (
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'cancelled', 'refunded', 'payment_failed')),
     total_amount DECIMAL(10,2) NOT NULL,
     payment_id VARCHAR(64),
+    idempotency_key VARCHAR(255) UNIQUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     completed_at TIMESTAMP WITH TIME ZONE,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Index for idempotency key lookup
+CREATE INDEX idx_orders_idempotency ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Order items table
 CREATE TABLE order_items (
@@ -116,6 +120,18 @@ CREATE TABLE sessions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
+
+-- Idempotency keys table for preventing duplicate operations
+-- Critical for checkout to prevent double-charging customers
+CREATE TABLE idempotency_keys (
+    key VARCHAR(255) PRIMARY KEY,
+    result JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for cleanup of old idempotency keys
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys(created_at);
 
 -- Create indexes
 CREATE INDEX idx_events_date ON events(event_date);

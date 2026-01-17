@@ -181,6 +181,15 @@ router.post('/', async (req: Request, res: Response) => {
       );
     }
 
+    // Invalidate parent page cache if nested, and workspace cache
+    if (parent_id) {
+      await invalidatePageCache(parent_id as string);
+    }
+    await invalidateWorkspaceCache(workspace_id as string);
+
+    // Track metrics
+    pageEditsCounter.inc({ operation_type: 'create' });
+
     res.status(201).json({ page });
   } catch (error) {
     console.error('Create page error:', error);
@@ -229,7 +238,7 @@ router.get('/:id', async (req: Request, res: Response) => {
     pageLoadsCounter.inc({ workspace_id: page.workspace_id });
 
     // Use cache-aside pattern for page content (blocks, children, views)
-    const cacheKey = CACHE_KEYS.pageWithBlocks(id);
+    const cacheKey = CACHE_KEYS.pageWithBlocks(id as string);
     const pageContent = await cacheAside(
       cacheKey,
       CACHE_TTL.page,
@@ -366,7 +375,7 @@ router.patch('/:id', async (req: Request, res: Response) => {
     const updatedPage = result.rows[0];
 
     // Invalidate page cache on update
-    await invalidatePageCache(id);
+    await invalidatePageCache(id as string);
 
     // If parent changed, also invalidate old and new parent caches
     if (parent_id !== undefined && parent_id !== page.parent_id) {
@@ -374,7 +383,7 @@ router.patch('/:id', async (req: Request, res: Response) => {
         await invalidatePageCache(page.parent_id);
       }
       if (parent_id) {
-        await invalidatePageCache(parent_id);
+        await invalidatePageCache(parent_id as string);
       }
     }
 
@@ -429,14 +438,14 @@ router.delete('/:id', async (req: Request, res: Response) => {
       // Audit log for permanent deletion
       await auditLogger.logPageDeleted(
         req.user!.id,
-        id,
+        id as string,
         {
           title: page.title,
           permanent: true,
           workspaceId: page.workspace_id,
         },
         req.ip || null,
-        req.headers['user-agent'] || null
+        (Array.isArray(req.headers['user-agent']) ? req.headers['user-agent'][0] : req.headers['user-agent']) || null
       );
 
       res.json({ message: 'Page permanently deleted' });
@@ -450,20 +459,20 @@ router.delete('/:id', async (req: Request, res: Response) => {
       // Audit log for archive
       await auditLogger.logPageDeleted(
         req.user!.id,
-        id,
+        id as string,
         {
           title: page.title,
           permanent: false,
           workspaceId: page.workspace_id,
         },
         req.ip || null,
-        req.headers['user-agent'] || null
+        (Array.isArray(req.headers['user-agent']) ? req.headers['user-agent'][0] : req.headers['user-agent']) || null
       );
       res.json({ message: 'Page archived' });
     }
 
     // Invalidate caches for deleted/archived page
-    await invalidatePageCache(id);
+    await invalidatePageCache(id as string);
     if (page.parent_id) {
       await invalidatePageCache(page.parent_id);
     }

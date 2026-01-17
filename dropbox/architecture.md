@@ -866,3 +866,186 @@ GET /health/deep    -> JSON with component status + latencies
   }
 }
 ```
+
+## Implementation Notes
+
+This section documents the key implementation decisions and their rationale for the backend observability, resilience, and security features.
+
+### Idempotency for Reliable Chunked Uploads
+
+**Location:** `src/shared/idempotency.ts`
+
+**WHY idempotency enables reliable chunked uploads:**
+
+1. **Network failures are common during large uploads.** A user uploading a 1GB file over a flaky connection may lose connectivity multiple times. Each 4MB chunk requires a separate HTTP request, and any of these can fail mid-transmission.
+
+2. **Clients may not receive confirmation even when the server succeeded.** The classic "at-most-once vs at-least-once" problem: if the client sends a chunk, the server stores it successfully, but the response is lost, the client has no way to know whether to retry.
+
+3. **Content-addressed storage provides natural idempotency for chunks.** Since chunks are stored by their SHA-256 hash, uploading the same chunk twice is inherently safe - it maps to the same storage key. However, the metadata operations (reference counts, session tracking) still need idempotency protection.
+
+4. **Reference counts must remain accurate despite retries.** Without idempotency middleware, a retried chunk upload could incorrectly increment the reference count twice, leading to "zombie chunks" that are never garbage collected.
+
+**Implementation approach:**
+- Redis-backed idempotency records with TTL-based cleanup
+- Requests in progress are locked to prevent concurrent duplicates
+- Completed responses are cached and replayed on retry
+- Failed requests can be retried with a fresh attempt
+
+```typescript
+// Client can safely retry any chunk upload
+const response = await fetch('/api/files/upload/chunk', {
+  method: 'POST',
+  headers: { 'Idempotency-Key': `${uploadSessionId}-chunk-${index}` },
+  body: chunkData,
+});
+// If network fails, retry with same key - server returns cached response
+```
+
+### Circuit Breakers for Storage Protection
+
+**Location:** `src/shared/circuitBreaker.ts`, integrated in `src/utils/storage.ts`
+
+**WHY circuit breakers protect storage services:**
+
+1. **Prevents cascading failures when MinIO is overloaded.** Without a circuit breaker, if MinIO becomes slow or unresponsive, every API server thread waits on I/O, eventually exhausting connection pools and causing the entire API to become unresponsive.
+
+2. **Fails fast instead of waiting for timeouts.** A circuit breaker in the "open" state immediately returns an error (typically 503 Service Unavailable) instead of waiting for a 30-second timeout. This improves user experience - they see an error in milliseconds rather than hanging.
+
+3. **Gives the storage service time to recover.** When the circuit opens, it stops sending traffic to MinIO for a configurable period (30 seconds in our implementation). This "back-off" period allows MinIO to recover from temporary overload.
+
+4. **Provides clear observability into storage health.** Circuit breaker state transitions (closed -> open -> half-open -> closed) are logged and tracked in Prometheus metrics, making it easy to identify infrastructure issues.
+
+**Implementation approach using cockatiel library:**
+- `ConsecutiveBreaker`: Opens after 5 consecutive failures
+- Half-open after 30 seconds to test if service has recovered
+- Metrics track state transitions and rejected requests
+
+```
+State Diagram:
+CLOSED ---(5 failures)---> OPEN ---(30s timeout)---> HALF-OPEN
+   ^                                                       |
+   |                                                       |
+   +-----------(success)----------<------------------------+
+                                   |
+                                   +---(failure)---> OPEN
+```
+
+### RBAC for File Sharing Permissions
+
+**Location:** `src/middleware/auth.ts`
+
+**WHY RBAC enables file sharing permissions:**
+
+1. **File owners need full control.** The owner of a file should be able to delete, share, manage versions, and perform any operation. This maps to the "owner" role with all permissions.
+
+2. **Editors can modify content but not share or delete.** When you share a folder with a collaborator, you often want them to upload and edit files, but not accidentally delete the entire folder or share it publicly. The "editor" role grants read and write permissions.
+
+3. **Viewers can only read content.** For read-only sharing (e.g., sharing project assets with a client for review), the "viewer" role restricts all modifications while allowing downloads.
+
+4. **Permissions are inherited through folder hierarchy.** When you share a folder, all files and subfolders within it inherit the same permission level. This is implemented by walking up the parent hierarchy until a share grant is found.
+
+5. **Fine-grained access control supports collaboration scenarios.** Different users can have different access levels to the same folder, enabling complex team workflows.
+
+**Permission Matrix:**
+
+| Action | Owner | Editor | Viewer |
+|--------|-------|--------|--------|
+| Read/Download | Yes | Yes | Yes |
+| Upload/Edit | Yes | Yes | No |
+| Delete | Yes | No | No |
+| Share with others | Yes | No | No |
+| Manage versions | Yes | No | No |
+
+**Implementation:**
+```typescript
+// Middleware validates access before route handler executes
+router.get('/files/:fileId/download', authMiddleware, requireRead, downloadHandler);
+router.delete('/files/:fileId', authMiddleware, requireDelete, deleteHandler);
+router.post('/files/:fileId/share', authMiddleware, requireShare, shareHandler);
+```
+
+### Sync Metrics for Client Optimization
+
+**Location:** `src/shared/metrics.ts`, integrated throughout services
+
+**WHY sync metrics enable client optimization:**
+
+1. **Clients can measure actual sync latency vs perceived latency.** By exposing `sync_latency_seconds` histogram, clients (and operators) can distinguish between server-side sync time and network latency, enabling targeted optimization.
+
+2. **Server-side metrics reveal bottlenecks in the sync pipeline.** Metrics like `upload_sessions_active`, `websocket_connections_active`, and `sync_events_total` help identify whether slow syncs are due to:
+   - Too many concurrent uploads (saturating storage)
+   - WebSocket connection scaling issues
+   - Message queue backlog
+
+3. **Deduplication metrics inform storage efficiency decisions.** The `deduplication_ratio` gauge shows what percentage of uploaded bytes were already stored. High deduplication rates (e.g., 50%+) justify the complexity of content-addressed storage.
+
+4. **Upload/download metrics help tune chunk sizes and parallelism.** By tracking `upload_chunk_size_bytes` and `download_duration_seconds`, we can determine if the 4MB chunk size is optimal or if smaller/larger chunks would improve throughput.
+
+**Key Metrics for Sync Optimization:**
+
+| Metric | Purpose | Optimization Action |
+|--------|---------|---------------------|
+| `sync_latency_seconds` | Time from file change to client notification | Scale WebSocket servers if p95 > 2s |
+| `upload_sessions_active` | Concurrent upload tracking | Rate limit if > 100 simultaneous |
+| `deduplication_ratio` | Storage efficiency | If < 10%, consider larger chunks |
+| `websocket_connections_active` | Connection scaling | Add servers if > 1000/instance |
+| `circuit_breaker_state` | Storage health | Alert if open for > 5 minutes |
+
+**Grafana Dashboard Example:**
+```
+Upload Performance Panel:
+- upload_chunks_total{status="success"} rate
+- upload_chunks_total{status="duplicate"} rate (deduplication)
+- upload_chunk_size_bytes histogram (chunk size distribution)
+
+Sync Health Panel:
+- sync_events_total by type (file_created, file_updated, etc.)
+- sync_latency_seconds p50, p95, p99
+- websocket_connections_active
+```
+
+### Structured Logging with Pino
+
+**Location:** `src/shared/logger.ts`
+
+Pino provides high-performance JSON logging suitable for production:
+
+1. **Machine-parseable format** enables log aggregation (ELK, Loki)
+2. **Request tracing** via trace IDs correlates logs across services
+3. **Typed log contexts** ensure consistent schema for file/chunk operations
+4. **Pretty printing** in development for human readability
+
+### Health Check Endpoints
+
+**Location:** `src/routes/health.ts`
+
+Three-tier health checks for different consumers:
+
+1. **`/health/live`** - Liveness probe for container orchestration (Kubernetes, Docker)
+2. **`/health/ready`** - Readiness probe checking database and cache connectivity
+3. **`/health/deep`** - Detailed component status with latencies for monitoring dashboards
+
+### Retry with Exponential Backoff
+
+**Location:** `src/shared/circuitBreaker.ts` (createRetryPolicy)
+
+Integrated with circuit breaker for storage operations:
+
+1. **3 retry attempts** for transient failures
+2. **Exponential backoff** (1s, 2s, 4s) prevents thundering herd
+3. **Jitter** (built into cockatiel) prevents synchronized retries
+4. **Metrics tracking** for retry attempts and exhausted retries
+
+### Files Modified/Created
+
+| File | Purpose |
+|------|---------|
+| `src/shared/logger.ts` | Pino-based structured JSON logging |
+| `src/shared/metrics.ts` | Prometheus metrics collection |
+| `src/shared/circuitBreaker.ts` | Circuit breaker and retry policies |
+| `src/shared/idempotency.ts` | Idempotency middleware for uploads |
+| `src/middleware/auth.ts` | Enhanced with RBAC permissions |
+| `src/routes/health.ts` | Health check endpoints |
+| `src/utils/storage.ts` | Integrated with circuit breaker and retry |
+| `src/services/fileService.ts` | Added metrics and logging |
+| `src/index.ts` | Metrics endpoint, request tracing |

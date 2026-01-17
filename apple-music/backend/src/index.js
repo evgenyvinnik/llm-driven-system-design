@@ -4,6 +4,13 @@ import cookieParser from 'cookie-parser';
 import { pool } from './db/index.js';
 import { redis } from './services/redis.js';
 
+// Shared modules
+import { logger, requestLogger } from './shared/logger.js';
+import { metricsMiddleware, metricsHandler } from './shared/metrics.js';
+import { globalLimiter, streamLimiter, searchLimiter, adminLimiter, loginLimiter } from './shared/rateLimit.js';
+import { validateIdempotencyKeyMiddleware } from './shared/idempotency.js';
+import { registerHealthRoutes } from './shared/health.js';
+
 // Routes
 import authRoutes from './routes/auth.js';
 import catalogRoutes from './routes/catalog.js';
@@ -17,7 +24,10 @@ import adminRoutes from './routes/admin.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// ============================================
+// Core Middleware
+// ============================================
+
 app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:5174'],
   credentials: true
@@ -25,44 +35,138 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Health check
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    await redis.ping();
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-  } catch (error) {
-    res.status(500).json({ status: 'unhealthy', error: error.message });
-  }
+// ============================================
+// Observability Middleware
+// ============================================
+
+// Structured logging - attaches logger to each request
+app.use(requestLogger);
+
+// Prometheus metrics collection
+app.use(metricsMiddleware);
+
+// ============================================
+// Security Middleware
+// ============================================
+
+// Validate idempotency key format on all requests
+app.use(validateIdempotencyKeyMiddleware);
+
+// Global rate limiting (100 req/min)
+app.use('/api', globalLimiter);
+
+// ============================================
+// Health & Metrics Endpoints (no auth required)
+// ============================================
+
+registerHealthRoutes(app);
+
+// Prometheus metrics endpoint
+app.get('/metrics', metricsHandler);
+
+// ============================================
+// API Routes with specific rate limits
+// ============================================
+
+// Auth routes with login rate limiting
+app.use('/api/auth', loginLimiter, authRoutes);
+
+// Catalog routes (read-heavy, standard limits)
+app.use('/api/catalog', catalogRoutes);
+
+// Library routes
+app.use('/api/library', libraryRoutes);
+
+// Playlist routes (includes idempotency for mutations)
+app.use('/api/playlists', playlistRoutes);
+
+// Streaming routes with higher rate limits
+app.use('/api/stream', streamLimiter, streamingRoutes);
+
+// Radio routes
+app.use('/api/radio', radioRoutes);
+
+// Recommendations routes
+app.use('/api/recommendations', recommendationsRoutes);
+
+// Admin routes with stricter limits
+app.use('/api/admin', adminLimiter, adminRoutes);
+
+// ============================================
+// Error Handling
+// ============================================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
-// API routes
-app.use('/api/auth', authRoutes);
-app.use('/api/catalog', catalogRoutes);
-app.use('/api/library', libraryRoutes);
-app.use('/api/playlists', playlistRoutes);
-app.use('/api/stream', streamingRoutes);
-app.use('/api/radio', radioRoutes);
-app.use('/api/recommendations', recommendationsRoutes);
-app.use('/api/admin', adminRoutes);
-
-// Error handling middleware
+// Global error handler with structured logging
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
+  // Log error with request context
+  const errorLog = {
+    err,
+    method: req.method,
+    path: req.path,
+    userId: req.user?.id,
+    statusCode: err.status || 500
+  };
+
+  if (err.status && err.status < 500) {
+    logger.warn(errorLog, 'Client error');
+  } else {
+    logger.error(errorLog, 'Server error');
+  }
+
   res.status(err.status || 500).json({
-    error: err.message || 'Internal server error'
+    error: err.message || 'Internal server error',
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
   });
 });
 
-// Start server
+// ============================================
+// Server Startup
+// ============================================
+
 app.listen(PORT, () => {
-  console.log(`Apple Music API server running on port ${PORT}`);
+  logger.info({
+    port: PORT,
+    env: process.env.NODE_ENV || 'development'
+  }, 'Apple Music API server started');
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  await pool.end();
-  redis.disconnect();
-  process.exit(0);
+// ============================================
+// Graceful Shutdown
+// ============================================
+
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Received shutdown signal, closing connections');
+
+  try {
+    await pool.end();
+    logger.info('PostgreSQL pool closed');
+
+    redis.disconnect();
+    logger.info('Redis connection closed');
+
+    process.exit(0);
+  } catch (err) {
+    logger.error({ err }, 'Error during shutdown');
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'Uncaught exception');
+  process.exit(1);
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error({ reason, promise }, 'Unhandled rejection');
+});
+
+export default app;
