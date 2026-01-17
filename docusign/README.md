@@ -1,5 +1,17 @@
 # Design DocuSign - Electronic Signature Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,403 |
+| Source Files | 48 |
+| .js | 2,708 |
+| .tsx | 2,241 |
+| .md | 1,297 |
+| .ts | 746 |
+| .sql | 150 |
+
 ## Overview
 
 A simplified DocuSign-like platform demonstrating document workflows, electronic signatures, and secure audit trails. This educational project focuses on building a legally compliant signature system with multi-party signing flows.
@@ -270,3 +282,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [DocuSign Developer Center](https://developers.docusign.com/) - Official API documentation and integration guides
+- [ESIGN Act (Electronic Signatures in Global and National Commerce Act)](https://www.fdic.gov/resources/supervision-and-examinations/consumer-compliance-examination-manual/documents/10/x-3-1.pdf) - US legal framework for e-signatures
+- [eIDAS Regulation](https://digital-strategy.ec.europa.eu/en/policies/eidas-regulation) - EU electronic identification and trust services
+- [pdf-lib Documentation](https://pdf-lib.js.org/) - JavaScript library for PDF manipulation
+- [React-PDF](https://react-pdf.org/) - PDF rendering in React applications
+- [Certificate Transparency](https://certificate.transparency.dev/) - Concepts applicable to audit trail integrity
+- [Merkle Trees and Hash Chains](https://en.wikipedia.org/wiki/Merkle_tree) - Data structures for tamper-evident logging
+- [UETA (Uniform Electronic Transactions Act)](https://www.uniformlaws.org/committees/community-home?CommunityKey=2c04b76c-2b7d-4399-977e-d5876ba7e034) - State-level e-signature legislation
+- [Designing Document Workflows](https://www.nngroup.com/articles/document-management-software/) - UX research on document management
+- [Digital Signatures and PKI](https://www.ibm.com/docs/en/zos/2.5.0?topic=concepts-digital-signatures) - Cryptographic foundations for signing

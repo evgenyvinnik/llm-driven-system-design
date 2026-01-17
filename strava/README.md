@@ -2,6 +2,18 @@
 
 A fitness tracking and social platform for athletes, inspired by Strava. This implementation includes activity recording, GPS visualization, segment-based leaderboards, and social features.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,717 |
+| Source Files | 53 |
+| .js | 2,498 |
+| .tsx | 2,277 |
+| .md | 1,147 |
+| .ts | 617 |
+| .json | 111 |
+
 ## Features
 
 - **Activity Tracking**: Upload GPX files or simulate activities
@@ -293,6 +305,19 @@ npm run seed
 
 See [architecture.md](./architecture.md) for system design documentation.
 See [claude.md](./claude.md) for development iteration history.
+
+## References & Inspiration
+
+- [Strava Engineering Blog](https://engineering.strava.com/) - Official engineering insights from Strava
+- [The Global Heatmap: How Strava Computes Routes](https://medium.com/strava-engineering/the-global-heatmap-now-6x-hotter-23fc01d301de) - Visualizing billions of GPS points
+- [Polyline Encoding Algorithm](https://developers.google.com/maps/documentation/utilities/polylinealgorithm) - Google's compression algorithm for GPS routes
+- [Haversine Formula](https://en.wikipedia.org/wiki/Haversine_formula) - Calculating distances between GPS coordinates
+- [PostGIS Documentation](https://postgis.net/documentation/) - Geospatial extensions for PostgreSQL
+- [Redis Sorted Sets](https://redis.io/docs/data-types/sorted-sets/) - Data structure for leaderboard implementations
+- [Kalman Filtering for GPS Data](https://www.bzarg.com/p/how-a-kalman-filter-works-in-pictures/) - Smoothing noisy GPS tracks
+- [GPX Schema Documentation](https://www.topografix.com/gpx.asp) - GPS Exchange Format specification
+- [Fan-Out on Write vs Read](https://www.youtube.com/watch?v=QmX2NPkJTKg) - Activity feed design patterns
+- [Leaflet.js Documentation](https://leafletjs.com/reference.html) - Interactive map library for route visualization
 
 ## License
 

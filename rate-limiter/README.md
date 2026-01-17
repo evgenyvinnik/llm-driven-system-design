@@ -2,6 +2,18 @@
 
 A distributed rate limiting service implementing multiple algorithms for API abuse prevention.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 3,399 |
+| Source Files | 40 |
+| .ts | 1,481 |
+| .md | 1,103 |
+| .tsx | 560 |
+| .json | 116 |
+| .yml | 53 |
+
 ## Overview
 
 This project implements five rate limiting algorithms:
@@ -448,3 +460,15 @@ frontend/
 ## License
 
 MIT
+
+## References & Inspiration
+
+- [Token Bucket Algorithm](https://en.wikipedia.org/wiki/Token_bucket) - Classic algorithm for traffic shaping and rate limiting
+- [Leaky Bucket Algorithm](https://en.wikipedia.org/wiki/Leaky_bucket) - Alternative algorithm for smoothing bursty traffic
+- [Stripe Engineering: Rate Limiters](https://stripe.com/blog/rate-limiters) - Stripe's comprehensive guide to rate limiting patterns
+- [Cloudflare: Counting Things at Scale](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) - Cloudflare's approach to distributed counting for rate limiting
+- [Redis Rate Limiting Patterns](https://redis.io/learn/howtos/ratelimiting) - Redis-based rate limiting implementations
+- [Designing Rate Limiting with Redis](https://engineering.classdojo.com/blog/2015/02/06/rolling-rate-limiter/) - ClassDojo's sliding window rate limiter implementation
+- [Google Cloud: Rate Limiting Strategies](https://cloud.google.com/architecture/rate-limiting-strategies-techniques) - Comprehensive overview of rate limiting techniques
+- [Kong: How to Design a Scalable Rate Limiter](https://konghq.com/blog/how-to-design-a-scalable-rate-limiting-algorithm) - API gateway perspective on rate limiting
+- [Sliding Window Rate Limiting](https://blog.figma.com/an-alternative-approach-to-rate-limiting-f8a06cf7c94c) - Figma's sliding window counter approach

@@ -2,6 +2,18 @@
 
 A simplified Slack-like platform demonstrating workspace isolation, message threading, real-time messaging, and search functionality. This educational project focuses on building a team communication system with channels, DMs, and real-time updates.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,340 |
+| Source Files | 51 |
+| .ts | 2,792 |
+| .tsx | 1,336 |
+| .md | 913 |
+| .json | 140 |
+| .css | 59 |
+
 ## Key Features
 
 ### 1. Workspace Management
@@ -275,3 +287,16 @@ Threads are implemented as messages with a `thread_ts` reference to the parent m
 
 See [claude.md](./claude.md) for development insights and design decisions.
 See [architecture.md](./architecture.md) for detailed system design documentation.
+
+## References & Inspiration
+
+- [Slack Engineering Blog](https://slack.engineering/) - Official engineering insights and architecture posts
+- [Scaling Slack's Job Queue](https://slack.engineering/scaling-slacks-job-queue/) - Handling millions of background jobs
+- [Rebuilding Slack's Mobile App](https://slack.engineering/rebuilding-slack-on-the-desktop/) - Architecture decisions for modern clients
+- [How Slack Built Shared Channels](https://slack.engineering/how-slack-built-shared-channels/) - Multi-tenant architecture patterns
+- [Slack's Secret Sauce: How They Search Through Billions of Messages](https://slack.engineering/search-at-slack/) - Elasticsearch at scale
+- [Real-Time Messaging at Scale](https://slack.engineering/real-time-messaging-at-slack/) - WebSocket and connection management
+- [Data Migration at Slack](https://slack.engineering/migrating-a-monolith-to-multi-tenant/) - Monolith to microservices journey
+- [Building the Slack Platform](https://api.slack.com/start/overview) - Official Slack API documentation
+- [Flannel: Slack's Application-Layer Networking](https://slack.engineering/flannel-application-layer-networking-for-slack/) - Internal service mesh
+- [How Slack Uses Vitess for Database Sharding](https://slack.engineering/scaling-datastores-at-slack-with-vitess/) - Scaling MySQL with Vitess

@@ -2,6 +2,18 @@
 
 A scalable API system capable of serving millions of concurrent users with low latency, high availability, and graceful degradation. This educational project focuses on building production-grade API infrastructure with load balancing, caching, rate limiting, and observability.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,304 |
+| Source Files | 43 |
+| .js | 2,104 |
+| .md | 1,543 |
+| .tsx | 826 |
+| .ts | 270 |
+| .yml | 217 |
+
 ## Architecture Overview
 
 ```
@@ -382,3 +394,18 @@ scalable-api/
 
 See [claude.md](./claude.md) for development insights and design decisions.
 See [architecture.md](./architecture.md) for detailed system design documentation.
+
+## References & Inspiration
+
+- [Building and Deploying Netflix API Gateway](https://netflixtechblog.com/announcing-zuul-edge-service-in-the-cloud-ab3af5be08ee) - Netflix Zuul API gateway architecture
+- [Kong API Gateway](https://docs.konghq.com/gateway/latest/) - Open-source API gateway and microservices management
+- [Rate Limiting Strategies and Techniques](https://cloud.google.com/architecture/rate-limiting-strategies-techniques) - Google Cloud's comprehensive guide to rate limiting
+- [Stripe's Rate Limiting](https://stripe.com/blog/rate-limiters) - How Stripe implements rate limiting at scale
+- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html) - Martin Fowler on the circuit breaker pattern
+- [Resilience4j Circuit Breaker](https://resilience4j.readme.io/docs/circuitbreaker) - Modern fault tolerance library patterns
+- [Load Balancing Algorithms](https://aws.amazon.com/what-is/load-balancing/) - AWS guide to load balancing strategies
+- [NGINX Load Balancing Guide](https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/) - Production load balancer configuration
+- [12-Factor App Methodology](https://12factor.net/) - Best practices for building scalable, maintainable services
+- [Caching Best Practices](https://aws.amazon.com/caching/best-practices/) - AWS caching strategies for web applications
+- [API Design Patterns](https://cloud.google.com/apis/design) - Google's API design guide for scalable APIs
+- [Envoy Proxy](https://www.envoyproxy.io/docs/envoy/latest/) - Modern edge and service proxy for cloud-native apps

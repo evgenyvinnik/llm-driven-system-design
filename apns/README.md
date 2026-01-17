@@ -1,5 +1,17 @@
 # Design APNs - Apple Push Notification Service
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,067 |
+| Source Files | 39 |
+| .ts | 2,553 |
+| .md | 1,223 |
+| .tsx | 917 |
+| .json | 123 |
+| .sql | 101 |
+
 ## Overview
 
 A simplified APNs-like platform demonstrating push notification delivery, device token management, and guaranteed delivery at scale. This educational project focuses on building a reliable notification system for millions of devices.
@@ -343,3 +355,12 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Apple Push Notification Service Documentation](https://developer.apple.com/documentation/usernotifications) - Official APNs developer documentation covering device tokens, payloads, and delivery
+- [Sending Push Notifications Using Command-Line Tools](https://developer.apple.com/documentation/usernotifications/sending-push-notifications-using-command-line-tools) - Apple's guide on APNs HTTP/2 API usage
+- [Setting Up a Remote Notification Server](https://developer.apple.com/documentation/usernotifications/setting-up-a-remote-notification-server) - Apple's architecture guidance for push notification providers
+- [Firebase Cloud Messaging Architecture](https://firebase.google.com/docs/cloud-messaging/concept-options) - Google's push notification system design patterns
+- [How We Scaled Push Notifications at Airbnb](https://medium.com/airbnb-engineering/how-we-scaled-push-notifications-at-airbnb-64f5c09ffa7) - Engineering insights on scaling notification delivery
+- [Scaling Push Messaging for Millions of Devices at Netflix](https://netflixtechblog.com/scaling-push-messaging-for-millions-of-devices-netflix-702d3a9a08fa) - Netflix's approach to high-volume push notifications

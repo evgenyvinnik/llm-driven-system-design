@@ -1,5 +1,17 @@
 # Design Health Data Pipeline - Multi-Device Health Aggregation
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,646 |
+| Source Files | 47 |
+| .js | 1,794 |
+| .md | 1,542 |
+| .tsx | 1,535 |
+| .ts | 473 |
+| .sql | 147 |
+
 ## Overview
 
 A health data pipeline that aggregates and processes health metrics from multiple devices (Apple Watch, iPhone, third-party devices) with high reliability, privacy protection, and real-time insights. This educational project focuses on building a HealthKit-like data aggregation system.
@@ -221,3 +233,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [HealthKit Documentation](https://developer.apple.com/documentation/healthkit) - Apple's framework for health and fitness data
+- [Health Records on iPhone](https://www.apple.com/healthcare/health-records/) - Apple's FHIR-based health records integration
+- [CareKit Documentation](https://developer.apple.com/documentation/carekit) - Framework for health care apps
+- [ResearchKit Documentation](https://www.researchandcare.org/) - Platform for medical research studies
+- [FHIR (Fast Healthcare Interoperability Resources)](https://www.hl7.org/fhir/) - Healthcare data interoperability standard
+- [TimescaleDB Documentation](https://docs.timescale.com/) - Time-series database for health metrics
+- [HIPAA Security Rule](https://www.hhs.gov/hipaa/for-professionals/security/index.html) - Health data privacy requirements
+- [Apple Health Privacy](https://support.apple.com/en-us/HT204351) - How Apple protects health data

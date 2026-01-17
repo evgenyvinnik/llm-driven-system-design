@@ -1,5 +1,17 @@
 # Design DoorDash - Food Delivery Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,563 |
+| Source Files | 48 |
+| .tsx | 1,848 |
+| .js | 1,532 |
+| .md | 1,022 |
+| .ts | 814 |
+| .sql | 187 |
+
 ## Overview
 
 A simplified DoorDash-like platform demonstrating real-time order tracking, restaurant aggregation, delivery optimization, and three-sided marketplace dynamics. This educational project focuses on building a food delivery system with real-time logistics.
@@ -204,3 +216,14 @@ doordash/
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [How DoorDash Optimizes Delivery Logistics](https://doordash.engineering/2024/03/05/how-doordash-optimizes-delivery-logistics/) - Real-time dispatch and routing optimization
+- [DoorDash's Evolving Dispatch Architecture](https://doordash.engineering/2021/06/29/doordashs-evolving-dispatch-architecture/) - Building a scalable logistics platform
+- [Next-Generation Optimization for Dasher Dispatch](https://doordash.engineering/2020/02/28/next-generation-optimization-for-dasher-dispatch-at-doordash/) - ML-based driver assignment
+- [Building Faster Indexing with Apache Kafka and Elasticsearch](https://doordash.engineering/2021/07/14/building-faster-indexing-with-apache-kafka-and-elasticsearch/) - Real-time search infrastructure
+- [How We Reduced Hotspot Issues on Our Cassandra Cluster](https://doordash.engineering/2021/03/02/how-we-reduced-hotspot-issues-on-our-cassandra-cluster/) - Scaling time-series data
+- [Managing Supply and Demand Balance Through Machine Learning](https://doordash.engineering/2021/04/14/managing-supply-and-demand-balance-through-machine-learning/) - Dynamic pricing and demand forecasting
+- [How DoorDash is Scaling its Data Platform](https://doordash.engineering/2020/04/27/how-doordash-is-scaling-its-data-platform/) - Data infrastructure at scale
+- [Building DoorDash's Self-Serve Analytics Platform](https://doordash.engineering/2020/05/27/building-doordashs-self-serve-analytics-platform/) - Real-time analytics for operations

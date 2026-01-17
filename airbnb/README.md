@@ -1,5 +1,17 @@
 # Design Airbnb - Two-Sided Marketplace
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,017 |
+| Source Files | 50 |
+| .tsx | 3,052 |
+| .js | 1,981 |
+| .md | 977 |
+| .ts | 618 |
+| .sql | 239 |
+
 ## Overview
 
 A simplified Airbnb-like platform demonstrating two-sided marketplace dynamics, availability calendars, search ranking, and trust & safety systems. This educational project focuses on building a property rental marketplace with complex booking workflows.
@@ -196,3 +208,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Airbnb's Search Ranking Algorithm](https://medium.com/airbnb-engineering/listing-search-ranking-at-airbnb-4ab8ec5d76fb) - How Airbnb ranks search results using machine learning
+- [Improving Deep Learning for Airbnb Search](https://medium.com/airbnb-engineering/improving-deep-learning-for-airbnb-search-5fb2c22ec31e) - Deep learning approaches for personalized search ranking
+- [Dynamic Pricing at Airbnb](https://medium.com/airbnb-engineering/dynamic-pricing-1a82fbb21f14) - Airbnb's Smart Pricing system for hosts
+- [Building a Trustworthy Marketplace](https://medium.com/airbnb-engineering/building-a-trustworthy-marketplace-60b3b0df2fc4) - Trust and safety systems at scale
+- [Machine Learning-Powered Search Ranking of Airbnb Experiences](https://medium.com/airbnb-engineering/machine-learning-powered-search-ranking-of-airbnb-experiences-110b4b1a0789) - ML for experiences ranking
+- [How Airbnb Avoids Double Payments](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) - Idempotency in payment systems
+- [Chronon, Airbnb's ML Feature Platform](https://medium.com/airbnb-engineering/chronon-airbnbs-ml-feature-platform-is-now-open-source-d9c4dba859e8) - Feature engineering for ML models
+- [Nebula: Airbnb's Data Marketplace](https://medium.com/airbnb-engineering/data-quality-at-airbnb-e582465f3ef7) - Data quality and governance at Airbnb

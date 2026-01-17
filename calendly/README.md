@@ -2,6 +2,18 @@
 
 A full-stack meeting scheduling platform that allows users to share their availability and let others book meetings without back-and-forth email coordination.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,200 |
+| Source Files | 52 |
+| .ts | 3,029 |
+| .tsx | 2,387 |
+| .md | 1,421 |
+| .json | 133 |
+| .sql | 124 |
+
 ## Features
 
 - **Event Types**: Create customizable meeting types with different durations, buffer times, and descriptions
@@ -260,3 +272,15 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [Calendly Engineering Blog](https://www.calendly.com/blog/engineering) - Official engineering insights from Calendly
+- [Google Calendar API Documentation](https://developers.google.com/calendar) - Calendar integration patterns and best practices
+- [Falsehoods Programmers Believe About Time](https://infiniteundo.com/post/25326999628/falsehoods-programmers-believe-about-time) - Essential reading on time zone edge cases
+- [IANA Time Zone Database](https://www.iana.org/time-zones) - The authoritative source for time zone data
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems fundamentals
+- [Merge Intervals - LeetCode](https://leetcode.com/problems/merge-intervals/) - Algorithm for availability slot calculation
+- [The Problem with Time & Timezones (Computerphile)](https://www.youtube.com/watch?v=-5wpm-gesOY) - Video explaining time zone complexity
+- [Date-fns Timezone Documentation](https://date-fns.org/docs/Time-Zones) - Modern approach to JavaScript date handling
+- [Building a Scheduling System at Scale](https://engineering.grab.com/building-a-scheduling-system) - Grab's engineering blog on scheduling challenges

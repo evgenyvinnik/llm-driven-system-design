@@ -1,5 +1,17 @@
 # Dropbox - Cloud Storage
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,218 |
+| Source Files | 52 |
+| .ts | 2,964 |
+| .tsx | 1,887 |
+| .md | 971 |
+| .json | 136 |
+| .sql | 133 |
+
 ## Overview
 
 A cloud file storage and synchronization service with file chunking, deduplication, versioning, and sharing capabilities.
@@ -217,3 +229,14 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - [ ] Activity logs and audit trail
 - [ ] Bandwidth throttling
 - [ ] Conflict resolution for collaborative editing
+
+## References & Inspiration
+
+- [How We've Scaled Dropbox](https://dropbox.tech/infrastructure/how-weve-scaled-dropbox) - Dropbox engineering blog on scaling infrastructure
+- [Dropbox's Sync Engine Architecture](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine) - Rewriting the heart of their sync engine in Rust
+- [Magic Pocket: Dropbox's Exabyte-Scale Blob Storage System](https://dropbox.tech/infrastructure/inside-the-magic-pocket) - How Dropbox built their own storage infrastructure
+- [Streaming File Synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) - Efficient sync protocol design
+- [Rabin Fingerprinting](https://en.wikipedia.org/wiki/Rabin_fingerprint) - Content-defined chunking algorithm for deduplication
+- [Rsync Algorithm](https://rsync.samba.org/tech_report/) - Seminal paper on delta synchronization
+- [A Low-Bandwidth Network File System (LBFS)](https://pdos.csail.mit.edu/papers/lbfs:sosp01/lbfs.pdf) - MIT paper on content-based chunking
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book covering replication and consistency

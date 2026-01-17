@@ -1,5 +1,17 @@
 # Design GitHub - Code Hosting Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,075 |
+| Source Files | 53 |
+| .tsx | 2,506 |
+| .js | 2,462 |
+| .md | 1,091 |
+| .ts | 490 |
+| .sql | 266 |
+
 ## Overview
 
 A simplified GitHub-like platform demonstrating Git hosting, pull request workflows, code search, and collaborative development features. This educational project focuses on building a collaborative code hosting system with version control features.
@@ -234,3 +246,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Git Internals - Plumbing and Porcelain](https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain) - Official Git documentation on internal architecture
+- [Git Wire Protocol v2](https://git-scm.com/docs/protocol-v2) - Modern Git network protocol specification
+- [GitHub Engineering Blog](https://github.blog/category/engineering/) - Engineering insights from GitHub
+- [How We Made Diff Pages Faster](https://github.blog/engineering/how-we-made-diff-pages-faster/) - Optimizing diff computation at scale
+- [How We Built the GitHub Globbing Library](https://github.blog/engineering/how-we-built-the-github-globbing-library/) - File pattern matching implementation
+- [Scaling Git at Microsoft](https://devblogs.microsoft.com/devops/the-largest-git-repo-on-the-planet/) - Virtual File System for Git (VFS for Git)
+- [Semantic: Code Parsing and Analysis](https://github.com/github/semantic) - GitHub's open-source code analysis library
+- [Building GitHub's Code Review](https://github.blog/engineering/building-github-code-review/) - Design insights for PR workflows
+- [CI/CD Pipelines Explained](https://www.redhat.com/en/topics/devops/what-cicd-pipeline) - Overview of continuous integration patterns
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems

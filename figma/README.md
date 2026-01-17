@@ -2,6 +2,18 @@
 
 A real-time collaborative design tool with vector graphics editing, inspired by Figma.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,299 |
+| Source Files | 38 |
+| .ts | 1,565 |
+| .tsx | 1,337 |
+| .md | 988 |
+| .json | 128 |
+| .sql | 125 |
+
 ## Features
 
 - **Real-time Collaboration**: Multiple users can edit the same design simultaneously
@@ -260,3 +272,15 @@ npm run type-check  # TypeScript check
 - [system-design-answer.md](./system-design-answer.md) - Full system design explanation
 - [architecture.md](./architecture.md) - Architecture documentation
 - [claude.md](./claude.md) - Development notes and iteration history
+
+## References & Inspiration
+
+- [How Figma's Multiplayer Technology Works](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) - Figma's engineering blog on real-time collaboration
+- [Building a Professional Design Tool on the Web](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/) - Figma's approach to WebGL rendering
+- [Realtime Editing of Ordered Sequences](https://www.figma.com/blog/realtime-editing-of-ordered-sequences/) - Fractional indexing for layer ordering
+- [Livegraph: A Faster Way to Check Live Reachability](https://www.figma.com/blog/livegraph-real-time-data-fetching-at-figma/) - Figma's real-time data architecture
+- [CRDTs and the Quest for Distributed Consistency](https://www.youtube.com/watch?v=B5NULPSiOGw) - Martin Kleppmann's talk on CRDTs
+- [A Conflict-Free Replicated JSON Datatype](https://arxiv.org/abs/1608.03960) - Academic paper on JSON CRDTs
+- [Yjs: Shared Editing with CRDTs](https://yjs.dev/) - Popular CRDT library for collaborative applications
+- [WebGL Fundamentals](https://webglfundamentals.org/) - Learning WebGL for high-performance rendering
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems

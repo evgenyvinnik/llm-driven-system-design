@@ -2,6 +2,18 @@
 
 A distributed web crawling system for indexing the internet with a focus on politeness, scalability, and efficient URL management.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,930 |
+| Source Files | 48 |
+| .ts | 2,178 |
+| .md | 1,187 |
+| .tsx | 1,175 |
+| .yml | 180 |
+| .json | 145 |
+
 ## Features
 
 - **URL Frontier with Priority Queue**: Manages URLs to crawl with three priority levels (high, medium, low)
@@ -428,3 +440,14 @@ MIT
 - [architecture.md](./architecture.md) - System design documentation
 - [system-design-answer.md](./system-design-answer.md) - Detailed system design interview answer
 - [claude.md](./claude.md) - Development notes and iteration history
+
+## References & Inspiration
+
+- [Mercator: A Scalable, Extensible Web Crawler](https://courses.cs.washington.edu/courses/cse454/10wi/papers/mercator.pdf) - Foundational paper on scalable web crawler architecture from Compaq/HP Labs
+- [The Anatomy of a Large-Scale Hypertextual Web Search Engine](http://infolab.stanford.edu/~backrub/google.html) - Original Google paper describing their crawler architecture
+- [IRLbot: Scaling to 6 Billion Pages and Beyond](https://irl.cse.tamu.edu/people/hsin-tsang/papers/www2008.pdf) - Academic paper on high-performance web crawling
+- [Politeness for Web Crawlers](https://en.wikipedia.org/wiki/Robots.txt) - The robots exclusion protocol standard
+- [Web Crawling Best Practices](https://developers.google.com/search/docs/crawling-indexing/overview-google-crawlers) - Google's guidelines for well-behaved crawlers
+- [Heritrix Web Crawler](https://github.com/internetarchive/heritrix3) - Internet Archive's open-source web crawler
+- [Scrapy Architecture](https://docs.scrapy.org/en/latest/topics/architecture.html) - Architecture overview of the popular Python crawling framework
+- [Distributed Web Crawling with Apache Nutch](https://nutch.apache.org/documentation.html) - Apache's distributed crawler built on Hadoop

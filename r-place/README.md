@@ -2,6 +2,18 @@
 
 A collaborative real-time pixel art canvas where users can place colored pixels with rate limiting. Inspired by Reddit's r/place.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 2,960 |
+| Source Files | 38 |
+| .ts | 1,454 |
+| .md | 777 |
+| .tsx | 482 |
+| .json | 118 |
+| .sql | 40 |
+
 ## Features
 
 - 500x500 pixel shared canvas
@@ -215,3 +227,16 @@ Open multiple browser tabs to simulate multiple users. Each anonymous session ge
 - [ ] Mobile-optimized interface
 - [ ] WebSocket message batching
 - [ ] CDN for canvas snapshots
+
+## References & Inspiration
+
+- [Reddit r/place Technical Retrospective](https://www.reddit.com/r/redditeng/comments/u6o8ua/rplace_technical_recap/) - Reddit engineering post-mortem
+- [How We Built r/place (Reddit Blog)](https://www.reddit.com/r/announcements/comments/62mesr/place/) - Original 2017 r/place announcement
+- [r/place 2022 Technical Post](https://www.redditinc.com/blog/how-we-built-rplace/) - Scaling to millions of concurrent users
+- [WebSocket Scaling with Redis Pub/Sub](https://redis.io/docs/manual/pubsub/) - Real-time message broadcasting patterns
+- [Rate Limiting at Scale (Figma)](https://www.figma.com/blog/an-alternative-approach-to-rate-limiting/) - Token bucket and sliding window algorithms
+- [Cloudflare Rate Limiting](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) - Distributed rate limiting strategies
+- [Canvas Rendering Performance (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Canvas_API/Tutorial/Optimizing_canvas) - HTML5 Canvas optimization techniques
+- [Redis BITFIELD for Efficient Storage](https://redis.io/commands/bitfield/) - Compact storage for pixel data
+- [Building Collaborative Applications](https://www.youtube.com/watch?v=S2Hp_1jqpY8) - Real-time sync patterns
+- [WebSocket at Scale (NGINX)](https://www.nginx.com/blog/websocket-nginx/) - Load balancing WebSocket connections

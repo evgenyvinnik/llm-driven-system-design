@@ -1,5 +1,17 @@
 # Design Shopify - Multi-Tenant E-Commerce
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,144 |
+| Source Files | 35 |
+| .tsx | 1,783 |
+| .js | 1,476 |
+| .md | 946 |
+| .ts | 502 |
+| .sql | 282 |
+
 ## Overview
 
 A simplified Shopify-like platform demonstrating multi-tenant e-commerce, checkout flows, payment processing, and merchant customization. This educational project focuses on building a platform where merchants can create their own online stores.
@@ -216,3 +228,14 @@ For simplicity, this learning project omits:
 - Real-time inventory sync
 
 See [architecture.md](./architecture.md) for how these would be implemented in production.
+
+## References & Inspiration
+
+- [Shopify Engineering Blog](https://shopify.engineering/) - Technical insights from Shopify's engineering team
+- [How Shopify Scaled Their Platform](https://shopify.engineering/e-commerce-at-scale-inside-shopifys-tech-stack) - Architecture decisions for massive scale
+- [Deconstructing the Monolith](https://shopify.engineering/deconstructing-monolith-designing-software-maximizes-developer-productivity) - Shopify's modular monolith approach
+- [Shopify's Architecture for Handling Flash Sales](https://shopify.engineering/handling-flash-sales-with-shopify) - Managing traffic spikes during high-demand events
+- [Multi-Tenant Data Architecture](https://www.citusdata.com/blog/2016/10/03/designing-your-saas-database-for-high-scalability/) - PostgreSQL patterns for SaaS applications
+- [PostgreSQL Row-Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) - Official RLS documentation for tenant isolation
+- [Building a Checkout That Converts](https://baymard.com/checkout-usability) - Baymard Institute's research on checkout UX
+- [Inventory Management at Scale](https://www.uber.com/blog/fulfillment-platform/) - Uber's patterns for real-time inventory tracking

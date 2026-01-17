@@ -1,5 +1,17 @@
 # Facebook News Feed
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,081 |
+| Source Files | 43 |
+| .ts | 2,322 |
+| .tsx | 1,427 |
+| .md | 936 |
+| .sql | 156 |
+| .json | 133 |
+
 ## Overview
 
 A personalized content feed system for social media with hybrid fan-out architecture, ranking algorithms, and real-time updates.
@@ -212,3 +224,13 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - [ ] Admin dashboard
 - [ ] Rate limiting and spam protection
 - [ ] Search functionality for posts
+
+## References & Inspiration
+
+- [The Facebook News Feed](https://engineering.fb.com/2010/05/13/web/the-new-facebook-news-feed/) - Original Facebook engineering post on News Feed architecture
+- [Scaling the Facebook News Feed](https://research.facebook.com/publications/serving-facebook-multifeed-efficiency-performance-gains-through-redesign/) - Research on feed serving optimization
+- [EdgeRank Algorithm](https://www.brandwatch.com/blog/react-how-does-the-facebook-edgerank-algorithm-work/) - Explanation of Facebook's original ranking algorithm
+- [Twitter Fan-out Architecture](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale) - Twitter's approach to fan-out for timeline delivery
+- [Facebook's Memcached](https://engineering.fb.com/2013/06/25/core-infra/scaling-memcache-at-facebook/) - Scaling caching infrastructure for News Feed
+- [TAO: Facebook's Distributed Data Store](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/) - Graph-aware caching layer used by News Feed
+- [Redis Sorted Sets for Ranking](https://redis.io/docs/data-types/sorted-sets/) - Data structure for efficient feed storage and retrieval

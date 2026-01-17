@@ -1,5 +1,17 @@
 # Online Auction System
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,331 |
+| Source Files | 49 |
+| .tsx | 2,183 |
+| .js | 1,618 |
+| .md | 609 |
+| .ts | 604 |
+| .sql | 114 |
+
 ## Overview
 
 A real-time bidding and auction platform for online sales with auto-bidding, snipe protection, and live updates via WebSocket.
@@ -239,6 +251,17 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [eBay's Architecture](https://www.cs.cornell.edu/courses/cs5414/2017fa/papers/ebay-architecture.pdf) - eBay's platform architecture and lessons learned
+- [Real-Time Bidding System Design](https://blog.bytebytego.com/p/how-to-design-a-real-time-bidding) - ByteByteGo overview of RTB systems
+- [Auction Theory and Mechanism Design](https://web.stanford.edu/~jdlevin/Econ%20286/Auctions.pdf) - Academic foundations of auction mechanics
+- [Handling Concurrency in Auctions](https://www.infoq.com/articles/ebay-scalability-best-practices/) - eBay's scalability patterns
+- [Redis for Real-Time Bidding](https://redis.io/docs/manual/patterns/distributed-locks/) - Distributed locks for bid ordering
+- [WebSocket at Scale](https://ably.com/blog/websocket-vs-http) - Real-time communication patterns
+- [Sniping and Auction Ending Strategies](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=276967) - Academic analysis of last-second bidding
+- [Building a Distributed Auction System](https://www.confluent.io/blog/building-real-time-auction-system-using-kafka/) - Kafka-based event-driven auction architecture
 
 ## Future Enhancements
 

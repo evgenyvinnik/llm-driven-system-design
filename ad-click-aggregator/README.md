@@ -2,6 +2,18 @@
 
 A real-time analytics system for aggregating ad clicks with fraud detection, designed to demonstrate high-volume event processing and real-time aggregation patterns.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 3,977 |
+| Source Files | 41 |
+| .ts | 1,695 |
+| .tsx | 1,093 |
+| .md | 845 |
+| .sql | 122 |
+| .json | 120 |
+
 ## Features
 
 - **Click Event Ingestion**: High-throughput API for recording ad clicks
@@ -293,3 +305,16 @@ MIT
 
 See [architecture.md](./architecture.md) for detailed system design documentation.
 See [claude.md](./claude.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [The Unified Logging Infrastructure for Data Analytics at Twitter](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2021/logging-at-twitter-updated) - How Twitter handles high-volume event streaming and analytics
+- [Scaling Ads Analytics at LinkedIn](https://engineering.linkedin.com/blog/2020/ads-analytics-platform) - Real-time advertising analytics architecture
+- [Lambda Architecture](http://lambda-architecture.net/) - Nathan Marz's approach to batch and real-time processing
+- [Questioning the Lambda Architecture](https://www.oreilly.com/radar/questioning-the-lambda-architecture/) - Jay Kreps on Kappa architecture as an alternative
+- [How Facebook Counts](https://www.meta.com/blog/engineering/real-time-analytics-at-facebook/) - Real-time counting at Facebook scale
+- [ClickHouse for Real-Time Analytics](https://clickhouse.com/blog/real-time-analytics-with-clickhouse) - Columnar database for analytics workloads
+- [Exactly-Once Semantics in Apache Kafka](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/) - Achieving exactly-once in stream processing
+- [Redis HyperLogLog](https://redis.io/docs/data-types/hyperloglog/) - Probabilistic counting for unique users
+- [Real-Time Fraud Detection at Scale](https://netflixtechblog.com/real-time-fraud-detection-at-netflix-aec0af7ea9e1) - Netflix's approach to fraud detection patterns
+- [Druid: A Real-time Analytical Data Store](http://druid.io/druid.pdf) - Academic paper on real-time OLAP systems

@@ -2,6 +2,18 @@
 
 A simplified Jira-like platform demonstrating issue tracking, workflow automation, permission systems, and reporting. This educational project focuses on building a project management system with customizable workflows.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,017 |
+| Source Files | 55 |
+| .ts | 4,396 |
+| .tsx | 2,367 |
+| .md | 961 |
+| .json | 145 |
+| .yml | 51 |
+
 ## Features
 
 ### Issue Management
@@ -234,3 +246,16 @@ See [architecture.md](./architecture.md) for detailed design documentation.
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Jira Cloud REST API Documentation](https://developer.atlassian.com/cloud/jira/platform/rest/v3/) - Official Atlassian API reference
+- [Workflow Patterns](https://www.workflowpatterns.com/) - Academic research on workflow modeling patterns
+- [Atlassian Engineering Blog](https://www.atlassian.com/engineering) - Engineering insights from Atlassian
+- [Building Query Languages (ANTLR Tutorial)](https://tomassetti.me/antlr-mega-tutorial/) - Guide to building parsers like JQL
+- [State Machines in Production](https://blog.pragmaticengineer.com/state-machines/) - Practical patterns for workflow engines
+- [JSONB Performance in PostgreSQL](https://www.postgresql.org/docs/current/datatype-json.html) - PostgreSQL JSON documentation for custom fields
+- [Elasticsearch: The Definitive Guide](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html) - Search engine fundamentals
+- [Linear Method](https://linear.app/method) - Modern issue tracking design philosophy from Linear
+- [The Art of Agile Development](https://www.jamesshore.com/v2/books/aoad2) - Understanding agile workflows
+- [Event Sourcing Pattern](https://martinfowler.com/eaaDev/EventSourcing.html) - Martin Fowler on audit trails and history tracking

@@ -1,5 +1,17 @@
 # Design Amazon - E-Commerce Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,146 |
+| Source Files | 48 |
+| .js | 2,306 |
+| .tsx | 2,086 |
+| .md | 988 |
+| .ts | 420 |
+| .sql | 186 |
+
 ## Overview
 
 A simplified Amazon-like platform demonstrating product catalog management, inventory systems, recommendation engines, and order fulfillment. This educational project focuses on building a scalable e-commerce system with complex product search and ordering workflows.
@@ -287,3 +299,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Amazon's Dynamo Paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) - Foundational distributed key-value store design from Amazon
+- [All Things Distributed (Werner Vogels' Blog)](https://www.allthingsdistributed.com/) - Insights from Amazon's CTO on distributed systems
+- [Building Scalable E-Commerce with Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) - Event sourcing pattern for order tracking
+- [Elasticsearch for E-Commerce Search](https://www.elastic.co/blog/found-elasticsearch-as-a-foundation-for-e-commerce-search) - Search implementation strategies
+- [Amazon Item-to-Item Collaborative Filtering](https://www.cs.umd.edu/~samir/498/Amazon-Recommendations.pdf) - The original recommendation algorithm paper
+- [Inventory Management Patterns](https://martinfowler.com/eaaCatalog/optimisticOfflineLock.html) - Optimistic locking for concurrent inventory updates
+- [Designing a Shopping Cart](https://blog.bytebytego.com/p/ep70-how-to-design-a-shopping-cart) - ByteByteGo deep dive on cart design
+- [Handling Flash Sales at Scale](https://engineering.grab.com/how-we-built-real-time-flash-sale-system) - Grab's approach to high-concurrency sales

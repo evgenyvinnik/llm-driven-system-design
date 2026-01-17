@@ -1,5 +1,17 @@
 # Design Reddit - Community-Driven Content Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,833 |
+| Source Files | 55 |
+| .js | 1,748 |
+| .tsx | 1,524 |
+| .md | 968 |
+| .ts | 409 |
+| .json | 104 |
+
 ## Overview
 
 A simplified Reddit-like platform demonstrating voting systems, nested comments, subreddit isolation, and content ranking algorithms. This educational project focuses on building a community-driven content aggregation system with real-time voting and discussion features.
@@ -242,3 +254,13 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 - [ ] Flair system for posts and users
 - [ ] Basic moderation tools
 - [ ] Awards and premium features
+
+## References & Inspiration
+
+- [How Reddit Ranking Algorithms Work](https://medium.com/hacking-and-gonzo/how-reddit-ranking-algorithms-work-ef111e33d0d9) - Deep dive into hot, controversial, and best ranking algorithms
+- [How Not To Sort By Average Rating](https://www.evanmiller.org/how-not-to-sort-by-average-rating.html) - Wilson score confidence interval for comment ranking
+- [Reddit's Architecture](https://www.redditinc.com/blog/how-we-built-rplace/) - Insights from building r/place at scale
+- [Scaling Reddit's Community Points with Arbitrum](https://www.reddit.com/r/ethereum/comments/l6c3kx/scaling_reddits_community_points_with_arbitrum/) - Reddit's approach to scaling community features
+- [The Evolution of Reddit.com's Architecture](https://www.infoq.com/presentations/reddit-architecture-evolution/) - Talk on Reddit's infrastructure evolution
+- [PostgreSQL ltree Extension](https://www.postgresql.org/docs/current/ltree.html) - Hierarchical data type used for materialized path trees
+- [Reddit's Voting System Design](https://redditblog.com/2009/10/15/reddits-new-comment-sorting-system/) - Original blog post on confidence-based comment sorting

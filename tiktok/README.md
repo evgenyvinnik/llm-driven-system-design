@@ -1,5 +1,17 @@
 # Design TikTok - Short Video Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,444 |
+| Source Files | 40 |
+| .js | 1,484 |
+| .tsx | 1,342 |
+| .md | 835 |
+| .ts | 443 |
+| .sql | 106 |
+
 ## Overview
 
 A simplified TikTok-like platform demonstrating short video recommendations, content discovery algorithms, and creator monetization. This educational project focuses on building a recommendation-driven video platform with infinite scroll experiences.
@@ -256,3 +268,16 @@ docker-compose ps redis
 # Test connection
 docker-compose exec redis redis-cli ping
 ```
+
+## References & Inspiration
+
+- [How TikTok Recommends Videos For You](https://newsroom.tiktok.com/en-us/how-tiktok-recommends-videos-for-you) - Official TikTok recommendation system explanation
+- [Monolith: Real-Time Recommendation at ByteDance](https://arxiv.org/abs/2209.07663) - ByteDance's production recommendation system paper
+- [Two-Stage Recommendation Systems (Google Research)](https://research.google/pubs/pub45530/) - Candidate generation and ranking approach
+- [Deep Neural Networks for YouTube Recommendations](https://research.google/pubs/pub45530/) - Foundational paper on video recommendation at scale
+- [FFmpeg Streaming Guide](https://trac.ffmpeg.org/wiki/StreamingGuide) - Video transcoding and format conversion
+- [Adaptive Bitrate Streaming (Netflix Tech Blog)](https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2) - Video encoding optimization techniques
+- [Exploration vs Exploitation in Recommendations](https://dl.acm.org/doi/10.1145/3298689.3346999) - Multi-armed bandit approaches for feed diversity
+- [Cold Start Problem in Recommendations (ACM)](https://dl.acm.org/doi/10.1145/3109859.3109892) - Handling new users and content
+- [Feature Store for ML (Uber Engineering)](https://www.uber.com/blog/michelangelo-machine-learning-platform/) - Feature engineering at scale
+- [S3-Compatible Object Storage Best Practices](https://min.io/docs/minio/linux/operations/concepts.html) - MinIO architecture for video storage

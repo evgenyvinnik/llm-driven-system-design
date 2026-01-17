@@ -1,5 +1,17 @@
 # Design Google Search - Web Search Engine
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,046 |
+| Source Files | 42 |
+| .js | 2,215 |
+| .md | 1,301 |
+| .tsx | 813 |
+| .ts | 450 |
+| .json | 97 |
+
 ## Overview
 
 A simplified Google Search-like platform demonstrating web crawling, indexing, ranking algorithms, and query processing at scale. This educational project focuses on building a distributed search engine with relevance-based ranking.
@@ -271,3 +283,15 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 ## License
 
 Educational project - MIT License
+
+## References & Inspiration
+
+- [The Anatomy of a Large-Scale Hypertextual Web Search Engine](http://infolab.stanford.edu/~backrub/google.html) - The original Google paper by Brin and Page describing PageRank and web search architecture
+- [The PageRank Citation Ranking](http://ilpubs.stanford.edu:8090/422/1/1999-66.pdf) - Original PageRank algorithm paper
+- [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) - Stanford's comprehensive textbook on search engine fundamentals
+- [Google Research Publications](https://research.google/pubs/) - Collection of papers on search, indexing, and distributed systems
+- [Inverted Index](https://en.wikipedia.org/wiki/Inverted_index) - Core data structure for full-text search
+- [BM25 Ranking Algorithm](https://en.wikipedia.org/wiki/Okapi_BM25) - Probabilistic ranking function used by modern search engines
+- [Elasticsearch: The Definitive Guide](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html) - Comprehensive guide to Elasticsearch for search applications
+- [How Google Works](https://www.google.com/intl/en/search/howsearchworks/) - Google's official explanation of their search technology
+- [Query Understanding at Google](https://research.google/pubs/pub37476/) - How Google processes and understands search queries

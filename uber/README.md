@@ -2,6 +2,18 @@
 
 A full-stack ride-hailing platform implementation featuring real-time driver matching, location tracking, surge pricing, and separate rider/driver interfaces.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,451 |
+| Source Files | 44 |
+| .js | 1,832 |
+| .tsx | 1,369 |
+| .md | 972 |
+| .ts | 968 |
+| .sql | 118 |
+
 ## Features
 
 ### Rider App
@@ -272,3 +284,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [Uber's Real-Time Data Infrastructure](https://www.uber.com/blog/real-time-data-infrastructure/) - How Uber handles millions of location updates per second
+- [H3: Uber's Hexagonal Hierarchical Spatial Index](https://www.uber.com/blog/h3/) - Uber's open-source geospatial indexing system for efficient spatial partitioning
+- [Uber's Dispatch Algorithm](https://www.uber.com/blog/engineering-for-next-generation-dispatch/) - Machine learning approach to matching riders with drivers
+- [Scaling Uber's Real-Time Market Platform](https://www.infoq.com/presentations/uber-market-platform/) - InfoQ talk on Uber's marketplace architecture
+- [Redis Geo Commands](https://redis.io/docs/data-types/geospatial/) - Documentation for GEOADD, GEORADIUS used for driver location indexing
+- [Designing Uber - High Scalability](http://highscalability.com/blog/2022/1/25/designing-uber.html) - System design overview covering surge pricing and real-time tracking
+- [Supply-Demand Matching at Lyft](https://www.youtube.com/watch?v=RpIvDZcHwjA) - Video on ride-hailing marketplace dynamics and pricing
+- [Location Tracking at Scale - Martin Kleppmann](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) - Distributed systems considerations for real-time location updates

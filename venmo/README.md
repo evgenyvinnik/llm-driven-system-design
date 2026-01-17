@@ -2,6 +2,18 @@
 
 A simplified Venmo-like platform demonstrating peer-to-peer payments, social feeds, and instant money transfers. This educational project focuses on building a social payment network with balance management and multi-source funding.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,562 |
+| Source Files | 46 |
+| .tsx | 1,969 |
+| .js | 1,888 |
+| .md | 1,107 |
+| .ts | 450 |
+| .json | 88 |
+
 ## Features
 
 ### Core Functionality
@@ -210,3 +222,13 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 ## License
 
 Educational project - MIT License
+
+## References & Inspiration
+
+- [Building a Payment System](https://newsletter.pragmaticengineer.com/p/designing-a-payment-system) - Gergely Orosz's comprehensive guide to payment system design
+- [PayPal Engineering Blog](https://medium.com/paypal-tech) - Technical insights from PayPal/Venmo engineering
+- [How Venmo Built a Highly Available Real-Time Transaction System](https://www.infoq.com/presentations/venmo-real-time/) - Architecture of Venmo's real-time processing
+- [Fan-out, Fan-in: Designing Social Feeds](https://www.mongodb.com/blog/post/schema-design-for-social-inboxes-in-mongodb) - Patterns for building activity feeds
+- [Designing Instagram's Activity Feed](https://instagram-engineering.com/designing-instagrams-feed-b8c3eb9d95e6) - Instagram's approach to feed architecture
+- [ACH Payment Processing Guide](https://www.nacha.org/rules) - Understanding bank transfer mechanics
+- [The Architecture of Uber's Wallet](https://www.uber.com/blog/money-scale-strong-data/) - How Uber handles money at scale with strong data consistency

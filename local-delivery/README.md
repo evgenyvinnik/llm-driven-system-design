@@ -2,6 +2,18 @@
 
 A last-mile delivery platform for local goods and services, similar to DoorDash, Instacart, or Uber Eats. Features real-time driver tracking, order management, and driver matching.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,317 |
+| Source Files | 56 |
+| .ts | 4,356 |
+| .tsx | 2,196 |
+| .md | 1,240 |
+| .sql | 240 |
+| .json | 121 |
+
 ## Features
 
 ### Customer Features
@@ -242,6 +254,18 @@ See [system-design-answer.md](./system-design-answer.md) for interview-style des
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [DoorDash System Design](https://blog.bytebytego.com/p/designing-doordash) - ByteByteGo breakdown of food delivery architecture
+- [Uber's Real-Time Marketplace](https://www.uber.com/blog/uber-marketplace-real-time-data-platform/) - Real-time matching at scale
+- [Redis Geospatial Indexes](https://redis.io/docs/data-types/geospatial/) - Efficient driver location tracking
+- [Last-Mile Delivery Optimization](https://www.mckinsey.com/industries/travel-logistics-and-infrastructure/our-insights/how-customer-demands-are-reshaping-last-mile-delivery) - McKinsey insights on delivery logistics
+- [Route Optimization Algorithms](https://developers.google.com/optimization/routing) - Google OR-Tools for vehicle routing
+- [Building Real-Time Location Tracking](https://www.pubnub.com/blog/build-a-real-time-location-tracking-app/) - PubNub patterns for live tracking
+- [Instacart's Dispatch System](https://tech.instacart.com/space-time-and-groceries-a315925acf3a) - Shopper assignment optimization
+- [Surge Pricing Algorithms](https://www.uber.com/blog/demand-pricing/) - Dynamic pricing based on demand
+- [WebSocket at Scale for Real-Time Updates](https://engineering.grab.com/how-we-built-grabchat-android) - Grab's real-time messaging architecture
 
 ## Future Enhancements
 

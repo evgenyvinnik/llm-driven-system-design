@@ -2,6 +2,18 @@
 
 A crowdsourced data collection platform where users contribute labeled drawing data through a game interface, administrators manage datasets and training, and implementors use trained models for inference.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,219 |
+| Source Files | 55 |
+| .ts | 2,194 |
+| .css | 2,187 |
+| .tsx | 1,599 |
+| .md | 1,051 |
+| .py | 856 |
+
 ## Project Overview
 
 **Three User Portals:**
@@ -363,3 +375,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 - MinIO for S3-compatible local object storage
 - RabbitMQ for training job queue
 - Small CNN optimized for fast inference
+
+## References & Inspiration
+
+- [Quick, Draw! by Google](https://quickdraw.withgoogle.com/) - Interactive game for collecting drawing data at scale
+- [Quick, Draw! Dataset](https://quickdraw.withgoogle.com/data) - 50M+ drawing samples for ML training
+- [Scale AI Engineering Blog](https://scale.com/blog) - Data labeling platform architecture insights
+- [Human-in-the-Loop Machine Learning](https://www.manning.com/books/human-in-the-loop-machine-learning) - Principles of active learning and annotation
+- [Crowdsourcing and Human Computation (Stanford)](https://hci.stanford.edu/publications/2011/crowdsourcing-chi2011.pdf) - Quality control in crowdsourced systems
+- [Amazon Mechanical Turk Best Practices](https://docs.aws.amazon.com/AWSMechTurk/latest/RequesterUI/BestPractices.html) - Guidelines for crowdsourced data collection
+- [Active Learning Literature Survey](https://burrsettles.com/pub/settles.activelearning.pdf) - Strategies for efficient labeling
+- [Data Quality for Machine Learning (Google)](https://developers.google.com/machine-learning/data-prep) - Best practices for training data
+- [Inter-Annotator Agreement](https://www.nltk.org/_modules/nltk/metrics/agreement.html) - Measuring labeling consistency
+- [Ramer-Douglas-Peucker Algorithm](https://en.wikipedia.org/wiki/Ramer%E2%80%93Douglas%E2%80%93Peucker_algorithm) - Stroke simplification technique

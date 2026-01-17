@@ -1,5 +1,17 @@
 # Design App Store - Application Marketplace
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,691 |
+| Source Files | 54 |
+| .ts | 3,369 |
+| .tsx | 1,859 |
+| .md | 1,154 |
+| .json | 137 |
+| .yml | 87 |
+
 ## Overview
 
 A simplified App Store-like platform demonstrating app discovery, secure purchases, review systems, and ranking algorithms. This educational project focuses on building a digital marketplace with content moderation and personalized recommendations.
@@ -209,3 +221,13 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [App Store Review Guidelines](https://developer.apple.com/app-store/review/guidelines/) - Apple's official guidelines for app submission and approval
+- [App Store Connect API](https://developer.apple.com/documentation/appstoreconnectapi) - Apple's API for managing apps, in-app purchases, and analytics
+- [StoreKit Documentation](https://developer.apple.com/documentation/storekit) - In-app purchases and subscriptions implementation
+- [Google Play Console Help](https://support.google.com/googleplay/android-developer/) - Comparison platform for app distribution patterns
+- [Detecting Fake Reviews with Machine Learning](https://arxiv.org/abs/2106.09757) - Research paper on review integrity and fraud detection
+- [App Store Optimization Guide](https://developer.apple.com/app-store/search/) - Apple's guidance on app discoverability and search ranking
+- [Rating and Review Guidelines](https://developer.apple.com/app-store/ratings-and-reviews/) - Best practices for encouraging authentic reviews

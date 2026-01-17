@@ -2,6 +2,18 @@
 
 A WhatsApp-inspired messaging application with real-time WebSocket communication, message delivery receipts, user presence, and group chat support.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,497 |
+| Source Files | 44 |
+| .ts | 2,199 |
+| .tsx | 1,110 |
+| .md | 877 |
+| .json | 137 |
+| .sql | 74 |
+
 ## Features
 
 - **Real-time 1:1 Messaging**: Send and receive messages instantly via WebSocket
@@ -247,3 +259,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [How WhatsApp Scaled to 1 Billion Users with Only 50 Engineers](http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html) - Classic High Scalability article on WhatsApp's Erlang-based architecture
+- [The WhatsApp Architecture Facebook Bought for $19 Billion](https://www.wired.com/2014/02/whatsapp-facebook/) - Background on WhatsApp's lean engineering approach
+- [XMPP Protocol Specification](https://xmpp.org/rfcs/rfc6120.html) - The messaging protocol that inspired WhatsApp's original design
+- [Redis Pub/Sub Documentation](https://redis.io/docs/interact/pubsub/) - Real-time message routing across distributed servers
+- [WebSocket API - MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) - Client-side WebSocket implementation reference
+- [ws - Node.js WebSocket Library](https://github.com/websockets/ws) - The WebSocket library used in this implementation
+- [Signal Protocol Technical Documentation](https://signal.org/docs/) - End-to-end encryption protocol used by WhatsApp
+- [Designing a Chat System - System Design Interview](https://bytebytego.com/courses/system-design-interview/design-a-chat-system) - ByteByteGo's comprehensive chat system design guide
+- [Building Real-Time Applications with WebSockets](https://ably.com/topic/websockets) - Patterns for scaling WebSocket connections
+- [Message Queuing with RabbitMQ](https://www.rabbitmq.com/tutorials/tutorial-one-javascript.html) - Alternative to Redis Pub/Sub for message delivery

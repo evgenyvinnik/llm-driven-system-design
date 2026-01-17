@@ -2,6 +2,18 @@
 
 A real-time commenting system for live video streams, demonstrating high-throughput comment delivery, batching, and reaction aggregation.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 3,440 |
+| Source Files | 44 |
+| .ts | 1,658 |
+| .md | 893 |
+| .tsx | 566 |
+| .json | 116 |
+| .sql | 83 |
+
 ## Features
 
 - Real-time comments via WebSocket
@@ -217,3 +229,13 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [Facebook Live: Under the Hood](https://engineering.fb.com/2015/12/03/ios/under-the-hood-broadcasting-live-video-to-millions/) - Facebook's engineering approach to live video broadcasting
+- [Scaling Live Video Comments at Facebook](https://engineering.fb.com/2016/04/06/android/building-live-video-broadcast-in-facebook-live/) - Real-time comment delivery for live streams
+- [WebSocket at Scale](https://blog.pusher.com/websocket-at-scale-one-million-connections/) - Scaling WebSocket connections for real-time features
+- [Twitter Snowflake ID Generation](https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake) - Time-ordered unique ID generation without coordination
+- [Redis Pub/Sub for Real-time Messaging](https://redis.io/docs/interact/pubsub/) - Horizontal scaling of real-time comment delivery
+- [Rate Limiting Strategies](https://stripe.com/blog/rate-limiters) - Stripe's approach to rate limiting at scale
+- [Facebook Live Reactions](https://engineering.fb.com/2016/04/06/android/building-live-video-broadcast-in-facebook-live/) - Aggregating and displaying real-time reactions

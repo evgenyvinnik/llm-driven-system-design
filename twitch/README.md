@@ -1,5 +1,17 @@
 # Design Twitch - Live Streaming Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,065 |
+| Source Files | 43 |
+| .js | 1,573 |
+| .tsx | 1,492 |
+| .md | 999 |
+| .ts | 542 |
+| .sql | 174 |
+
 ## Overview
 
 A simplified Twitch-like platform demonstrating live video streaming, real-time chat at scale, subscription systems, and VOD storage. This educational project focuses on building a live broadcasting system with interactive viewer experiences.
@@ -294,3 +306,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Twitch Engineering Blog](https://blog.twitch.tv/en/tags/engineering/) - Official engineering insights from Twitch
+- [How Twitch Uses PostgreSQL](https://blog.twitch.tv/en/2016/10/11/how-twitch-uses-postgresql-c34aa9e56731/) - Database architecture for chat and user data
+- [Chat Microservices at Twitch](https://blog.twitch.tv/en/2022/04/12/breaking-the-monolith-at-twitch/) - Breaking up the monolith for chat scalability
+- [Low-Latency HLS (Apple Developer)](https://developer.apple.com/documentation/http_live_streaming/enabling_low-latency_http_live_streaming_ll-hls) - Official LL-HLS specification
+- [HLS Specification (Apple)](https://developer.apple.com/streaming/) - HTTP Live Streaming protocol documentation
+- [DASH Industry Forum](https://dashif.org/) - MPEG-DASH streaming standard and guidelines
+- [nginx-rtmp-module](https://github.com/arut/nginx-rtmp-module) - NGINX-based RTMP server for live streaming
+- [Building a Live Streaming Platform (InfoQ)](https://www.infoq.com/presentations/twitch-video-distribution/) - Twitch video distribution architecture
+- [WebSocket at Scale (NGINX Blog)](https://www.nginx.com/blog/websocket-nginx/) - Scaling WebSocket connections
+- [Redis Pub/Sub for Real-Time Systems](https://redis.io/docs/manual/pubsub/) - Redis messaging patterns for chat

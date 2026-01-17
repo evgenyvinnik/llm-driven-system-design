@@ -1,5 +1,17 @@
 # Design Apple Music - Music Streaming Service
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,338 |
+| Source Files | 49 |
+| .tsx | 2,567 |
+| .js | 2,458 |
+| .md | 1,158 |
+| .ts | 559 |
+| .sql | 370 |
+
 ## Overview
 
 A simplified Apple Music-like platform demonstrating music streaming, library management, and personalized recommendations. This educational project focuses on building an audio streaming service integrated with user libraries and social features.
@@ -213,3 +225,13 @@ MINIO_SECRET_KEY=minio_secret
 
 - [architecture.md](./architecture.md) - System design documentation
 - [claude.md](./claude.md) - Development notes and decisions
+
+## References & Inspiration
+
+- [MusicKit Documentation](https://developer.apple.com/documentation/musickit) - Apple's framework for integrating Apple Music
+- [Apple Music API](https://developer.apple.com/documentation/applemusicapi) - RESTful API for Apple Music catalog and user libraries
+- [Spotify Engineering Blog](https://engineering.atspotify.com/) - Technical insights on music streaming at scale
+- [How Spotify's Audio Delivery Works](https://engineering.atspotify.com/2022/06/audio-streaming-at-spotify/) - Streaming architecture and delivery optimization
+- [Chromaprint Audio Fingerprinting](https://acoustid.org/chromaprint) - Open-source audio fingerprinting library for music matching
+- [Music Recommendation at Spotify](https://research.atspotify.com/2022/03/music-recommendation-at-spotify/) - Research on personalization algorithms
+- [Content-Based Music Recommendations](https://towardsdatascience.com/music-recommendation-system-spotify-dcf7c9e5d99) - Hybrid recommendation system approaches

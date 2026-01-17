@@ -1,5 +1,17 @@
 # Design Twitter/X - Real-Time Social Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,728 |
+| Source Files | 47 |
+| .js | 1,826 |
+| .tsx | 1,070 |
+| .md | 1,001 |
+| .ts | 676 |
+| .json | 89 |
+
 ## Overview
 
 A simplified Twitter-like platform demonstrating timeline fanout, real-time updates, trend detection, and social graph management. This educational project focuses on building a high-throughput microblogging system with real-time content delivery.
@@ -227,3 +239,15 @@ async function getHomeTimeline(userId) {
 - [ ] Algorithmic timeline ranking
 - [ ] Real-time updates via SSE/WebSocket
 - [ ] Multi-instance load balancing
+
+## References & Inspiration
+
+- [The Infrastructure Behind Twitter: Scale](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale) - Twitter's engineering blog on scaling infrastructure
+- [How Twitter Handles 3,000 Images Per Second](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2016/how-twitter-handles-3000-images-per-second) - Image processing pipeline at scale
+- [Snowflake: Twitter's Unique ID Generator](https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake) - Distributed ID generation for ordering
+- [The Mystery of the Missing Tweets](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2018/mission-control-of-the-tweetypie) - How TweetyPie manages tweet storage
+- [Timelines at Scale](https://www.infoq.com/presentations/Twitter-Timeline-Scalability/) - Raffi Krikorian's talk on fanout strategies
+- [Real-Time Delivery Architecture at Twitter](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2022/real-time-delivery-architecture-at-twitter) - Push vs pull trade-offs
+- [GraphJet: Real-Time Content Recommendations at Twitter](https://www.vldb.org/pvldb/vol9/p1281-sharma.pdf) - Graph-based recommendations paper
+- [The Unified Graph (Twitter)](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2021/a-]closer-look-at-the-unified-graph) - Social graph architecture
+- [Scaling the Twitter Cache](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/caching-at-twitter-part-1) - Redis caching strategies

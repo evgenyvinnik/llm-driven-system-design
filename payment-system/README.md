@@ -2,6 +2,18 @@
 
 A transaction processing and payment platform with double-entry bookkeeping, idempotency support, and a merchant dashboard.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,389 |
+| Source Files | 44 |
+| .ts | 2,788 |
+| .tsx | 1,552 |
+| .md | 702 |
+| .json | 133 |
+| .sql | 131 |
+
 ## Overview
 
 This project implements a payment processing system similar to Stripe, featuring:
@@ -273,3 +285,14 @@ payment-system/
 - Enhanced fraud detection with ML models
 - Comprehensive test suite
 - Performance monitoring with Prometheus/Grafana
+
+## References & Inspiration
+
+- [Saga Pattern for Microservices](https://microservices.io/patterns/data/saga.html) - Chris Richardson's guide to managing distributed transactions
+- [PCI DSS Quick Reference Guide](https://www.pcisecuritystandards.org/document_library/) - Payment Card Industry Data Security Standards
+- [Avoiding Double Payments in Distributed Systems](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) - Airbnb's battle-tested patterns
+- [Building a Modern Payment System](https://www.moderntreasury.com/learn/payment-operations) - Modern Treasury's guide to payment operations
+- [Eventual Consistency in Payment Systems](https://www.uber.com/blog/money-scale-strong-data/) - Uber's approach to financial data integrity
+- [Implementing Event Sourcing for Financial Ledgers](https://www.eventstore.com/blog/event-sourcing-and-cqrs) - Event sourcing patterns for audit trails
+- [Two-Phase Commit vs Saga](https://www.baeldung.com/cs/saga-pattern-microservices) - Comparing distributed transaction approaches
+- [Designing Webhooks for Payment Systems](https://stripe.com/docs/webhooks/best-practices) - Best practices for reliable webhook delivery

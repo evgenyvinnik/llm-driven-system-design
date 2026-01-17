@@ -2,6 +2,18 @@
 
 A privacy-aware search engine for social media posts with personalized ranking and real-time indexing.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,388 |
+| Source Files | 54 |
+| .ts | 2,827 |
+| .tsx | 1,387 |
+| .md | 935 |
+| .json | 135 |
+| .yml | 52 |
+
 ## Overview
 
 This project implements a Facebook-like post search system that demonstrates:
@@ -265,3 +277,13 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 - [ ] Comment search
 - [ ] Multi-language support
 - [ ] Load testing and benchmarks
+
+## References & Inspiration
+
+- [Unicorn: A System for Searching the Social Graph](https://research.facebook.com/publications/unicorn-a-system-for-searching-the-social-graph/) - Facebook's research paper on social graph search
+- [Under the Hood: Indexing and Ranking in Graph Search](https://engineering.fb.com/2013/02/20/core-infra/under-the-hood-indexing-and-ranking-in-graph-search/) - Facebook's approach to privacy-aware search
+- [Typeahead Search at Facebook](https://engineering.fb.com/2010/05/17/web/the-life-of-a-typeahead-query/) - Real-time search suggestions implementation
+- [Elasticsearch: The Definitive Guide](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html) - Comprehensive guide for full-text search
+- [Privacy in Social Search](https://research.facebook.com/publications/privacy-social-search/) - Research on balancing privacy and search relevance
+- [BM25 Ranking Algorithm](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables) - Understanding the default Elasticsearch ranking
+- [Facebook's TAO](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/) - Graph data store enabling efficient social queries

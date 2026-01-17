@@ -1,5 +1,17 @@
 # Design Collaborative Editor - Real-Time Document Editing
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,511 |
+| Source Files | 37 |
+| .ts | 2,275 |
+| .md | 1,515 |
+| .tsx | 446 |
+| .json | 128 |
+| .sql | 62 |
+
 ## Overview
 
 A collaborative document editing system enabling multiple users to edit documents simultaneously with real-time synchronization, conflict resolution, and presence indicators. This educational project focuses on building a Google Docs-like experience with Operational Transformation (OT) based synchronization.
@@ -265,3 +277,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Operational Transformation (Wikipedia)](https://en.wikipedia.org/wiki/Operational_transformation) - Overview of OT algorithms and history
+- [Google Wave OT Paper](https://svn.apache.org/repos/asf/incubator/wave/whitepapers/operational-transform/operational-transform.html) - Jupiter collaboration system and OT
+- [Understanding CRDTs](https://crdt.tech/) - Conflict-free Replicated Data Types explained
+- [Yjs CRDT Documentation](https://docs.yjs.dev/) - Popular CRDT implementation for collaborative editing
+- [How Figma's Multiplayer Technology Works](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) - CRDT-based real-time collaboration
+- [Building a Collaborative Text Editor](https://conclave-team.github.io/conclave-site/) - Deep dive into OT vs CRDT trade-offs
+- [Real-Time Collaboration in Google Docs](https://developers.google.com/docs/api/concepts/structure) - Google's approach to document structure
+- [Automerge: A CRDT Library](https://automerge.org/) - JSON-like CRDT for collaborative applications
+- [OT.js: Operational Transformation Library](https://github.com/nicholaslocascio/ot.js) - Reference implementation of OT
+- [Quill Delta Format](https://quilljs.com/docs/delta/) - Rich text representation for collaborative editing

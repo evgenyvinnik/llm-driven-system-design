@@ -2,6 +2,18 @@
 
 A full-stack event ticketing platform inspired by Ticketmaster, featuring seat selection, real-time availability, virtual waiting room for high-demand events, and time-limited checkout.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,160 |
+| Source Files | 50 |
+| .ts | 2,302 |
+| .tsx | 1,439 |
+| .md | 885 |
+| .sql | 299 |
+| .json | 131 |
+
 ## Features
 
 - **Event Browsing**: Search and filter events by category, date, artist, and venue
@@ -247,3 +259,14 @@ See [system-design-answer.md](./system-design-answer.md) for interview-style sys
 - [ ] Secondary market (resale)
 - [ ] Bot detection and CAPTCHA
 - [ ] WebSocket for real-time seat updates
+
+## References & Inspiration
+
+- [Ticketmaster Tech Blog](https://tech.ticketmaster.com/) - Official Ticketmaster engineering blog
+- [How We Built Our Virtual Waiting Room](https://tech.ticketmaster.com/2022/01/24/how-we-built-our-virtual-waiting-room/) - Queue systems for high-demand events
+- [Redis Distributed Locks (Redlock)](https://redis.io/docs/manual/patterns/distributed-locks/) - Distributed locking patterns
+- [Handling High Traffic Ticket Sales](https://www.infoq.com/presentations/ticketmaster-scalability/) - Scalability lessons from Ticketmaster
+- [PostgreSQL FOR UPDATE NOWAIT](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE) - Optimistic locking in PostgreSQL
+- [Queue-Fair: Virtual Waiting Room](https://queue-fair.com/virtual-waiting-room-explained) - Virtual waiting room concepts
+- [Building Fair Queuing Systems](https://aws.amazon.com/blogs/architecture/managing-flash-traffic-with-amazon-sqs/) - AWS queue-based traffic management
+- [Preventing Ticket Scalping with CAPTCHA](https://www.cloudflare.com/learning/bots/what-is-a-captcha/) - Bot detection and prevention strategies

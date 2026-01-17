@@ -1,5 +1,17 @@
 # Instagram - Photo Sharing
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,818 |
+| Source Files | 49 |
+| .tsx | 2,281 |
+| .js | 1,793 |
+| .md | 881 |
+| .ts | 359 |
+| .sql | 228 |
+
 ## Overview
 
 A photo and video sharing social platform with photo/video uploads, filters, feeds, stories, likes, comments, and follows.
@@ -288,3 +300,14 @@ docker-compose down -v
 - Content moderation
 - Hashtags and mentions
 - Admin dashboard
+
+## References & Inspiration
+
+- [Sharding & IDs at Instagram](https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c) - How Instagram generates unique IDs and shards data across PostgreSQL clusters
+- [Storing Hundreds of Millions of Simple Key-Value Pairs in Redis](https://instagram-engineering.com/storing-hundreds-of-millions-of-simple-key-value-pairs-in-redis-1091ae80f74c) - Instagram's approach to efficient Redis memory usage
+- [What Powers Instagram: Hundreds of Instances, Dozens of Technologies](https://instagram-engineering.com/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad) - Original architecture overview from Instagram engineering
+- [Building Feed at Facebook Scale](https://www.facebook.com/notes/facebook-engineering/building-a-modern-news-feed/10151040681463920/) - Feed generation patterns applicable to Instagram-style timelines
+- [Serving 100 Million Users with MinIO](https://blog.min.io/serving-100-million-users-with-minio/) - Object storage patterns for media-heavy applications
+- [Image Processing with Sharp](https://sharp.pixelplumbing.com/) - High-performance Node.js image processing library documentation
+- [Designing Instagram - System Design Primer](https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/scaling_aws/README.md) - Scaling patterns for photo sharing platforms
+- [CDN Architecture for Media Delivery](https://www.cloudflare.com/learning/cdn/what-is-a-cdn/) - Content delivery network fundamentals for image/video distribution

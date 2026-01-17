@@ -1,5 +1,17 @@
 # Price Tracking Service
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,990 |
+| Source Files | 56 |
+| .ts | 2,584 |
+| .tsx | 1,246 |
+| .md | 761 |
+| .json | 148 |
+| .sql | 132 |
+
 ## Overview
 
 An e-commerce price monitoring and alert system that helps users track product prices across multiple online retailers, receive alerts when prices drop, and view historical price trends.
@@ -198,6 +210,18 @@ See [system-design-answer.md](./system-design-answer.md) for detailed system des
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [Web Scraping at Scale](https://scrapfly.io/blog/web-scraping-at-scale-with-python/) - Strategies for large-scale scraping operations
+- [Camelcamelcamel Architecture](https://www.camelcamelcamel.com/blog/about-us) - Inspiration from the popular Amazon price tracker
+- [TimescaleDB for Time-Series Data](https://docs.timescale.com/timescaledb/latest/overview/) - Efficient storage for price history
+- [Building a Price Monitoring System](https://blog.apify.com/price-monitoring-with-web-scraping/) - Apify's guide to price tracking
+- [Handling Anti-Bot Measures](https://www.zenrows.com/blog/web-scraping-without-getting-blocked) - Techniques for reliable scraping
+- [Change Detection Algorithms](https://en.wikipedia.org/wiki/Change_detection) - Detecting meaningful price changes
+- [Alert System Design](https://blog.bytebytego.com/p/a-crash-course-in-notification-system) - Notification system patterns
+- [Proxy Rotation Strategies](https://www.scrapehero.com/how-to-rotate-proxies-and-ip-addresses-using-python-3/) - Managing IP rotation for scraping
+- [Cheerio vs Puppeteer](https://blog.logrocket.com/cheerio-vs-puppeteer-web-scraping/) - Choosing the right scraping approach
 
 ## Future Enhancements
 

@@ -2,6 +2,18 @@
 
 A distributed task scheduling system with cron-like scheduling, priority queues, worker pools, and at-least-once execution guarantees.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,022 |
+| Source Files | 47 |
+| .ts | 2,910 |
+| .tsx | 1,460 |
+| .md | 1,269 |
+| .yml | 179 |
+| .json | 134 |
+
 ## Features
 
 - **Job Management**: Create, update, delete, pause, resume, and trigger jobs
@@ -316,3 +328,15 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 ## License
 
 MIT
+
+## References & Inspiration
+
+- [Uber's Schemaless Job Scheduler](https://www.uber.com/blog/cherami-message-queue-system/) - How Uber built a distributed task queue
+- [Airflow Architecture Overview](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/overview.html) - Apache Airflow's DAG-based workflow scheduler
+- [Designing a Distributed Job Scheduler](https://levelup.gitconnected.com/designing-a-distributed-job-scheduler-461ac0c3a9e8) - System design walkthrough for job scheduling
+- [Redis as a Job Queue](https://redis.io/docs/manual/patterns/distributed-locks/) - Using Redis for distributed locks and queues
+- [Celery Best Practices](https://docs.celeryq.dev/en/stable/userguide/tasks.html) - Task queue patterns from Python's Celery
+- [How Robinhood Built a Distributed Job Scheduler](https://robinhood.engineering/how-we-built-a-distributed-job-scheduler-eff7e7caa95e) - Building reliable job scheduling at scale
+- [Sidekiq in Practice](https://www.mikeperham.com/2015/11/05/sidekiq-job-best-practices/) - Best practices for background job processing
+- [Temporal: Open Source Durable Execution](https://docs.temporal.io/concepts/what-is-temporal) - Modern approach to workflow orchestration
+- [Cron at Scale: Pinterest's PinLater](https://medium.com/pinterest-engineering/pinlater-an-asynchronous-job-execution-system-b8664cb8aa7d) - Pinterest's async job execution system

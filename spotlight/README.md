@@ -1,5 +1,17 @@
 # Design Spotlight - Universal Search
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 3,767 |
+| Source Files | 37 |
+| .js | 1,356 |
+| .md | 1,214 |
+| .tsx | 592 |
+| .ts | 340 |
+| .json | 88 |
+
 ## Overview
 
 A simplified Spotlight-like platform demonstrating local and cloud search, indexing, and intelligent suggestions. This educational project focuses on building a universal search system across files, apps, contacts, and web content.
@@ -260,3 +272,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Core Spotlight Documentation](https://developer.apple.com/documentation/corespotlight) - Apple's framework for indexing app content
+- [NSUserActivity Documentation](https://developer.apple.com/documentation/foundation/nsuseractivity) - Making app content searchable
+- [Elasticsearch Documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html) - Distributed search engine for full-text search
+- [Apache Lucene](https://lucene.apache.org/) - Core search library powering many search engines
+- [SQLite FTS5 Extension](https://www.sqlite.org/fts5.html) - Full-text search for SQLite databases
+- [Apache Tika](https://tika.apache.org/) - Content extraction toolkit for diverse file formats
+- [Algolia Documentation](https://www.algolia.com/doc/) - Search-as-a-service patterns and ranking algorithms
+- [Building a Search Engine from Scratch](https://www.alexmolas.com/2024/02/05/a-search-engine-in-80-lines.html) - Educational search implementation

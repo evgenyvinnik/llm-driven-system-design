@@ -1,5 +1,17 @@
 # LeetCode - Online Judge
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,153 |
+| Source Files | 43 |
+| .js | 2,002 |
+| .tsx | 1,406 |
+| .md | 955 |
+| .ts | 430 |
+| .css | 109 |
+
 ## Overview
 
 An online coding practice and evaluation platform where users can solve programming challenges, submit code solutions, and track their progress.
@@ -216,3 +228,16 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - Code similarity detection for plagiarism
 - WebSocket for real-time submission updates
 - Rate limiting and abuse prevention
+
+## References & Inspiration
+
+- [Codeforces Architecture](https://codeforces.com/blog/entry/70) - Mike Mirzayanov on building competitive programming platforms
+- [Docker Security Best Practices](https://docs.docker.com/engine/security/) - Container isolation for code execution
+- [gVisor: Container Runtime Sandbox](https://gvisor.dev/) - Google's application kernel for sandboxing
+- [Firecracker MicroVMs](https://firecracker-microvm.github.io/) - AWS's lightweight virtualization for serverless
+- [MOSS (Measure of Software Similarity)](https://theory.stanford.edu/~aiken/moss/) - Stanford's plagiarism detection system
+- [Judge0 - Open Source Online Judge](https://github.com/judge0/judge0) - Production-ready code execution system
+- [HackerRank Engineering Blog](https://www.hackerrank.com/blog/engineering/) - Insights on online assessment platforms
+- [Seccomp and Linux Security Modules](https://man7.org/linux/man-pages/man2/seccomp.2.html) - System call filtering for sandboxing
+- [Building a Code Execution Engine](https://blog.remoteinterview.io/how-we-built-a-remote-code-execution-engine/) - Real-world implementation insights
+- [Competitive Programming Handbook](https://cses.fi/book/book.pdf) - Understanding competitive programming problem design

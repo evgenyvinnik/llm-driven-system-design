@@ -1,5 +1,17 @@
 # Design LinkedIn - Professional Social Network
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,378 |
+| Source Files | 48 |
+| .ts | 2,898 |
+| .tsx | 2,376 |
+| .md | 703 |
+| .sql | 171 |
+| .json | 118 |
+
 ## Overview
 
 A simplified LinkedIn-like platform demonstrating professional social graphs, connection recommendations, feed ranking, and job matching algorithms. This educational project focuses on building a professional networking system with sophisticated recommendation engines.
@@ -210,3 +222,13 @@ FRONTEND_URL=http://localhost:5173
 ## Development Insights
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [LinkedIn Engineering Blog](https://engineering.linkedin.com/blog) - Official engineering blog with deep dives into LinkedIn's infrastructure
+- [Building the LinkedIn Economic Graph](https://engineering.linkedin.com/blog/2016/10/building-the-linkedin-economic-graph) - How LinkedIn models the global economy as a graph
+- [People You May Know: A Social Network Friend Recommendation System](https://dl.acm.org/doi/10.1145/1772690.1772698) - ACM paper on friend recommendation algorithms used at LinkedIn
+- [Whom to Follow on Twitter](https://dl.acm.org/doi/10.1145/2433396.2433405) - Research paper on recommendation systems applicable to professional networks
+- [LinkedIn's Real-time Graph Partitioning](https://engineering.linkedin.com/blog/2020/graph-interest-cohort) - Scaling graph processing for billions of connections
+- [Feed Ranking at LinkedIn](https://engineering.linkedin.com/blog/2021/feed-curation-infrastructure) - How LinkedIn curates and ranks feed content
+- [Galene: LinkedIn's Search Architecture](https://engineering.linkedin.com/search/galene-linkedins-search-architecture) - LinkedIn's approach to search across the economic graph

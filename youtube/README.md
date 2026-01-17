@@ -1,5 +1,17 @@
 # YouTube - Video Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,782 |
+| Source Files | 54 |
+| .js | 2,691 |
+| .tsx | 1,963 |
+| .md | 965 |
+| .ts | 728 |
+| .sql | 166 |
+
 ## Overview
 
 A video hosting and streaming platform featuring video upload with chunked uploads, simulated transcoding pipeline, HLS manifest generation, channels, subscriptions, likes, comments, and a recommendation system.
@@ -255,3 +267,16 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - Content moderation tools
 - OAuth integration
 - CDN integration for production
+
+## References & Inspiration
+
+- [YouTube Architecture: From Single Server to Global Platform](https://www.youtube.com/watch?v=ZW5_eEKEC28) - Early YouTube architecture talk
+- [YouTube Engineering and Developers Blog](https://youtube-eng.googleblog.com/) - Official engineering insights
+- [Vitess: Database Clustering for YouTube](https://vitess.io/) - How YouTube scaled MySQL horizontally
+- [Serving Videos at Scale with Kubernetes](https://cloud.google.com/blog/products/containers-kubernetes/how-youtube-prepares-for-peak-traffic) - YouTube's Kubernetes infrastructure
+- [Deep Neural Networks for YouTube Recommendations](https://research.google.com/pubs/archive/45530.pdf) - Google Research paper on recommendation systems
+- [The YouTube Video Delivery System](https://dl.acm.org/doi/10.1145/2785956.2787486) - Academic paper on video CDN architecture
+- [HTTP Live Streaming (HLS) Specification](https://datatracker.ietf.org/doc/html/rfc8216) - IETF RFC for adaptive streaming
+- [MPEG-DASH: Dynamic Adaptive Streaming over HTTP](https://dashif.org/docs/DASH-IF-IOP-v5.pdf) - Industry standard for adaptive bitrate streaming
+- [Netflix: What Happens When You Press Play](https://netflixtechblog.com/what-happens-when-you-press-play-263a5f7f92a0) - Similar architecture for video streaming
+- [FFmpeg Documentation](https://ffmpeg.org/documentation.html) - Video transcoding reference

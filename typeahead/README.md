@@ -1,5 +1,17 @@
 # Design Typeahead - Autocomplete System
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,981 |
+| Source Files | 37 |
+| .js | 1,957 |
+| .md | 1,176 |
+| .tsx | 1,123 |
+| .ts | 488 |
+| .json | 96 |
+
 ## Overview
 
 A typeahead/autocomplete system demonstrating prefix matching, ranking suggestions, and real-time updates. This educational project focuses on building a low-latency suggestion service used by search engines and applications.
@@ -284,3 +296,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [How We Built Prefixy](https://engineering.fb.com/2019/05/23/data-infrastructure/prefixy/) - Facebook's typeahead system serving billions of queries
+- [Trie Data Structure](https://en.wikipedia.org/wiki/Trie) - Fundamental data structure for prefix matching
+- [Autocomplete at Scale](https://www.youtube.com/watch?v=us0qySiUsGU) - Google Tech Talk on building autocomplete systems
+- [Design Autocomplete System](https://www.educative.io/courses/grokking-the-system-design-interview/mE2XkgGRnmp) - System design walkthrough for typeahead
+- [Elasticsearch Suggesters](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html) - Elasticsearch's built-in autocomplete functionality
+- [Ternary Search Trees](https://www.cs.princeton.edu/~rs/strings/paper.pdf) - Memory-efficient alternative to tries for prefix matching
+- [Prefix Hash Tree](https://people.eecs.berkeley.edu/~sylvia/papers/pht.pdf) - Distributed data structure for prefix queries at scale
+- [LinkedIn Typeahead](https://engineering.linkedin.com/blog/2017/08/powering-typeahead-on-linkedin-with-new-indices) - How LinkedIn powers typeahead search with specialized indices

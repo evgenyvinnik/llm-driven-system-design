@@ -1,5 +1,17 @@
 # Design Apple Pay - Secure Mobile Payments
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,502 |
+| Source Files | 46 |
+| .ts | 2,314 |
+| .tsx | 1,612 |
+| .md | 1,144 |
+| .json | 133 |
+| .sql | 120 |
+
 ## Overview
 
 A simplified Apple Pay-like platform demonstrating secure tokenized payments, NFC transactions, and biometric authentication. This educational project focuses on building a mobile payment system with hardware security integration.
@@ -313,3 +325,13 @@ redis-cli ping
 - [ ] NFC payment simulation
 - [ ] Admin dashboard
 - [ ] Fraud detection simulation
+
+## References & Inspiration
+
+- [Apple Pay Security and Privacy Overview](https://support.apple.com/en-us/HT203027) - Apple's documentation on Apple Pay security architecture
+- [Apple Pay Developer Documentation](https://developer.apple.com/documentation/passkit/apple_pay) - PassKit integration for Apple Pay
+- [EMV Payment Tokenization Specification](https://www.emvco.com/emv-technologies/payment-tokenisation/) - Industry standard for payment token generation
+- [Secure Element Overview](https://developer.apple.com/documentation/security/certificate_key_and_trust_services) - Hardware-backed key storage on Apple devices
+- [NFC Payment Standards (ISO 14443)](https://www.iso.org/standard/70121.html) - Contactless payment communication protocols
+- [PCI DSS Compliance Guide](https://www.pcisecuritystandards.org/) - Payment Card Industry Data Security Standard
+- [Google Pay Architecture](https://developers.google.com/pay/api/web/overview) - Comparison mobile payment platform design

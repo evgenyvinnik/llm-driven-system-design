@@ -2,6 +2,18 @@
 
 A full-stack stock trading platform with real-time quotes, portfolio tracking, order execution simulation, watchlists, and price alerts.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,438 |
+| Source Files | 52 |
+| .ts | 2,528 |
+| .tsx | 1,670 |
+| .md | 838 |
+| .sql | 135 |
+| .json | 120 |
+
 ## Features
 
 - Real-time stock quotes with WebSocket streaming
@@ -257,3 +269,14 @@ See [claude.md](./claude.md) for development insights and iteration history.
 ## License
 
 MIT
+
+## References & Inspiration
+
+- [Robinhood Engineering Blog](https://robinhood.engineering/) - Technical insights from Robinhood's engineering team
+- [How Robinhood Built Its Clearing Systems](https://robinhood.engineering/scaling-robinhoods-clearing-systems-8de9d0e83f0e) - Scaling clearing and settlement
+- [Designing a Real-Time Stock Trading System](https://www.youtube.com/watch?v=dUMWMZmMsVE) - System design walkthrough for trading platforms
+- [LMAX Exchange Architecture](https://martinfowler.com/articles/lmax.html) - High-performance trading system design patterns
+- [The LMAX Disruptor](https://lmax-exchange.github.io/disruptor/) - Low-latency inter-thread messaging for trading systems
+- [Building Real-Time Data Pipelines](https://www.confluent.io/blog/building-real-time-streaming-etl-pipeline-20-minutes/) - Kafka patterns for market data
+- [WebSocket at Scale](https://slack.engineering/scaling-slacks-job-queue-6b72e28a5dcc) - Patterns for scaling real-time connections
+- [Order Matching Engine Design](https://web.archive.org/web/20110219163448/http://howtohft.wordpress.com/2011/02/15/building-a-trading-system-general-considerations/) - Core concepts for matching engine implementation

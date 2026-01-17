@@ -1,5 +1,17 @@
 # Design Notion - Block-Based Collaboration
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,241 |
+| Source Files | 48 |
+| .ts | 3,722 |
+| .tsx | 2,058 |
+| .md | 852 |
+| .sql | 216 |
+| .css | 175 |
+
 ## Overview
 
 A simplified Notion-like platform demonstrating block-based editing, real-time collaboration, and workspace hierarchy. This educational project focuses on building a flexible document system with collaborative editing features.
@@ -269,3 +281,15 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [The Data Model Behind Notion](https://www.notion.so/blog/data-model-behind-notion) - Notion's engineering blog on their block-based architecture
+- [How Notion Uses Notion](https://www.notion.so/blog/how-notion-uses-notion) - Insights into Notion's internal usage patterns
+- [Figma's Real-time Editing of Ordered Sequences](https://www.figma.com/blog/realtime-editing-of-ordered-sequences/) - Fractional indexing for block ordering
+- [CRDTs: Consistency without Consensus](https://crdt.tech/) - Foundation for conflict-free collaborative editing
+- [Yjs: Shared Editing with CRDTs](https://yjs.dev/) - Popular CRDT library for real-time collaboration
+- [An Introduction to Conflict-Free Replicated Data Types](https://lars.hupel.info/topics/crdt/01-intro/) - Beginner-friendly CRDT tutorial
+- [Local-First Software](https://www.inkandswitch.com/local-first/) - Ink & Switch research on offline-first design patterns
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book covering distributed systems
+- [Building Offline-First Apps](https://web.dev/articles/offline-cookbook) - Web.dev guide on offline-first strategies

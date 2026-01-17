@@ -2,6 +2,18 @@
 
 A high-performance distributed caching layer with consistent hashing, LRU eviction, and TTL support.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,152 |
+| Source Files | 31 |
+| .js | 1,412 |
+| .md | 1,244 |
+| .tsx | 992 |
+| .ts | 259 |
+| .yml | 104 |
+
 ## Features
 
 - **Consistent Hashing**: Even key distribution with virtual nodes
@@ -376,3 +388,14 @@ npm test
 ## License
 
 MIT
+
+## References & Inspiration
+
+- [Consistent Hashing and Random Trees](https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf) - The original paper introducing consistent hashing for distributed systems
+- [Scaling Memcache at Facebook](https://research.facebook.com/publications/scaling-memcache-at-facebook/) - How Facebook scaled Memcached to handle billions of requests
+- [Redis Cluster Specification](https://redis.io/docs/reference/cluster-spec/) - Official documentation on Redis cluster architecture and hash slot distribution
+- [Memcached Internals](https://github.com/memcached/memcached/wiki/Overview) - Understanding Memcached's slab allocator and LRU eviction
+- [A Guide to Consistent Hashing](https://www.toptal.com/big-data/consistent-hashing) - Practical explanation of consistent hashing with virtual nodes
+- [Cache Invalidation Strategies](https://codeahoy.com/2017/08/11/caching-strategies-and-how-to-choose-the-right-one/) - Overview of cache-aside, write-through, and write-behind patterns
+- [How Discord Stores Billions of Messages](https://discord.com/blog/how-discord-stores-billions-of-messages) - Real-world caching and data storage at scale
+- [Dynamo: Amazon's Highly Available Key-value Store](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) - Foundational paper on distributed key-value stores

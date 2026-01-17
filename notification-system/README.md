@@ -1,5 +1,17 @@
 # Design Notification System - High-Traffic Push Notifications
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,952 |
+| Source Files | 48 |
+| .js | 2,029 |
+| .tsx | 1,606 |
+| .md | 1,249 |
+| .ts | 746 |
+| .sql | 162 |
+
 ## Overview
 
 A scalable notification system capable of delivering millions of push notifications, emails, and in-app messages with high reliability and low latency. This educational project focuses on building a multi-channel notification platform with prioritization, rate limiting, and delivery tracking.
@@ -239,3 +251,15 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Designing a Notification System](https://bytebytego.com/courses/system-design-interview/design-a-notification-system) - ByteByteGo's comprehensive guide to notification system design
+- [How Slack Sends Millions of Messages](https://slack.engineering/scaling-slacks-job-queue/) - Slack's approach to job queues and message delivery
+- [APNs Documentation](https://developer.apple.com/documentation/usernotifications) - Apple Push Notification service architecture
+- [Firebase Cloud Messaging](https://firebase.google.com/docs/cloud-messaging/fcm-architecture) - FCM architecture and best practices
+- [Building Airbnb's Notification Platform](https://medium.com/airbnb-engineering/building-an-effective-notification-system-7cf5db35b7e9) - Airbnb's notification infrastructure
+- [LinkedIn's Real-Time Messaging Platform](https://engineering.linkedin.com/blog/2016/04/building-linkedin-s-real-time-messaging-platform) - Fan-out patterns for messaging
+- [How Instagram Sends Push Notifications](https://instagram-engineering.com/making-direct-messages-reliable-and-fast-a152bdfd697f) - Instagram's reliable messaging infrastructure
+- [RabbitMQ Best Practices](https://www.rabbitmq.com/tutorials) - Message queue patterns and reliability
+- [Designing for Scale: Multi-Channel Notifications](https://aws.amazon.com/blogs/compute/building-scalable-notification-systems/) - AWS patterns for notification systems

@@ -299,3 +299,50 @@ this.register(MyTool);
 ## License
 
 MIT
+
+## References & Inspiration
+
+### AI Code Assistant Products
+
+- [GitHub Copilot](https://github.com/features/copilot) - GitHub's AI pair programmer powered by OpenAI Codex
+- [Cursor](https://cursor.sh) - AI-first code editor built on VS Code
+- [Codeium](https://codeium.com) - Free AI code completion and chat
+- [Tabnine](https://www.tabnine.com) - AI code assistant with local and cloud models
+- [Amazon CodeWhisperer](https://aws.amazon.com/codewhisperer/) - AWS AI coding companion
+- [Sourcegraph Cody](https://sourcegraph.com/cody) - AI coding assistant with codebase context
+
+### Research Papers
+
+- [Evaluating Large Language Models Trained on Code](https://arxiv.org/abs/2107.03374) - OpenAI Codex paper introducing code-trained LLMs
+- [A Systematic Evaluation of Large Language Models of Code](https://arxiv.org/abs/2202.13169) - Comprehensive benchmark of code LLMs
+- [CodeBERT: A Pre-Trained Model for Programming and Natural Languages](https://arxiv.org/abs/2002.08155) - Microsoft's bimodal pre-trained model for code
+- [InCoder: A Generative Model for Code Infilling and Synthesis](https://arxiv.org/abs/2204.05999) - Meta AI's unified generative model for code
+- [StarCoder: May the Source Be with You](https://arxiv.org/abs/2305.06161) - BigCode's open LLM trained on permissively licensed code
+
+### Documentation & Guides
+
+- [Anthropic Tool Use Documentation](https://docs.anthropic.com/claude/docs/tool-use) - Building agentic systems with Claude
+- [Model Context Protocol](https://modelcontextprotocol.io) - Anthropic's open protocol for connecting AI to tools and data
+- [OpenAI Function Calling Guide](https://platform.openai.com/docs/guides/function-calling) - Connecting GPT models to external tools
+- [LangChain Agents](https://python.langchain.com/docs/modules/agents/) - Framework for building agentic LLM applications
+
+### Engineering Blogs
+
+- [GitHub Blog: How GitHub Copilot is getting better at understanding your code](https://github.blog/2023-05-17-how-github-copilot-is-getting-better-at-understanding-your-code/) - Copilot architecture deep dive
+- [Inside GitHub: Working with the LLMs behind GitHub Copilot](https://github.blog/2023-05-17-inside-github-working-with-the-llms-behind-github-copilot/) - Engineering decisions behind Copilot
+- [Cursor Blog](https://cursor.sh/blog) - Technical posts on building an AI-native IDE
+- [Codeium Blog: How Codeium Works](https://codeium.com/blog) - Engineering insights on AI code completion
+
+### Open Source Projects
+
+- [aider](https://github.com/paul-gauthier/aider) - AI pair programming in your terminal
+- [Continue](https://github.com/continuedev/continue) - Open-source autopilot for VS Code and JetBrains
+- [Tabby](https://github.com/TabbyML/tabby) - Self-hosted AI coding assistant
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) - Efficient inference of LLMs in C/C++
+- [Ollama](https://github.com/ollama/ollama) - Run LLMs locally with simple API
+
+### Prompt Engineering for Code
+
+- [OpenAI Best Practices for Prompt Engineering](https://platform.openai.com/docs/guides/prompt-engineering) - Official guide to effective prompting
+- [Anthropic Prompt Engineering Guide](https://docs.anthropic.com/claude/docs/prompt-engineering) - Techniques for getting better outputs from Claude
+- [Microsoft Semantic Kernel](https://learn.microsoft.com/en-us/semantic-kernel/overview/) - SDK for integrating LLMs into applications

@@ -1,5 +1,17 @@
 # Hotel Booking - Hotel Reservation and Management System
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,800 |
+| Source Files | 55 |
+| .tsx | 3,156 |
+| .js | 2,464 |
+| .md | 1,002 |
+| .ts | 838 |
+| .sql | 140 |
+
 ## Overview
 
 A hotel reservation and management system with inventory management, dynamic pricing, and booking capabilities. This project implements a fully functional hotel booking platform similar to Booking.com or Expedia.
@@ -239,3 +251,14 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 - [ ] Loyalty program
 - [ ] Multi-language support
 - [ ] Mobile app with React Native
+
+## References & Inspiration
+
+- [How Booking.com Handles Millions of Bookings](https://blog.booking.com/how-booking-handles-millions-of-bookings.html) - High-availability booking systems
+- [Expedia Group Technology Blog](https://medium.com/expedia-group-tech) - Travel industry engineering insights
+- [Preventing Double Bookings with Database Transactions](https://www.postgresql.org/docs/current/explicit-locking.html) - PostgreSQL locking mechanisms
+- [Building Inventory Management Systems](https://engineering.atspotify.com/2023/03/managing-inventory-at-scale/) - Inventory systems at scale
+- [Distributed Locking with Redis](https://redis.io/docs/manual/patterns/distributed-locks/) - Redis distributed lock patterns
+- [How Hotels.com Redesigned Their Checkout](https://medium.com/hotels-com-technology/how-hotels-com-redesigned-their-checkout-a3e18c7dd57b) - Checkout flow optimization
+- [Building Real-Time Availability Systems](https://www.infoq.com/articles/real-time-hotel-availability/) - Real-time inventory challenges
+- [Overbooking Strategies in Hospitality](https://www.sciencedirect.com/science/article/abs/pii/S0261517706001889) - Revenue management and overbooking research

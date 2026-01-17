@@ -1,5 +1,17 @@
 # Dashboarding System - Metrics Monitoring and Visualization
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,253 |
+| Source Files | 46 |
+| .ts | 2,524 |
+| .tsx | 1,557 |
+| .md | 930 |
+| .json | 128 |
+| .css | 40 |
+
 ## Overview
 
 A metrics monitoring and visualization system similar to Datadog or Grafana for collecting, storing, and visualizing time-series data. This implementation includes:
@@ -234,3 +246,16 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - Dashboard sharing and embedding
 - More panel types (heatmap, histogram)
 - Notification channels (Slack, email, PagerDuty)
+
+## References & Inspiration
+
+- [TimescaleDB Documentation](https://docs.timescale.com/) - Time-series database with SQL interface
+- [Grafana Architecture](https://grafana.com/docs/grafana/latest/fundamentals/timeseries/) - Dashboard and visualization patterns
+- [Prometheus Data Model](https://prometheus.io/docs/concepts/data_model/) - Metrics labeling and storage concepts
+- [Datadog Architecture (InfoQ)](https://www.infoq.com/presentations/datadog-metrics/) - Scaling metrics ingestion at Datadog
+- [Time-Series Data at Scale (Netflix)](https://netflixtechblog.com/scaling-time-series-data-storage-part-i-ec2b6d44ba39) - Netflix Atlas time-series database
+- [InfluxDB Design Principles](https://docs.influxdata.com/influxdb/v2/reference/internals/) - Alternative time-series database approach
+- [Uber M3: Metrics Platform](https://eng.uber.com/m3/) - Uber's distributed metrics platform
+- [Facebook Gorilla (VLDB Paper)](http://www.vldb.org/pvldb/vol8/p1816-teller.pdf) - In-memory time-series compression
+- [Downsampling and Retention (Victoria Metrics)](https://docs.victoriametrics.com/guides/guide-delete-or-replace-metrics.html) - Data lifecycle management strategies
+- [Real-Time Dashboard Design (Tableau)](https://www.tableau.com/learn/articles/dashboard-design) - Visualization best practices

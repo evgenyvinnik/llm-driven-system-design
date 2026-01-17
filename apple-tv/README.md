@@ -1,5 +1,17 @@
 # Design Apple TV+ - Video Streaming Service
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,225 |
+| Source Files | 55 |
+| .tsx | 2,628 |
+| .js | 2,126 |
+| .md | 1,330 |
+| .ts | 711 |
+| .sql | 164 |
+
 ## Overview
 
 A premium video streaming service delivering high-quality original content with adaptive bitrate streaming, multi-device sync, and offline downloads. This educational project focuses on building a video-on-demand platform with focus on content delivery, recommendation, and cross-device experience.
@@ -242,3 +254,13 @@ Access the MinIO console at http://localhost:9001
 Buckets:
 - `videos` - Video content storage
 - `thumbnails` - Thumbnail images
+
+## References & Inspiration
+
+- [HLS Authoring Specification for Apple Devices](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) - Apple's HTTP Live Streaming requirements
+- [FairPlay Streaming Documentation](https://developer.apple.com/streaming/fps/) - Apple's DRM technology for content protection
+- [AVFoundation Framework](https://developer.apple.com/documentation/avfoundation) - Apple's framework for audiovisual media
+- [FFmpeg Documentation](https://ffmpeg.org/documentation.html) - Open-source video transcoding toolkit
+- [Netflix Tech Blog: Video Encoding](https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464c7e7f8) - Netflix's approach to per-title encoding
+- [Building a Scalable Video Service](https://www.youtube.com/watch?v=bJOWRsCjO4c) - YouTube's video delivery architecture
+- [Adaptive Bitrate Streaming](https://developer.apple.com/documentation/http-live-streaming) - Apple's guide to HLS adaptive streaming

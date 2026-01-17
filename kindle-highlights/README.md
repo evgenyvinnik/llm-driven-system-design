@@ -65,3 +65,16 @@ See also the comprehensive design document: [design-kindle-community-highlights.
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Offline-First Web Development](https://developers.google.com/codelabs/pwa-offline-quickstart) - Google's guide to building offline-capable apps
+- [Designing Offline-First Applications](https://alistapart.com/article/offline-first/) - A List Apart on offline-first design philosophy
+- [CRDTs: Conflict-free Replicated Data Types](https://crdt.tech/) - Data structures for eventual consistency without conflicts
+- [Local-First Software](https://www.inkandswitch.com/local-first/) - Ink & Switch research on collaboration and local-first design
+- [Building Mobile Apps with Firebase](https://firebase.google.com/docs/database/android/offline-capabilities) - Real-time sync with offline persistence
+- [Dropbox's Sync Engine](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine) - How Dropbox handles file synchronization
+- [How Notion Syncs Data Across Devices](https://www.notion.so/blog/data-model-behind-notion) - Notion's approach to real-time collaboration
+- [Figma's Multiplayer Technology](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) - Real-time sync for collaborative editing
+- [The Log: What Every Software Engineer Should Know](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying) - Jay Kreps on event logs for sync
+- [Pocket's Sync Architecture](https://blog.mozilla.org/data/2019/05/22/syncing-firefox-data/) - Mozilla's approach to cross-device sync for reading lists

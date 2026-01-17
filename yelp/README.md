@@ -2,6 +2,18 @@
 
 A local business review and discovery platform inspired by Yelp, built with modern web technologies.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,094 |
+| Source Files | 48 |
+| .tsx | 3,183 |
+| .js | 2,258 |
+| .md | 896 |
+| .ts | 296 |
+| .sql | 271 |
+
 ## Features
 
 - **Business Search**: Full-text search with geo-spatial filtering using Elasticsearch
@@ -226,3 +238,14 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 ## License
 
 This is a learning project for system design practice.
+
+## References & Inspiration
+
+- [Yelp's Real-Time Data Pipeline](https://engineeringblog.yelp.com/2016/11/salute-our-new-yelp-data-pipeline.html) - How Yelp processes billions of events
+- [How Yelp Runs Millions of Tests Every Day](https://engineeringblog.yelp.com/2017/04/how-yelp-runs-millions-of-tests-every-day.html) - Testing infrastructure at scale
+- [Scaling Yelp's Ad Platform](https://engineeringblog.yelp.com/2023/04/scaling-yelps-ad-platform.html) - High-throughput advertising system
+- [Yelp's Photo Search Engine](https://engineeringblog.yelp.com/2019/09/yelp-photo-search-engine.html) - Visual search for local businesses
+- [Fighting Review Fraud at Yelp](https://engineeringblog.yelp.com/2018/07/fighting-review-fraud-at-yelp.html) - ML-based spam and fraud detection
+- [Elasticsearch Cluster Management at Yelp](https://engineeringblog.yelp.com/2017/10/nrtsearch-yelps-fast-lucene-based-search-engine.html) - NRTSearch: Yelp's fast search engine
+- [Building Local Search with Elasticsearch](https://engineeringblog.yelp.com/2015/03/scaling-elasticsearch-to-hundreds-of-millions-of-reviews.html) - Scaling Elasticsearch for local search
+- [Yelp's Review Ranking Algorithm](https://www.yelp.com/developers/documentation/v3/business_reviews) - How reviews are sorted and ranked

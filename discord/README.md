@@ -2,6 +2,18 @@
 
 A simplified real-time chat server that demonstrates core distributed system concepts by supporting **dual protocols**: raw TCP (for netcat clients) and HTTP/SSE (for browser clients). This educational project focuses on fundamentals: connection management, room-based chat, message history, and horizontal scaling with Redis pub/sub.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,301 |
+| Source Files | 45 |
+| .ts | 2,449 |
+| .md | 2,012 |
+| .tsx | 529 |
+| .json | 133 |
+| .sql | 54 |
+
 ## Features
 
 ### Core Functionality
@@ -452,3 +464,16 @@ This project demonstrates:
 ## License
 
 MIT
+
+## References & Inspiration
+
+- [Discord Engineering Blog](https://discord.com/blog/category/engineering) - Official engineering insights and architecture posts
+- [How Discord Stores Billions of Messages](https://discord.com/blog/how-discord-stores-billions-of-messages) - Cassandra to ScyllaDB migration story
+- [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) - Updated architecture with ScyllaDB
+- [How Discord Handles Two and a Half Million Concurrent Voice Users](https://discord.com/blog/how-discord-handles-two-and-a-half-million-concurrent-voice-users-using-webrtc) - WebRTC at scale
+- [How Discord Supercharges Network Disks](https://discord.com/blog/how-discord-supercharges-network-disks-for-extreme-low-latency) - Storage infrastructure optimization
+- [Why Discord is Switching from Go to Rust](https://discord.com/blog/why-discord-is-switching-from-go-to-rust) - Read States service performance
+- [Discord's Snowflake ID Generation](https://discord.com/developers/docs/reference#snowflakes) - Distributed ID generation like Twitter
+- [Real-Time Communication with WebRTC](https://webrtc.org/) - Foundation for Discord's voice/video
+- [ScyllaDB Documentation](https://docs.scylladb.com/) - Discord's message storage database
+- [Elixir and Discord](https://elixir-lang.org/blog/2020/10/08/real-time-communication-at-scale-with-elixir-at-discord/) - How Discord uses Elixir for real-time features

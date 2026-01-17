@@ -1,5 +1,17 @@
 # Design AirTag - Item Tracking System
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,071 |
+| Source Files | 49 |
+| .ts | 2,392 |
+| .tsx | 1,314 |
+| .md | 984 |
+| .json | 132 |
+| .sql | 99 |
+
 ## Overview
 
 A simplified AirTag-like platform demonstrating Bluetooth item tracking, crowd-sourced location, and the Find My network. This educational project focuses on building a privacy-preserving tracking system using billions of Apple devices as location reporters.
@@ -263,3 +275,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Find My Network Accessory Specification](https://developer.apple.com/find-my/) - Apple's program for third-party Find My accessories
+- [AirTag and Find My Network Security](https://support.apple.com/en-us/HT212227) - Apple's privacy and security documentation
+- [Apple Platform Security: Find My](https://support.apple.com/guide/security/find-my-seca1a1b1c1d/web) - Technical security details of the Find My network
+- [ECIES Encryption Scheme](https://en.wikipedia.org/wiki/Integrated_Encryption_Scheme) - Elliptic curve integrated encryption
+- [Who Can Find My Devices? Security Analysis of Apple's Find My Network](https://www.usenix.org/conference/usenixsecurity21/presentation/heinrich) - Academic security analysis of Find My
+- [Ultra-Wideband (UWB) Technology](https://www.nxp.com/docs/en/white-paper/UWBSECURITYWP.pdf) - Precision finding technology
+- [Bluetooth Low Energy Beacons](https://developer.apple.com/ibeacon/) - Apple's iBeacon technology documentation
+- [Anti-Stalking Features in Item Trackers](https://support.apple.com/en-us/HT212227) - Apple's unwanted tracking prevention

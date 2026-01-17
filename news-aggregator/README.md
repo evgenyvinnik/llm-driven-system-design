@@ -2,6 +2,18 @@
 
 A content aggregation and curation platform that crawls RSS feeds, deduplicates articles into stories, and provides personalized news feeds.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,413 |
+| Source Files | 48 |
+| .ts | 2,605 |
+| .tsx | 1,293 |
+| .md | 1,139 |
+| .sql | 127 |
+| .json | 120 |
+
 ## Key Features
 
 - **Source Crawling**: Fetches articles from RSS/Atom feeds with rate limiting
@@ -225,3 +237,15 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - [ ] Collaborative filtering for recommendations
 - [ ] Source credibility scoring
 - [ ] Fact-checking integration
+
+## References & Inspiration
+
+- [SimHash: Detecting Near-Duplicates](https://www.cs.princeton.edu/courses/archive/spr04/cos598B/bib/ChsriychainS.pdf) - Original paper on locality-sensitive hashing for duplicate detection
+- [Google News Personalization](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/35599.pdf) - Scalable collaborative filtering for news
+- [RSS 2.0 Specification](https://www.rssboard.org/rss-specification) - Really Simple Syndication standard
+- [Atom Syndication Format (RFC 4287)](https://datatracker.ietf.org/doc/html/rfc4287) - Atom feed specification
+- [Building a News Feed System](https://www.inoreader.com/blog/2019/06/how-inoreader-works-overview.html) - Behind the scenes of a feed reader
+- [How Flipboard Curates Content](https://about.flipboard.com/inside-flipboard/) - Content aggregation and curation strategies
+- [Feedly's Feed Processing Pipeline](https://blog.feedly.com/feedly-cloud-architecture/) - Large-scale RSS processing architecture
+- [Content Deduplication at Scale](https://engineering.fb.com/2013/02/06/android/news-feed-in-2013-a-short-history/) - Facebook's approach to content clustering
+- [Elasticsearch for News Search](https://www.elastic.co/blog/found-uses-of-elasticsearch) - Full-text search patterns for news content

@@ -1,5 +1,17 @@
 # Design iCloud Sync - File and Photo Synchronization
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,038 |
+| Source Files | 46 |
+| .js | 2,695 |
+| .tsx | 1,614 |
+| .ts | 1,197 |
+| .md | 1,065 |
+| .sql | 185 |
+
 ## Overview
 
 A simplified iCloud-like platform demonstrating file synchronization, conflict resolution, and cross-device consistency. This educational project focuses on building a sync service that handles photos, documents, and app data across devices.
@@ -253,3 +265,13 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [CloudKit Documentation](https://developer.apple.com/documentation/cloudkit) - Apple's framework for iCloud data storage and sync
+- [iCloud Security Overview](https://support.apple.com/en-us/HT202303) - Apple's documentation on iCloud data protection
+- [NSFileCoordinator Documentation](https://developer.apple.com/documentation/foundation/nsfilecoordinator) - File coordination for conflict prevention
+- [How Dropbox Designed Its Sync Engine](https://dropbox.tech/infrastructure/how-we-designed-dropbox-atf) - Dropbox's sync architecture patterns
+- [Vector Clocks Explained](https://en.wikipedia.org/wiki/Vector_clock) - Distributed systems causality tracking
+- [Content-Defined Chunking in Restic](https://restic.readthedocs.io/en/latest/100_references.html#design) - Efficient chunking algorithms for deduplication
+- [Building a Distributed File Sync Service](https://www.allthingsdistributed.com/2007/12/eventually_consistent.html) - Werner Vogels on eventual consistency patterns

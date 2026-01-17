@@ -2,6 +2,18 @@
 
 A Stripe-like payment processing platform demonstrating payment APIs, financial ledger systems, and fraud prevention. This educational project focuses on building secure payment infrastructure with idempotency guarantees.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,907 |
+| Source Files | 56 |
+| .js | 3,669 |
+| .tsx | 1,800 |
+| .md | 1,170 |
+| .ts | 797 |
+| .sql | 249 |
+
 ## Features
 
 ### Payment Processing
@@ -310,3 +322,13 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Stripe API Design](https://stripe.com/docs/api) - The gold standard for payment API design with consistent patterns and excellent documentation
+- [Designing Robust and Predictable APIs with Idempotency](https://stripe.com/blog/idempotency) - Stripe's approach to building retry-safe APIs
+- [Implementing Stripe-like Idempotency Keys in Postgres](https://brandur.org/idempotency-keys) - Deep dive into idempotency implementation with database transactions
+- [Accounting for Developers](https://www.moderntreasury.com/journal/accounting-for-developers-part-i) - Modern Treasury's guide to double-entry bookkeeping
+- [Life of a Payment](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) - Airbnb's approach to avoiding double payments
+- [Distributed Transactions at Scale in Amazon DynamoDB](https://www.usenix.org/conference/atc23/presentation/idziorek) - Patterns for distributed transaction consistency
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's essential book on building reliable systems

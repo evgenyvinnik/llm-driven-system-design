@@ -1,5 +1,17 @@
 # Design Spotify - Music Streaming Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,584 |
+| Source Files | 55 |
+| .js | 2,570 |
+| .tsx | 2,180 |
+| .md | 874 |
+| .ts | 689 |
+| .css | 98 |
+
 ## Overview
 
 A simplified Spotify-like platform demonstrating music streaming, playlist management, recommendation systems, and playback analytics. This educational project focuses on building a music streaming service with personalized discovery features.
@@ -225,3 +237,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Spotify Engineering Blog](https://engineering.atspotify.com/) - Official engineering insights and best practices
+- [Personalized Recommendations at Spotify](https://engineering.atspotify.com/2022/06/personalized-recommendations-at-spotify/) - How Discover Weekly and recommendations work
+- [How Spotify's Backstage Was Born](https://engineering.atspotify.com/2020/03/what-the-heck-is-backstage-anyway/) - Developer platform and microservices management
+- [Scaling Agile at Spotify](https://blog.crisp.se/wp-content/uploads/2012/11/SpotifyScaling.pdf) - The famous squad/tribe organizational model
+- [The Story of Spotify Wrapped](https://engineering.atspotify.com/2022/11/the-story-of-spotify-wrapped-2022/) - Large-scale data processing and personalization
+- [Audio Features API](https://developer.spotify.com/documentation/web-api/reference/get-audio-features) - Understanding audio analysis for recommendations
+- [Ogg Vorbis and Spotify's Audio Codec](https://support.spotify.com/us/article/audio-quality/) - Audio streaming quality and codecs
+- [Music Information Retrieval](https://musicinformationretrieval.com/) - Fundamentals of audio analysis and fingerprinting
+- [Collaborative Filtering at Scale](https://dl.acm.org/doi/10.1145/2959100.2959120) - Matrix factorization techniques for recommendations
+- [Approximate Nearest Neighbors (Annoy)](https://github.com/spotify/annoy) - Spotify's open-source library for similarity search

@@ -1,5 +1,17 @@
 # Design Etsy - Seller Marketplace
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,057 |
+| Source Files | 53 |
+| .tsx | 2,838 |
+| .js | 2,475 |
+| .md | 926 |
+| .ts | 619 |
+| .json | 101 |
+
 ## Overview
 
 A simplified Etsy-like platform demonstrating seller marketplace dynamics, search relevance, personalization, and handmade/vintage product discovery. This educational project focuses on building a multi-seller e-commerce platform with emphasis on unique product discovery.
@@ -224,3 +236,14 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Etsy Code as Craft](https://www.etsy.com/codeascraft) - Etsy's official engineering blog with marketplace insights
+- [Search Ranking at Etsy](https://www.etsy.com/codeascraft/how-we-built-a-context-specific-bidding-system-for-etsy-ads) - Context-aware search and ranking
+- [Personalization at Scale](https://www.etsy.com/codeascraft/personalized-recommendations-at-etsy) - Etsy's approach to product recommendations
+- [Elasticsearch Synonyms Guide](https://www.elastic.co/guide/en/elasticsearch/reference/current/analysis-synonym-tokenfilter.html) - Handling variant terminology in search
+- [Relevance Tuning for E-Commerce](https://opensourceconnections.com/blog/2016/08/11/relevance-at-scale/) - Balancing relevance and business rules
+- [Two-Sided Marketplace Design](https://a16z.com/marketplace-100/) - Andreessen Horowitz insights on marketplace dynamics
+- [Building Etsy's Activity Feed](https://www.etsy.com/codeascraft/the-architecture-of-etsys-activity-feeds/) - Architecture for activity feeds and notifications
+- [Search Quality at Pinterest](https://medium.com/pinterest-engineering/building-a-real-time-user-action-counting-system-for-ads-88a60d9c9a) - Related approaches to discovery-based commerce

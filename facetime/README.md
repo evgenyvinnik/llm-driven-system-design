@@ -1,5 +1,17 @@
 # Design FaceTime - Real-Time Video Calling
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 3,727 |
+| Source Files | 36 |
+| .ts | 1,582 |
+| .md | 1,224 |
+| .tsx | 555 |
+| .json | 126 |
+| .sql | 84 |
+
 ## Overview
 
 A simplified FaceTime-like platform demonstrating real-time video/audio communication using WebRTC. This educational project focuses on building a low-latency video calling system with proper signaling, NAT traversal, and peer-to-peer connections.
@@ -245,3 +257,14 @@ See [claude.md](./claude.md) for development insights and LLM collaboration note
 - [ ] Call recording
 - [ ] Push notifications
 - [ ] Mobile app support
+
+## References & Inspiration
+
+- [FaceTime Security](https://support.apple.com/guide/security/facetime-security-seca93b68ed2/web) - Apple's documentation on FaceTime encryption and security
+- [WebRTC.org](https://webrtc.org/) - Official WebRTC project documentation and standards
+- [Real-Time Communication with WebRTC (O'Reilly)](https://www.oreilly.com/library/view/real-time-communication-with/9781449371869/) - Comprehensive WebRTC implementation guide
+- [Jitsi Meet Architecture](https://jitsi.org/blog/a-looking-in-the-sausage-factory-of-jitsi/) - Open-source video conferencing architecture
+- [Coturn TURN Server](https://github.com/coturn/coturn) - Open-source TURN/STUN server for NAT traversal
+- [ICE: Interactive Connectivity Establishment (RFC 8445)](https://datatracker.ietf.org/doc/html/rfc8445) - NAT traversal protocol specification
+- [WebRTC for the Curious](https://webrtcforthecurious.com/) - In-depth WebRTC protocol documentation
+- [Twilio Video Architecture](https://www.twilio.com/docs/video) - Commercial video calling platform patterns

@@ -2,6 +2,18 @@
 
 A real-time collaborative document editing platform built with React, Node.js, WebSocket, and PostgreSQL. This project implements core Google Docs features including rich text editing, real-time collaboration using Operational Transformation (OT), comments, and version history.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,066 |
+| Source Files | 47 |
+| .ts | 3,094 |
+| .tsx | 1,549 |
+| .md | 935 |
+| .css | 163 |
+| .json | 130 |
+
 ## Key Features
 
 - **Rich Text Editing** - Full formatting support with TipTap/ProseMirror
@@ -245,3 +257,15 @@ See [claude.md](./claude.md) for development history and design decisions.
 - Rich embeds (images, tables, drawings)
 - Export to multiple formats
 - Mobile-optimized editor
+
+## References & Inspiration
+
+- [Operational Transformation FAQ](https://www3.ntu.edu.sg/home/czsun/projects/otfaq/) - Comprehensive overview of OT algorithms and implementations
+- [High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System](https://dl.acm.org/doi/10.1145/215585.215706) - Original Jupiter OT paper from Xerox PARC
+- [Google Wave Operational Transformation](https://svn.apache.org/repos/asf/incubator/wave/whitepapers/operational-transform/operational-transform.html) - Google's OT implementation for Wave
+- [CRDTs: Consistency without Consensus](https://crdt.tech/) - Alternative approach to collaborative editing
+- [Convergent and Commutative Replicated Data Types](https://hal.inria.fr/inria-00555588/document) - Shapiro et al. paper on CRDT foundations
+- [ProseMirror Collaborative Editing](https://prosemirror.net/docs/guide/#collab) - Guide on building collaborative editors
+- [Yjs: Shared Editing with CRDTs](https://yjs.dev/) - CRDT library for real-time collaboration
+- [Real Differences between OT and CRDT for Co-Editors](https://arxiv.org/abs/1810.02137) - Academic comparison of approaches
+- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book covering replication and consistency

@@ -1,5 +1,17 @@
 # Tinder - Matching Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,352 |
+| Source Files | 53 |
+| .ts | 3,281 |
+| .tsx | 2,544 |
+| .md | 1,089 |
+| .json | 136 |
+| .sql | 110 |
+
 ## Overview
 
 A location-based matching and recommendation system that allows users to discover potential matches, swipe to like or pass, chat with matches, and manage their profiles.
@@ -222,3 +234,13 @@ See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 - [ ] Rate limiting
 - [ ] Load balancing
 - [ ] Horizontal scaling
+
+## References & Inspiration
+
+- [PostGIS Documentation](https://postgis.net/docs/) - Comprehensive guide to geospatial queries and indexing in PostgreSQL
+- [Elasticsearch Geo Queries](https://www.elastic.co/guide/en/elasticsearch/reference/current/geo-queries.html) - Official docs for geo_distance, geo_bounding_box, and geo_shape queries
+- [Redis Pub/Sub Documentation](https://redis.io/docs/interact/pubsub/) - Real-time messaging patterns for match notifications
+- [Designing Tinder - High Scalability](http://highscalability.com/blog/2022/1/17/designing-tinder.html) - Architecture overview and scaling considerations
+- [Geospatial Indexing: The 10 Million QPS Redis Architecture Powering Lyft](https://www.youtube.com/watch?v=cSFWlF96Sds) - Video on Redis geo commands at scale (applicable to location-based matching)
+- [Building a Geospatial App with Redis](https://redis.io/blog/building-geospatial-app-with-redis/) - Practical guide to GEOADD, GEORADIUS for proximity searches
+- [System Design: Tinder - Grokking the System Design Interview](https://www.designgurus.io/course-play/grokking-the-system-design-interview/doc/638c0b6aac93e7ae59a1afcc) - Comprehensive design walkthrough covering matching algorithms and data models

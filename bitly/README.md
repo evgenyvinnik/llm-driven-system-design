@@ -2,6 +2,18 @@
 
 A full-stack URL shortening service with analytics tracking, custom short codes, link expiration, and an admin dashboard.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,555 |
+| Source Files | 50 |
+| .ts | 2,151 |
+| .tsx | 1,065 |
+| .md | 993 |
+| .json | 136 |
+| .sql | 102 |
+
 ## Features
 
 - **URL Shortening**: Convert long URLs to short, memorable links
@@ -435,3 +447,13 @@ curl http://localhost:3000/api/v1/admin/stats -b cookies.txt
 - [x] Redis caching for redirects
 - [x] Rate limiting
 - [x] Docker support
+
+## References & Inspiration
+
+- [How We Built Bitly](https://word.bitly.com/post/28558800777/10-lessons-from-10-years-of-aws) - Lessons from a decade of running a URL shortener at scale
+- [Base62 Encoding](https://en.wikipedia.org/wiki/Base62) - The encoding scheme commonly used for generating short URL codes
+- [Instagram Engineering: Generating Unique IDs](https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c) - How Instagram generates unique IDs at scale, applicable to short code generation
+- [Designing a URL Shortening Service](https://www.educative.io/courses/grokking-the-system-design-interview/m2ygV4E81AR) - Comprehensive system design walkthrough
+- [How Short Links Work](https://blog.bitsrc.io/how-url-shorteners-work-b2e8d4b01a8c) - Technical deep dive into URL shortener architecture
+- [Redis as a Cache](https://redis.io/docs/manual/client-side-caching/) - Redis caching patterns for high-throughput applications
+- [Analytics at Scale with ClickHouse](https://clickhouse.com/docs/en/about-us/distinctive-features) - Analytics database commonly used for click tracking at scale

@@ -1,5 +1,17 @@
 # Design iMessage - Cross-Device Messaging
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,860 |
+| Source Files | 43 |
+| .js | 1,666 |
+| .md | 1,095 |
+| .tsx | 897 |
+| .ts | 846 |
+| .sql | 158 |
+
 ## Overview
 
 A simplified iMessage-like platform demonstrating real-time messaging, cross-device sync, and offline support. This educational project focuses on building a scalable messaging system with seamless multi-device experience.
@@ -298,3 +310,13 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [iMessage Security Overview](https://support.apple.com/guide/security/imessage-security-overview-secd0c9a5c93/web) - Apple's documentation on iMessage encryption
+- [Apple Platform Security Guide](https://support.apple.com/guide/security/welcome/web) - Comprehensive security documentation for Apple services
+- [Signal Protocol Documentation](https://signal.org/docs/) - End-to-end encryption protocol used by many messaging apps
+- [Double Ratchet Algorithm](https://signal.org/docs/specifications/doubleratchet/) - Forward secrecy in messaging systems
+- [X3DH Key Agreement Protocol](https://signal.org/docs/specifications/x3dh/) - Extended Triple Diffie-Hellman for establishing sessions
+- [WhatsApp Encryption Overview](https://www.whatsapp.com/security/) - Another implementation of secure messaging
+- [Building Real-Time Chat with WebSockets](https://socket.io/docs/v4/) - WebSocket patterns for real-time messaging

@@ -2,6 +2,18 @@
 
 A real-time analytics system that tracks video views and computes trending videos using windowed counting and Top K algorithms.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 2,845 |
+| Source Files | 34 |
+| .js | 1,160 |
+| .md | 951 |
+| .tsx | 377 |
+| .ts | 200 |
+| .json | 86 |
+
 ## Features
 
 - **View Counting**: Track views using Redis-based windowed counting with time buckets
@@ -273,3 +285,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+
+## References & Inspiration
+
+- [Count-Min Sketch: A Data Structure for Stream Mining](http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf) - Original paper by Cormode and Muthukrishnan on approximate frequency counting
+- [Finding Frequent Items in Data Streams](https://www.vldb.org/conf/2002/S10P03.pdf) - Space-Saving algorithm for heavy hitters
+- [Top K Frequent Elements](https://dl.acm.org/doi/10.1145/1807167.1807197) - ACM survey on streaming Top-K algorithms
+- [YouTube's Video Recommendation System](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/45530.pdf) - Deep Neural Networks for YouTube Recommendations
+- [Real-time Video Ranking at Facebook](https://engineering.fb.com/2017/02/01/video-engineering/facebook-video-recommendations/) - How Facebook ranks trending videos
+- [Redis Sorted Sets for Leaderboards](https://redis.io/solutions/leaderboards/) - Using Redis for real-time rankings
+- [Streaming 101: The World Beyond Batch](https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/) - Tyler Akidau's introduction to stream processing
+- [Streaming 102: The World Beyond Batch](https://www.oreilly.com/radar/the-world-beyond-batch-streaming-102/) - Windowing and triggers in streaming systems
+- [Apache Flink: Stream Processing for Real-Time Analytics](https://flink.apache.org/what-is-flink/) - Real-time stream processing at scale
+- [HyperLogLog in Practice](https://research.google.com/pubs/archive/40671.pdf) - Google's improvements to cardinality estimation

@@ -1,5 +1,17 @@
 # Design Netflix - Video Streaming Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,160 |
+| Source Files | 55 |
+| .ts | 2,892 |
+| .tsx | 1,701 |
+| .md | 996 |
+| .sql | 260 |
+| .json | 140 |
+
 ## Overview
 
 A simplified Netflix-like platform demonstrating video streaming, adaptive bitrate delivery, content personalization, and A/B testing infrastructure. This educational project focuses on building a video streaming service with sophisticated recommendation and experimentation systems.
@@ -254,3 +266,16 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## Development Notes
 
 See [claude.md](./claude.md) for development insights and design decisions.
+
+## References & Inspiration
+
+- [Netflix Tech Blog](https://netflixtechblog.com/) - Official engineering blog with deep dives on all Netflix systems
+- [Netflix Recommendations: Beyond the 5 Stars](https://netflixtechblog.com/netflix-recommendations-beyond-the-5-stars-part-1-55838468f429) - How Netflix's recommendation engine works
+- [It's All A/Bout Testing: The Netflix Experimentation Platform](https://netflixtechblog.com/its-all-a-bout-testing-the-netflix-experimentation-platform-4e1ca458c15) - A/B testing infrastructure at Netflix scale
+- [Open Connect: Netflix's Content Delivery Network](https://openconnect.netflix.com/en/) - How Netflix delivers video content globally
+- [Adaptive Bitrate Streaming - DASH Industry Forum](https://dashif.org/docs/) - Dynamic Adaptive Streaming over HTTP specification
+- [HLS Authoring Specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) - Apple's HTTP Live Streaming documentation
+- [The Netflix Cosmos Platform](https://netflixtechblog.com/the-netflix-cosmos-platform-35c14d9351ad) - Media encoding and workflow orchestration
+- [Full Cycle Developers at Netflix](https://netflixtechblog.com/full-cycle-developers-at-netflix-a08c31f83249) - Netflix's microservices philosophy
+- [Zuul: Netflix's Cloud Gateway](https://netflixtechblog.com/open-sourcing-zuul-2-82ea476cb2b3) - API gateway and edge service architecture
+- [Designing Data-Intensive Applications by Martin Kleppmann](https://dataintensive.net/) - Foundational book covering distributed systems concepts used in streaming platforms

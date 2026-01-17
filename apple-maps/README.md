@@ -1,5 +1,17 @@
 # Design Apple Maps - Navigation Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,521 |
+| Source Files | 35 |
+| .js | 1,623 |
+| .md | 1,144 |
+| .tsx | 856 |
+| .ts | 534 |
+| .css | 139 |
+
 ## Overview
 
 A simplified Apple Maps-like platform demonstrating mapping, routing, real-time traffic, and turn-by-turn navigation. This educational project focuses on building a navigation system with live traffic updates and ETA prediction.
@@ -264,3 +276,14 @@ npm run dev:server3  # Port 3003
 3. **Map Matching**: Snapping GPS coordinates to road network
 4. **ETA Accuracy**: Predicting arrival times with traffic
 5. **Offline Navigation**: (Future) Functioning without connectivity
+
+## References & Inspiration
+
+- [MapKit Documentation](https://developer.apple.com/documentation/mapkit) - Apple's mapping framework for iOS and macOS applications
+- [MapKit JS](https://developer.apple.com/documentation/mapkitjs) - Apple Maps for web applications
+- [OSRM - Open Source Routing Machine](https://project-osrm.org/) - High-performance routing engine for shortest paths
+- [Contraction Hierarchies Paper](https://algo2.iti.kit.edu/schultes/hwy/contract.pdf) - Academic paper on fast routing preprocessing
+- [Map Matching with Hidden Markov Models](https://www.microsoft.com/en-us/research/publication/hidden-markov-map-matching-through-noise-and-sparseness/) - Microsoft Research on GPS-to-road matching
+- [PostGIS Documentation](https://postgis.net/documentation/) - Spatial database extension for geographic queries
+- [Leaflet Documentation](https://leafletjs.com/) - Open-source JavaScript library for interactive maps
+- [Valhalla Routing Engine](https://github.com/valhalla/valhalla) - Open-source routing with turn-by-turn navigation
