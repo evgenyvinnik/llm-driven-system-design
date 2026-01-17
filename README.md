@@ -120,10 +120,10 @@ Each folder contains an independent implementation of a system design problem:
 - [Design Scalable API](./scalable-api/) - API serving millions of users
 
 ### Personal Projects & Experiments
-External projects demonstrating system design concepts in practice:
-- [MDReader](https://github.com/evgenyvinnik/mdreader) - "The Markdown Maestro" - Elegant markdown rendering and reading experience
-- [MCPlator](https://github.com/evgenyvinnik/MCPlator) - "The Protocol Polyglot" - MCP (Model Context Protocol) integration toolkit
-- [20 Forms, 20 Designs](https://github.com/evgenyvinnik/20forms-20designs) - "The Form Factory" - Showcase of 20 unique form UI/UX patterns
+External projects demonstrating system design concepts in practice (with local architecture documentation):
+- [MD Reader](./mdreader/) - Progressive Web App for Markdown editing with offline support ([source](https://github.com/evgenyvinnik/mdreader))
+- [MCPlator](./mcplator/) - Retro calculator with LLM-powered AI assistant ([source](https://github.com/evgenyvinnik/MCPlator))
+- [20 Forms, 40 Designs](./20forms-20designs/) - Form library comparison across 41 React design systems ([source](https://github.com/evgenyvinnik/20forms-20designs))
 
 ## 🏗️ Project Structure
 
