@@ -125,9 +125,9 @@ Comprehensive design documents covering specific system design topics:
 
 ### Personal Projects & Experiments
 External projects demonstrating system design concepts in practice:
-- [MDReader](https://github.com/evgenyvinnik/mdreader) - "The Markdown Maestro" - Elegant markdown rendering and reading experience
-- [MCPlator](https://github.com/evgenyvinnik/MCPlator) - "The Protocol Polyglot" - MCP (Model Context Protocol) integration toolkit
-- [20 Forms, 20 Designs](https://github.com/evgenyvinnik/20forms-20designs) - "The Form Factory" - Showcase of 20 unique form UI/UX patterns
+- [MDReader](https://github.com/evgenyvinnik/mdreader) - "The Markdown PWA app" - Elegant markdown rendering and reading experience
+- [MCPlator](https://github.com/evgenyvinnik/MCPlator) - "The AI chat integration" - MCP (Model Context Protocol) integration toolkit
+- [20 Forms, 20 Designs](https://github.com/evgenyvinnik/20forms-20designs) - "The Form Factory showcasing various designs" - Showcase of 20 unique form UI/UX patterns
 
 ## 🏗️ Project Structure
 
