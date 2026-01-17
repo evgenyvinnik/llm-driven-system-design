@@ -33,41 +33,77 @@ Each folder contains an independent implementation of a system design problem:
 - [Design Instagram](./instagram/) - Photo sharing platform
 - [Design Tinder](./tinder/) - Matching and recommendation system
 - [Design r/place](./r-place/) - Collaborative real-time pixel canvas
+- [Design Reddit](./reddit/) - Community forums with voting system
+- [Design Twitter](./twitter/) - Microblogging and social network
+- [Design LinkedIn](./linkedin/) - Professional networking platform
+- [Design TikTok](./tiktok/) - Short-form video platform
 
 ### Messaging & Communication
 - [Design WhatsApp](./whatsapp/) - Real-time messaging platform
 - [Design Discord](./discord/) - Real-time chat and community platform
+- [Design Slack](./slack/) - Team communication and collaboration
+- [Design iMessage](./imessage/) - Cross-device messaging with offline sync
+- [Design FaceTime](./facetime/) - Real-time video calling
 
 ### Video & Streaming
 - [Design YouTube](./youtube/) - Video hosting and streaming platform
 - [Design YouTube Top K](./youtube-top-k/) - Real-time trending video analytics
+- [Design Twitch](./twitch/) - Live streaming platform
+- [Design Netflix](./netflix/) - Video streaming with adaptive bitrate
+- [Design Spotify](./spotify/) - Music streaming and recommendations
+- [Design Apple Music](./apple-music/) - Music streaming service
+- [Design Apple TV+](./apple-tv/) - Video streaming service
 
 ### E-Commerce & Marketplaces
 - [Design Yelp](./yelp/) - Local business review platform
 - [Design Online Auction](./online-auction/) - Bidding and auction system
 - [Design a Price Tracking Service](./price-tracking/) - E-commerce price monitoring
+- [Design Amazon](./amazon/) - E-commerce platform at scale
+- [Design Airbnb](./airbnb/) - Vacation rental marketplace
+- [Design Etsy](./etsy/) - Handmade goods marketplace
+- [Design DoorDash](./doordash/) - Food delivery logistics
+- [Design Shopify](./shopify/) - Multi-tenant e-commerce platform
+- [Design App Store](./app-store/) - App discovery, purchases, and rankings
 
 ### Transportation & Logistics
 - [Design Uber](./uber/) - Ride-hailing platform
 - [Design a Local Delivery Service](./local-delivery/) - Last-mile delivery system
 - [Design Strava](./strava/) - Fitness tracking and social platform
+- [Design Apple Maps](./apple-maps/) - Navigation with real-time traffic
+- [Design AirTag](./airtag/) - Item tracking and Find My network
 
 ### Ticketing, Events & Reservations
 - [Design Ticketmaster](./ticketmaster/) - Event ticketing and inventory management
 - [Design Hotel Booking](./hotel-booking/) - Hotel reservation and management system
 - [Design Calendly](./calendly/) - Meeting scheduling and calendar coordination platform
 
-### Developer Tools & Platforms
+### Developer & Productivity Tools
 - [Design LeetCode](./leetcode/) - Online coding judge and practice platform
 - [Design Google Docs](./google-docs/) - Collaborative document editing
 - [Design Figma](./figma/) - Collaborative design and prototyping platform
+- [Design GitHub](./github/) - Code hosting and version control
+- [Design Notion](./notion/) - Collaborative workspace with blocks
+- [Design Jira](./jira/) - Issue tracking and project management
+- [Design Collaborative Editor](./collaborative-editor/) - Real-time document editing
 
-### Financial Services
+### Financial Services & Payments
 - [Design Robinhood](./robinhood/) - Stock trading platform
 - [Design a Payment System](./payment-system/) - Transaction processing system
+- [Design Stripe](./stripe/) - Payment processing and APIs
+- [Design Venmo](./venmo/) - P2P payment platform
+- [Design Apple Pay](./apple-pay/) - Secure mobile payments
+
+### Business Services
+- [Design DocuSign](./docusign/) - Electronic signature platform
+
+### Search & Discovery
+- [Design Google Search](./google-search/) - Web search engine
+- [Design Typeahead](./typeahead/) - Autocomplete and suggestions
+- [Design Spotlight](./spotlight/) - Device and cloud search
 
 ### ML/AI & Data Platforms
 - [Design Scale AI](./scale-ai/) - Data labeling platform with crowdsourced drawing collection and ML training
+- [Design Health Data Pipeline](./health-data-pipeline/) - Multi-device health data aggregation
 
 ### Infrastructure & System Components
 - [Design a Rate Limiter](./rate-limiter/) - API rate limiting service
@@ -75,6 +111,10 @@ Each folder contains an independent implementation of a system design problem:
 - [Design Ad Click Aggregator](./ad-click-aggregator/) - Real-time analytics aggregation
 - [Design a News Aggregator](./news-aggregator/) - Content aggregation and curation
 - [Design Dashboarding System](./dashboarding/) - Metrics monitoring and visualization (Datadog/Grafana-like)
+- [Design Notification System](./notification-system/) - High-traffic push notifications
+- [Design APNs](./apns/) - Apple Push Notification Service
+- [Design iCloud Sync](./icloud/) - File and photo synchronization
+- [Design Scalable API](./scalable-api/) - API serving millions of users
 
 ## 🏗️ Project Structure
 
