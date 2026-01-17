@@ -1,9 +1,9 @@
-import amqp, { Connection, Channel } from 'amqplib'
+import amqp, { type Channel, type ChannelModel } from 'amqplib'
 
 // Queue names
 export const TRAINING_QUEUE = 'training_jobs'
 
-let connection: Connection | null = null
+let connection: ChannelModel | null = null
 let channel: Channel | null = null
 
 // Connect to RabbitMQ

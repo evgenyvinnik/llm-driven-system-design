@@ -101,3 +101,38 @@ npm run dev:lb       # Port 3000 (load balancer)
 ```
 
 Keep resource requirements reasonable (< 8GB RAM for most projects).
+
+## Infrastructure Options
+
+**Always provide TWO alternatives** for running infrastructure in project READMEs:
+
+### Option A: Docker Compose (Recommended)
+```bash
+docker-compose up -d
+```
+- Fastest setup, one command
+- Pre-configured credentials and networking
+- Includes helpful commands: `docker-compose down`, `docker-compose down -v`
+
+### Option B: Native Installation (No Docker)
+Provide step-by-step instructions for installing each service via Homebrew (macOS):
+- PostgreSQL: `brew install postgresql@16`
+- Redis/Valkey: `brew install valkey` or `brew install redis`
+- MinIO: `brew install minio`
+- RabbitMQ: `brew install rabbitmq`
+
+Include commands to:
+1. Start the service
+2. Create required databases/users/buckets
+3. Verify it's running
+
+### Environment Variables
+Document all connection strings with sensible defaults:
+```bash
+DATABASE_URL=postgresql://user:pass@localhost:5432/dbname
+REDIS_URL=redis://localhost:6379
+MINIO_ENDPOINT=localhost:9000
+RABBITMQ_URL=amqp://user:pass@localhost:5672
+```
+
+This ensures projects are accessible to developers who prefer not to use Docker.

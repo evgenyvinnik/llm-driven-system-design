@@ -3,8 +3,6 @@ import { PostItCanvas } from '../../components/PostItCanvas'
 import { classifyDrawing, getModelInfo, type ClassificationResult, type ModelInfo } from '../../services/api'
 import './ImplementorPortal.css'
 
-type Shape = 'line' | 'heart' | 'circle' | 'square' | 'triangle'
-
 export function ImplementorPortal() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
   const [result, setResult] = useState<ClassificationResult | null>(null)
