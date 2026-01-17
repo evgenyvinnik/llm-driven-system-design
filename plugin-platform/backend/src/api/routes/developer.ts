@@ -3,18 +3,25 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { query } from '../../shared/db.js';
 import { cacheDelete, cacheDeletePattern } from '../../shared/cache.js';
+import { uploadPluginBundle, uploadPluginSourceMap, deletePluginFiles } from '../../shared/storage.js';
 
 export const developerRouter = Router();
 
 // Configure multer for plugin bundle uploads
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype === 'application/javascript' || file.originalname.endsWith('.js')) {
+    // Accept JS bundles and source maps
+    if (
+      file.mimetype === 'application/javascript' ||
+      file.mimetype === 'application/json' ||
+      file.originalname.endsWith('.js') ||
+      file.originalname.endsWith('.js.map')
+    ) {
       cb(null, true);
     } else {
-      cb(new Error('Only JavaScript bundles are allowed'));
+      cb(new Error('Only JavaScript bundles and source maps are allowed'));
     }
   },
 });
@@ -122,7 +129,10 @@ developerRouter.post('/plugins', async (req: Request, res: Response) => {
 // Publish a new version
 developerRouter.post(
   '/plugins/:pluginId/versions',
-  upload.single('bundle'),
+  upload.fields([
+    { name: 'bundle', maxCount: 1 },
+    { name: 'sourcemap', maxCount: 1 },
+  ]),
   async (req: Request, res: Response) => {
     try {
       const userId = req.session.userId;
@@ -132,6 +142,15 @@ developerRouter.post(
 
       if (!version || !manifestJson) {
         res.status(400).json({ error: 'Version and manifest are required' });
+        return;
+      }
+
+      const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+      const bundleFile = files?.bundle?.[0];
+      const sourcemapFile = files?.sourcemap?.[0];
+
+      if (!bundleFile) {
+        res.status(400).json({ error: 'Bundle file is required' });
         return;
       }
 
@@ -171,13 +190,16 @@ developerRouter.post(
         return;
       }
 
-      // In a real system, we'd upload the bundle to S3/MinIO
-      // For now, we'll store a reference to the plugins folder
-      const bundleUrl = `/plugins/${pluginId}/bundle.js`;
-      const fileSize = req.file?.size || 0;
-      const checksum = req.file
-        ? crypto.createHash('sha256').update(req.file.buffer).digest('hex')
-        : null;
+      // Upload bundle to MinIO
+      const bundleUrl = await uploadPluginBundle(pluginId, version, bundleFile.buffer);
+
+      // Upload source map if provided
+      if (sourcemapFile) {
+        await uploadPluginSourceMap(pluginId, version, sourcemapFile.buffer);
+      }
+
+      const fileSize = bundleFile.size;
+      const checksum = crypto.createHash('sha256').update(bundleFile.buffer).digest('hex');
 
       // Create version
       await query(
@@ -201,6 +223,8 @@ developerRouter.post(
         pluginId,
         version,
         bundleUrl,
+        fileSize,
+        checksum,
       });
     } catch (err) {
       console.error(err);

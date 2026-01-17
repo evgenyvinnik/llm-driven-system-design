@@ -80,6 +80,62 @@ node scripts/sloc.mjs scale-ai --summary
 node scripts/update-readme-sloc.mjs
 ```
 
+### Screenshot Automation
+
+Capture screenshots of frontend projects for documentation using Playwright.
+
+**One-time setup:**
+```bash
+npm install                      # Install Playwright
+npx playwright install chromium  # Download browser
+```
+
+**Usage:**
+```bash
+# Take screenshots for a specific project
+npm run screenshots instagram
+
+# Take screenshots for all configured projects
+npm run screenshots:all
+
+# Dry run (show what would be captured)
+npm run screenshots:dry instagram
+
+# List available configurations
+node scripts/screenshots.mjs --list
+```
+
+**Prerequisites:**
+- Project infrastructure running (`docker-compose up -d`)
+- Frontend dev server running (`cd <project>/frontend && npm run dev`)
+
+**Adding a new project:**
+1. Create `scripts/screenshot-configs/<project>.json`
+2. Define screens to capture with selectors and routes
+3. Run `npm run screenshots <project>`
+
+**Configuration schema:**
+```json
+{
+  "name": "project-name",
+  "frontendPort": 5173,
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "skipAuth": true },
+    { "name": "02-home", "path": "/", "waitFor": "main" }
+  ]
+}
+```
+
+Screenshots are saved to `<project>/screenshots/`.
+
 ## Technology Stack Defaults
 
 Use these unless there's a compelling reason to deviate (document justification in the project's claude.md):

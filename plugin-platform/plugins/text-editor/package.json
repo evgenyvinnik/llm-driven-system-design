@@ -1,0 +1,37 @@
+{
+  "name": "@plugins/text-editor",
+  "version": "1.0.0",
+  "description": "The core text editing component for the pluggable text editor",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build",
+    "type-check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.2",
+    "vite": "^6.0.5",
+    "vite-plugin-dts": "^4.5.0"
+  },
+  "author": "Official Plugins",
+  "license": "MIT",
+  "pluginManifest": {
+    "id": "text-editor",
+    "name": "Text Editor",
+    "version": "1.0.0",
+    "description": "The core text editing component",
+    "category": "core",
+    "contributes": {
+      "slots": [
+        { "slot": "canvas", "component": "TextEditor", "order": 10 }
+      ]
+    }
+  }
+}

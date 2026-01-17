@@ -1,0 +1,38 @@
+{
+  "name": "plugin-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pluggable Text Editor - A text editor where everything is a plugin",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "plugins/*",
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces --if-present",
+    "build": "npm run build:sdk && npm run build:plugins && npm run build:apps",
+    "build:sdk": "npm run build -w @plugin-platform/sdk",
+    "build:plugins": "npm run build -w @plugins/paper-background -w @plugins/font-selector -w @plugins/text-editor -w @plugins/word-count -w @plugins/theme",
+    "build:apps": "npm run build -w frontend -w backend",
+    "build:frontend": "npm run build -w frontend",
+    "build:backend": "npm run build -w backend",
+    "dev:frontend": "npm run dev -w frontend",
+    "dev:backend": "npm run dev -w backend",
+    "type-check": "npm run type-check --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "rm -rf node_modules packages/*/node_modules plugins/*/node_modules frontend/node_modules backend/node_modules packages/*/dist plugins/*/dist frontend/dist backend/dist",
+    "db:migrate": "npm run db:migrate -w backend",
+    "db:seed": "npm run db:seed -w backend",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:reset": "docker-compose down -v && docker-compose up -d"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

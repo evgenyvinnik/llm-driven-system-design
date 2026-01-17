@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { chromium } from 'playwright';
+import { firefox } from 'playwright';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -343,8 +343,8 @@ async function main() {
 
   // Launch browser
   log('Launching browser...', 'dim');
-  const browser = await chromium.launch({
-    headless: true,
+  const browser = await firefox.launch({
+    headless: false, // Use headed mode for macOS compatibility
   });
 
   const results = [];
