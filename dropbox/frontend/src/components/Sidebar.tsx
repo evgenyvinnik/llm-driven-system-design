@@ -1,8 +1,19 @@
+/**
+ * Application sidebar component.
+ * Contains navigation links, storage usage bar, and user info.
+ * Shows admin link only for users with admin role.
+ * @module components/Sidebar
+ */
+
 import { Link, useNavigate } from '@tanstack/react-router';
 import { HardDrive, Users, Settings, LogOut, Shield } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { formatBytes, getStoragePercentage, getStorageColor } from '../utils/format';
 
+/**
+ * Renders the left sidebar with navigation and user info.
+ * Returns null if no user is authenticated.
+ */
 export function Sidebar() {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();

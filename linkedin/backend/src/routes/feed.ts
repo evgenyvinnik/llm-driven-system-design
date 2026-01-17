@@ -1,3 +1,10 @@
+/**
+ * Feed routes for the LinkedIn clone.
+ * Handles post creation, feed generation with ranking,
+ * and engagement features (likes, comments).
+ *
+ * @module routes/feed
+ */
 import { Router, Request, Response } from 'express';
 import * as feedService from '../services/feedService.js';
 import { requireAuth } from '../middleware/auth.js';

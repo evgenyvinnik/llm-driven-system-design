@@ -5,13 +5,18 @@ import { format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 
 /**
- * Simulated email service
- * In production, this would integrate with SendGrid, Mailgun, etc.
- * For this demo, we log emails and store them in the database
+ * Simulated email service for sending booking notifications.
+ * In production, this would integrate with SendGrid, Mailgun, SES, etc.
+ * For this demo, emails are logged to console and stored in the database
+ * for tracking and debugging purposes.
  */
 export class EmailService {
   /**
-   * Send booking confirmation email
+   * Sends a booking confirmation email to either the invitee or host.
+   * Formats the meeting time in the invitee's timezone for clarity.
+   * @param booking - The booking to send confirmation for
+   * @param meetingType - Meeting type details including host info
+   * @param recipient - Whether to send to 'invitee' or 'host'
    */
   async sendBookingConfirmation(
     booking: Booking,
@@ -64,7 +69,9 @@ Calendly
   }
 
   /**
-   * Send reschedule notification
+   * Sends a notification when a booking is rescheduled.
+   * Informs the invitee of the new meeting time.
+   * @param booking - The rescheduled booking with new time
    */
   async sendRescheduleNotification(booking: Booking): Promise<void> {
     const startTimeInvitee = toZonedTime(new Date(booking.start_time), booking.invitee_timezone);
@@ -88,7 +95,10 @@ Calendly
   }
 
   /**
-   * Send cancellation notification
+   * Sends a notification when a booking is cancelled.
+   * Includes the cancellation reason if provided.
+   * @param booking - The cancelled booking
+   * @param reason - Optional cancellation reason to include in the email
    */
   async sendCancellationNotification(booking: Booking, reason?: string): Promise<void> {
     const startTimeInvitee = toZonedTime(new Date(booking.start_time), booking.invitee_timezone);
@@ -112,7 +122,10 @@ Calendly
   }
 
   /**
-   * Send reminder notification
+   * Sends a reminder notification before a scheduled meeting.
+   * Used by background jobs to remind invitees of upcoming meetings.
+   * @param booking - The upcoming booking
+   * @param hoursUntil - Number of hours until the meeting starts
    */
   async sendReminder(booking: Booking, hoursUntil: number): Promise<void> {
     const startTimeInvitee = toZonedTime(new Date(booking.start_time), booking.invitee_timezone);
@@ -136,7 +149,13 @@ Calendly
   }
 
   /**
-   * Log email to database (simulated sending)
+   * Logs an email to the database and console.
+   * In production, this would send via an email service provider.
+   * @param bookingId - The UUID of the related booking
+   * @param recipientEmail - The email address to send to
+   * @param notificationType - Type of notification (confirmation, reminder, etc.)
+   * @param subject - Email subject line
+   * @param body - Email body content
    */
   private async logEmail(
     bookingId: string,
@@ -166,7 +185,10 @@ Calendly
   }
 
   /**
-   * Get email logs for a booking
+   * Retrieves all email notifications for a specific booking.
+   * Useful for debugging email delivery issues.
+   * @param bookingId - The UUID of the booking
+   * @returns Array of email notifications sorted by sent time (newest first)
    */
   async getEmailsForBooking(bookingId: string): Promise<Array<{
     id: string;
@@ -188,7 +210,10 @@ Calendly
   }
 
   /**
-   * Get all email logs (admin)
+   * Retrieves all email notifications in the system.
+   * Admin-only operation for monitoring email activity.
+   * @param limit - Maximum number of emails to return (default 100)
+   * @returns Array of email notifications sorted by sent time (newest first)
    */
   async getAllEmails(limit: number = 100): Promise<Array<{
     id: string;
@@ -211,4 +236,5 @@ Calendly
   }
 }
 
+/** Singleton instance of EmailService for application-wide use */
 export const emailService = new EmailService();

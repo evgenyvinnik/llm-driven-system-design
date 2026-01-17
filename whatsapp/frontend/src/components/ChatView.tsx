@@ -1,3 +1,13 @@
+/**
+ * Chat View Component
+ *
+ * Displays the main chat interface for a conversation including:
+ * - Message history with date separators
+ * - Message status indicators (sent, delivered, read)
+ * - Typing indicators for other participants
+ * - Message input with typing event broadcasting
+ */
+
 import { useState, useEffect, useRef, FormEvent, useCallback } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useAuthStore } from '../stores/authStore';
@@ -5,11 +15,21 @@ import { sendMessage, sendTyping, sendReadReceipt } from '../hooks/useWebSocket'
 import { messagesApi } from '../services/api';
 import { Message, MessageStatus } from '../types';
 
+/**
+ * Props for the ChatView component.
+ */
 interface ChatViewProps {
+  /** ID of the conversation to display */
   conversationId: string;
+  /** Optional callback for back navigation (mobile) */
   onBack?: () => void;
 }
 
+/**
+ * Main chat interface with message list and input.
+ * Handles real-time message sending, typing indicators, and read receipts.
+ * @param props - Component props with conversation ID and back callback
+ */
 export function ChatView({ conversationId, onBack }: ChatViewProps) {
   const { user } = useAuthStore();
   const {

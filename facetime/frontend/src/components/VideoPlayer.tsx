@@ -1,13 +1,34 @@
+/**
+ * VideoPlayer Component
+ *
+ * Renders a video stream in a styled container with optional mirroring,
+ * muting, and label overlay. Handles cases where no stream is available.
+ */
+
 import { useRef, useEffect } from 'react';
 
+/**
+ * Props for the VideoPlayer component.
+ */
 interface VideoPlayerProps {
+  /** MediaStream to display, null shows placeholder */
   stream: MediaStream | null;
+  /** Whether audio should be muted (typically for local preview) */
   muted?: boolean;
+  /** Whether to mirror the video horizontally (for self-view) */
   mirror?: boolean;
+  /** Additional CSS classes for the container */
   className?: string;
+  /** Optional label to display in the bottom-left corner */
   label?: string;
 }
 
+/**
+ * Displays a video stream with optional controls and styling.
+ *
+ * @param props - VideoPlayer configuration options
+ * @returns Video element with stream attached or placeholder if no stream
+ */
 export function VideoPlayer({
   stream,
   muted = false,

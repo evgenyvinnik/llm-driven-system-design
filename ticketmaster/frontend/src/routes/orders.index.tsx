@@ -1,13 +1,22 @@
+/**
+ * Orders list page route.
+ * Displays all orders for the authenticated user with status and details.
+ * Requires authentication - redirects to login if not authenticated.
+ */
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { checkoutApi } from '../services/api';
 import { useAuthStore } from '../stores/auth.store';
 import type { Order } from '../types';
 
+/** Route configuration for orders list page */
 export const Route = createFileRoute('/orders')({
   component: OrdersPage,
 });
 
+/**
+ * Orders page component showing user's order history.
+ */
 function OrdersPage() {
   const { isAuthenticated } = useAuthStore();
   const [orders, setOrders] = useState<Order[]>([]);

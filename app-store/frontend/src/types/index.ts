@@ -1,3 +1,11 @@
+/**
+ * @fileoverview Type definitions for the App Store frontend.
+ * Mirrors backend types for API responses.
+ */
+
+/**
+ * User account data.
+ */
 export interface User {
   id: string;
   email: string;
@@ -9,12 +17,18 @@ export interface User {
   updatedAt: string;
 }
 
+/**
+ * Developer information (subset for display).
+ */
 export interface Developer {
   id: string;
   name: string;
   verified: boolean;
 }
 
+/**
+ * App category for store navigation.
+ */
 export interface Category {
   id: string;
   name: string;
@@ -25,6 +39,9 @@ export interface Category {
   subcategories?: Category[];
 }
 
+/**
+ * Application listing data.
+ */
 export interface App {
   id: string;
   bundleId: string;
@@ -52,6 +69,9 @@ export interface App {
   status: 'draft' | 'pending' | 'approved' | 'rejected' | 'published' | 'suspended';
 }
 
+/**
+ * App screenshot or preview.
+ */
 export interface Screenshot {
   id: string;
   url: string;
@@ -59,6 +79,9 @@ export interface Screenshot {
   sortOrder: number;
 }
 
+/**
+ * User review of an app.
+ */
 export interface Review {
   id: string;
   userId: string;
@@ -82,6 +105,10 @@ export interface Review {
   };
 }
 
+/**
+ * Generic paginated API response wrapper.
+ * @template T - Type of items in the data array
+ */
 export interface PaginatedResponse<T> {
   data: T[];
   pagination: {
@@ -92,6 +119,9 @@ export interface PaginatedResponse<T> {
   };
 }
 
+/**
+ * Rating statistics for an app.
+ */
 export interface RatingSummary {
   averageRating: number;
   totalRatings: number;

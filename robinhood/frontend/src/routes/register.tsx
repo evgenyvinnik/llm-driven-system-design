@@ -1,11 +1,21 @@
+/**
+ * Registration page route (/register).
+ * Provides new user account creation form.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/** Route definition for registration page */
 export const Route = createFileRoute('/register')({
   component: RegisterPage,
 });
 
+/**
+ * Registration page component with account creation form.
+ * Redirects to home page on successful registration.
+ */
 function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');

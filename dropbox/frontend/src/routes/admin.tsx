@@ -1,3 +1,10 @@
+/**
+ * Admin dashboard page route.
+ * Displays system statistics, user management, and storage analytics.
+ * Requires admin role; redirects non-admins to home.
+ * @module routes/admin
+ */
+
 import { useEffect, useState } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
@@ -7,10 +14,15 @@ import { SystemStats, User } from '../types';
 import { Loader2, Users, HardDrive, FileBox, Layers, Trash2, RefreshCw } from 'lucide-react';
 import { formatBytes } from '../utils/format';
 
+/** Route definition for the admin dashboard at /admin */
 export const Route = createFileRoute('/admin')({
   component: AdminDashboard,
 });
 
+/**
+ * Admin dashboard component.
+ * Shows system stats, user list, storage breakdown, and cleanup tools.
+ */
 function AdminDashboard() {
   const navigate = useNavigate();
   const { user, isLoading: authLoading, checkAuth } = useAuthStore();

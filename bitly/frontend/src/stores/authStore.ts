@@ -1,8 +1,18 @@
+/**
+ * Authentication Store
+ *
+ * Manages user authentication state using Zustand with localStorage persistence.
+ * Provides login, logout, registration, and session verification functionality.
+ */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { User } from '../types';
 import { api } from '../services/api';
 
+/**
+ * Authentication state interface.
+ * Includes user data, loading state, and authentication actions.
+ */
 interface AuthState {
   user: User | null;
   isLoading: boolean;
@@ -15,6 +25,10 @@ interface AuthState {
   clearError: () => void;
 }
 
+/**
+ * Authentication store hook.
+ * Persists user data to localStorage for session continuity across page reloads.
+ */
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({

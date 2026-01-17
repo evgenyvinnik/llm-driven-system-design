@@ -1,5 +1,15 @@
+/**
+ * Color palette component for selecting the pixel color.
+ *
+ * Displays the 16-color palette matching the original r/place.
+ * Highlights the currently selected color.
+ */
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Renders a grid of color buttons for color selection.
+ * The selected color is highlighted with a ring indicator.
+ */
 export function ColorPalette() {
   const { config, selectedColor, setSelectedColor } = useAppStore();
 

@@ -1,8 +1,15 @@
+/**
+ * Driver trip history page - displays past trips completed by the driver.
+ * Protected route that requires driver authentication.
+ */
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../../stores/authStore';
 import api from '../../services/api';
 
+/**
+ * Trip history item structure for display.
+ */
 interface TripHistoryItem {
   id: string;
   status: string;
@@ -16,6 +23,12 @@ interface TripHistoryItem {
   completedAt?: string;
 }
 
+/**
+ * Trip history page showing past rides completed by the driver.
+ * Displays trip details including pickup/dropoff, rider info, fare earned, and status.
+ *
+ * @returns Driver history page component
+ */
 function DriverHistoryPage() {
   const user = useAuthStore((state) => state.user);
   const navigate = useNavigate();
@@ -42,7 +55,18 @@ function DriverHistoryPage() {
     fetchHistory();
   }, [user, navigate]);
 
+  /**
+   * Format cents as USD currency string.
+   * @param cents - Amount in cents
+   * @returns Formatted currency string
+   */
   const formatCurrency = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+
+  /**
+   * Format ISO date string as localized date.
+   * @param dateStr - ISO date string
+   * @returns Localized date string
+   */
   const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString();
 
   if (!user) return null;

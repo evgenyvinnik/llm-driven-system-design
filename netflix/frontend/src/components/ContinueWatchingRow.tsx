@@ -1,12 +1,25 @@
+/**
+ * ContinueWatchingRow Component
+ *
+ * Specialized row for displaying in-progress content.
+ * Shows larger thumbnails with episode info and progress bars.
+ * Links directly to resume playback at the saved position.
+ */
 import React from 'react';
 import { Link } from '@tanstack/react-router';
 import { Play } from 'lucide-react';
 import type { ContinueWatchingItem } from '../types';
 
+/** Props for ContinueWatchingRow component */
 interface ContinueWatchingRowProps {
+  /** In-progress items with viewing progress data */
   items: ContinueWatchingItem[];
 }
 
+/**
+ * Row displaying in-progress content for quick resume.
+ * Shows progress bar, time remaining, and episode info for series.
+ */
 export function ContinueWatchingRow({ items }: ContinueWatchingRowProps) {
   if (items.length === 0) return null;
 
@@ -76,6 +89,12 @@ export function ContinueWatchingRow({ items }: ContinueWatchingRowProps) {
   );
 }
 
+/**
+ * Formats remaining time for display.
+ *
+ * @param seconds - Remaining time in seconds
+ * @returns Formatted string (e.g., "1h 23m" or "45m")
+ */
 function formatTimeRemaining(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);

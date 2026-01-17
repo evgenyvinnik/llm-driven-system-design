@@ -1,9 +1,24 @@
-// Algorithm Selector Component
+/**
+ * @fileoverview Algorithm Selector component for choosing rate limiting algorithms.
+ *
+ * Displays all available algorithms as clickable buttons and shows
+ * detailed information about the selected algorithm including:
+ * - Description of how the algorithm works
+ * - Pros and cons
+ * - Required parameters
+ */
 
 import { useEffect } from 'react';
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 import type { Algorithm } from '../types';
 
+/**
+ * Algorithm selection component with documentation display.
+ * Fetches available algorithms from the backend and displays them
+ * with interactive selection and detailed information.
+ *
+ * @returns Algorithm selector with documentation panel
+ */
 export function AlgorithmSelector() {
   const {
     algorithm,
@@ -67,6 +82,12 @@ export function AlgorithmSelector() {
   );
 }
 
+/**
+ * Format algorithm name from snake_case to Title Case.
+ *
+ * @param name - Algorithm name in snake_case
+ * @returns Formatted name with spaces and capitalization
+ */
 function formatAlgorithmName(name: string): string {
   return name
     .split('_')

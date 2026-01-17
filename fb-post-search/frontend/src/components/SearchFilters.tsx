@@ -1,8 +1,19 @@
+/**
+ * @fileoverview Search filters dropdown component.
+ * Provides filter options for post type, visibility, and date range.
+ */
+
 import { useState } from 'react';
 import { Filter, X, Calendar, FileType, Eye } from 'lucide-react';
 import { useSearchStore } from '../stores/searchStore';
 import type { PostType, Visibility } from '../types';
 
+/**
+ * Dropdown component for filtering search results.
+ * Allows filtering by post type (text, photo, video, link),
+ * visibility (public, friends), and date range.
+ * @returns Filter button with expandable dropdown panel
+ */
 export function SearchFilters() {
   const [isOpen, setIsOpen] = useState(false);
   const { filters, setFilters, search } = useSearchStore();

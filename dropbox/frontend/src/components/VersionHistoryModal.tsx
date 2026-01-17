@@ -1,16 +1,31 @@
+/**
+ * Modal dialog for viewing and restoring file version history.
+ * Lists all previous versions with size and date, allowing restore.
+ * @module components/VersionHistoryModal
+ */
+
 import { useState, useEffect } from 'react';
 import { X, RotateCcw } from 'lucide-react';
 import { FileItem, FileVersion } from '../types';
 import { filesApi } from '../services/api';
 import { formatBytes, formatDate } from '../utils/format';
 
+/** Props for the VersionHistoryModal component */
 interface VersionHistoryModalProps {
+  /** Whether the modal is currently visible */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
+  /** The file to show version history for (null if none selected) */
   file: FileItem | null;
+  /** Callback after a version is successfully restored */
   onRestore: () => void;
 }
 
+/**
+ * Renders a modal showing all versions of a file.
+ * Displays current version and allows restoring previous versions.
+ */
 export function VersionHistoryModal({ isOpen, onClose, file, onRestore }: VersionHistoryModalProps) {
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [isLoading, setIsLoading] = useState(false);

@@ -1,11 +1,61 @@
+/**
+ * @fileoverview Worker status display component.
+ *
+ * Displays the status of crawler worker processes:
+ * - List of active workers
+ * - Health status indicator (green/yellow/red)
+ * - Last seen timestamp for each worker
+ * - Total worker count
+ *
+ * Workers send heartbeats every 5 seconds. Status is determined by
+ * how recently the last heartbeat was received:
+ * - Active (green): < 10 seconds ago
+ * - Stale (yellow): 10-30 seconds ago
+ * - Dead (red): > 30 seconds ago
+ *
+ * @module components/WorkerStatus
+ */
+
+/**
+ * Props for the WorkerStatus component.
+ */
 interface WorkerStatusProps {
+  /** Array of active worker IDs */
   workers: string[];
+  /** Heartbeat timestamps for each worker */
   heartbeats: { workerId: string; lastHeartbeat: number }[];
 }
 
+/**
+ * Displays the health status of crawler workers.
+ *
+ * Shows a list of registered workers with their current health status
+ * based on heartbeat timestamps. Workers that haven't sent a heartbeat
+ * recently are marked as stale or dead.
+ *
+ * @param props - Component props
+ * @returns React component rendering worker status
+ *
+ * @example
+ * ```tsx
+ * <WorkerStatus
+ *   workers={['worker-1', 'worker-2']}
+ *   heartbeats={[
+ *     { workerId: 'worker-1', lastHeartbeat: Date.now() - 5000 },
+ *     { workerId: 'worker-2', lastHeartbeat: Date.now() - 60000 },
+ *   ]}
+ * />
+ * ```
+ */
 export function WorkerStatus({ workers, heartbeats }: WorkerStatusProps) {
   const now = Date.now();
 
+  /**
+   * Determines the health status of a worker based on its last heartbeat.
+   *
+   * @param workerId - The worker ID to check
+   * @returns Status string: 'active', 'stale', 'dead', or 'unknown'
+   */
   const getWorkerStatus = (workerId: string) => {
     const heartbeat = heartbeats.find((h) => h.workerId === workerId);
     if (!heartbeat) return 'unknown';
@@ -16,6 +66,9 @@ export function WorkerStatus({ workers, heartbeats }: WorkerStatusProps) {
     return 'dead';
   };
 
+  /**
+   * CSS classes for status indicator colors.
+   */
   const statusColors = {
     active: 'bg-green-500',
     stale: 'bg-yellow-500',

@@ -1,3 +1,8 @@
+/**
+ * Event detail page route.
+ * Shows full event information, seat map, and purchase workflow.
+ * Handles waiting room integration for high-demand events.
+ */
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useState, useEffect, useCallback } from 'react';
 import { eventsApi, seatsApi } from '../../services/api';
@@ -8,10 +13,15 @@ import { CheckoutSummary } from '../../components/CheckoutSummary';
 import { WaitingRoom } from '../../components/WaitingRoom';
 import type { Event, SectionAvailability, Seat } from '../../types';
 
+/** Route configuration for event detail page */
 export const Route = createFileRoute('/events/$eventId')({
   component: EventDetailPage,
 });
 
+/**
+ * Event detail page with seat selection and checkout functionality.
+ * Manages complex state for seat availability, reservations, and queue status.
+ */
 function EventDetailPage() {
   const { eventId } = Route.useParams();
   const navigate = useNavigate();

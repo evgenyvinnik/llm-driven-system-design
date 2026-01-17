@@ -411,6 +411,13 @@ function sendError(ws: ExtendedWebSocket, error: string): void {
   });
 }
 
+/**
+ * Broadcasts a message to all clients viewing a specific file.
+ * Optionally excludes one client (typically the sender).
+ * @param fileId - The file to broadcast to
+ * @param message - The message to broadcast
+ * @param exclude - Optional client to exclude from broadcast
+ */
 function broadcastToFile(fileId: string, message: WSMessage, exclude?: ExtendedWebSocket): void {
   const clients = fileClients.get(fileId);
   if (!clients) return;
@@ -423,6 +430,12 @@ function broadcastToFile(fileId: string, message: WSMessage, exclude?: ExtendedW
   });
 }
 
+/**
+ * Gets the count of connected users for a specific file.
+ * Used for displaying active user count in the UI.
+ * @param fileId - The file to get user count for
+ * @returns The number of connected users
+ */
 // Get connected users count for a file
 export function getFileUserCount(fileId: string): number {
   return fileClients.get(fileId)?.size || 0;

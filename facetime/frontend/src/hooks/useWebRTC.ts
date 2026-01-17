@@ -1,9 +1,24 @@
+/**
+ * WebRTC Hook Module
+ *
+ * Custom React hook that manages WebRTC peer connections for video/audio calls.
+ * Handles media stream acquisition, peer connection setup, ICE candidate exchange,
+ * and SDP offer/answer negotiation through the signaling service.
+ */
+
 import { useEffect, useRef, useCallback } from 'react';
 import { useStore } from '../stores/useStore';
 import { signalingService } from '../services/signaling';
 import { fetchTurnCredentials } from '../services/api';
 import type { WebSocketMessage, ICEServer } from '../types';
 
+/**
+ * Hook for managing WebRTC connections and media streams.
+ * Provides functions to initiate, answer, decline, and end calls.
+ * Automatically handles WebRTC signaling messages and ICE candidate exchange.
+ *
+ * @returns Object containing call control functions and local stream/peer connection
+ */
 export function useWebRTC() {
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([]);
@@ -28,7 +43,10 @@ export function useWebRTC() {
       .catch(console.error);
   }, []);
 
-  // Get user media
+  /**
+   * Acquires local media stream with specified constraints.
+   * Configures video resolution and audio processing options.
+   */
   const getLocalStream = useCallback(async (callType: 'video' | 'audio') => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -51,7 +69,11 @@ export function useWebRTC() {
     }
   }, [setLocalStream]);
 
-  // Create peer connection
+  /**
+   * Creates and configures RTCPeerConnection with ICE servers.
+   * Sets up event handlers for ICE candidates, track events,
+   * and connection state changes.
+   */
   const createPeerConnection = useCallback(() => {
     const config: RTCConfiguration = {
       iceServers: iceServersRef.current.length > 0
@@ -95,7 +117,10 @@ export function useWebRTC() {
     return pc;
   }, [callState.callId, setCallState, setRemoteStream]);
 
-  // Initiate call
+  /**
+   * Initiates an outgoing call to specified users.
+   * Acquires local media, creates peer connection, and sends call initiation.
+   */
   const initiateCall = useCallback(async (calleeIds: string[], callType: 'video' | 'audio') => {
     try {
       setCallState({
@@ -129,7 +154,10 @@ export function useWebRTC() {
     }
   }, [setCallState, getLocalStream, createPeerConnection, resetCallState]);
 
-  // Answer call
+  /**
+   * Answers an incoming call.
+   * Acquires local media, creates peer connection, and signals acceptance.
+   */
   const answerCall = useCallback(async () => {
     try {
       setCallState({ state: 'connecting' });
@@ -150,7 +178,10 @@ export function useWebRTC() {
     }
   }, [callState.callId, callState.callType, setCallState, getLocalStream, createPeerConnection, resetCallState]);
 
-  // Decline call
+  /**
+   * Declines an incoming call.
+   * Signals rejection and resets call state.
+   */
   const declineCall = useCallback(() => {
     if (callState.callId) {
       signalingService.declineCall(callState.callId);
@@ -158,7 +189,10 @@ export function useWebRTC() {
     resetCallState();
   }, [callState.callId, resetCallState]);
 
-  // End call
+  /**
+   * Ends an active call.
+   * Closes peer connection, signals termination, and cleans up resources.
+   */
   const endCall = useCallback(() => {
     if (callState.callId) {
       signalingService.endCall(callState.callId);
@@ -172,7 +206,10 @@ export function useWebRTC() {
     resetCallState();
   }, [callState.callId, resetCallState]);
 
-  // Handle incoming signaling messages
+  /**
+   * Effect that handles incoming signaling messages.
+   * Processes call lifecycle events and WebRTC offer/answer/ICE exchange.
+   */
   useEffect(() => {
     const unsubscribe = signalingService.onMessage(async (message: WebSocketMessage) => {
       switch (message.type) {

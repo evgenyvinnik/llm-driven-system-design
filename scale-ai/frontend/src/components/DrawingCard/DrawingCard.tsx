@@ -1,19 +1,43 @@
+/**
+ * DrawingCard component - Displays a drawing with its metadata and actions.
+ * Used in the admin dashboard gallery to show drawing thumbnails with
+ * flag, delete, and restore capabilities.
+ * @module components/DrawingCard
+ */
+
 import { useState, useEffect } from 'react'
 import { StrokeThumbnail, StrokeThumbnailPlaceholder } from '../StrokeThumbnail'
 import { getDrawingStrokes, type StrokeData } from '../../services/api'
 import './DrawingCard.css'
 
+/**
+ * Props for the DrawingCard component.
+ */
 interface DrawingCardProps {
+  /** Unique drawing ID */
   id: string
+  /** The shape that was drawn */
   shape: string
+  /** ISO timestamp when drawing was created */
   createdAt: string
+  /** Whether the drawing is flagged for review */
   isFlagged: boolean
+  /** Whether the drawing is soft-deleted */
   isDeleted: boolean
+  /** Called when flag/unflag button is clicked */
   onFlag: (id: string, flagged: boolean) => void
+  /** Called when delete button is clicked */
   onDelete: (id: string) => void
+  /** Called when restore button is clicked */
   onRestore: (id: string) => void
 }
 
+/**
+ * A card component displaying a drawing thumbnail with metadata and action buttons.
+ * Lazily loads stroke data from the API for efficient gallery rendering.
+ *
+ * @param props - Component props
+ */
 export function DrawingCard({
   id,
   shape,

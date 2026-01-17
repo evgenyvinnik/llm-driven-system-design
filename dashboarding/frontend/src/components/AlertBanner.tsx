@@ -1,8 +1,24 @@
+/**
+ * @fileoverview Alert banner component for displaying active alerts.
+ *
+ * Shows a horizontal banner at the top of the page when there are
+ * firing alerts. Provides quick visibility into critical system issues.
+ */
+
 import { useState, useEffect } from 'react';
 import type { AlertInstance, AlertRule } from '../types';
 import { getAlertInstances, getAlertRules } from '../services/api';
 import { format } from 'date-fns';
 
+/**
+ * Renders a banner displaying currently firing alerts.
+ *
+ * Fetches firing alerts and their associated rules every 30 seconds.
+ * Displays each alert as a colored pill with severity, name, value,
+ * and time. Returns null if there are no active alerts.
+ *
+ * @returns The rendered alert banner or null
+ */
 export function AlertBanner() {
   const [firingAlerts, setFiringAlerts] = useState<AlertInstance[]>([]);
   const [rules, setRules] = useState<Map<string, AlertRule>>(new Map());
@@ -30,6 +46,12 @@ export function AlertBanner() {
     return null;
   }
 
+  /**
+   * Returns the appropriate CSS class for an alert severity level.
+   *
+   * @param severity - The alert severity ('critical', 'warning', 'info')
+   * @returns Tailwind CSS class for the severity color
+   */
   const getSeverityColor = (severity: string) => {
     switch (severity) {
       case 'critical':

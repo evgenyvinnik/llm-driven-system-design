@@ -1,7 +1,22 @@
+/**
+ * Comment List Component
+ *
+ * Displays the scrolling list of comments for the current stream.
+ * Auto-scrolls to show new comments as they arrive.
+ *
+ * @module components/CommentList
+ */
+
 import { useRef, useEffect } from 'react';
 import { useAppStore } from '../stores/appStore';
 import { CommentItem } from './CommentItem';
 
+/**
+ * Renders the scrollable comment list.
+ * Automatically scrolls to bottom when new comments are added.
+ *
+ * @returns Comment list JSX
+ */
 export function CommentList() {
   const comments = useAppStore((state) => state.comments);
   const listRef = useRef<HTMLDivElement>(null);

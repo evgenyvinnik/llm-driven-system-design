@@ -368,6 +368,585 @@ CREATE TABLE comments (
 
 ---
 
+## Consistency and Idempotency
+
+### Write Consistency Model
+
+**PostgreSQL (Source of Truth)**:
+- **Strong consistency** for all issue writes within a single project
+- Transactions wrap multi-table operations (issue update + history record + custom field updates)
+- `SERIALIZABLE` isolation for transitions where concurrent state changes could conflict
+
+**Elasticsearch (Search Index)**:
+- **Eventual consistency** with PostgreSQL as authoritative source
+- Index updates happen asynchronously via message queue
+- Typical lag: 100-500ms for local development, acceptable for search use cases
+
+**Consistency Boundaries by Operation**:
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Issue create/update | Strong (PostgreSQL) | Single-project writes require immediate consistency |
+| Status transitions | Strong + optimistic locking | Workflow state must be atomic |
+| Comment add | Strong | User expects immediate visibility |
+| Search results | Eventual (~500ms) | Slight delay acceptable for search |
+| Board views | Eventually consistent | Cached aggregations, refreshed periodically |
+
+### Idempotency Keys
+
+All mutating API operations accept an `X-Idempotency-Key` header to handle client retries safely.
+
+**Implementation**:
+```sql
+CREATE TABLE idempotency_keys (
+  key VARCHAR(64) PRIMARY KEY,
+  user_id UUID NOT NULL,
+  request_path VARCHAR(200) NOT NULL,
+  response_status INTEGER,
+  response_body JSONB,
+  created_at TIMESTAMP DEFAULT NOW(),
+  expires_at TIMESTAMP DEFAULT NOW() + INTERVAL '24 hours'
+);
+
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+```
+
+**Request Flow**:
+```javascript
+async function handleRequest(req, handler) {
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  if (!idempotencyKey) {
+    return handler(req); // Non-idempotent request
+  }
+
+  // Check for existing result
+  const existing = await db('idempotency_keys')
+    .where({ key: idempotencyKey, user_id: req.user.id })
+    .first();
+
+  if (existing) {
+    return { status: existing.response_status, body: existing.response_body };
+  }
+
+  // Execute and store result
+  const result = await handler(req);
+  await db('idempotency_keys').insert({
+    key: idempotencyKey,
+    user_id: req.user.id,
+    request_path: req.path,
+    response_status: result.status,
+    response_body: result.body
+  });
+
+  return result;
+}
+```
+
+**TTL**: Keys expire after 24 hours. A background job purges expired keys hourly.
+
+### Conflict Resolution
+
+**Optimistic Concurrency Control** for issue updates:
+
+```sql
+ALTER TABLE issues ADD COLUMN version INTEGER DEFAULT 1;
+```
+
+**Update Pattern**:
+```javascript
+async function updateIssue(issueId, updates, expectedVersion) {
+  const result = await db('issues')
+    .where({ id: issueId, version: expectedVersion })
+    .update({
+      ...updates,
+      version: expectedVersion + 1,
+      updated_at: db.fn.now()
+    });
+
+  if (result === 0) {
+    throw new ConflictError('Issue was modified by another user. Refresh and retry.');
+  }
+}
+```
+
+**Conflict Scenarios**:
+- **Concurrent field edits**: Last-write-wins for non-conflicting fields; conflict error for same field
+- **Status transitions**: Reject if current status differs from expected `from_status`
+- **Bulk operations**: Process in batches of 50, skip conflicting issues, report failures
+
+### Replay Handling
+
+For message queue consumers (search indexing, notifications):
+- Messages include `event_id` (UUID) generated at source
+- Consumers track processed event IDs in Redis with 24-hour TTL
+- Duplicate messages are logged and skipped
+
+```javascript
+async function handleIndexEvent(event) {
+  const processed = await redis.get(`processed:${event.event_id}`);
+  if (processed) {
+    logger.debug('Skipping duplicate event', { eventId: event.event_id });
+    return;
+  }
+
+  await indexIssue(event.issue);
+  await redis.setex(`processed:${event.event_id}`, 86400, '1');
+}
+```
+
+---
+
+## Caching and Edge Strategy
+
+### Cache Architecture
+
+For local development, we use **Valkey/Redis** as the primary cache layer. In production, a CDN would sit in front for static assets and read-heavy API responses.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Client                                   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    API Gateway                                   │
+│         (Rate limiting, Auth, Response cache headers)            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Valkey/Redis Cache                            │
+│    Session │ Issue Cache │ Permission Cache │ Workflow Cache     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  PostgreSQL / Elasticsearch                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Cache Strategy: Cache-Aside (Lazy Loading)
+
+We use **cache-aside** for most reads. This pattern:
+1. Check cache first
+2. On miss, read from database
+3. Populate cache with result
+
+**Rationale**: Issue data is frequently updated; write-through would add latency to every write. Cache-aside allows stale reads briefly but keeps writes fast.
+
+```javascript
+async function getIssue(issueId) {
+  const cacheKey = `issue:${issueId}`;
+
+  // 1. Check cache
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 2. Fetch from database
+  const issue = await db('issues').where({ id: issueId }).first();
+  if (!issue) return null;
+
+  // 3. Populate cache
+  await redis.setex(cacheKey, 300, JSON.stringify(issue)); // 5 min TTL
+
+  return issue;
+}
+```
+
+### Cache Keys and TTLs
+
+| Cache Type | Key Pattern | TTL | Invalidation |
+|------------|-------------|-----|--------------|
+| Issue data | `issue:{id}` | 5 min | On update, delete key |
+| Issue by key | `issue:key:{projectKey}-{number}` | 5 min | On update, delete key |
+| Project metadata | `project:{id}` | 15 min | On project update |
+| Workflow definition | `workflow:{id}` | 30 min | On workflow edit (rare) |
+| Permission scheme | `perm-scheme:{id}` | 30 min | On scheme edit (rare) |
+| User permissions | `user-perms:{userId}:{projectId}` | 10 min | On role change |
+| Board configuration | `board:{id}` | 15 min | On board edit |
+| JQL saved filter | `filter:{id}:results` | 2 min | On filter execution |
+
+### Cache Invalidation Rules
+
+**Explicit invalidation** (preferred for critical data):
+```javascript
+async function updateIssue(issueId, updates) {
+  await db('issues').where({ id: issueId }).update(updates);
+
+  // Invalidate all related cache keys
+  const issue = await db('issues').where({ id: issueId }).first();
+  await redis.del(`issue:${issueId}`);
+  await redis.del(`issue:key:${issue.key}`);
+
+  // Publish event for search reindexing
+  await publishEvent('issue.updated', { issueId, changes: updates });
+}
+```
+
+**Pattern-based invalidation** for bulk operations:
+```javascript
+async function invalidateProjectIssues(projectId) {
+  // Use Redis SCAN to find and delete matching keys
+  let cursor = '0';
+  do {
+    const [newCursor, keys] = await redis.scan(
+      cursor, 'MATCH', `issue:*`, 'COUNT', 100
+    );
+    cursor = newCursor;
+    if (keys.length > 0) {
+      // Filter to project issues and delete
+      const issues = await Promise.all(keys.map(k => redis.get(k)));
+      const projectKeys = keys.filter((k, i) => {
+        const issue = JSON.parse(issues[i] || '{}');
+        return issue.project_id === projectId;
+      });
+      if (projectKeys.length > 0) await redis.del(...projectKeys);
+    }
+  } while (cursor !== '0');
+}
+```
+
+### Read-Heavy Optimization: Board Views
+
+Board views (Kanban/Scrum) are expensive to compute. We use **cache-aside with computed aggregations**:
+
+```javascript
+async function getBoardIssues(boardId) {
+  const cacheKey = `board:${boardId}:issues`;
+
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const board = await getBoard(boardId);
+  const issues = await db('issues')
+    .where({ project_id: board.project_id })
+    .whereIn('status_id', board.column_status_ids)
+    .orderBy('rank', 'asc');
+
+  // Group by status for frontend
+  const columns = groupBy(issues, 'status_id');
+
+  await redis.setex(cacheKey, 60, JSON.stringify(columns)); // 1 min TTL
+  return columns;
+}
+```
+
+**Invalidation trigger**: Any issue update within the board's project invalidates the board cache.
+
+### Static Asset Caching (Local Dev)
+
+For local development, Vite dev server handles static assets. In production:
+- CDN caches `/static/*` with 1-year TTL (immutable, hashed filenames)
+- API responses include `Cache-Control: private, no-cache` for dynamic data
+- Board thumbnails and attachment previews: CDN with 24-hour TTL
+
+---
+
+## Async Queue and Background Jobs
+
+### Queue Architecture
+
+We use **RabbitMQ** for async processing. For local development, this runs in Docker alongside other services.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      API Services                                │
+│    Issue Service │ Workflow Engine │ Comment Service             │
+└─────────────────────────────────────────────────────────────────┘
+        │                   │                     │
+        ▼                   ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      RabbitMQ                                    │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                │
+│  │ issue.events│ │ search.index│ │notifications│                │
+│  │   (fanout)  │ │   (direct)  │ │   (direct)  │                │
+│  └─────────────┘ └─────────────┘ └─────────────┘                │
+└─────────────────────────────────────────────────────────────────┘
+        │                   │                     │
+        ▼                   ▼                     ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│ Search Indexer│   │ Notification  │   │ Webhook       │
+│               │   │ Worker        │   │ Dispatcher    │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+### Queue Configuration
+
+```javascript
+// RabbitMQ connection and channel setup
+const QUEUES = {
+  ISSUE_EVENTS: 'issue.events',      // Fanout exchange for all issue changes
+  SEARCH_INDEX: 'search.index',      // Direct queue for ES indexing
+  NOTIFICATIONS: 'notifications',    // Direct queue for email/in-app
+  WEBHOOKS: 'webhooks',              // Direct queue for webhook delivery
+  BULK_OPERATIONS: 'bulk.operations' // Direct queue for bulk updates
+};
+
+// Queue declarations with durability
+async function setupQueues(channel) {
+  // Durable queues survive broker restarts
+  await channel.assertQueue(QUEUES.SEARCH_INDEX, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'dlx',
+      'x-dead-letter-routing-key': 'search.index.dlq'
+    }
+  });
+
+  // Set prefetch for backpressure control
+  await channel.prefetch(10); // Process 10 messages at a time
+}
+```
+
+### Message Types and Delivery Semantics
+
+| Queue | Message Type | Delivery | Retry Policy |
+|-------|--------------|----------|--------------|
+| `issue.events` | Issue created/updated/deleted | At-least-once | N/A (fanout) |
+| `search.index` | Reindex request | At-least-once | 3 retries, exponential backoff |
+| `notifications` | Email/in-app notification | At-least-once | 3 retries, then DLQ |
+| `webhooks` | Webhook payload | At-least-once | 5 retries with exponential backoff |
+| `bulk.operations` | Batch update job | At-least-once | 3 retries, log failures |
+
+### Publisher Implementation
+
+```javascript
+async function publishIssueEvent(eventType, issue, changes) {
+  const event = {
+    event_id: uuid(),
+    event_type: eventType, // 'created', 'updated', 'deleted', 'transitioned'
+    issue_id: issue.id,
+    project_id: issue.project_id,
+    changes: changes,
+    timestamp: new Date().toISOString(),
+    actor_id: getCurrentUserId()
+  };
+
+  // Publish to fanout exchange - all consumers receive
+  await channel.publish(
+    'issue.events.exchange',
+    '', // Fanout ignores routing key
+    Buffer.from(JSON.stringify(event)),
+    {
+      persistent: true, // Survive broker restart
+      contentType: 'application/json',
+      messageId: event.event_id
+    }
+  );
+}
+```
+
+### Consumer Implementation with Backpressure
+
+```javascript
+class SearchIndexConsumer {
+  constructor(channel) {
+    this.channel = channel;
+    this.processing = 0;
+    this.maxConcurrent = 10;
+  }
+
+  async start() {
+    await this.channel.consume(
+      QUEUES.SEARCH_INDEX,
+      async (msg) => {
+        if (this.processing >= this.maxConcurrent) {
+          // Backpressure: reject and requeue
+          this.channel.nack(msg, false, true);
+          return;
+        }
+
+        this.processing++;
+        try {
+          const event = JSON.parse(msg.content.toString());
+          await this.indexIssue(event);
+          this.channel.ack(msg);
+        } catch (error) {
+          await this.handleError(msg, error);
+        } finally {
+          this.processing--;
+        }
+      },
+      { noAck: false } // Manual acknowledgment
+    );
+  }
+
+  async handleError(msg, error) {
+    const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+
+    if (retryCount > 3) {
+      // Send to dead letter queue
+      logger.error('Message failed after 3 retries', {
+        messageId: msg.properties.messageId,
+        error: error.message
+      });
+      this.channel.reject(msg, false); // Don't requeue
+      return;
+    }
+
+    // Exponential backoff: 1s, 2s, 4s
+    const delay = Math.pow(2, retryCount - 1) * 1000;
+
+    setTimeout(() => {
+      this.channel.publish(
+        '',
+        QUEUES.SEARCH_INDEX,
+        msg.content,
+        {
+          ...msg.properties,
+          headers: { ...msg.properties.headers, 'x-retry-count': retryCount }
+        }
+      );
+      this.channel.ack(msg);
+    }, delay);
+  }
+
+  async indexIssue(event) {
+    // Deduplicate based on event_id
+    const processed = await redis.get(`processed:${event.event_id}`);
+    if (processed) return;
+
+    const issue = await db('issues')
+      .where({ id: event.issue_id })
+      .first();
+
+    if (!issue) {
+      // Issue was deleted - remove from index
+      await esClient.delete({
+        index: 'issues',
+        id: event.issue_id.toString()
+      }).catch(() => {}); // Ignore if not found
+      return;
+    }
+
+    await esClient.index({
+      index: 'issues',
+      id: issue.id.toString(),
+      body: this.mapToDocument(issue)
+    });
+
+    await redis.setex(`processed:${event.event_id}`, 86400, '1');
+  }
+}
+```
+
+### Background Job Types
+
+**1. Search Index Sync**
+- Triggered by: Issue create/update/delete
+- Purpose: Keep Elasticsearch in sync with PostgreSQL
+- Latency target: < 500ms from event to searchable
+
+**2. Notification Dispatch**
+- Triggered by: Issue assignment, @mentions, watch list updates
+- Purpose: Send email and in-app notifications
+- Batching: Aggregate rapid changes into single notification (5-second window)
+
+**3. Bulk Operations**
+- Triggered by: Admin bulk update requests
+- Purpose: Update 100+ issues without blocking UI
+- Progress: Stored in Redis, queryable via API
+
+```javascript
+async function startBulkOperation(userId, issueIds, updates) {
+  const jobId = uuid();
+
+  await redis.hmset(`bulk:${jobId}`, {
+    status: 'pending',
+    total: issueIds.length,
+    processed: 0,
+    failed: 0,
+    started_at: new Date().toISOString()
+  });
+
+  await channel.sendToQueue(
+    QUEUES.BULK_OPERATIONS,
+    Buffer.from(JSON.stringify({ jobId, userId, issueIds, updates })),
+    { persistent: true }
+  );
+
+  return jobId;
+}
+
+// Poll for progress
+async function getBulkOperationStatus(jobId) {
+  return redis.hgetall(`bulk:${jobId}`);
+}
+```
+
+**4. Webhook Delivery**
+- Triggered by: Configurable issue events
+- Purpose: Notify external systems (CI/CD, Slack, etc.)
+- Retry: 5 attempts with exponential backoff (1s, 2s, 4s, 8s, 16s)
+- Timeout: 10 seconds per attempt
+
+### Dead Letter Queue Handling
+
+Messages that fail all retries go to a dead letter queue for manual inspection:
+
+```javascript
+async function processDLQ() {
+  await channel.consume('dlq.search.index', async (msg) => {
+    const event = JSON.parse(msg.content.toString());
+
+    // Log for investigation
+    logger.error('DLQ message', {
+      queue: 'search.index',
+      event: event,
+      originalError: msg.properties.headers?.['x-first-death-reason']
+    });
+
+    // Store in database for admin review
+    await db('failed_jobs').insert({
+      queue: 'search.index',
+      payload: event,
+      failed_at: new Date(),
+      error: msg.properties.headers?.['x-first-death-reason']
+    });
+
+    channel.ack(msg);
+  });
+}
+```
+
+### Local Development Setup
+
+Add to `docker-compose.yml`:
+```yaml
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: jira
+      RABBITMQ_DEFAULT_PASS: jira_dev
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  valkey:
+    image: valkey/valkey:7.2
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+
+volumes:
+  rabbitmq_data:
+  valkey_data:
+```
+
+Environment variables:
+```bash
+RABBITMQ_URL=amqp://jira:jira_dev@localhost:5672
+REDIS_URL=redis://localhost:6379
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -376,3 +955,7 @@ CREATE TABLE comments (
 | Search | Elasticsearch | PostgreSQL FTS | JQL complexity |
 | Workflow | DB-driven | Code-driven | Flexibility |
 | History | Event table | Event sourcing | Simpler queries |
+| Cache strategy | Cache-aside | Write-through | Write latency matters for issue updates |
+| Message queue | RabbitMQ | Kafka | Simpler for point-to-point, good enough for fanout |
+| Consistency | Strong (PG) + Eventual (ES) | Full eventual | Issue state must be immediately consistent |
+| Idempotency | Request-level keys | Operation log | Simpler client integration |

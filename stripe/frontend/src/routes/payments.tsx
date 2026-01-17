@@ -1,3 +1,13 @@
+/**
+ * Payments Route
+ *
+ * Payment management page for viewing and managing payment intents.
+ * Provides filtering, detail view, and actions like capture and cancel.
+ * Implements a master-detail layout with list on the left and details on the right.
+ *
+ * @module routes/payments
+ */
+
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { listPaymentIntents, getPaymentIntent, cancelPaymentIntent, capturePaymentIntent } from '@/services/api';
@@ -5,10 +15,20 @@ import { formatCurrency, formatDate, formatRelativeTime } from '@/utils';
 import { StatusBadge } from '@/components';
 import type { PaymentIntent } from '@/types';
 
+/**
+ * Route definition for the payments page (/payments).
+ */
 export const Route = createFileRoute('/payments')({
   component: PaymentsPage,
 });
 
+/**
+ * Payments page component.
+ * Lists all payment intents with filtering by status, and shows
+ * detailed information with available actions for the selected payment.
+ *
+ * @returns The payments management page
+ */
 function PaymentsPage() {
   const [payments, setPayments] = useState<PaymentIntent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -20,6 +40,9 @@ function PaymentsPage() {
     loadPayments();
   }, [filter]);
 
+  /**
+   * Fetches payment intents from the API with optional status filter.
+   */
   async function loadPayments() {
     try {
       setLoading(true);
@@ -35,6 +58,10 @@ function PaymentsPage() {
     }
   }
 
+  /**
+   * Cancels a payment intent after user confirmation.
+   * @param id - Payment intent ID to cancel
+   */
   async function handleCancel(id: string) {
     if (!confirm('Are you sure you want to cancel this payment?')) return;
 
@@ -47,6 +74,10 @@ function PaymentsPage() {
     }
   }
 
+  /**
+   * Captures an authorized payment intent.
+   * @param id - Payment intent ID to capture
+   */
   async function handleCapture(id: string) {
     try {
       await capturePaymentIntent(id);
@@ -57,6 +88,10 @@ function PaymentsPage() {
     }
   }
 
+  /**
+   * Loads and displays detailed information for a payment intent.
+   * @param id - Payment intent ID to show details for
+   */
   async function showDetails(id: string) {
     try {
       const pi = await getPaymentIntent(id);

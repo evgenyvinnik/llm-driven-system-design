@@ -1,10 +1,24 @@
+/**
+ * Form component for adding new products to track.
+ * Includes URL input, optional target price, and notification preferences.
+ * @module components/AddProductForm
+ */
 import { useState } from 'react';
 
+/** Props for the AddProductForm component */
 interface AddProductFormProps {
+  /** Callback when form is submitted with valid data */
   onSubmit: (url: string, targetPrice?: number, notifyAnyDrop?: boolean) => Promise<void>;
+  /** Whether the form is currently submitting */
   isLoading?: boolean;
 }
 
+/**
+ * Renders a form for adding new products to track.
+ * Validates URL format and handles form submission.
+ * Provides advanced options for target price and notifications.
+ * @param props - Component props
+ */
 export function AddProductForm({ onSubmit, isLoading }: AddProductFormProps) {
   const [url, setUrl] = useState('');
   const [targetPrice, setTargetPrice] = useState('');

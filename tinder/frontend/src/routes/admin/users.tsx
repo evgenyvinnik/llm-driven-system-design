@@ -1,3 +1,7 @@
+/**
+ * Admin user management route - list and manage platform users.
+ * Provides user listing with ban and delete functionality.
+ */
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../../stores/authStore';
 import { useState, useEffect } from 'react';
@@ -5,6 +9,12 @@ import { adminApi } from '../../services/api';
 import type { User } from '../../types';
 import ReignsAvatar from '../../components/ReignsAvatar';
 
+/**
+ * Admin user management page component.
+ * Displays paginated list of all platform users.
+ * Allows admins to ban or delete non-admin users.
+ * @returns User management page with pagination
+ */
 function AdminUsersPage() {
   const { isAuthenticated, user: currentUser } = useAuthStore();
   const [users, setUsers] = useState<User[]>([]);

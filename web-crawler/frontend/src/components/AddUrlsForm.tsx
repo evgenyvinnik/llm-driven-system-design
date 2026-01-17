@@ -1,17 +1,66 @@
+/**
+ * @fileoverview Form component for adding URLs to the frontier.
+ *
+ * Provides a textarea for entering URLs (one per line) with:
+ * - Priority selection dropdown (High/Medium/Low)
+ * - Submit button with loading state
+ * - Success feedback showing how many URLs were added
+ *
+ * URLs are validated to ensure they start with http/https.
+ * Duplicates and invalid URLs are filtered server-side.
+ *
+ * @module components/AddUrlsForm
+ */
+
 import { useState } from 'react';
 
+/**
+ * Props for the AddUrlsForm component.
+ */
 interface AddUrlsFormProps {
+  /** Callback when URLs are submitted */
   onSubmit: (urls: string[], priority?: number) => Promise<void>;
+  /** Whether the form is in a loading state */
   loading?: boolean;
 }
 
+/**
+ * Form for adding URLs to the crawler frontier.
+ *
+ * Accepts URLs (one per line) and a priority level.
+ * Validates URLs client-side and provides feedback on submission.
+ *
+ * @param props - Component props
+ * @returns React component rendering the form
+ *
+ * @example
+ * ```tsx
+ * <AddUrlsForm
+ *   onSubmit={async (urls, priority) => {
+ *     await frontierService.addUrls(urls, priority);
+ *   }}
+ *   loading={isSubmitting}
+ * />
+ * ```
+ */
 export function AddUrlsForm({ onSubmit, loading }: AddUrlsFormProps) {
+  /** Textarea content (URLs separated by newlines) */
   const [urls, setUrls] = useState('');
+  /** Selected priority level (1=low, 2=medium, 3=high) */
   const [priority, setPriority] = useState(2);
+  /** Result of last submission for feedback */
   const [result, setResult] = useState<{ added: number; total: number } | null>(null);
 
+  /**
+   * Handles form submission.
+   * Parses URLs from textarea, filters invalid ones, and calls onSubmit.
+   *
+   * @param e - Form submit event
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Parse URLs from textarea, filter empty lines and non-HTTP URLs
     const urlList = urls
       .split('\n')
       .map((u) => u.trim())

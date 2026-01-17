@@ -1,6 +1,16 @@
+/**
+ * Floating Reactions Component
+ *
+ * Displays animated emoji reactions floating up the screen.
+ * Creates a visual feedback effect when users send reactions.
+ *
+ * @module components/FloatingReactions
+ */
+
 import { useEffect } from 'react';
 import { useAppStore } from '../stores/appStore';
 
+/** Map of reaction types to their emoji HTML entities */
 const EMOJI_MAP: Record<string, string> = {
   like: '&#128077;',
   love: '&#10084;',
@@ -10,6 +20,12 @@ const EMOJI_MAP: Record<string, string> = {
   angry: '&#128544;',
 };
 
+/**
+ * Renders floating reaction emojis with animation.
+ * Automatically removes reactions after animation completes.
+ *
+ * @returns Floating reactions overlay JSX
+ */
 export function FloatingReactions() {
   const floatingReactions = useAppStore((state) => state.floatingReactions);
   const removeFloatingReaction = useAppStore((state) => state.removeFloatingReaction);

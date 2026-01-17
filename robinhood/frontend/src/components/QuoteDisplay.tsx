@@ -1,12 +1,27 @@
+/**
+ * Quote display components for showing real-time stock prices.
+ * Provides visual feedback (flashing) when prices change.
+ */
+
 import { useEffect, useRef, useState } from 'react';
 import type { Quote } from '../types';
 
+/**
+ * Props for the PriceDisplay component.
+ */
 interface PriceDisplayProps {
   quote: Quote | undefined;
   showChange?: boolean;
   size?: 'sm' | 'md' | 'lg';
 }
 
+/**
+ * Displays a stock price with optional change indicator.
+ * Flashes green/red when price moves up/down.
+ * @param quote - Quote data to display
+ * @param showChange - Whether to show price change (default: true)
+ * @param size - Text size variant (sm, md, lg)
+ */
 export function PriceDisplay({ quote, showChange = true, size = 'md' }: PriceDisplayProps) {
   const [flashClass, setFlashClass] = useState('');
   const prevPriceRef = useRef<number | null>(null);
@@ -55,6 +70,9 @@ export function PriceDisplay({ quote, showChange = true, size = 'md' }: PriceDis
   );
 }
 
+/**
+ * Props for the QuoteCard component.
+ */
 interface QuoteCardProps {
   symbol: string;
   name?: string;
@@ -62,6 +80,14 @@ interface QuoteCardProps {
   onClick?: () => void;
 }
 
+/**
+ * Card component displaying stock symbol, name, price, and change.
+ * Used in stock lists and watchlists.
+ * @param symbol - Stock ticker symbol
+ * @param name - Company name (optional)
+ * @param quote - Quote data to display
+ * @param onClick - Optional click handler
+ */
 export function QuoteCard({ symbol, name, quote, onClick }: QuoteCardProps) {
   const changeColor = (quote?.change ?? 0) >= 0 ? 'text-robinhood-green' : 'text-robinhood-red';
 
@@ -99,10 +125,18 @@ export function QuoteCard({ symbol, name, quote, onClick }: QuoteCardProps) {
   );
 }
 
+/**
+ * Props for the MiniChart component.
+ */
 interface MiniChartProps {
   positive: boolean;
 }
 
+/**
+ * Simple SVG mini chart placeholder.
+ * Shows an upward or downward trend line based on positive prop.
+ * @param positive - Whether to show upward (green) or downward (red) trend
+ */
 export function MiniChart({ positive }: MiniChartProps) {
   // Simple placeholder for a mini chart
   const color = positive ? '#00C805' : '#FF5000';

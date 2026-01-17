@@ -642,6 +642,759 @@ CREATE TABLE query_logs (
 
 ---
 
+## Consistency and Idempotency
+
+### Consistency Model by Component
+
+| Component | Consistency Level | Rationale |
+|-----------|-------------------|-----------|
+| URL Frontier | Eventual | Duplicate URLs acceptable; deduped during crawl |
+| Crawl State (PostgreSQL) | Strong (per-URL) | Uses row-level locks to prevent concurrent crawls of same URL |
+| Document Store | Eventual | Newer crawls overwrite older; content hash prevents duplicates |
+| Inverted Index (Elasticsearch) | Eventual | Near real-time indexing with refresh interval |
+| PageRank | Batch consistent | Computed atomically; swapped in during index rebuild |
+| Query Cache (Redis) | Eventual | Stale reads acceptable; TTL-based invalidation |
+
+### Idempotency Patterns
+
+**URL Crawling**:
+```javascript
+// Each crawl job carries an idempotency key
+const crawlJob = {
+  idempotencyKey: `crawl:${urlHash}:${scheduledAt}`,
+  url: 'https://example.com/page',
+  attempt: 1
+}
+
+async function processCrawlJob(job) {
+  // Check if already processed (Redis SET with NX)
+  const acquired = await redis.set(
+    job.idempotencyKey,
+    'processing',
+    'EX', 3600,  // 1 hour expiry
+    'NX'         // Only set if not exists
+  )
+
+  if (!acquired) {
+    console.log(`Job ${job.idempotencyKey} already processed, skipping`)
+    return
+  }
+
+  try {
+    await crawl(job.url)
+    await redis.set(job.idempotencyKey, 'completed', 'EX', 86400)
+  } catch (error) {
+    await redis.del(job.idempotencyKey)  // Allow retry
+    throw error
+  }
+}
+```
+
+**Document Indexing**:
+```javascript
+// Elasticsearch uses document ID for upsert semantics
+async function indexDocument(doc) {
+  const docId = hashUrl(doc.url)  // Deterministic ID from URL
+
+  await elasticsearch.index({
+    index: 'documents',
+    id: docId,           // Same URL always gets same ID
+    body: doc,
+    refresh: false       // Batch refresh for performance
+  })
+}
+```
+
+**PageRank Updates**:
+```javascript
+// Atomic swap pattern for PageRank updates
+async function updatePageRanks(newRanks) {
+  const batchId = Date.now()
+
+  // Write new ranks to staging table
+  await db.query(`
+    INSERT INTO pagerank_staging (url_hash, rank, batch_id)
+    SELECT url_hash, rank, $1 FROM unnest($2::pagerank_row[])
+  `, [batchId, newRanks])
+
+  // Atomic swap within transaction
+  await db.query(`
+    BEGIN;
+    DELETE FROM pagerank_active;
+    INSERT INTO pagerank_active SELECT url_hash, rank FROM pagerank_staging WHERE batch_id = $1;
+    DELETE FROM pagerank_staging WHERE batch_id < $1;
+    COMMIT;
+  `, [batchId])
+}
+```
+
+### Conflict Resolution
+
+| Scenario | Resolution Strategy |
+|----------|---------------------|
+| Concurrent crawls of same URL | First-writer-wins via Redis lock |
+| Duplicate content from different URLs | Canonical URL detection; keep highest PageRank |
+| Stale index entries | Periodic index rebuild from document store |
+| Query cache vs fresh results | TTL expiry (5 min for trending, 1 hour standard) |
+
+---
+
+## Observability
+
+### Metrics (Prometheus)
+
+**Crawl System Metrics**:
+```yaml
+# prometheus/crawl_metrics.yml
+- name: crawl_urls_fetched_total
+  type: counter
+  help: Total URLs fetched by crawler
+  labels: [status_code, content_type]
+
+- name: crawl_latency_seconds
+  type: histogram
+  help: Time to fetch and process a URL
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30]
+
+- name: crawl_frontier_size
+  type: gauge
+  help: Number of URLs waiting in frontier
+
+- name: crawl_robots_cache_hits_total
+  type: counter
+  help: robots.txt cache hit/miss ratio
+  labels: [cache_result]
+
+- name: crawl_errors_total
+  type: counter
+  help: Crawl failures by error type
+  labels: [error_type]  # timeout, dns_failure, http_error, parse_error
+```
+
+**Index System Metrics**:
+```yaml
+- name: index_documents_total
+  type: counter
+  help: Documents indexed
+
+- name: index_bulk_latency_seconds
+  type: histogram
+  help: Time for bulk index operations
+  buckets: [0.5, 1, 2, 5, 10, 30]
+
+- name: elasticsearch_index_size_bytes
+  type: gauge
+  help: Size of Elasticsearch index
+
+- name: pagerank_computation_seconds
+  type: gauge
+  help: Time for last PageRank computation
+```
+
+**Query System Metrics**:
+```yaml
+- name: query_latency_seconds
+  type: histogram
+  help: End-to-end query latency
+  buckets: [0.05, 0.1, 0.2, 0.5, 1, 2]
+
+- name: query_cache_hit_ratio
+  type: gauge
+  help: Percentage of queries served from cache
+
+- name: query_results_count
+  type: histogram
+  help: Number of results returned per query
+  buckets: [0, 1, 5, 10, 50, 100, 1000]
+
+- name: query_error_rate
+  type: gauge
+  help: Percentage of queries returning errors
+```
+
+### Structured Logging
+
+```javascript
+// Structured log format for all components
+const logger = {
+  info: (event, data) => console.log(JSON.stringify({
+    level: 'info',
+    timestamp: new Date().toISOString(),
+    service: process.env.SERVICE_NAME,
+    event,
+    ...data
+  })),
+
+  error: (event, error, data) => console.log(JSON.stringify({
+    level: 'error',
+    timestamp: new Date().toISOString(),
+    service: process.env.SERVICE_NAME,
+    event,
+    error: { message: error.message, stack: error.stack },
+    ...data
+  }))
+}
+
+// Crawl logging
+logger.info('crawl_complete', {
+  url: 'https://example.com',
+  statusCode: 200,
+  contentLength: 45000,
+  parseTimeMs: 45,
+  linksExtracted: 23,
+  traceId: request.traceId
+})
+
+// Query logging
+logger.info('query_executed', {
+  query: 'javascript tutorial',
+  resultCount: 1500,
+  latencyMs: 85,
+  cacheHit: false,
+  userId: 'anonymous',
+  traceId: request.traceId
+})
+```
+
+### Distributed Tracing
+
+```javascript
+// OpenTelemetry trace context propagation
+const { trace, context, propagation } = require('@opentelemetry/api')
+
+async function handleSearch(req, res) {
+  const tracer = trace.getTracer('search-service')
+
+  return tracer.startActiveSpan('search_query', async (span) => {
+    span.setAttribute('query.text', req.query.q)
+    span.setAttribute('query.page', req.query.page || 1)
+
+    try {
+      // Parse query (child span)
+      const parsed = await tracer.startActiveSpan('parse_query', async (parseSpan) => {
+        const result = queryProcessor.parse(req.query.q)
+        parseSpan.setAttribute('query.terms_count', result.terms.length)
+        parseSpan.end()
+        return result
+      })
+
+      // Search index (child span)
+      const results = await tracer.startActiveSpan('search_index', async (searchSpan) => {
+        const result = await elasticsearch.search(parsed)
+        searchSpan.setAttribute('results.count', result.hits.total)
+        searchSpan.end()
+        return result
+      })
+
+      // Rank results (child span)
+      const ranked = await tracer.startActiveSpan('rank_results', async (rankSpan) => {
+        const result = await ranker.rank(results, parsed)
+        rankSpan.end()
+        return result
+      })
+
+      span.setStatus({ code: 0 })
+      return ranked
+    } catch (error) {
+      span.setStatus({ code: 2, message: error.message })
+      span.recordException(error)
+      throw error
+    } finally {
+      span.end()
+    }
+  })
+}
+```
+
+### SLI Dashboard (Grafana)
+
+**Key Panels for Local Development**:
+
+```yaml
+# grafana/dashboards/search-sli.json
+panels:
+  - title: "Query Latency (p50/p95/p99)"
+    type: graph
+    targets:
+      - expr: histogram_quantile(0.50, rate(query_latency_seconds_bucket[5m]))
+      - expr: histogram_quantile(0.95, rate(query_latency_seconds_bucket[5m]))
+      - expr: histogram_quantile(0.99, rate(query_latency_seconds_bucket[5m]))
+    thresholds:
+      - value: 0.2
+        color: green
+      - value: 0.5
+        color: yellow
+      - value: 1.0
+        color: red
+
+  - title: "Crawl Rate (URLs/min)"
+    type: stat
+    targets:
+      - expr: rate(crawl_urls_fetched_total[5m]) * 60
+
+  - title: "Index Freshness (avg age)"
+    type: gauge
+    targets:
+      - expr: avg(time() - document_last_indexed_timestamp)
+
+  - title: "Error Rate by Component"
+    type: bargauge
+    targets:
+      - expr: rate(crawl_errors_total[5m])
+      - expr: rate(index_errors_total[5m])
+      - expr: rate(query_errors_total[5m])
+```
+
+### Alert Thresholds
+
+```yaml
+# prometheus/alerts.yml
+groups:
+  - name: search-alerts
+    rules:
+      - alert: HighQueryLatency
+        expr: histogram_quantile(0.95, rate(query_latency_seconds_bucket[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query latency p95 exceeds 500ms"
+
+      - alert: CrawlFrontierBacklog
+        expr: crawl_frontier_size > 100000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Crawl frontier has large backlog"
+
+      - alert: ElasticsearchClusterRed
+        expr: elasticsearch_cluster_health_status{color="red"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elasticsearch cluster is red"
+
+      - alert: QueryCacheHitRateLow
+        expr: query_cache_hit_ratio < 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query cache hit rate below 30%"
+
+      - alert: CrawlErrorRateHigh
+        expr: rate(crawl_errors_total[5m]) / rate(crawl_urls_fetched_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Crawl error rate exceeds 10%"
+```
+
+### Audit Logging
+
+```javascript
+// Audit log for admin operations and data access
+const auditLogger = {
+  log: async (action, details) => {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      action,
+      actor: details.actor || 'system',
+      resource: details.resource,
+      resourceId: details.resourceId,
+      outcome: details.outcome,  // success, failure, denied
+      metadata: details.metadata,
+      ipAddress: details.ipAddress,
+      traceId: details.traceId
+    }
+
+    // Write to dedicated audit table (immutable, append-only)
+    await db.query(`
+      INSERT INTO audit_log (timestamp, action, actor, resource, resource_id, outcome, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [entry.timestamp, action, entry.actor, entry.resource, entry.resourceId, entry.outcome, entry.metadata])
+
+    // Also log to stdout for centralized collection
+    console.log(JSON.stringify({ type: 'audit', ...entry }))
+  }
+}
+
+// Usage examples
+await auditLogger.log('index_rebuild', {
+  actor: 'admin@example.com',
+  resource: 'elasticsearch_index',
+  resourceId: 'documents_v2',
+  outcome: 'success',
+  metadata: { documentCount: 150000, durationSeconds: 3600 }
+})
+
+await auditLogger.log('crawl_config_change', {
+  actor: 'admin@example.com',
+  resource: 'crawl_config',
+  outcome: 'success',
+  metadata: { field: 'politeness_delay', oldValue: 1000, newValue: 500 }
+})
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency
+
+```javascript
+// Exponential backoff with jitter and idempotency
+class RetryHandler {
+  constructor(options = {}) {
+    this.maxRetries = options.maxRetries || 3
+    this.baseDelayMs = options.baseDelayMs || 1000
+    this.maxDelayMs = options.maxDelayMs || 30000
+  }
+
+  async execute(operation, idempotencyKey) {
+    let lastError
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        // Check if already completed (idempotent)
+        const cached = await redis.get(`result:${idempotencyKey}`)
+        if (cached) {
+          return JSON.parse(cached)
+        }
+
+        const result = await operation()
+
+        // Cache successful result
+        await redis.set(
+          `result:${idempotencyKey}`,
+          JSON.stringify(result),
+          'EX', 3600
+        )
+
+        return result
+      } catch (error) {
+        lastError = error
+
+        // Don't retry non-retryable errors
+        if (this.isNonRetryable(error)) {
+          throw error
+        }
+
+        if (attempt < this.maxRetries) {
+          const delay = this.calculateDelay(attempt)
+          console.log(`Retry ${attempt}/${this.maxRetries} after ${delay}ms: ${error.message}`)
+          await this.sleep(delay)
+        }
+      }
+    }
+
+    throw lastError
+  }
+
+  calculateDelay(attempt) {
+    // Exponential backoff with jitter
+    const exponentialDelay = this.baseDelayMs * Math.pow(2, attempt - 1)
+    const jitter = Math.random() * 0.3 * exponentialDelay
+    return Math.min(exponentialDelay + jitter, this.maxDelayMs)
+  }
+
+  isNonRetryable(error) {
+    // Don't retry client errors or validation failures
+    return error.statusCode >= 400 && error.statusCode < 500
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+
+// Usage in crawler
+const retryHandler = new RetryHandler({ maxRetries: 3 })
+
+async function fetchWithRetry(url) {
+  const idempotencyKey = `fetch:${hashUrl(url)}:${Date.now()}`
+
+  return retryHandler.execute(
+    () => fetch(url, { timeout: 10000 }),
+    idempotencyKey
+  )
+}
+```
+
+### Circuit Breaker
+
+```javascript
+// Circuit breaker for external dependencies
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeoutMs = options.resetTimeoutMs || 30000
+    this.halfOpenMaxAttempts = options.halfOpenMaxAttempts || 3
+
+    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
+    this.failureCount = 0
+    this.lastFailureTime = null
+    this.halfOpenAttempts = 0
+  }
+
+  async execute(operation, fallback = null) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
+        this.state = 'HALF_OPEN'
+        this.halfOpenAttempts = 0
+      } else {
+        if (fallback) return fallback()
+        throw new Error('Circuit breaker is OPEN')
+      }
+    }
+
+    try {
+      const result = await operation()
+
+      if (this.state === 'HALF_OPEN') {
+        this.halfOpenAttempts++
+        if (this.halfOpenAttempts >= this.halfOpenMaxAttempts) {
+          this.reset()
+        }
+      }
+
+      return result
+    } catch (error) {
+      this.recordFailure()
+      throw error
+    }
+  }
+
+  recordFailure() {
+    this.failureCount++
+    this.lastFailureTime = Date.now()
+
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'OPEN'
+      console.log('Circuit breaker opened')
+    }
+  }
+
+  reset() {
+    this.state = 'CLOSED'
+    this.failureCount = 0
+    this.halfOpenAttempts = 0
+    console.log('Circuit breaker reset to CLOSED')
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime
+    }
+  }
+}
+
+// Circuit breakers for each external service
+const circuitBreakers = {
+  elasticsearch: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 10000 }),
+  postgres: new CircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30000 }),
+  redis: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 5000 })
+}
+
+// Usage in query handler
+async function searchWithCircuitBreaker(query) {
+  return circuitBreakers.elasticsearch.execute(
+    () => elasticsearch.search(query),
+    () => ({ hits: { total: 0, hits: [] }, fallback: true })  // Graceful degradation
+  )
+}
+```
+
+### Local Development DR Simulation
+
+```yaml
+# docker-compose.dr-test.yml
+# Simulate failures for disaster recovery testing
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    deploy:
+      replicas: 2  # Run 2 nodes for failover testing
+
+  postgres-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: search_primary
+
+  postgres-replica:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: search_replica
+    depends_on:
+      - postgres-primary
+
+  # Chaos testing container
+  chaos:
+    image: alexei-led/pumba
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      --random
+      --interval 30s
+      pause --duration 10s
+      re2:.*elasticsearch.*
+```
+
+**DR Test Scripts**:
+
+```bash
+#!/bin/bash
+# scripts/dr-test.sh - Test disaster recovery scenarios
+
+echo "=== DR Test Suite ==="
+
+echo "1. Testing Elasticsearch node failure..."
+docker stop google-search-elasticsearch-1
+sleep 5
+# Verify queries still work via remaining node
+curl -s "http://localhost:3000/search?q=test" | jq '.error // "OK"'
+docker start google-search-elasticsearch-1
+
+echo "2. Testing Redis failure (cache miss fallback)..."
+docker stop google-search-redis-1
+curl -s "http://localhost:3000/search?q=test" | jq '.cacheHit'  # Should be false
+docker start google-search-redis-1
+
+echo "3. Testing PostgreSQL failover..."
+docker stop google-search-postgres-primary-1
+# Verify crawler handles DB unavailability gracefully
+curl -s "http://localhost:3001/health" | jq '.database'
+docker start google-search-postgres-primary-1
+
+echo "=== DR Tests Complete ==="
+```
+
+### Backup and Restore
+
+**PostgreSQL Backup**:
+
+```bash
+#!/bin/bash
+# scripts/backup-postgres.sh
+
+BACKUP_DIR="./backups/postgres"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BACKUP_DIR}/search_${TIMESTAMP}.sql.gz"
+
+mkdir -p $BACKUP_DIR
+
+# Create compressed backup
+docker exec google-search-postgres-1 \
+  pg_dump -U postgres search_db | gzip > $BACKUP_FILE
+
+echo "Backup created: $BACKUP_FILE"
+
+# Keep only last 7 daily backups (for local dev)
+find $BACKUP_DIR -name "*.sql.gz" -mtime +7 -delete
+```
+
+**Elasticsearch Snapshot**:
+
+```bash
+#!/bin/bash
+# scripts/backup-elasticsearch.sh
+
+BACKUP_DIR="./backups/elasticsearch"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Register snapshot repository (first time only)
+curl -X PUT "localhost:9200/_snapshot/local_backup" -H 'Content-Type: application/json' -d'
+{
+  "type": "fs",
+  "settings": {
+    "location": "/usr/share/elasticsearch/backup"
+  }
+}'
+
+# Create snapshot
+curl -X PUT "localhost:9200/_snapshot/local_backup/snapshot_${TIMESTAMP}?wait_for_completion=true"
+
+echo "Elasticsearch snapshot created: snapshot_${TIMESTAMP}"
+
+# List snapshots
+curl -s "localhost:9200/_snapshot/local_backup/_all" | jq '.snapshots | length'
+```
+
+**Restore Procedures**:
+
+```bash
+#!/bin/bash
+# scripts/restore-postgres.sh
+
+BACKUP_FILE=$1
+if [ -z "$BACKUP_FILE" ]; then
+  echo "Usage: ./restore-postgres.sh <backup_file.sql.gz>"
+  exit 1
+fi
+
+echo "Restoring from $BACKUP_FILE..."
+
+# Drop and recreate database
+docker exec -i google-search-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS search_db;"
+docker exec -i google-search-postgres-1 psql -U postgres -c "CREATE DATABASE search_db;"
+
+# Restore from backup
+gunzip -c $BACKUP_FILE | docker exec -i google-search-postgres-1 psql -U postgres search_db
+
+echo "Restore complete. Verify with: docker exec google-search-postgres-1 psql -U postgres -d search_db -c 'SELECT COUNT(*) FROM urls;'"
+```
+
+```bash
+#!/bin/bash
+# scripts/restore-elasticsearch.sh
+
+SNAPSHOT_NAME=$1
+if [ -z "$SNAPSHOT_NAME" ]; then
+  echo "Usage: ./restore-elasticsearch.sh <snapshot_name>"
+  echo "Available snapshots:"
+  curl -s "localhost:9200/_snapshot/local_backup/_all" | jq '.snapshots[].snapshot'
+  exit 1
+fi
+
+echo "Restoring from snapshot $SNAPSHOT_NAME..."
+
+# Close indices before restore
+curl -X POST "localhost:9200/documents/_close"
+
+# Restore snapshot
+curl -X POST "localhost:9200/_snapshot/local_backup/${SNAPSHOT_NAME}/_restore?wait_for_completion=true"
+
+# Reopen indices
+curl -X POST "localhost:9200/documents/_open"
+
+echo "Restore complete."
+```
+
+**Backup Testing Schedule**:
+
+```yaml
+# For local dev: Run backup tests weekly
+backup_test_checklist:
+  - Create fresh backup of PostgreSQL and Elasticsearch
+  - Spin up separate Docker containers for restore testing
+  - Restore backups to test containers
+  - Run validation queries:
+      - SELECT COUNT(*) FROM urls
+      - SELECT COUNT(*) FROM documents
+      - curl localhost:9201/_cat/indices
+  - Verify crawl state can resume from restored data
+  - Document any issues in project claude.md
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -650,3 +1403,7 @@ CREATE TABLE query_logs (
 | Ranking | Multi-phase | Single phase | Latency |
 | Freshness | Crawl priority | Real-time | Cost, scale |
 | PageRank | Batch | Incremental | Simplicity |
+| Consistency | Eventual (reads) | Strong | Performance; stale acceptable |
+| Idempotency | Redis locks + content hash | DB transactions | Speed; acceptable for crawl dedup |
+| Circuit breakers | Per-service | Global | Granular failure isolation |
+| Backups | Daily local snapshots | Continuous replication | Simpler for learning project |

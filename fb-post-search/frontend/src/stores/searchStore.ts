@@ -1,7 +1,15 @@
+/**
+ * @fileoverview Search state management using Zustand.
+ * Manages search queries, results, filters, suggestions, and pagination.
+ */
+
 import { create } from 'zustand';
 import { api } from '../services/api';
 import type { SearchResult, SearchFilters, SearchSuggestion } from '../types';
 
+/**
+ * Search store state and actions.
+ */
 interface SearchState {
   query: string;
   filters: SearchFilters;
@@ -27,6 +35,11 @@ interface SearchState {
   clearSuggestions: () => void;
 }
 
+/**
+ * Zustand store for search state.
+ * Handles search execution, pagination, typeahead suggestions,
+ * trending queries, and recent search history.
+ */
 export const useSearchStore = create<SearchState>((set, get) => ({
   query: '',
   filters: {},

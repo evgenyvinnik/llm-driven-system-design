@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Main entry point for the Notion-like backend server.
+ * Sets up Express with CORS, cookie parsing, and REST API routes.
+ * Attaches WebSocket server for real-time collaboration features.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';

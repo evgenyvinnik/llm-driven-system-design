@@ -1,3 +1,10 @@
+/**
+ * @fileoverview Single dashboard view page.
+ *
+ * Displays a dashboard with all its panels in a grid layout.
+ * Provides time range selection and manual refresh controls.
+ */
+
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import type { Dashboard, TimeRange } from '../types';
@@ -5,10 +12,25 @@ import { getDashboard } from '../services/api';
 import { DashboardGrid } from '../components/DashboardGrid';
 import { TimeRangeSelector } from '../components/TimeRangeSelector';
 
+/**
+ * Route configuration for the dashboard view page.
+ * Accepts a dashboardId parameter in the URL.
+ */
 export const Route = createFileRoute('/dashboard/$dashboardId')({
   component: DashboardViewPage,
 });
 
+/**
+ * Dashboard view page component.
+ *
+ * Features:
+ * - Loads and displays a single dashboard by ID
+ * - Time range selector for adjusting panel query windows
+ * - Manual refresh button with timestamp display
+ * - Back navigation to dashboard list
+ *
+ * @returns The rendered dashboard view page
+ */
 function DashboardViewPage() {
   const { dashboardId } = Route.useParams();
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);

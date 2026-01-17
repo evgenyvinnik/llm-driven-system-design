@@ -1,3 +1,7 @@
+/**
+ * User account information.
+ * Represents both hosts and admin users in the system.
+ */
 export interface User {
   id: string;
   email: string;
@@ -8,6 +12,10 @@ export interface User {
   updated_at: string;
 }
 
+/**
+ * Meeting type (event type) configuration.
+ * Defines scheduling options that hosts offer to invitees.
+ */
 export interface MeetingType {
   id: string;
   user_id: string;
@@ -28,6 +36,10 @@ export interface MeetingType {
   user_timezone?: string;
 }
 
+/**
+ * Weekly recurring availability rule.
+ * Defines when a host is available for meetings.
+ */
 export interface AvailabilityRule {
   id: string;
   user_id: string;
@@ -38,6 +50,10 @@ export interface AvailabilityRule {
   created_at: string;
 }
 
+/**
+ * Scheduled meeting between host and invitee.
+ * Includes status tracking and optional notes.
+ */
 export interface Booking {
   id: string;
   meeting_type_id: string;
@@ -60,11 +76,19 @@ export interface Booking {
   host_email?: string;
 }
 
+/**
+ * Available time slot for booking.
+ * Times are in ISO 8601 format.
+ */
 export interface TimeSlot {
   start: string;
   end: string;
 }
 
+/**
+ * Dashboard statistics for a host.
+ * Aggregated booking counts for display.
+ */
 export interface DashboardStats {
   total_bookings: number;
   upcoming_bookings: number;
@@ -73,6 +97,11 @@ export interface DashboardStats {
   bookings_this_month: number;
 }
 
+/**
+ * Standard API response wrapper.
+ * All API endpoints return this structure for consistent error handling.
+ * @template T - The type of data returned on success
+ */
 export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;

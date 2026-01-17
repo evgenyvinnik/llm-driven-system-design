@@ -1,7 +1,14 @@
+/**
+ * Stocks browse page route (/stocks).
+ * Displays searchable list of all available stocks.
+ * Requires authentication.
+ */
+
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { StockSearch } from '../components/Watchlist';
 import { useAuthStore } from '../stores/authStore';
 
+/** Route definition with auth guard */
 export const Route = createFileRoute('/stocks')({
   beforeLoad: () => {
     const { isAuthenticated } = useAuthStore.getState();
@@ -12,6 +19,10 @@ export const Route = createFileRoute('/stocks')({
   component: StocksPage,
 });
 
+/**
+ * Stocks browse page component.
+ * Shows searchable grid of all available stocks.
+ */
 function StocksPage() {
   return (
     <div className="container mx-auto px-4 py-8">

@@ -1,17 +1,38 @@
+/**
+ * @fileoverview Kanban board view for database visualization.
+ * Groups rows by a select property and displays them as cards in columns.
+ */
+
 import { useState } from 'react';
 import type { DatabaseRow, PropertySchema, PropertyOption } from '@/types';
 import { Plus } from 'lucide-react';
 import PropertyCell from './PropertyCell';
 
+/**
+ * Props for the BoardView component.
+ */
 interface BoardViewProps {
+  /** Database rows to display */
   rows: DatabaseRow[];
+  /** Column definitions from the database schema */
   schema: PropertySchema[];
+  /** Property ID to group by (must be a select type) */
   groupBy: string;
+  /** Callback to add a new row */
   onAddRow: () => void;
+  /** Callback to update a row's properties */
   onUpdateRow: (rowId: string, properties: Record<string, unknown>) => void;
+  /** Callback to delete a row */
   onDeleteRow: (rowId: string) => void;
 }
 
+/**
+ * BoardView displays database rows in a Kanban-style board.
+ * Rows are grouped into columns based on a select property value.
+ *
+ * @param props - Component props
+ * @returns The rendered board view
+ */
 export default function BoardView({
   rows,
   schema,
@@ -99,17 +120,31 @@ export default function BoardView({
   );
 }
 
+/**
+ * Props for a single column in the board view.
+ */
 interface BoardColumnProps {
+  /** Column title (option name) */
   title: string;
+  /** Column color for styling */
   color: string;
+  /** Rows belonging to this column */
   rows: DatabaseRow[];
+  /** Property ID for the title field */
   titlePropertyId: string;
+  /** Full schema for accessing property metadata */
   schema: PropertySchema[];
+  /** Callback to update a row */
   onUpdateRow: (rowId: string, properties: Record<string, unknown>) => void;
+  /** Callback to delete a row */
   onDeleteRow: (rowId: string) => void;
+  /** Callback to add a row to this column */
   onAddRow: () => void;
 }
 
+/**
+ * BoardColumn renders a single column in the Kanban board.
+ */
 function BoardColumn({
   title,
   color,
@@ -162,14 +197,25 @@ function BoardColumn({
   );
 }
 
+/**
+ * Props for a single card in the board view.
+ */
 interface BoardCardProps {
+  /** The database row data */
   row: DatabaseRow;
+  /** Property ID for the title field */
   titlePropertyId: string;
+  /** Full schema for accessing property metadata */
   schema: PropertySchema[];
+  /** Callback to update the row */
   onUpdate: (properties: Record<string, unknown>) => void;
+  /** Callback to delete the row */
   onDelete: () => void;
 }
 
+/**
+ * BoardCard renders a single card representing a database row.
+ */
 function BoardCard({ row, titlePropertyId, schema, onUpdate, onDelete }: BoardCardProps) {
   const title = row.properties[titlePropertyId] as string || 'Untitled';
 

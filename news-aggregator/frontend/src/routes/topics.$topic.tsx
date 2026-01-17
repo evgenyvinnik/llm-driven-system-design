@@ -1,9 +1,19 @@
+/**
+ * Topic-specific feed page route.
+ * Displays stories filtered by a single topic with pagination.
+ * @module routes/topics.$topic
+ */
+
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { feedApi } from '../services/api';
 import { StoryList } from '../components';
 import { ArrowLeft, Tag } from 'lucide-react';
 import { useState } from 'react';
 
+/**
+ * Topic page route configuration.
+ * Loads stories for the specified topic from URL parameter.
+ */
 export const Route = createFileRoute('/topics/$topic')({
   loader: async ({ params }) => {
     const response = await feedApi.getTopicFeed(params.topic);
@@ -15,6 +25,11 @@ export const Route = createFileRoute('/topics/$topic')({
   component: TopicPage,
 });
 
+/**
+ * Topic page component.
+ * Shows stories for a specific topic with infinite scroll pagination.
+ * @returns Topic feed page with story list and load more button
+ */
 function TopicPage() {
   const { topic, initialFeed } = Route.useLoaderData();
   const [stories, setStories] = useState(initialFeed.stories);
@@ -22,6 +37,10 @@ function TopicPage() {
   const [hasMore, setHasMore] = useState(initialFeed.has_more);
   const [isLoading, setIsLoading] = useState(false);
 
+  /**
+   * Load more stories for the current topic.
+   * Appends next page of results to the existing list.
+   */
   const loadMore = async () => {
     if (isLoading || !hasMore || !cursor) return;
 

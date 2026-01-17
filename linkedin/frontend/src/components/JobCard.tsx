@@ -1,13 +1,32 @@
+/**
+ * Job card component for displaying job listings.
+ * Shows job title, company, location, salary, and match score.
+ * Used in job search results and recommendations.
+ *
+ * @module components/JobCard
+ */
 import { Link } from '@tanstack/react-router';
 import type { Job } from '../types';
 import { MapPin, Clock, Building2, DollarSign } from 'lucide-react';
 
+/**
+ * Props for the JobCard component.
+ */
 interface JobCardProps {
   job: Job;
   showMatchScore?: boolean;
   matchScore?: number;
 }
 
+/**
+ * Displays a job listing with company info and key details.
+ * Links to the full job detail page when clicked.
+ * Optionally shows a color-coded match score percentage.
+ *
+ * @param job - The job data to display
+ * @param showMatchScore - Whether to show the match score badge
+ * @param matchScore - Match score percentage (0-100)
+ */
 export function JobCard({ job, showMatchScore, matchScore }: JobCardProps) {
   const formatSalary = (min?: number, max?: number) => {
     if (!min && !max) return null;

@@ -5,6 +5,17 @@ import { contentApi } from '../services/api';
 import type { Content } from '../types';
 import { Play } from 'lucide-react';
 
+/**
+ * TV Shows catalog page displaying all available series.
+ * Shows a grid of series thumbnails with hover effects and metadata.
+ *
+ * Features:
+ * - Responsive grid layout (2-5 columns based on viewport)
+ * - Thumbnail with hover zoom and play overlay
+ * - Featured badge for promoted content
+ * - Genre and rating display
+ * - Links to content detail page
+ */
 function ShowsPage() {
   const [shows, setShows] = useState<Content[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -77,6 +88,10 @@ function ShowsPage() {
   );
 }
 
+/**
+ * Route configuration for shows page (/shows).
+ * Displays the full TV series catalog for browsing.
+ */
 export const Route = createFileRoute('/shows')({
   component: ShowsPage,
 });

@@ -1,3 +1,10 @@
+/**
+ * Admin routes for system management and monitoring.
+ * All routes require both authentication and admin role.
+ * Provides system stats, user management, and maintenance operations.
+ * @module routes/admin
+ */
+
 import { Router, Response } from 'express';
 import { authMiddleware, adminMiddleware, AuthRequest } from '../middleware/auth.js';
 import { getAllUsers, updateUserQuota, deleteUser } from '../services/authService.js';
@@ -5,11 +12,14 @@ import { query, queryOne } from '../utils/database.js';
 
 const router = Router();
 
-// Apply auth and admin middleware to all routes
+// Require authentication and admin role for all admin routes
 router.use(authMiddleware);
 router.use(adminMiddleware);
 
-// Get system stats
+/**
+ * GET /api/admin/stats - Get system-wide statistics.
+ * Returns user counts, storage metrics, and deduplication efficiency.
+ */
 router.get('/stats', async (req: AuthRequest, res: Response) => {
   try {
     const [userCount] = await query<{ count: string }>('SELECT COUNT(*) as count FROM users');
@@ -44,7 +54,9 @@ router.get('/stats', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get all users
+/**
+ * GET /api/admin/users - Get all registered users.
+ */
 router.get('/users', async (req: AuthRequest, res: Response) => {
   try {
     const users = await getAllUsers();
@@ -55,7 +67,9 @@ router.get('/users', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get user details with file stats
+/**
+ * GET /api/admin/users/:userId - Get detailed user info with file stats.
+ */
 router.get('/users/:userId', async (req: AuthRequest, res: Response) => {
   try {
     const [user] = await query(
@@ -89,7 +103,10 @@ router.get('/users/:userId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Update user quota
+/**
+ * PATCH /api/admin/users/:userId/quota - Update a user's storage quota.
+ * Body: { quotaBytes: number }
+ */
 router.patch('/users/:userId/quota', async (req: AuthRequest, res: Response) => {
   try {
     const { quotaBytes } = req.body;
@@ -107,7 +124,10 @@ router.patch('/users/:userId/quota', async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Delete user
+/**
+ * DELETE /api/admin/users/:userId - Delete a user account.
+ * Prevents self-deletion. Cascade deletes files and sessions.
+ */
 router.delete('/users/:userId', async (req: AuthRequest, res: Response) => {
   try {
     // Prevent self-deletion
@@ -124,7 +144,10 @@ router.delete('/users/:userId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get recent activity
+/**
+ * GET /api/admin/activity - Get recent file activity across all users.
+ * Query: limit (default 50)
+ */
 router.get('/activity', async (req: AuthRequest, res: Response) => {
   try {
     const limit = parseInt(req.query.limit as string, 10) || 50;
@@ -153,7 +176,9 @@ router.get('/activity', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get storage breakdown by file type
+/**
+ * GET /api/admin/storage/breakdown - Get storage usage by file type category.
+ */
 router.get('/storage/breakdown', async (req: AuthRequest, res: Response) => {
   try {
     const breakdown = await query(
@@ -184,7 +209,10 @@ router.get('/storage/breakdown', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Cleanup orphaned chunks (maintenance)
+/**
+ * POST /api/admin/maintenance/cleanup - Remove orphaned chunks from storage.
+ * Deletes chunks with reference_count <= 0 from both database and object storage.
+ */
 router.post('/maintenance/cleanup', async (req: AuthRequest, res: Response) => {
   try {
     // Find and delete orphaned chunks (reference_count = 0)

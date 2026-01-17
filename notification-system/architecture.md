@@ -716,6 +716,508 @@ CREATE TABLE notification_templates (
 
 ---
 
+## Authentication and Authorization
+
+### Session-Based Authentication
+
+For local development, we use Redis-backed sessions with Express middleware:
+
+```javascript
+// Session configuration
+const sessionConfig = {
+  store: new RedisStore({ client: redisClient }),
+  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}
+
+app.use(session(sessionConfig))
+```
+
+### Role-Based Access Control (RBAC)
+
+**User Roles:**
+| Role | Description | Permissions |
+|------|-------------|-------------|
+| `user` | End user | Send notifications to self, manage own preferences, view own delivery status |
+| `service` | Internal service | Send notifications to any user, access bulk endpoints, view aggregate stats |
+| `admin` | System admin | All service permissions plus: manage templates, configure rate limits, access all user data |
+
+**Permission Boundaries:**
+
+```javascript
+// Middleware for role checking
+const requireRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.session?.user) {
+      return res.status(401).json({ error: 'Authentication required' })
+    }
+
+    if (!allowedRoles.includes(req.session.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' })
+    }
+
+    next()
+  }
+}
+
+// Route protection examples
+app.post('/api/v1/notifications', requireRole('user', 'service', 'admin'), sendNotification)
+app.post('/api/v1/notifications/bulk', requireRole('service', 'admin'), sendBulkNotifications)
+app.get('/api/v1/admin/templates', requireRole('admin'), listTemplates)
+app.put('/api/v1/admin/rate-limits', requireRole('admin'), updateRateLimits)
+```
+
+### API Endpoint Authorization Matrix
+
+| Endpoint | User | Service | Admin | Description |
+|----------|------|---------|-------|-------------|
+| `POST /notifications` | Own only | Any user | Any user | Send notification |
+| `GET /notifications/:id` | Own only | Any | Any | Get notification status |
+| `GET /preferences` | Own only | - | Any user | Get preferences |
+| `PUT /preferences` | Own only | - | Any user | Update preferences |
+| `GET /admin/stats` | - | Read-only | Full | Delivery statistics |
+| `POST /admin/templates` | - | - | Full | Manage templates |
+| `PUT /admin/rate-limits` | - | - | Full | Configure limits |
+
+### Rate Limit Configuration by Role
+
+```javascript
+const rateLimitsByRole = {
+  user: {
+    push: { count: 50, window: 3600 },   // 50/hour
+    email: { count: 10, window: 3600 },  // 10/hour
+    sms: { count: 5, window: 3600 }      // 5/hour
+  },
+  service: {
+    push: { count: 10000, window: 60 },  // 10k/minute
+    email: { count: 1000, window: 60 },  // 1k/minute
+    sms: { count: 100, window: 60 }      // 100/minute
+  },
+  admin: {
+    // No rate limits for admin (use global limits only)
+    push: { count: Infinity, window: 60 },
+    email: { count: Infinity, window: 60 },
+    sms: { count: Infinity, window: 60 }
+  }
+}
+```
+
+---
+
+## Failure Handling and Reliability
+
+### Idempotency Keys
+
+All notification sends use client-provided idempotency keys to prevent duplicate deliveries:
+
+```javascript
+class NotificationService {
+  async sendNotification(request, idempotencyKey) {
+    // Check for existing notification with this key
+    const existing = await redis.get(`idempotency:${idempotencyKey}`)
+    if (existing) {
+      return JSON.parse(existing) // Return cached response
+    }
+
+    // Process notification
+    const result = await this.processNotification(request)
+
+    // Cache result for 24 hours
+    await redis.setex(
+      `idempotency:${idempotencyKey}`,
+      86400,
+      JSON.stringify(result)
+    )
+
+    return result
+  }
+}
+```
+
+**Idempotency Key Format:**
+```
+# Client-generated keys (recommended)
+{service-name}:{entity-id}:{action}:{timestamp}
+# Example: order-service:order-12345:confirmation:1704067200
+```
+
+### Retry Strategy with Exponential Backoff
+
+```javascript
+class RetryHandler {
+  constructor() {
+    this.maxRetries = 5
+    this.baseDelay = 1000 // 1 second
+    this.maxDelay = 300000 // 5 minutes
+  }
+
+  async executeWithRetry(operation, context) {
+    let lastError
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await operation()
+      } catch (error) {
+        lastError = error
+
+        if (!this.isRetryable(error) || attempt === this.maxRetries) {
+          await this.sendToDeadLetter(context, error)
+          throw error
+        }
+
+        const delay = this.calculateDelay(attempt)
+        console.log(`Retry ${attempt + 1}/${this.maxRetries} in ${delay}ms`)
+        await this.sleep(delay)
+      }
+    }
+
+    throw lastError
+  }
+
+  calculateDelay(attempt) {
+    // Exponential backoff with jitter
+    const exponentialDelay = this.baseDelay * Math.pow(2, attempt)
+    const jitter = Math.random() * 1000
+    return Math.min(exponentialDelay + jitter, this.maxDelay)
+  }
+
+  isRetryable(error) {
+    // Retry on transient errors only
+    const retryableCodes = [429, 500, 502, 503, 504]
+    return retryableCodes.includes(error.statusCode) ||
+           error.code === 'ECONNRESET' ||
+           error.code === 'ETIMEDOUT'
+  }
+}
+```
+
+**Retry Schedule:**
+| Attempt | Delay | Cumulative Time |
+|---------|-------|-----------------|
+| 1 | ~1s | ~1s |
+| 2 | ~2s | ~3s |
+| 3 | ~4s | ~7s |
+| 4 | ~8s | ~15s |
+| 5 | ~16s | ~31s |
+
+### Circuit Breaker Pattern
+
+Protects downstream services (APNs, SendGrid, Twilio) from cascading failures:
+
+```javascript
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeout = options.resetTimeout || 30000 // 30 seconds
+    this.halfOpenRequests = options.halfOpenRequests || 3
+
+    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.successes = 0
+    this.lastFailure = null
+  }
+
+  async execute(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailure > this.resetTimeout) {
+        this.state = 'HALF_OPEN'
+        this.successes = 0
+      } else {
+        throw new Error('Circuit breaker is OPEN')
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+    if (this.state === 'HALF_OPEN') {
+      this.successes++
+      if (this.successes >= this.halfOpenRequests) {
+        this.state = 'CLOSED'
+      }
+    }
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailure = Date.now()
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+    }
+  }
+}
+
+// Usage per channel provider
+const apnsBreaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 })
+const fcmBreaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 })
+const sendgridBreaker = new CircuitBreaker({ failureThreshold: 3, resetTimeout: 60000 })
+const twilioBreaker = new CircuitBreaker({ failureThreshold: 3, resetTimeout: 60000 })
+```
+
+### Dead Letter Queue Handling
+
+Failed notifications after all retries go to a dead letter queue for manual review:
+
+```javascript
+class DeadLetterHandler {
+  async sendToDeadLetter(notification, error) {
+    await db.query(`
+      INSERT INTO dead_letter_notifications
+        (notification_id, original_payload, error_message, error_code, failed_at)
+      VALUES ($1, $2, $3, $4, NOW())
+    `, [
+      notification.id,
+      JSON.stringify(notification),
+      error.message,
+      error.code || 'UNKNOWN'
+    ])
+
+    // Alert on DLQ growth
+    const dlqCount = await this.getDLQCount()
+    if (dlqCount > 100) {
+      await this.alertOps('DLQ count exceeded threshold', { count: dlqCount })
+    }
+  }
+
+  async reprocessDLQ(batchSize = 10) {
+    const items = await db.query(`
+      SELECT * FROM dead_letter_notifications
+      WHERE reprocessed_at IS NULL
+      ORDER BY failed_at ASC
+      LIMIT $1
+    `, [batchSize])
+
+    for (const item of items.rows) {
+      try {
+        await notificationService.sendNotification(JSON.parse(item.original_payload))
+        await db.query(`
+          UPDATE dead_letter_notifications
+          SET reprocessed_at = NOW(), reprocess_status = 'success'
+          WHERE id = $1
+        `, [item.id])
+      } catch (error) {
+        await db.query(`
+          UPDATE dead_letter_notifications
+          SET reprocess_attempts = reprocess_attempts + 1,
+              last_error = $2
+          WHERE id = $1
+        `, [item.id, error.message])
+      }
+    }
+  }
+}
+```
+
+### Backup and Restore Strategy (Local Development)
+
+**Backup Script:**
+```bash
+#!/bin/bash
+# backup.sh - Run daily via cron
+
+BACKUP_DIR="/backups/notification-system"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+# PostgreSQL backup
+pg_dump -h localhost -U postgres notification_db > "$BACKUP_DIR/postgres_$DATE.sql"
+
+# Redis backup (RDB snapshot)
+redis-cli BGSAVE
+cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis_$DATE.rdb"
+
+# Keep last 7 days
+find "$BACKUP_DIR" -mtime +7 -delete
+```
+
+**Restore Script:**
+```bash
+#!/bin/bash
+# restore.sh - Restore from backup
+
+BACKUP_FILE=$1
+
+# Stop services
+docker-compose stop notification-api notification-worker
+
+# Restore PostgreSQL
+psql -h localhost -U postgres -d notification_db < "$BACKUP_FILE"
+
+# Restart services
+docker-compose start notification-api notification-worker
+```
+
+**Testing Backup/Restore (Quarterly):**
+1. Create test notifications in staging
+2. Run backup script
+3. Drop and recreate database
+4. Run restore script
+5. Verify notification delivery status matches pre-backup state
+
+---
+
+## Cost Optimization and Resource Tradeoffs
+
+### Storage Tiering
+
+For a local development environment, we optimize for learning rather than cost, but the same principles apply:
+
+**Notification Data Lifecycle:**
+| Age | Storage | Retention | Access Pattern |
+|-----|---------|-----------|----------------|
+| 0-7 days | PostgreSQL (hot) | Full detail | High (status checks) |
+| 7-30 days | PostgreSQL (warm) | Full detail | Medium (analytics) |
+| 30-90 days | PostgreSQL (archive) | Summary only | Low (compliance) |
+| 90+ days | Export to file/delete | N/A | Rare (audit) |
+
+```sql
+-- Partition notifications table by month
+CREATE TABLE notifications (
+  id UUID,
+  user_id UUID,
+  created_at TIMESTAMP DEFAULT NOW(),
+  -- ... other columns
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE notifications_current PARTITION OF notifications
+  FOR VALUES FROM (CURRENT_DATE - INTERVAL '30 days') TO (MAXVALUE);
+
+CREATE TABLE notifications_archive PARTITION OF notifications
+  FOR VALUES FROM (MINVALUE) TO (CURRENT_DATE - INTERVAL '30 days');
+
+-- Archive old notifications (run weekly)
+-- For local dev, just delete after 30 days to save disk space
+DELETE FROM notifications WHERE created_at < NOW() - INTERVAL '30 days';
+DELETE FROM notification_events WHERE occurred_at < NOW() - INTERVAL '30 days';
+DELETE FROM delivery_status WHERE updated_at < NOW() - INTERVAL '30 days';
+```
+
+### Cache Sizing Guidelines
+
+**Redis Memory Allocation (Local Development):**
+| Cache Type | Max Size | TTL | Eviction Policy |
+|------------|----------|-----|-----------------|
+| User preferences | 50 MB | 5 min | LRU |
+| Rate limit counters | 20 MB | 1 hour | Automatic expiry |
+| Idempotency keys | 30 MB | 24 hours | Automatic expiry |
+| Session data | 50 MB | 24 hours | LRU |
+| **Total** | **150 MB** | - | - |
+
+```bash
+# redis.conf for local development
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+```
+
+**Cache Hit Rate Targets:**
+- User preferences: >95% (high read volume)
+- Rate limit counters: 100% (always in Redis)
+- Sessions: >90% (frequent access)
+
+### Queue Retention Settings
+
+**RabbitMQ Configuration:**
+```javascript
+// Queue declarations with TTL and limits
+const queueOptions = {
+  durable: true,
+  arguments: {
+    'x-message-ttl': 86400000,     // Messages expire after 24 hours
+    'x-max-length': 100000,         // Max 100k messages per queue
+    'x-overflow': 'reject-publish', // Reject new messages when full
+    'x-dead-letter-exchange': 'dlx' // Route expired/rejected to DLX
+  }
+}
+
+// Channel-specific settings
+const channelQueues = {
+  push: { maxLength: 100000, ttl: 3600000 },    // 100k, 1 hour TTL
+  email: { maxLength: 50000, ttl: 86400000 },   // 50k, 24 hour TTL
+  sms: { maxLength: 10000, ttl: 3600000 }       // 10k, 1 hour TTL
+}
+```
+
+**Queue Depth Alerts:**
+```javascript
+// Monitor queue depth and alert
+async function monitorQueues() {
+  const thresholds = { push: 50000, email: 25000, sms: 5000 }
+
+  for (const [channel, threshold] of Object.entries(thresholds)) {
+    const depth = await getQueueDepth(channel)
+    if (depth > threshold) {
+      console.warn(`Queue ${channel} depth ${depth} exceeds threshold ${threshold}`)
+    }
+  }
+}
+```
+
+### Compute vs Storage Optimization
+
+**Local Development Resource Budget:**
+| Component | CPU | Memory | Disk | Notes |
+|-----------|-----|--------|------|-------|
+| PostgreSQL | 1 core | 512 MB | 2 GB | Single instance |
+| Redis | 0.5 core | 256 MB | 100 MB | In-memory only |
+| RabbitMQ | 0.5 core | 256 MB | 500 MB | Persistent queues |
+| API Server | 0.5 core | 256 MB | - | Node.js |
+| Workers (x3) | 0.5 core each | 128 MB each | - | One per channel |
+| **Total** | **4 cores** | **~2 GB** | **~3 GB** | Fits in 8 GB laptop |
+
+**Tradeoff Decisions:**
+
+1. **Preference Caching vs Database Queries**
+   - Cache: 50 MB Redis, ~$0.01/day equivalent
+   - No cache: ~1000 extra DB queries/min, higher DB CPU
+   - **Decision**: Cache with 5-min TTL (preferences rarely change)
+
+2. **Queue Persistence vs Speed**
+   - Persistent: Survives restarts, slight write overhead
+   - Transient: Faster, lose messages on crash
+   - **Decision**: Persistent for learning reliability patterns
+
+3. **Notification Retention vs Disk Space**
+   - Keep all: ~100 MB/month growth for 10k notifications/day
+   - 30-day retention: ~100 MB steady state
+   - **Decision**: 30-day retention for local dev, configurable for prod
+
+4. **Worker Count vs Message Latency**
+   - More workers: Lower latency, higher resource use
+   - Fewer workers: Higher latency, lower resource use
+   - **Decision**: 1 worker per channel (3 total) for local dev
+
+```javascript
+// Configuration for different environments
+const envConfig = {
+  development: {
+    workers: { push: 1, email: 1, sms: 1 },
+    batchSize: 10,
+    cacheSize: '256mb'
+  },
+  production: {
+    workers: { push: 5, email: 3, sms: 2 },
+    batchSize: 100,
+    cacheSize: '2gb'
+  }
+}
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -725,3 +1227,8 @@ CREATE TABLE notification_templates (
 | Rate limit | Per-user + global | Per-user only | Protect downstream |
 | Preferences | Cached | Real-time | Performance |
 | Tracking | Async events | Sync update | Throughput |
+| Auth | Session + RBAC | JWT tokens | Simpler for local dev |
+| Retries | Exponential backoff | Fixed interval | Prevents thundering herd |
+| Circuit breaker | Per-provider | Global | Isolate failures by channel |
+| Storage | 30-day retention | Unlimited | Bounded disk usage |
+| Cache | 256 MB Redis | Larger cache | Fits local dev constraints |

@@ -1,12 +1,23 @@
 import type { Order } from '../types';
 
+/**
+ * Props for the OrderCard component.
+ */
 interface Props {
+  /** Order data to display */
   order: Order;
+  /** Whether to show detailed order information (items, pricing, address) */
   showDetails?: boolean;
+  /** Callback when status update button is clicked */
   onStatusUpdate?: (status: string) => void;
+  /** User role determines available status transitions */
   userRole?: 'customer' | 'restaurant' | 'driver';
 }
 
+/**
+ * Color mapping for order status badges.
+ * Each status has a corresponding Tailwind color class.
+ */
 const STATUS_COLORS: Record<string, string> = {
   PLACED: 'bg-yellow-100 text-yellow-800',
   CONFIRMED: 'bg-blue-100 text-blue-800',
@@ -18,6 +29,9 @@ const STATUS_COLORS: Record<string, string> = {
   CANCELLED: 'bg-red-100 text-red-800',
 };
 
+/**
+ * Human-readable labels for order statuses.
+ */
 const STATUS_LABELS: Record<string, string> = {
   PLACED: 'Order Placed',
   CONFIRMED: 'Confirmed',
@@ -29,6 +43,26 @@ const STATUS_LABELS: Record<string, string> = {
   CANCELLED: 'Cancelled',
 };
 
+/**
+ * Order card component for displaying order information.
+ * Shows order summary with optional detailed view including items,
+ * pricing breakdown, delivery address, and driver information.
+ *
+ * Features:
+ * - Status badge with color coding
+ * - ETA display for active orders
+ * - Detailed view with items and pricing breakdown
+ * - Status update button based on user role
+ * - ETA breakdown showing time components
+ *
+ * The component adapts its display and actions based on:
+ * - showDetails: Controls visibility of item list and pricing
+ * - userRole: Determines which status transitions are available
+ * - onStatusUpdate: Enables the action button when provided
+ *
+ * @param props - Component props
+ * @returns React component rendering an order card
+ */
 export function OrderCard({ order, showDetails = false, onStatusUpdate, userRole = 'customer' }: Props) {
   const formatTime = (dateStr: string) => {
     return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });

@@ -1,9 +1,19 @@
+/**
+ * Execution detail page showing full execution information.
+ * Displays timing, results, errors, and execution logs.
+ * @module routes/ExecutionDetail
+ */
+
 import { useEffect } from 'react';
 import { useParams, Link } from '@tanstack/react-router';
 import { useExecutionsStore } from '../stores';
 import { Spinner } from '../components/UI';
 import { ExecutionDetail } from '../components/ExecutionList';
 
+/**
+ * Detailed view of a single job execution.
+ * Auto-refreshes for running executions to show real-time status.
+ */
 export function ExecutionDetailPage() {
   const { executionId } = useParams({ from: '/executions/$executionId' });
   const {

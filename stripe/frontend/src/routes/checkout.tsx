@@ -1,26 +1,54 @@
+/**
+ * Checkout Route
+ *
+ * Interactive checkout demo page for testing the complete payment flow.
+ * Provides a multi-step checkout experience with amount input, card entry,
+ * and payment result display. Useful for merchants to test their integration.
+ *
+ * @module routes/checkout
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState } from 'react';
 import { createPaymentIntent, createPaymentMethod, confirmPaymentIntent } from '@/services/api';
 import { formatCurrency } from '@/utils';
 import { StatusBadge } from '@/components';
 
+/**
+ * Route definition for the checkout demo page (/checkout).
+ */
 export const Route = createFileRoute('/checkout')({
   component: CheckoutPage,
 });
 
+/**
+ * Checkout demo page component.
+ * Implements a three-step checkout flow:
+ * 1. Amount entry and configuration
+ * 2. Card details input
+ * 3. Payment result display
+ *
+ * Includes test card numbers for various scenarios (success, decline, etc.)
+ *
+ * @returns The checkout demo page
+ */
 function CheckoutPage() {
+  // Step tracking
   const [step, setStep] = useState<'amount' | 'card' | 'result'>('amount');
+
+  // Amount configuration
   const [amount, setAmount] = useState('25.00');
   const [currency, setCurrency] = useState('usd');
   const [description, setDescription] = useState('');
   const [captureMethod, setCaptureMethod] = useState<'automatic' | 'manual'>('automatic');
 
-  // Card details
+  // Card details (pre-filled with test card)
   const [cardNumber, setCardNumber] = useState('4242 4242 4242 4242');
   const [expMonth, setExpMonth] = useState('12');
   const [expYear, setExpYear] = useState('2027');
   const [cvc, setCvc] = useState('123');
 
+  // Processing state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<{
@@ -31,6 +59,10 @@ function CheckoutPage() {
     declineCode?: string;
   } | null>(null);
 
+  /**
+   * Processes the payment by creating a payment intent,
+   * creating a payment method, and confirming the payment.
+   */
   async function handlePayment(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -77,6 +109,9 @@ function CheckoutPage() {
     }
   }
 
+  /**
+   * Resets the checkout form to start a new payment.
+   */
   function resetForm() {
     setStep('amount');
     setResult(null);

@@ -5,9 +5,16 @@ import * as projectService from '../services/projectService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { IssueType, Priority } from '../types/index.js';
 
+/**
+ * Issue management routes.
+ * Handles CRUD operations for issues, transitions, comments, and history.
+ */
 const router = Router();
 
-// Get issue by ID or key
+/**
+ * GET /:idOrKey
+ * Returns an issue by numeric ID or issue key (e.g., "PROJ-123").
+ */
 router.get('/:idOrKey', requireAuth, async (req, res) => {
   try {
     const { idOrKey } = req.params;
@@ -31,7 +38,10 @@ router.get('/:idOrKey', requireAuth, async (req, res) => {
   }
 });
 
-// Create issue
+/**
+ * POST /
+ * Creates a new issue in a project.
+ */
 router.post('/', requireAuth, async (req, res) => {
   try {
     const {
@@ -89,7 +99,10 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-// Update issue
+/**
+ * PATCH /:id
+ * Updates an issue's fields.
+ */
 router.patch('/:id', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -138,7 +151,10 @@ router.patch('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Delete issue
+/**
+ * DELETE /:id
+ * Deletes an issue.
+ */
 router.delete('/:id', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -155,7 +171,10 @@ router.delete('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Get available transitions for issue
+/**
+ * GET /:id/transitions
+ * Returns available workflow transitions for an issue from its current status.
+ */
 router.get('/:id/transitions', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -188,7 +207,10 @@ router.get('/:id/transitions', requireAuth, async (req, res) => {
   }
 });
 
-// Execute transition
+/**
+ * POST /:id/transitions/:transitionId
+ * Executes a workflow transition on an issue.
+ */
 router.post('/:id/transitions/:transitionId', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -221,7 +243,10 @@ router.post('/:id/transitions/:transitionId', requireAuth, async (req, res) => {
   }
 });
 
-// Get issue comments
+/**
+ * GET /:id/comments
+ * Returns all comments for an issue.
+ */
 router.get('/:id/comments', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -233,7 +258,10 @@ router.get('/:id/comments', requireAuth, async (req, res) => {
   }
 });
 
-// Add comment
+/**
+ * POST /:id/comments
+ * Adds a comment to an issue.
+ */
 router.post('/:id/comments', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -251,7 +279,10 @@ router.post('/:id/comments', requireAuth, async (req, res) => {
   }
 });
 
-// Update comment
+/**
+ * PATCH /:issueId/comments/:commentId
+ * Updates a comment (author only).
+ */
 router.patch('/:issueId/comments/:commentId', requireAuth, async (req, res) => {
   try {
     const commentId = parseInt(req.params.commentId, 10);
@@ -274,7 +305,10 @@ router.patch('/:issueId/comments/:commentId', requireAuth, async (req, res) => {
   }
 });
 
-// Delete comment
+/**
+ * DELETE /:issueId/comments/:commentId
+ * Deletes a comment (author only).
+ */
 router.delete('/:issueId/comments/:commentId', requireAuth, async (req, res) => {
   try {
     const commentId = parseInt(req.params.commentId, 10);
@@ -291,7 +325,10 @@ router.delete('/:issueId/comments/:commentId', requireAuth, async (req, res) => 
   }
 });
 
-// Get issue history
+/**
+ * GET /:id/history
+ * Returns the change history for an issue.
+ */
 router.get('/:id/history', requireAuth, async (req, res) => {
   try {
     const issueId = parseInt(req.params.id, 10);
@@ -303,7 +340,10 @@ router.get('/:id/history', requireAuth, async (req, res) => {
   }
 });
 
-// Get issues by project
+/**
+ * GET /project/:projectId
+ * Returns paginated issues for a project with optional filters.
+ */
 router.get('/project/:projectId', requireAuth, async (req, res) => {
   try {
     const { statusId, assigneeId, sprintId, epicId, issueType, limit, offset } = req.query;
@@ -325,7 +365,10 @@ router.get('/project/:projectId', requireAuth, async (req, res) => {
   }
 });
 
-// Get backlog issues
+/**
+ * GET /project/:projectId/backlog
+ * Returns issues not assigned to any sprint.
+ */
 router.get('/project/:projectId/backlog', requireAuth, async (req, res) => {
   try {
     const issues = await issueService.getBacklogIssues(req.params.projectId);
@@ -336,7 +379,10 @@ router.get('/project/:projectId/backlog', requireAuth, async (req, res) => {
   }
 });
 
-// Get sprint issues
+/**
+ * GET /sprint/:sprintId
+ * Returns all issues assigned to a sprint.
+ */
 router.get('/sprint/:sprintId', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.sprintId, 10);

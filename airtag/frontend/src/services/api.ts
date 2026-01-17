@@ -1,5 +1,20 @@
+/**
+ * API client for the Find My backend.
+ * Provides typed methods for all API endpoints with automatic error handling.
+ */
+
+/** Base URL for API requests, uses relative path for Vite proxy */
 const API_BASE = '/api';
 
+/**
+ * Generic fetch wrapper with JSON parsing and error handling.
+ * All requests include credentials for session cookie authentication.
+ *
+ * @param endpoint - API endpoint path (without /api prefix)
+ * @param options - Fetch options (method, body, headers)
+ * @returns Parsed JSON response
+ * @throws Error with message from API response
+ */
 async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -21,7 +36,9 @@ async function fetchApi<T>(
   return response.json();
 }
 
-// Auth
+/**
+ * Authentication API methods.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     fetchApi('/auth/login', {
@@ -37,7 +54,9 @@ export const authApi = {
   me: () => fetchApi('/auth/me'),
 };
 
-// Devices
+/**
+ * Device management API methods.
+ */
 export const devicesApi = {
   getAll: () => fetchApi('/devices'),
   get: (id: string) => fetchApi(`/devices/${id}`),
@@ -57,7 +76,9 @@ export const devicesApi = {
     fetchApi(`/devices/${id}/play-sound`, { method: 'POST' }),
 };
 
-// Locations
+/**
+ * Location retrieval and simulation API methods.
+ */
 export const locationsApi = {
   getHistory: (deviceId: string, options?: { startTime?: number; endTime?: number; limit?: number }) => {
     const params = new URLSearchParams();
@@ -74,7 +95,9 @@ export const locationsApi = {
     }),
 };
 
-// Lost Mode
+/**
+ * Lost mode management API methods.
+ */
 export const lostModeApi = {
   get: (deviceId: string) => fetchApi(`/lost-mode/${deviceId}`),
   update: (
@@ -97,7 +120,9 @@ export const lostModeApi = {
     fetchApi(`/lost-mode/${deviceId}/disable`, { method: 'POST' }),
 };
 
-// Notifications
+/**
+ * Notification management API methods.
+ */
 export const notificationsApi = {
   getAll: (options?: { unreadOnly?: boolean; limit?: number }) => {
     const params = new URLSearchParams();
@@ -114,7 +139,9 @@ export const notificationsApi = {
     fetchApi(`/notifications/${id}`, { method: 'DELETE' }),
 };
 
-// Anti-Stalking
+/**
+ * Anti-stalking detection API methods.
+ */
 export const antiStalkingApi = {
   recordSighting: (data: { identifier_hash: string; latitude: number; longitude: number }) =>
     fetchApi('/anti-stalking/sighting', {
@@ -126,7 +153,9 @@ export const antiStalkingApi = {
     fetchApi(`/anti-stalking/sightings/${identifierHash}`),
 };
 
-// Admin
+/**
+ * Admin dashboard API methods.
+ */
 export const adminApi = {
   getStats: () => fetchApi('/admin/stats'),
   getUsers: () => fetchApi('/admin/users'),

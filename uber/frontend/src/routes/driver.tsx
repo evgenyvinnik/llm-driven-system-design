@@ -1,8 +1,24 @@
+/**
+ * Driver dashboard page - main interface for receiving and completing rides.
+ * Protected route that requires driver authentication.
+ */
 import { createFileRoute, useNavigate, Link } from '@tanstack/react-router';
 import { useEffect, useState, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useDriverStore } from '../stores/driverStore';
 
+/**
+ * Main driver interface for the ride-hailing experience.
+ * Provides the complete driver workflow:
+ * 1. Go online to start receiving ride offers
+ * 2. Accept or decline incoming ride offers (with countdown timer)
+ * 3. Navigate to pickup and mark arrival
+ * 4. Start trip and complete at dropoff
+ *
+ * Features real-time location updates and WebSocket-based ride offers.
+ *
+ * @returns Driver dashboard component
+ */
 function DriverPage() {
   const user = useAuthStore((state) => state.user);
   const logout = useAuthStore((state) => state.logout);
@@ -91,6 +107,10 @@ function DriverPage() {
     }
   }, [offerExpiresAt, declineRide]);
 
+  /**
+   * Toggle driver online/offline status.
+   * Memoized to prevent unnecessary re-renders.
+   */
   const handleToggleOnline = useCallback(async () => {
     if (isOnline) {
       await goOffline();
@@ -99,6 +119,9 @@ function DriverPage() {
     }
   }, [isOnline, goOnline, goOffline]);
 
+  /**
+   * Log out driver, ensuring they go offline first.
+   */
   const handleLogout = async () => {
     if (isOnline) {
       await goOffline();
@@ -107,6 +130,11 @@ function DriverPage() {
     navigate({ to: '/' });
   };
 
+  /**
+   * Format cents as USD currency string.
+   * @param cents - Amount in cents
+   * @returns Formatted currency string
+   */
   const formatCurrency = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
   if (!user) {

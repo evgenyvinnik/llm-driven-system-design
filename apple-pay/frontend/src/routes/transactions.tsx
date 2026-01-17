@@ -1,13 +1,25 @@
+/**
+ * Transaction history route for viewing payment activity.
+ * Displays all user transactions grouped by date with pagination.
+ */
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { Layout } from '../components/Layout';
 import { TransactionItem, TransactionSkeleton } from '../components/TransactionItem';
 import { useTransactionStore } from '../stores';
 
+/** Route configuration for /transactions */
 export const Route = createFileRoute('/transactions')({
   component: TransactionsPage,
 });
 
+/**
+ * Transaction history page component with date grouping.
+ * Groups transactions by "Today", "Yesterday", or specific dates.
+ * Supports infinite scroll pagination via "Load More" button.
+ *
+ * @returns JSX element representing the transaction history view
+ */
 function TransactionsPage() {
   const { transactions, total, isLoading, loadTransactions } = useTransactionStore();
 

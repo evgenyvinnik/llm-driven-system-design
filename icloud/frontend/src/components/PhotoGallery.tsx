@@ -3,13 +3,29 @@ import type { Photo } from '../types';
 import { usePhotoStore } from '../stores/photoStore';
 import { formatDate } from '../utils/helpers';
 
+/**
+ * Props for the PhotoItem component.
+ */
 interface PhotoItemProps {
+  /** Photo to display */
   photo: Photo;
+  /** Whether this photo is currently selected */
   isSelected: boolean;
+  /** Callback when photo is clicked (for selection) */
   onSelect: () => void;
+  /** Callback when photo is double-clicked (for viewing) */
   onView: () => void;
 }
 
+/**
+ * Renders a single photo thumbnail in the gallery grid.
+ *
+ * Displays the photo thumbnail with a favorite indicator and selection state.
+ * Supports lazy loading for performance with large galleries.
+ *
+ * @param props - Component props
+ * @returns Photo thumbnail element
+ */
 const PhotoItem: React.FC<PhotoItemProps> = ({ photo, isSelected, onSelect, onView }) => {
   return (
     <div
@@ -29,15 +45,34 @@ const PhotoItem: React.FC<PhotoItemProps> = ({ photo, isSelected, onSelect, onVi
   );
 };
 
+/**
+ * Props for the PhotoViewer component.
+ */
 interface PhotoViewerProps {
+  /** Photo currently being viewed */
   photo: Photo;
+  /** Callback to close the viewer */
   onClose: () => void;
+  /** Callback to view previous photo */
   onPrev: () => void;
+  /** Callback to view next photo */
   onNext: () => void;
+  /** Whether there is a previous photo */
   hasPrev: boolean;
+  /** Whether there is a next photo */
   hasNext: boolean;
 }
 
+/**
+ * Full-screen photo viewer (lightbox) component.
+ *
+ * Displays a photo in full-screen mode with navigation controls,
+ * favorite toggle, and delete button. Supports keyboard navigation
+ * (arrow keys for prev/next, Escape to close).
+ *
+ * @param props - Component props
+ * @returns Full-screen photo viewer modal
+ */
 const PhotoViewer: React.FC<PhotoViewerProps> = ({
   photo,
   onClose,
@@ -141,6 +176,23 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({
   );
 };
 
+/**
+ * Main photo gallery component for iCloud Photos.
+ *
+ * Provides a complete photo browsing experience including:
+ * - Responsive thumbnail grid with lazy loading
+ * - Infinite scroll pagination
+ * - Filter toggle between all photos and favorites
+ * - Multi-select for batch operations
+ * - Photo upload with automatic thumbnail generation
+ * - Album creation with selected photos
+ * - Full-screen photo viewer with navigation
+ *
+ * The component uses the photo store for state management and
+ * subscribes to WebSocket events for real-time sync updates.
+ *
+ * @returns Complete photo gallery UI
+ */
 export const PhotoGallery: React.FC = () => {
   const {
     photos,

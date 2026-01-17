@@ -4,12 +4,36 @@ import { useCartStore } from '../stores/cartStore';
 import { useAuthStore } from '../stores/authStore';
 import { orderAPI } from '../services/api';
 
+/**
+ * Tax rate applied to orders (8.75% for San Francisco).
+ */
 const TAX_RATE = 0.0875;
 
+/**
+ * Cart page route configuration.
+ * Provides checkout functionality.
+ */
 export const Route = createFileRoute('/cart')({
   component: CartPage,
 });
 
+/**
+ * Cart page component for reviewing and placing orders.
+ * Displays cart items, delivery address input, tip selection,
+ * and order summary with totals.
+ *
+ * Features:
+ * - List of cart items with quantity controls
+ * - Delivery address input
+ * - Delivery instructions textarea
+ * - Tip amount selection
+ * - Order summary with subtotal, fees, tax, and total
+ * - Place order button with loading state
+ * - Empty cart state with link to browse restaurants
+ * - Login prompt for unauthenticated users
+ *
+ * @returns React component for the cart/checkout page
+ */
 function CartPage() {
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);

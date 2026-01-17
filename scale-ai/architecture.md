@@ -385,6 +385,421 @@ cd frontend && npm run dev  # Port 5173
 - Request tracing (correlation IDs)
 - Training job progress logs
 
+## Consistency and Idempotency Semantics
+
+### Write Consistency Model
+
+| Operation | Consistency Level | Rationale |
+|-----------|------------------|-----------|
+| Drawing submission | Eventual | Loss of a single drawing is acceptable; high write throughput is critical |
+| Training job creation | Strong | Must guarantee exactly-once job creation to avoid duplicate training runs |
+| Model activation | Strong | Active model state must be immediately consistent across all inference instances |
+| User stats update | Eventual | Can be reconciled asynchronously via background job |
+
+**Drawing Submissions (Eventual Consistency):**
+- Writes to PostgreSQL and MinIO are not transactional
+- If MinIO write succeeds but PostgreSQL fails, orphan detection job cleans up hourly
+- If PostgreSQL write succeeds but MinIO fails, the `drawings` row has null `stroke_data_path` and is excluded from training
+
+**Training Jobs (Strong Consistency):**
+- Uses PostgreSQL transaction with `SELECT ... FOR UPDATE` on job creation
+- Job ID is UUID generated server-side, preventing duplicate job creation on retry
+
+### Idempotency Implementation
+
+**Drawing Submissions:**
+```typescript
+// Client generates idempotency key before submission
+const idempotencyKey = `${sessionId}:${shapeId}:${Date.now()}`;
+
+// Server checks Redis before processing
+const exists = await redis.get(`idem:drawing:${idempotencyKey}`);
+if (exists) return { status: 'already_processed', drawingId: exists };
+
+// After successful save, mark as processed with 1-hour TTL
+await redis.setex(`idem:drawing:${idempotencyKey}`, 3600, drawingId);
+```
+
+**Training Job Triggers:**
+```typescript
+// Admin clicks "Start Training" - use job config hash as idempotency key
+const configHash = crypto.createHash('sha256').update(JSON.stringify(jobConfig)).digest('hex');
+const idempotencyKey = `training:${configHash}:${new Date().toISOString().slice(0,10)}`;
+
+// Check for existing pending/running job with same config from today
+const existing = await db.query(`
+  SELECT id FROM training_jobs
+  WHERE status IN ('pending', 'running')
+    AND config_hash = $1
+    AND created_at > NOW() - INTERVAL '24 hours'
+`, [configHash]);
+if (existing.rows.length > 0) return { jobId: existing.rows[0].id, status: 'already_exists' };
+```
+
+### Conflict Resolution
+
+**Concurrent Drawing Submissions:**
+- No conflicts possible: each drawing gets a unique UUID, no updates to existing records
+- Quality score updates use last-write-wins (admin override is final)
+
+**Model Activation Race:**
+```sql
+-- Atomic model activation (only one active model at a time)
+BEGIN;
+UPDATE models SET is_active = FALSE WHERE is_active = TRUE;
+UPDATE models SET is_active = TRUE WHERE id = $1;
+COMMIT;
+```
+
+**Replay Handling:**
+- Drawing submissions: Safe to replay due to idempotency keys
+- Training jobs: Config hash prevents duplicate training on same data
+- Model activation: Idempotent by nature (activating already-active model is no-op)
+
+## Failure Handling
+
+### Retry Strategies
+
+| Component | Retry Policy | Backoff | Max Attempts |
+|-----------|-------------|---------|--------------|
+| MinIO uploads | Exponential | 100ms, 200ms, 400ms, 800ms | 4 |
+| PostgreSQL writes | Exponential | 50ms, 100ms, 200ms | 3 |
+| RabbitMQ publish | Exponential | 500ms, 1s, 2s, 4s | 5 |
+| Training data fetch | Linear | 1s between attempts | 3 |
+
+**Collection Service - Drawing Upload:**
+```typescript
+async function saveDrawing(drawing: DrawingData, idempotencyKey: string): Promise<string> {
+  // Check idempotency first
+  const cached = await redis.get(`idem:drawing:${idempotencyKey}`);
+  if (cached) return cached;
+
+  let minioPath: string | null = null;
+
+  // Retry MinIO upload with exponential backoff
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      minioPath = await minio.putObject(bucket, `drawings/${drawing.id}.json`, JSON.stringify(drawing));
+      break;
+    } catch (err) {
+      if (attempt === 3) throw new Error('MinIO upload failed after retries');
+      await sleep(100 * Math.pow(2, attempt));
+    }
+  }
+
+  // PostgreSQL insert (separate retry loop)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await db.query(`INSERT INTO drawings (id, shape_id, stroke_data_path, ...) VALUES ($1, $2, $3, ...)`,
+        [drawing.id, drawing.shapeId, minioPath]);
+      break;
+    } catch (err) {
+      if (attempt === 2) {
+        // Log for orphan cleanup job, but don't fail the request
+        console.error('DB insert failed, MinIO object is orphaned:', minioPath);
+        throw err;
+      }
+      await sleep(50 * Math.pow(2, attempt));
+    }
+  }
+
+  await redis.setex(`idem:drawing:${idempotencyKey}`, 3600, drawing.id);
+  return drawing.id;
+}
+```
+
+### Circuit Breaker Pattern
+
+**Implementation for External Dependencies (Local Dev):**
+```typescript
+// Simple circuit breaker for learning purposes
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailure = 0;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+
+  constructor(
+    private threshold: number = 5,      // Open after 5 failures
+    private resetTimeout: number = 30000 // Try again after 30s
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailure > this.resetTimeout) {
+        this.state = 'half-open';
+      } else {
+        throw new Error('Circuit breaker is open');
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = 'closed';
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.threshold) {
+      this.state = 'open';
+    }
+  }
+}
+
+// Usage
+const minioBreaker = new CircuitBreaker(5, 30000);
+const result = await minioBreaker.call(() => minio.putObject(...));
+```
+
+**Circuit Breaker Configuration:**
+| Service | Failure Threshold | Reset Timeout | Fallback Behavior |
+|---------|------------------|---------------|-------------------|
+| MinIO | 5 failures | 30s | Return 503, client retries later |
+| PostgreSQL | 3 failures | 15s | Return 503, queue in memory (short-term) |
+| RabbitMQ | 5 failures | 60s | Write to dead-letter table in PostgreSQL |
+| Training Worker | 2 failures | 120s | Mark job as 'failed', notify admin |
+
+### Disaster Recovery (Local Development Context)
+
+For a local learning project, DR focuses on data protection and quick recovery:
+
+**Backup Strategy:**
+```bash
+# PostgreSQL: Daily logical backup (cron job or manual)
+pg_dump -h localhost -U user scale_ai > backup_$(date +%Y%m%d).sql
+
+# MinIO: Sync to local backup directory
+mc mirror local/drawings ./backups/minio/drawings/
+
+# Combined backup script (run before major changes)
+#!/bin/bash
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+pg_dump -h localhost -U user scale_ai > "$BACKUP_DIR/postgres.sql"
+mc mirror local/drawings "$BACKUP_DIR/minio/"
+echo "Backup complete: $BACKUP_DIR"
+```
+
+**Restore Procedure:**
+```bash
+# 1. Stop all services
+docker-compose down
+
+# 2. Restore PostgreSQL
+docker-compose up -d postgres
+psql -h localhost -U user -d scale_ai < backup_20240115.sql
+
+# 3. Restore MinIO
+docker-compose up -d minio
+mc mirror ./backups/minio/drawings/ local/drawings/
+
+# 4. Restart all services
+docker-compose up -d
+```
+
+**Backup Testing Checklist (Monthly):**
+- [ ] Restore PostgreSQL backup to a test database
+- [ ] Verify row counts match: `SELECT COUNT(*) FROM drawings`
+- [ ] Restore random MinIO objects and verify JSON validity
+- [ ] Run inference on restored model to verify functionality
+- [ ] Document restore time and any issues encountered
+
+### Failure Scenarios and Responses
+
+| Failure | Detection | Response | Recovery |
+|---------|-----------|----------|----------|
+| MinIO down | Circuit breaker trips | Return 503, log to file | Retry after reset timeout |
+| PostgreSQL down | Connection timeout | Return 503, queue minimal data in Redis | Drain Redis queue on recovery |
+| RabbitMQ down | Publish fails | Write to `dead_letter_jobs` table | Background job replays on recovery |
+| Training worker crash | Job timeout (30min) | Mark job as 'failed' | Admin manually restarts job |
+| Model file corrupted | Inference throws error | Fall back to previous model version | Re-run training job |
+
+## Data Lifecycle Policies
+
+### Retention Policies
+
+| Data Type | Hot Storage | Warm Storage | Cold/Archive | Deletion |
+|-----------|-------------|--------------|--------------|----------|
+| Drawings (stroke JSON) | 30 days | 30-180 days | 180+ days | Never (training data) |
+| Drawing metadata (PostgreSQL) | Indefinite | N/A | N/A | Never |
+| Training jobs | Indefinite | N/A | N/A | Completed jobs > 1 year: archive |
+| Model files | Active + last 5 versions | Older versions | N/A | After 2 years if unused |
+| User sessions | 7 days | N/A | N/A | Auto-expire |
+| Inference logs | 7 days | 7-30 days | N/A | 30 days |
+
+### TTL Implementation
+
+**Redis Keys:**
+```typescript
+// Session data: 7 days
+await redis.setex(`session:${sessionId}`, 7 * 24 * 3600, sessionData);
+
+// Idempotency keys: 1 hour (enough to handle retries)
+await redis.setex(`idem:drawing:${key}`, 3600, drawingId);
+
+// Cached stats: 5 minutes
+await redis.setex('stats:dashboard', 300, JSON.stringify(stats));
+
+// Rate limit counters: 1 minute window
+await redis.setex(`ratelimit:${ip}`, 60, count);
+```
+
+**PostgreSQL Cleanup Jobs:**
+```sql
+-- Run daily: Archive old inference logs
+INSERT INTO inference_logs_archive
+SELECT * FROM inference_logs WHERE created_at < NOW() - INTERVAL '30 days';
+DELETE FROM inference_logs WHERE created_at < NOW() - INTERVAL '30 days';
+
+-- Run weekly: Clean up orphaned drawings (MinIO exists, DB doesn't)
+-- Implemented as a Node.js script that lists MinIO objects and checks DB
+```
+
+### Storage Tiering (Local Dev Simulation)
+
+For learning purposes, simulate tiering with different MinIO buckets:
+
+```yaml
+# docker-compose.yml buckets represent tiers
+# In production: S3 Standard → S3 Infrequent Access → S3 Glacier
+
+# Local simulation:
+# - drawings-hot/    : Recent 30 days, fast access
+# - drawings-warm/   : 30-180 days, still accessible
+# - drawings-archive/: 180+ days, compressed JSON
+```
+
+**Tiering Job (Background Worker):**
+```typescript
+// Run daily at 2 AM
+async function tieringJob() {
+  // Move drawings older than 30 days from hot to warm
+  const hotToWarm = await db.query(`
+    SELECT id, stroke_data_path FROM drawings
+    WHERE created_at < NOW() - INTERVAL '30 days'
+      AND stroke_data_path LIKE 'drawings-hot/%'
+  `);
+
+  for (const row of hotToWarm.rows) {
+    const data = await minio.getObject('drawings-hot', row.id + '.json');
+    await minio.putObject('drawings-warm', row.id + '.json', data);
+    await minio.removeObject('drawings-hot', row.id + '.json');
+    await db.query(`UPDATE drawings SET stroke_data_path = $1 WHERE id = $2`,
+      [`drawings-warm/${row.id}.json`, row.id]);
+  }
+
+  // Move drawings older than 180 days from warm to archive (compressed)
+  const warmToArchive = await db.query(`
+    SELECT id, stroke_data_path FROM drawings
+    WHERE created_at < NOW() - INTERVAL '180 days'
+      AND stroke_data_path LIKE 'drawings-warm/%'
+  `);
+
+  for (const row of warmToArchive.rows) {
+    const data = await minio.getObject('drawings-warm', row.id + '.json');
+    const compressed = zlib.gzipSync(data);
+    await minio.putObject('drawings-archive', row.id + '.json.gz', compressed);
+    await minio.removeObject('drawings-warm', row.id + '.json');
+    await db.query(`UPDATE drawings SET stroke_data_path = $1 WHERE id = $2`,
+      [`drawings-archive/${row.id}.json.gz`, row.id]);
+  }
+}
+```
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Reprocess All Drawings with New Quality Scoring Algorithm**
+```bash
+# 1. Create backfill job in admin UI or via API
+POST /api/admin/backfill
+{
+  "type": "quality_rescore",
+  "filter": { "created_after": "2024-01-01" },
+  "batch_size": 1000
+}
+
+# 2. Worker processes in batches
+# - Fetches drawings in chunks of 1000
+# - Applies new scoring algorithm
+# - Updates quality_score in PostgreSQL
+# - Logs progress to backfill_jobs table
+```
+
+**Scenario 2: Replay Failed Training Job with Fixed Data**
+```typescript
+// Admin UI: "Replay Training Job" button
+async function replayTrainingJob(originalJobId: string) {
+  const original = await db.query(`SELECT config FROM training_jobs WHERE id = $1`, [originalJobId]);
+
+  // Create new job with same config but updated timestamp
+  const newJob = await db.query(`
+    INSERT INTO training_jobs (config, status, replay_of)
+    VALUES ($1, 'pending', $2)
+    RETURNING id
+  `, [original.rows[0].config, originalJobId]);
+
+  // Publish to RabbitMQ
+  await rabbit.publish('training_jobs', { jobId: newJob.rows[0].id });
+
+  return newJob.rows[0].id;
+}
+```
+
+**Scenario 3: Backfill Missing MinIO Objects from Backup**
+```bash
+#!/bin/bash
+# Compare MinIO objects with PostgreSQL records, restore missing from backup
+
+# 1. Get list of expected objects from PostgreSQL
+psql -h localhost -U user -d scale_ai -t -c \
+  "SELECT stroke_data_path FROM drawings WHERE stroke_data_path IS NOT NULL" \
+  > expected_objects.txt
+
+# 2. Get list of actual objects in MinIO
+mc ls --recursive local/drawings | awk '{print $NF}' > actual_objects.txt
+
+# 3. Find missing objects
+comm -23 <(sort expected_objects.txt) <(sort actual_objects.txt) > missing_objects.txt
+
+# 4. Restore from backup
+while read object; do
+  if [ -f "./backups/minio/$object" ]; then
+    mc cp "./backups/minio/$object" "local/$object"
+    echo "Restored: $object"
+  else
+    echo "MISSING FROM BACKUP: $object"
+  fi
+done < missing_objects.txt
+```
+
+**Backfill Job Tracking:**
+```sql
+-- Track backfill job progress
+CREATE TABLE backfill_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type VARCHAR(50) NOT NULL,  -- 'quality_rescore', 'tier_migration', 'replay'
+    status VARCHAR(50) DEFAULT 'pending',
+    total_items INT,
+    processed_items INT DEFAULT 0,
+    failed_items INT DEFAULT 0,
+    config JSONB,
+    error_log JSONB,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
 ## Future Enhancements
 
 1. **Active Learning:** Prioritize collecting drawings for underperforming classes

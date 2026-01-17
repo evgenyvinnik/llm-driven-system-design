@@ -5,16 +5,24 @@ import fs from 'fs';
 import { UserService } from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * User profile and settings routes.
+ * Handles profile CRUD, location updates, preferences, and photo management.
+ * All routes require authentication.
+ */
 const router = Router();
 const userService = new UserService();
 
-// Ensure uploads directory exists
+/** Ensure uploads directory exists for photo storage */
 const uploadsDir = path.join(process.cwd(), 'uploads', 'photos');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Configure multer for photo uploads
+/**
+ * Multer storage configuration for profile photos.
+ * Saves files with unique timestamp-based filenames.
+ */
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     cb(null, uploadsDir);
@@ -25,6 +33,10 @@ const storage = multer.diskStorage({
   },
 });
 
+/**
+ * Multer upload middleware with file validation.
+ * Limits: 5MB max size, JPEG/PNG/WebP only.
+ */
 const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
@@ -38,7 +50,10 @@ const upload = multer({
   },
 });
 
-// Get user profile
+/**
+ * GET /api/users/profile
+ * Returns the authenticated user's complete profile with photos and preferences.
+ */
 router.get('/profile', requireAuth, async (req: Request, res: Response) => {
   try {
     const profile = await userService.getUserProfile(req.session.userId!);
@@ -55,7 +70,10 @@ router.get('/profile', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Update user profile
+/**
+ * PUT /api/users/profile
+ * Updates the authenticated user's profile fields (name, bio, job, company, school).
+ */
 router.put('/profile', requireAuth, async (req: Request, res: Response) => {
   try {
     const { name, bio, job_title, company, school } = req.body;
@@ -81,7 +99,11 @@ router.put('/profile', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Update location
+/**
+ * PUT /api/users/location
+ * Updates the user's geographic location for geo-based discovery.
+ * Validates coordinates are within valid ranges.
+ */
 router.put('/location', requireAuth, async (req: Request, res: Response) => {
   try {
     const { latitude, longitude } = req.body;
@@ -104,7 +126,10 @@ router.put('/location', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get preferences
+/**
+ * GET /api/users/preferences
+ * Returns the user's discovery preferences (interested_in, age range, distance, visibility).
+ */
 router.get('/preferences', requireAuth, async (req: Request, res: Response) => {
   try {
     const preferences = await userService.getPreferences(req.session.userId!);
@@ -119,7 +144,11 @@ router.get('/preferences', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Update preferences
+/**
+ * PUT /api/users/preferences
+ * Updates discovery preferences with validation.
+ * Validates age range (18+), distance (1-500km), and gender interests.
+ */
 router.put('/preferences', requireAuth, async (req: Request, res: Response) => {
   try {
     const { interested_in, age_min, age_max, distance_km, show_me } = req.body;
@@ -170,7 +199,10 @@ router.put('/preferences', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get photos
+/**
+ * GET /api/users/photos
+ * Returns all photos for the authenticated user, ordered by position.
+ */
 router.get('/photos', requireAuth, async (req: Request, res: Response) => {
   try {
     const photos = await userService.getPhotos(req.session.userId!);
@@ -181,7 +213,11 @@ router.get('/photos', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Upload photo
+/**
+ * POST /api/users/photos
+ * Uploads a new profile photo. Maximum 6 photos per user.
+ * Accepts multipart/form-data with 'photo' field.
+ */
 router.post(
   '/photos',
   requireAuth,
@@ -213,7 +249,11 @@ router.post(
   }
 );
 
-// Delete photo
+/**
+ * DELETE /api/users/photos/:photoId
+ * Deletes a photo from the user's profile.
+ * Only allows deletion of own photos.
+ */
 router.delete('/photos/:photoId', requireAuth, async (req: Request, res: Response) => {
   try {
     const { photoId } = req.params;

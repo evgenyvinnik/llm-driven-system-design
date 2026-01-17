@@ -1,3 +1,10 @@
+/**
+ * Feed API routes.
+ * Provides endpoints for retrieving news feeds, stories, and search functionality.
+ * Supports personalized feeds, topic filtering, breaking news, and trending content.
+ * @module routes/feed
+ */
+
 import { Router, Request, Response } from 'express';
 import {
   getPersonalizedFeed,
@@ -11,7 +18,11 @@ import { searchArticles } from '../db/elasticsearch.js';
 
 const router = Router();
 
-// Get personalized feed
+/**
+ * GET /feed - Get personalized news feed
+ * Returns stories ranked by relevance, freshness, quality, and trending signals.
+ * Authenticated users receive personalized rankings based on their preferences.
+ */
 router.get('/feed', async (req: Request, res: Response) => {
   try {
     const userId = (req.session as { userId?: string })?.userId || null;
@@ -26,7 +37,10 @@ router.get('/feed', async (req: Request, res: Response) => {
   }
 });
 
-// Get feed by topic
+/**
+ * GET /feed/topic/:topic - Get feed filtered by topic
+ * Returns stories matching the specified topic, ordered by velocity and recency.
+ */
 router.get('/feed/topic/:topic', async (req: Request, res: Response) => {
   try {
     const { topic } = req.params;
@@ -41,7 +55,10 @@ router.get('/feed/topic/:topic', async (req: Request, res: Response) => {
   }
 });
 
-// Get breaking news
+/**
+ * GET /breaking - Get breaking news stories
+ * Returns stories marked as breaking or with high velocity (> 0.5 articles/min).
+ */
 router.get('/breaking', async (_req: Request, res: Response) => {
   try {
     const stories = await getBreakingNews(10);
@@ -52,7 +69,10 @@ router.get('/breaking', async (_req: Request, res: Response) => {
   }
 });
 
-// Get trending stories
+/**
+ * GET /trending - Get trending stories
+ * Returns stories with the most article coverage in the last 24 hours.
+ */
 router.get('/trending', async (_req: Request, res: Response) => {
   try {
     const stories = await getTrendingStories(10);
@@ -63,7 +83,10 @@ router.get('/trending', async (_req: Request, res: Response) => {
   }
 });
 
-// Get a single story with all articles
+/**
+ * GET /stories/:id - Get a single story with all its articles
+ * Returns full story details including up to 20 article sources.
+ */
 router.get('/stories/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -80,7 +103,10 @@ router.get('/stories/:id', async (req: Request, res: Response) => {
   }
 });
 
-// Get articles for a story
+/**
+ * GET /stories/:id/articles - Get articles for a story
+ * Returns articles belonging to the specified story with source information.
+ */
 router.get('/stories/:id/articles', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -104,7 +130,11 @@ router.get('/stories/:id/articles', async (req: Request, res: Response) => {
   }
 });
 
-// Search articles
+/**
+ * GET /search - Search articles
+ * Full-text search across article titles, summaries, and bodies.
+ * Supports filtering by topics and date range.
+ */
 router.get('/search', async (req: Request, res: Response) => {
   try {
     const q = req.query.q as string;
@@ -159,7 +189,10 @@ router.get('/search', async (req: Request, res: Response) => {
   }
 });
 
-// Get available topics
+/**
+ * GET /topics - Get available topics with story counts
+ * Returns topics from recent stories, sorted by popularity.
+ */
 router.get('/topics', async (_req: Request, res: Response) => {
   try {
     const result = await query<{ topic: string; count: number }>(

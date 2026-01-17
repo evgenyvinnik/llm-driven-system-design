@@ -1,8 +1,19 @@
-// Health Status Component
+/**
+ * @fileoverview Health Status component for displaying backend service health.
+ *
+ * Shows Redis connection status, ping latency, and server uptime.
+ * Auto-refreshes every 5 seconds to provide real-time health monitoring.
+ */
 
 import { useEffect } from 'react';
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 
+/**
+ * Displays the current health status of the rate limiter backend.
+ * Uses color coding to indicate healthy (green) or unhealthy (red) status.
+ *
+ * @returns Health status card with connection details
+ */
 export function HealthStatus() {
   const { health, fetchHealth } = useRateLimiterStore();
 

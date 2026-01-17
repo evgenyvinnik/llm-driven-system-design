@@ -1,6 +1,16 @@
+/**
+ * Header Component
+ *
+ * Application header with navigation and user controls.
+ * Shows different navigation options based on authentication state and user role.
+ */
 import { Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Main application header.
+ * Displays logo, navigation links, and user authentication status.
+ */
 export function Header() {
   const { user, logout } = useAuthStore();
 

@@ -1,22 +1,45 @@
+/**
+ * Zustand stores for the Apple Pay frontend application.
+ * Provides state management for authentication, wallet, transactions, and payments.
+ */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import api from '../services/api';
 import type { User, Device, Card, Transaction } from '../types';
 
+/**
+ * Authentication store state interface.
+ * Manages user session, devices, and authentication operations.
+ */
 interface AuthState {
+  /** Currently authenticated user or null if not logged in */
   user: User | null;
+  /** Session ID for API authentication */
   sessionId: string | null;
+  /** List of user's registered devices */
   devices: Device[];
+  /** Whether an auth operation is in progress */
   isLoading: boolean;
+  /** Error message from last operation or null */
   error: string | null;
+  /** Authenticates user with email and password */
   login: (email: string, password: string, deviceId?: string) => Promise<void>;
+  /** Creates a new user account */
   register: (email: string, password: string, name: string) => Promise<void>;
+  /** Logs out the current user */
   logout: () => Promise<void>;
+  /** Loads user from stored session */
   loadUser: () => Promise<void>;
+  /** Fetches user's registered devices */
   loadDevices: () => Promise<void>;
+  /** Registers a new device for the user */
   registerDevice: (name: string, type: string) => Promise<Device>;
 }
 
+/**
+ * Zustand store for authentication state.
+ * Persists session ID to localStorage for session recovery.
+ */
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
@@ -98,12 +121,22 @@ export const useAuthStore = create<AuthState>()(
   )
 );
 
+/**
+ * Wallet store state interface.
+ * Manages payment cards and card operations.
+ */
 interface WalletState {
+  /** List of user's provisioned cards */
   cards: Card[];
+  /** Currently selected card for payment */
   selectedCard: Card | null;
+  /** Whether a wallet operation is in progress */
   isLoading: boolean;
+  /** Error message from last operation or null */
   error: string | null;
+  /** Fetches all cards for the user */
   loadCards: () => Promise<void>;
+  /** Provisions a new card to a device */
   addCard: (data: {
     pan: string;
     expiry_month: number;
@@ -112,13 +145,22 @@ interface WalletState {
     card_holder_name: string;
     device_id: string;
   }) => Promise<Card>;
+  /** Temporarily suspends a card */
   suspendCard: (cardId: string, reason?: string) => Promise<void>;
+  /** Reactivates a suspended card */
   reactivateCard: (cardId: string) => Promise<void>;
+  /** Permanently removes a card */
   removeCard: (cardId: string) => Promise<void>;
+  /** Sets a card as the default payment method */
   setDefaultCard: (cardId: string) => Promise<void>;
+  /** Selects a card for payment */
   selectCard: (card: Card | null) => void;
 }
 
+/**
+ * Zustand store for wallet/card state.
+ * Manages card provisioning, suspension, and selection.
+ */
 export const useWalletStore = create<WalletState>((set, get) => ({
   cards: [],
   selectedCard: null,
@@ -171,11 +213,20 @@ export const useWalletStore = create<WalletState>((set, get) => ({
   selectCard: (card) => set({ selectedCard: card }),
 }));
 
+/**
+ * Transaction store state interface.
+ * Manages transaction history with pagination support.
+ */
 interface TransactionState {
+  /** List of loaded transactions */
   transactions: Transaction[];
+  /** Total count of transactions (for pagination) */
   total: number;
+  /** Whether transactions are being fetched */
   isLoading: boolean;
+  /** Error message from last operation or null */
   error: string | null;
+  /** Fetches transactions with optional filtering */
   loadTransactions: (options?: {
     limit?: number;
     offset?: number;
@@ -184,6 +235,10 @@ interface TransactionState {
   }) => Promise<void>;
 }
 
+/**
+ * Zustand store for transaction history.
+ * Supports pagination and filtering by card/status.
+ */
 export const useTransactionStore = create<TransactionState>((set) => ({
   transactions: [],
   total: 0,
@@ -201,13 +256,24 @@ export const useTransactionStore = create<TransactionState>((set) => ({
   },
 }));
 
+/**
+ * Payment store state interface.
+ * Manages biometric authentication and payment processing.
+ */
 interface PaymentState {
+  /** Current biometric session ID or null */
   biometricSession: string | null;
+  /** Whether biometric auth is in progress */
   isAuthenticating: boolean;
+  /** Whether payment is being processed */
   isProcessing: boolean;
+  /** Error message from last operation or null */
   error: string | null;
+  /** Initiates a biometric authentication session */
   initiateBiometric: (deviceId: string, authType: string) => Promise<string>;
+  /** Simulates successful biometric auth (demo only) */
   simulateBiometric: (sessionId: string) => Promise<void>;
+  /** Processes a payment transaction */
   processPayment: (data: {
     card_id: string;
     amount: number;
@@ -215,9 +281,14 @@ interface PaymentState {
     merchant_id: string;
     transaction_type: string;
   }) => Promise<{ success: boolean; transaction_id?: string; auth_code?: string; error?: string }>;
+  /** Clears the current biometric session */
   clearBiometricSession: () => void;
 }
 
+/**
+ * Zustand store for payment operations.
+ * Handles biometric authentication flow and payment processing.
+ */
 export const usePaymentStore = create<PaymentState>((set) => ({
   biometricSession: null,
   isAuthenticating: false,

@@ -1,10 +1,21 @@
+/**
+ * Reusable UI components for the job scheduler dashboard.
+ * Provides consistent styling for common UI elements.
+ * @module components/UI
+ */
+
 import { JobStatus, ExecutionStatus } from '../types';
 
+/** Props for the StatusBadge component */
 interface StatusBadgeProps {
   status: JobStatus | ExecutionStatus;
   size?: 'sm' | 'md';
 }
 
+/**
+ * Displays a colored badge for job or execution status.
+ * Colors are defined via CSS classes matching status names.
+ */
 export function StatusBadge({ status, size = 'md' }: StatusBadgeProps) {
   const statusLower = status.toLowerCase();
   const sizeClasses = size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-0.5 text-sm';
@@ -18,6 +29,7 @@ export function StatusBadge({ status, size = 'md' }: StatusBadgeProps) {
   );
 }
 
+/** Props for the MetricCard component */
 interface MetricCardProps {
   title: string;
   value: number | string;
@@ -25,6 +37,10 @@ interface MetricCardProps {
   trend?: 'up' | 'down' | 'neutral';
 }
 
+/**
+ * Displays a metric value in a card format.
+ * Used on the dashboard for showing system statistics.
+ */
 export function MetricCard({ title, value, subtitle, trend }: MetricCardProps) {
   const trendColors = {
     up: 'text-green-600',
@@ -55,11 +71,15 @@ export function MetricCard({ title, value, subtitle, trend }: MetricCardProps) {
   );
 }
 
+/** Props for the Button component */
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'danger' | 'success';
   size?: 'sm' | 'md' | 'lg';
 }
 
+/**
+ * Styled button component with variant and size options.
+ */
 export function Button({
   children,
   variant = 'primary',
@@ -90,11 +110,18 @@ export function Button({
   );
 }
 
+/** Props for the Input component */
 interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
+  /** Optional label displayed above the input */
   label?: string;
+  /** Error message to display below the input */
   error?: string;
 }
 
+/**
+ * Styled input field with optional label and error display.
+ * Provides consistent form input styling with validation feedback.
+ */
 export function Input({ label, error, className = '', ...props }: InputProps) {
   return (
     <div>
@@ -114,11 +141,18 @@ export function Input({ label, error, className = '', ...props }: InputProps) {
   );
 }
 
+/** Props for the Select component */
 interface SelectProps extends React.SelectHTMLAttributes<HTMLSelectElement> {
+  /** Optional label displayed above the select */
   label?: string;
+  /** Array of options with value and display label */
   options: { value: string; label: string }[];
 }
 
+/**
+ * Styled select dropdown with label support.
+ * Used for choosing from predefined options in forms.
+ */
 export function Select({ label, options, className = '', ...props }: SelectProps) {
   return (
     <div>
@@ -141,11 +175,18 @@ export function Select({ label, options, className = '', ...props }: SelectProps
   );
 }
 
+/** Props for the TextArea component */
 interface TextAreaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
+  /** Optional label displayed above the textarea */
   label?: string;
+  /** Error message to display below the textarea */
   error?: string;
 }
 
+/**
+ * Multi-line text input with optional label and error display.
+ * Used for longer text content like job payloads or descriptions.
+ */
 export function TextArea({ label, error, className = '', ...props }: TextAreaProps) {
   return (
     <div>
@@ -165,6 +206,11 @@ export function TextArea({ label, error, className = '', ...props }: TextAreaPro
   );
 }
 
+/**
+ * Animated loading spinner with size options.
+ * Displays during async operations to indicate loading state.
+ * @param size - Spinner size: 'sm' (16px), 'md' (32px), or 'lg' (48px)
+ */
 export function Spinner({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
   const sizeClasses = {
     sm: 'h-4 w-4',
@@ -181,13 +227,22 @@ export function Spinner({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
   );
 }
 
+/** Props for the Modal component */
 interface ModalProps {
+  /** Controls modal visibility */
   isOpen: boolean;
+  /** Callback when modal should close (backdrop click or close action) */
   onClose: () => void;
+  /** Modal header title */
   title: string;
+  /** Modal body content */
   children: React.ReactNode;
 }
 
+/**
+ * Overlay modal dialog for focused interactions.
+ * Used for job creation, editing, and confirmation dialogs.
+ */
 export function Modal({ isOpen, onClose, title, children }: ModalProps) {
   if (!isOpen) return null;
 
@@ -220,12 +275,21 @@ export function Modal({ isOpen, onClose, title, children }: ModalProps) {
   );
 }
 
+/** Props for the Pagination component */
 interface PaginationProps {
+  /** Current page number (1-indexed) */
   page: number;
+  /** Total number of pages available */
   totalPages: number;
+  /** Callback when user navigates to a different page */
   onPageChange: (page: number) => void;
 }
 
+/**
+ * Page navigation controls for paginated lists.
+ * Shows previous/next buttons and current page indicator.
+ * Renders nothing when there's only one page.
+ */
 export function Pagination({ page, totalPages, onPageChange }: PaginationProps) {
   if (totalPages <= 1) return null;
 

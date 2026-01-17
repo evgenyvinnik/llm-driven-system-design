@@ -1,7 +1,24 @@
+/**
+ * Message List Component
+ *
+ * Displays the chat message history for the current room.
+ * Shows a welcome banner at the top of each room and renders
+ * messages with user avatars and timestamps. Auto-scrolls to
+ * new messages and handles system messages with special styling.
+ */
+
 import { useEffect, useRef } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import type { Message } from '../types';
 
+/**
+ * Renders a single chat message.
+ * Displays user avatar, nickname, timestamp, and message content.
+ * System messages are rendered in a muted, italicized style.
+ *
+ * @param props.message - The message to display
+ * @returns Formatted message row with avatar and content
+ */
 function MessageItem({ message }: { message: Message }) {
   const timestamp = new Date(message.timestamp).toLocaleTimeString('en-US', {
     hour: '2-digit',
@@ -38,6 +55,14 @@ function MessageItem({ message }: { message: Message }) {
   );
 }
 
+/**
+ * Renders the message list container for a chat room.
+ * Shows welcome message when no room is selected, loading state
+ * while fetching messages, and the message history when ready.
+ * Automatically scrolls to the bottom on new messages.
+ *
+ * @returns Scrollable message container with room header
+ */
 export function MessageList() {
   const { messages, currentRoom, isLoadingMessages } = useChatStore();
   const messagesEndRef = useRef<HTMLDivElement>(null);

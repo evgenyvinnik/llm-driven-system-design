@@ -1,3 +1,9 @@
+/**
+ * Admin dashboard page route.
+ * Provides system statistics and news source management.
+ * @module routes/admin
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores';
@@ -15,10 +21,20 @@ import {
   Play,
 } from 'lucide-react';
 
+/**
+ * Admin page route configuration.
+ * Protected route - requires admin role.
+ */
 export const Route = createFileRoute('/admin')({
   component: AdminPage,
 });
 
+/**
+ * Admin dashboard component.
+ * Shows system statistics and provides source management.
+ * Requires admin role - redirects to home if not admin.
+ * @returns Admin dashboard with stats and source table
+ */
 function AdminPage() {
   const navigate = useNavigate();
   const { user } = useAuthStore();
@@ -30,6 +46,7 @@ function AdminPage() {
   const [showAddSource, setShowAddSource] = useState(false);
   const [newSource, setNewSource] = useState({ name: '', feed_url: '', category: 'general' });
 
+  // Redirect non-admins and load data on mount
   useEffect(() => {
     if (!user || user.role !== 'admin') {
       navigate({ to: '/' });
@@ -39,6 +56,10 @@ function AdminPage() {
     loadData();
   }, [user, navigate]);
 
+  /**
+   * Load stats and sources from API.
+   * Called on mount and after mutations.
+   */
   const loadData = async () => {
     setIsLoading(true);
     try {
@@ -55,6 +76,10 @@ function AdminPage() {
     }
   };
 
+  /**
+   * Trigger crawl of all due sources.
+   * Shows result message and refreshes data.
+   */
   const handleTriggerCrawl = async () => {
     setIsCrawling(true);
     setCrawlMessage(null);
@@ -69,6 +94,10 @@ function AdminPage() {
     }
   };
 
+  /**
+   * Handle add source form submission.
+   * Creates source and updates table.
+   */
   const handleAddSource = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -81,6 +110,10 @@ function AdminPage() {
     }
   };
 
+  /**
+   * Delete a source after confirmation.
+   * @param id - Source UUID to delete
+   */
   const handleDeleteSource = async (id: string) => {
     if (!confirm('Are you sure you want to delete this source?')) return;
     try {
@@ -91,6 +124,10 @@ function AdminPage() {
     }
   };
 
+  /**
+   * Manually trigger crawl for a single source.
+   * @param id - Source UUID to crawl
+   */
   const handleCrawlSource = async (id: string) => {
     try {
       const result = await adminApi.crawlSource(id);

@@ -1,10 +1,28 @@
+/**
+ * Video Player Component
+ *
+ * Displays the video player or a placeholder for the live stream.
+ * Shows a LIVE indicator and handles video autoplay.
+ *
+ * @module components/VideoPlayer
+ */
+
 import { useRef, useEffect } from 'react';
 import { Stream } from '../types';
 
+/** Props for the VideoPlayer component */
 interface VideoPlayerProps {
+  /** Stream to display */
   stream: Stream;
 }
 
+/**
+ * Renders a video player for the current stream.
+ * Falls back to a placeholder if no video URL is provided.
+ *
+ * @param props - Component props containing the stream
+ * @returns Video player JSX
+ */
 export function VideoPlayer({ stream }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 

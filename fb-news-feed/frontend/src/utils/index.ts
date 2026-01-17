@@ -1,3 +1,16 @@
+/**
+ * @fileoverview Utility functions for the News Feed frontend.
+ * Provides date formatting, number abbreviation, and UI helpers.
+ */
+
+/**
+ * Formats a date string into a human-readable relative time.
+ * Shows "Just now" for < 1 minute, "Xm" for minutes, "Xh" for hours,
+ * "Xd" for days, "Xw" for weeks, or the actual date for older posts.
+ *
+ * @param dateString - ISO date string to format
+ * @returns Human-readable relative time string
+ */
 export function formatRelativeTime(dateString: string): string {
   const date = new Date(dateString);
   const now = new Date();
@@ -27,6 +40,13 @@ export function formatRelativeTime(dateString: string): string {
   }
 }
 
+/**
+ * Abbreviates large numbers for display (e.g., 1500 -> "1.5K").
+ * Supports K (thousands) and M (millions) suffixes.
+ *
+ * @param num - Number to format
+ * @returns Abbreviated string representation
+ */
 export function formatNumber(num: number): string {
   if (num >= 1000000) {
     return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
@@ -37,6 +57,13 @@ export function formatNumber(num: number): string {
   return num.toString();
 }
 
+/**
+ * Extracts initials from a name for avatar display.
+ * Takes first letter of first two words, uppercase.
+ *
+ * @param name - Full name to extract initials from
+ * @returns 1-2 character uppercase initials string
+ */
 export function getInitials(name: string): string {
   return name
     .split(' ')
@@ -46,6 +73,13 @@ export function getInitials(name: string): string {
     .slice(0, 2);
 }
 
+/**
+ * Utility function for conditionally joining class names.
+ * Filters out falsy values and joins remaining strings with spaces.
+ *
+ * @param classes - Array of class names or falsy values
+ * @returns Space-separated string of truthy class names
+ */
 export function cn(...classes: (string | boolean | undefined | null)[]): string {
   return classes.filter(Boolean).join(' ');
 }

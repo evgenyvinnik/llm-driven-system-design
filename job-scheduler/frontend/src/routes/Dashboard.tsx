@@ -1,9 +1,19 @@
+/**
+ * Dashboard page showing system overview and recent activity.
+ * Displays key metrics, worker status, and recent jobs.
+ * @module routes/Dashboard
+ */
+
 import { useEffect } from 'react';
 import { Link } from '@tanstack/react-router';
 import { useMetricsStore, useJobsStore } from '../stores';
 import { MetricCard, Spinner } from '../components/UI';
 import { JobTable } from '../components/JobCard';
 
+/**
+ * Main dashboard view with system metrics and job overview.
+ * Auto-refreshes metrics every 5 seconds for real-time monitoring.
+ */
 export function DashboardPage() {
   const { metrics, loading: metricsLoading, fetchMetrics, fetchWorkers } = useMetricsStore();
   const { jobs, loading: jobsLoading, fetchJobs, pauseJob, resumeJob, triggerJob, deleteJob } = useJobsStore();

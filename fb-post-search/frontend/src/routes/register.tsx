@@ -1,7 +1,16 @@
+/**
+ * @fileoverview Registration page route.
+ * Provides new user account creation form.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Registration form component.
+ * Handles new user account creation with validation.
+ */
 function RegisterPage() {
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
@@ -152,6 +161,9 @@ function RegisterPage() {
   );
 }
 
+/**
+ * TanStack Router file route for the registration page.
+ */
 export const Route = createFileRoute('/register')({
   component: RegisterPage,
 });

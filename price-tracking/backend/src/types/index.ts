@@ -1,3 +1,10 @@
+/**
+ * Type definitions for the Price Tracking backend.
+ * Defines database models, API request/response shapes, and internal types.
+ * @module types
+ */
+
+/** Registered user in the system */
 export interface User {
   id: string;
   email: string;
@@ -8,6 +15,7 @@ export interface User {
   updated_at: Date;
 }
 
+/** Product being tracked for price changes */
 export interface Product {
   id: string;
   url: string;
@@ -23,6 +31,7 @@ export interface Product {
   updated_at: Date;
 }
 
+/** User subscription to a product with alert settings */
 export interface UserProduct {
   id: string;
   user_id: string;
@@ -32,6 +41,7 @@ export interface UserProduct {
   created_at: Date;
 }
 
+/** Historical price record for a product */
 export interface PriceHistory {
   id: string;
   product_id: string;
@@ -41,6 +51,7 @@ export interface PriceHistory {
   availability: boolean;
 }
 
+/** Price change notification sent to a user */
 export interface Alert {
   id: string;
   user_id: string;
@@ -53,6 +64,7 @@ export interface Alert {
   created_at: Date;
 }
 
+/** Domain-specific scraper configuration */
 export interface ScraperConfig {
   id: string;
   domain: string;
@@ -68,6 +80,7 @@ export interface ScraperConfig {
   updated_at: Date;
 }
 
+/** User authentication session */
 export interface Session {
   id: string;
   user_id: string;
@@ -76,28 +89,32 @@ export interface Session {
   created_at: Date;
 }
 
-// API Request/Response types
+/** Request body for adding a new product to track */
 export interface CreateProductRequest {
   url: string;
   target_price?: number;
   notify_any_drop?: boolean;
 }
 
+/** Request body for updating product tracking settings */
 export interface UpdateUserProductRequest {
   target_price?: number;
   notify_any_drop?: boolean;
 }
 
+/** Request body for user login */
 export interface LoginRequest {
   email: string;
   password: string;
 }
 
+/** Request body for user registration */
 export interface RegisterRequest {
   email: string;
   password: string;
 }
 
+/** Query parameters for price history retrieval */
 export interface PriceHistoryParams {
   product_id: string;
   start_date?: Date;
@@ -105,6 +122,7 @@ export interface PriceHistoryParams {
   granularity?: 'hour' | 'day' | 'week';
 }
 
+/** Aggregated daily price statistics from TimescaleDB */
 export interface DailyPriceSummary {
   day: Date;
   min_price: number;
@@ -113,6 +131,7 @@ export interface DailyPriceSummary {
   data_points: number;
 }
 
+/** Product with user-specific subscription settings merged */
 export interface ProductWithTracking extends Product {
   target_price?: number | null;
   notify_any_drop?: boolean;
@@ -120,6 +139,7 @@ export interface ProductWithTracking extends Product {
   watcher_count?: number;
 }
 
+/** Data extracted from a scraped product page */
 export interface ScrapedData {
   price: number | null;
   title: string | null;
@@ -128,6 +148,7 @@ export interface ScrapedData {
   currency: string;
 }
 
+/** Scrape job queued for processing */
 export interface ScrapeJob {
   product_id: string;
   url: string;

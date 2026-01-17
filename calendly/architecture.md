@@ -459,6 +459,370 @@ Following the repository's preferred open-source stack:
    - Allow users to delete their data (GDPR compliance)
    - Anonymize booking data for analytics
 
+## Data Lifecycle Policies
+
+### Retention and TTL
+
+| Data Type | Retention Period | Storage Location | Notes |
+|-----------|-----------------|------------------|-------|
+| Active bookings | Indefinite (until completed/cancelled) | PostgreSQL | Primary working set |
+| Completed bookings | 90 days | PostgreSQL | For rescheduling reference and analytics |
+| Archived bookings | 2 years | PostgreSQL archive table | Legal/audit requirements |
+| Calendar event cache | 24 hours | PostgreSQL + Valkey | Refreshed on sync |
+| Availability cache | 5 minutes | Valkey | Invalidated on booking |
+| OAuth tokens | Until revoked | PostgreSQL (encrypted) | Rotate refresh tokens monthly |
+| Notification queue messages | 7 days | RabbitMQ | Dead-letter queue for failures |
+| Rate limiting counters | 1 hour sliding window | Valkey | Auto-expire with TTL |
+
+### Archival Strategy
+
+**Bookings Archival (Local Development)**:
+```sql
+-- Run monthly via cron job or manual script
+-- Move completed bookings older than 90 days to archive table
+
+CREATE TABLE bookings_archive (LIKE bookings INCLUDING ALL);
+
+-- Archive script (run with: npm run db:archive-bookings)
+INSERT INTO bookings_archive
+SELECT * FROM bookings
+WHERE status IN ('completed', 'cancelled')
+  AND end_time < NOW() - INTERVAL '90 days';
+
+DELETE FROM bookings
+WHERE status IN ('completed', 'cancelled')
+  AND end_time < NOW() - INTERVAL '90 days';
+```
+
+**Calendar Cache Cleanup**:
+```sql
+-- Clean up expired calendar event cache entries daily
+DELETE FROM calendar_events_cache
+WHERE expires_at < NOW();
+```
+
+### Backfill and Replay Procedures
+
+**Calendar Sync Backfill**:
+When calendar integration is newly connected or after extended downtime:
+```bash
+# Trigger full calendar sync for a user
+npm run calendar:backfill -- --user-id=<uuid> --days-back=30
+
+# Bulk backfill for all users (use sparingly due to API limits)
+npm run calendar:backfill-all -- --days-back=7 --rate-limit=10
+```
+
+**Notification Replay**:
+For failed notifications stored in dead-letter queue:
+```bash
+# View failed notifications
+npm run queue:dlq-inspect -- --queue=notifications
+
+# Replay specific notification
+npm run queue:dlq-replay -- --message-id=<id>
+
+# Replay all failed notifications from last 24 hours
+npm run queue:dlq-replay-all -- --since="24 hours"
+```
+
+**Booking Data Restoration**:
+```bash
+# Restore archived bookings for a user (for support cases)
+npm run db:restore-bookings -- --user-id=<uuid> --from-date=2024-01-01
+
+# Verify booking integrity after restore
+npm run db:verify-bookings -- --user-id=<uuid>
+```
+
+---
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+**Local Development Rollout (2-3 service instances)**:
+
+1. **Blue-Green Deployment (Recommended for Learning)**:
+   ```bash
+   # Terminal 1: Blue instance (current production)
+   PORT=3001 npm run dev:server1
+
+   # Terminal 2: Green instance (new version)
+   PORT=3002 npm run dev:server2
+
+   # Terminal 3: Load balancer pointing to blue (port 3001)
+   npm run dev:lb
+
+   # After testing green instance manually:
+   # Update load balancer config to point to green (port 3002)
+   # Verify all endpoints work
+   # Terminate blue instance
+   ```
+
+2. **Canary Deployment (Advanced)**:
+   ```bash
+   # Configure nginx to split traffic
+   # 90% to stable (port 3001), 10% to canary (port 3002)
+   # Monitor error rates for 15 minutes before full rollout
+   ```
+
+**Deployment Checklist**:
+- [ ] Run `npm run type-check` (TypeScript validation)
+- [ ] Run `npm run test` (all tests pass)
+- [ ] Run `npm run lint` (no linting errors)
+- [ ] Run `npm run db:migrate` (apply pending migrations)
+- [ ] Verify RabbitMQ connection
+- [ ] Verify Valkey/Redis connection
+- [ ] Test booking creation end-to-end
+- [ ] Test availability calculation
+- [ ] Monitor logs for errors for 5 minutes
+
+### Schema Migrations
+
+**Migration Workflow**:
+```bash
+# Create new migration
+npm run db:migrate:create -- --name=add_booking_reminder_sent
+
+# This creates: backend/src/db/migrations/003_add_booking_reminder_sent.sql
+```
+
+**Migration File Template**:
+```sql
+-- Migration: 003_add_booking_reminder_sent
+-- Created: 2024-01-15
+-- Description: Add flag to track reminder email status
+
+-- UP
+ALTER TABLE bookings ADD COLUMN reminder_sent BOOLEAN DEFAULT false;
+CREATE INDEX idx_bookings_reminder ON bookings(reminder_sent) WHERE reminder_sent = false;
+
+-- DOWN (for rollback)
+-- DROP INDEX idx_bookings_reminder;
+-- ALTER TABLE bookings DROP COLUMN reminder_sent;
+```
+
+**Running Migrations**:
+```bash
+# Apply all pending migrations
+npm run db:migrate
+
+# Check migration status
+npm run db:migrate:status
+
+# Rollback last migration (manual - requires editing migration file)
+npm run db:migrate:rollback -- --steps=1
+```
+
+**Migration Safety Rules**:
+1. Never drop columns in the same release as code changes - use two-phase approach
+2. Add new columns as nullable or with defaults
+3. Create indexes concurrently when possible: `CREATE INDEX CONCURRENTLY`
+4. Test migrations on a copy of production data before applying
+5. Keep migrations small and focused (one change per migration)
+
+### Rollback Runbooks
+
+**Scenario 1: Bad Code Deployment (No Database Changes)**
+```bash
+# 1. Identify the issue in logs
+npm run logs:tail
+
+# 2. Stop the new instance
+# Ctrl+C on the new server process
+
+# 3. Restart with previous code version
+git checkout <previous-commit>
+npm run dev:server1
+
+# 4. Verify functionality
+curl http://localhost:3001/health
+```
+
+**Scenario 2: Failed Database Migration**
+```bash
+# 1. Stop all application servers to prevent data corruption
+
+# 2. Check migration status
+npm run db:migrate:status
+
+# 3. Manual rollback (execute DOWN section of migration)
+psql $DATABASE_URL -f backend/src/db/rollback/003_rollback.sql
+
+# 4. Update migration tracking
+psql $DATABASE_URL -c "DELETE FROM schema_migrations WHERE version = '003';"
+
+# 5. Restart application with previous code version
+git checkout <previous-commit>
+npm run dev
+```
+
+**Scenario 3: RabbitMQ Queue Backup**
+```bash
+# 1. Check queue depth
+npm run queue:status
+
+# 2. Pause consumers (let messages accumulate)
+npm run queue:pause -- --queue=notifications
+
+# 3. Investigate and fix the issue
+
+# 4. Resume consumers
+npm run queue:resume -- --queue=notifications
+
+# 5. Monitor queue draining
+watch 'npm run queue:status'
+```
+
+**Scenario 4: Cache Corruption (Valkey/Redis)**
+```bash
+# 1. Flush specific cache prefix
+npm run cache:flush -- --prefix=availability:*
+
+# 2. Or flush all caches (nuclear option)
+npm run cache:flush-all
+
+# 3. Application will rebuild cache on next request
+# Monitor cache hit rates
+```
+
+---
+
+## Capacity and Cost Guardrails
+
+### Alert Thresholds
+
+**RabbitMQ Queue Monitoring**:
+| Queue | Warning Threshold | Critical Threshold | Action |
+|-------|------------------|-------------------|--------|
+| notifications | 100 messages | 500 messages | Scale consumers or check email service |
+| calendar-sync | 50 messages | 200 messages | Check calendar API rate limits |
+| dead-letter | 10 messages | 50 messages | Investigate failed messages |
+
+**Prometheus Alert Rules** (for local Grafana setup):
+```yaml
+# prometheus/alerts.yml
+groups:
+  - name: calendly_alerts
+    rules:
+      - alert: QueueLagHigh
+        expr: rabbitmq_queue_messages{queue="notifications"} > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification queue lag exceeds 100 messages"
+
+      - alert: QueueLagCritical
+        expr: rabbitmq_queue_messages{queue="notifications"} > 500
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Notification queue lag critical - check email service"
+
+      - alert: CacheHitRateLow
+        expr: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m])) < 0.7
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 70% - review cache strategy"
+
+      - alert: BookingLatencyHigh
+        expr: histogram_quantile(0.95, rate(booking_create_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Booking creation p95 latency exceeds 500ms"
+```
+
+### Storage Growth Monitoring
+
+**PostgreSQL Table Sizes** (check weekly):
+```sql
+-- Run to monitor table growth
+SELECT
+  schemaname || '.' || tablename AS table_name,
+  pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
+  pg_size_pretty(pg_relation_size(schemaname || '.' || tablename)) AS table_size,
+  pg_size_pretty(pg_indexes_size(schemaname || '.' || tablename)) AS index_size
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY pg_total_relation_size(schemaname || '.' || tablename) DESC;
+```
+
+**Storage Thresholds** (Local Development):
+| Resource | Warning | Critical | Action |
+|----------|---------|----------|--------|
+| PostgreSQL total | 5 GB | 10 GB | Run archival scripts |
+| bookings table | 2 GB | 5 GB | Archive old bookings |
+| calendar_events_cache | 500 MB | 1 GB | Reduce cache TTL or clean up |
+| Valkey memory | 256 MB | 512 MB | Review cache eviction policy |
+| RabbitMQ disk | 1 GB | 2 GB | Purge old messages |
+
+### Cache Hit Rate Targets
+
+| Cache Type | Target Hit Rate | Minimum Acceptable | Improvement Actions |
+|------------|-----------------|-------------------|---------------------|
+| Availability slots | 80% | 70% | Increase TTL to 10 min, pre-warm popular users |
+| Calendar events | 85% | 75% | Batch calendar fetches, use webhook updates |
+| User profiles | 95% | 90% | Increase TTL, cache is stable data |
+| Meeting types | 95% | 90% | Invalidate only on explicit update |
+
+**Cache Monitoring Script**:
+```bash
+# Add to package.json scripts
+# "cache:stats": "node scripts/cache-stats.js"
+
+# scripts/cache-stats.js outputs:
+# - Total keys by prefix
+# - Memory usage
+# - Hit/miss rates (from application metrics)
+# - TTL distribution
+```
+
+### Cost Optimization (Local Development Context)
+
+**Resource Limits for Docker Compose**:
+```yaml
+# docker-compose.yml resource limits
+services:
+  postgres:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  valkey:
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  rabbitmq:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+```
+
+**Development vs. "Production-like" Configuration**:
+| Setting | Development | Production-like |
+|---------|-------------|-----------------|
+| PostgreSQL connections | 5 | 20 |
+| Valkey max memory | 64 MB | 256 MB |
+| RabbitMQ prefetch | 1 | 10 |
+| Calendar sync interval | 30 min | 10 min |
+| Availability cache TTL | 1 min | 5 min |
+| Log level | debug | info |
+
+---
+
 ## Future Optimizations
 
 1. **Intelligent Availability Prediction**

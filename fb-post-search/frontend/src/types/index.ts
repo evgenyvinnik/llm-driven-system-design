@@ -1,6 +1,21 @@
+/**
+ * @fileoverview Frontend type definitions for the post search application.
+ * Mirrors backend types for consistent API communication.
+ */
+
+/**
+ * Post visibility levels determining who can see a post.
+ */
 export type Visibility = 'public' | 'friends' | 'friends_of_friends' | 'private';
+
+/**
+ * Content type classification for posts.
+ */
 export type PostType = 'text' | 'photo' | 'video' | 'link';
 
+/**
+ * User profile information returned from the API.
+ */
 export interface User {
   id: string;
   username: string;
@@ -10,6 +25,9 @@ export interface User {
   role: 'user' | 'admin';
 }
 
+/**
+ * Individual search result with highlighted snippet.
+ */
 export interface SearchResult {
   post_id: string;
   author_id: string;
@@ -26,6 +44,9 @@ export interface SearchResult {
   relevance_score: number;
 }
 
+/**
+ * Filter criteria for narrowing search results.
+ */
 export interface SearchFilters {
   date_range?: {
     start?: string;
@@ -36,6 +57,9 @@ export interface SearchFilters {
   visibility?: Visibility[];
 }
 
+/**
+ * Search API response with paginated results and metadata.
+ */
 export interface SearchResponse {
   results: SearchResult[];
   next_cursor?: string;
@@ -43,12 +67,18 @@ export interface SearchResponse {
   took_ms: number;
 }
 
+/**
+ * Typeahead/autocomplete suggestion item.
+ */
 export interface SearchSuggestion {
   text: string;
   type: 'query' | 'hashtag' | 'user';
   score: number;
 }
 
+/**
+ * Post model for display in feeds and results.
+ */
 export interface Post {
   id: string;
   author_id: string;
@@ -64,6 +94,9 @@ export interface Post {
   updated_at: string;
 }
 
+/**
+ * Admin dashboard statistics.
+ */
 export interface AdminStats {
   users: {
     total: number;
@@ -84,6 +117,9 @@ export interface AdminStats {
   } | null;
 }
 
+/**
+ * Search history entry for admin viewing.
+ */
 export interface SearchHistoryEntry {
   id: string;
   query: string;

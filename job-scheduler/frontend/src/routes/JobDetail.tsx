@@ -1,3 +1,9 @@
+/**
+ * Job detail page showing full job configuration and execution history.
+ * Provides job lifecycle actions and paginated execution list.
+ * @module routes/JobDetail
+ */
+
 import { useEffect } from 'react';
 import { useParams, Link } from '@tanstack/react-router';
 import { useJobsStore, useExecutionsStore } from '../stores';
@@ -5,6 +11,10 @@ import { Button, Spinner, StatusBadge, Pagination } from '../components/UI';
 import { ExecutionList } from '../components/ExecutionList';
 import { JobStatus } from '../types';
 
+/**
+ * Detailed view of a single job with metadata and executions.
+ * Shows job configuration, payload, and full execution history.
+ */
 export function JobDetailPage() {
   const { jobId } = useParams({ from: '/jobs/$jobId' });
   const { selectedJob, loading: jobLoading, fetchJob, pauseJob, resumeJob, triggerJob, deleteJob } = useJobsStore();

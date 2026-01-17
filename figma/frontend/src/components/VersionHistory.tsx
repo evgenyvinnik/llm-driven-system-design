@@ -1,13 +1,29 @@
-import React, { useState, useEffect } from 'react';
+/**
+ * Version history modal component for managing file versions.
+ * Allows viewing, creating, and restoring version snapshots.
+ */
+import { useState, useEffect } from 'react';
 import { useEditorStore } from '../stores/editorStore';
 import { api } from '../services/api';
 import type { FileVersion } from '../types';
 
+/**
+ * Props for the VersionHistory component.
+ */
 interface VersionHistoryProps {
+  /** The file ID to show versions for */
   fileId: string;
+  /** Callback when the modal should be closed */
   onClose: () => void;
 }
 
+/**
+ * VersionHistory component displaying a modal with version management.
+ * Shows a list of saved versions with timestamps and allows restore.
+ * Supports creating new named versions.
+ * @param props - Component props
+ * @returns The rendered version history modal
+ */
 export function VersionHistory({ fileId, onClose }: VersionHistoryProps) {
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [loading, setLoading] = useState(true);

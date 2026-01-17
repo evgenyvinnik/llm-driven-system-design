@@ -1,4 +1,10 @@
+/**
+ * Type definitions for the Google Docs clone frontend.
+ * Mirrors backend types but with string dates (from JSON serialization).
+ */
+
 // User types
+/** User data received from API (excludes sensitive fields like password_hash) */
 export interface User {
   id: string;
   email: string;
@@ -8,6 +14,7 @@ export interface User {
 }
 
 // Document types
+/** Main document entity with ProseMirror content */
 export interface Document {
   id: string;
   title: string;
@@ -21,11 +28,13 @@ export interface Document {
   owner?: User;
 }
 
+/** ProseMirror document content structure */
 export interface DocumentContent {
   type: 'doc';
   content: DocumentNode[];
 }
 
+/** A node in the ProseMirror document tree */
 export interface DocumentNode {
   type: string;
   attrs?: Record<string, unknown>;
@@ -34,14 +43,17 @@ export interface DocumentNode {
   marks?: Mark[];
 }
 
+/** Text formatting mark (bold, italic, etc.) */
 export interface Mark {
   type: string;
   attrs?: Record<string, unknown>;
 }
 
 // Permission types
+/** Access levels for document permissions */
 export type PermissionLevel = 'view' | 'comment' | 'edit';
 
+/** Permission grant record for document sharing */
 export interface DocumentPermission {
   id: string;
   document_id: string;
@@ -53,6 +65,7 @@ export interface DocumentPermission {
 }
 
 // Document list item
+/** Lightweight document representation for list views */
 export interface DocumentListItem {
   id: string;
   title: string;
@@ -65,6 +78,7 @@ export interface DocumentListItem {
 }
 
 // Version types
+/** Document version snapshot for history */
 export interface DocumentVersion {
   id: string;
   version_number: number;
@@ -77,6 +91,7 @@ export interface DocumentVersion {
 }
 
 // Comment types
+/** Comment or reply on a document */
 export interface Comment {
   id: string;
   document_id: string;
@@ -94,9 +109,13 @@ export interface Comment {
 }
 
 // Suggestion types
+/** Types of edit suggestions */
 export type SuggestionType = 'insert' | 'delete' | 'replace';
+
+/** Status of a suggestion */
 export type SuggestionStatus = 'pending' | 'accepted' | 'rejected';
 
+/** Proposed edit that can be accepted or rejected */
 export interface Suggestion {
   id: string;
   document_id: string;
@@ -114,6 +133,7 @@ export interface Suggestion {
 }
 
 // Presence types
+/** User presence information for real-time collaboration */
 export interface PresenceState {
   user_id: string;
   name: string;
@@ -124,6 +144,7 @@ export interface PresenceState {
 }
 
 // WebSocket message types
+/** All possible WebSocket message types */
 export type WSMessageType =
   | 'CONNECTED'
   | 'SUBSCRIBE'
@@ -135,6 +156,7 @@ export type WSMessageType =
   | 'CURSOR'
   | 'ERROR';
 
+/** WebSocket message payload for real-time communication */
 export interface WSMessage {
   type: WSMessageType;
   doc_id?: string;
@@ -148,6 +170,7 @@ export interface WSMessage {
 }
 
 // Operation types
+/** OT operation union type for insert, delete, retain, and format */
 export type Operation =
   | { type: 'insert'; position: number; text: string; attrs?: Record<string, unknown> }
   | { type: 'delete'; position: number; length: number }
@@ -155,6 +178,7 @@ export type Operation =
   | { type: 'format'; position: number; length: number; mark: string; value: boolean | string };
 
 // API Response types
+/** Standard API response wrapper for all endpoints */
 export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;

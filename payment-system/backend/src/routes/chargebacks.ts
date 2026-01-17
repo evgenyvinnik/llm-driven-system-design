@@ -2,11 +2,17 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { ChargebackService } from '../services/refund.service.js';
 
+/**
+ * Chargeback routes module.
+ * Provides endpoints for viewing and responding to chargebacks
+ * initiated by card issuers on behalf of customers.
+ */
 const router = Router();
 const chargebackService = new ChargebackService();
 
 /**
- * List chargebacks for merchant
+ * Lists all chargebacks for the authenticated merchant.
+ * Supports filtering by status and pagination.
  * GET /api/v1/chargebacks
  */
 router.get('/', async (req: Request, res: Response) => {
@@ -40,7 +46,8 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 /**
- * Get a specific chargeback
+ * Retrieves a specific chargeback by ID.
+ * Only returns chargebacks owned by the authenticated merchant.
  * GET /api/v1/chargebacks/:id
  */
 router.get('/:id', async (req: Request, res: Response) => {
@@ -70,7 +77,8 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * Update chargeback status (submit evidence result)
+ * Submits evidence in response to a chargeback.
+ * In production, this would forward evidence to the card network.
  * POST /api/v1/chargebacks/:id/respond
  */
 router.post('/:id/respond', async (req: Request, res: Response) => {

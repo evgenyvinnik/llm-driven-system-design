@@ -1,14 +1,26 @@
+/**
+ * @fileoverview Type definitions for the App Store backend.
+ * Defines all domain models, API request/response types, and database entities.
+ */
+
+/**
+ * User account in the system.
+ */
 export interface User {
   id: string;
   email: string;
   username: string;
   displayName: string | null;
+  /** User's role: regular user, developer, or admin */
   role: 'user' | 'developer' | 'admin';
   avatarUrl: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
 
+/**
+ * Developer profile for app publishers.
+ */
 export interface Developer {
   id: string;
   userId: string | null;
@@ -23,6 +35,9 @@ export interface Developer {
   updatedAt: Date;
 }
 
+/**
+ * App category for organizing the catalog.
+ */
 export interface Category {
   id: string;
   name: string;
@@ -35,6 +50,10 @@ export interface Category {
   subcategories?: Category[];
 }
 
+/**
+ * Application listing in the store.
+ * Core entity containing all app metadata.
+ */
 export interface App {
   id: string;
   bundleId: string;
@@ -68,6 +87,9 @@ export interface App {
   screenshots?: Screenshot[];
 }
 
+/**
+ * Screenshot or video preview for an app.
+ */
 export interface Screenshot {
   id: string;
   appId: string;
@@ -77,6 +99,9 @@ export interface Screenshot {
   createdAt: Date;
 }
 
+/**
+ * Version history entry for an app.
+ */
 export interface AppVersion {
   id: string;
   appId: string;
@@ -91,6 +116,9 @@ export interface AppVersion {
   publishedAt: Date | null;
 }
 
+/**
+ * Record of a user's app purchase.
+ */
 export interface Purchase {
   id: string;
   userId: string;
@@ -104,6 +132,9 @@ export interface Purchase {
   expiresAt: Date | null;
 }
 
+/**
+ * User's library entry for an app (owned/downloaded apps).
+ */
 export interface UserApp {
   id: string;
   userId: string;
@@ -114,6 +145,10 @@ export interface UserApp {
   lastDownloadedAt: Date;
 }
 
+/**
+ * User review of an app.
+ * Includes integrity scoring for fake review detection.
+ */
 export interface Review {
   id: string;
   userId: string;
@@ -134,6 +169,9 @@ export interface Review {
   user?: Pick<User, 'id' | 'username' | 'displayName' | 'avatarUrl'>;
 }
 
+/**
+ * Daily ranking entry for app charts.
+ */
 export interface Ranking {
   id: string;
   date: Date;
@@ -145,6 +183,9 @@ export interface Ranking {
   createdAt: Date;
 }
 
+/**
+ * Download event for analytics.
+ */
 export interface DownloadEvent {
   id: string;
   appId: string;
@@ -155,12 +196,22 @@ export interface DownloadEvent {
   downloadedAt: Date;
 }
 
+// =============================================================================
 // API request/response types
+// =============================================================================
+
+/**
+ * Common pagination parameters for list endpoints.
+ */
 export interface PaginationParams {
   page?: number;
   limit?: number;
 }
 
+/**
+ * Generic paginated response wrapper.
+ * @template T - Type of items in the data array
+ */
 export interface PaginatedResponse<T> {
   data: T[];
   pagination: {
@@ -171,6 +222,9 @@ export interface PaginatedResponse<T> {
   };
 }
 
+/**
+ * Search endpoint query parameters.
+ */
 export interface SearchParams extends PaginationParams {
   q?: string;
   category?: string;
@@ -179,6 +233,9 @@ export interface SearchParams extends PaginationParams {
   sortBy?: 'relevance' | 'rating' | 'downloads' | 'date';
 }
 
+/**
+ * Request body for creating a new app.
+ */
 export interface AppSubmission {
   bundleId: string;
   name: string;
@@ -192,6 +249,9 @@ export interface AppSubmission {
   ageRating: string;
 }
 
+/**
+ * Request body for creating or updating a review.
+ */
 export interface ReviewSubmission {
   rating: number;
   title?: string;

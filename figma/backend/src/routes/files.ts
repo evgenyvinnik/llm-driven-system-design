@@ -2,8 +2,16 @@ import { Router, Request, Response } from 'express';
 import { fileService } from '../services/fileService.js';
 import { getFileUserCount } from '../websocket/handler.js';
 
+/**
+ * Express router for file management REST API endpoints.
+ * Provides CRUD operations for design files and version management.
+ */
 const router = Router();
 
+/**
+ * GET /api/files
+ * Retrieves all design files, ordered by most recently updated.
+ */
 // Get all files
 router.get('/', async (_req: Request, res: Response) => {
   try {
@@ -15,6 +23,10 @@ router.get('/', async (_req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/files/:id
+ * Retrieves a single file by ID with active user count.
+ */
 // Get file by ID
 router.get('/:id', async (req: Request, res: Response) => {
   try {
@@ -33,6 +45,10 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/files
+ * Creates a new design file with the given name.
+ */
 // Create new file
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -52,6 +68,10 @@ router.post('/', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * PATCH /api/files/:id
+ * Updates a file's name.
+ */
 // Update file name
 router.patch('/:id', async (req: Request, res: Response) => {
   try {
@@ -70,6 +90,10 @@ router.patch('/:id', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * DELETE /api/files/:id
+ * Permanently deletes a file.
+ */
 // Delete file
 router.delete('/:id', async (req: Request, res: Response) => {
   try {
@@ -81,6 +105,10 @@ router.delete('/:id', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/files/:id/versions
+ * Retrieves version history for a file.
+ */
 // Get version history
 router.get('/:id/versions', async (req: Request, res: Response) => {
   try {
@@ -93,6 +121,10 @@ router.get('/:id/versions', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/files/:id/versions
+ * Creates a named version snapshot of the current file state.
+ */
 // Create named version
 router.post('/:id/versions', async (req: Request, res: Response) => {
   try {
@@ -107,6 +139,10 @@ router.post('/:id/versions', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/files/:id/versions/:versionId/restore
+ * Restores a file to a previous version state.
+ */
 // Restore version
 router.post('/:id/versions/:versionId/restore', async (req: Request, res: Response) => {
   try {

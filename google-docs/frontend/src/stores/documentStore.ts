@@ -1,44 +1,84 @@
+/**
+ * Document store for managing documents, presence, comments, and versions.
+ * Central state management for the collaborative editing experience.
+ * Uses Zustand for reactive state updates across components.
+ */
+
 import { create } from 'zustand';
 import type { Document, DocumentListItem, PresenceState, Comment, DocumentVersion } from '../types';
 import { documentsApi, commentsApi, versionsApi } from '../services/api';
 
+/**
+ * Document state interface for Zustand store.
+ * Contains document data, presence info, comments, versions, and CRUD actions.
+ */
 interface DocumentState {
+  /** List of all accessible documents for the document list view */
   documents: DocumentListItem[];
+  /** Currently open document with full content */
   currentDocument: Document | null;
+  /** Active collaborators in the current document */
   presence: PresenceState[];
+  /** Comments on the current document */
   comments: Comment[];
+  /** Version history for the current document */
   versions: DocumentVersion[];
+  /** True when a document operation is in progress */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
 
   // Document actions
+  /** Fetches all accessible documents */
   fetchDocuments: () => Promise<void>;
+  /** Fetches a single document with content */
   fetchDocument: (id: string) => Promise<void>;
+  /** Creates a new document */
   createDocument: (title?: string) => Promise<string | null>;
+  /** Updates document metadata */
   updateDocument: (id: string, updates: Partial<Document>) => Promise<void>;
+  /** Soft deletes a document */
   deleteDocument: (id: string) => Promise<void>;
+  /** Sets the current document in state */
   setCurrentDocument: (doc: Document | null) => void;
 
   // Presence actions
+  /** Sets all presence states (typically from WebSocket sync) */
   setPresence: (presence: PresenceState[]) => void;
+  /** Updates a single user's presence */
   updatePresence: (user: PresenceState) => void;
+  /** Removes a user's presence when they leave */
   removePresence: (userId: string) => void;
 
   // Comments actions
+  /** Fetches comments for a document */
   fetchComments: (docId: string) => Promise<void>;
+  /** Adds a new comment */
   addComment: (docId: string, content: string, anchor?: { start: number; end: number; version: number }) => Promise<void>;
+  /** Resolves or unresolves a comment */
   resolveComment: (docId: string, commentId: string, resolved: boolean) => Promise<void>;
+  /** Deletes a comment */
   deleteComment: (docId: string, commentId: string) => Promise<void>;
+  /** Adds a reply to a comment thread */
   replyToComment: (docId: string, parentId: string, content: string) => Promise<void>;
 
   // Versions actions
+  /** Fetches version history for a document */
   fetchVersions: (docId: string) => Promise<void>;
+  /** Creates a named version checkpoint */
   createVersion: (docId: string, name?: string) => Promise<void>;
+  /** Restores document to a previous version */
   restoreVersion: (docId: string, versionNumber: number) => Promise<void>;
 
+  /** Clears any error state */
   clearError: () => void;
 }
 
+/**
+ * Zustand store for document state management.
+ * Manages documents, presence, comments, and version history.
+ * All async actions handle loading and error states internally.
+ */
 export const useDocumentStore = create<DocumentState>((set, get) => ({
   documents: [],
   currentDocument: null,

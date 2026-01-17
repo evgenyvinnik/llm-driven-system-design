@@ -4,10 +4,31 @@ import { useAuthStore } from '../stores/authStore';
 import { api } from '../services/api';
 import type { Notification } from '../types';
 
+/**
+ * Route definition for notifications page (/notifications).
+ * Protected route - redirects unauthenticated users to login.
+ */
 export const Route = createFileRoute('/notifications')({
   component: NotificationsPage,
 });
 
+/**
+ * User notifications center page.
+ *
+ * Displays all notifications for auction events:
+ * - Outbid notifications (red icon)
+ * - Auction won notifications (green icon)
+ * - Auction sold notifications (blue icon)
+ *
+ * Features:
+ * - Click to mark individual notification as read
+ * - "Mark all as read" bulk action
+ * - Links to related auctions
+ * - Relative time display (e.g., "5m ago", "2d ago")
+ * - Visual distinction for unread notifications
+ *
+ * @returns JSX element for the notifications page
+ */
 function NotificationsPage() {
   const navigate = useNavigate();
   const { isAuthenticated } = useAuthStore();

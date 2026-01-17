@@ -1,3 +1,10 @@
+/**
+ * File list item component for the file browser.
+ * Displays a single file or folder with context menu actions.
+ * Supports inline renaming, selection, and file operations.
+ * @module components/FileListItem
+ */
+
 import { useState, useRef } from 'react';
 import { MoreVertical, Download, Trash2, Edit2, Share2, History, FolderInput } from 'lucide-react';
 import { FileItem } from '../types';
@@ -5,18 +12,32 @@ import { FileIcon } from './FileIcon';
 import { formatBytes, formatRelativeDate } from '../utils/format';
 import { filesApi } from '../services/api';
 
+/** Props for the FileListItem component */
 interface FileListItemProps {
+  /** The file or folder to display */
   item: FileItem;
+  /** Whether this item is currently selected */
   isSelected: boolean;
+  /** Callback when item selection is toggled */
   onSelect: () => void;
+  /** Callback when item is opened (double-click or Enter) */
   onOpen: () => void;
+  /** Callback when item is deleted */
   onDelete: () => void;
+  /** Callback when item is renamed */
   onRename: (name: string) => void;
+  /** Callback to open share dialog */
   onShare: () => void;
+  /** Callback to show version history */
   onShowVersions: () => void;
+  /** Callback to open move dialog */
   onMove: () => void;
 }
 
+/**
+ * Renders a file or folder row in the file list.
+ * Includes icon, name, metadata, and context menu for actions.
+ */
 export function FileListItem({
   item,
   isSelected,

@@ -543,6 +543,591 @@ CREATE INDEX idx_pois_category ON pois(category);
 
 ---
 
+## Consistency and Idempotency Semantics
+
+### Write Consistency Model
+
+This system uses different consistency levels based on data criticality:
+
+| Data Type | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Road graph (nodes, segments) | Strong (PostgreSQL transactions) | Infrequent writes, correctness critical |
+| Traffic flow | Eventual (last-write-wins) | High write volume, stale data acceptable for seconds |
+| Incidents | Eventual with conflict resolution | Multiple sources may report same incident |
+| POIs | Strong (PostgreSQL transactions) | User-facing data, consistency matters |
+| User saved places | Strong (PostgreSQL transactions) | Must not lose user data |
+
+### Idempotency Implementation
+
+**GPS Probe Ingestion (Idempotent)**:
+```javascript
+// Each probe has a composite key: deviceId + timestamp
+// Duplicate probes are ignored via UPSERT
+async function ingestProbe(probe) {
+  const idempotencyKey = `${probe.deviceId}:${probe.timestamp}`;
+
+  // Redis check for recent duplicates (24h TTL)
+  const exists = await redis.get(`probe:${idempotencyKey}`);
+  if (exists) {
+    return { status: 'duplicate', processed: false };
+  }
+
+  await redis.setex(`probe:${idempotencyKey}`, 86400, '1');
+  await processProbe(probe);
+  return { status: 'processed', processed: true };
+}
+```
+
+**Incident Reports (Conflict Resolution)**:
+```javascript
+// Multiple users may report same incident
+// Merge strategy: earliest report wins, aggregate confidence
+async function reportIncident(report) {
+  const existing = await findNearbyIncident(report.location, 100); // 100m radius
+
+  if (existing) {
+    // Merge: increase confidence, update last_seen
+    await db.query(`
+      UPDATE incidents
+      SET confidence = LEAST(confidence + 0.1, 1.0),
+          sample_count = sample_count + 1,
+          last_reported_at = NOW()
+      WHERE id = $1
+    `, [existing.id]);
+    return { action: 'merged', incidentId: existing.id };
+  }
+
+  // New incident with idempotency key
+  const idempotencyKey = report.clientRequestId;
+  const result = await db.query(`
+    INSERT INTO incidents (id, segment_id, location, type, reported_at, idempotency_key)
+    VALUES ($1, $2, $3, $4, NOW(), $5)
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING id
+  `, [uuid(), report.segmentId, report.location, report.type, idempotencyKey]);
+
+  return { action: result.rowCount ? 'created' : 'duplicate' };
+}
+```
+
+### Replay Handling
+
+For queue-based processing (GPS probes, traffic updates):
+
+1. **At-least-once delivery**: RabbitMQ with manual acknowledgment
+2. **Deduplication window**: Redis set with 24h TTL for probe IDs
+3. **Idempotent writes**: PostgreSQL UPSERT for traffic_flow table
+
+```sql
+-- Traffic flow upsert (idempotent)
+INSERT INTO traffic_flow (segment_id, timestamp, speed_kph, sample_count)
+VALUES ($1, date_trunc('minute', $2), $3, 1)
+ON CONFLICT (segment_id, timestamp) DO UPDATE SET
+  speed_kph = (traffic_flow.speed_kph * traffic_flow.sample_count + EXCLUDED.speed_kph)
+              / (traffic_flow.sample_count + 1),
+  sample_count = traffic_flow.sample_count + 1;
+```
+
+---
+
+## Observability
+
+### Metrics (Prometheus Format)
+
+**Routing Service Metrics**:
+```prometheus
+# Route calculation latency
+routing_request_duration_seconds{route_type="primary|alternative"}
+
+# Route success/failure
+routing_requests_total{status="success|no_route|error"}
+
+# Graph operations
+routing_nodes_visited_total
+routing_path_length_meters
+
+# Cache effectiveness
+tile_cache_hits_total
+tile_cache_misses_total
+```
+
+**Traffic Service Metrics**:
+```prometheus
+# Probe ingestion rate
+traffic_probes_ingested_total
+traffic_probes_duplicates_total
+
+# Aggregation lag
+traffic_segment_staleness_seconds{segment_id}
+
+# Incident detection
+traffic_incidents_detected_total{type="congestion|accident|road_work"}
+traffic_incidents_false_positives_total
+```
+
+**Infrastructure Metrics**:
+```prometheus
+# Database connections
+postgres_connections_active
+postgres_query_duration_seconds{query_type}
+
+# Queue depth (RabbitMQ)
+rabbitmq_queue_messages{queue="gps_probes"}
+rabbitmq_consumers_active
+
+# Redis cache
+redis_memory_used_bytes
+redis_keyspace_hits_total
+redis_keyspace_misses_total
+```
+
+### Logging Strategy
+
+**Structured Log Format**:
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "level": "info",
+  "service": "routing",
+  "trace_id": "abc123",
+  "span_id": "def456",
+  "user_id": "anonymized-hash",
+  "event": "route_calculated",
+  "duration_ms": 145,
+  "origin_tile": "12/1234/5678",
+  "destination_tile": "12/1235/5679",
+  "distance_km": 15.3,
+  "traffic_delay_minutes": 5
+}
+```
+
+**Log Levels by Event**:
+| Event | Level | Retention |
+|-------|-------|-----------|
+| Route calculated | INFO | 7 days |
+| Route failed (no path) | WARN | 30 days |
+| Database error | ERROR | 90 days |
+| Incident detected | INFO | 30 days |
+| GPS probe ingested | DEBUG | 1 day |
+
+### Distributed Tracing
+
+**Trace Propagation** (OpenTelemetry):
+```javascript
+// Example trace for route request
+async function handleRouteRequest(req, res) {
+  const span = tracer.startSpan('route_request', {
+    attributes: {
+      'http.method': 'POST',
+      'route.origin': hashLocation(req.body.origin),
+      'route.destination': hashLocation(req.body.destination)
+    }
+  });
+
+  try {
+    // Child span for traffic fetch
+    const trafficSpan = tracer.startSpan('fetch_traffic', { parent: span });
+    const traffic = await trafficService.getTraffic(bounds);
+    trafficSpan.end();
+
+    // Child span for A* execution
+    const routingSpan = tracer.startSpan('astar_routing', { parent: span });
+    const route = await routingEngine.findRoute(origin, dest, traffic);
+    routingSpan.setAttribute('nodes_visited', route.nodesVisited);
+    routingSpan.end();
+
+    span.setStatus({ code: SpanStatusCode.OK });
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    throw error;
+  } finally {
+    span.end();
+  }
+}
+```
+
+### SLI Dashboards
+
+**Primary Dashboard Panels**:
+
+1. **Route Latency (p50, p95, p99)**
+   - Target: p95 < 500ms, p99 < 1000ms
+   - Alert if p95 > 750ms for 5 minutes
+
+2. **Route Success Rate**
+   - Target: > 99.5% successful routes
+   - Alert if < 99% for 5 minutes
+
+3. **Traffic Data Freshness**
+   - Target: 90% of segments updated within 5 minutes
+   - Alert if < 80% fresh for 10 minutes
+
+4. **ETA Accuracy**
+   - Compare predicted vs actual arrival times
+   - Target: 90% within 10% of actual
+   - Weekly review (not alertable)
+
+### Alert Thresholds
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| Route p95 latency | > 500ms | > 1000ms | Scale routing workers |
+| Route error rate | > 1% | > 5% | Page on-call, check DB |
+| Probe ingestion lag | > 1 min | > 5 min | Check RabbitMQ, scale consumers |
+| Postgres connections | > 80% | > 95% | Investigate connection leaks |
+| Redis memory | > 80% | > 95% | Evict stale keys, add capacity |
+| Disk usage (tiles) | > 70% | > 85% | Archive old tiles to S3 |
+
+### Audit Logging
+
+**Auditable Events** (written to separate audit log):
+```javascript
+const auditLog = {
+  // Admin actions
+  'map_data.import': { retention: '1 year', pii: false },
+  'incident.manual_create': { retention: '1 year', pii: true },
+  'incident.manual_resolve': { retention: '1 year', pii: true },
+  'poi.create': { retention: '1 year', pii: false },
+  'poi.update': { retention: '1 year', pii: false },
+  'poi.delete': { retention: '1 year', pii: false },
+
+  // User data access (for compliance)
+  'user.saved_places.export': { retention: '2 years', pii: true },
+  'user.location_history.access': { retention: '2 years', pii: true }
+};
+
+async function audit(event, actor, details) {
+  await db.query(`
+    INSERT INTO audit_log (event, actor_id, actor_type, details, ip_address, timestamp)
+    VALUES ($1, $2, $3, $4, $5, NOW())
+  `, [event, actor.id, actor.type, JSON.stringify(details), actor.ip]);
+}
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency
+
+**HTTP Client Retries**:
+```javascript
+const retryConfig = {
+  maxRetries: 3,
+  initialDelayMs: 100,
+  maxDelayMs: 5000,
+  backoffMultiplier: 2,
+  retryableStatusCodes: [408, 429, 500, 502, 503, 504]
+};
+
+async function fetchWithRetry(url, options, idempotencyKey) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...options.headers,
+          'Idempotency-Key': idempotencyKey,
+          'X-Request-Attempt': attempt
+        }
+      });
+
+      if (response.ok) return response;
+
+      if (!retryConfig.retryableStatusCodes.includes(response.status)) {
+        throw new Error(`Non-retryable status: ${response.status}`);
+      }
+
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < retryConfig.maxRetries) {
+      const delay = Math.min(
+        retryConfig.initialDelayMs * Math.pow(retryConfig.backoffMultiplier, attempt),
+        retryConfig.maxDelayMs
+      );
+      await sleep(delay + Math.random() * 100); // Jitter
+    }
+  }
+
+  throw lastError;
+}
+```
+
+**Queue Consumer Retries**:
+```javascript
+// RabbitMQ dead letter queue for failed messages
+const queueConfig = {
+  queue: 'gps_probes',
+  deadLetterExchange: 'gps_probes_dlx',
+  maxRetries: 3,
+  retryDelays: [1000, 5000, 30000] // 1s, 5s, 30s
+};
+
+async function processWithRetry(message) {
+  const retryCount = message.properties.headers['x-retry-count'] || 0;
+
+  try {
+    await processProbe(JSON.parse(message.content));
+    channel.ack(message);
+  } catch (error) {
+    if (retryCount >= queueConfig.maxRetries) {
+      // Send to dead letter queue for manual inspection
+      channel.nack(message, false, false);
+      await alertSlack(`Probe processing failed after ${retryCount} retries`);
+    } else {
+      // Requeue with delay
+      channel.nack(message, false, false);
+      setTimeout(() => {
+        channel.publish('', 'gps_probes', message.content, {
+          headers: { 'x-retry-count': retryCount + 1 }
+        });
+      }, queueConfig.retryDelays[retryCount]);
+    }
+  }
+}
+```
+
+### Circuit Breaker Pattern
+
+```javascript
+class CircuitBreaker {
+  constructor(name, options = {}) {
+    this.name = name;
+    this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 3;
+    this.timeout = options.timeout || 30000; // 30s before trying again
+  }
+
+  async execute(fn) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.timeout) {
+        this.state = 'HALF_OPEN';
+      } else {
+        throw new Error(`Circuit breaker ${this.name} is OPEN`);
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0;
+    if (this.state === 'HALF_OPEN') {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this.state = 'CLOSED';
+        this.successCount = 0;
+      }
+    }
+  }
+
+  onFailure() {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'OPEN';
+    }
+  }
+}
+
+// Usage for external traffic data provider
+const externalTrafficBreaker = new CircuitBreaker('external_traffic', {
+  failureThreshold: 5,
+  timeout: 60000
+});
+
+async function getExternalTrafficData(bounds) {
+  return externalTrafficBreaker.execute(async () => {
+    return await fetch(`https://traffic-provider.com/api/v1/flow?bounds=${bounds}`);
+  });
+}
+```
+
+### Graceful Degradation
+
+```javascript
+class RoutingService {
+  async findRoute(origin, destination, options) {
+    let trafficData;
+
+    // Try real-time traffic, fall back to historical
+    try {
+      trafficData = await this.trafficBreaker.execute(() =>
+        this.trafficService.getTraffic(bounds)
+      );
+    } catch (error) {
+      console.warn('Traffic service unavailable, using historical data');
+      trafficData = await this.getHistoricalTraffic(bounds, new Date());
+      // Add warning to response
+      options.degraded = { traffic: 'historical' };
+    }
+
+    // Try primary routing, fall back to simpler algorithm
+    try {
+      return await this.aStarHierarchical(origin, destination, trafficData);
+    } catch (error) {
+      if (error.message.includes('timeout')) {
+        console.warn('Hierarchical routing timeout, falling back to basic A*');
+        options.degraded = { ...options.degraded, routing: 'basic' };
+        return await this.basicAStar(origin, destination);
+      }
+      throw error;
+    }
+  }
+}
+```
+
+### Local Development Disaster Recovery
+
+For this learning project, we simulate multi-region patterns locally:
+
+**Backup Strategy**:
+```bash
+# Automated daily backup (cron job in development)
+#!/bin/bash
+BACKUP_DIR="./backups/$(date +%Y-%m-%d)"
+mkdir -p $BACKUP_DIR
+
+# PostgreSQL backup
+pg_dump -h localhost -U maps_user maps_db > "$BACKUP_DIR/maps_db.sql"
+
+# Redis backup (RDB snapshot)
+redis-cli BGSAVE
+cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis.rdb"
+
+# Compress and optionally upload to MinIO (S3-compatible)
+tar -czf "$BACKUP_DIR.tar.gz" "$BACKUP_DIR"
+mc cp "$BACKUP_DIR.tar.gz" minio/backups/
+
+# Retain last 7 days locally
+find ./backups -mtime +7 -delete
+```
+
+**Restore Testing** (run monthly):
+```bash
+#!/bin/bash
+# Test restore to verify backups are valid
+
+# 1. Start fresh containers
+docker-compose -f docker-compose.restore-test.yml up -d
+
+# 2. Restore PostgreSQL
+docker exec -i restore_postgres psql -U maps_user maps_db < backups/latest/maps_db.sql
+
+# 3. Restore Redis
+docker cp backups/latest/redis.rdb restore_redis:/data/dump.rdb
+docker restart restore_redis
+
+# 4. Run smoke tests
+npm run test:smoke -- --target=restore
+
+# 5. Cleanup
+docker-compose -f docker-compose.restore-test.yml down -v
+```
+
+**Simulated Region Failover** (for learning):
+```yaml
+# docker-compose.multi-region.yml
+version: '3.8'
+services:
+  # Primary region
+  routing-primary:
+    build: ./backend
+    environment:
+      - REGION=primary
+      - DATABASE_URL=postgres://localhost:5432/maps_primary
+    ports:
+      - "3001:3000"
+
+  # Secondary region (simulated)
+  routing-secondary:
+    build: ./backend
+    environment:
+      - REGION=secondary
+      - DATABASE_URL=postgres://localhost:5433/maps_secondary
+      - READ_REPLICA=true
+    ports:
+      - "3002:3000"
+
+  # Load balancer with health checks
+  haproxy:
+    image: haproxy:latest
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    ports:
+      - "3000:3000"
+
+# haproxy.cfg includes:
+# - Health check every 5s
+# - Failover to secondary if primary fails 3 checks
+# - Sticky sessions for active navigation
+```
+
+### Health Checks
+
+```javascript
+// Comprehensive health check endpoint
+app.get('/health', async (req, res) => {
+  const checks = {
+    database: await checkPostgres(),
+    redis: await checkRedis(),
+    rabbitmq: await checkRabbitMQ(),
+    routing_graph: await checkRoutingGraph()
+  };
+
+  const allHealthy = Object.values(checks).every(c => c.status === 'healthy');
+
+  res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'healthy' : 'degraded',
+    timestamp: new Date().toISOString(),
+    checks
+  });
+});
+
+async function checkPostgres() {
+  const start = Date.now();
+  try {
+    await db.query('SELECT 1');
+    return { status: 'healthy', latency_ms: Date.now() - start };
+  } catch (error) {
+    return { status: 'unhealthy', error: error.message };
+  }
+}
+
+async function checkRoutingGraph() {
+  // Verify graph is loaded and queryable
+  const start = Date.now();
+  try {
+    const nodeCount = routingEngine.graph.nodeCount();
+    if (nodeCount < 100) {
+      return { status: 'degraded', message: 'Graph appears incomplete' };
+    }
+    return { status: 'healthy', nodes: nodeCount, latency_ms: Date.now() - start };
+  } catch (error) {
+    return { status: 'unhealthy', error: error.message };
+  }
+}
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -551,3 +1136,7 @@ CREATE INDEX idx_pois_category ON pois(category);
 | Traffic | GPS probe aggregation | Sensor only | Coverage, cost |
 | Map format | Vector tiles | Raster | Flexibility, size |
 | ETA | ML prediction | Simple calculation | Accuracy |
+| Traffic consistency | Eventual (last-write-wins) | Strong consistency | High write throughput |
+| Probe deduplication | Redis with TTL | Database unique constraint | Performance at scale |
+| Circuit breaker timeout | 30 seconds | Shorter/longer | Balance between recovery and availability |
+| Backup frequency | Daily | Hourly | Sufficient for learning project, low data change rate |

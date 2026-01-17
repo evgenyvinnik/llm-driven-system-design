@@ -1,3 +1,12 @@
+/**
+ * Chat App Component
+ *
+ * Main application shell for Baby Discord. Renders either the login form
+ * (when not authenticated) or the full chat interface (when logged in).
+ * The chat interface consists of three columns: server list, channel sidebar,
+ * and main chat area with header, messages, and input.
+ */
+
 import { useChatStore } from '../stores/chatStore';
 import { LoginForm } from './LoginForm';
 import { ServerList } from './ServerList';
@@ -5,6 +14,13 @@ import { ChannelSidebar } from './ChannelSidebar';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 
+/**
+ * Root component for the Baby Discord chat application.
+ * Conditionally renders LoginForm or the main chat layout
+ * based on authentication state.
+ *
+ * @returns Login form or full chat interface
+ */
 export function ChatApp() {
   const { session } = useChatStore();
 
@@ -35,6 +51,13 @@ export function ChatApp() {
   );
 }
 
+/**
+ * Renders the channel header bar at the top of the chat area.
+ * Shows the current room name with hash icon, welcome text,
+ * and action buttons (members list placeholder).
+ *
+ * @returns Header bar with room info and actions
+ */
 function ChannelHeader() {
   const { currentRoom } = useChatStore();
 

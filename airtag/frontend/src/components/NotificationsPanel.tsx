@@ -1,3 +1,9 @@
+/**
+ * Notifications panel component.
+ * Displays user notifications in a dropdown overlay.
+ * Supports marking notifications as read and bulk mark-all-read.
+ */
+
 import { useEffect, useState } from 'react';
 import { useStore } from '../stores/useStore';
 
@@ -6,6 +12,14 @@ interface NotificationsPanelProps {
   onClose: () => void;
 }
 
+/**
+ * Notifications dropdown panel.
+ * Shows list of notifications with read/unread status.
+ *
+ * @param isOpen - Whether the panel is visible
+ * @param onClose - Callback to close the panel
+ * @returns Notification list overlay
+ */
 export function NotificationsPanel({ isOpen, onClose }: NotificationsPanelProps) {
   const { notifications, fetchNotifications, markAsRead, markAllAsRead, unreadCount } =
     useStore();

@@ -1,3 +1,10 @@
+/**
+ * Job routes for the LinkedIn clone.
+ * Handles job listings, search, applications, and recommendations.
+ * Includes admin routes for job posting and applicant management.
+ *
+ * @module routes/jobs
+ */
 import { Router, Request, Response } from 'express';
 import * as jobService from '../services/jobService.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';

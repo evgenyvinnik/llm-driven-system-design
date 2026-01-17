@@ -1,6 +1,18 @@
+/**
+ * Login/Registration form component.
+ * Provides a toggle between sign-in and registration modes.
+ * Handles form validation and displays errors from the authentication API.
+ */
+
 import { useState } from 'react';
 import { useStore } from '../stores/useStore';
 
+/**
+ * Authentication form component.
+ * Displays either login or registration form based on user toggle.
+ *
+ * @returns Login/registration form with error handling
+ */
 export function LoginForm() {
   const [isRegister, setIsRegister] = useState(false);
   const [email, setEmail] = useState('');

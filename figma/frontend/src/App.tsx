@@ -1,7 +1,16 @@
-import React, { useState } from 'react';
+/**
+ * Root application component for the Figma clone.
+ * Manages top-level navigation between the file browser and editor views.
+ */
+import { useState } from 'react';
 import { FileBrowser } from './components/FileBrowser';
 import { Editor } from './components/Editor';
 
+/**
+ * App component providing the main application shell.
+ * Conditionally renders either the file browser or editor based on selection state.
+ * @returns The rendered application
+ */
 function App() {
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
 

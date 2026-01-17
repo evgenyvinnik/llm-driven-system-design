@@ -1,13 +1,30 @@
+/**
+ * New Chat Dialog Component
+ *
+ * Modal dialog for creating new conversations.
+ * Supports both direct 1:1 messages and group creation.
+ * Features user search with debounced input.
+ */
+
 import { useState, useEffect } from 'react';
 import { authApi, conversationsApi } from '../services/api';
 import { useChatStore } from '../stores/chatStore';
 import { User } from '../types';
 
+/**
+ * Props for the NewChatDialog component.
+ */
 interface NewChatDialogProps {
+  /** Callback to close the dialog */
   onClose: () => void;
+  /** Callback when a new conversation is created */
   onChatCreated: (conversationId: string) => void;
 }
 
+/**
+ * Modal dialog for creating direct or group conversations.
+ * @param props - Component props with close and creation callbacks
+ */
 export function NewChatDialog({ onClose, onChatCreated }: NewChatDialogProps) {
   const [mode, setMode] = useState<'direct' | 'group'>('direct');
   const [searchQuery, setSearchQuery] = useState('');

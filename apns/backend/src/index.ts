@@ -1,3 +1,19 @@
+/**
+ * APNs Backend Server Entry Point.
+ *
+ * This is the main entry point for the Apple Push Notification service clone.
+ * It sets up an Express HTTP server with WebSocket support for real-time
+ * device connections and notification delivery.
+ *
+ * Key features:
+ * - REST API for device registration and notification sending
+ * - WebSocket server for persistent device connections
+ * - Redis pub/sub for cross-server notification routing
+ * - Periodic cleanup of expired notifications
+ *
+ * @module index
+ */
+
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
@@ -22,14 +38,21 @@ import { pushService } from "./services/pushService.js";
 import { WSMessage, WSConnect, WSAck } from "./types/index.js";
 
 const app = express();
+
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || "3000", 10);
+
+/** Unique server identifier for pub/sub routing */
 const SERVER_ID = `server-${PORT}`;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Request logging
+/**
+ * Request logging middleware.
+ * Logs method, path, status code, and duration for each request.
+ */
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   res.on("finish", () => {
@@ -39,7 +62,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Health check endpoint
+/**
+ * Health check endpoint.
+ * Returns the status of database and Redis connections.
+ *
+ * @route GET /health
+ */
 app.get("/health", async (req: Request, res: Response) => {
   const dbHealthy = await checkDbConnection();
   const redisHealthy = await checkRedisConnection();
@@ -63,7 +91,16 @@ app.use("/api/v1/notifications", notificationsRouter);
 app.use("/api/v1/feedback", feedbackRouter);
 app.use("/api/v1/admin", adminRouter);
 
-// APNs-style endpoint: POST /3/device/{device_token}
+/**
+ * APNs-style endpoint for sending notifications.
+ * Mimics the real APNs HTTP/2 endpoint format.
+ * Reads priority and expiration from custom headers.
+ *
+ * @route POST /3/device/:deviceToken
+ * @header apns-priority - Notification priority (1, 5, or 10)
+ * @header apns-expiration - Unix timestamp expiration
+ * @header apns-collapse-id - Collapse ID for deduplication
+ */
 app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
   try {
     const { deviceToken } = req.params;
@@ -92,7 +129,10 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
   }
 });
 
-// Error handling middleware
+/**
+ * Global error handling middleware.
+ * Catches unhandled errors and returns a 500 response.
+ */
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   console.error("Unhandled error:", err);
   return res.status(500).json({
@@ -101,7 +141,9 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
-// 404 handler
+/**
+ * 404 handler for unmatched routes.
+ */
 app.use((req: Request, res: Response) => {
   return res.status(404).json({
     error: "NotFound",
@@ -112,12 +154,21 @@ app.use((req: Request, res: Response) => {
 // Create HTTP server
 const server = http.createServer(app);
 
-// WebSocket server for device connections
+/**
+ * WebSocket server for device connections.
+ * Devices connect here to receive push notifications in real-time.
+ * Path: /ws
+ */
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// Track connected devices
+/** Map of connected devices: deviceId -> WebSocket */
 const deviceConnections = new Map<string, WebSocket>();
 
+/**
+ * Handle new WebSocket connections.
+ * Devices send a 'connect' message with their device_id to register.
+ * Server delivers pending notifications upon connection.
+ */
 wss.on("connection", (ws: WebSocket) => {
   let deviceId: string | null = null;
 
@@ -180,7 +231,11 @@ wss.on("connection", (ws: WebSocket) => {
   });
 });
 
-// Subscribe to notification delivery channel
+/**
+ * Subscribe to Redis pub/sub for cross-server notification delivery.
+ * When a notification needs to be delivered to a device connected to this server,
+ * the message comes through this channel.
+ */
 subscribeToNotifications(`notifications:${SERVER_ID}`, (message: unknown) => {
   const msg = message as {
     type: string;
@@ -207,7 +262,10 @@ subscribeToNotifications(`notifications:${SERVER_ID}`, (message: unknown) => {
   }
 });
 
-// Periodic cleanup of expired notifications
+/**
+ * Periodic cleanup task.
+ * Runs every minute to mark expired notifications and clean up pending queue.
+ */
 setInterval(async () => {
   try {
     const cleaned = await pushService.cleanupExpiredNotifications();
@@ -227,7 +285,10 @@ server.listen(PORT, () => {
   console.log(`WebSocket: ws://localhost:${PORT}/ws`);
 });
 
-// Graceful shutdown
+/**
+ * Graceful shutdown handler.
+ * Closes HTTP server, WebSocket server, and database connections.
+ */
 process.on("SIGTERM", async () => {
   console.log("Received SIGTERM, shutting down gracefully...");
 

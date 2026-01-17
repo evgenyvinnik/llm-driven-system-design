@@ -1,12 +1,27 @@
+/**
+ * Alert notification item component.
+ * Displays price drop alerts with icons, messages, and actions.
+ * @module components/AlertItem
+ */
 import { Alert } from '../types';
 import { formatDistanceToNow } from 'date-fns';
 
+/** Props for the AlertItem component */
 interface AlertItemProps {
+  /** Alert data to display */
   alert: Alert;
+  /** Optional callback when mark as read is clicked */
   onMarkRead?: (id: string) => void;
+  /** Optional callback when delete is clicked */
   onDelete?: (id: string) => void;
 }
 
+/**
+ * Renders a single alert notification with icon, message, and actions.
+ * Different icons and messages for target reached, price drop, and back in stock.
+ * Shows price change percentage when applicable.
+ * @param props - Component props
+ */
 export function AlertItem({ alert, onMarkRead, onDelete }: AlertItemProps) {
   const formatPrice = (price: number | null) => {
     if (price === null) return 'N/A';

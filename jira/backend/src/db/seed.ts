@@ -1,7 +1,22 @@
+/**
+ * Database seeding script.
+ * Populates the database with default data for development and testing.
+ * Creates admin user, demo project, sample issues, and default workflow.
+ */
+
 import { pool } from '../config/database.js';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 
+/**
+ * Seeds the database with initial data.
+ * Creates:
+ * - Default project roles (Administrator, Developer, Viewer)
+ * - Default permission scheme with role-based grants
+ * - Default workflow (To Do, In Progress, In Review, Done)
+ * - Admin and demo users
+ * - Demo project with sample issues
+ */
 async function seed() {
   console.log('Seeding database...');
 

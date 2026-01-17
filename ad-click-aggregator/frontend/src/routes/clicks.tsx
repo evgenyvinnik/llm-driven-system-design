@@ -1,12 +1,27 @@
+/**
+ * @fileoverview Recent clicks page route component.
+ * Displays a paginated table of recent click events.
+ * Supports filtering by fraud status and configurable result limits.
+ */
+
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { useDashboardStore } from '../stores/dashboardStore'
 import { ClickTable } from '../components/ClickTable'
 
+/**
+ * Route definition for the recent clicks page.
+ */
 export const Route = createFileRoute('/clicks')({
   component: Clicks,
 })
 
+/**
+ * Recent clicks viewer with filtering options.
+ * Shows individual click events for monitoring and debugging.
+ *
+ * @returns Click table with filter controls
+ */
 function Clicks() {
   const { recentClicks, fetchRecentClicks, isLoading } = useDashboardStore()
   const [limit, setLimit] = useState(100)

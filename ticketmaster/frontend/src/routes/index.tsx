@@ -1,13 +1,22 @@
+/**
+ * Home page route displaying event listings.
+ * Shows a searchable, filterable grid of upcoming events.
+ * Supports category filtering and text search.
+ */
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { EventCard } from '../components/EventCard';
 import { eventsApi } from '../services/api';
 import type { Event } from '../types';
 
+/** Route configuration for the home page */
 export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Home page component with event grid and search functionality.
+ */
 function HomePage() {
   const [events, setEvents] = useState<Event[]>([]);
   const [isLoading, setIsLoading] = useState(true);

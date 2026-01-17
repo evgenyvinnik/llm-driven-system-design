@@ -1,3 +1,10 @@
+/**
+ * VideoPlayer Component
+ *
+ * Full-screen video player with Netflix-style controls.
+ * Features: quality selection, keyboard shortcuts, progress saving,
+ * fullscreen mode, and auto-hiding controls during playback.
+ */
 import React from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import {
@@ -14,13 +21,22 @@ import {
 } from 'lucide-react';
 import { usePlayerStore } from '../stores/playerStore';
 
+/** Props for VideoPlayer component */
 interface VideoPlayerProps {
+  /** Video ID being played */
   videoId: string;
+  /** Episode ID for series (optional) */
   episodeId?: string;
+  /** Video title to display */
   title: string;
+  /** Subtitle (e.g., episode title) */
   subtitle?: string;
 }
 
+/**
+ * Full-screen video player component.
+ * Manages playback, controls visibility, and progress tracking.
+ */
 export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayerProps) {
   const navigate = useNavigate();
   const videoRef = React.useRef<HTMLVideoElement>(null);

@@ -1,6 +1,17 @@
+/**
+ * Layers panel component for managing design objects.
+ * Displays a hierarchical list of objects with visibility and lock toggles.
+ * Supports selection, z-order reordering, and deletion of objects.
+ */
 import React from 'react';
 import { useEditorStore } from '../stores/editorStore';
 
+/**
+ * LayersPanel component showing all canvas objects.
+ * Objects are displayed in reverse z-order (top-most layer first).
+ * Provides controls for visibility, locking, layer ordering, and deletion.
+ * @returns The rendered layers panel element
+ */
 export function LayersPanel() {
   const {
     canvasData,

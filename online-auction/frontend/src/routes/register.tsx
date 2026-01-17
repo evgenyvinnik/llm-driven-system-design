@@ -2,10 +2,29 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Route definition for registration page (/register).
+ * Redirects authenticated users to home page.
+ */
 export const Route = createFileRoute('/register')({
   component: RegisterPage,
 });
 
+/**
+ * User registration page component.
+ *
+ * Features:
+ * - Username, email, and password input fields
+ * - Password confirmation with matching validation
+ * - Minimum password length validation (6 characters)
+ * - Error message display for validation and API errors
+ * - Loading state during registration
+ * - Link to login page for existing users
+ *
+ * Creates new account and automatically logs in on success.
+ *
+ * @returns JSX element for the registration form
+ */
 function RegisterPage() {
   const navigate = useNavigate();
   const { register, isAuthenticated } = useAuthStore();

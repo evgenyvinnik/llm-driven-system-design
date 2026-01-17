@@ -1,15 +1,37 @@
+/**
+ * @fileoverview Form component for generating test click events.
+ * Allows sending single or batch clicks with configurable parameters.
+ * Useful for testing the ingestion pipeline and fraud detection.
+ */
+
 import { useState } from 'react';
 import { sendTestClick, sendBatchClicks } from '../services/api';
 
+/**
+ * Props for the TestClickForm component.
+ */
 interface TestClickFormProps {
+  /** Available ads to select from */
   ads: { id: string; campaign_id: string; name: string }[];
+  /** Available campaigns (for advertiser lookup) */
   campaigns: { id: string; advertiser_id: string; name: string }[];
+  /** Callback after successful click submission */
   onSuccess?: () => void;
 }
 
+/** List of country codes for test data */
 const COUNTRIES = ['US', 'CA', 'UK', 'DE', 'FR', 'JP', 'AU', 'BR', 'IN', 'MX'];
+
+/** Device type options */
 const DEVICE_TYPES = ['desktop', 'mobile', 'tablet'] as const;
 
+/**
+ * Form for sending test click events to the backend.
+ * Supports single clicks and batch generation with randomization.
+ *
+ * @param props - Form configuration and callbacks
+ * @returns Interactive form with result display
+ */
 export function TestClickForm({ ads, campaigns, onSuccess }: TestClickFormProps) {
   const [selectedAd, setSelectedAd] = useState('');
   const [deviceType, setDeviceType] = useState<'desktop' | 'mobile' | 'tablet'>('desktop');

@@ -1,38 +1,84 @@
+/**
+ * Chat Store Module
+ *
+ * Central state management for the Baby Discord frontend using Zustand.
+ * Manages user sessions, room state, and message handling with persistence.
+ * The store uses the persist middleware to save session data to localStorage,
+ * allowing users to maintain their session across page refreshes.
+ */
+
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Session, Room, Message } from '../types';
 import * as api from '../services/api';
 
+/**
+ * Shape of the chat store state and actions.
+ * Combines reactive state with methods for session and room management.
+ */
 interface ChatState {
-  // Session
+  /** Current user session, null if not logged in */
   session: Session | null;
+  /** Whether a connection attempt is in progress */
   isConnecting: boolean;
+  /** Error message from failed connection attempt */
   connectionError: string | null;
 
-  // Rooms
+  /** List of available chat rooms */
   rooms: Room[];
+  /** Name of the room the user is currently in */
   currentRoom: string | null;
+  /** Whether room list is being loaded */
   isLoadingRooms: boolean;
 
-  // Messages
+  /** Messages in the current room */
   messages: Message[];
+  /** Whether message history is being loaded */
   isLoadingMessages: boolean;
 
-  // SSE
+  /** Active SSE connection for real-time messages */
   eventSource: EventSource | null;
 
-  // Actions
+  /**
+   * Connect to the chat server with a nickname.
+   * @param nickname - Display name for the user
+   */
   connect: (nickname: string) => Promise<void>;
+  /** Disconnect from the server and clean up state */
   disconnect: () => Promise<void>;
+  /** Refresh the list of available rooms from the server */
   refreshRooms: () => Promise<void>;
+  /**
+   * Create a new chat room and join it.
+   * @param name - Name for the new room
+   */
   createRoom: (name: string) => Promise<void>;
+  /**
+   * Join an existing room and start receiving messages.
+   * @param name - Name of the room to join
+   */
   joinRoom: (name: string) => Promise<void>;
+  /** Leave the current room and stop receiving messages */
   leaveRoom: () => Promise<void>;
+  /**
+   * Send a message to the current room.
+   * @param content - Message text to send
+   */
   sendMessage: (content: string) => Promise<void>;
+  /**
+   * Add a message to the local message list (used by SSE handler).
+   * @param message - Message to add
+   */
   addMessage: (message: Message) => void;
+  /** Clear all messages from local state */
   clearMessages: () => void;
 }
 
+/**
+ * Global chat store using Zustand with persistence.
+ * Session data is persisted to localStorage under 'baby-discord-session'.
+ * Only the session object is persisted; rooms and messages are ephemeral.
+ */
 export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({

@@ -5,6 +5,11 @@ import { RefundService, ChargebackService } from '../services/refund.service.js'
 import { LedgerService } from '../services/ledger.service.js';
 import type { CreatePaymentRequest, RefundRequest, TransactionListParams } from '../types/index.js';
 
+/**
+ * Payment routes module.
+ * Provides REST endpoints for the full payment lifecycle:
+ * creation, retrieval, capture, void, and refund operations.
+ */
 const router = Router();
 const paymentService = new PaymentService();
 const refundService = new RefundService();
@@ -12,7 +17,9 @@ const chargebackService = new ChargebackService();
 const ledgerService = new LedgerService();
 
 /**
- * Create a payment
+ * Creates a new payment transaction.
+ * Supports immediate capture or authorize-only mode.
+ * Idempotency key prevents duplicate charges on network retries.
  * POST /api/v1/payments
  */
 router.post('/', async (req: Request, res: Response) => {
@@ -61,7 +68,8 @@ router.post('/', async (req: Request, res: Response) => {
 });
 
 /**
- * Get a payment by ID
+ * Retrieves a specific payment by its unique identifier.
+ * Only returns payments owned by the authenticated merchant.
  * GET /api/v1/payments/:id
  */
 router.get('/:id', async (req: Request, res: Response) => {
@@ -92,7 +100,8 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * List payments for merchant
+ * Lists payments for the authenticated merchant with pagination and filtering.
+ * Supports filtering by status and date range.
  * GET /api/v1/payments
  */
 router.get('/', async (req: Request, res: Response) => {
@@ -125,7 +134,8 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 /**
- * Capture an authorized payment
+ * Captures funds from an authorized payment.
+ * Moves payment from 'authorized' to 'captured' status and records ledger entries.
  * POST /api/v1/payments/:id/capture
  */
 router.post('/:id/capture', async (req: Request, res: Response) => {
@@ -160,7 +170,8 @@ router.post('/:id/capture', async (req: Request, res: Response) => {
 });
 
 /**
- * Void an authorized payment
+ * Voids an authorized payment before capture.
+ * Cancels the authorization and releases the hold on customer funds.
  * POST /api/v1/payments/:id/void
  */
 router.post('/:id/void', async (req: Request, res: Response) => {
@@ -195,7 +206,8 @@ router.post('/:id/void', async (req: Request, res: Response) => {
 });
 
 /**
- * Create a refund
+ * Creates a full or partial refund for a captured payment.
+ * Validates refund amount and creates reversing ledger entries.
  * POST /api/v1/payments/:id/refund
  */
 router.post('/:id/refund', async (req: Request, res: Response) => {
@@ -241,7 +253,8 @@ router.post('/:id/refund', async (req: Request, res: Response) => {
 });
 
 /**
- * Get refunds for a payment
+ * Retrieves all refunds associated with a specific payment.
+ * Returns history of both full and partial refunds.
  * GET /api/v1/payments/:id/refunds
  */
 router.get('/:id/refunds', async (req: Request, res: Response) => {
@@ -273,7 +286,8 @@ router.get('/:id/refunds', async (req: Request, res: Response) => {
 });
 
 /**
- * Get ledger entries for a payment
+ * Retrieves all ledger entries for a specific payment.
+ * Shows the double-entry bookkeeping trail for auditing and reconciliation.
  * GET /api/v1/payments/:id/ledger
  */
 router.get('/:id/ledger', async (req: Request, res: Response) => {

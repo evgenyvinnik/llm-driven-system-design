@@ -1,3 +1,24 @@
+/**
+ * HTTP Server Adapter
+ *
+ * Provides a REST API and SSE (Server-Sent Events) interface for the chat system.
+ * This adapter enables browser clients to connect using standard HTTP.
+ *
+ * Endpoints:
+ * - GET  /api/health              - Server health check
+ * - POST /api/connect             - Authenticate with nickname, get session token
+ * - POST /api/disconnect          - End session
+ * - POST /api/command             - Execute a slash command
+ * - POST /api/message             - Send a chat message
+ * - GET  /api/rooms               - List available rooms
+ * - GET  /api/rooms/:room/history - Get room message history
+ * - GET  /api/session/:sessionId  - Get session details
+ * - GET  /api/messages/:room      - SSE stream for real-time messages
+ *
+ * The SSE endpoint maintains a persistent connection for pushing messages
+ * to the client, while commands use regular POST requests.
+ */
+
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
@@ -13,19 +34,40 @@ import { connectionManager, chatHandler, historyBuffer, roomManager } from '../c
 import * as dbOps from '../db/index.js';
 import { logger } from '../utils/logger.js';
 
-// Track SSE clients for each room
+/**
+ * Internal state for tracking an SSE client connection.
+ */
 interface SSEClient {
+  /** Session ID of the connected user */
   sessionId: string;
+  /** Express response object for the SSE stream */
   res: Response;
+  /** Room name this connection is subscribed to */
   room: string;
 }
 
+/**
+ * HTTP/REST server for Baby Discord.
+ *
+ * Implements the Adapter pattern to provide an HTTP interface over
+ * the core chat functionality. Supports both REST endpoints for commands
+ * and SSE for real-time message streaming.
+ */
 export class HTTPServer {
+  /** Express application instance */
   private app: express.Application;
+  /** Port to listen on */
   private port: number;
+  /** Node.js HTTP server instance */
   private server: ReturnType<typeof express.application.listen> | null = null;
+  /** Active SSE connections for real-time updates */
   private sseClients: Map<string, SSEClient> = new Map();
 
+  /**
+   * Create a new HTTP server.
+   *
+   * @param port - Port number to listen on (default: 3001)
+   */
   constructor(port: number = 3001) {
     this.port = port;
     this.app = express();
@@ -34,7 +76,8 @@ export class HTTPServer {
   }
 
   /**
-   * Set up Express middleware
+   * Configure Express middleware.
+   * Sets up CORS, JSON parsing, and request logging.
    */
   private setupMiddleware(): void {
     this.app.use(cors());
@@ -48,10 +91,11 @@ export class HTTPServer {
   }
 
   /**
-   * Set up API routes
+   * Set up API routes.
+   * Registers all REST endpoints and the SSE stream.
    */
   private setupRoutes(): void {
-    // Health check
+    // Health check endpoint - includes DB status and connection count
     this.app.get('/api/health', async (req: Request, res: Response) => {
       const dbHealthy = await dbOps.db.healthCheck();
       res.json({
@@ -62,7 +106,7 @@ export class HTTPServer {
       });
     });
 
-    // Connect (authenticate)
+    // POST /api/connect - Authenticate user and create session
     this.app.post('/api/connect', async (req: Request, res: Response) => {
       try {
         const { nickname } = req.body as ConnectRequest;
@@ -122,7 +166,7 @@ export class HTTPServer {
       }
     });
 
-    // Execute command
+    // POST /api/command - Execute a slash command
     this.app.post('/api/command', async (req: Request, res: Response) => {
       try {
         const { sessionId, command } = req.body as CommandRequest;
@@ -165,7 +209,7 @@ export class HTTPServer {
       }
     });
 
-    // Send message
+    // POST /api/message - Send a chat message
     this.app.post('/api/message', async (req: Request, res: Response) => {
       try {
         const { sessionId, content } = req.body as MessageRequest;
@@ -211,7 +255,7 @@ export class HTTPServer {
       }
     });
 
-    // List rooms
+    // GET /api/rooms - List all available rooms
     this.app.get('/api/rooms', async (req: Request, res: Response) => {
       try {
         const rooms = await roomManager.listRooms();
@@ -228,7 +272,7 @@ export class HTTPServer {
       }
     });
 
-    // Get room history
+    // GET /api/rooms/:room/history - Get message history for a room
     this.app.get('/api/rooms/:room/history', async (req: Request, res: Response) => {
       try {
         const roomName = req.params.room;
@@ -256,7 +300,7 @@ export class HTTPServer {
       }
     });
 
-    // SSE endpoint for real-time messages
+    // GET /api/messages/:room - SSE endpoint for real-time messages
     this.app.get('/api/messages/:room', (req: Request, res: Response) => {
       const roomName = req.params.room;
       const sessionId = req.query.sessionId as string;
@@ -308,7 +352,7 @@ export class HTTPServer {
       logger.debug('SSE client connected', { sessionId, room: roomName });
     });
 
-    // Disconnect
+    // POST /api/disconnect - End user session
     this.app.post('/api/disconnect', async (req: Request, res: Response) => {
       try {
         const { sessionId } = req.body as { sessionId: string };
@@ -353,7 +397,7 @@ export class HTTPServer {
       }
     });
 
-    // Session info
+    // GET /api/session/:sessionId - Get session details
     this.app.get('/api/session/:sessionId', (req: Request, res: Response) => {
       const { sessionId } = req.params;
       const session = connectionManager.getSession(sessionId);
@@ -380,7 +424,11 @@ export class HTTPServer {
   }
 
   /**
-   * Send a message to SSE clients for a session
+   * Send a message to all SSE clients for a specific session.
+   * Called by ConnectionManager when messages need to be delivered.
+   *
+   * @param sessionId - Target session's ID
+   * @param message - Message string to send
    */
   sendSSEMessage(sessionId: string, message: string): void {
     for (const [, client] of this.sseClients) {
@@ -395,7 +443,11 @@ export class HTTPServer {
   }
 
   /**
-   * Broadcast a message to all SSE clients in a room
+   * Broadcast a message to all SSE clients in a specific room.
+   * Used for room-wide announcements and messages.
+   *
+   * @param roomName - Target room name
+   * @param message - Chat message to broadcast
    */
   broadcastToRoom(roomName: string, message: ChatMessage): void {
     const jsonMessage = JSON.stringify(message);
@@ -411,7 +463,9 @@ export class HTTPServer {
   }
 
   /**
-   * Start the HTTP server
+   * Start the HTTP server and begin accepting connections.
+   *
+   * @returns Promise that resolves when server is listening
    */
   start(): Promise<void> {
     return new Promise((resolve) => {
@@ -423,7 +477,9 @@ export class HTTPServer {
   }
 
   /**
-   * Stop the HTTP server
+   * Stop the HTTP server and close all SSE connections.
+   *
+   * @returns Promise that resolves when server is fully stopped
    */
   stop(): Promise<void> {
     return new Promise((resolve) => {
@@ -445,14 +501,19 @@ export class HTTPServer {
   }
 
   /**
-   * Get the Express app (for testing)
+   * Get the Express application instance.
+   * Used for testing.
+   *
+   * @returns Express application
    */
   getApp(): express.Application {
     return this.app;
   }
 
   /**
-   * Get the number of SSE clients
+   * Get the number of active SSE connections.
+   *
+   * @returns Number of SSE client connections
    */
   getSSEClientCount(): number {
     return this.sseClients.size;

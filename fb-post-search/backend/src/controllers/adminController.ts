@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Admin API controller.
+ * Provides administrative endpoints for system statistics, user management,
+ * post management, search history viewing, health checks, and reindexing.
+ */
+
 import type { Response } from 'express';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { getAllUsers } from '../services/authService.js';
@@ -5,7 +11,13 @@ import { getAllPosts, getPostStats } from '../services/postService.js';
 import { query } from '../config/database.js';
 import { esClient, POSTS_INDEX } from '../config/elasticsearch.js';
 
-// GET /api/v1/admin/stats
+/**
+ * Handles GET /api/v1/admin/stats - System statistics.
+ * Returns aggregate counts for users, posts, and searches.
+ * Includes Elasticsearch index statistics if available.
+ * @param _req - Request (unused)
+ * @param res - Response with stats object or error
+ */
 export async function getStats(_req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     // Get various stats
@@ -45,7 +57,12 @@ export async function getStats(_req: AuthenticatedRequest, res: Response): Promi
   }
 }
 
-// GET /api/v1/admin/users
+/**
+ * Handles GET /api/v1/admin/users - List all users.
+ * Returns paginated list of users with sensitive data removed.
+ * @param req - Request with optional limit and offset query params
+ * @param res - Response with users array or error
+ */
 export async function getUsers(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { limit, offset } = req.query;
@@ -72,7 +89,12 @@ export async function getUsers(req: AuthenticatedRequest, res: Response): Promis
   }
 }
 
-// GET /api/v1/admin/posts
+/**
+ * Handles GET /api/v1/admin/posts - List all posts.
+ * Returns paginated list of all posts in the system.
+ * @param req - Request with optional limit and offset query params
+ * @param res - Response with posts array or error
+ */
 export async function getPosts(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { limit, offset } = req.query;
@@ -89,7 +111,12 @@ export async function getPosts(req: AuthenticatedRequest, res: Response): Promis
   }
 }
 
-// GET /api/v1/admin/search-history
+/**
+ * Handles GET /api/v1/admin/search-history - View search history.
+ * Returns paginated list of all search queries across all users.
+ * @param req - Request with optional limit and offset query params
+ * @param res - Response with history array or error
+ */
 export async function getSearchHistory(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { limit, offset } = req.query;
@@ -122,7 +149,13 @@ export async function getSearchHistory(req: AuthenticatedRequest, res: Response)
   }
 }
 
-// POST /api/v1/admin/reindex
+/**
+ * Handles POST /api/v1/admin/reindex - Reindex all posts.
+ * Triggers a full reindex of all posts into Elasticsearch.
+ * Use when index is corrupted or after schema changes.
+ * @param _req - Request (unused)
+ * @param res - Response with indexed count or error
+ */
 export async function reindexPosts(_req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     // Get all posts
@@ -146,7 +179,13 @@ export async function reindexPosts(_req: AuthenticatedRequest, res: Response): P
   }
 }
 
-// GET /api/v1/admin/health
+/**
+ * Handles GET /api/v1/admin/health - System health check.
+ * Tests connectivity to PostgreSQL, Elasticsearch, and Redis.
+ * Returns 200 if all services are healthy, 503 if any are degraded.
+ * @param _req - Request (unused)
+ * @param res - Response with health status for each service
+ */
 export async function healthCheck(_req: AuthenticatedRequest, res: Response): Promise<void> {
   const health: {
     status: string;

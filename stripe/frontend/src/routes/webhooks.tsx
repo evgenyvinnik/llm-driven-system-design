@@ -1,3 +1,13 @@
+/**
+ * Webhooks Route
+ *
+ * Webhook management page for configuring endpoints and monitoring event delivery.
+ * Allows merchants to set up webhook URLs, view delivery history,
+ * and retry failed webhook deliveries.
+ *
+ * @module routes/webhooks
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { listWebhookEvents, getWebhookEndpoint, updateWebhookEndpoint, deleteWebhookEndpoint, retryWebhook } from '@/services/api';
@@ -5,10 +15,20 @@ import { formatDate } from '@/utils';
 import { StatusBadge } from '@/components';
 import type { WebhookEvent, WebhookEndpoint } from '@/types';
 
+/**
+ * Route definition for the webhooks page (/webhooks).
+ */
 export const Route = createFileRoute('/webhooks')({
   component: WebhooksPage,
 });
 
+/**
+ * Webhooks page component.
+ * Displays webhook endpoint configuration, event history,
+ * and provides ability to configure endpoints and retry deliveries.
+ *
+ * @returns The webhooks management page
+ */
 function WebhooksPage() {
   const [events, setEvents] = useState<WebhookEvent[]>([]);
   const [endpoint, setEndpoint] = useState<WebhookEndpoint | null>(null);
@@ -21,6 +41,9 @@ function WebhooksPage() {
     loadData();
   }, []);
 
+  /**
+   * Fetches webhook events and endpoint configuration.
+   */
   async function loadData() {
     try {
       setLoading(true);
@@ -37,6 +60,10 @@ function WebhooksPage() {
     }
   }
 
+  /**
+   * Queues a failed webhook event for redelivery.
+   * @param eventId - The event ID to retry
+   */
   async function handleRetry(eventId: string) {
     try {
       await retryWebhook(eventId);
@@ -233,6 +260,15 @@ function WebhooksPage() {
   );
 }
 
+/**
+ * Modal dialog for configuring the webhook endpoint URL.
+ * Allows merchants to set or clear their webhook destination.
+ *
+ * @param props - Modal props
+ * @param props.currentUrl - The currently configured URL (if any)
+ * @param props.onClose - Callback to close the modal
+ * @param props.onSave - Callback with the new URL when saved
+ */
 function ConfigureEndpointModal({
   currentUrl,
   onClose,
@@ -245,6 +281,9 @@ function ConfigureEndpointModal({
   const [url, setUrl] = useState(currentUrl);
   const [loading, setLoading] = useState(false);
 
+  /**
+   * Handles form submission and calls onSave callback.
+   */
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);

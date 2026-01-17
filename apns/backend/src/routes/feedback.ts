@@ -2,9 +2,29 @@ import { Router, Request, Response } from "express";
 import { feedbackService } from "../services/feedbackService.js";
 import { validateBundleId } from "../utils/index.js";
 
+/**
+ * Feedback Routes.
+ *
+ * Provides the APNs Feedback Service API for app providers.
+ * Providers poll these endpoints to learn about invalidated device tokens
+ * so they can stop sending notifications to those devices.
+ *
+ * Routes:
+ * - GET /:appBundleId - Get feedback entries for an app
+ * - DELETE /:appBundleId - Clear processed feedback entries
+ */
 const router = Router();
 
-// Get feedback for an app
+/**
+ * Get feedback entries for an app.
+ * Returns invalid tokens that should be removed from the provider's database.
+ * Supports filtering by timestamp to get only new feedback since last check.
+ *
+ * @route GET /api/v1/feedback/:appBundleId
+ * @param appBundleId - App bundle identifier
+ * @query since - ISO date string to filter feedback after
+ * @returns {feedback: FeedbackEntry[]}
+ */
 router.get("/:appBundleId", async (req: Request, res: Response) => {
   try {
     const { appBundleId } = req.params;
@@ -31,7 +51,15 @@ router.get("/:appBundleId", async (req: Request, res: Response) => {
   }
 });
 
-// Clear feedback for an app
+/**
+ * Clear feedback entries for an app.
+ * Called after provider has processed the feedback and updated their database.
+ *
+ * @route DELETE /api/v1/feedback/:appBundleId
+ * @param appBundleId - App bundle identifier
+ * @query before - ISO date string to clear feedback before
+ * @returns {cleared: number}
+ */
 router.delete("/:appBundleId", async (req: Request, res: Response) => {
   try {
     const { appBundleId } = req.params;

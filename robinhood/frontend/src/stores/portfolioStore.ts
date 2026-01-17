@@ -1,20 +1,36 @@
+/**
+ * Portfolio, orders, watchlists, and alerts state management using Zustand.
+ * Centralizes all trading-related data and provides actions
+ * for placing orders, managing watchlists, and setting price alerts.
+ */
+
 import { create } from 'zustand';
 import type { Portfolio, Order, Watchlist, PriceAlert } from '../types';
 import { portfolioApi, ordersApi, watchlistsApi } from '../services/api';
 
+/**
+ * Portfolio store state and actions.
+ */
 interface PortfolioState {
+  /** User's portfolio with holdings and P&L metrics */
   portfolio: Portfolio | null;
+  /** User's order history */
   orders: Order[];
+  /** User's watchlists with items */
   watchlists: Watchlist[];
+  /** User's price alerts */
   alerts: PriceAlert[];
+  /** Whether an operation is in progress */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
 
-  // Portfolio actions
+  /** Fetches portfolio summary from API */
   fetchPortfolio: () => Promise<void>;
 
-  // Order actions
+  /** Fetches orders, optionally filtered by status */
   fetchOrders: (status?: string) => Promise<void>;
+  /** Places a new order and refreshes portfolio/orders */
   placeOrder: (data: {
     symbol: string;
     side: 'buy' | 'sell';
@@ -23,23 +39,35 @@ interface PortfolioState {
     limitPrice?: number;
     stopPrice?: number;
   }) => Promise<Order>;
+  /** Cancels an order and refreshes portfolio/orders */
   cancelOrder: (orderId: string) => Promise<void>;
 
-  // Watchlist actions
+  /** Fetches all watchlists with items */
   fetchWatchlists: () => Promise<void>;
+  /** Creates a new watchlist */
   createWatchlist: (name: string) => Promise<Watchlist>;
+  /** Deletes a watchlist */
   deleteWatchlist: (watchlistId: string) => Promise<void>;
+  /** Adds a symbol to a watchlist */
   addToWatchlist: (watchlistId: string, symbol: string) => Promise<void>;
+  /** Removes a symbol from a watchlist */
   removeFromWatchlist: (watchlistId: string, symbol: string) => Promise<void>;
 
-  // Alert actions
+  /** Fetches all price alerts */
   fetchAlerts: () => Promise<void>;
+  /** Creates a new price alert */
   createAlert: (symbol: string, targetPrice: number, condition: 'above' | 'below') => Promise<PriceAlert>;
+  /** Deletes a price alert */
   deleteAlert: (alertId: string) => Promise<void>;
 
+  /** Clears any stored error message */
   clearError: () => void;
 }
 
+/**
+ * Zustand store for portfolio, orders, watchlists, and alerts.
+ * Provides actions for trading operations and data fetching.
+ */
 export const usePortfolioStore = create<PortfolioState>((set, get) => ({
   portfolio: null,
   orders: [],

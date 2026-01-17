@@ -1,4 +1,11 @@
-// Transaction statuses
+/**
+ * Frontend type definitions for the payment system.
+ * Mirrors backend types for API response parsing.
+ */
+
+/**
+ * Represents the lifecycle state of a payment transaction.
+ */
 export type TransactionStatus =
   | 'pending'
   | 'authorized'
@@ -8,9 +15,13 @@ export type TransactionStatus =
   | 'voided'
   | 'partially_refunded';
 
+/** Represents the processing state of a refund request. */
 export type RefundStatus = 'pending' | 'completed' | 'failed';
+
+/** Represents the state of a customer-disputed charge. */
 export type ChargebackStatus = 'open' | 'won' | 'lost' | 'pending_response';
 
+/** Describes how a customer is paying. */
 export interface PaymentMethod {
   type: 'card' | 'bank_transfer';
   card_brand?: string;
@@ -19,6 +30,7 @@ export interface PaymentMethod {
   exp_year?: number;
 }
 
+/** Core payment transaction record for display. */
 export interface Transaction {
   id: string;
   idempotency_key?: string;
@@ -39,6 +51,7 @@ export interface Transaction {
   updated_at: string;
 }
 
+/** Represents a refund for a captured payment. */
 export interface Refund {
   id: string;
   original_tx_id: string;
@@ -50,6 +63,7 @@ export interface Refund {
   updated_at: string;
 }
 
+/** Represents a customer-initiated dispute. */
 export interface Chargeback {
   id: string;
   transaction_id: string;
@@ -63,6 +77,7 @@ export interface Chargeback {
   updated_at: string;
 }
 
+/** Merchant profile data. */
 export interface Merchant {
   id: string;
   name: string;
@@ -74,6 +89,7 @@ export interface Merchant {
   created_at: string;
 }
 
+/** Aggregated metrics for the merchant dashboard. */
 export interface DashboardStats {
   total_volume: number;
   total_transactions: number;
@@ -83,12 +99,14 @@ export interface DashboardStats {
   average_transaction: number;
 }
 
+/** Data point for volume time-series charts. */
 export interface VolumeDataPoint {
   period: string;
   volume: number;
   count: number;
 }
 
+/** Request body for creating a new payment. */
 export interface CreatePaymentRequest {
   amount: number;
   currency: string;
@@ -99,6 +117,7 @@ export interface CreatePaymentRequest {
   capture?: boolean;
 }
 
+/** Generic wrapper for paginated API responses. */
 export interface ApiResponse<T> {
   data?: T;
   total?: number;

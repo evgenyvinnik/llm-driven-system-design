@@ -1,3 +1,10 @@
+/**
+ * Scraper worker process for fetching product prices.
+ * Runs independently of the API server as a cron-scheduled job.
+ * Processes products from a Redis-backed priority queue, respecting
+ * rate limits and concurrency settings.
+ * @module scraper-worker
+ */
 import cron from 'node-cron';
 import dotenv from 'dotenv';
 
@@ -10,12 +17,24 @@ import { sleep } from './utils/helpers.js';
 
 dotenv.config();
 
+/** Maximum concurrent scrape operations */
 const MAX_CONCURRENT_SCRAPES = parseInt(process.env.MAX_CONCURRENT_SCRAPES || '5', 10);
+
+/** Interval between scheduled scrape runs in minutes */
 const SCRAPE_INTERVAL_MINUTES = parseInt(process.env.SCRAPE_INTERVAL_MINUTES || '30', 10);
 
+/** Flag indicating if a scrape job is currently running */
 let isRunning = false;
+
+/** Counter for currently active concurrent scrapes */
 let activeScrapes = 0;
 
+/**
+ * Scrapes a single product and updates the database.
+ * Fetches the product URL, extracts price data, updates the database,
+ * and triggers alerts if the price changed.
+ * @param productId - The UUID of the product to scrape
+ */
 async function scrapeProduct(productId: string): Promise<void> {
   const { getProductById } = await import('./services/productService.js');
 
@@ -73,6 +92,10 @@ async function scrapeProduct(productId: string): Promise<void> {
   }
 }
 
+/**
+ * Processes the Redis scrape queue up to the concurrency limit.
+ * Spawns concurrent scrape tasks and tracks completion.
+ */
 async function processQueue(): Promise<void> {
   while (isRunning && activeScrapes < MAX_CONCURRENT_SCRAPES) {
     const productId = await getNextScrapeJob();
@@ -91,6 +114,11 @@ async function processQueue(): Promise<void> {
   }
 }
 
+/**
+ * Populates the Redis scrape queue from the database.
+ * Queries for products that are due for scraping based on their
+ * priority-based refresh interval.
+ */
 async function populateQueue(): Promise<void> {
   logger.info('Populating scrape queue...');
 
@@ -102,6 +130,11 @@ async function populateQueue(): Promise<void> {
   }
 }
 
+/**
+ * Executes a complete scrape job cycle.
+ * Populates the queue and processes until all products are scraped.
+ * Prevents concurrent job runs.
+ */
 async function runScrapeJob(): Promise<void> {
   if (isRunning) {
     logger.warn('Scrape job already running');
@@ -137,7 +170,11 @@ async function runScrapeJob(): Promise<void> {
   }
 }
 
-// Handle graceful shutdown
+/**
+ * Graceful shutdown handler.
+ * Stops accepting new work and waits for active scrapes to complete.
+ * Force exits after 30 seconds if scrapes don't complete.
+ */
 function shutdown() {
   logger.info('Shutting down scraper worker...');
   isRunning = false;
@@ -161,7 +198,10 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Main entry point
+/**
+ * Main entry point for the scraper worker.
+ * Runs an initial scrape job, then schedules periodic jobs via cron.
+ */
 async function main() {
   logger.info('Price Tracker Scraper Worker starting...');
   logger.info(`Max concurrent scrapes: ${MAX_CONCURRENT_SCRAPES}`);

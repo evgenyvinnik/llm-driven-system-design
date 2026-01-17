@@ -1,3 +1,9 @@
+/**
+ * Application router configuration using TanStack Router.
+ * Defines all routes and their component mappings.
+ * @module router
+ */
+
 import { createRouter, createRootRoute, createRoute, Outlet } from '@tanstack/react-router';
 import { Layout } from './components/Layout';
 import { DashboardPage } from './routes/Dashboard';
@@ -6,7 +12,7 @@ import { JobDetailPage } from './routes/JobDetail';
 import { ExecutionDetailPage } from './routes/ExecutionDetail';
 import { WorkersPage } from './routes/Workers';
 
-// Root route
+/** Root route wrapping all pages in the Layout component */
 const rootRoute = createRootRoute({
   component: () => (
     <Layout>
@@ -15,42 +21,42 @@ const rootRoute = createRootRoute({
   ),
 });
 
-// Dashboard route
+/** Dashboard route - system overview at root path */
 const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
   component: DashboardPage,
 });
 
-// Jobs list route
+/** Jobs list route - paginated job management */
 const jobsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/jobs',
   component: JobsPage,
 });
 
-// Job detail route
+/** Job detail route - single job view with executions */
 const jobDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/jobs/$jobId',
   component: JobDetailPage,
 });
 
-// Execution detail route
+/** Execution detail route - single execution with logs */
 const executionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/executions/$executionId',
   component: ExecutionDetailPage,
 });
 
-// Workers route
+/** Workers route - worker status monitoring */
 const workersRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/workers',
   component: WorkersPage,
 });
 
-// Route tree
+/** Complete route tree with all application routes */
 const routeTree = rootRoute.addChildren([
   dashboardRoute,
   jobsRoute,
@@ -59,10 +65,10 @@ const routeTree = rootRoute.addChildren([
   workersRoute,
 ]);
 
-// Router
+/** Configured router instance for the application */
 export const router = createRouter({ routeTree });
 
-// Type declarations
+/** Type declarations for TanStack Router type safety */
 declare module '@tanstack/react-router' {
   interface Register {
     router: typeof router;

@@ -1,5 +1,17 @@
 import { useEditorStore } from '../stores/editorStore';
 
+/**
+ * UserList - Displays the list of collaborators currently editing the document.
+ *
+ * Shows each connected client with their:
+ * - Assigned color (for presence visualization)
+ * - Display name
+ * - Current cursor position (if available)
+ *
+ * The current user is marked with "(you)" for identification.
+ *
+ * @returns The UserList component
+ */
 export function UserList() {
   const { clients, clientId, connected } = useEditorStore();
 

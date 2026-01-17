@@ -1,3 +1,10 @@
+/**
+ * Top navigation bar component for the LinkedIn clone.
+ * Displays navigation links, search, and user menu when authenticated.
+ * Shows simplified nav with sign in/join links when not authenticated.
+ *
+ * @module components/Navbar
+ */
 import { Link, useNavigate } from '@tanstack/react-router';
 import {
   Home,
@@ -12,6 +19,14 @@ import {
 import { useAuthStore } from '../stores/authStore';
 import { useState } from 'react';
 
+/**
+ * Main navigation bar displayed at the top of every page.
+ * Features:
+ * - Logo and search bar
+ * - Navigation icons for Home, Network, Jobs, Messaging, Notifications
+ * - User dropdown with profile link and logout
+ * - Responsive layout with sticky positioning
+ */
 export function Navbar() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const navigate = useNavigate();

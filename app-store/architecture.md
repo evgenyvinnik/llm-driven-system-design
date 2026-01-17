@@ -636,6 +636,576 @@ CREATE TABLE rankings (
 
 ---
 
+## Consistency and Idempotency
+
+### Consistency Model by Operation
+
+| Operation | Consistency Level | Rationale |
+|-----------|-------------------|-----------|
+| Purchase creation | **Strong (serializable)** | Financial correctness requires no double-charges |
+| Review submission | **Strong (read-your-writes)** | User sees their review immediately |
+| Download count increment | **Eventual** | Slight delays acceptable for analytics |
+| Ranking updates | **Eventual (batch)** | Rankings recomputed hourly, lag is acceptable |
+| Search index updates | **Eventual (~5s)** | New apps appear shortly after publish |
+
+### Idempotency Keys
+
+All mutating operations that interact with payment or critical state require client-provided idempotency keys:
+
+```javascript
+// Purchase endpoint with idempotency
+app.post('/api/v1/purchases', async (req, res) => {
+  const { appId, priceId, idempotencyKey } = req.body
+  const userId = req.session.userId
+
+  // Check for existing operation with this key
+  const existing = await redis.get(`idempotency:purchase:${userId}:${idempotencyKey}`)
+  if (existing) {
+    // Return cached result (replay handling)
+    return res.json(JSON.parse(existing))
+  }
+
+  // Acquire lock to prevent concurrent duplicates
+  const lockKey = `lock:purchase:${userId}:${idempotencyKey}`
+  const locked = await redis.set(lockKey, '1', 'NX', 'EX', 30)
+  if (!locked) {
+    return res.status(409).json({ error: 'Request in progress' })
+  }
+
+  try {
+    const result = await purchaseService.purchaseApp(userId, appId, priceId)
+
+    // Cache result for 24 hours (idempotency window)
+    await redis.setex(
+      `idempotency:purchase:${userId}:${idempotencyKey}`,
+      86400,
+      JSON.stringify(result)
+    )
+
+    return res.json(result)
+  } finally {
+    await redis.del(lockKey)
+  }
+})
+```
+
+**Key idempotency patterns:**
+- **Purchases**: Key = `{userId}:{appId}:{timestamp_bucket}` - prevents double-purchase within 1-minute window
+- **Reviews**: Key = `{userId}:{appId}` - one review per user per app, upsert semantics
+- **Developer payouts**: Key = `{developerId}:{period}` - one payout per billing period
+
+### Conflict Resolution
+
+For concurrent modifications to the same resource:
+
+| Resource | Strategy | Implementation |
+|----------|----------|----------------|
+| App metadata | Last-write-wins with version | `UPDATE apps SET ... WHERE id = $1 AND version = $2` |
+| Reviews | User can only have one per app | `ON CONFLICT (user_id, app_id) DO UPDATE` |
+| Developer response | Last-write-wins | Single developer per app simplifies this |
+| Rankings | Batch recompute | No conflicts - read-only table rebuilt hourly |
+
+---
+
+## Async Processing with RabbitMQ
+
+### Queue Architecture
+
+For a local development setup, RabbitMQ provides durable, ordered message processing with explicit acknowledgments.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         RabbitMQ Exchanges                              │
+├─────────────────────┬───────────────────────┬───────────────────────────┤
+│  app-store.events   │  app-store.tasks      │  app-store.dlx            │
+│  (topic exchange)   │  (direct exchange)    │  (dead letter exchange)   │
+└─────────────────────┴───────────────────────┴───────────────────────────┘
+         │                       │                        │
+         ▼                       ▼                        ▼
+┌─────────────────┐   ┌─────────────────┐      ┌─────────────────┐
+│ review.created  │   │ ranking.compute │      │ failed-messages │
+│ purchase.done   │   │ search.reindex  │      │ (for inspection)│
+│ app.updated     │   │ email.send      │      └─────────────────┘
+└─────────────────┘   └─────────────────┘
+```
+
+### Queue Definitions
+
+```javascript
+// queue-config.js
+const queues = {
+  // Event-driven fanout
+  'review.created': {
+    durable: true,
+    deadLetterExchange: 'app-store.dlx',
+    messageTtl: 86400000, // 24h
+    maxLength: 10000,     // Backpressure: reject when full
+  },
+  'purchase.completed': {
+    durable: true,
+    deadLetterExchange: 'app-store.dlx',
+    messageTtl: 604800000, // 7 days (critical for payouts)
+  },
+
+  // Background tasks
+  'ranking.compute': {
+    durable: true,
+    maxPriority: 10,      // Priority queue for urgent recalcs
+  },
+  'search.reindex': {
+    durable: true,
+    prefetch: 5,          // Batch ES updates
+  },
+  'integrity.analyze': {
+    durable: true,
+    prefetch: 1,          // ML inference is slow
+  }
+}
+```
+
+### Delivery Semantics
+
+| Queue | Semantics | Retry Policy | Notes |
+|-------|-----------|--------------|-------|
+| `purchase.completed` | **At-least-once** | 3 retries, exponential backoff | Downstream must be idempotent |
+| `review.created` | **At-least-once** | 3 retries, then DLQ | Integrity analysis can reprocess |
+| `ranking.compute` | **At-most-once** | No retry (scheduled job retries) | Stale rankings okay briefly |
+| `search.reindex` | **At-least-once** | 5 retries | ES upsert is idempotent |
+
+### Producer Example
+
+```javascript
+// After purchase completes
+async function publishPurchaseEvent(purchase) {
+  const message = {
+    eventId: uuid(),        // For deduplication
+    eventType: 'purchase.completed',
+    timestamp: new Date().toISOString(),
+    data: {
+      purchaseId: purchase.id,
+      userId: purchase.user_id,
+      appId: purchase.app_id,
+      amount: purchase.amount,
+      developerId: purchase.developer_id,
+    }
+  }
+
+  await channel.publish(
+    'app-store.events',
+    'purchase.completed',
+    Buffer.from(JSON.stringify(message)),
+    {
+      persistent: true,           // Survive broker restart
+      messageId: message.eventId, // For deduplication
+      contentType: 'application/json',
+    }
+  )
+}
+```
+
+### Consumer Example with Backpressure
+
+```javascript
+// Worker: process review integrity checks
+async function startIntegrityWorker() {
+  const channel = await connection.createChannel()
+
+  // Prefetch 1: process one at a time (ML is slow)
+  await channel.prefetch(1)
+
+  await channel.consume('integrity.analyze', async (msg) => {
+    const event = JSON.parse(msg.content.toString())
+
+    try {
+      // Check for duplicate processing
+      const processed = await redis.get(`processed:review:${event.eventId}`)
+      if (processed) {
+        channel.ack(msg) // Already done, just ack
+        return
+      }
+
+      // Run integrity analysis
+      const result = await reviewIntegrityService.analyzeReview(
+        event.data.review,
+        event.data.userId,
+        event.data.appId
+      )
+
+      // Update review status
+      await db.query(
+        'UPDATE reviews SET integrity_score = $1, status = $2 WHERE id = $3',
+        [result.integrityScore, result.action, event.data.reviewId]
+      )
+
+      // Mark as processed
+      await redis.setex(`processed:review:${event.eventId}`, 86400, '1')
+
+      channel.ack(msg)
+    } catch (error) {
+      console.error('Integrity check failed:', error)
+
+      // Requeue with limit
+      const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1
+      if (retryCount <= 3) {
+        // Requeue with backoff
+        setTimeout(() => {
+          channel.publish(
+            '',
+            'integrity.analyze',
+            msg.content,
+            { headers: { 'x-retry-count': retryCount } }
+          )
+          channel.ack(msg)
+        }, Math.pow(2, retryCount) * 1000)
+      } else {
+        // Send to DLQ
+        channel.nack(msg, false, false)
+      }
+    }
+  })
+}
+```
+
+### Background Jobs Summary
+
+| Job | Trigger | Queue | Frequency |
+|-----|---------|-------|-----------|
+| Ranking computation | Cron | `ranking.compute` | Hourly |
+| Search index sync | App update event | `search.reindex` | Real-time |
+| Review integrity | Review created event | `integrity.analyze` | Real-time |
+| Developer payout calc | Purchase event | `payout.calculate` | On each purchase |
+| Receipt email | Purchase event | `email.send` | On each purchase |
+
+---
+
+## Failure Handling and Resilience
+
+### Retry Strategy with Idempotency
+
+All external calls follow this pattern:
+
+```javascript
+class RetryableOperation {
+  constructor(options = {}) {
+    this.maxRetries = options.maxRetries || 3
+    this.baseDelay = options.baseDelay || 1000
+    this.maxDelay = options.maxDelay || 30000
+  }
+
+  async execute(operation, idempotencyKey) {
+    let lastError
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await operation()
+      } catch (error) {
+        lastError = error
+
+        // Don't retry non-retryable errors
+        if (this.isNonRetryable(error)) {
+          throw error
+        }
+
+        if (attempt < this.maxRetries) {
+          const delay = Math.min(
+            this.baseDelay * Math.pow(2, attempt) + Math.random() * 1000,
+            this.maxDelay
+          )
+          await this.sleep(delay)
+        }
+      }
+    }
+
+    // Log for investigation
+    console.error(`Operation failed after ${this.maxRetries} retries`, {
+      idempotencyKey,
+      error: lastError.message
+    })
+
+    throw lastError
+  }
+
+  isNonRetryable(error) {
+    // 4xx errors (except 429) are not retryable
+    if (error.status >= 400 && error.status < 500 && error.status !== 429) {
+      return true
+    }
+    // Business logic errors
+    if (error.code === 'ALREADY_PURCHASED' || error.code === 'INVALID_PRICE') {
+      return true
+    }
+    return false
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+```
+
+### Circuit Breaker for External Dependencies
+
+```javascript
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeout = options.resetTimeout || 30000
+    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.lastFailure = null
+    this.name = options.name || 'unnamed'
+  }
+
+  async call(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailure > this.resetTimeout) {
+        this.state = 'HALF_OPEN'
+      } else {
+        throw new Error(`Circuit breaker ${this.name} is OPEN`)
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+    this.state = 'CLOSED'
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailure = Date.now()
+
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      console.warn(`Circuit breaker ${this.name} opened after ${this.failures} failures`)
+    }
+  }
+}
+
+// Usage
+const esCircuitBreaker = new CircuitBreaker({ name: 'elasticsearch', failureThreshold: 3 })
+const paymentCircuitBreaker = new CircuitBreaker({ name: 'payment-provider', failureThreshold: 2 })
+
+// In search service
+async function search(query) {
+  return esCircuitBreaker.call(async () => {
+    return elasticsearch.search({ index: 'apps', body: { query } })
+  })
+}
+```
+
+### Graceful Degradation
+
+When dependencies fail, the system degrades gracefully:
+
+| Dependency | Failure Mode | Degradation Strategy |
+|------------|--------------|---------------------|
+| Elasticsearch | Circuit open | Fall back to PostgreSQL full-text search (slower) |
+| Redis (cache) | Connection lost | Bypass cache, hit database directly |
+| Redis (sessions) | Connection lost | Reject new logins, existing sessions continue if stateless fallback |
+| RabbitMQ | Broker down | Write events to PostgreSQL `outbox` table, replay on recovery |
+| Payment provider | Timeout | Show "try again later", preserve cart state |
+
+### Outbox Pattern for Guaranteed Delivery
+
+When RabbitMQ is unavailable, events are stored in PostgreSQL and replayed:
+
+```sql
+-- Outbox table for events that failed to publish
+CREATE TABLE event_outbox (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_type VARCHAR(100) NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  published_at TIMESTAMP,
+  retry_count INTEGER DEFAULT 0,
+  last_error TEXT
+);
+
+CREATE INDEX idx_outbox_pending ON event_outbox(created_at)
+  WHERE published_at IS NULL;
+```
+
+```javascript
+// Outbox publisher (runs every 10 seconds)
+async function processOutbox() {
+  const events = await db.query(`
+    SELECT * FROM event_outbox
+    WHERE published_at IS NULL AND retry_count < 5
+    ORDER BY created_at
+    LIMIT 100
+  `)
+
+  for (const event of events.rows) {
+    try {
+      await channel.publish(
+        'app-store.events',
+        event.event_type,
+        Buffer.from(JSON.stringify(event.payload)),
+        { persistent: true, messageId: event.id }
+      )
+
+      await db.query(
+        'UPDATE event_outbox SET published_at = NOW() WHERE id = $1',
+        [event.id]
+      )
+    } catch (error) {
+      await db.query(
+        'UPDATE event_outbox SET retry_count = retry_count + 1, last_error = $1 WHERE id = $2',
+        [error.message, event.id]
+      )
+    }
+  }
+}
+
+// Schedule every 10 seconds
+setInterval(processOutbox, 10000)
+```
+
+### Local Development DR Simulation
+
+For learning purposes, simulate multi-region disaster recovery locally:
+
+```yaml
+# docker-compose.yml - Multi-instance setup
+services:
+  postgres-primary:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: appstore
+      POSTGRES_USER: appstore
+      POSTGRES_PASSWORD: devpassword
+
+  postgres-replica:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: appstore
+      POSTGRES_USER: appstore
+      POSTGRES_PASSWORD: devpassword
+    # In production: configure streaming replication
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: appstore
+      RABBITMQ_DEFAULT_PASS: devpassword
+```
+
+**Failover testing script:**
+
+```bash
+#!/bin/bash
+# scripts/simulate-failover.sh
+
+echo "=== Simulating primary database failure ==="
+
+# Stop primary
+docker-compose stop postgres-primary
+
+# Application should fail over to replica
+# (requires app config to support read replica)
+
+echo "Primary stopped. Check app behavior..."
+sleep 10
+
+# Restore
+docker-compose start postgres-primary
+echo "Primary restored."
+```
+
+### Backup and Restore Procedures
+
+**Automated backup script (for local testing):**
+
+```bash
+#!/bin/bash
+# scripts/backup.sh
+
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+# PostgreSQL backup
+docker exec appstore-postgres pg_dump -U appstore appstore > "$BACKUP_DIR/postgres.sql"
+
+# Redis backup (if persistence enabled)
+docker exec appstore-redis redis-cli BGSAVE
+docker cp appstore-redis:/data/dump.rdb "$BACKUP_DIR/redis.rdb"
+
+# MinIO backup (app packages and screenshots)
+docker run --rm -v "$BACKUP_DIR:/backup" \
+  --network appstore_default \
+  minio/mc mirror appstore-minio/app-packages /backup/minio/
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+**Restore script:**
+
+```bash
+#!/bin/bash
+# scripts/restore.sh
+
+BACKUP_DIR=$1
+
+if [ -z "$BACKUP_DIR" ]; then
+  echo "Usage: ./restore.sh <backup-dir>"
+  exit 1
+fi
+
+# Restore PostgreSQL
+docker exec -i appstore-postgres psql -U appstore appstore < "$BACKUP_DIR/postgres.sql"
+
+# Restore Redis
+docker cp "$BACKUP_DIR/redis.rdb" appstore-redis:/data/dump.rdb
+docker exec appstore-redis redis-cli DEBUG RELOAD
+
+# Restore MinIO
+docker run --rm -v "$BACKUP_DIR:/backup" \
+  --network appstore_default \
+  minio/mc mirror /backup/minio/ appstore-minio/app-packages/
+
+echo "Restore completed from: $BACKUP_DIR"
+```
+
+**Testing backup/restore:**
+
+```bash
+# 1. Create some test data
+npm run db:seed
+
+# 2. Backup
+./scripts/backup.sh
+
+# 3. Destroy data
+docker-compose down -v
+docker-compose up -d
+npm run db:migrate
+
+# 4. Restore
+./scripts/restore.sh ./backups/20240115_120000
+
+# 5. Verify data integrity
+npm run test:integration
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -644,3 +1214,6 @@ CREATE TABLE rankings (
 | Reviews | ML moderation | Manual only | Scale |
 | Search | Elasticsearch | PostgreSQL FTS | Performance, features |
 | Recommendations | Hybrid CF + content | Pure CF | Cold start |
+| Message queue | RabbitMQ | Kafka | Simpler for local dev, sufficient for learning |
+| Consistency | Strong for payments, eventual for analytics | All strong | Performance vs correctness tradeoff |
+| Idempotency | Client-provided keys with Redis locks | Database constraints only | Handles network retries gracefully |

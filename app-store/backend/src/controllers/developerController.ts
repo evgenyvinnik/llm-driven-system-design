@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Developer controller for app management.
+ * Handles app creation, updates, publishing, and analytics for developers.
+ */
+
 import { Request, Response } from 'express';
 import { catalogService } from '../services/catalogService.js';
 import { searchService } from '../services/searchService.js';
@@ -6,10 +11,16 @@ import { uploadFile, getPresignedUploadUrl } from '../config/minio.js';
 import { config } from '../config/index.js';
 import multer from 'multer';
 
+/** Multer middleware configured for memory storage (files in buffer) */
 const upload = multer({ storage: multer.memoryStorage() });
 
+/** Express middleware for single file uploads */
 export const uploadMiddleware = upload.single('file');
 
+/**
+ * Retrieves all apps belonging to the authenticated developer.
+ * GET /api/v1/developer/apps
+ */
 export async function getDeveloperApps(req: Request, res: Response): Promise<void> {
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
 
@@ -22,6 +33,10 @@ export async function getDeveloperApps(req: Request, res: Response): Promise<voi
   res.json({ data: apps });
 }
 
+/**
+ * Creates a new app for the authenticated developer.
+ * POST /api/v1/developer/apps
+ */
 export async function createApp(req: Request, res: Response): Promise<void> {
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
 
@@ -71,6 +86,10 @@ export async function createApp(req: Request, res: Response): Promise<void> {
   res.status(201).json({ data: app });
 }
 
+/**
+ * Updates an existing app's metadata.
+ * PUT /api/v1/developer/apps/:id
+ */
 export async function updateApp(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -125,6 +144,10 @@ export async function updateApp(req: Request, res: Response): Promise<void> {
   res.json({ data: updated });
 }
 
+/**
+ * Submits an app for review before publishing.
+ * POST /api/v1/developer/apps/:id/submit
+ */
 export async function submitForReview(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -149,6 +172,10 @@ export async function submitForReview(req: Request, res: Response): Promise<void
   res.json({ data: updated });
 }
 
+/**
+ * Publishes an approved app to the store.
+ * POST /api/v1/developer/apps/:id/publish
+ */
 export async function publishApp(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -175,6 +202,10 @@ export async function publishApp(req: Request, res: Response): Promise<void> {
   res.json({ data: updated });
 }
 
+/**
+ * Uploads an app icon.
+ * POST /api/v1/developer/apps/:id/icon
+ */
 export async function uploadIcon(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -208,6 +239,10 @@ export async function uploadIcon(req: Request, res: Response): Promise<void> {
   res.json({ data: { url } });
 }
 
+/**
+ * Uploads a screenshot for an app.
+ * POST /api/v1/developer/apps/:id/screenshots
+ */
 export async function uploadScreenshot(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { deviceType = 'iphone' } = req.body;
@@ -243,6 +278,10 @@ export async function uploadScreenshot(req: Request, res: Response): Promise<voi
   res.json({ data: screenshot });
 }
 
+/**
+ * Deletes a screenshot from an app.
+ * DELETE /api/v1/developer/apps/:id/screenshots/:screenshotId
+ */
 export async function deleteScreenshot(req: Request, res: Response): Promise<void> {
   const { id, screenshotId } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -262,6 +301,10 @@ export async function deleteScreenshot(req: Request, res: Response): Promise<voi
   res.json({ success: true });
 }
 
+/**
+ * Generates a presigned URL for direct file upload to MinIO.
+ * GET /api/v1/developer/apps/:id/upload-url
+ */
 export async function getUploadUrl(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { type, filename } = req.query;
@@ -303,6 +346,10 @@ export async function getUploadUrl(req: Request, res: Response): Promise<void> {
   res.json({ data: { uploadUrl: url, objectName } });
 }
 
+/**
+ * Retrieves analytics data for an app.
+ * GET /api/v1/developer/apps/:id/analytics
+ */
 export async function getAppAnalytics(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const developer = await catalogService.getDeveloperByUserId(req.user!.id);
@@ -344,6 +391,10 @@ export async function getAppAnalytics(req: Request, res: Response): Promise<void
   });
 }
 
+/**
+ * Retrieves reviews for a developer's app.
+ * GET /api/v1/developer/apps/:id/reviews
+ */
 export async function getAppReviews(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { page = '1', limit = '20' } = req.query;

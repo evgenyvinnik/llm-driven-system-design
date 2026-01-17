@@ -7,6 +7,17 @@ import type { WatchlistItem } from '../types';
 import { formatDurationHuman } from '../utils';
 import { Play, X } from 'lucide-react';
 
+/**
+ * Watchlist page displaying user's saved content.
+ * Shows all items the user has added to "My List" for later viewing.
+ *
+ * Features:
+ * - Grid display of saved content thumbnails
+ * - Click to navigate to content detail
+ * - Hover to reveal play overlay and remove button
+ * - Empty state with link to browse content
+ * - Requires authentication and profile selection
+ */
 function WatchlistPage() {
   const navigate = useNavigate();
   const { user, currentProfile } = useAuthStore();
@@ -113,6 +124,10 @@ function WatchlistPage() {
   );
 }
 
+/**
+ * Route configuration for watchlist page (/watchlist).
+ * User's saved content list, also known as "My List".
+ */
 export const Route = createFileRoute('/watchlist')({
   component: WatchlistPage,
 });

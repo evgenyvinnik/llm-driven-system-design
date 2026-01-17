@@ -1,3 +1,14 @@
+/**
+ * Frontend Type Definitions
+ *
+ * Shared TypeScript interfaces for the Netflix clone frontend.
+ * Mirrors backend types with camelCase naming for API responses.
+ */
+
+/**
+ * Video content metadata.
+ * Represents a movie or TV series in the catalog.
+ */
 export interface Video {
   id: string;
   title: string;
@@ -15,6 +26,9 @@ export interface Video {
   seasons?: Season[];
 }
 
+/**
+ * Season within a TV series.
+ */
 export interface Season {
   id: string;
   seasonNumber: number;
@@ -25,6 +39,9 @@ export interface Season {
   episodes: Episode[];
 }
 
+/**
+ * Individual episode within a season.
+ */
 export interface Episode {
   id: string;
   episodeNumber: number;
@@ -34,6 +51,10 @@ export interface Episode {
   thumbnailUrl: string | null;
 }
 
+/**
+ * User profile within an account.
+ * Each account can have multiple profiles with independent settings.
+ */
 export interface Profile {
   id: string;
   name: string;
@@ -43,6 +64,9 @@ export interface Profile {
   language: string;
 }
 
+/**
+ * User account (subscription holder).
+ */
 export interface Account {
   id: string;
   email: string;
@@ -50,12 +74,19 @@ export interface Account {
   country: string;
 }
 
+/**
+ * Authentication state for the app.
+ */
 export interface AuthState {
   account: Account | null;
   currentProfile: Profile | null;
   isAuthenticated: boolean;
 }
 
+/**
+ * Item in the "Continue Watching" row.
+ * Includes video/episode info and viewing progress.
+ */
 export interface ContinueWatchingItem {
   video: {
     id: string;
@@ -78,12 +109,19 @@ export interface ContinueWatchingItem {
   lastWatchedAt: string;
 }
 
+/**
+ * A row on the homepage.
+ */
 export interface HomepageRow {
   title: string;
   rowType: string;
   items: Video[];
 }
 
+/**
+ * Streaming manifest for video playback.
+ * Contains available quality levels and resume position.
+ */
 export interface StreamManifest {
   videoId: string;
   episodeId?: string;
@@ -92,6 +130,9 @@ export interface StreamManifest {
   resumePosition?: number;
 }
 
+/**
+ * Quality level for video streaming.
+ */
 export interface StreamQuality {
   quality: string;
   bitrate: number;
@@ -100,6 +141,9 @@ export interface StreamQuality {
   url: string;
 }
 
+/**
+ * A/B test experiment.
+ */
 export interface Experiment {
   id: string;
   name: string;
@@ -111,6 +155,9 @@ export interface Experiment {
   endDate: string | null;
 }
 
+/**
+ * Variant within an experiment.
+ */
 export interface ExperimentVariant {
   id: string;
   name: string;

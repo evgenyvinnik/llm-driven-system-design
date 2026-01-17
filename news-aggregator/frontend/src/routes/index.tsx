@@ -1,3 +1,9 @@
+/**
+ * Home page route with personalized news feed.
+ * Displays breaking news banner, topic filters, and paginated story list.
+ * @module routes/index
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useCallback } from 'react';
 import { StoryList, TopicBadges } from '../components';
@@ -6,6 +12,10 @@ import { useFeedStore } from '../stores';
 import type { Topic } from '../types';
 import { RefreshCw, Zap } from 'lucide-react';
 
+/**
+ * Home page route configuration.
+ * Prefetches feed, topics, and breaking news data.
+ */
 export const Route = createFileRoute('/')({
   loader: async () => {
     const [feedResponse, topicsResponse, breakingResponse] = await Promise.all([
@@ -22,6 +32,11 @@ export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Home page component.
+ * Manages feed state, topic filtering, and infinite scroll loading.
+ * @returns Home page with breaking news, topic filters, and story feed
+ */
 function HomePage() {
   const { initialFeed, topics, breaking } = Route.useLoaderData();
   const {
@@ -36,12 +51,17 @@ function HomePage() {
     setSelectedTopic,
   } = useFeedStore();
 
+  // Initialize feed from loader data
   useEffect(() => {
     if (stories.length === 0 && !selectedTopic) {
       setStories(initialFeed.stories, initialFeed.next_cursor, initialFeed.has_more);
     }
   }, [initialFeed, stories.length, selectedTopic, setStories]);
 
+  /**
+   * Load more stories for infinite scroll.
+   * Fetches next page based on current cursor and topic filter.
+   */
   const loadMore = useCallback(async () => {
     if (isLoading || !hasMore) return;
 
@@ -56,6 +76,11 @@ function HomePage() {
     }
   }, [isLoading, hasMore, cursor, selectedTopic, setLoading, appendStories]);
 
+  /**
+   * Handle topic filter change.
+   * Resets feed and fetches stories for the selected topic.
+   * @param topic - Topic name or null for all topics
+   */
   const handleTopicChange = async (topic: string | null) => {
     setSelectedTopic(topic);
     setLoading(true);
@@ -69,6 +94,10 @@ function HomePage() {
     }
   };
 
+  /**
+   * Refresh the current feed.
+   * Fetches fresh data for the current topic filter.
+   */
   const handleRefresh = async () => {
     setLoading(true);
     try {

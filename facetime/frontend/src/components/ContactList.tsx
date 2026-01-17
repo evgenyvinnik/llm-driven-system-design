@@ -1,11 +1,30 @@
+/**
+ * ContactList Component
+ *
+ * Displays a list of contacts with audio and video call buttons.
+ * Filters out the current user from the displayed list.
+ */
+
 import type { User } from '../types';
 
+/**
+ * Props for the ContactList component.
+ */
 interface ContactListProps {
+  /** Array of all users to display as contacts */
   contacts: User[];
+  /** ID of the current user (to exclude from list) */
   currentUserId: string;
+  /** Callback invoked when user initiates a call */
   onCall: (userId: string, callType: 'video' | 'audio') => void;
 }
 
+/**
+ * Renders a scrollable list of contacts with call action buttons.
+ *
+ * @param props - Component props with contacts, current user, and call handler
+ * @returns Contact list or empty state message
+ */
 export function ContactList({ contacts, currentUserId, onCall }: ContactListProps) {
   const filteredContacts = contacts.filter((c) => c.id !== currentUserId);
 

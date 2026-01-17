@@ -1,3 +1,7 @@
+/**
+ * Matches route - conversation list view.
+ * Displays all matched users and recent message previews.
+ */
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useMatchStore } from '../stores/matchStore';
@@ -5,6 +9,12 @@ import { useEffect } from 'react';
 import BottomNav from '../components/BottomNav';
 import ReignsAvatar from '../components/ReignsAvatar';
 
+/**
+ * Matches page component.
+ * Lists all user matches with conversation previews.
+ * Shows unread message badges and links to chat views.
+ * @returns Matches list element with navigation
+ */
 function MatchesPage() {
   const { isAuthenticated } = useAuthStore();
   const { matches, isLoading, loadMatches } = useMatchStore();

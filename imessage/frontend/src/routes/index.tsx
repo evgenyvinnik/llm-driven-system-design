@@ -6,6 +6,14 @@ import { ConversationList } from '@/components/ConversationList';
 import { ChatView } from '@/components/ChatView';
 import { AuthForm } from '@/components/AuthForm';
 
+/**
+ * Main index page component.
+ * Displays the authentication form for unauthenticated users,
+ * or the messaging interface (conversation list + chat view) for authenticated users.
+ * Implements a responsive layout with sidebar hidden on mobile when viewing a chat.
+ *
+ * @returns React component for the index page
+ */
 function IndexPage() {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const isLoading = useAuthStore((state) => state.isLoading);
@@ -89,6 +97,10 @@ function IndexPage() {
   );
 }
 
+/**
+ * Index route configuration for TanStack Router.
+ * Maps the "/" path to the IndexPage component.
+ */
 export const Route = createFileRoute('/')({
   component: IndexPage,
 });

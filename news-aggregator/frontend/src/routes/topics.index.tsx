@@ -1,8 +1,18 @@
+/**
+ * Topics index page route.
+ * Displays all available topics as a browsable grid.
+ * @module routes/topics.index
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { feedApi } from '../services/api';
 import { TopicLinks } from '../components';
 import { Tag } from 'lucide-react';
 
+/**
+ * Topics index page route configuration.
+ * Prefetches topic list with story counts.
+ */
 export const Route = createFileRoute('/topics/')({
   loader: async () => {
     const response = await feedApi.getTopics();
@@ -11,6 +21,11 @@ export const Route = createFileRoute('/topics/')({
   component: TopicsPage,
 });
 
+/**
+ * Topics index page component.
+ * Shows grid of topic cards linking to individual topic feeds.
+ * @returns Topics browse page with topic grid
+ */
 function TopicsPage() {
   const { topics } = Route.useLoaderData();
 

@@ -1,3 +1,8 @@
+/**
+ * Price history chart component using Recharts.
+ * Displays min/max/avg prices over time with optional target price line.
+ * @module components/PriceChart
+ */
 import {
   LineChart,
   Line,
@@ -11,12 +16,22 @@ import {
 import { format } from 'date-fns';
 import { DailyPrice } from '../types';
 
+/** Props for the PriceChart component */
 interface PriceChartProps {
+  /** Array of daily price summary data */
   data: DailyPrice[];
+  /** Currency code for formatting (default: USD) */
   currency?: string;
+  /** Optional target price to show as reference line */
   targetPrice?: number | null;
 }
 
+/**
+ * Renders an interactive line chart of price history.
+ * Shows average, min, and max price lines.
+ * Displays target price as a dashed reference line if set.
+ * @param props - Component props
+ */
 export function PriceChart({ data, currency = 'USD', targetPrice }: PriceChartProps) {
   const formatPrice = (price: number) => {
     return new Intl.NumberFormat('en-US', {

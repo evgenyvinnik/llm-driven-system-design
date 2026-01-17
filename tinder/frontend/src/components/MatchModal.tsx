@@ -2,11 +2,23 @@ import { useNavigate } from '@tanstack/react-router';
 import type { SwipeResult } from '../types';
 import ReignsAvatar from './ReignsAvatar';
 
+/**
+ * Props for the MatchModal component.
+ */
 interface MatchModalProps {
+  /** Match data from the swipe result */
   match: SwipeResult['match'];
+  /** Callback to close the modal */
   onClose: () => void;
 }
 
+/**
+ * Modal displayed when a mutual match is detected.
+ * Shows celebratory animation with matched user's info.
+ * Provides options to send a message or continue swiping.
+ * @param props - MatchModal component props
+ * @returns Match modal element or null if no match
+ */
 export default function MatchModal({ match, onClose }: MatchModalProps) {
   const navigate = useNavigate();
 

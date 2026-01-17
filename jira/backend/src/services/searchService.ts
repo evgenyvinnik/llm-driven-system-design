@@ -1,23 +1,47 @@
 import { esClient, ISSUE_INDEX, searchIssues } from '../config/elasticsearch.js';
 import { jqlParser, JQLNode } from './jqlParser.js';
 
+/**
+ * Options for issue search queries.
+ */
 export interface SearchOptions {
+  /** JQL query string */
   jql?: string;
+  /** Full-text search query */
   text?: string;
+  /** Filter to specific project */
   projectId?: string;
+  /** Maximum results to return (default: 50) */
   limit?: number;
+  /** Number of results to skip for pagination */
   offset?: number;
+  /** Field to sort by (default: updated_at) */
   sortField?: string;
+  /** Sort direction (default: desc) */
   sortOrder?: 'asc' | 'desc';
 }
 
+/**
+ * Result of a search query.
+ */
 export interface SearchResult {
+  /** Array of matching issue documents */
   issues: Record<string, unknown>[];
+  /** Total number of matches */
   total: number;
+  /** Query execution time in milliseconds */
   took: number;
 }
 
-// Search issues using JQL
+/**
+ * Searches issues using JQL and/or full-text search.
+ * Combines JQL parsing with Elasticsearch queries for powerful issue filtering.
+ *
+ * @param options - Search parameters including JQL, text, filters, and pagination
+ * @param currentUserId - ID of current user for resolving currentUser() function
+ * @returns Search results with issues, total count, and timing
+ * @throws Error if JQL syntax is invalid or search fails
+ */
 export async function searchIssuesWithJQL(
   options: SearchOptions,
   currentUserId?: string
@@ -94,7 +118,15 @@ export async function searchIssuesWithJQL(
   }
 }
 
-// Get search suggestions/autocomplete
+/**
+ * Gets autocomplete suggestions for a JQL field.
+ * Returns possible values for a field based on existing data.
+ *
+ * @param field - Field name to get suggestions for (status, assignee, etc.)
+ * @param prefix - Prefix to filter suggestions
+ * @param projectId - Optional project to scope suggestions
+ * @returns Array of matching field values
+ */
 export async function getSearchSuggestions(
   field: string,
   prefix: string,
@@ -143,7 +175,13 @@ export async function getSearchSuggestions(
   }
 }
 
-// Get aggregations for filters
+/**
+ * Gets aggregated counts for filter facets.
+ * Returns counts for statuses, priorities, types, assignees, sprints, and labels.
+ *
+ * @param projectId - Optional project to scope aggregations
+ * @returns Object with arrays of key-count pairs for each facet
+ */
 export async function getFilterAggregations(
   projectId?: string
 ): Promise<Record<string, { key: string; count: number }[]>> {
@@ -188,7 +226,16 @@ export async function getFilterAggregations(
   }
 }
 
-// Quick search (simple text search)
+/**
+ * Performs a quick text search for issues.
+ * Uses fuzzy matching across key, summary, and description.
+ * Optimized for type-ahead search UI.
+ *
+ * @param text - Search query text
+ * @param projectId - Optional project to scope search
+ * @param limit - Maximum results (default: 10)
+ * @returns Array of matching issue documents with scores
+ */
 export async function quickSearch(
   text: string,
   projectId?: string,
@@ -229,7 +276,13 @@ export async function quickSearch(
   }
 }
 
-// Validate JQL syntax
+/**
+ * Validates JQL syntax without executing the query.
+ * Useful for providing real-time syntax feedback in the UI.
+ *
+ * @param jql - JQL query string to validate
+ * @returns Object with valid flag and optional error message
+ */
 export function validateJQL(jql: string): { valid: boolean; error?: string } {
   try {
     jqlParser.parse(jql);

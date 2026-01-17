@@ -1,3 +1,7 @@
+/**
+ * Payment route for initiating Apple Pay transactions.
+ * Simulates the complete in-app payment flow with biometric authentication.
+ */
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { Layout } from '../components/Layout';
@@ -6,10 +10,19 @@ import { BiometricModal } from '../components/BiometricModal';
 import { useAuthStore, useWalletStore, usePaymentStore, useTransactionStore } from '../stores';
 import api from '../services/api';
 
+/** Route configuration for /pay */
 export const Route = createFileRoute('/pay')({
   component: PayPage,
 });
 
+/**
+ * Payment page component for making Apple Pay purchases.
+ * Orchestrates the full payment flow: card selection, merchant selection,
+ * amount entry, biometric authentication, and payment processing.
+ * Includes test scenarios for simulating different payment outcomes.
+ *
+ * @returns JSX element representing the payment interface
+ */
 function PayPage() {
   const { devices } = useAuthStore();
   const { cards, loadCards } = useWalletStore();

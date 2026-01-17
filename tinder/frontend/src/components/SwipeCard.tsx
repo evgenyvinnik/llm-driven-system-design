@@ -2,13 +2,27 @@ import { useState, useRef } from 'react';
 import type { DiscoveryCard } from '../types';
 import ReignsAvatar from './ReignsAvatar';
 
+/**
+ * Props for the SwipeCard component.
+ */
 interface SwipeCardProps {
+  /** The discovery card data to display */
   card: DiscoveryCard;
+  /** Whether this card is the active/topmost card in the stack */
   isActive: boolean;
+  /** Callback fired when user completes a swipe gesture */
   onSwipe?: (direction: 'like' | 'pass') => void;
-  useReignsStyle?: boolean; // Enable Reigns: Her Majesty style avatars
+  /** Enable Reigns: Her Majesty style procedural avatars instead of photos */
+  useReignsStyle?: boolean;
 }
 
+/**
+ * Swipeable profile card component for the discovery deck.
+ * Supports touch and mouse drag gestures with visual feedback (rotation, opacity).
+ * Shows LIKE/NOPE indicators based on drag direction.
+ * @param props - SwipeCard component props
+ * @returns Swipe card element
+ */
 export default function SwipeCard({ card, isActive, onSwipe, useReignsStyle = true }: SwipeCardProps) {
   const [currentPhotoIndex, setCurrentPhotoIndex] = useState(0);
   const [showInfo, setShowInfo] = useState(false);

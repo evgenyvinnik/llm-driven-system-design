@@ -1,8 +1,25 @@
+/**
+ * Router configuration for the iCloud Sync frontend.
+ *
+ * Uses Tanstack Router for type-safe routing with protected routes
+ * and role-based access control. The router handles:
+ * - Public routes (login, register)
+ * - Protected routes requiring authentication (drive, photos)
+ * - Admin-only routes with role check (admin)
+ */
 import { createRootRoute, createRoute, createRouter, Outlet, Link, redirect } from '@tanstack/react-router';
 import { useAuthStore } from './stores/authStore';
 import { CloudIcon } from './components/Icons';
 
-// Root layout
+/**
+ * Root layout component for the application.
+ *
+ * Renders the main navigation header when a user is logged in,
+ * including the iCloud logo, navigation links (Drive, Photos, Admin),
+ * user email, and sign out button. The Outlet renders child routes.
+ *
+ * @returns Layout wrapper with header and outlet
+ */
 const RootLayout = () => {
   const { user, logout } = useAuthStore();
 
@@ -61,12 +78,17 @@ const RootLayout = () => {
   );
 };
 
-// Create root route
+/**
+ * Root route with the main layout component.
+ */
 export const rootRoute = createRootRoute({
   component: RootLayout,
 });
 
-// Index route - redirect to drive or login
+/**
+ * Index route that redirects based on authentication state.
+ * Authenticated users go to /drive, others go to /login.
+ */
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
@@ -80,7 +102,9 @@ const indexRoute = createRoute({
   component: () => null,
 });
 
-// Login route
+/**
+ * Login route for user authentication.
+ */
 import { LoginPage } from './routes/LoginPage';
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -88,7 +112,9 @@ const loginRoute = createRoute({
   component: LoginPage,
 });
 
-// Register route
+/**
+ * Registration route for new user signup.
+ */
 import { RegisterPage } from './routes/RegisterPage';
 const registerRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -96,7 +122,10 @@ const registerRoute = createRoute({
   component: RegisterPage,
 });
 
-// Protected route wrapper
+/**
+ * Guard function for protected routes.
+ * Redirects to /login if user is not authenticated.
+ */
 const protectedBeforeLoad = () => {
   const { user, isLoading } = useAuthStore.getState();
   if (!user && !isLoading) {
@@ -104,7 +133,9 @@ const protectedBeforeLoad = () => {
   }
 };
 
-// Drive route
+/**
+ * Drive route for file management (protected).
+ */
 import { DrivePage } from './routes/DrivePage';
 const driveRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -113,7 +144,9 @@ const driveRoute = createRoute({
   component: DrivePage,
 });
 
-// Photos route
+/**
+ * Photos route for photo gallery (protected).
+ */
 import { PhotosPage } from './routes/PhotosPage';
 const photosRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -122,7 +155,10 @@ const photosRoute = createRoute({
   component: PhotosPage,
 });
 
-// Admin route
+/**
+ * Admin route with role-based access control.
+ * Requires authentication and admin role.
+ */
 import { AdminPage } from './routes/AdminPage';
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -139,7 +175,9 @@ const adminRoute = createRoute({
   component: AdminPage,
 });
 
-// Create route tree
+/**
+ * Complete route tree combining all routes.
+ */
 const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
@@ -149,10 +187,16 @@ const routeTree = rootRoute.addChildren([
   adminRoute,
 ]);
 
-// Create router
+/**
+ * Configured router instance with the route tree.
+ * Export for use with RouterProvider in App.tsx.
+ */
 export const router = createRouter({ routeTree });
 
-// Type declarations
+/**
+ * Module augmentation for Tanstack Router type safety.
+ * Enables autocomplete and type checking for route navigation.
+ */
 declare module '@tanstack/react-router' {
   interface Register {
     router: typeof router;

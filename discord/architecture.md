@@ -720,6 +720,514 @@ logger.error('DB error', { error, query })
 
 ---
 
+## Data Lifecycle Policies
+
+### Message Retention and TTL
+
+**In-Memory Ring Buffer (HistoryBuffer)**
+- **Retention**: Last 10 messages per room, evicted on overflow (oldest first)
+- **TTL**: None (messages persist until evicted or server restart)
+- **Eviction**: Automatic via ring buffer shift operation when buffer exceeds 10
+
+**PostgreSQL Messages Table**
+- **Retention Strategy**: Keep last 10 messages per room in hot storage
+- **Cleanup Job**: Run `cleanup_old_messages()` function every 5 minutes via pg_cron or application-level scheduler
+
+```sql
+-- Schedule cleanup (if using pg_cron)
+SELECT cron.schedule('cleanup-messages', '*/5 * * * *', 'SELECT cleanup_old_messages()');
+
+-- Or run from Node.js
+setInterval(async () => {
+  await db.query('SELECT cleanup_old_messages()');
+  logger.info('Message cleanup completed');
+}, 5 * 60 * 1000);  // Every 5 minutes
+```
+
+**Local Development**: For learning purposes, the 10-message limit keeps the dataset small and demonstrates bounded buffer patterns.
+
+### Archival to Cold Storage
+
+**When to Archive (Production Pattern)**
+- Messages older than 30 days move from PostgreSQL to MinIO (S3-compatible)
+- Store as JSON files: `archive/rooms/{room_id}/{year}/{month}.json`
+
+**Local Development Implementation**
+Since this is an educational project, archival is optional but can be demonstrated:
+
+```bash
+# Export messages older than 1 hour to JSON file
+npm run archive:messages
+
+# This runs:
+# 1. SELECT messages WHERE created_at < NOW() - INTERVAL '1 hour'
+# 2. Write to discord/archive/{room_name}_{timestamp}.json
+# 3. DELETE archived messages from PostgreSQL
+```
+
+**Archive Schema**:
+```json
+{
+  "room": "general",
+  "archived_at": "2024-01-15T10:30:00Z",
+  "messages": [
+    {"id": 42, "user": "alice", "content": "Hello", "created_at": "2024-01-14T09:15:00Z"}
+  ]
+}
+```
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Restore HistoryBuffer After Restart**
+On server startup, the HistoryBuffer loads recent messages from PostgreSQL:
+
+```typescript
+// In HistoryBuffer.loadFromDB()
+async loadFromDB(): Promise<void> {
+  const rooms = await db.getRooms();
+  for (const room of rooms) {
+    const messages = await db.getRecentMessages(room.name, 10);
+    this.buffers.set(room.name, messages);
+    logger.info(`Loaded ${messages.length} messages for room: ${room.name}`);
+  }
+}
+```
+
+**Scenario 2: Replay Messages from Archive**
+To restore archived messages to PostgreSQL:
+
+```bash
+# Replay archived messages for a specific room
+npm run replay:messages -- --room general --file archive/general_2024-01.json
+
+# This inserts messages back into PostgreSQL and updates HistoryBuffer
+```
+
+**Scenario 3: Rebuild Valkey Pub/Sub State**
+Valkey pub/sub is ephemeral (no message persistence). If Valkey restarts:
+1. Active subscriptions are lost
+2. Clients reconnect automatically (SSE has auto-reconnect)
+3. No message replay needed (chat is real-time, not guaranteed delivery)
+
+**Scenario 4: PostgreSQL Recovery**
+```bash
+# Backup (run weekly in production, on-demand locally)
+pg_dump babydiscord > backup_$(date +%Y%m%d).sql
+
+# Restore
+psql babydiscord < backup_20240115.sql
+
+# After restore, restart server to reload HistoryBuffer
+npm run dev
+```
+
+---
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+**Local Development (3 Instances)**
+
+For testing horizontal scaling locally:
+
+```bash
+# Step 1: Start infrastructure
+docker-compose up -d  # PostgreSQL, Valkey
+
+# Step 2: Run database migrations
+npm run db:migrate
+
+# Step 3: Start instances one at a time (rolling deployment simulation)
+npm run dev:instance1 &  # Wait for "Server listening" log
+sleep 5
+npm run dev:instance2 &  # Wait for "Server listening" log
+sleep 5
+npm run dev:instance3 &
+
+# Step 4: Verify all instances are healthy
+curl http://localhost:3001/health
+curl http://localhost:3002/health
+curl http://localhost:3003/health
+```
+
+**Rolling Deployment Pattern**
+
+When updating code:
+
+1. **Deploy to Instance 1**:
+   ```bash
+   # Stop instance 1
+   kill $(lsof -t -i:3001)
+   # Pull new code, restart
+   npm run dev:instance1
+   # Verify health
+   curl http://localhost:3001/health
+   ```
+
+2. **Wait for stability** (30 seconds): Monitor logs for errors
+
+3. **Deploy to Instance 2**: Repeat process
+
+4. **Deploy to Instance 3**: Repeat process
+
+**Canary Deployment (Advanced)**
+
+Route 10% of traffic to new instance, monitor for errors:
+```nginx
+# nginx.conf for local testing
+upstream chat_backend {
+    server localhost:3001 weight=9;
+    server localhost:3002 weight=1;  # Canary
+}
+```
+
+### Schema Migrations
+
+**Migration File Structure**
+```
+backend/src/db/migrations/
+├── 001_initial_schema.sql      # users, rooms, room_members, messages
+├── 002_add_message_index.sql   # idx_messages_room_time
+├── 003_add_user_status.sql     # Example: add online_status column
+└── 004_add_room_description.sql
+```
+
+**Migration Runner**
+```bash
+# Run all pending migrations
+npm run db:migrate
+
+# Check migration status
+npm run db:migrate:status
+
+# Rollback last migration (if supported)
+npm run db:migrate:rollback
+```
+
+**Migration Script Implementation** (`backend/src/db/migrate.ts`):
+```typescript
+async function migrate() {
+  const applied = await db.query('SELECT name FROM schema_migrations');
+  const appliedNames = new Set(applied.rows.map(r => r.name));
+
+  const files = fs.readdirSync('./migrations').sort();
+  for (const file of files) {
+    if (!appliedNames.has(file)) {
+      console.log(`Applying: ${file}`);
+      const sql = fs.readFileSync(`./migrations/${file}`, 'utf8');
+      await db.query(sql);
+      await db.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
+    }
+  }
+  console.log('Migrations complete');
+}
+```
+
+**Safe Migration Practices**
+- Always add columns as nullable first, then backfill, then add NOT NULL
+- Create indexes with `CONCURRENTLY` to avoid locking tables
+- Test migrations on a copy of production data before deploying
+
+### Rollback Runbooks
+
+**Runbook 1: Bad Code Deployment**
+
+*Symptoms*: 500 errors, connection failures, increased latency
+
+*Steps*:
+1. **Identify bad instance**: Check logs for errors
+   ```bash
+   tail -f logs/instance1.log | grep ERROR
+   ```
+
+2. **Rollback code**: Revert to previous git commit
+   ```bash
+   git checkout HEAD~1
+   npm run build
+   ```
+
+3. **Restart affected instance**:
+   ```bash
+   kill $(lsof -t -i:3001)
+   npm run dev:instance1
+   ```
+
+4. **Verify health**:
+   ```bash
+   curl http://localhost:3001/health
+   # Expected: {"status": "healthy", "db": "connected", "valkey": "connected"}
+   ```
+
+**Runbook 2: Database Migration Failure**
+
+*Symptoms*: Server won't start, "relation does not exist" errors
+
+*Steps*:
+1. **Check migration status**:
+   ```bash
+   psql babydiscord -c "SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5"
+   ```
+
+2. **Identify failed migration**: Check logs for SQL errors
+
+3. **Manual rollback** (if migration was partially applied):
+   ```sql
+   -- Example: remove partially created index
+   DROP INDEX IF EXISTS idx_new_feature;
+   -- Remove migration record
+   DELETE FROM schema_migrations WHERE name = '005_add_new_feature.sql';
+   ```
+
+4. **Fix migration file** and re-run:
+   ```bash
+   npm run db:migrate
+   ```
+
+**Runbook 3: Valkey Connection Failure**
+
+*Symptoms*: Messages not delivered across instances, pub/sub errors in logs
+
+*Steps*:
+1. **Check Valkey status**:
+   ```bash
+   docker-compose ps valkey
+   redis-cli -p 6379 PING  # Should return PONG
+   ```
+
+2. **Restart Valkey**:
+   ```bash
+   docker-compose restart valkey
+   ```
+
+3. **Restart chat instances** (to re-establish subscriptions):
+   ```bash
+   # Instances auto-reconnect, but restart if subscriptions seem stale
+   npm run restart:all
+   ```
+
+4. **Verify pub/sub**:
+   ```bash
+   # Terminal 1: Subscribe
+   redis-cli SUBSCRIBE room:general
+
+   # Terminal 2: Publish
+   redis-cli PUBLISH room:general '{"test": true}'
+
+   # Terminal 1 should show the message
+   ```
+
+**Runbook 4: PostgreSQL Connection Pool Exhaustion**
+
+*Symptoms*: "too many connections" errors, slow queries
+
+*Steps*:
+1. **Check active connections**:
+   ```sql
+   SELECT count(*) FROM pg_stat_activity WHERE datname = 'babydiscord';
+   ```
+
+2. **Identify long-running queries**:
+   ```sql
+   SELECT pid, now() - pg_stat_activity.query_start AS duration, query
+   FROM pg_stat_activity
+   WHERE state != 'idle'
+   ORDER BY duration DESC;
+   ```
+
+3. **Kill stuck queries**:
+   ```sql
+   SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+   WHERE duration > interval '5 minutes' AND state != 'idle';
+   ```
+
+4. **Increase pool size** (if legitimate load):
+   ```javascript
+   // In db.ts
+   const pool = new Pool({
+     max: 20,  // Increase from default 10
+   });
+   ```
+
+---
+
+## Capacity and Cost Guardrails
+
+### Alert Thresholds
+
+**Queue Lag Alerts (Valkey Pub/Sub)**
+
+Monitor message delivery delay:
+
+```typescript
+// In MessageRouter, measure pub/sub latency
+const startTime = Date.now();
+await redis.publish(`room:${room}`, JSON.stringify(message));
+const latency = Date.now() - startTime;
+
+if (latency > 100) {
+  logger.warn('Pub/sub latency exceeded threshold', { latency, room });
+}
+if (latency > 500) {
+  logger.error('Pub/sub latency critical', { latency, room });
+  // Alert: Valkey may be overloaded
+}
+```
+
+**Thresholds for Local Development**:
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| Pub/sub latency | > 100ms | > 500ms | Check Valkey memory, restart if needed |
+| Message queue depth | > 100 | > 500 | Scale instances or increase Valkey memory |
+| DB connection wait | > 50ms | > 200ms | Increase pool size |
+
+**Storage Growth Alerts**
+
+Monitor PostgreSQL table sizes:
+
+```sql
+-- Check messages table size
+SELECT pg_size_pretty(pg_total_relation_size('messages')) AS messages_size;
+
+-- Should stay under 10MB for local testing (10 messages/room * ~100 rooms * 200 bytes)
+```
+
+**Local Thresholds**:
+| Table | Expected Size | Warning | Action |
+|-------|---------------|---------|--------|
+| messages | < 1 MB | > 5 MB | Run cleanup_old_messages() manually |
+| users | < 100 KB | > 500 KB | Check for duplicate user creation |
+| rooms | < 50 KB | > 200 KB | Normal growth, no action needed |
+
+**Monitoring Script** (`scripts/check-storage.sh`):
+```bash
+#!/bin/bash
+psql babydiscord -c "
+SELECT
+  relname AS table,
+  pg_size_pretty(pg_total_relation_size(relid)) AS size
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
+"
+```
+
+### Cache Hit Rate Targets
+
+**HistoryBuffer Cache Hit Rate**
+
+Track how often we serve from memory vs DB:
+
+```typescript
+class HistoryBuffer {
+  private hits = 0;
+  private misses = 0;
+
+  getHistory(roomName: string): Message[] {
+    const buffer = this.buffers.get(roomName);
+    if (buffer) {
+      this.hits++;
+      return buffer;
+    }
+    this.misses++;
+    // Fallback to DB query (should rarely happen)
+    return this.loadRoomFromDB(roomName);
+  }
+
+  getHitRate(): number {
+    const total = this.hits + this.misses;
+    return total > 0 ? (this.hits / total) * 100 : 100;
+  }
+}
+```
+
+**Targets**:
+| Cache | Target Hit Rate | Warning Threshold | Action if Below |
+|-------|-----------------|-------------------|-----------------|
+| HistoryBuffer | > 95% | < 90% | Check if rooms are being evicted unexpectedly |
+| Session cache (Valkey) | > 99% | < 95% | Increase Valkey memory or check TTL settings |
+
+**Expose metrics endpoint**:
+```typescript
+app.get('/metrics', (req, res) => {
+  res.json({
+    history_buffer_hit_rate: historyBuffer.getHitRate(),
+    active_connections: connectionManager.getSessionCount(),
+    rooms_in_memory: roomManager.getRoomCount(),
+    db_pool_available: pool.idleCount,
+    db_pool_waiting: pool.waitingCount,
+  });
+});
+```
+
+### Cost Guardrails (Local Development)
+
+**Resource Limits** (Docker Compose):
+```yaml
+services:
+  postgres:
+    mem_limit: 512m
+    cpus: 0.5
+
+  valkey:
+    mem_limit: 128m
+    cpus: 0.25
+```
+
+**Connection Limits**:
+```typescript
+// PostgreSQL pool
+const pool = new Pool({
+  max: 10,  // Max connections per instance
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Valkey connection
+const redis = new Redis({
+  maxRetriesPerRequest: 3,
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+});
+```
+
+**Automatic Circuit Breakers**:
+```typescript
+// If DB connections are exhausted, reject new connections gracefully
+app.use((req, res, next) => {
+  if (pool.waitingCount > 5) {
+    logger.warn('DB pool exhausted, rejecting request');
+    return res.status(503).json({ error: 'Service temporarily unavailable' });
+  }
+  next();
+});
+```
+
+### Monitoring Dashboard (Optional)
+
+For local development, a simple terminal dashboard:
+
+```bash
+# scripts/monitor.sh
+watch -n 2 '
+echo "=== Baby Discord Health ==="
+echo ""
+echo "Instances:"
+curl -s localhost:3001/health 2>/dev/null || echo "Instance 1: DOWN"
+curl -s localhost:3002/health 2>/dev/null || echo "Instance 2: DOWN"
+curl -s localhost:3003/health 2>/dev/null || echo "Instance 3: DOWN"
+echo ""
+echo "Metrics (Instance 1):"
+curl -s localhost:3001/metrics 2>/dev/null | jq .
+echo ""
+echo "PostgreSQL Connections:"
+psql babydiscord -t -c "SELECT count(*) FROM pg_stat_activity WHERE datname = '\''babydiscord'\''"
+echo ""
+echo "Valkey Memory:"
+redis-cli INFO memory | grep used_memory_human
+'
+```
+
+---
+
 ## Security Considerations
 
 ### Current Scope (Educational)

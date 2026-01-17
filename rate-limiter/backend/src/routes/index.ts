@@ -1,4 +1,11 @@
-// API routes for rate limiting service
+/**
+ * @fileoverview API routes for the rate limiting service.
+ *
+ * Defines three route groups:
+ * - Rate limit routes: Check, query, and reset rate limits
+ * - Metrics routes: Get aggregated metrics and health status
+ * - Algorithm info routes: List available algorithms with documentation
+ */
 
 import { Router, Request, Response } from 'express';
 import { RateLimiterFactory } from '../algorithms/index.js';
@@ -7,10 +14,23 @@ import { getMetrics, recordMetric } from '../utils/redis.js';
 import { config } from '../config/index.js';
 import Redis from 'ioredis';
 
+/**
+ * Create routes for rate limit operations.
+ * These endpoints allow clients to check rate limits, query current state,
+ * reset limits, and perform batch operations.
+ *
+ * @param factory - RateLimiterFactory instance for rate limit operations
+ * @param redis - Redis client for metrics recording
+ * @returns Express router with rate limit endpoints
+ */
 export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis): Router {
   const router = Router();
 
-  // Check rate limit (consumes a token)
+  /**
+   * POST /check - Check rate limit and consume a token.
+   * This is the primary endpoint for rate limiting checks.
+   * Returns 200 if allowed, 429 if rate limited.
+   */
   router.post('/check', async (req: Request, res: Response) => {
     const startTime = Date.now();
 
@@ -40,6 +60,7 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
       const latencyMs = Date.now() - startTime;
       await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs);
 
+      // Set standard rate limit headers
       res.set({
         'X-RateLimit-Limit': result.limit.toString(),
         'X-RateLimit-Remaining': result.remaining.toString(),
@@ -67,7 +88,10 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
     }
   });
 
-  // Get current state (does not consume a token)
+  /**
+   * GET /state/:identifier - Get current rate limit state without consuming.
+   * Useful for displaying remaining quota to users or admin monitoring.
+   */
   router.get('/state/:identifier', async (req: Request, res: Response) => {
     try {
       const { identifier } = req.params;
@@ -98,7 +122,10 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
     }
   });
 
-  // Reset rate limit for an identifier
+  /**
+   * DELETE /reset/:identifier - Reset rate limit state for an identifier.
+   * Can optionally specify an algorithm to reset only that algorithm's state.
+   */
   router.delete('/reset/:identifier', async (req: Request, res: Response) => {
     try {
       const { identifier } = req.params;
@@ -121,7 +148,11 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
     }
   });
 
-  // Batch check for multiple identifiers
+  /**
+   * POST /batch-check - Check rate limits for multiple identifiers at once.
+   * Useful for services that need to validate multiple rate limits in one call.
+   * Maximum 100 checks per batch to prevent abuse.
+   */
   router.post('/batch-check', async (req: Request, res: Response) => {
     const startTime = Date.now();
 
@@ -180,10 +211,20 @@ export function createRateLimitRoutes(factory: RateLimiterFactory, redis: Redis)
   return router;
 }
 
+/**
+ * Create routes for metrics and health monitoring.
+ * These endpoints support dashboards and monitoring systems.
+ *
+ * @param redis - Redis client for fetching metrics and health checks
+ * @returns Express router with metrics endpoints
+ */
 export function createMetricsRoutes(redis: Redis): Router {
   const router = Router();
 
-  // Get aggregated metrics
+  /**
+   * GET / - Get aggregated metrics for the last 5 minutes.
+   * Returns request counts, latency statistics, and active identifier count.
+   */
   router.get('/', async (_req: Request, res: Response) => {
     try {
       const metrics = await getMetrics(redis);
@@ -194,7 +235,10 @@ export function createMetricsRoutes(redis: Redis): Router {
     }
   });
 
-  // Get health status
+  /**
+   * GET /health - Health check endpoint for load balancers and monitoring.
+   * Returns Redis connection status and server uptime.
+   */
   router.get('/health', async (_req: Request, res: Response) => {
     try {
       const pingStart = Date.now();
@@ -226,10 +270,19 @@ export function createMetricsRoutes(redis: Redis): Router {
   return router;
 }
 
+/**
+ * Create routes for algorithm documentation.
+ * Provides information about available algorithms to help clients choose.
+ *
+ * @returns Express router with algorithm info endpoints
+ */
 export function createAlgorithmInfoRoutes(): Router {
   const router = Router();
 
-  // List available algorithms
+  /**
+   * GET / - List all available rate limiting algorithms.
+   * Returns descriptions, pros/cons, and parameters for each algorithm.
+   */
   router.get('/', (_req: Request, res: Response) => {
     res.json({
       algorithms: [

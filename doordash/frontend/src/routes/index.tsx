@@ -4,10 +4,27 @@ import { restaurantAPI } from '../services/api';
 import { RestaurantCard } from '../components/RestaurantCard';
 import type { Restaurant } from '../types';
 
+/**
+ * Home page route configuration.
+ * This is the main landing page showing restaurant listings.
+ */
 export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Home page component displaying restaurant discovery interface.
+ * Provides search and filtering capabilities for finding restaurants.
+ *
+ * Features:
+ * - Hero section with search input
+ * - Cuisine type filter pills
+ * - Responsive grid of restaurant cards
+ * - Loading state with spinner
+ * - Empty state messaging
+ *
+ * @returns React component for the home/discovery page
+ */
 function HomePage() {
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
   const [cuisines, setCuisines] = useState<string[]>([]);
@@ -23,6 +40,9 @@ function HomePage() {
     loadRestaurants();
   }, [selectedCuisine]);
 
+  /**
+   * Fetches available cuisine types for filtering.
+   */
   const loadCuisines = async () => {
     try {
       const { cuisines } = await restaurantAPI.getCuisines();
@@ -32,6 +52,9 @@ function HomePage() {
     }
   };
 
+  /**
+   * Fetches restaurants with current filters applied.
+   */
   const loadRestaurants = async () => {
     setIsLoading(true);
     try {
@@ -47,6 +70,10 @@ function HomePage() {
     }
   };
 
+  /**
+   * Handles search form submission.
+   * @param e - Form submit event
+   */
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     loadRestaurants();

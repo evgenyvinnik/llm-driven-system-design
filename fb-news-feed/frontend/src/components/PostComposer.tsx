@@ -1,3 +1,9 @@
+/**
+ * @fileoverview PostComposer component for creating new posts.
+ * Provides a text area, image URL input, and privacy selector.
+ * Integrates with feed store to add new posts optimistically.
+ */
+
 import { useState } from 'react';
 import { Avatar } from './Avatar';
 import { Button } from './Button';
@@ -5,6 +11,13 @@ import { useAuthStore } from '@/stores/authStore';
 import { useFeedStore } from '@/stores/feedStore';
 import { postsApi } from '@/services/api';
 
+/**
+ * Form component for creating new posts.
+ * Only renders when user is authenticated.
+ * Supports text content, optional image URLs, and privacy settings.
+ *
+ * @returns JSX element rendering the post composer or null if not authenticated
+ */
 export function PostComposer() {
   const [content, setContent] = useState('');
   const [imageUrl, setImageUrl] = useState('');

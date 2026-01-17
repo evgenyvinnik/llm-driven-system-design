@@ -1,8 +1,22 @@
-// Test Runner Component
+/**
+ * @fileoverview Test Runner component for executing rate limit tests.
+ *
+ * Provides controls for:
+ * - Running single manual tests
+ * - Starting/stopping automatic tests at a configurable interval
+ * - Clearing test results
+ * - Resetting rate limits for the current identifier
+ */
 
 import { useState } from 'react';
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 
+/**
+ * Test execution controls component.
+ * Allows users to run rate limit tests manually or automatically.
+ *
+ * @returns Test runner controls with buttons and interval configuration
+ */
 export function TestRunner() {
   const {
     isRunning,

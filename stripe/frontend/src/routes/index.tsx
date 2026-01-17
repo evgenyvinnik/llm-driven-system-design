@@ -1,3 +1,13 @@
+/**
+ * Dashboard Route
+ *
+ * The main dashboard page showing an overview of payment activity.
+ * Displays summary statistics, recent payment intents, and charges
+ * to give merchants a quick view of their business performance.
+ *
+ * @module routes/index
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { getBalanceSummary, listPaymentIntents, listCharges } from '@/services/api';
@@ -5,10 +15,20 @@ import { formatCurrency, formatRelativeTime } from '@/utils';
 import { StatusBadge, CardDisplay } from '@/components';
 import type { BalanceSummary, PaymentIntent, Charge } from '@/types';
 
+/**
+ * Route definition for the dashboard page (/).
+ */
 export const Route = createFileRoute('/')({
   component: Dashboard,
 });
 
+/**
+ * Dashboard page component.
+ * Fetches and displays balance summary, recent payment intents,
+ * and recent charges in a grid layout with statistics cards.
+ *
+ * @returns The dashboard page content
+ */
 function Dashboard() {
   const [summary, setSummary] = useState<BalanceSummary | null>(null);
   const [recentPayments, setRecentPayments] = useState<PaymentIntent[]>([]);
@@ -20,6 +40,10 @@ function Dashboard() {
     loadData();
   }, []);
 
+  /**
+   * Fetches dashboard data from the API.
+   * Loads balance summary, payment intents, and charges in parallel.
+   */
   async function loadData() {
     try {
       setLoading(true);
@@ -193,6 +217,16 @@ function Dashboard() {
   );
 }
 
+/**
+ * Statistics card component.
+ * Displays a single metric with title, value, and subtitle.
+ *
+ * @param props - Card properties
+ * @param props.title - Label above the value
+ * @param props.value - The main metric value
+ * @param props.subtitle - Additional context below the value
+ * @returns A styled card element
+ */
 function StatCard({ title, value, subtitle }: { title: string; value: string; subtitle: string }) {
   return (
     <div className="card card-body">

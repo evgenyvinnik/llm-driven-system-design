@@ -1,8 +1,13 @@
 /**
- * Fractional indexing for ordering blocks
+ * @fileoverview Fractional indexing for ordering blocks and list items.
  * Based on: https://www.figma.com/blog/realtime-editing-of-ordered-sequences/
  *
- * This allows inserting items between any two existing items without reindexing.
+ * Fractional indexing allows inserting items between any two existing items
+ * without reindexing other elements. This is crucial for real-time collaboration
+ * where multiple users may be inserting items simultaneously.
+ *
+ * Position strings use lowercase letters (a-z) and are lexicographically sortable.
+ * The algorithm generates midpoint positions between existing positions.
  */
 
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz';

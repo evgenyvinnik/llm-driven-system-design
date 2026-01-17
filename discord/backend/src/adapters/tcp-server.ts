@@ -1,21 +1,63 @@
+/**
+ * TCP Server Adapter
+ *
+ * Provides a raw TCP interface for the chat system, allowing connections
+ * via netcat or telnet. This adapter handles socket lifecycle, line-based
+ * input buffering, and nickname authentication.
+ *
+ * Protocol:
+ * - Line-based text protocol (newline-delimited)
+ * - User must provide nickname on first input
+ * - Commands start with "/" (e.g., /join, /help)
+ * - All other input is treated as chat messages
+ *
+ * Example usage:
+ *   nc localhost 9001
+ *   > Enter nickname: alice
+ *   > /join general
+ *   > Hello, world!
+ */
+
 import net from 'net';
 import { v4 as uuidv4 } from 'uuid';
 import { connectionManager, chatHandler } from '../core/index.js';
 import * as dbOps from '../db/index.js';
 import { logger } from '../utils/logger.js';
 
+/**
+ * Internal state for tracking a TCP client connection.
+ */
 interface TCPClientState {
+  /** Session ID once authenticated, null before authentication */
   sessionId: string | null;
+  /** Buffer for incomplete line input */
   buffer: string;
+  /** Whether the client has completed authentication */
   authenticated: boolean;
+  /** Whether we are waiting for nickname input */
   waitingForNickname: boolean;
 }
 
+/**
+ * TCP server for Baby Discord.
+ *
+ * Implements the Adapter pattern to provide a TCP interface over
+ * the core chat functionality. Handles socket connections, authentication,
+ * and message routing.
+ */
 export class TCPServer {
+  /** Node.js TCP server instance */
   private server: net.Server;
+  /** Port to listen on */
   private port: number;
+  /** Map of socket to client state for tracking connections */
   private clients: Map<net.Socket, TCPClientState> = new Map();
 
+  /**
+   * Create a new TCP server.
+   *
+   * @param port - Port number to listen on (default: 9001)
+   */
   constructor(port: number = 9001) {
     this.port = port;
     this.server = net.createServer((socket) => this.handleConnection(socket));
@@ -30,7 +72,9 @@ export class TCPServer {
   }
 
   /**
-   * Start the TCP server
+   * Start the TCP server and begin accepting connections.
+   *
+   * @returns Promise that resolves when server is listening
    */
   start(): Promise<void> {
     return new Promise((resolve) => {
@@ -42,7 +86,9 @@ export class TCPServer {
   }
 
   /**
-   * Stop the TCP server
+   * Stop the TCP server and close all client connections.
+   *
+   * @returns Promise that resolves when server is fully stopped
    */
   stop(): Promise<void> {
     return new Promise((resolve) => {
@@ -60,7 +106,10 @@ export class TCPServer {
   }
 
   /**
-   * Handle a new client connection
+   * Handle a new client connection.
+   * Sets up event handlers and prompts for nickname.
+   *
+   * @param socket - The new client socket
    */
   private handleConnection(socket: net.Socket): void {
     const clientAddr = `${socket.remoteAddress}:${socket.remotePort}`;
@@ -99,7 +148,11 @@ export class TCPServer {
   }
 
   /**
-   * Handle incoming data from a client
+   * Handle incoming data from a client.
+   * Buffers input until complete lines are received, then processes each line.
+   *
+   * @param socket - The client socket
+   * @param data - Raw data buffer from socket
    */
   private async handleData(socket: net.Socket, data: Buffer): Promise<void> {
     const state = this.clients.get(socket);
@@ -125,7 +178,12 @@ export class TCPServer {
   }
 
   /**
-   * Handle nickname input during authentication
+   * Handle nickname input during authentication.
+   * Validates nickname, creates user if needed, and establishes session.
+   *
+   * @param socket - The client socket
+   * @param state - Client state object
+   * @param nickname - The submitted nickname
    */
   private async handleNicknameInput(
     socket: net.Socket,
@@ -174,7 +232,12 @@ export class TCPServer {
   }
 
   /**
-   * Handle a command or message from an authenticated client
+   * Handle a command or message from an authenticated client.
+   * Passes input to ChatHandler and sends response back.
+   *
+   * @param socket - The client socket
+   * @param state - Client state object
+   * @param input - The command or message input
    */
   private async handleCommand(
     socket: net.Socket,
@@ -198,7 +261,10 @@ export class TCPServer {
   }
 
   /**
-   * Handle client disconnect
+   * Handle client disconnect.
+   * Cleans up session and removes from tracking.
+   *
+   * @param socket - The disconnected socket
    */
   private async handleClose(socket: net.Socket): Promise<void> {
     const state = this.clients.get(socket);
@@ -212,7 +278,11 @@ export class TCPServer {
   }
 
   /**
-   * Send a message to a client
+   * Send a message to a client.
+   * Appends newline for line-based protocol.
+   *
+   * @param socket - Target socket
+   * @param message - Message string to send
    */
   private send(socket: net.Socket, message: string): void {
     if (!socket.destroyed) {
@@ -221,7 +291,9 @@ export class TCPServer {
   }
 
   /**
-   * Get the number of connected clients
+   * Get the number of connected clients.
+   *
+   * @returns Number of active TCP connections
    */
   getClientCount(): number {
     return this.clients.size;

@@ -1,6 +1,20 @@
+/**
+ * Interactive canvas component for viewing and editing the pixel canvas.
+ *
+ * Features:
+ * - Renders the canvas from pixel data
+ * - Supports zoom (mouse wheel) and pan (right/middle click drag)
+ * - Shows hover indicator at high zoom levels
+ * - Handles pixel placement on click
+ * - Displays notifications and status indicators
+ */
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Main canvas component providing the interactive pixel editing experience.
+ * Uses HTML5 Canvas for efficient pixel rendering.
+ */
 export function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -23,7 +37,10 @@ export function Canvas() {
     isAuthenticated,
   } = useAppStore();
 
-  // Render canvas
+  /**
+   * Renders the canvas from pixel data.
+   * Iterates through all pixels and draws them with their corresponding colors.
+   */
   const renderCanvas = useCallback(() => {
     const ctx = canvasRef.current?.getContext('2d');
     if (!ctx || !config || !canvas) return;
@@ -47,7 +64,10 @@ export function Canvas() {
     renderCanvas();
   }, [renderCanvas]);
 
-  // Handle zoom with mouse wheel
+  /**
+   * Handles zoom with mouse wheel.
+   * Prevents default scroll behavior and adjusts zoom level.
+   */
   const handleWheel = useCallback(
     (e: WheelEvent) => {
       e.preventDefault();
@@ -66,7 +86,10 @@ export function Canvas() {
     }
   }, [handleWheel]);
 
-  // Get canvas coordinates from mouse event
+  /**
+   * Converts mouse event coordinates to canvas pixel coordinates.
+   * Returns null if the coordinates are outside the canvas bounds.
+   */
   const getCanvasCoords = useCallback(
     (e: React.MouseEvent) => {
       if (!canvasRef.current || !config) return null;
@@ -83,7 +106,10 @@ export function Canvas() {
     [zoom, config]
   );
 
-  // Handle mouse move
+  /**
+   * Handles mouse movement for hover tracking and panning.
+   * Updates hovered pixel or pan offset based on drag state.
+   */
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       if (isDragging) {
@@ -102,7 +128,9 @@ export function Canvas() {
     [isDragging, dragStart, panOffset, getCanvasCoords, setHoveredPixel, setPanOffset]
   );
 
-  // Handle mouse down
+  /**
+   * Initiates panning on middle or right mouse button press.
+   */
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (e.button === 1 || e.button === 2) {
@@ -115,12 +143,17 @@ export function Canvas() {
     []
   );
 
-  // Handle mouse up
+  /**
+   * Ends panning on mouse button release.
+   */
   const handleMouseUp = useCallback(() => {
     setIsDragging(false);
   }, []);
 
-  // Handle click to place pixel
+  /**
+   * Handles left-click to place a pixel.
+   * Validates authentication and cooldown before placing.
+   */
   const handleClick = useCallback(
     async (e: React.MouseEvent) => {
       if (e.button !== 0) return; // Only left click
@@ -152,7 +185,9 @@ export function Canvas() {
     [getCanvasCoords, placePixel, isAuthenticated, cooldown]
   );
 
-  // Prevent context menu
+  /**
+   * Prevents context menu on right-click (used for panning).
+   */
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
   }, []);

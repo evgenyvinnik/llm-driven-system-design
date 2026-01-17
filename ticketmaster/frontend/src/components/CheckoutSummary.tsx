@@ -1,16 +1,38 @@
+/**
+ * Checkout summary panel component.
+ * Displays selected/reserved seats, total price, countdown timer,
+ * and action buttons for the purchase workflow.
+ */
 import type { Seat, Reservation } from '../types';
 
+/**
+ * Props for the CheckoutSummary component.
+ */
 interface CheckoutSummaryProps {
+  /** Seats selected by the user (before reservation) */
   selectedSeats: Seat[];
+  /** Active reservation with held seats (after reserve) */
   reservation: Reservation | null;
+  /** Seconds remaining until reservation expires */
   timer: number | null;
+  /** Callback to reserve selected seats */
   onReserve: () => void;
+  /** Callback to complete purchase */
   onCheckout: () => void;
+  /** Callback to clear selection */
   onClear: () => void;
+  /** Whether an operation is in progress */
   isLoading: boolean;
+  /** Whether user is authenticated */
   isAuthenticated: boolean;
 }
 
+/**
+ * Displays order summary sidebar with seat list, pricing, and checkout actions.
+ *
+ * @param props - Component props
+ * @returns The rendered checkout summary panel
+ */
 export function CheckoutSummary({
   selectedSeats,
   reservation,

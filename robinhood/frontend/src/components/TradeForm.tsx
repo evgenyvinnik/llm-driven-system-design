@@ -1,13 +1,32 @@
+/**
+ * Trade form component for placing buy/sell orders.
+ * Supports market and limit orders with real-time price estimation.
+ */
+
 import { useState } from 'react';
 import { useQuoteStore } from '../stores/quoteStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
 
+/**
+ * Props for the TradeForm component.
+ */
 interface TradeFormProps {
+  /** Stock symbol to trade */
   symbol: string;
+  /** Callback after successful order placement */
   onSuccess?: () => void;
+  /** Callback to close the form */
   onClose?: () => void;
 }
 
+/**
+ * Order entry form for buying or selling stocks.
+ * Displays current price, buying power, and estimated total.
+ * Shows success/error messages after order submission.
+ * @param symbol - Stock ticker symbol to trade
+ * @param onSuccess - Optional callback after successful order
+ * @param onClose - Optional callback to close the form
+ */
 export function TradeForm({ symbol, onSuccess, onClose }: TradeFormProps) {
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market');

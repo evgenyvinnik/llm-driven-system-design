@@ -1,5 +1,14 @@
+/**
+ * Axios HTTP client configuration for API communication.
+ * Sets up base URL, credentials, and interceptors for auth and error handling.
+ * @module services/api
+ */
 import axios from 'axios';
 
+/**
+ * Pre-configured axios instance for API calls.
+ * Includes auth token injection and 401 redirect handling.
+ */
 const api = axios.create({
   baseURL: '/api/v1',
   withCredentials: true,
@@ -8,7 +17,7 @@ const api = axios.create({
   },
 });
 
-// Request interceptor to add auth token
+/** Request interceptor to add auth token from localStorage */
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
@@ -17,7 +26,7 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Response interceptor to handle errors
+/** Response interceptor to handle 401 errors by redirecting to login */
 api.interceptors.response.use(
   (response) => response,
   (error) => {

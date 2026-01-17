@@ -5,10 +5,17 @@ import { BulkAvailabilitySchema, AvailabilitySlotsQuerySchema } from '../types/i
 import { isValidTimezone } from '../utils/time.js';
 import { z } from 'zod';
 
+/**
+ * Express router for availability management.
+ * Handles availability rule CRUD and time slot calculation for booking.
+ */
 const router = Router();
 
 /**
- * GET /api/availability/rules - Get availability rules for the current user
+ * GET /api/availability/rules - Get availability rules for the current user.
+ * Returns the weekly recurring availability schedule.
+ * Requires authentication.
+ * @returns {AvailabilityRule[]} Array of availability rules
  */
 router.get('/rules', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -28,7 +35,11 @@ router.get('/rules', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/availability/rules - Set availability rules (bulk update)
+ * POST /api/availability/rules - Bulk update availability rules.
+ * Replaces all existing rules with the provided set.
+ * Requires authentication.
+ * @body {rules} - Array of availability rule objects
+ * @returns {AvailabilityRule[]} The newly created rules
  */
 router.post('/rules', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -59,7 +70,10 @@ router.post('/rules', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * DELETE /api/availability/rules/:id - Delete an availability rule
+ * DELETE /api/availability/rules/:id - Delete an availability rule.
+ * Requires authentication and ownership.
+ * @param {id} - Rule UUID
+ * @returns {message} Success message
  */
 router.delete('/rules/:id', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -87,7 +101,12 @@ router.delete('/rules/:id', requireAuth, async (req: Request, res: Response) => 
 });
 
 /**
- * GET /api/availability/slots - Get available time slots for a meeting type
+ * GET /api/availability/slots - Get available time slots for a meeting type.
+ * Public endpoint for booking pages. Calculates real-time availability.
+ * @query {meeting_type_id} - Meeting type UUID
+ * @query {date} - Date in YYYY-MM-DD format
+ * @query {timezone} - IANA timezone string (defaults to UTC)
+ * @returns {slots} Array of available time slots
  */
 router.get('/slots', async (req: Request, res: Response) => {
   try {
@@ -134,7 +153,12 @@ router.get('/slots', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/availability/dates - Get dates with available slots
+ * GET /api/availability/dates - Get dates with available slots.
+ * Public endpoint for calendar displays. Returns dates that have availability.
+ * @query {meeting_type_id} - Meeting type UUID
+ * @query {timezone} - IANA timezone string (defaults to UTC)
+ * @query {days_ahead} - Number of days to check (defaults to 30)
+ * @returns {available_dates} Array of date strings (YYYY-MM-DD)
  */
 router.get('/dates', async (req: Request, res: Response) => {
   try {

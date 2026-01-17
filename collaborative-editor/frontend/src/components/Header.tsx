@@ -1,10 +1,27 @@
 import { useEditorStore } from '../stores/editorStore';
 
+/**
+ * Props for the Header component.
+ */
 interface HeaderProps {
+  /** The document title to display */
   title: string;
+  /** Optional callback when the title changes */
   onTitleChange?: (title: string) => void;
 }
 
+/**
+ * Header - Document header showing title and sync status.
+ *
+ * Displays:
+ * - Document title (optionally editable)
+ * - Sync status indicator (Connecting/Syncing/Saved)
+ * - Current server version number
+ * - Connection status indicator (green/red dot)
+ *
+ * @param props - Component props
+ * @returns The Header component
+ */
 export function Header({ title, onTitleChange }: HeaderProps) {
   const { connected, serverVersion, inflightOp, pendingOps } = useEditorStore();
 

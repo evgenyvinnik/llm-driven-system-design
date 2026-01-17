@@ -1,3 +1,9 @@
+/**
+ * Home page route showing the user's tracked products.
+ * Displays product list and form to add new products.
+ * Requires authentication.
+ * @module routes/index
+ */
 import { createFileRoute, Navigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useProductStore } from '../stores/productStore';
@@ -5,6 +11,11 @@ import { useEffect, useState } from 'react';
 import { AddProductForm } from '../components/AddProductForm';
 import { ProductCard } from '../components/ProductCard';
 
+/**
+ * Home page component.
+ * Shows tracked products and add product form.
+ * Redirects to login if not authenticated.
+ */
 function HomePage() {
   const { isAuthenticated } = useAuthStore();
   const { products, isLoading, fetchProducts, addProduct, deleteProduct } = useProductStore();

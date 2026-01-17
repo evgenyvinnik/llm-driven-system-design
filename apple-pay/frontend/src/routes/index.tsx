@@ -1,3 +1,8 @@
+/**
+ * Wallet home page route - the main dashboard for Apple Pay.
+ * Displays registered devices and provisioned payment cards.
+ * Allows users to add new devices and provision cards to their wallet.
+ */
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { Layout } from '../components/Layout';
@@ -5,10 +10,18 @@ import { CreditCard, CreditCardSkeleton } from '../components/CreditCard';
 import { AddCardForm } from '../components/AddCardForm';
 import { useAuthStore, useWalletStore } from '../stores';
 
+/** Route configuration for the wallet home page (/) */
 export const Route = createFileRoute('/')({
   component: WalletPage,
 });
 
+/**
+ * Main wallet page component displaying devices and payment cards.
+ * Provides device registration, card provisioning, and card management
+ * including suspend, reactivate, remove, and set default actions.
+ *
+ * @returns JSX element representing the wallet dashboard
+ */
 function WalletPage() {
   const { devices, loadDevices, registerDevice } = useAuthStore();
   const { cards, isLoading, loadCards, addCard, suspendCard, reactivateCard, removeCard, setDefaultCard } = useWalletStore();

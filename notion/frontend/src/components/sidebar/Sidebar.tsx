@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Sidebar navigation component.
+ * Displays workspace selector, page tree, quick actions, and user menu.
+ * Supports hierarchical page navigation with expand/collapse.
+ */
+
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore, useWorkspaceStore, usePageStore } from '@/stores';
 import {
@@ -15,6 +21,12 @@ import {
 import { useState } from 'react';
 import type { Page } from '@/types';
 
+/**
+ * Sidebar provides the main navigation interface.
+ * Includes workspace switcher, hierarchical page tree, and user actions.
+ *
+ * @returns The rendered sidebar component
+ */
 export default function Sidebar() {
   const navigate = useNavigate();
   const { user, logout } = useAuthStore();

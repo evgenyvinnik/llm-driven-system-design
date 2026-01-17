@@ -1,11 +1,20 @@
+/**
+ * Login/Register page route.
+ * Provides user authentication forms with toggle between login and registration.
+ * Redirects to home page after successful authentication.
+ */
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/auth.store';
 
+/** Route configuration for the login page */
 export const Route = createFileRoute('/login')({
   component: LoginPage,
 });
 
+/**
+ * Login/Register page component with dual-mode form.
+ */
 function LoginPage() {
   const navigate = useNavigate();
   const { login, register, isLoading, error, clearError } = useAuthStore();

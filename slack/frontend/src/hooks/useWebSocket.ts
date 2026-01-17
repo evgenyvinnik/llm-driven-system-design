@@ -1,7 +1,22 @@
+/**
+ * @fileoverview Custom React hook for WebSocket real-time communication.
+ * Handles connection lifecycle, reconnection, heartbeat, and message dispatching
+ * to the appropriate Zustand stores.
+ */
+
 import { useEffect, useRef, useCallback } from 'react';
 import { useMessageStore, usePresenceStore } from '../stores';
 import type { WSMessage, Message } from '../types';
 
+/**
+ * Establishes and manages a WebSocket connection for real-time updates.
+ * Automatically reconnects on disconnection after 3 seconds.
+ * Dispatches incoming messages to the appropriate stores for state updates.
+ *
+ * @param userId - The authenticated user's ID. If undefined, no connection is made.
+ * @param workspaceId - The workspace to connect to. If undefined, no connection is made.
+ * @returns Object containing sendTyping function for typing indicator broadcasts
+ */
 export function useWebSocket(userId: string | undefined, workspaceId: string | undefined) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number>();
@@ -9,6 +24,11 @@ export function useWebSocket(userId: string | undefined, workspaceId: string | u
     useMessageStore();
   const { updatePresence } = usePresenceStore();
 
+  /**
+   * Establishes WebSocket connection with the server.
+   * Sets up event handlers for open, close, error, and message events.
+   * Automatically attempts reconnection on disconnect.
+   */
   const connect = useCallback(() => {
     if (!userId || !workspaceId) return;
 
@@ -44,6 +64,11 @@ export function useWebSocket(userId: string | undefined, workspaceId: string | u
     };
   }, [userId, workspaceId]);
 
+  /**
+   * Processes incoming WebSocket messages and routes them to appropriate handlers.
+   * Updates stores for messages, reactions, presence, and typing indicators.
+   * @param message - The parsed WebSocket message
+   */
   const handleMessage = useCallback(
     (message: WSMessage) => {
       switch (message.type) {
@@ -133,12 +158,22 @@ export function useWebSocket(userId: string | undefined, workspaceId: string | u
     [addMessage, updateMessage, deleteMessage, addReaction, removeReaction, setTypingUsers, updatePresence]
   );
 
+  /**
+   * Sends a message over the WebSocket connection.
+   * Silently fails if the connection is not open.
+   * @param type - The message type
+   * @param payload - The message payload
+   */
   const sendMessage = useCallback((type: string, payload: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type, payload }));
     }
   }, []);
 
+  /**
+   * Broadcasts a typing indicator to other users in a channel.
+   * @param channelId - The channel where the user is typing
+   */
   const sendTyping = useCallback((channelId: string) => {
     sendMessage('typing', { channelId });
   }, [sendMessage]);

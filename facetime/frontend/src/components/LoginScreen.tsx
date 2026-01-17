@@ -1,11 +1,31 @@
+/**
+ * LoginScreen Component
+ *
+ * Initial screen displayed before authentication.
+ * Shows available users for demo login selection.
+ * Includes FaceTime branding and user selection list.
+ */
+
 import type { User } from '../types';
 
+/**
+ * Props for the LoginScreen component.
+ */
 interface LoginScreenProps {
+  /** Array of available users to select from */
   users: User[];
+  /** Callback invoked when a user is selected for login */
   onLogin: (username: string) => void;
+  /** Whether users are currently being loaded */
   isLoading: boolean;
 }
 
+/**
+ * Renders the login screen with user selection for demo purposes.
+ *
+ * @param props - Component props with users, login handler, and loading state
+ * @returns Login screen with FaceTime branding and user list
+ */
 export function LoginScreen({ users, onLogin, isLoading }: LoginScreenProps) {
   return (
     <div className="min-h-screen bg-black flex flex-col items-center justify-center p-6">

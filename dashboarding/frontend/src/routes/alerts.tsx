@@ -1,3 +1,10 @@
+/**
+ * @fileoverview Alerts management page.
+ *
+ * Provides UI for managing alert rules and viewing alert history.
+ * Includes forms for creating rules and testing alert evaluation.
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { format } from 'date-fns';
@@ -11,10 +18,24 @@ import {
   evaluateAlertRule,
 } from '../services/api';
 
+/**
+ * Route configuration for the alerts page.
+ */
 export const Route = createFileRoute('/alerts')({
   component: AlertsPage,
 });
 
+/**
+ * Alerts management page component.
+ *
+ * Features:
+ * - List all alert rules with enable/disable toggle
+ * - Create new alert rules with metric, condition, and severity
+ * - View alert history with firing/resolved status
+ * - Test alert rules with manual evaluation
+ *
+ * @returns The rendered alerts page
+ */
 function AlertsPage() {
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [instances, setInstances] = useState<AlertInstance[]>([]);

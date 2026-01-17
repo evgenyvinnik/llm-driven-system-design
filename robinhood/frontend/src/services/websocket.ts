@@ -1,8 +1,21 @@
+/**
+ * WebSocket service for real-time quote streaming.
+ * Connects to the backend WebSocket server and provides quote updates
+ * to subscribed components. Handles automatic reconnection.
+ */
+
 import type { Quote } from '../types';
 
+/** Callback for receiving quote updates */
 type MessageHandler = (quotes: Quote[]) => void;
+/** Callback for connection state changes */
 type ConnectionHandler = (connected: boolean) => void;
 
+/**
+ * Singleton WebSocket service for managing real-time quote subscriptions.
+ * Provides automatic reconnection, symbol subscription management,
+ * and event handling for quote updates and connection state changes.
+ */
 class WebSocketService {
   private ws: WebSocket | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
@@ -11,6 +24,10 @@ class WebSocketService {
   private subscribedSymbols: Set<string> = new Set();
   private isConnecting = false;
 
+  /**
+   * Establishes WebSocket connection to the backend.
+   * Automatically resubscribes to previously subscribed symbols on reconnect.
+   */
   connect(): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) {
       return;
@@ -63,6 +80,9 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Closes the WebSocket connection and cancels any pending reconnect.
+   */
   disconnect(): void {
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
@@ -75,6 +95,9 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Schedules automatic reconnection after 3 seconds.
+   */
   private scheduleReconnect(): void {
     if (this.reconnectTimeout) return;
 
@@ -84,6 +107,10 @@ class WebSocketService {
     }, 3000);
   }
 
+  /**
+   * Subscribes to quote updates for the specified symbols.
+   * @param symbols - Array of stock ticker symbols
+   */
   subscribe(symbols: string[]): void {
     symbols.forEach((s) => this.subscribedSymbols.add(s.toUpperCase()));
 
@@ -95,6 +122,10 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Unsubscribes from quote updates for the specified symbols.
+   * @param symbols - Array of stock ticker symbols
+   */
   unsubscribe(symbols: string[]): void {
     symbols.forEach((s) => this.subscribedSymbols.delete(s.toUpperCase()));
 
@@ -106,22 +137,39 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Subscribes to quote updates for all available symbols.
+   */
   subscribeAll(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'subscribe_all' }));
     }
   }
 
+  /**
+   * Registers a handler for quote update messages.
+   * @param handler - Callback to invoke with quote array
+   * @returns Cleanup function to unregister the handler
+   */
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
     return () => this.messageHandlers.delete(handler);
   }
 
+  /**
+   * Registers a handler for connection state changes.
+   * @param handler - Callback to invoke with connection status
+   * @returns Cleanup function to unregister the handler
+   */
   onConnectionChange(handler: ConnectionHandler): () => void {
     this.connectionHandlers.add(handler);
     return () => this.connectionHandlers.delete(handler);
   }
 
+  /**
+   * Notifies all registered message handlers with quote updates.
+   * @param quotes - Array of updated quotes
+   */
   private notifyMessageHandlers(quotes: Quote[]): void {
     this.messageHandlers.forEach((handler) => {
       try {
@@ -132,6 +180,10 @@ class WebSocketService {
     });
   }
 
+  /**
+   * Notifies all registered connection handlers with state change.
+   * @param connected - Current connection state
+   */
   private notifyConnectionHandlers(connected: boolean): void {
     this.connectionHandlers.forEach((handler) => {
       try {
@@ -142,9 +194,17 @@ class WebSocketService {
     });
   }
 
+  /**
+   * Returns current WebSocket connection status.
+   * @returns true if WebSocket is open and connected
+   */
   get isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 }
 
+/**
+ * Singleton instance of the WebSocket service.
+ * Used throughout the app for real-time quote streaming.
+ */
 export const wsService = new WebSocketService();

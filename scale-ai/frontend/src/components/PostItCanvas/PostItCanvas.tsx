@@ -1,6 +1,16 @@
+/**
+ * PostItCanvas component - Skeuomorphic drawing canvas styled as a post-it note.
+ * Provides a tactile, nostalgic drawing experience with realistic marker strokes.
+ * Features a cork board background, decorative Sharpie, and realistic paper textures.
+ * @module components/PostItCanvas
+ */
+
 import { useRef, useState, useEffect, useCallback } from 'react'
 import './PostItCanvas.css'
 
+/**
+ * A single point in a stroke with position, pressure, and timing data.
+ */
 interface Point {
   x: number
   y: number
@@ -8,18 +18,28 @@ interface Point {
   timestamp: number
 }
 
+/**
+ * A complete stroke containing all points and styling.
+ */
 interface Stroke {
   points: Point[]
   color: string
   width: number
 }
 
+/**
+ * Props for the PostItCanvas component.
+ */
 interface PostItCanvasProps {
+  /** The shape the user should draw */
   shape: 'line' | 'heart' | 'circle' | 'square' | 'triangle'
+  /** Called when user clicks "Done!" with the stroke data */
   onComplete?: (strokeData: { strokes: Stroke[]; duration_ms: number }) => void
+  /** Called when user clicks "Start Over" */
   onClear?: () => void
 }
 
+/** Human-readable prompts for each shape */
 const SHAPE_PROMPTS: Record<string, string> = {
   line: 'Draw a line',
   heart: 'Draw a heart',
@@ -28,6 +48,7 @@ const SHAPE_PROMPTS: Record<string, string> = {
   triangle: 'Draw a triangle',
 }
 
+/** Unicode symbols as visual hints for each shape */
 const SHAPE_HINTS: Record<string, string> = {
   line: '—',
   heart: '♡',
@@ -36,6 +57,16 @@ const SHAPE_HINTS: Record<string, string> = {
   triangle: '△',
 }
 
+/**
+ * A skeuomorphic drawing canvas styled as a yellow post-it note on a cork board.
+ * Captures stroke data including timing and pressure for ML training.
+ * Uses multi-pass canvas rendering to create a realistic marker ink effect.
+ *
+ * @param props - Component props
+ * @param props.shape - The shape to prompt the user to draw
+ * @param props.onComplete - Callback when user submits their drawing
+ * @param props.onClear - Callback when user clears the canvas
+ */
 export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [isDrawing, setIsDrawing] = useState(false)
@@ -44,10 +75,14 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
   const [startTime, setStartTime] = useState<number | null>(null)
   const [hasDrawn, setHasDrawn] = useState(false)
 
-  // Marker settings for realistic effect
+  /** Marker styling for realistic ink effect */
   const markerColor = '#1a1a1a'
   const markerWidth = 4
 
+  /**
+   * Converts a mouse or touch event to canvas coordinates.
+   * Handles both mouse and touch input, including pressure from supported devices.
+   */
   const getCanvasPoint = useCallback(
     (e: React.MouseEvent | React.TouchEvent | MouseEvent | TouchEvent): Point | null => {
       const canvas = canvasRef.current
@@ -83,6 +118,10 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     []
   )
 
+  /**
+   * Draws a stroke with realistic marker ink effect using multiple passes.
+   * First pass is dark, subsequent passes add ink bleeding and texture.
+   */
   const drawMarkerStroke = useCallback(
     (ctx: CanvasRenderingContext2D, points: Point[], color: string, width: number) => {
       if (points.length < 2) return
@@ -130,6 +169,9 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     []
   )
 
+  /**
+   * Redraws the entire canvas including all completed strokes and current stroke.
+   */
   const redrawCanvas = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -155,6 +197,7 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     redrawCanvas()
   }, [redrawCanvas])
 
+  /** Handles starting a new stroke on mouse/touch down */
   const handleStart = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
       e.preventDefault()
@@ -172,6 +215,7 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     [getCanvasPoint, startTime]
   )
 
+  /** Handles adding points to the current stroke on move */
   const handleMove = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
       if (!isDrawing) return
@@ -185,6 +229,7 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     [isDrawing, getCanvasPoint]
   )
 
+  /** Handles completing the current stroke on mouse/touch up */
   const handleEnd = useCallback(() => {
     if (!isDrawing) return
 
@@ -199,6 +244,7 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     setIsDrawing(false)
   }, [isDrawing, currentStroke])
 
+  /** Clears all strokes and resets the canvas */
   const handleClear = () => {
     setStrokes([])
     setCurrentStroke([])
@@ -207,6 +253,7 @@ export function PostItCanvas({ shape, onComplete, onClear }: PostItCanvasProps) 
     onClear?.()
   }
 
+  /** Submits the drawing and resets for the next one */
   const handleSubmit = () => {
     if (!hasDrawn || strokes.length === 0) return
 

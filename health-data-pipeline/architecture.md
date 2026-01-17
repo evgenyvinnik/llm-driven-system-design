@@ -825,3 +825,544 @@ CREATE INDEX idx_devices_user ON user_devices(user_id);
 | Encryption | Per-user keys | Single key | Privacy, sharing |
 | Sync | Batch | Real-time | Battery efficiency |
 | Deduplication | Priority-based | Time-based | Data accuracy |
+
+---
+
+## Cost Tradeoffs
+
+### Storage Tiering
+
+For a local development environment, we use a simplified two-tier storage model.
+
+**Tier 1 - Hot Storage (TimescaleDB)**
+- Stores last 90 days of raw samples and all aggregates
+- Uncompressed for fast read/write access
+- Target: < 500MB per user for 90 days of data
+- Use case: Active queries, real-time aggregation, dashboard rendering
+
+**Tier 2 - Warm Storage (Compressed TimescaleDB chunks)**
+- Data older than 90 days compressed in-place using TimescaleDB native compression
+- Compression ratio: ~10:1 for health data (repetitive numeric values)
+- Query latency increases from ~5ms to ~50ms for compressed chunks
+- Use case: Historical trend analysis, yearly reports
+
+**Local Development Sizing (per user)**
+| Data Type | Raw Samples/Day | Size/Day | 90 Days |
+|-----------|-----------------|----------|---------|
+| Heart rate | 1,440 (1/min) | 50 KB | 4.5 MB |
+| Steps | 24 (hourly) | 1 KB | 90 KB |
+| Sleep | 1 | 0.5 KB | 45 KB |
+| Other vitals | ~100 | 4 KB | 360 KB |
+| **Total** | ~1,565 | ~56 KB | **~5 MB** |
+
+### Cache Sizing (Valkey/Redis)
+
+**Session Cache**
+- Size per session: ~500 bytes (user ID, device tokens, preferences)
+- Target: 1,000 concurrent sessions for local testing
+- Allocation: 1 MB for sessions
+- TTL: 24 hours (sliding expiration on activity)
+
+**Aggregate Cache**
+- Cache recent aggregates (last 7 days) for dashboard performance
+- Size per user: ~50 KB (7 days x 16 data types x 24 hourly values x 12 bytes)
+- Target: 100 users cached
+- Allocation: 5 MB for aggregates
+- TTL: 1 hour (invalidated on new data sync)
+
+**Total Valkey Memory: 16 MB** (comfortable for local development)
+
+```javascript
+// Cache configuration
+const cacheConfig = {
+  session: {
+    prefix: 'session:',
+    ttlSeconds: 86400,
+    maxMemory: '1mb'
+  },
+  aggregates: {
+    prefix: 'agg:',
+    ttlSeconds: 3600,
+    maxMemory: '5mb'
+  },
+  insights: {
+    prefix: 'insight:',
+    ttlSeconds: 300,
+    maxMemory: '2mb'
+  }
+}
+```
+
+### Queue Retention
+
+**RabbitMQ Configuration**
+- Queue: `health-aggregation`
+  - Max length: 10,000 messages
+  - TTL: 1 hour (unprocessed messages expire)
+  - Dead letter exchange: `health-aggregation-dlx`
+  - Retention on DLX: 24 hours (for debugging failed jobs)
+
+- Queue: `health-insights`
+  - Max length: 1,000 messages
+  - TTL: 4 hours (insights are less time-sensitive)
+  - No dead letter (insights can be regenerated)
+
+```javascript
+// Queue declarations
+const queueConfig = {
+  aggregation: {
+    name: 'health-aggregation',
+    options: {
+      durable: true,
+      arguments: {
+        'x-max-length': 10000,
+        'x-message-ttl': 3600000,
+        'x-dead-letter-exchange': 'health-aggregation-dlx'
+      }
+    }
+  }
+}
+```
+
+### Compute vs Storage Optimization
+
+**Pre-computation Strategy (chosen)**
+- Compute aggregates immediately after sync
+- Store hourly + daily aggregates (24 + 1 = 25 rows/day/type)
+- Query time: O(1) lookup
+- Storage overhead: ~2x raw data size
+- CPU spike: Brief burst during sync
+
+**On-demand Calculation (alternative, not chosen)**
+- Store only raw samples
+- Compute aggregates at query time
+- Query time: O(n) where n = samples in range
+- Storage: 1x
+- CPU: Constant load on every dashboard view
+
+**Decision**: Pre-computation wins for health dashboards because:
+1. Dashboards refresh frequently (every page load)
+2. Aggregation logic is stable (sum, avg, latest)
+3. Storage is cheap; user wait time is expensive
+4. Background processing absorbs compute cost
+
+---
+
+## Data Lifecycle Policies
+
+### Retention Rules
+
+| Data Type | Hot Retention | Warm Retention | Delete After |
+|-----------|---------------|----------------|--------------|
+| Raw samples | 90 days | 2 years | 7 years |
+| Hourly aggregates | 90 days | 1 year | 2 years |
+| Daily aggregates | Forever | N/A | Never |
+| Weekly/Monthly aggregates | Forever | N/A | Never |
+| Insights | 90 days | 1 year | 2 years |
+| Share tokens | Until expiry + 30 days | N/A | 30 days after expiry |
+| Audit logs | 1 year | 6 years | 7 years |
+
+### Automated Retention Jobs
+
+```sql
+-- Run daily: compress old chunks (TimescaleDB)
+SELECT compress_chunk(c)
+FROM show_chunks('health_samples', older_than => INTERVAL '90 days') c
+WHERE NOT is_compressed(c);
+
+-- Run weekly: delete expired raw samples
+DELETE FROM health_samples
+WHERE start_date < NOW() - INTERVAL '7 years';
+
+-- Run daily: delete expired hourly aggregates
+DELETE FROM health_aggregates
+WHERE period = 'hour'
+  AND period_start < NOW() - INTERVAL '2 years';
+
+-- Run daily: cleanup expired share tokens
+DELETE FROM share_tokens
+WHERE expires_at < NOW() - INTERVAL '30 days';
+
+-- Run daily: cleanup old insights
+DELETE FROM health_insights
+WHERE created_at < NOW() - INTERVAL '2 years';
+```
+
+**Cron Schedule (local dev with node-cron)**
+```javascript
+const cron = require('node-cron');
+
+// Daily at 3 AM: compression and cleanup
+cron.schedule('0 3 * * *', async () => {
+  await compressOldChunks();
+  await deleteExpiredTokens();
+  await deleteOldInsights();
+});
+
+// Weekly on Sunday at 4 AM: deep cleanup
+cron.schedule('0 4 * * 0', async () => {
+  await deleteAncientSamples();
+  await deleteOldHourlyAggregates();
+  await vacuumAnalyze();
+});
+```
+
+### Archival to Cold Storage
+
+For local development, cold storage is simulated with MinIO (S3-compatible).
+
+**Archive Format**
+- Parquet files for columnar efficiency
+- Partitioned by: `user_id/year/month/data_type.parquet`
+- Compressed with Snappy (fast decompression)
+
+**Archive Trigger**
+```javascript
+async function archiveToMinio(userId, year, month) {
+  // Extract data for the month
+  const samples = await db.query(`
+    SELECT * FROM health_samples
+    WHERE user_id = $1
+      AND start_date >= $2
+      AND start_date < $3
+  `, [userId, `${year}-${month}-01`, `${year}-${month + 1}-01`]);
+
+  // Convert to Parquet
+  const parquetBuffer = await toParquet(samples.rows);
+
+  // Upload to MinIO
+  await minio.putObject(
+    'health-archive',
+    `${userId}/${year}/${month}/samples.parquet`,
+    parquetBuffer
+  );
+
+  // Optionally delete from hot storage after verification
+  // await deleteArchivedSamples(userId, year, month);
+}
+```
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Aggregation Bug Fix**
+
+When aggregation logic is fixed, replay affected date ranges:
+
+```javascript
+async function replayAggregation(userId, startDate, endDate) {
+  // 1. Delete existing aggregates in range
+  await db.query(`
+    DELETE FROM health_aggregates
+    WHERE user_id = $1
+      AND period_start >= $2
+      AND period_start <= $3
+  `, [userId, startDate, endDate]);
+
+  // 2. Re-queue aggregation job
+  await queue.publish('health-aggregation', {
+    userId,
+    sampleTypes: Object.keys(HealthDataTypes),
+    dateRange: { start: startDate, end: endDate },
+    priority: 'low',
+    isReplay: true
+  });
+}
+
+// Bulk replay for all users (admin operation)
+async function bulkReplayAggregation(startDate, endDate) {
+  const users = await db.query('SELECT DISTINCT user_id FROM health_samples');
+
+  for (const { user_id } of users.rows) {
+    await replayAggregation(user_id, startDate, endDate);
+    // Rate limit to avoid queue overload
+    await sleep(100);
+  }
+}
+```
+
+**Scenario 2: Restore from Archive**
+
+```javascript
+async function restoreFromArchive(userId, year, month) {
+  // 1. Download from MinIO
+  const stream = await minio.getObject(
+    'health-archive',
+    `${userId}/${year}/${month}/samples.parquet`
+  );
+
+  // 2. Parse Parquet
+  const samples = await fromParquet(stream);
+
+  // 3. Insert into hot storage
+  await batchInsertSamples(samples);
+
+  // 4. Trigger reaggregation
+  await replayAggregation(
+    userId,
+    new Date(year, month - 1, 1),
+    new Date(year, month, 0)
+  );
+}
+```
+
+**Scenario 3: Device Re-sync (duplicate handling)**
+
+When a device re-syncs historical data:
+1. UPSERT handles duplicates at the sample level (same sample ID)
+2. Deduplication handles overlapping time ranges from different sources
+3. Aggregates are recomputed for affected date ranges
+
+---
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+**Local Development (Single Instance)**
+```bash
+# Start all services
+docker-compose up -d          # PostgreSQL, TimescaleDB, Valkey, RabbitMQ, MinIO
+npm run dev                   # Start all Node services
+
+# Individual services for debugging
+npm run dev:ingestion         # Port 3001 - handles device sync
+npm run dev:aggregation       # Background worker
+npm run dev:api               # Port 3000 - query API
+npm run dev:admin             # Port 3002 - admin interface
+```
+
+**Multi-Instance Testing (Simulated Production)**
+```bash
+# Run 3 API instances behind nginx
+npm run dev:api1              # Port 3001
+npm run dev:api2              # Port 3002
+npm run dev:api3              # Port 3003
+npm run dev:lb                # Port 3000 (nginx load balancer)
+
+# Run 2 aggregation workers
+npm run dev:worker1
+npm run dev:worker2
+```
+
+**Rollout Checklist**
+1. Run `npm run db:migrate` to apply schema changes
+2. Start workers before API servers (process backlog)
+3. Health check endpoints must return 200 before routing traffic
+4. Monitor queue depth during rollout
+
+### Schema Migrations
+
+**Migration File Naming**
+```
+db/migrations/
+├── 001_initial_schema.sql
+├── 002_add_insights_table.sql
+├── 003_add_compression_policy.sql
+├── 004_add_share_tokens.sql
+└── 005_add_audit_log.sql
+```
+
+**Migration Runner**
+```javascript
+// db/migrate.ts
+async function runMigrations() {
+  const applied = await getAppliedMigrations();
+  const files = await getMigrationFiles();
+
+  for (const file of files) {
+    const version = parseInt(file.split('_')[0]);
+    if (!applied.includes(version)) {
+      console.log(`Applying migration: ${file}`);
+
+      await db.query('BEGIN');
+      try {
+        const sql = await fs.readFile(`db/migrations/${file}`, 'utf8');
+        await db.query(sql);
+        await recordMigration(version, file);
+        await db.query('COMMIT');
+      } catch (error) {
+        await db.query('ROLLBACK');
+        throw error;
+      }
+    }
+  }
+}
+```
+
+**Migration Best Practices**
+1. Always include both UP and DOWN in migration files
+2. Never modify a deployed migration; create a new one
+3. Test migrations against a copy of production data
+4. Use transactions for DDL when possible
+
+**Example Migration with Rollback**
+```sql
+-- 006_add_device_priority.sql
+
+-- UP
+ALTER TABLE user_devices ADD COLUMN priority INTEGER DEFAULT 50;
+
+UPDATE user_devices SET priority = CASE
+  WHEN device_type = 'apple_watch' THEN 100
+  WHEN device_type = 'iphone' THEN 80
+  WHEN device_type = 'ipad' THEN 70
+  ELSE 50
+END;
+
+INSERT INTO schema_migrations (version, name, applied_at)
+VALUES (6, '006_add_device_priority.sql', NOW());
+
+-- DOWN (run manually if rollback needed)
+-- ALTER TABLE user_devices DROP COLUMN priority;
+-- DELETE FROM schema_migrations WHERE version = 6;
+```
+
+### Rollback Runbooks
+
+**Runbook 1: Application Rollback**
+
+*Trigger*: Error rate > 5% or P99 latency > 2s after deployment
+
+```bash
+# 1. Stop new deployments
+# 2. Revert to previous container/code version
+git checkout HEAD~1
+npm install
+npm run build
+pm2 restart all
+
+# 3. Verify health
+curl http://localhost:3000/health
+# Expected: {"status":"ok","version":"1.2.3"}
+
+# 4. Monitor error rates for 10 minutes
+# 5. Investigate root cause before re-deploying
+```
+
+**Runbook 2: Database Migration Rollback**
+
+*Trigger*: Migration causes application errors or data corruption
+
+```bash
+# 1. Identify the problematic migration
+npm run db:status
+# Shows: Migration 006_add_device_priority.sql FAILED
+
+# 2. Run the DOWN section manually
+psql $DATABASE_URL < db/rollbacks/006_down.sql
+
+# 3. Remove from migration history
+psql $DATABASE_URL -c "DELETE FROM schema_migrations WHERE version = 6"
+
+# 4. Fix the migration and retry
+vim db/migrations/006_add_device_priority.sql
+npm run db:migrate
+```
+
+**Runbook 3: Queue Backlog Recovery**
+
+*Trigger*: Queue depth > 50,000 messages or processing stopped
+
+```bash
+# 1. Check queue status
+curl -u guest:guest http://localhost:15672/api/queues/%2F/health-aggregation
+# Look for: messages, consumers, message_stats
+
+# 2. If workers are dead, restart them
+pm2 restart aggregation-worker
+
+# 3. If backlog is from bad data, move to DLQ
+rabbitmqctl purge_queue health-aggregation
+# Or selectively: move messages older than 1 hour to DLQ
+
+# 4. Scale up workers temporarily
+pm2 scale aggregation-worker 4
+
+# 5. Monitor until queue depth returns to normal (< 100)
+watch -n 5 'curl -s localhost:15672/api/queues/%2F/health-aggregation | jq .messages'
+```
+
+**Runbook 4: Cache Corruption Recovery**
+
+*Trigger*: Stale or incorrect data appearing in dashboards
+
+```bash
+# 1. Flush specific cache prefix
+redis-cli KEYS "agg:*" | xargs redis-cli DEL
+
+# 2. Or flush all caches (nuclear option)
+redis-cli FLUSHALL
+
+# 3. Warm cache by hitting endpoints
+curl http://localhost:3000/api/v1/users/me/summary?date=today
+
+# 4. Monitor cache hit rate
+redis-cli INFO stats | grep keyspace
+```
+
+**Runbook 5: Data Integrity Check**
+
+*Trigger*: Weekly scheduled check or user reports inconsistent data
+
+```sql
+-- Check for orphaned aggregates (no source samples)
+SELECT DISTINCT user_id, type, period_start
+FROM health_aggregates a
+WHERE NOT EXISTS (
+  SELECT 1 FROM health_samples s
+  WHERE s.user_id = a.user_id
+    AND s.type = a.type
+    AND s.start_date >= a.period_start
+    AND s.start_date < a.period_start + INTERVAL '1 day'
+);
+
+-- Check for missing aggregates (samples exist, no aggregate)
+SELECT user_id, type, DATE_TRUNC('day', start_date) as day, COUNT(*)
+FROM health_samples s
+WHERE NOT EXISTS (
+  SELECT 1 FROM health_aggregates a
+  WHERE a.user_id = s.user_id
+    AND a.type = s.type
+    AND a.period = 'day'
+    AND a.period_start = DATE_TRUNC('day', s.start_date)
+)
+GROUP BY user_id, type, day;
+
+-- Fix: trigger reaggregation for affected users/dates
+```
+
+### Health Check Endpoints
+
+```javascript
+// GET /health - basic liveness
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', version: process.env.VERSION });
+});
+
+// GET /ready - full readiness (dependencies checked)
+app.get('/ready', async (req, res) => {
+  const checks = {
+    database: await checkDatabase(),
+    cache: await checkCache(),
+    queue: await checkQueue(),
+    storage: await checkMinio()
+  };
+
+  const allHealthy = Object.values(checks).every(c => c.healthy);
+
+  res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'ready' : 'degraded',
+    checks,
+    timestamp: new Date().toISOString()
+  });
+});
+
+async function checkDatabase() {
+  try {
+    await db.query('SELECT 1');
+    return { healthy: true, latencyMs: 1 };
+  } catch (error) {
+    return { healthy: false, error: error.message };
+  }
+}
+```

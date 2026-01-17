@@ -1,3 +1,9 @@
+/**
+ * Product detail page route showing price history and settings.
+ * Displays price chart, statistics, and alert configuration.
+ * Requires authentication.
+ * @module routes/products.$productId
+ */
 import { createFileRoute, Navigate, useParams } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useProductStore } from '../stores/productStore';
@@ -7,6 +13,10 @@ import { PriceChart } from '../components/PriceChart';
 import { DailyPrice, Product } from '../types';
 import { formatDistanceToNow, format } from 'date-fns';
 
+/**
+ * Product detail page component.
+ * Shows product info, price chart, and alert settings editor.
+ */
 function ProductDetailPage() {
   const { productId } = useParams({ from: '/products/$productId' });
   const { isAuthenticated } = useAuthStore();

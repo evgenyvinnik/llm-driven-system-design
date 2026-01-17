@@ -1,6 +1,22 @@
+/**
+ * Server List Component
+ *
+ * Discord-style vertical sidebar showing available rooms as circular icons.
+ * Located on the far left of the application, it displays rooms with their
+ * first letter as an avatar. Includes a home button and room creation button.
+ * Auto-refreshes room list every 30 seconds.
+ */
+
 import { useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 
+/**
+ * Renders the server/room list sidebar.
+ * Shows room icons with tooltips and active state indicators.
+ * Handles room navigation and creation prompts.
+ *
+ * @returns Vertical sidebar with room navigation
+ */
 export function ServerList() {
   const { rooms, currentRoom, refreshRooms, joinRoom, isLoadingRooms } =
     useChatStore();

@@ -1,20 +1,41 @@
+/**
+ * @fileoverview Authentication state management using Zustand.
+ * Handles user login, registration, logout, and session persistence.
+ */
+
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { User } from '../types';
 import api from '../services/api';
 
+/**
+ * Authentication store state and actions.
+ */
 interface AuthState {
+  /** Currently authenticated user, null if not logged in */
   user: User | null;
+  /** Session ID stored in localStorage for API authentication */
   sessionId: string | null;
+  /** True when an auth operation is in progress */
   isLoading: boolean;
+  /** Error message from the last failed operation */
   error: string | null;
+  /** Authenticates user with email and password */
   login: (email: string, password: string) => Promise<void>;
+  /** Creates a new user account */
   register: (email: string, password: string, username: string, displayName?: string) => Promise<void>;
+  /** Logs out the current user and clears session */
   logout: () => Promise<void>;
+  /** Fetches current user data from the server */
   fetchUser: () => Promise<void>;
+  /** Clears any stored error message */
   clearError: () => void;
 }
 
+/**
+ * Zustand store for authentication state.
+ * Persists session ID to localStorage for session continuity.
+ */
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({

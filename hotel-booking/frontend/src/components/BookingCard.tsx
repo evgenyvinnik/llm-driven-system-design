@@ -2,13 +2,40 @@ import { Link } from '@tanstack/react-router';
 import type { Booking } from '@/types';
 import { formatCurrency, formatDateRange, getStatusColor, getStatusLabel, getNights } from '@/utils';
 
+/**
+ * Props for the BookingCard component.
+ */
 interface BookingCardProps {
+  /** Booking data to display */
   booking: Booking;
+  /** Whether to show action buttons (View Details, Confirm, Cancel) */
   showActions?: boolean;
+  /** Callback when cancel button is clicked */
   onCancel?: (bookingId: string) => void;
+  /** Callback when confirm button is clicked */
   onConfirm?: (bookingId: string) => void;
 }
 
+/**
+ * Booking summary card for the My Bookings page.
+ * Displays hotel image, booking details, and action buttons.
+ *
+ * Features:
+ * - Hotel image with fallback
+ * - Hotel name (links to hotel detail)
+ * - Booking status badge with color coding
+ * - Room type, dates, guest count, and total price
+ * - View Details link
+ * - Confirm & Pay button for reserved bookings
+ * - Cancel button for reserved/confirmed bookings
+ *
+ * @param props - Component props
+ * @param props.booking - Booking data to display
+ * @param props.showActions - Whether to show action buttons (default: true)
+ * @param props.onCancel - Callback for cancel action
+ * @param props.onConfirm - Callback for confirm action
+ * @returns Booking card with details and optional actions
+ */
 export function BookingCard({ booking, showActions = true, onCancel, onConfirm }: BookingCardProps) {
   const nights = getNights(booking.checkIn, booking.checkOut);
 

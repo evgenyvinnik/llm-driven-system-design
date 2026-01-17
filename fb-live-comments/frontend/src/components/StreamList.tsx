@@ -1,11 +1,31 @@
+/**
+ * Stream List Component
+ *
+ * Sidebar list of available streams, separated into live and past streams.
+ * Allows users to select which stream to watch.
+ *
+ * @module components/StreamList
+ */
+
 import { Stream } from '../types';
 
+/** Props for the StreamList component */
 interface StreamListProps {
+  /** Array of all available streams */
   streams: Stream[];
+  /** Callback when a stream is selected */
   onSelect: (stream: Stream) => void;
+  /** ID of the currently selected stream */
   selectedId?: string;
 }
 
+/**
+ * Renders the list of available streams.
+ * Separates live and ended streams into sections.
+ *
+ * @param props - Component props with streams and selection handler
+ * @returns Stream list JSX
+ */
 export function StreamList({ streams, onSelect, selectedId }: StreamListProps) {
   const liveStreams = streams.filter((s) => s.status === 'live');
   const endedStreams = streams.filter((s) => s.status === 'ended');
@@ -59,12 +79,22 @@ export function StreamList({ streams, onSelect, selectedId }: StreamListProps) {
   );
 }
 
+/** Props for the StreamCard component */
 interface StreamCardProps {
+  /** Stream to display */
   stream: Stream;
+  /** Callback when card is clicked */
   onSelect: (stream: Stream) => void;
+  /** Whether this card is currently selected */
   isSelected: boolean;
 }
 
+/**
+ * Renders a single stream card in the list.
+ *
+ * @param props - Component props
+ * @returns Stream card button JSX
+ */
 function StreamCard({ stream, onSelect, isSelected }: StreamCardProps) {
   return (
     <button

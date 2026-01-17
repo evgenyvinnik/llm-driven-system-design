@@ -1,3 +1,16 @@
+/**
+ * Apple Pay Backend Server Entry Point
+ *
+ * This is the main entry point for the Apple Pay demo backend.
+ * It sets up an Express server with the following capabilities:
+ * - Authentication and device management (/api/auth)
+ * - Payment card provisioning and management (/api/cards)
+ * - Payment processing with biometric auth (/api/payments)
+ * - Merchant integration endpoints (/api/merchants)
+ *
+ * The server requires PostgreSQL for persistent storage and
+ * Redis for session management and caching.
+ */
 import express from 'express';
 import cors from 'cors';
 import redis from './db/redis.js';
@@ -7,7 +20,10 @@ import cardsRoutes from './routes/cards.js';
 import paymentsRoutes from './routes/payments.js';
 import merchantsRoutes from './routes/merchants.js';
 
+/** Express application instance */
 const app = express();
+
+/** Server port from environment or default 3000 */
 const PORT = process.env.PORT || 3000;
 
 // Middleware
@@ -23,7 +39,11 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Health check
+/**
+ * GET /health
+ * Health check endpoint for monitoring and load balancer probes.
+ * Verifies database and Redis connectivity.
+ */
 app.get('/health', async (_req, res) => {
   try {
     // Check database
@@ -49,7 +69,11 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
+/**
+ * Initializes and starts the Express server.
+ * Establishes connections to Redis and PostgreSQL before listening.
+ * Exits with code 1 if connections fail.
+ */
 async function start() {
   try {
     // Connect to Redis

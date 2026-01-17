@@ -1,3 +1,9 @@
+/**
+ * File icon component that displays appropriate icon based on file type.
+ * Uses Lucide React icons with color-coding by MIME type.
+ * @module components/FileIcon
+ */
+
 import {
   Folder,
   File,
@@ -11,13 +17,22 @@ import {
   FileType,
 } from 'lucide-react';
 
+/** Props for the FileIcon component */
 interface FileIconProps {
+  /** MIME type of the file (null for unknown) */
   mimeType: string | null;
+  /** Whether this item is a folder */
   isFolder: boolean;
+  /** Icon size in pixels (default 24) */
   size?: number;
+  /** Additional CSS classes */
   className?: string;
 }
 
+/**
+ * Displays the appropriate icon for a file or folder.
+ * Icons are color-coded by type (e.g., blue for folders, green for images).
+ */
 export function FileIcon({ mimeType, isFolder, size = 24, className = '' }: FileIconProps) {
   const iconProps = { size, className };
 

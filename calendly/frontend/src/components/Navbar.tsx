@@ -1,6 +1,12 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Main navigation bar component.
+ * Displays navigation links based on authentication state.
+ * Shows user info and logout button when authenticated,
+ * login/signup buttons when not authenticated.
+ */
 export function Navbar() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const navigate = useNavigate();

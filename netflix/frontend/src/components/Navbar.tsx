@@ -1,8 +1,19 @@
+/**
+ * Navbar Component
+ *
+ * Main navigation bar displayed on all authenticated pages.
+ * Features: logo, navigation links, search, notifications, and profile menu.
+ * Transitions from transparent to solid background on scroll.
+ */
 import React from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Search, Bell, ChevronDown, User } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Main navigation bar component.
+ * Provides site navigation, search, and profile management.
+ */
 export function Navbar() {
   const { currentProfile, clearProfile, logout } = useAuthStore();
   const navigate = useNavigate();

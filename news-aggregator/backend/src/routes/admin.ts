@@ -1,10 +1,21 @@
+/**
+ * Admin API routes.
+ * Provides endpoints for administrative functions including source management,
+ * crawl control, and system statistics.
+ * All routes require admin role authentication.
+ * @module routes/admin
+ */
+
 import { Router, Request, Response } from 'express';
 import { query, execute } from '../db/postgres.js';
 import { crawlAllDueSources, getAllSources, addSource, crawlSource } from '../services/crawler.js';
 
 const router = Router();
 
-// Middleware to check admin role
+/**
+ * Middleware to require admin role.
+ * Returns 403 if user is not authenticated as admin.
+ */
 const requireAdmin = (req: Request, res: Response, next: () => void) => {
   const session = req.session as { role?: string } | undefined;
   if (session?.role !== 'admin') {
@@ -13,7 +24,10 @@ const requireAdmin = (req: Request, res: Response, next: () => void) => {
   next();
 };
 
-// Get admin dashboard stats
+/**
+ * GET /stats - Get admin dashboard statistics
+ * Returns counts of sources, articles, stories, users, and recent article activity.
+ */
 router.get('/stats', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const [
@@ -46,7 +60,10 @@ router.get('/stats', requireAdmin, async (_req: Request, res: Response) => {
   }
 });
 
-// Get all sources
+/**
+ * GET /sources - Get all news sources
+ * Returns source configurations with crawl schedule information.
+ */
 router.get('/sources', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const sources = await query(
@@ -63,7 +80,10 @@ router.get('/sources', requireAdmin, async (_req: Request, res: Response) => {
   }
 });
 
-// Add a new source
+/**
+ * POST /sources - Add a new news source
+ * Creates a source and schedules it for immediate crawling.
+ */
 router.post('/sources', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { name, feed_url, category } = req.body;
@@ -80,7 +100,10 @@ router.post('/sources', requireAdmin, async (req: Request, res: Response) => {
   }
 });
 
-// Update a source
+/**
+ * PUT /sources/:id - Update a news source
+ * Updates source configuration including name, URL, category, and status.
+ */
 router.put('/sources/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -105,7 +128,10 @@ router.put('/sources/:id', requireAdmin, async (req: Request, res: Response) => 
   }
 });
 
-// Delete a source
+/**
+ * DELETE /sources/:id - Delete a news source
+ * Removes the source from the system (articles remain).
+ */
 router.delete('/sources/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -117,7 +143,10 @@ router.delete('/sources/:id', requireAdmin, async (req: Request, res: Response) 
   }
 });
 
-// Manually trigger crawl for a source
+/**
+ * POST /sources/:id/crawl - Manually trigger crawl for a source
+ * Immediately crawls the specified source and returns results.
+ */
 router.post('/sources/:id/crawl', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -146,7 +175,11 @@ router.post('/sources/:id/crawl', requireAdmin, async (req: Request, res: Respon
   }
 });
 
-// Trigger full crawl
+/**
+ * POST /crawl - Trigger full crawl of all due sources
+ * Crawls all sources that are scheduled for refresh.
+ * Returns summary of crawl results.
+ */
 router.post('/crawl', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const results = await crawlAllDueSources();
@@ -163,7 +196,10 @@ router.post('/crawl', requireAdmin, async (_req: Request, res: Response) => {
   }
 });
 
-// Get recent articles
+/**
+ * GET /articles - Get recent articles
+ * Returns paginated list of articles for review.
+ */
 router.get('/articles', requireAdmin, async (req: Request, res: Response) => {
   try {
     const limit = parseInt(req.query.limit as string) || 50;
@@ -187,7 +223,10 @@ router.get('/articles', requireAdmin, async (req: Request, res: Response) => {
   }
 });
 
-// Get stories with high velocity (potential breaking news)
+/**
+ * GET /breaking-candidates - Get potential breaking news stories
+ * Returns stories with high velocity that may warrant breaking news status.
+ */
 router.get('/breaking-candidates', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const stories = await query(
@@ -205,7 +244,10 @@ router.get('/breaking-candidates', requireAdmin, async (_req: Request, res: Resp
   }
 });
 
-// Mark story as breaking
+/**
+ * POST /stories/:id/breaking - Set story breaking news status
+ * Marks or unmarks a story as breaking news.
+ */
 router.post('/stories/:id/breaking', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;

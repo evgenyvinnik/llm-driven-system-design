@@ -1,8 +1,19 @@
+/**
+ * Workers monitoring page showing active and historical worker status.
+ * Displays worker metrics and detailed status table.
+ * @module routes/Workers
+ */
+
 import { useEffect } from 'react';
 import { useMetricsStore } from '../stores';
 import { Spinner, MetricCard } from '../components/UI';
 import { Worker } from '../types';
 
+/**
+ * Workers status page with real-time updates.
+ * Shows worker activity, job counts, and heartbeat status.
+ * Auto-refreshes every 5 seconds.
+ */
 export function WorkersPage() {
   const { workers, loading, fetchWorkers } = useMetricsStore();
 

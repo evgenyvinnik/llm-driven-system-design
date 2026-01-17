@@ -1,9 +1,24 @@
 import { Router, type Request, type Response } from 'express';
 import { db } from '../services/database.js';
 
+/**
+ * REST API router for document and user management.
+ *
+ * Provides endpoints for:
+ * - Document CRUD operations
+ * - User listing and retrieval
+ *
+ * Note: Real-time editing is handled via WebSocket, not REST.
+ */
 const router = Router();
 
-// Get all documents
+/**
+ * GET /documents
+ *
+ * List all documents, sorted by last update time.
+ *
+ * @returns Array of document objects
+ */
 router.get('/documents', async (_req: Request, res: Response) => {
   try {
     const documents = await db.getDocuments();
@@ -14,7 +29,14 @@ router.get('/documents', async (_req: Request, res: Response) => {
   }
 });
 
-// Get a single document
+/**
+ * GET /documents/:id
+ *
+ * Get a single document by ID.
+ *
+ * @param id - The document's UUID
+ * @returns The document object or 404
+ */
 router.get('/documents/:id', async (req: Request, res: Response) => {
   try {
     const document = await db.getDocument(req.params.id);
@@ -28,7 +50,15 @@ router.get('/documents/:id', async (req: Request, res: Response) => {
   }
 });
 
-// Create a new document
+/**
+ * POST /documents
+ *
+ * Create a new document.
+ *
+ * @body title - Optional document title (defaults to "Untitled Document")
+ * @body ownerId - Required user ID of the document creator
+ * @returns The created document object
+ */
 router.post('/documents', async (req: Request, res: Response) => {
   try {
     const { title, ownerId } = req.body;
@@ -43,7 +73,15 @@ router.post('/documents', async (req: Request, res: Response) => {
   }
 });
 
-// Update document title
+/**
+ * PATCH /documents/:id
+ *
+ * Update a document's title.
+ *
+ * @param id - The document's UUID
+ * @body title - The new title
+ * @returns Success confirmation
+ */
 router.patch('/documents/:id', async (req: Request, res: Response) => {
   try {
     const { title } = req.body;
@@ -58,7 +96,13 @@ router.patch('/documents/:id', async (req: Request, res: Response) => {
   }
 });
 
-// Get all users
+/**
+ * GET /users
+ *
+ * List all users in the system.
+ *
+ * @returns Array of user objects
+ */
 router.get('/users', async (_req: Request, res: Response) => {
   try {
     const users = await db.getUsers();
@@ -69,7 +113,14 @@ router.get('/users', async (_req: Request, res: Response) => {
   }
 });
 
-// Get a single user
+/**
+ * GET /users/:id
+ *
+ * Get a single user by ID.
+ *
+ * @param id - The user's UUID
+ * @returns The user object or 404
+ */
 router.get('/users/:id', async (req: Request, res: Response) => {
   try {
     const user = await db.getUser(req.params.id);

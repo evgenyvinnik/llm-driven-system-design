@@ -3,13 +3,29 @@ import { api } from '../services/api';
 import type { SystemStats, SyncOperation, Conflict } from '../types';
 import { formatBytes, formatRelativeTime } from '../utils/helpers';
 
+/**
+ * Props for the StatCard component.
+ */
 interface StatCardProps {
+  /** Title label for the statistic */
   title: string;
+  /** Value to display (number or formatted string) */
   value: string | number;
+  /** Optional subtitle for additional context */
   subtitle?: string;
+  /** Color theme for the card */
   color?: 'blue' | 'green' | 'yellow' | 'red' | 'purple';
 }
 
+/**
+ * Displays a single statistic in a colored card.
+ *
+ * Used in the admin dashboard to show key metrics with
+ * color-coded backgrounds for quick visual scanning.
+ *
+ * @param props - Component props
+ * @returns Styled statistic card
+ */
 const StatCard: React.FC<StatCardProps> = ({ title, value, subtitle, color = 'blue' }) => {
   const colorClasses = {
     blue: 'bg-blue-100 text-blue-800',
@@ -28,6 +44,21 @@ const StatCard: React.FC<StatCardProps> = ({ title, value, subtitle, color = 'bl
   );
 };
 
+/**
+ * Admin dashboard component for system monitoring and management.
+ *
+ * Provides administrative functionality including:
+ * - **Overview Tab**: System-wide statistics (users, files, photos, devices, sync, storage)
+ * - **Operations Tab**: Recent sync operations with status and timing
+ * - **Conflicts Tab**: Unresolved file conflicts across all users
+ * - **Users Tab**: User list with search and storage usage
+ *
+ * Also includes maintenance actions:
+ * - Cleanup orphaned chunks (storage optimization)
+ * - Purge soft-deleted files older than 30 days
+ *
+ * @returns Admin dashboard with tabbed navigation
+ */
 export const AdminDashboard: React.FC = () => {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [operations, setOperations] = useState<SyncOperation[]>([]);
@@ -337,6 +368,14 @@ export const AdminDashboard: React.FC = () => {
   );
 };
 
+/**
+ * User list component for admin user management.
+ *
+ * Displays a searchable table of all users with their email, role,
+ * device count, storage usage (with visual progress bar), and registration date.
+ *
+ * @returns Searchable user list table
+ */
 const UsersList: React.FC = () => {
   const [users, setUsers] = useState<Array<{
     id: string;

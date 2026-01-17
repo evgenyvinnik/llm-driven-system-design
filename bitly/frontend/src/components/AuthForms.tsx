@@ -1,6 +1,16 @@
+/**
+ * Authentication Form Components
+ *
+ * Provides login and registration forms for user authentication.
+ * Includes form validation and error handling.
+ */
 import React, { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Login form component.
+ * Handles user authentication with email and password.
+ */
 export function LoginForm({ onSwitchToRegister }: { onSwitchToRegister: () => void }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -66,6 +76,10 @@ export function LoginForm({ onSwitchToRegister }: { onSwitchToRegister: () => vo
   );
 }
 
+/**
+ * Registration form component.
+ * Handles new user account creation with password confirmation.
+ */
 export function RegisterForm({ onSwitchToLogin }: { onSwitchToLogin: () => void }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -163,6 +177,10 @@ export function RegisterForm({ onSwitchToLogin }: { onSwitchToLogin: () => void 
   );
 }
 
+/**
+ * Container component for authentication forms.
+ * Switches between login and registration views.
+ */
 export function AuthForms() {
   const [showLogin, setShowLogin] = useState(true);
 

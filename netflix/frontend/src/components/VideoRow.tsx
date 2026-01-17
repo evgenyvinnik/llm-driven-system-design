@@ -1,15 +1,31 @@
+/**
+ * VideoRow Component
+ *
+ * Horizontal scrollable row of video cards.
+ * Used for displaying content categories on the homepage.
+ * Features: row title, horizontal scroll with arrow navigation.
+ */
 import React from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { VideoCard } from './VideoCard';
 import type { Video } from '../types';
 
+/** Props for VideoRow component */
 interface VideoRowProps {
+  /** Row title displayed above the cards */
   title: string;
+  /** Videos to display in the row */
   videos: Video[];
+  /** Whether to show progress bars on cards */
   showProgress?: boolean;
+  /** Map of video IDs to progress percentages */
   progressMap?: Record<string, number>;
 }
 
+/**
+ * Horizontal scrollable row of video cards.
+ * Supports arrow-based navigation when content overflows.
+ */
 export function VideoRow({ title, videos, showProgress, progressMap }: VideoRowProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [showLeftArrow, setShowLeftArrow] = React.useState(false);

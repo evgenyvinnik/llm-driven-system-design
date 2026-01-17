@@ -5,13 +5,23 @@ import { useAuthStore } from '../stores/authStore';
 import { adminApi } from '../services/api';
 import { Users, Film, Eye, TrendingUp, Star, Settings } from 'lucide-react';
 
+/**
+ * Platform statistics for admin dashboard.
+ */
 interface AdminStats {
+  /** Total registered users */
   totalUsers: number;
+  /** Total content items (movies + series) */
   totalContent: number;
+  /** Total video views across platform */
   totalViews: number;
+  /** Breakdown of active subscriptions by tier */
   activeSubscriptions: Record<string, number>;
 }
 
+/**
+ * Content item type for admin content table.
+ */
 interface AdminContent {
   id: string;
   title: string;
@@ -22,6 +32,17 @@ interface AdminContent {
   created_at: string;
 }
 
+/**
+ * Admin dashboard page for platform management.
+ * Provides overview statistics, content management, and user listing.
+ * Restricted to users with admin role.
+ *
+ * Features:
+ * - Overview tab with platform statistics and subscription breakdown
+ * - Content tab with table of all content items and featured toggle
+ * - Users tab with list of registered users
+ * - Role-based access control (admin only)
+ */
 function AdminPage() {
   const navigate = useNavigate();
   const { user } = useAuthStore();
@@ -257,6 +278,17 @@ function AdminPage() {
   );
 }
 
+/**
+ * Statistic card component for displaying key metrics.
+ * Shows an icon, label, and value with colored gradient background.
+ *
+ * @param props - Card configuration
+ * @param props.icon - React node icon element
+ * @param props.label - Metric label text
+ * @param props.value - Numeric value to display
+ * @param props.color - Color theme for the card gradient
+ * @returns Colored stat card component
+ */
 function StatCard({
   icon,
   label,
@@ -288,6 +320,9 @@ function StatCard({
   );
 }
 
+/**
+ * User data type for admin user listing.
+ */
 interface AdminUser {
   id: string;
   email: string;
@@ -297,6 +332,12 @@ interface AdminUser {
   created_at: string;
 }
 
+/**
+ * Users tab component for admin dashboard.
+ * Displays a table of all registered users with their details.
+ *
+ * @returns Table of platform users
+ */
 function UsersTab() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -359,6 +400,10 @@ function UsersTab() {
   );
 }
 
+/**
+ * Route configuration for admin dashboard (/admin).
+ * Platform management interface for admin users.
+ */
 export const Route = createFileRoute('/admin')({
   component: AdminPage,
 });

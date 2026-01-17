@@ -1,4 +1,9 @@
-import React, { useState, useEffect } from 'react';
+/**
+ * Main editor component for the design workspace.
+ * Composes the toolbar, layers panel, canvas, and properties panel.
+ * Manages file loading, WebSocket connection, and version history modal.
+ */
+import { useState, useEffect } from 'react';
 import { useEditorStore } from '../stores/editorStore';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { api } from '../services/api';
@@ -8,11 +13,23 @@ import { PropertiesPanel } from './PropertiesPanel';
 import { Canvas } from './Canvas';
 import { VersionHistory } from './VersionHistory';
 
+/**
+ * Props for the Editor component.
+ */
 interface EditorProps {
+  /** The file ID to edit */
   fileId: string;
+  /** Callback to return to the file browser */
   onBack: () => void;
 }
 
+/**
+ * Editor component providing the full design editing experience.
+ * Loads the file data, establishes WebSocket connection for collaboration,
+ * and renders all editor panels and tools.
+ * @param props - Component props
+ * @returns The rendered editor workspace
+ */
 export function Editor({ fileId, onBack }: EditorProps) {
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [loading, setLoading] = useState(true);

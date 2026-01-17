@@ -7,10 +7,34 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Order, WSMessage, Driver } from '../types';
 
+/**
+ * Driver dashboard route configuration.
+ * Restricted to users with driver role.
+ */
 export const Route = createFileRoute('/driver-dashboard')({
   component: DriverDashboard,
 });
 
+/**
+ * Driver dashboard component for managing deliveries.
+ * Provides driver-specific functionality including order management,
+ * location tracking, and earnings display.
+ *
+ * Features:
+ * - Online/offline toggle for availability
+ * - Real-time GPS location tracking
+ * - Active delivery list with status controls
+ * - Daily statistics (deliveries, fees, tips)
+ * - Real-time order assignment via WebSocket
+ * - Pickup and delivery confirmation buttons
+ * - Driver rating display
+ *
+ * Access Control:
+ * - Redirects non-drivers to home page
+ * - Requires authenticated driver role
+ *
+ * @returns React component for the driver dashboard
+ */
 function DriverDashboard() {
   const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();

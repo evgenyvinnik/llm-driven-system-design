@@ -3,10 +3,19 @@ import bcrypt from 'bcryptjs';
 import { UserService } from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Authentication routes for user registration, login, logout, and session management.
+ * Uses bcrypt for password hashing and express-session for session storage.
+ */
 const router = Router();
 const userService = new UserService();
 
-// Register
+/**
+ * POST /api/auth/register
+ * Registers a new user account with email/password authentication.
+ * Validates age (18+), email uniqueness, and required fields.
+ * Automatically logs in the user by setting session cookie.
+ */
 router.post('/register', async (req: Request, res: Response) => {
   try {
     const { email, password, name, birthdate, gender, bio } = req.body;
@@ -64,7 +73,11 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 });
 
-// Login
+/**
+ * POST /api/auth/login
+ * Authenticates a user with email and password.
+ * Updates last_active timestamp and creates session cookie.
+ */
 router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -104,7 +117,10 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
-// Logout
+/**
+ * POST /api/auth/logout
+ * Destroys the current session and clears the session cookie.
+ */
 router.post('/logout', (req: Request, res: Response) => {
   req.session.destroy((err) => {
     if (err) {
@@ -116,7 +132,12 @@ router.post('/logout', (req: Request, res: Response) => {
   });
 });
 
-// Get current user
+/**
+ * GET /api/auth/me
+ * Returns the current authenticated user's profile.
+ * Excludes sensitive data like password hash.
+ * Requires authentication.
+ */
 router.get('/me', requireAuth, async (req: Request, res: Response) => {
   try {
     const profile = await userService.getUserProfile(req.session.userId!);

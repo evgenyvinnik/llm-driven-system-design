@@ -1,7 +1,18 @@
+/**
+ * Zustand Store Module
+ *
+ * Centralized state management for the FaceTime application.
+ * Manages authentication, contacts, call state, media streams,
+ * and UI controls for audio/video toggling.
+ */
+
 import { create } from 'zustand';
 import type { User, CallState } from '../types';
 import { signalingService } from '../services/signaling';
 
+/**
+ * Application state interface defining all store properties and actions.
+ */
 interface AppState {
   // Auth
   currentUser: User | null;
@@ -30,6 +41,9 @@ interface AppState {
   toggleVideo: () => void;
 }
 
+/**
+ * Default call state when no call is active.
+ */
 const initialCallState: CallState = {
   callId: '',
   caller: null,
@@ -41,6 +55,11 @@ const initialCallState: CallState = {
   isGroup: false,
 };
 
+/**
+ * Zustand store hook for application-wide state.
+ * Provides reactive state updates for authentication, contacts,
+ * call management, and media stream handling.
+ */
 export const useStore = create<AppState>((set, get) => ({
   // Auth
   currentUser: null,

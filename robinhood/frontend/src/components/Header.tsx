@@ -1,7 +1,18 @@
+/**
+ * Application header component with navigation and user controls.
+ * Displays logo, navigation links, connection status indicator,
+ * and authentication controls (login/logout).
+ */
+
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useQuoteStore } from '../stores/quoteStore';
 
+/**
+ * Main application header component.
+ * Shows navigation for authenticated users and login/register for guests.
+ * Includes real-time connection status indicator.
+ */
 export function Header() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const { isConnected } = useQuoteStore();

@@ -1,3 +1,19 @@
+/**
+ * Robinhood Trading Platform - Main Server Entry Point
+ *
+ * This file initializes and starts all server components:
+ * - Express HTTP server with REST API endpoints
+ * - WebSocket server for real-time quote streaming
+ * - Background services (quote simulation, order matching, alerts)
+ *
+ * The server provides a complete trading platform with:
+ * - User authentication (session-based)
+ * - Real-time stock quotes (simulated)
+ * - Order placement and execution
+ * - Portfolio tracking with P&L calculations
+ * - Watchlists and price alerts
+ */
+
 import express from 'express';
 import cors from 'cors';
 import http from 'http';
@@ -16,6 +32,7 @@ import ordersRoutes from './routes/orders.js';
 import portfolioRoutes from './routes/portfolio.js';
 import watchlistsRoutes from './routes/watchlists.js';
 
+/** Express application instance */
 const app = express();
 
 // Middleware
@@ -23,6 +40,11 @@ app.use(cors());
 app.use(express.json());
 
 // Health check
+/**
+ * GET /health
+ * Returns health status of database and Redis connections.
+ * Used for monitoring and load balancer health checks.
+ */
 app.get('/health', async (_req, res) => {
   const dbHealthy = await testDatabaseConnection();
   const redisHealthy = await testRedisConnection();
@@ -42,13 +64,17 @@ app.use('/api/orders', ordersRoutes);
 app.use('/api/portfolio', portfolioRoutes);
 app.use('/api/watchlists', watchlistsRoutes);
 
-// Create HTTP server
+/** HTTP server instance */
 const server = http.createServer(app);
 
-// Initialize WebSocket handler
+/** WebSocket handler for real-time quote streaming */
 const wsHandler = new WebSocketHandler(server);
 
-// Start services
+/**
+ * Starts the trading platform server.
+ * Verifies database/Redis connections, starts background services,
+ * and begins listening for HTTP/WebSocket connections.
+ */
 async function startServer(): Promise<void> {
   // Test connections
   const dbConnected = await testDatabaseConnection();

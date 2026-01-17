@@ -1,12 +1,26 @@
+/**
+ * Modal dialog for creating new folders.
+ * Provides a form to enter folder name with validation.
+ * @module components/CreateFolderModal
+ */
+
 import { useState } from 'react';
 import { X } from 'lucide-react';
 
+/** Props for the CreateFolderModal component */
 interface CreateFolderModalProps {
+  /** Whether the modal is currently visible */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
+  /** Callback to create folder with given name */
   onCreate: (name: string) => Promise<void>;
 }
 
+/**
+ * Renders a modal dialog for creating new folders.
+ * Handles form submission, validation, and error display.
+ */
 export function CreateFolderModal({ isOpen, onClose, onCreate }: CreateFolderModalProps) {
   const [name, setName] = useState('');
   const [isLoading, setIsLoading] = useState(false);

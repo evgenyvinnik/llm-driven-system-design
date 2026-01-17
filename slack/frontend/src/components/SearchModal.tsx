@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Full-text search modal component.
+ * Provides a search interface with debounced queries and result highlighting.
+ */
+
 import { useState, useEffect } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { searchApi } from '../services/api';
@@ -5,6 +10,12 @@ import { useWorkspaceStore, useUIStore } from '../stores';
 import { formatMessageTime } from '../utils';
 import type { SearchResult } from '../types';
 
+/**
+ * Search modal component.
+ * Provides full-text search across all messages in the workspace.
+ * Features debounced search input, result highlighting, and navigation
+ * to the channel containing the selected message.
+ */
 export function SearchModal() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);

@@ -1,15 +1,29 @@
+/**
+ * ImplementorPortal component - Test interface for ML model predictions.
+ * Allows users to draw shapes and see how the trained model classifies them.
+ * Displays prediction confidence, all class probabilities, and inference time.
+ * @module routes/implement/ImplementorPortal
+ */
+
 import { useState, useCallback } from 'react'
 import { PostItCanvas } from '../../components/PostItCanvas'
 import { classifyDrawing, getModelInfo, type ClassificationResult, type ModelInfo } from '../../services/api'
 import './ImplementorPortal.css'
 
+/**
+ * The model tester portal for implementors.
+ * Provides a canvas for drawing and displays classification results.
+ */
 export function ImplementorPortal() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
   const [result, setResult] = useState<ClassificationResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Load model info on first interaction
+  /**
+   * Loads model info from the inference service.
+   * Called on first drawing interaction.
+   */
   const loadModelInfo = useCallback(async () => {
     try {
       const info = await getModelInfo()
@@ -20,6 +34,10 @@ export function ImplementorPortal() {
     }
   }, [])
 
+  /**
+   * Handles drawing completion and runs classification.
+   * Sends strokes to inference API and displays results.
+   */
   const handleComplete = async (strokeData: {
     strokes: Array<{
       points: Array<{ x: number; y: number; pressure: number; timestamp: number }>
@@ -46,6 +64,9 @@ export function ImplementorPortal() {
     }
   }
 
+  /**
+   * Clears the current classification result.
+   */
   const handleClear = () => {
     setResult(null)
   }
@@ -145,6 +166,12 @@ export function ImplementorPortal() {
   )
 }
 
+/**
+ * Maps shape names to Unicode symbols for display.
+ *
+ * @param shape - Shape name to convert
+ * @returns Unicode symbol representing the shape
+ */
 function getShapeIcon(shape: string): string {
   const icons: Record<string, string> = {
     line: '—',

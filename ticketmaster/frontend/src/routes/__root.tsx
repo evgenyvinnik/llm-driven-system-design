@@ -1,8 +1,17 @@
+/**
+ * Root route component that wraps all pages.
+ * Sets up the application layout with header, main content, and footer.
+ * Handles initial authentication check on app load.
+ */
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { Header } from '../components/Header';
 import { useAuthStore } from '../stores/auth.store';
 
+/**
+ * Root layout component.
+ * Checks authentication status on mount and displays loading indicator.
+ */
 function RootComponent() {
   const { checkAuth, isLoading } = useAuthStore();
 
@@ -33,6 +42,7 @@ function RootComponent() {
   );
 }
 
+/** Root route configuration with the layout component */
 export const Route = createRootRoute({
   component: RootComponent,
 });

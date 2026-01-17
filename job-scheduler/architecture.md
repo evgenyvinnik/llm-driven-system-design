@@ -300,6 +300,528 @@ GET    /api/v1/dead-letter             - Dead letter queue
 - Scheduler lag > 60 seconds
 - No active workers when queue > 0
 
+## Caching Strategy
+
+### Overview
+
+The job scheduler uses a multi-layer caching approach optimized for read-heavy dashboard queries while maintaining strong consistency for job state mutations.
+
+### Cache Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Caching Layers                                  │
+│                                                                         │
+│   Browser Cache ──► API Response Cache ──► Redis Cache ──► PostgreSQL  │
+│   (static assets)    (ETags, 304s)         (job metadata)   (source)   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cache-Aside Pattern (Primary Strategy)
+
+The system uses **cache-aside** for job metadata reads:
+
+```typescript
+// Read path: check cache first, fallback to database
+async function getJob(jobId: string): Promise<Job> {
+  const cacheKey = `job:${jobId}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const job = await db.query('SELECT * FROM jobs WHERE id = $1', [jobId]);
+  await redis.setex(cacheKey, 300, JSON.stringify(job)); // TTL: 5 minutes
+  return job;
+}
+
+// Write path: update database, then invalidate cache
+async function updateJob(jobId: string, updates: Partial<Job>): Promise<void> {
+  await db.query('UPDATE jobs SET ... WHERE id = $1', [jobId, ...]);
+  await redis.del(`job:${jobId}`);
+  await redis.del('jobs:list:*'); // Invalidate list caches
+}
+```
+
+**Rationale**: Cache-aside is simpler to implement and reason about. Write-through adds complexity without significant benefit for this workload where writes are infrequent compared to dashboard reads.
+
+### TTL Configuration
+
+| Cache Key Pattern | TTL | Rationale |
+|-------------------|-----|-----------|
+| `job:{id}` | 5 minutes | Job metadata changes infrequently |
+| `jobs:list:{page}:{filters}` | 30 seconds | List views need fresher data |
+| `job:{id}:executions` | 10 seconds | Execution history updates frequently |
+| `workers:status` | 5 seconds | Worker heartbeats are real-time |
+| `metrics:summary` | 15 seconds | Dashboard metrics aggregate |
+| `handlers:list` | 1 hour | Handler registry rarely changes |
+
+### Cache Invalidation Rules
+
+**Event-Driven Invalidation:**
+
+| Event | Keys Invalidated |
+|-------|------------------|
+| Job created | `jobs:list:*` |
+| Job updated | `job:{id}`, `jobs:list:*` |
+| Job deleted | `job:{id}`, `jobs:list:*` |
+| Execution started | `job:{id}:executions`, `metrics:*` |
+| Execution completed | `job:{id}`, `job:{id}:executions`, `metrics:*` |
+| Worker status change | `workers:status` |
+
+**Pattern Deletion:**
+
+```typescript
+// Use Redis SCAN for pattern-based invalidation (not KEYS in production)
+async function invalidatePattern(pattern: string): Promise<void> {
+  let cursor = '0';
+  do {
+    const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    if (keys.length > 0) await redis.del(...keys);
+    cursor = nextCursor;
+  } while (cursor !== '0');
+}
+```
+
+### Static Asset Caching
+
+For the frontend dashboard (local development):
+
+```typescript
+// Express static file serving with cache headers
+app.use('/assets', express.static('dist/assets', {
+  maxAge: '1d',              // Cache JS/CSS for 1 day
+  etag: true,
+  lastModified: true,
+}));
+
+app.use('/', express.static('dist', {
+  maxAge: '0',               // HTML files: no cache (always fresh)
+  etag: true,
+}));
+```
+
+### API Response Caching
+
+```typescript
+// ETag-based conditional requests for job lists
+app.get('/api/v1/jobs', async (req, res) => {
+  const jobs = await getJobsList(req.query);
+  const etag = crypto.createHash('md5').update(JSON.stringify(jobs)).digest('hex');
+
+  if (req.headers['if-none-match'] === etag) {
+    return res.status(304).end();
+  }
+
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', 'private, max-age=30');
+  res.json(jobs);
+});
+```
+
+### CDN Considerations (Future Production)
+
+For production deployment, static assets would be served via CDN:
+
+- **Assets**: `/assets/*` with `Cache-Control: public, max-age=31536000, immutable`
+- **API**: No CDN caching (private, authenticated)
+- **Invalidation**: Version-based filenames (hash in filename) eliminate need for purging
+
+## Authentication and Authorization
+
+### Overview
+
+The job scheduler implements session-based authentication with role-based access control (RBAC). This approach aligns with the project defaults (simple session auth, avoid OAuth/JWT complexity unless studying those topics).
+
+### Authentication Flow
+
+```
+┌──────────┐        ┌──────────────┐        ┌─────────┐
+│  Client  │───────►│  API Server  │───────►│  Redis  │
+│          │◄───────│              │◄───────│(sessions)│
+└──────────┘        └──────────────┘        └─────────┘
+     │                     │
+     │   POST /api/auth/login
+     │   { username, password }
+     │──────────────────────►
+     │                     │
+     │   Set-Cookie: session_id=abc123
+     │◄──────────────────────
+```
+
+### Session Management
+
+```typescript
+// Session stored in Redis with 24-hour TTL
+interface Session {
+  userId: string;
+  role: 'user' | 'admin';
+  createdAt: number;
+  lastActivity: number;
+}
+
+// Redis key: session:{session_id}
+await redis.setex(`session:${sessionId}`, 86400, JSON.stringify(session));
+```
+
+**Session Configuration:**
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| Session TTL | 24 hours | Reasonable for dashboard use |
+| Sliding expiration | Yes | Extends on activity |
+| Cookie flags | `HttpOnly`, `SameSite=Strict` | Security best practices |
+| Cookie secure | `true` in production | HTTPS only in prod |
+
+### Role-Based Access Control (RBAC)
+
+**Roles:**
+
+| Role | Description |
+|------|-------------|
+| `user` | Can view jobs and executions, trigger own jobs |
+| `admin` | Full access: create, update, delete jobs; manage workers; view all data |
+
+**Permission Matrix:**
+
+| Operation | Endpoint | `user` | `admin` |
+|-----------|----------|--------|---------|
+| List jobs | `GET /api/v1/jobs` | Own jobs only | All jobs |
+| View job | `GET /api/v1/jobs/{id}` | Own jobs only | All jobs |
+| Create job | `POST /api/v1/jobs` | No | Yes |
+| Update job | `PUT /api/v1/jobs/{id}` | No | Yes |
+| Delete job | `DELETE /api/v1/jobs/{id}` | No | Yes |
+| Pause/Resume | `POST /api/v1/jobs/{id}/pause` | No | Yes |
+| Trigger job | `POST /api/v1/jobs/{id}/trigger` | Own jobs only | All jobs |
+| View executions | `GET /api/v1/executions` | Own jobs only | All jobs |
+| Cancel execution | `POST /api/v1/executions/{id}/cancel` | No | Yes |
+| Retry execution | `POST /api/v1/executions/{id}/retry` | Own jobs only | All jobs |
+| View workers | `GET /api/v1/workers` | Read-only | Full access |
+| Dead letter queue | `GET /api/v1/dead-letter` | Read-only | Full + requeue |
+| System metrics | `GET /api/v1/metrics` | Limited | Full |
+
+### Middleware Implementation
+
+```typescript
+// Authentication middleware
+async function authenticate(req: Request, res: Response, next: NextFunction) {
+  const sessionId = req.cookies?.session_id;
+  if (!sessionId) return res.status(401).json({ error: 'Authentication required' });
+
+  const session = await redis.get(`session:${sessionId}`);
+  if (!session) return res.status(401).json({ error: 'Session expired' });
+
+  req.user = JSON.parse(session);
+  // Extend session on activity
+  await redis.expire(`session:${sessionId}`, 86400);
+  next();
+}
+
+// Authorization middleware
+function authorize(...allowedRoles: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+}
+
+// Usage
+app.post('/api/v1/jobs', authenticate, authorize('admin'), createJob);
+app.get('/api/v1/jobs', authenticate, listJobs); // Role check inside handler
+```
+
+### Rate Limiting
+
+**Configuration:**
+
+| Endpoint Category | Limit | Window | Rationale |
+|-------------------|-------|--------|-----------|
+| Authentication (`/auth/*`) | 5 requests | 1 minute | Prevent brute force |
+| Job creation (`POST /jobs`) | 10 requests | 1 minute | Prevent job flooding |
+| Job trigger (`POST /jobs/*/trigger`) | 30 requests | 1 minute | Allow batch triggers |
+| Read operations (`GET /*`) | 100 requests | 1 minute | Generous for dashboard |
+| Admin operations | 50 requests | 1 minute | Reasonable admin use |
+
+**Implementation:**
+
+```typescript
+import rateLimit from 'express-rate-limit';
+import RedisStore from 'rate-limit-redis';
+
+const authLimiter = rateLimit({
+  store: new RedisStore({ client: redisClient, prefix: 'rl:auth:' }),
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: 'Too many login attempts, try again later' },
+  keyGenerator: (req) => req.ip,
+});
+
+const jobCreationLimiter = rateLimit({
+  store: new RedisStore({ client: redisClient, prefix: 'rl:jobs:' }),
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: 'Job creation rate limit exceeded' },
+  keyGenerator: (req) => req.user?.userId || req.ip,
+});
+
+app.post('/api/auth/login', authLimiter, login);
+app.post('/api/v1/jobs', authenticate, authorize('admin'), jobCreationLimiter, createJob);
+```
+
+### Local Development Defaults
+
+For local development, authentication can be simplified:
+
+```typescript
+// Development mode: auto-login as admin
+if (process.env.NODE_ENV === 'development' && process.env.SKIP_AUTH === 'true') {
+  app.use((req, res, next) => {
+    req.user = { userId: 'dev-user', role: 'admin' };
+    next();
+  });
+}
+```
+
+## Data Lifecycle Policies
+
+### Overview
+
+Data lifecycle management ensures storage costs remain reasonable, system performance stays consistent, and historical data remains accessible for auditing and replay.
+
+### Data Categories
+
+| Category | Table | Retention | Storage Tier |
+|----------|-------|-----------|--------------|
+| Job definitions | `jobs` | Indefinite | Hot (PostgreSQL) |
+| Active executions | `job_executions` | 30 days | Hot (PostgreSQL) |
+| Execution logs | `execution_logs` | 7 days | Hot (PostgreSQL) |
+| Archived executions | `job_executions_archive` | 1 year | Cold (PostgreSQL/S3) |
+| Dead letter queue | Redis list | 30 days | Hot (Redis) |
+| Metrics data | Prometheus | 15 days | Hot (local) |
+
+### Retention and TTL Policies
+
+**PostgreSQL Partitioning (for executions):**
+
+```sql
+-- Partition job_executions by month
+CREATE TABLE job_executions (
+  id UUID NOT NULL,
+  job_id UUID NOT NULL,
+  status execution_status NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  -- ... other columns
+) PARTITION BY RANGE (created_at);
+
+-- Create monthly partitions (automated via cron or pg_partman)
+CREATE TABLE job_executions_2024_01 PARTITION OF job_executions
+  FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+-- Archive old partitions
+ALTER TABLE job_executions DETACH PARTITION job_executions_2023_12;
+-- Export to S3/cold storage, then drop
+```
+
+**Automated Cleanup (Scheduler Job):**
+
+```typescript
+// Built-in maintenance job that runs daily
+const maintenanceJob = {
+  name: 'system:data-cleanup',
+  handler: 'maintenance',
+  schedule: '0 3 * * *', // 3 AM daily
+  payload: {
+    tasks: [
+      { action: 'delete_old_executions', olderThanDays: 30 },
+      { action: 'delete_old_logs', olderThanDays: 7 },
+      { action: 'vacuum_tables', tables: ['job_executions', 'execution_logs'] },
+    ],
+  },
+};
+```
+
+**Cleanup SQL:**
+
+```sql
+-- Delete executions older than 30 days (after archiving)
+DELETE FROM job_executions
+WHERE created_at < NOW() - INTERVAL '30 days'
+  AND status IN ('COMPLETED', 'FAILED', 'CANCELLED');
+
+-- Delete logs older than 7 days
+DELETE FROM execution_logs
+WHERE created_at < NOW() - INTERVAL '7 days';
+
+-- Redis dead letter TTL (set on insertion)
+LPUSH job_scheduler:dead_letter {execution_data}
+EXPIRE job_scheduler:dead_letter 2592000  -- 30 days
+```
+
+### Archival to Cold Storage
+
+**Archive Process:**
+
+```
+┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
+│  PostgreSQL     │─────►│  Archive Worker  │─────►│  MinIO (S3)     │
+│  (hot data)     │      │  (daily job)     │      │  (cold storage) │
+└─────────────────┘      └──────────────────┘      └─────────────────┘
+                                 │
+                                 ▼
+                         ┌──────────────────┐
+                         │  Archive Index   │
+                         │  (PostgreSQL)    │
+                         └──────────────────┘
+```
+
+**Archive Schema:**
+
+```sql
+-- Track archived data for retrieval
+CREATE TABLE execution_archives (
+  id UUID PRIMARY KEY,
+  partition_name VARCHAR(50) NOT NULL,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  record_count INTEGER NOT NULL,
+  file_path VARCHAR(500) NOT NULL,  -- S3/MinIO path
+  file_size_bytes BIGINT NOT NULL,
+  checksum VARCHAR(64) NOT NULL,    -- SHA-256
+  archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Example entry
+INSERT INTO execution_archives VALUES (
+  'a1b2c3d4...',
+  'job_executions_2023_12',
+  '2023-12-01',
+  '2023-12-31',
+  45000,
+  's3://job-scheduler-archive/executions/2023/12/data.parquet',
+  12582912,
+  'sha256:abc123...',
+  NOW()
+);
+```
+
+**Archive Format:**
+
+- **Format**: Parquet (columnar, compressed, schema-aware)
+- **Compression**: Snappy (fast decompression for replay)
+- **Partitioning**: One file per month per job type
+- **Naming**: `{bucket}/executions/{year}/{month}/{job_type}.parquet`
+
+### Backfill and Replay Procedures
+
+**Replay from Archive:**
+
+```typescript
+// Restore archived executions for analysis or reprocessing
+async function replayFromArchive(options: {
+  startDate: Date;
+  endDate: Date;
+  jobType?: string;
+  targetTable?: string; // Default: temp table
+}): Promise<void> {
+  // 1. Find relevant archive files
+  const archives = await db.query(`
+    SELECT file_path FROM execution_archives
+    WHERE start_date >= $1 AND end_date <= $2
+  `, [options.startDate, options.endDate]);
+
+  // 2. Download from S3/MinIO
+  for (const archive of archives) {
+    const data = await minio.getObject('job-scheduler-archive', archive.file_path);
+
+    // 3. Load into temporary table
+    await loadParquetToPostgres(data, options.targetTable || 'temp_replay');
+  }
+
+  // 4. Re-enqueue jobs for replay if needed
+  if (options.reprocess) {
+    await db.query(`
+      INSERT INTO job_executions (job_id, status, scheduled_at)
+      SELECT job_id, 'PENDING', NOW()
+      FROM temp_replay
+      WHERE status = 'FAILED' AND job_type = $1
+    `, [options.jobType]);
+  }
+}
+```
+
+**Backfill Scenarios:**
+
+| Scenario | Procedure |
+|----------|-----------|
+| Missed jobs (scheduler downtime) | Query `jobs` for `next_run_time < NOW()`, enqueue with `immediate=true` |
+| Failed job batch retry | Query dead letter queue, filter by error type, re-enqueue |
+| Data migration | Export old format, transform, import to new schema |
+| Disaster recovery | Restore PostgreSQL from backup, replay Redis queue from execution table |
+
+**Backfill Job:**
+
+```typescript
+// Admin-triggered backfill for missed executions
+app.post('/api/v1/admin/backfill', authenticate, authorize('admin'), async (req, res) => {
+  const { startTime, endTime, jobIds, dryRun } = req.body;
+
+  // Find jobs that should have run but didn't
+  const missedJobs = await db.query(`
+    SELECT j.id, j.schedule, j.handler, j.payload
+    FROM jobs j
+    WHERE j.status = 'SCHEDULED'
+      AND j.id = ANY($1::uuid[])
+      AND NOT EXISTS (
+        SELECT 1 FROM job_executions e
+        WHERE e.job_id = j.id
+          AND e.scheduled_at BETWEEN $2 AND $3
+      )
+  `, [jobIds, startTime, endTime]);
+
+  if (dryRun) {
+    return res.json({ missedJobs, count: missedJobs.length });
+  }
+
+  // Enqueue missed jobs
+  for (const job of missedJobs) {
+    await enqueueJob(job, { backfill: true, originalScheduledTime: startTime });
+  }
+
+  res.json({ backfilled: missedJobs.length });
+});
+```
+
+### Local Development Considerations
+
+For local development, simplified lifecycle management:
+
+```yaml
+# docker-compose.yml - add cleanup volumes
+services:
+  postgres:
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Reset with: docker-compose down -v
+
+  redis:
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+    # Auto-eviction prevents unbounded growth
+
+  minio:
+    volumes:
+      - miniodata:/data
+    # Archives stored locally
+```
+
+```bash
+# Development cleanup commands
+npm run db:cleanup          # Delete data older than 7 days
+npm run db:reset            # Drop and recreate all tables
+npm run archive:export      # Export executions to local MinIO
+npm run archive:import      # Import archived data for testing
+```
+
 ## Security Considerations
 
 - Input validation on all API endpoints

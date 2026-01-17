@@ -2,11 +2,17 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { MerchantService } from '../services/merchant.service.js';
 
+/**
+ * Merchant routes module.
+ * Provides endpoints for merchant registration, profile management,
+ * webhook configuration, and business analytics.
+ */
 const router = Router();
 const merchantService = new MerchantService();
 
 /**
- * Create a new merchant (public endpoint for signup)
+ * Creates a new merchant account (public signup endpoint).
+ * Returns the API key only once on creation - merchant must store it securely.
  * POST /api/v1/merchants
  */
 router.post('/', async (req: Request, res: Response) => {
@@ -47,7 +53,7 @@ router.post('/', async (req: Request, res: Response) => {
 });
 
 /**
- * Get current merchant profile
+ * Retrieves the authenticated merchant's profile including current balance.
  * GET /api/v1/merchants/me
  */
 router.get('/me', async (req: Request, res: Response) => {
@@ -76,7 +82,7 @@ router.get('/me', async (req: Request, res: Response) => {
 });
 
 /**
- * Update webhook URL
+ * Updates the webhook URL for receiving payment event notifications.
  * PATCH /api/v1/merchants/me/webhook
  */
 router.patch('/me/webhook', async (req: Request, res: Response) => {
@@ -105,7 +111,8 @@ router.patch('/me/webhook', async (req: Request, res: Response) => {
 });
 
 /**
- * Rotate API key
+ * Generates a new API key, invalidating the previous one.
+ * The old key becomes invalid immediately - client must update integration.
  * POST /api/v1/merchants/me/rotate-key
  */
 router.post('/me/rotate-key', async (req: Request, res: Response) => {
@@ -128,7 +135,8 @@ router.post('/me/rotate-key', async (req: Request, res: Response) => {
 });
 
 /**
- * Get dashboard statistics
+ * Retrieves aggregated dashboard statistics for the merchant.
+ * Defaults to last 30 days if no date range specified.
  * GET /api/v1/merchants/me/stats
  */
 router.get('/me/stats', async (req: Request, res: Response) => {
@@ -160,7 +168,8 @@ router.get('/me/stats', async (req: Request, res: Response) => {
 });
 
 /**
- * Get volume over time (for charts)
+ * Retrieves time-series transaction volume data for chart visualization.
+ * Supports hourly, daily, or weekly granularity.
  * GET /api/v1/merchants/me/volume
  */
 router.get('/me/volume', async (req: Request, res: Response) => {

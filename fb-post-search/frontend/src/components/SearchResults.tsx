@@ -1,11 +1,26 @@
+/**
+ * @fileoverview Search results list component.
+ * Displays search results with loading states, error handling, and pagination.
+ */
+
 import { Loader2 } from 'lucide-react';
 import { useSearchStore } from '../stores/searchStore';
 import { SearchResultCard } from './SearchResultCard';
 
+/**
+ * Props for the SearchResults component.
+ */
 interface SearchResultsProps {
+  /** Callback when a hashtag is clicked in a result */
   onHashtagClick?: (hashtag: string) => void;
 }
 
+/**
+ * Renders search results from the search store.
+ * Handles loading spinner, error display, empty states, and load more pagination.
+ * @param props - SearchResults props
+ * @returns Search results list with loading and error states
+ */
 export function SearchResults({ onHashtagClick }: SearchResultsProps) {
   const { results, isLoading, error, totalResults, searchTime, query, nextCursor, loadMore } =
     useSearchStore();

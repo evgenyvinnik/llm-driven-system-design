@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Campaigns page route component.
+ * Displays campaign list with detailed performance summaries.
+ * Shows country and device breakdowns with interactive charts.
+ */
+
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { useDashboardStore } from '../stores/dashboardStore'
@@ -6,12 +12,22 @@ import type { CampaignSummary } from '../types'
 import { StatCard } from '../components/StatCard'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
 
+/**
+ * Route definition for the campaigns page.
+ */
 export const Route = createFileRoute('/campaigns')({
   component: Campaigns,
 })
 
+/** Color palette for pie chart segments */
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16']
 
+/**
+ * Campaign management and analytics view.
+ * Allows selecting campaigns and viewing detailed performance metrics.
+ *
+ * @returns Campaign list and detail panels
+ */
 function Campaigns() {
   const { campaigns, fetchCampaigns, isLoading } = useDashboardStore()
   const [selectedCampaign, setSelectedCampaign] = useState<string | null>(null)

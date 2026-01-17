@@ -605,3 +605,680 @@ CREATE TABLE user_privacy_settings (
 | Aggregation | Redis + batch | Real-time SQL | Write performance |
 | Passage matching | Normalized windows | Exact matching | Practical grouping |
 | Privacy | Per-user settings | Global default | User control |
+
+---
+
+## Observability
+
+### Metrics Collection
+
+For local development, use Prometheus to scrape metrics from each service. Key metrics to track:
+
+**Highlight Service Metrics:**
+```javascript
+const prometheus = require('prom-client')
+
+// Request latency histogram
+const highlightLatency = new prometheus.Histogram({
+  name: 'highlight_operation_duration_seconds',
+  help: 'Duration of highlight operations',
+  labelNames: ['operation', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5]
+})
+
+// Highlight counters
+const highlightsCreated = new prometheus.Counter({
+  name: 'highlights_created_total',
+  help: 'Total highlights created',
+  labelNames: ['book_id']
+})
+
+// Sync queue depth
+const syncQueueDepth = new prometheus.Gauge({
+  name: 'sync_queue_depth',
+  help: 'Number of pending sync events per user',
+  labelNames: ['user_id']
+})
+
+// WebSocket connection gauge
+const activeConnections = new prometheus.Gauge({
+  name: 'websocket_active_connections',
+  help: 'Number of active WebSocket connections'
+})
+```
+
+**SLI Definitions:**
+| SLI | Target | Measurement |
+|-----|--------|-------------|
+| Highlight creation latency | p99 < 200ms | `highlight_operation_duration_seconds{operation="create"}` |
+| Sync latency (cross-device) | p95 < 2s | Time from create to WebSocket delivery |
+| Popular highlights cache hit | > 90% | `cache_hits / (cache_hits + cache_misses)` |
+| API availability | 99.5% | Successful responses / total requests |
+
+### Logging
+
+Use structured JSON logging for easier parsing in development:
+
+```javascript
+const logger = require('pino')({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  }
+})
+
+// Log highlight operations with context
+logger.info({
+  event: 'highlight_created',
+  user_id: userId,
+  book_id: bookId,
+  highlight_id: highlightId,
+  location: { start: locationStart, end: locationEnd },
+  duration_ms: endTime - startTime
+})
+
+// Log sync events
+logger.info({
+  event: 'sync_pushed',
+  user_id: userId,
+  device_count: devices.size,
+  queued_count: queuedDevices.length
+})
+```
+
+**Log Levels:**
+- `error`: Failed operations, database errors, unhandled exceptions
+- `warn`: Retry attempts, degraded performance, approaching limits
+- `info`: Successful operations, sync events, aggregation jobs
+- `debug`: Request/response details, cache operations (local dev only)
+
+### Distributed Tracing
+
+For local development, use Jaeger with OpenTelemetry:
+
+```javascript
+const { trace } = require('@opentelemetry/api')
+
+const tracer = trace.getTracer('highlight-service')
+
+async function createHighlight(userId, highlight) {
+  return tracer.startActiveSpan('createHighlight', async (span) => {
+    span.setAttribute('user.id', userId)
+    span.setAttribute('book.id', highlight.bookId)
+
+    try {
+      // Database insert span
+      await tracer.startActiveSpan('db.insert', async (dbSpan) => {
+        await db.query(...)
+        dbSpan.end()
+      })
+
+      // Aggregation update span
+      await tracer.startActiveSpan('aggregation.increment', async (aggSpan) => {
+        await aggregationService.incrementHighlightCount(...)
+        aggSpan.end()
+      })
+
+      // Sync push span
+      await tracer.startActiveSpan('sync.push', async (syncSpan) => {
+        await syncService.pushHighlight(...)
+        syncSpan.end()
+      })
+
+      span.setStatus({ code: SpanStatusCode.OK })
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
+      throw error
+    } finally {
+      span.end()
+    }
+  })
+}
+```
+
+### Alert Thresholds (Local Development)
+
+Configure alerts in Grafana for local testing:
+
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| High API latency | p99 > 500ms for 5 min | Check database queries, Redis connection |
+| Sync queue backlog | Queue depth > 100 per user | Investigate WebSocket disconnections |
+| Cache miss spike | Hit rate < 70% for 10 min | Check Redis memory, TTL configuration |
+| Error rate increase | > 5% errors for 5 min | Check logs for root cause |
+| WebSocket disconnections | > 10 disconnects/min | Check network, server memory |
+
+### Audit Logging
+
+Track security-relevant events in a separate audit table:
+
+```sql
+CREATE TABLE audit_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  timestamp TIMESTAMP DEFAULT NOW(),
+  user_id UUID,
+  action VARCHAR(50) NOT NULL,
+  resource_type VARCHAR(50),
+  resource_id UUID,
+  details JSONB,
+  ip_address INET,
+  user_agent TEXT
+);
+
+CREATE INDEX idx_audit_user ON audit_log(user_id, timestamp DESC);
+CREATE INDEX idx_audit_action ON audit_log(action, timestamp DESC);
+```
+
+**Audited Actions:**
+- `highlight.export` - User exported their highlights
+- `privacy.changed` - User modified privacy settings
+- `follow.created` / `follow.deleted` - Social graph changes
+- `share.external` - Highlight shared to external platform
+- `session.created` / `session.revoked` - Authentication events
+
+```javascript
+async function auditLog(userId, action, resourceType, resourceId, details, req) {
+  await db.query(`
+    INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, ip_address, user_agent)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+  `, [userId, action, resourceType, resourceId, JSON.stringify(details),
+      req.ip, req.headers['user-agent']])
+}
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency Keys
+
+All write operations use client-generated idempotency keys to prevent duplicates:
+
+```javascript
+class HighlightService {
+  async createHighlight(userId, highlight, idempotencyKey) {
+    // Check if this request was already processed
+    const existing = await redis.get(`idempotency:${idempotencyKey}`)
+    if (existing) {
+      return JSON.parse(existing) // Return cached result
+    }
+
+    // Use database transaction with idempotency check
+    const result = await db.transaction(async (tx) => {
+      // Check again inside transaction (race condition protection)
+      const existingHighlight = await tx.query(`
+        SELECT id FROM highlights WHERE idempotency_key = $1
+      `, [idempotencyKey])
+
+      if (existingHighlight.rows[0]) {
+        return existingHighlight.rows[0]
+      }
+
+      const highlightId = uuid()
+      await tx.query(`
+        INSERT INTO highlights (id, user_id, book_id, ..., idempotency_key)
+        VALUES ($1, $2, $3, ..., $4)
+      `, [highlightId, userId, highlight.bookId, ..., idempotencyKey])
+
+      return { id: highlightId, ...highlight }
+    })
+
+    // Cache result for 24 hours
+    await redis.setex(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(result))
+    return result
+  }
+}
+```
+
+**Retry Configuration:**
+```javascript
+const retryConfig = {
+  maxRetries: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 5000,
+  backoffMultiplier: 2,
+  retryableErrors: ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', '503', '429']
+}
+
+async function withRetry(fn, config = retryConfig) {
+  let lastError
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      if (!isRetryable(error, config) || attempt === config.maxRetries) {
+        throw error
+      }
+      const delay = Math.min(
+        config.baseDelayMs * Math.pow(config.backoffMultiplier, attempt),
+        config.maxDelayMs
+      )
+      await sleep(delay + Math.random() * 100) // Jitter
+    }
+  }
+  throw lastError
+}
+```
+
+### Circuit Breaker Pattern
+
+Protect downstream services with circuit breakers:
+
+```javascript
+const CircuitBreaker = require('opossum')
+
+// Circuit breaker for Elasticsearch
+const searchBreaker = new CircuitBreaker(async (query) => {
+  return await elasticsearch.search(query)
+}, {
+  timeout: 3000,           // 3s timeout per request
+  errorThresholdPercentage: 50,
+  resetTimeout: 30000,     // 30s before trying again
+  volumeThreshold: 5       // Min requests before opening
+})
+
+searchBreaker.on('open', () => {
+  logger.warn({ event: 'circuit_open', service: 'elasticsearch' })
+})
+
+searchBreaker.on('halfOpen', () => {
+  logger.info({ event: 'circuit_halfopen', service: 'elasticsearch' })
+})
+
+searchBreaker.fallback(async (query) => {
+  // Return cached results or empty array
+  const cached = await redis.get(`search:fallback:${query.bookId}`)
+  return cached ? JSON.parse(cached) : []
+})
+
+// Circuit breaker for Redis (aggregation)
+const redisBreaker = new CircuitBreaker(async (cmd, args) => {
+  return await redis[cmd](...args)
+}, {
+  timeout: 1000,
+  errorThresholdPercentage: 60,
+  resetTimeout: 10000
+})
+
+redisBreaker.fallback(async (cmd, args) => {
+  // For reads, return null; for writes, queue for later
+  if (cmd.startsWith('get') || cmd.startsWith('hget')) {
+    return null
+  }
+  await db.query(`
+    INSERT INTO redis_write_queue (command, args, created_at)
+    VALUES ($1, $2, NOW())
+  `, [cmd, JSON.stringify(args)])
+  return 'queued'
+})
+```
+
+**Circuit Breaker States:**
+| State | Behavior |
+|-------|----------|
+| Closed | Normal operation, requests pass through |
+| Open | All requests immediately fail/fallback |
+| Half-Open | Allow one test request to check recovery |
+
+### Disaster Recovery (Local Simulation)
+
+For learning purposes, simulate multi-region behavior with multiple PostgreSQL instances:
+
+```yaml
+# docker-compose.yml
+services:
+  postgres-primary:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: highlights
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+
+  postgres-replica:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: highlights
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    # In production: configure streaming replication
+```
+
+**Failover Logic:**
+```javascript
+class DatabasePool {
+  constructor() {
+    this.primary = new Pool({ port: 5432 })
+    this.replica = new Pool({ port: 5433 })
+    this.usePrimary = true
+  }
+
+  async query(sql, params) {
+    const pool = this.usePrimary ? this.primary : this.replica
+    try {
+      return await pool.query(sql, params)
+    } catch (error) {
+      if (this.usePrimary && this.isConnectionError(error)) {
+        logger.error({ event: 'primary_failed', error: error.message })
+        this.usePrimary = false
+        // Retry on replica (read-only operations)
+        if (!this.isWriteQuery(sql)) {
+          return await this.replica.query(sql, params)
+        }
+      }
+      throw error
+    }
+  }
+
+  isConnectionError(error) {
+    return ['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT'].includes(error.code)
+  }
+
+  isWriteQuery(sql) {
+    return /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)/i.test(sql.trim())
+  }
+}
+```
+
+### Backup and Restore Testing
+
+**Backup Strategy:**
+```bash
+#!/bin/bash
+# backup.sh - Run weekly in local dev to practice restore
+
+BACKUP_DIR="./backups/$(date +%Y%m%d)"
+mkdir -p "$BACKUP_DIR"
+
+# PostgreSQL backup
+pg_dump -h localhost -U user -d highlights > "$BACKUP_DIR/highlights.sql"
+
+# Redis backup (RDB snapshot)
+docker exec redis redis-cli BGSAVE
+docker cp redis:/data/dump.rdb "$BACKUP_DIR/redis.rdb"
+
+# Elasticsearch snapshot
+curl -X PUT "localhost:9200/_snapshot/backup/snapshot_$(date +%Y%m%d)?wait_for_completion=true"
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+**Restore Test Script:**
+```bash
+#!/bin/bash
+# restore-test.sh - Verify backups are valid
+
+BACKUP_DIR=$1
+
+# Start fresh containers
+docker-compose down -v
+docker-compose up -d
+
+# Wait for services
+sleep 10
+
+# Restore PostgreSQL
+psql -h localhost -U user -d highlights < "$BACKUP_DIR/highlights.sql"
+
+# Restore Redis
+docker cp "$BACKUP_DIR/redis.rdb" redis:/data/dump.rdb
+docker restart redis
+
+# Verify data
+HIGHLIGHT_COUNT=$(psql -h localhost -U user -d highlights -t -c "SELECT COUNT(*) FROM highlights")
+echo "Restored $HIGHLIGHT_COUNT highlights"
+
+# Run smoke tests
+npm run test:smoke
+```
+
+**Restore Checklist:**
+- [ ] PostgreSQL restore completes without errors
+- [ ] All foreign key constraints satisfied
+- [ ] Redis cache warming successful
+- [ ] Elasticsearch indices rebuilt and searchable
+- [ ] WebSocket connections re-establish
+- [ ] Sync queues processed after restore
+
+---
+
+## Cost Tradeoffs
+
+### Storage Tiering
+
+For a learning project, understand how storage tiers would work at scale:
+
+**Highlights Storage Strategy:**
+| Data Age | Storage Tier | Cost Implication |
+|----------|--------------|------------------|
+| 0-30 days | PostgreSQL (hot) | Fast SSD, full indexing |
+| 30-365 days | PostgreSQL (warm) | Regular HDD, partial indexing |
+| > 1 year | S3/MinIO (cold) | Object storage, no indexing |
+
+**Implementation for Local Dev:**
+```javascript
+class StorageTiering {
+  async archiveOldHighlights() {
+    // Move highlights older than 1 year to cold storage
+    const oldHighlights = await db.query(`
+      SELECT * FROM highlights
+      WHERE created_at < NOW() - INTERVAL '1 year'
+      AND archived = false
+      LIMIT 1000
+    `)
+
+    for (const highlight of oldHighlights.rows) {
+      // Store in MinIO (S3-compatible)
+      await minio.putObject(
+        'highlights-archive',
+        `${highlight.user_id}/${highlight.id}.json`,
+        JSON.stringify(highlight)
+      )
+
+      // Mark as archived in PostgreSQL
+      await db.query(`
+        UPDATE highlights SET archived = true WHERE id = $1
+      `, [highlight.id])
+    }
+
+    // Optionally delete archived data after verification
+    // await db.query(`DELETE FROM highlights WHERE archived = true AND created_at < NOW() - INTERVAL '2 years'`)
+  }
+
+  async getHighlight(highlightId) {
+    // Check hot storage first
+    const hot = await db.query(`SELECT * FROM highlights WHERE id = $1`, [highlightId])
+    if (hot.rows[0] && !hot.rows[0].archived) {
+      return hot.rows[0]
+    }
+
+    // Fall back to cold storage
+    try {
+      const stream = await minio.getObject('highlights-archive', `*/${highlightId}.json`)
+      return JSON.parse(await streamToString(stream))
+    } catch (error) {
+      return null
+    }
+  }
+}
+```
+
+**Storage Cost Comparison (Illustrative):**
+| Tier | 1M Highlights | Cost/Month |
+|------|---------------|------------|
+| PostgreSQL (SSD) | ~500 MB | ~$5 (managed) |
+| PostgreSQL (HDD) | ~500 MB | ~$2 (managed) |
+| S3/MinIO | ~500 MB | ~$0.02 |
+
+### Cache Sizing
+
+**Redis Memory Budget:**
+```javascript
+// Calculate cache requirements
+const cacheConfig = {
+  // Popular highlights cache
+  popularHighlights: {
+    keyPattern: 'popular:{bookId}',
+    avgValueSize: 2048,      // 2KB per book (10 highlights)
+    maxKeys: 10000,          // Top 10k books
+    ttlSeconds: 300,
+    estimatedMemoryMB: (2048 * 10000) / 1024 / 1024  // ~20MB
+  },
+
+  // Sync state cache
+  syncState: {
+    keyPattern: 'sync:{userId}',
+    avgValueSize: 256,       // Device list + timestamps
+    maxKeys: 100000,         // Active users
+    ttlSeconds: 86400,
+    estimatedMemoryMB: (256 * 100000) / 1024 / 1024  // ~25MB
+  },
+
+  // Idempotency keys
+  idempotency: {
+    keyPattern: 'idempotency:{key}',
+    avgValueSize: 512,
+    maxKeys: 50000,          // Last 24h of operations
+    ttlSeconds: 86400,
+    estimatedMemoryMB: (512 * 50000) / 1024 / 1024  // ~25MB
+  },
+
+  // Aggregation counters
+  aggregation: {
+    keyPattern: 'book:{bookId}:highlights',
+    avgValueSize: 1024,      // Hash of passage counts
+    maxKeys: 50000,          // Books with activity
+    ttlSeconds: null,        // Persistent
+    estimatedMemoryMB: (1024 * 50000) / 1024 / 1024  // ~50MB
+  }
+}
+
+// Total: ~120MB for local dev (set maxmemory to 256MB for headroom)
+```
+
+**Local Dev Redis Configuration:**
+```conf
+# redis.conf
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+```
+
+**Cache Eviction Priority:**
+1. Idempotency keys (can regenerate from DB)
+2. Sync state (will rebuild on reconnect)
+3. Popular highlights (can query PostgreSQL)
+4. Aggregation counters (preserve - write-heavy)
+
+### Queue Retention
+
+**Sync Queue Configuration:**
+```javascript
+const queueConfig = {
+  // Per-device sync queue
+  syncQueue: {
+    maxLength: 1000,         // Events per device
+    retentionDays: 30,       // Auto-expire old events
+    maxMemoryPerUser: '1MB'
+  },
+
+  // Aggregation job queue
+  aggregationQueue: {
+    maxLength: 10000,
+    retentionHours: 24,
+    batchSize: 100
+  }
+}
+
+// Enforce queue limits
+async function enqueueSyncEvent(userId, deviceId, event) {
+  const queueKey = `sync:queue:${userId}:${deviceId}`
+
+  // Check queue length before adding
+  const length = await redis.llen(queueKey)
+  if (length >= queueConfig.syncQueue.maxLength) {
+    // Trim oldest events (FIFO)
+    await redis.ltrim(queueKey, -queueConfig.syncQueue.maxLength + 1, -1)
+    logger.warn({ event: 'sync_queue_trimmed', user_id: userId, device_id: deviceId })
+  }
+
+  await redis.rpush(queueKey, JSON.stringify(event))
+  await redis.expire(queueKey, queueConfig.syncQueue.retentionDays * 86400)
+}
+```
+
+### Compute vs Storage Optimization
+
+**Decision Matrix:**
+| Operation | Compute | Storage | Recommendation |
+|-----------|---------|---------|----------------|
+| Popular highlights | Pre-compute aggregates | Query on-demand | Pre-compute: Cheaper at read-heavy scale |
+| Full-text search | PostgreSQL ILIKE | Elasticsearch index | Elasticsearch: 10x faster for large datasets |
+| Highlight export | Generate on request | Pre-generate nightly | On-request: Storage cost not worth it |
+| Passage normalization | Compute on write | Store normalized key | Compute: Simple operation, saves storage |
+
+**Pre-computation vs On-Demand Trade-off:**
+```javascript
+// Option A: Pre-compute popular highlights (chosen)
+// - Runs every 5 minutes as background job
+// - Stores results in PostgreSQL + Redis cache
+// - Cost: 1 job/5min = ~8,640 queries/day
+// - Benefit: O(1) read latency
+
+// Option B: Compute on-demand
+// - Query and aggregate on each request
+// - Cost: 100k reads/sec * aggregation query
+// - Problem: Would require 100k+ aggregation queries/sec
+
+class ComputeOptimization {
+  // Pre-compute popular highlights (batch job)
+  async precomputePopular() {
+    // Cost: One heavy query every 5 minutes
+    const popular = await db.query(`
+      SELECT book_id, passage_id, COUNT(*) as highlight_count
+      FROM highlights
+      WHERE created_at > NOW() - INTERVAL '30 days'
+      GROUP BY book_id, passage_id
+      HAVING COUNT(*) >= 5
+      ORDER BY highlight_count DESC
+    `)
+
+    // Store in cache and database
+    for (const row of popular.rows) {
+      await redis.hset(`popular:${row.book_id}`, row.passage_id, row.highlight_count)
+    }
+  }
+
+  // On-demand computation (for rare queries)
+  async computeOnDemand(bookId) {
+    // Only for books not in pre-computed set
+    const cached = await redis.hgetall(`popular:${bookId}`)
+    if (Object.keys(cached).length > 0) {
+      return cached
+    }
+
+    // Compute for this specific book (rare case)
+    return await db.query(`
+      SELECT passage_id, COUNT(*) as highlight_count
+      FROM highlights
+      WHERE book_id = $1
+      GROUP BY passage_id
+      HAVING COUNT(*) >= 3
+    `, [bookId])
+  }
+}
+```
+
+**Resource Budget for Local Development:**
+| Component | Memory | CPU | Storage |
+|-----------|--------|-----|---------|
+| PostgreSQL | 512 MB | 1 core | 1 GB |
+| Redis | 256 MB | 0.5 core | 256 MB |
+| Elasticsearch | 512 MB | 1 core | 500 MB |
+| Node.js services (3) | 384 MB | 0.5 core each | - |
+| **Total** | ~2 GB | ~3.5 cores | ~2 GB |
+
+This fits comfortably on a development machine while simulating the key architectural patterns used at scale.

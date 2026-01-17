@@ -1,7 +1,35 @@
+/**
+ * @fileoverview Frontier route component for URL queue management.
+ *
+ * The Frontier page displays and manages the URL queue (frontier) of the crawler.
+ * It allows operators to:
+ * - View URLs by status (pending, in_progress, completed, failed)
+ * - Add new URLs to the crawl queue
+ * - Monitor URL metadata (priority, depth, domain)
+ *
+ * The frontier is a core concept in web crawling - it represents all discovered
+ * URLs that are scheduled for crawling, organized by priority and status.
+ *
+ * @module routes/Frontier
+ */
+
 import { useEffect, useState } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
 import { AddUrlsForm } from '../components/AddUrlsForm';
 
+/**
+ * Frontier route component for managing the URL crawl queue.
+ *
+ * Displays a filterable list of frontier URLs with their metadata:
+ * - Priority level (high/medium/low)
+ * - Crawl depth from seed URL
+ * - Current status
+ * - Domain information
+ *
+ * Includes an AddUrlsForm for adding new URLs to the queue.
+ *
+ * @returns Frontier management page
+ */
 export function Frontier() {
   const { frontierUrls, frontierLoading, fetchFrontierUrls, addUrls } = useCrawlerStore();
   const [filter, setFilter] = useState<string>('pending');
@@ -10,10 +38,24 @@ export function Frontier() {
     fetchFrontierUrls(filter);
   }, [fetchFrontierUrls, filter]);
 
+  /**
+   * Handles adding URLs to the frontier.
+   * Delegates to the store's addUrls action.
+   *
+   * @param urls - Array of URL strings to add
+   * @param priority - Optional priority level (1-3)
+   */
   const handleAddUrls = async (urls: string[], priority?: number) => {
     await addUrls(urls, priority);
   };
 
+  /**
+   * Renders a colored badge for priority level.
+   * High priority (3) is red, medium (2) is yellow, low (1) is gray.
+   *
+   * @param priority - Priority level (1, 2, or 3)
+   * @returns JSX badge element with appropriate color
+   */
   const getPriorityBadge = (priority: number) => {
     const colors = {
       3: 'bg-red-100 text-red-800',
@@ -28,6 +70,13 @@ export function Frontier() {
     );
   };
 
+  /**
+   * Renders a colored badge for URL status.
+   * Each status has a distinct color for quick visual identification.
+   *
+   * @param status - URL status (pending, in_progress, completed, failed)
+   * @returns JSX badge element with status-appropriate color
+   */
   const getStatusBadge = (status: string) => {
     const colors: Record<string, string> = {
       pending: 'bg-yellow-100 text-yellow-800',

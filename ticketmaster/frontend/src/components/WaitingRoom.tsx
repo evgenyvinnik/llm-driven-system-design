@@ -1,10 +1,26 @@
+/**
+ * Virtual waiting room component for high-demand events.
+ * Displays the user's position in queue and estimated wait time.
+ * Users are automatically redirected when their turn comes.
+ */
 import type { QueueStatus } from '../types';
 
+/**
+ * Props for the WaitingRoom component.
+ */
 interface WaitingRoomProps {
+  /** Current queue status including position and estimated wait */
   queueStatus: QueueStatus;
+  /** Callback when user chooses to leave the queue */
   onLeave: () => void;
 }
 
+/**
+ * Displays waiting room UI with queue position and animated waiting indicator.
+ *
+ * @param props - Component props
+ * @returns The rendered waiting room display
+ */
 export function WaitingRoom({ queueStatus, onLeave }: WaitingRoomProps) {
   const formatWaitTime = (seconds: number) => {
     if (seconds < 60) {

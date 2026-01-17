@@ -4,13 +4,30 @@ import { FileIcon, SyncStatusIcon } from './Icons';
 import { formatBytes, formatRelativeTime, getFileIcon } from '../utils/helpers';
 import { useFileStore } from '../stores/fileStore';
 
+/**
+ * Props for the FileItemComponent.
+ */
 interface FileItemComponentProps {
+  /** File or folder to display */
   file: FileItem;
+  /** Whether this item is currently selected */
   isSelected: boolean;
+  /** Callback when item is clicked (for selection) */
   onSelect: () => void;
+  /** Callback when item is double-clicked (for open/download) */
   onOpen: () => void;
 }
 
+/**
+ * Renders a single file or folder item in the file browser.
+ *
+ * Displays the file icon, name, size/type, modification time, and sync status.
+ * Supports selection (click), opening (double-click), and a context menu
+ * for actions like rename, download, and delete.
+ *
+ * @param props - Component props
+ * @returns File item row element with icon and metadata
+ */
 export const FileItemComponent: React.FC<FileItemComponentProps> = ({
   file,
   isSelected,
@@ -131,10 +148,33 @@ export const FileItemComponent: React.FC<FileItemComponentProps> = ({
   );
 };
 
+/**
+ * Props for the FileBrowser component.
+ */
 interface FileBrowserProps {
+  /** Callback when user navigates to a different directory */
   onNavigate: (path: string) => void;
 }
 
+/**
+ * Main file browser component for iCloud Drive.
+ *
+ * Provides a complete file browsing experience including:
+ * - Breadcrumb navigation
+ * - File/folder listing with icons and metadata
+ * - Drag-and-drop file upload
+ * - Toolbar with "New Folder" and "Upload" buttons
+ * - Multi-select for batch operations
+ * - Conflict warnings
+ * - Upload progress indicators
+ *
+ * The component uses the file store for state management and
+ * subscribes to WebSocket events for real-time sync updates.
+ *
+ * @param props - Component props
+ * @param props.onNavigate - Callback when navigating directories
+ * @returns Complete file browser UI
+ */
 export const FileBrowser: React.FC<FileBrowserProps> = ({ onNavigate }) => {
   const {
     files,

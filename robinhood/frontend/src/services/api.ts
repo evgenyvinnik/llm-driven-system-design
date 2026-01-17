@@ -1,5 +1,20 @@
+/**
+ * Frontend API service for communicating with the Robinhood backend.
+ * Provides typed API clients for authentication, quotes, portfolio,
+ * orders, and watchlists. Automatically handles auth token injection.
+ */
+
+/** Base URL for all API requests (proxied to backend in dev) */
 const API_BASE = '/api';
 
+/**
+ * Generic request helper with auth token injection.
+ * Automatically includes Bearer token from localStorage if available.
+ * @param endpoint - API endpoint path (e.g., '/auth/login')
+ * @param options - Fetch options (method, body, headers)
+ * @returns Promise resolving to typed response data
+ * @throws Error with message from API on non-2xx responses
+ */
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -28,7 +43,10 @@ async function request<T>(
   return response.json();
 }
 
-// Auth API
+/**
+ * Authentication API client.
+ * Handles user login, registration, and logout.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     request<{ token: string; user: import('../types').User }>('/auth/login', {
@@ -48,7 +66,10 @@ export const authApi = {
     }),
 };
 
-// Quotes API
+/**
+ * Stock quotes API client.
+ * Provides real-time quote data and stock information.
+ */
 export const quotesApi = {
   getAll: () => request<import('../types').Quote[]>('/quotes'),
 
@@ -75,7 +96,10 @@ export const quotesApi = {
     }>(`/quotes/${symbol}/details`),
 };
 
-// Portfolio API
+/**
+ * Portfolio API client.
+ * Provides portfolio summary, positions, and account information.
+ */
 export const portfolioApi = {
   getPortfolio: () => request<import('../types').Portfolio>('/portfolio'),
 
@@ -97,7 +121,10 @@ export const portfolioApi = {
     }>('/portfolio/account'),
 };
 
-// Orders API
+/**
+ * Orders API client.
+ * Handles order placement, retrieval, and cancellation.
+ */
 export const ordersApi = {
   getOrders: (status?: string) =>
     request<import('../types').Order[]>(`/orders${status ? `?status=${status}` : ''}`),
@@ -125,7 +152,10 @@ export const ordersApi = {
     }),
 };
 
-// Watchlists API
+/**
+ * Watchlists and price alerts API client.
+ * Manages user watchlists, watchlist items, and price alerts.
+ */
 export const watchlistsApi = {
   getWatchlists: () => request<import('../types').Watchlist[]>('/watchlists'),
 

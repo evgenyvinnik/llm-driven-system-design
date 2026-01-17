@@ -1,9 +1,19 @@
+/**
+ * Search page route.
+ * Provides full-text article search with results display.
+ * @module routes/search
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { feedApi } from '../services/api';
 import { useState, useEffect } from 'react';
 import { Search, ExternalLink, Clock } from 'lucide-react';
 import type { Article } from '../types';
 
+/**
+ * Search page route configuration.
+ * Validates search query parameter and loads matching articles.
+ */
 export const Route = createFileRoute('/search')({
   validateSearch: (search: Record<string, unknown>) => ({
     q: (search.q as string) || '',
@@ -19,6 +29,11 @@ export const Route = createFileRoute('/search')({
   component: SearchPage,
 });
 
+/**
+ * Format a date as a short readable string.
+ * @param dateString - ISO 8601 timestamp string
+ * @returns Formatted date (e.g., "Jan 15, 2024")
+ */
 function formatDate(dateString: string): string {
   const date = new Date(dateString);
   return date.toLocaleDateString('en-US', {
@@ -28,15 +43,25 @@ function formatDate(dateString: string): string {
   });
 }
 
+/**
+ * Search page component.
+ * Provides search input and displays matching article results.
+ * @returns Search page with input form and result list
+ */
 function SearchPage() {
   const { articles, query } = Route.useLoaderData();
   const navigate = useNavigate();
   const [searchInput, setSearchInput] = useState(query);
 
+  // Sync search input with URL query
   useEffect(() => {
     setSearchInput(query);
   }, [query]);
 
+  /**
+   * Handle search form submission.
+   * Navigates to search page with new query parameter.
+   */
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     if (searchInput.trim()) {

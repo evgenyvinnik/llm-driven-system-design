@@ -1,7 +1,36 @@
+/**
+ * @fileoverview Domains route component for domain-level statistics.
+ *
+ * The Domains view provides insights into crawling activity at the domain level.
+ * It shows:
+ * - All domains that have been crawled
+ * - Page counts per domain
+ * - Crawl delay settings (from robots.txt or defaults)
+ * - Allow/block status for each domain
+ * - Ability to view cached robots.txt content
+ *
+ * This view helps operators understand the crawler's reach and compliance
+ * with domain-specific crawling policies.
+ *
+ * @module routes/Domains
+ */
+
 import { useEffect, useState } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
 import { api } from '../services/api';
 
+/**
+ * Domains route component for viewing domain-level crawl statistics.
+ *
+ * Features:
+ * - Paginated domain list (25 per page)
+ * - Expandable robots.txt viewer for each domain
+ * - Color-coded allow/block status
+ * - Crawl delay display in seconds
+ * - Direct links to domain homepages
+ *
+ * @returns Paginated domains browser with robots.txt viewer
+ */
 export function Domains() {
   const { domains, domainsTotal, domainsLoading, fetchDomains } = useCrawlerStore();
   const [offset, setOffset] = useState(0);
@@ -13,6 +42,12 @@ export function Domains() {
     fetchDomains(limit, offset);
   }, [fetchDomains, offset]);
 
+  /**
+   * Toggles display of a domain's robots.txt content.
+   * Fetches from the API on first view, then caches in component state.
+   *
+   * @param domain - Domain hostname to fetch robots.txt for
+   */
   const handleViewRobots = async (domain: string) => {
     if (selectedDomain === domain) {
       setSelectedDomain(null);

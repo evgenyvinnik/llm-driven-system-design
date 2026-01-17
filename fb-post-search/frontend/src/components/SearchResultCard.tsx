@@ -1,11 +1,27 @@
+/**
+ * @fileoverview Search result card component.
+ * Displays a single search result with author info, content snippet, and engagement stats.
+ */
+
 import { Heart, MessageCircle, Share2, Globe, Users, Lock, Image, Video, Link as LinkIcon, FileText } from 'lucide-react';
 import type { SearchResult } from '../types';
 
+/**
+ * Props for the SearchResultCard component.
+ */
 interface SearchResultCardProps {
+  /** The search result to display */
   result: SearchResult;
+  /** Callback when a hashtag is clicked */
   onHashtagClick?: (hashtag: string) => void;
 }
 
+/**
+ * Displays a single search result with highlighted content snippet.
+ * Shows author info, visibility icon, post type, engagement metrics, and clickable hashtags.
+ * @param props - SearchResultCard props
+ * @returns Search result card with author, content, and engagement
+ */
 export function SearchResultCard({ result, onHashtagClick }: SearchResultCardProps) {
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);

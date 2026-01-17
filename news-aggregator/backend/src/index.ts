@@ -1,3 +1,10 @@
+/**
+ * News Aggregator Backend Server
+ * Main entry point for the Express application.
+ * Configures middleware, routes, and scheduled tasks for RSS feed crawling.
+ * @module index
+ */
+
 import express from 'express';
 import cors from 'cors';
 import cron from 'node-cron';
@@ -9,6 +16,8 @@ import userRoutes from './routes/user.js';
 import adminRoutes from './routes/admin.js';
 
 const app = express();
+
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || '3000');
 
 // Middleware
@@ -18,7 +27,10 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Session middleware
+/**
+ * Session middleware.
+ * Loads session data from Redis using session_id cookie or X-Session-Id header.
+ */
 app.use(async (req, _res, next) => {
   const sessionId = req.cookies?.session_id || req.headers['x-session-id'];
   if (sessionId) {
@@ -30,7 +42,10 @@ app.use(async (req, _res, next) => {
   next();
 });
 
-// Cookie parser (simple implementation)
+/**
+ * Cookie parser middleware.
+ * Simple implementation that parses the Cookie header into req.cookies object.
+ */
 app.use((req, _res, next) => {
   const cookieHeader = req.headers.cookie;
   req.cookies = {};
@@ -47,13 +62,18 @@ app.use((req, _res, next) => {
 declare global {
   namespace Express {
     interface Request {
+      /** Parsed cookies from Cookie header */
       cookies: Record<string, string>;
+      /** Session data loaded from Redis */
       session?: Record<string, unknown>;
     }
   }
 }
 
-// Health check
+/**
+ * GET /health - Health check endpoint
+ * Returns server status for load balancer and monitoring.
+ */
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -63,13 +83,19 @@ app.use('/api/v1', feedRoutes);
 app.use('/api/v1/user', userRoutes);
 app.use('/api/v1/admin', adminRoutes);
 
-// Error handler
+/**
+ * Global error handler.
+ * Logs unhandled errors and returns 500 response.
+ */
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize and start server
+/**
+ * Initialize and start the server.
+ * Sets up Elasticsearch indexes, starts HTTP server, and schedules crawl jobs.
+ */
 async function start() {
   try {
     // Initialize Elasticsearch indexes

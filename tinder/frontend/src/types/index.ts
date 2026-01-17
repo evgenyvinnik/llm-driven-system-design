@@ -1,3 +1,6 @@
+/**
+ * Core user entity with profile and account information.
+ */
 export interface User {
   id: string;
   email: string;
@@ -18,6 +21,9 @@ export interface User {
   preferences: UserPreferences | null;
 }
 
+/**
+ * User discovery preferences for filtering potential matches.
+ */
 export interface UserPreferences {
   user_id: string;
   interested_in: string[];
@@ -27,6 +33,9 @@ export interface UserPreferences {
   show_me: boolean;
 }
 
+/**
+ * User profile photo with ordering metadata.
+ */
 export interface Photo {
   id: string;
   user_id: string;
@@ -36,6 +45,9 @@ export interface Photo {
   created_at: string;
 }
 
+/**
+ * Profile card shown in the discovery swipe deck.
+ */
 export interface DiscoveryCard {
   id: string;
   name: string;
@@ -49,6 +61,9 @@ export interface DiscoveryCard {
   score?: number;
 }
 
+/**
+ * Match with another user including conversation preview.
+ */
 export interface Match {
   id: string;
   matched_at: string;
@@ -62,6 +77,9 @@ export interface Match {
   };
 }
 
+/**
+ * Chat message in a match conversation.
+ */
 export interface Message {
   id: string;
   sender_id: string;
@@ -71,6 +89,9 @@ export interface Message {
   is_mine: boolean;
 }
 
+/**
+ * Result of a swipe action, including match data if mutual.
+ */
 export interface SwipeResult {
   success: boolean;
   match: {
@@ -83,6 +104,9 @@ export interface SwipeResult {
   } | null;
 }
 
+/**
+ * Admin dashboard statistics for platform metrics.
+ */
 export interface AdminStats {
   users: {
     total: number;

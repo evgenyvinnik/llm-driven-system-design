@@ -1,13 +1,29 @@
+/**
+ * User settings page route.
+ * Provides account info display and topic preference management.
+ * @module routes/settings
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores';
 import { userApi } from '../services/api';
 import { Settings, Check, X } from 'lucide-react';
 
+/**
+ * Settings page route configuration.
+ * Protected route - redirects to login if not authenticated.
+ */
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
 });
 
+/**
+ * Settings page component.
+ * Displays account information and allows topic preference updates.
+ * Requires authentication - redirects to login if not logged in.
+ * @returns Settings page with account info and preference editor
+ */
 function SettingsPage() {
   const navigate = useNavigate();
   const { user, preferences, updatePreferences } = useAuthStore();
@@ -16,6 +32,7 @@ function SettingsPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
+  // Redirect to login if not authenticated, load topics on mount
   useEffect(() => {
     if (!user) {
       navigate({ to: '/login' });
@@ -27,12 +44,17 @@ function SettingsPage() {
     });
   }, [user, navigate]);
 
+  // Sync selected topics with preferences from store
   useEffect(() => {
     if (preferences) {
       setSelectedTopics(preferences.preferred_topics);
     }
   }, [preferences]);
 
+  /**
+   * Toggle topic selection for preferences.
+   * @param topic - Topic name to toggle
+   */
   const handleTopicToggle = (topic: string) => {
     setSelectedTopics((prev) =>
       prev.includes(topic)
@@ -41,6 +63,10 @@ function SettingsPage() {
     );
   };
 
+  /**
+   * Save updated topic preferences.
+   * Calls API and shows success/error message.
+   */
   const handleSave = async () => {
     setIsSaving(true);
     setMessage(null);

@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Express server entry point for the Facebook Post Search API.
+ * Configures middleware, initializes services, and starts the HTTP server.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
@@ -5,6 +10,9 @@ import { config } from './config/index.js';
 import { initializeElasticsearch } from './config/elasticsearch.js';
 import routes from './routes/index.js';
 
+/**
+ * Express application instance.
+ */
 const app = express();
 
 // Middleware
@@ -14,7 +22,10 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Rate limiting
+/**
+ * Rate limiter middleware to prevent abuse.
+ * Limits each IP to 1000 requests per 15 minutes.
+ */
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 1000, // Limit each IP to 1000 requests per windowMs
@@ -41,7 +52,10 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
+/**
+ * Initializes the server and starts listening.
+ * Sets up Elasticsearch index and starts the HTTP server.
+ */
 async function start() {
   try {
     // Initialize Elasticsearch index

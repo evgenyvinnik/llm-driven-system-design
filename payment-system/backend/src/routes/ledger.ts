@@ -2,11 +2,17 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { LedgerService } from '../services/ledger.service.js';
 
+/**
+ * Ledger routes module.
+ * Provides endpoints for financial reconciliation and reporting.
+ * Exposes double-entry bookkeeping verification and summaries.
+ */
 const router = Router();
 const ledgerService = new LedgerService();
 
 /**
- * Get ledger balance verification (reconciliation check)
+ * Verifies that ledger debits equal credits for a given period.
+ * Used for daily reconciliation to ensure financial integrity.
  * GET /api/v1/ledger/verify
  */
 router.get('/verify', async (req: Request, res: Response) => {
@@ -46,7 +52,8 @@ router.get('/verify', async (req: Request, res: Response) => {
 });
 
 /**
- * Get ledger summary
+ * Retrieves a summary of net changes by account for reporting.
+ * Shows total volume and per-account movements for the period.
  * GET /api/v1/ledger/summary
  */
 router.get('/summary', async (req: Request, res: Response) => {

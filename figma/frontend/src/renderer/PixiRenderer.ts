@@ -1,8 +1,18 @@
+/**
+ * PixiJS-based renderer for the design canvas.
+ * Provides hardware-accelerated rendering of design objects, selection overlays,
+ * collaboration cursors, and the canvas grid. Handles viewport transformations
+ * for pan and zoom functionality.
+ */
 import * as PIXI from 'pixi.js';
 import type { DesignObject, Viewport, PresenceState } from '../types';
 import { ShapeFactory } from './ShapeFactory';
 import { SelectionOverlay } from './SelectionOverlay';
 
+/**
+ * Main renderer class for the design editor canvas.
+ * Manages the PixiJS application, viewport container, and rendering pipeline.
+ */
 export class PixiRenderer {
   private app: PIXI.Application;
   private viewportContainer: PIXI.Container;
@@ -15,6 +25,11 @@ export class PixiRenderer {
   private currentViewport: Viewport = { x: 0, y: 0, zoom: 1 };
   private isInitialized = false;
 
+  /**
+   * Creates a new PixiRenderer and attaches it to the given container.
+   * Initializes asynchronously - check `initialized` before using.
+   * @param container - The HTML div element to render into
+   */
   constructor(container: HTMLDivElement) {
     // Create PixiJS Application
     this.app = new PIXI.Application();
@@ -34,6 +49,10 @@ export class PixiRenderer {
     this.init(container);
   }
 
+  /**
+   * Initializes the PixiJS application and sets up the render hierarchy.
+   * @param container - The HTML element to attach the canvas to
+   */
   private async init(container: HTMLDivElement): Promise<void> {
     await this.app.init({
       background: '#1E1E1E',
@@ -62,28 +81,46 @@ export class PixiRenderer {
     this.isInitialized = true;
   }
 
+  /** Returns the PixiJS stage container */
   public get stage(): PIXI.Container {
     return this.app.stage;
   }
 
+  /** Returns the underlying HTML canvas element */
   public get canvas(): HTMLCanvasElement {
     return this.app.canvas;
   }
 
+  /** Returns whether the renderer has finished initialization */
   public get initialized(): boolean {
     return this.isInitialized;
   }
 
+  /**
+   * Updates the viewport pan and zoom.
+   * @param viewport - The new viewport state with x, y, and zoom
+   */
   public setViewport(viewport: Viewport): void {
     this.currentViewport = viewport;
     this.viewportContainer.position.set(viewport.x, viewport.y);
     this.viewportContainer.scale.set(viewport.zoom);
   }
 
+  /**
+   * Returns the current viewport state.
+   * @returns The current viewport with x, y, and zoom values
+   */
   public getViewport(): Viewport {
     return this.currentViewport;
   }
 
+  /**
+   * Main render function that updates all visual elements.
+   * Should be called whenever canvas data, selection, or collaborators change.
+   * @param objects - Array of design objects to render
+   * @param selectedIds - IDs of currently selected objects
+   * @param collaborators - Presence states of other collaborators
+   */
   public render(
     objects: DesignObject[],
     selectedIds: string[],
@@ -105,6 +142,10 @@ export class PixiRenderer {
     this.drawCursors(collaborators);
   }
 
+  /**
+   * Draws the background grid pattern.
+   * Grid density adjusts based on zoom level.
+   */
   private drawGrid(): void {
     const { zoom, x, y } = this.currentViewport;
     const width = this.app.screen.width;
@@ -132,6 +173,11 @@ export class PixiRenderer {
     this.gridGraphics.stroke();
   }
 
+  /**
+   * Synchronizes PixiJS display objects with the design object array.
+   * Creates, updates, or removes objects as needed.
+   * @param objects - The current array of design objects
+   */
   private syncObjects(objects: DesignObject[]): void {
     const currentIds = new Set(objects.map((obj) => obj.id));
 
@@ -173,6 +219,11 @@ export class PixiRenderer {
     });
   }
 
+  /**
+   * Draws collaborator cursors with names.
+   * Positions cursors in screen space.
+   * @param collaborators - Array of collaborator presence states
+   */
   private drawCursors(collaborators: PresenceState[]): void {
     // Clear existing cursors
     this.cursorContainer.removeChildren();
@@ -190,6 +241,12 @@ export class PixiRenderer {
     });
   }
 
+  /**
+   * Creates a cursor graphic with user color and name label.
+   * @param color - The user's assigned color
+   * @param name - The user's display name
+   * @returns A PixiJS container with the cursor graphic
+   */
   private createCursor(color: string, name: string): PIXI.Container {
     const container = new PIXI.Container();
     const colorNum = parseInt(color.replace('#', ''), 16);
@@ -227,6 +284,13 @@ export class PixiRenderer {
     return container;
   }
 
+  /**
+   * Converts screen (pixel) coordinates to canvas coordinates.
+   * Accounts for viewport pan and zoom.
+   * @param screenX - X position in screen pixels
+   * @param screenY - Y position in screen pixels
+   * @returns Canvas coordinates
+   */
   public screenToCanvas(screenX: number, screenY: number): { x: number; y: number } {
     const rect = this.app.canvas.getBoundingClientRect();
     return {
@@ -235,6 +299,13 @@ export class PixiRenderer {
     };
   }
 
+  /**
+   * Converts canvas coordinates to screen (pixel) coordinates.
+   * Accounts for viewport pan and zoom.
+   * @param canvasX - X position in canvas units
+   * @param canvasY - Y position in canvas units
+   * @returns Screen pixel coordinates
+   */
   public canvasToScreen(canvasX: number, canvasY: number): { x: number; y: number } {
     return {
       x: canvasX * this.currentViewport.zoom + this.currentViewport.x,
@@ -242,6 +313,14 @@ export class PixiRenderer {
     };
   }
 
+  /**
+   * Performs hit testing to find an object at the given canvas position.
+   * Searches in reverse z-order (top-most first).
+   * @param canvasX - X position in canvas units
+   * @param canvasY - Y position in canvas units
+   * @param objects - Array of objects to test against
+   * @returns The topmost visible, unlocked object at the point, or null
+   */
   public getObjectAtPoint(canvasX: number, canvasY: number, objects: DesignObject[]): DesignObject | null {
     // Search in reverse order (top-most first)
     for (let i = objects.length - 1; i >= 0; i--) {
@@ -261,12 +340,20 @@ export class PixiRenderer {
     return null;
   }
 
+  /**
+   * Resizes the renderer to fit its container.
+   * Should be called when the window or container size changes.
+   */
   public resize(): void {
     if (this.isInitialized) {
       this.app.resize();
     }
   }
 
+  /**
+   * Cleans up all resources and destroys the PixiJS application.
+   * Should be called when the component unmounts.
+   */
   public destroy(): void {
     this.objectMap.forEach((container) => {
       container.destroy({ children: true });

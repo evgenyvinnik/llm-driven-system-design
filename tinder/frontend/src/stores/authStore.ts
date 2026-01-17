@@ -3,13 +3,23 @@ import type { User } from '../types';
 import { authApi, userApi } from '../services/api';
 import { wsService } from '../services/websocket';
 
+/**
+ * Authentication store state and actions interface.
+ * Manages user session, login/register flows, and profile updates.
+ */
 interface AuthState {
+  /** Current authenticated user or null */
   user: User | null;
+  /** Whether an auth operation is in progress */
   isLoading: boolean;
+  /** Whether user is authenticated */
   isAuthenticated: boolean;
+  /** Error message from last failed operation */
   error: string | null;
 
+  /** Authenticates user with email/password */
   login: (email: string, password: string) => Promise<void>;
+  /** Registers a new user account */
   register: (data: {
     email: string;
     password: string;
@@ -18,8 +28,11 @@ interface AuthState {
     gender: string;
     bio?: string;
   }) => Promise<void>;
+  /** Logs out current user and disconnects WebSocket */
   logout: () => Promise<void>;
+  /** Checks if user has valid session on app load */
   checkAuth: () => Promise<void>;
+  /** Updates user profile fields */
   updateProfile: (data: {
     name?: string;
     bio?: string;
@@ -27,10 +40,17 @@ interface AuthState {
     company?: string;
     school?: string;
   }) => Promise<void>;
+  /** Updates user's geographic location */
   updateLocation: (latitude: number, longitude: number) => Promise<void>;
+  /** Clears error state */
   clearError: () => void;
 }
 
+/**
+ * Zustand store for authentication and user session management.
+ * Handles login, registration, logout, and session validation.
+ * Automatically connects/disconnects WebSocket on auth state changes.
+ */
 export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   isLoading: true,

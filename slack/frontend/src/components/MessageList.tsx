@@ -1,14 +1,33 @@
+/**
+ * @fileoverview Message list and composer component.
+ * Displays channel messages with reactions, threads, and edit/delete controls.
+ * Includes the message input for sending new messages.
+ */
+
 import { useState, useRef, useEffect } from 'react';
 import { messageApi } from '../services/api';
 import { useAuthStore, useChannelStore, useMessageStore, useUIStore } from '../stores';
 import { formatMessageTime, shouldShowDateDivider, formatDateDivider, groupReactions, getInitials } from '../utils';
 import type { Message } from '../types';
 
+/**
+ * Props for the MessageList component.
+ */
 interface MessageListProps {
+  /** The channel ID to display messages for */
   channelId: string;
+  /** Callback to send typing indicators */
   sendTyping?: () => void;
 }
 
+/**
+ * Message list component with input composer.
+ * Displays messages with threading, reactions, and edit/delete capabilities.
+ * Automatically scrolls to newest messages and shows typing indicators.
+ * @param props - Component props
+ * @param props.channelId - The channel to display messages for
+ * @param props.sendTyping - Function to call when user starts typing
+ */
 export function MessageList({ channelId, sendTyping }: MessageListProps) {
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);

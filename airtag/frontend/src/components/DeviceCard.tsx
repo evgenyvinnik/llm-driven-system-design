@@ -1,6 +1,12 @@
+/**
+ * Device card component for the device list.
+ * Displays device info, last location timestamp, and lost mode status.
+ */
+
 import { Device } from '../types';
 import { useStore } from '../stores/useStore';
 
+/** Emoji mapping for each device type */
 const deviceEmojis: Record<string, string> = {
   airtag: '&#9898;',
   iphone: '&#128241;',
@@ -15,6 +21,16 @@ interface DeviceCardProps {
   lastLocation?: { latitude: number; longitude: number; timestamp: string } | null;
 }
 
+/**
+ * Device card component.
+ * Shows device name, type, emoji, and last seen time.
+ * Highlights when selected and shows lost mode badge.
+ *
+ * @param device - The device to display
+ * @param isSelected - Whether this card is currently selected
+ * @param lastLocation - Most recent location data for this device
+ * @returns Clickable card for the device list
+ */
 export function DeviceCard({ device, isSelected, lastLocation }: DeviceCardProps) {
   const { selectDevice, lostModeSettings } = useStore();
   const lostMode = lostModeSettings[device.id];

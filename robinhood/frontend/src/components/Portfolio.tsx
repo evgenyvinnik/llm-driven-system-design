@@ -1,9 +1,18 @@
+/**
+ * Portfolio display components for showing account summary and holdings.
+ * Integrates with portfolio store and real-time quote updates.
+ */
+
 import { useEffect, useMemo } from 'react';
 import { Link } from '@tanstack/react-router';
 import { usePortfolioStore } from '../stores/portfolioStore';
 import { useQuoteStore } from '../stores/quoteStore';
 import { MiniChart } from './QuoteDisplay';
 
+/**
+ * Portfolio summary card showing total equity, gains/losses, and buying power.
+ * Refreshes data every 10 seconds to keep values current.
+ */
 export function PortfolioSummary() {
   const { portfolio, fetchPortfolio, isLoading } = usePortfolioStore();
 
@@ -68,6 +77,11 @@ export function PortfolioSummary() {
   );
 }
 
+/**
+ * Holdings list showing all stock positions with real-time prices.
+ * Subscribes to WebSocket updates for held symbols.
+ * Links to individual stock detail pages.
+ */
 export function HoldingsList() {
   const { portfolio } = usePortfolioStore();
   const { quotes, subscribe, unsubscribe } = useQuoteStore();

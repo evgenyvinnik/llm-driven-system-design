@@ -475,6 +475,415 @@ CREATE TABLE lost_mode (
 
 ---
 
+## Consistency and Idempotency Semantics
+
+### Write Semantics by Operation
+
+| Operation | Consistency | Idempotency | Rationale |
+|-----------|-------------|-------------|-----------|
+| Location Report | Eventual | Idempotent (dedupe by hash) | High volume, duplicates harmless |
+| Device Registration | Strong | Idempotent (upsert by device_id) | Critical user data |
+| Lost Mode Toggle | Strong | Idempotent (last-write-wins) | User expects immediate effect |
+| Anti-Stalking Alert | Eventual | At-least-once | Missing alert is worse than duplicate |
+
+### Location Report Handling
+
+Location reports are the highest-volume write operation. We use **eventual consistency** with idempotent processing:
+
+```javascript
+// Location reports use composite key for deduplication
+async function submitLocationReport(report) {
+  // Generate idempotency key from content hash
+  const idempotencyKey = crypto.createHash('sha256')
+    .update(report.identifierHash)
+    .update(report.timestamp.toString())
+    .update(report.encryptedPayload)
+    .digest('hex')
+    .slice(0, 32)
+
+  // Upsert with conflict handling
+  await db.query(`
+    INSERT INTO location_reports (id, identifier_hash, encrypted_payload, created_at)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (id) DO NOTHING  -- Ignore duplicate submissions
+  `, [idempotencyKey, report.identifierHash, report.encryptedPayload, new Date(report.timestamp)])
+}
+```
+
+### Replay and Conflict Resolution
+
+**Replay Handling:**
+- Reports older than 7 days are rejected at API gateway (prevents replay attacks)
+- Timestamp tolerance of +/- 5 minutes for clock drift
+- Duplicate detection window: 24 hours (reports with same idempotency key ignored)
+
+**Conflict Resolution Strategy:**
+- **Location Reports**: No conflict - duplicates are discarded, all unique reports are stored
+- **Device Registration**: Last-write-wins with `updated_at` timestamp; frontend shows optimistic update
+- **Lost Mode**: Last-write-wins; toggle operations include client timestamp for ordering
+
+```javascript
+// Lost mode uses optimistic locking with version check
+async function toggleLostMode(deviceId, enabled, clientVersion) {
+  const result = await db.query(`
+    UPDATE lost_mode
+    SET enabled = $1, enabled_at = NOW(), version = version + 1
+    WHERE device_id = $2 AND version = $3
+    RETURNING version
+  `, [enabled, deviceId, clientVersion])
+
+  if (result.rowCount === 0) {
+    throw new ConflictError('Lost mode was modified by another session')
+  }
+  return result.rows[0].version
+}
+```
+
+### Local Development Setup
+
+For local testing, run PostgreSQL with synchronous commits enabled (default) to observe strong consistency:
+
+```bash
+# Verify synchronous commits in psql
+SHOW synchronous_commit;  -- Should be 'on'
+
+# Test idempotency by submitting same report twice
+curl -X POST http://localhost:3001/api/v1/reports \
+  -H "Content-Type: application/json" \
+  -d '{"identifierHash":"abc123","encryptedPayload":"...","timestamp":1700000000000}'
+# Second identical request should return 200 but not create duplicate
+```
+
+---
+
+## Caching and Edge Strategy
+
+### Cache Architecture
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Mobile    │───▶│    CDN      │───▶│   Valkey    │───▶│ PostgreSQL  │
+│   Client    │    │  (Static)   │    │   (Cache)   │    │  (Source)   │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+```
+
+### Cache Layers
+
+| Layer | What's Cached | TTL | Strategy |
+|-------|---------------|-----|----------|
+| CDN | Static assets, map tiles | 24 hours | Cache-Control headers |
+| Valkey L1 | User's device list | 5 minutes | Cache-aside |
+| Valkey L2 | Location report lookups | 15 minutes | Cache-aside with write-through hint |
+| Local (client) | Recent locations | 1 minute | Stale-while-revalidate |
+
+### Cache-Aside Pattern (Primary)
+
+Used for device list and location queries where reads far exceed writes:
+
+```javascript
+class CacheAside {
+  constructor(redis, db) {
+    this.redis = redis
+    this.db = db
+  }
+
+  async getDeviceList(userId) {
+    const cacheKey = `devices:${userId}`
+
+    // 1. Check cache first
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      return JSON.parse(cached)
+    }
+
+    // 2. Cache miss - fetch from DB
+    const devices = await this.db.query(
+      'SELECT * FROM registered_devices WHERE user_id = $1',
+      [userId]
+    )
+
+    // 3. Populate cache with TTL
+    await this.redis.setex(cacheKey, 300, JSON.stringify(devices.rows)) // 5 min TTL
+
+    return devices.rows
+  }
+
+  // Invalidate on write
+  async registerDevice(userId, device) {
+    await this.db.query('INSERT INTO registered_devices ...', [userId, device])
+    await this.redis.del(`devices:${userId}`)  // Invalidate cache
+  }
+}
+```
+
+### Write-Through Pattern (Location Reports)
+
+For location reports, we use write-through to pre-warm the cache for owner queries:
+
+```javascript
+async function submitAndCacheReport(report) {
+  // 1. Write to database
+  await db.query('INSERT INTO location_reports ...', [report])
+
+  // 2. Append to cache (for owner's next query)
+  const cacheKey = `reports:${report.identifierHash}`
+  await redis.lpush(cacheKey, JSON.stringify(report))
+  await redis.ltrim(cacheKey, 0, 99)  // Keep last 100 reports
+  await redis.expire(cacheKey, 900)   // 15 min TTL (matches key rotation period)
+}
+```
+
+### Cache Invalidation Rules
+
+| Event | Invalidation Action |
+|-------|---------------------|
+| Device registered | Delete `devices:{userId}` |
+| Device removed | Delete `devices:{userId}` |
+| Lost mode toggled | Delete `lostmode:{deviceId}` |
+| Key rotation (15 min) | Reports cache expires naturally (TTL = 15 min) |
+| User logout | Delete all `*:{userId}` keys |
+
+### Local Development with Valkey
+
+```bash
+# Start Valkey via Docker
+docker run -d --name airtag-valkey -p 6379:6379 valkey/valkey:latest
+
+# Or via Homebrew
+brew install valkey && valkey-server
+
+# Monitor cache operations in real-time
+valkey-cli MONITOR
+
+# Check cache hit rates
+valkey-cli INFO stats | grep keyspace
+```
+
+### CDN Configuration (for Static Assets)
+
+In local development, simulate CDN behavior with Express static middleware:
+
+```javascript
+// Simulate CDN cache headers for static assets
+app.use('/static', express.static('public', {
+  maxAge: '1d',  // Cache-Control: max-age=86400
+  etag: true,
+  lastModified: true
+}))
+
+// Map tiles and images
+app.use('/tiles', express.static('tiles', {
+  maxAge: '7d',
+  immutable: true  // Cache-Control: immutable (content-addressed)
+}))
+```
+
+---
+
+## Async Queue Architecture (RabbitMQ)
+
+### Queue Topology
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           RabbitMQ                                       │
+│                                                                          │
+│  ┌─────────────┐    ┌─────────────────────────────────────────────────┐ │
+│  │  Exchange   │───▶│  location.reports (fanout to workers)           │ │
+│  │  (topic)    │    └─────────────────────────────────────────────────┘ │
+│  │             │    ┌─────────────────────────────────────────────────┐ │
+│  │             │───▶│  antistalk.analyze (stalking pattern check)     │ │
+│  │             │    └─────────────────────────────────────────────────┘ │
+│  │             │    ┌─────────────────────────────────────────────────┐ │
+│  │             │───▶│  notifications.push (alert delivery)            │ │
+│  │             │    └─────────────────────────────────────────────────┘ │
+│  │             │    ┌─────────────────────────────────────────────────┐ │
+│  │             │───▶│  reports.cleanup (TTL expiration)               │ │
+│  └─────────────┘    └─────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Queue Definitions
+
+| Queue | Purpose | Delivery | Backpressure |
+|-------|---------|----------|--------------|
+| `location.reports` | Store encrypted location blobs | At-least-once | Prefetch = 100 |
+| `antistalk.analyze` | Detect stalking patterns | At-least-once | Prefetch = 10 |
+| `notifications.push` | Send alerts to users | At-least-once with retry | Prefetch = 50 |
+| `reports.cleanup` | Expire old reports (7 days) | At-most-once | Prefetch = 1000 |
+
+### Producer: Location Report Ingestion
+
+```javascript
+const amqp = require('amqplib')
+
+class ReportProducer {
+  async connect() {
+    this.connection = await amqp.connect('amqp://guest:guest@localhost:5672')
+    this.channel = await this.connection.createChannel()
+
+    // Declare exchange and queues
+    await this.channel.assertExchange('airtag.events', 'topic', { durable: true })
+    await this.channel.assertQueue('location.reports', {
+      durable: true,
+      arguments: {
+        'x-message-ttl': 7 * 24 * 60 * 60 * 1000,  // 7 days
+        'x-max-length': 1000000  // Backpressure: max 1M messages
+      }
+    })
+    await this.channel.bindQueue('location.reports', 'airtag.events', 'report.location.*')
+  }
+
+  async publishReport(report) {
+    const message = Buffer.from(JSON.stringify(report))
+
+    // Publish with persistence
+    this.channel.publish('airtag.events', 'report.location.new', message, {
+      persistent: true,
+      messageId: report.idempotencyKey,  // For deduplication
+      timestamp: Date.now()
+    })
+  }
+}
+```
+
+### Consumer: Anti-Stalking Analysis (Background Job)
+
+```javascript
+class AntiStalkConsumer {
+  async start() {
+    const connection = await amqp.connect('amqp://guest:guest@localhost:5672')
+    const channel = await connection.createChannel()
+
+    // Backpressure: only process 10 messages at a time
+    await channel.prefetch(10)
+
+    await channel.assertQueue('antistalk.analyze', { durable: true })
+    await channel.bindQueue('antistalk.analyze', 'airtag.events', 'report.location.*')
+
+    channel.consume('antistalk.analyze', async (msg) => {
+      try {
+        const report = JSON.parse(msg.content.toString())
+        await this.analyzeForStalking(report)
+        channel.ack(msg)  // Acknowledge success
+      } catch (err) {
+        console.error('Analysis failed:', err)
+        // Requeue with delay for retry (dead letter after 3 attempts)
+        if (msg.fields.redelivered) {
+          channel.nack(msg, false, false)  // Dead letter
+        } else {
+          channel.nack(msg, false, true)   // Requeue
+        }
+      }
+    })
+  }
+
+  async analyzeForStalking(report) {
+    // Fetch recent sightings for this identifier
+    const sightings = await db.query(`
+      SELECT * FROM location_reports
+      WHERE identifier_hash = $1
+      AND created_at > NOW() - INTERVAL '3 hours'
+      ORDER BY created_at
+    `, [report.identifierHash])
+
+    // Run pattern detection (see AntiStalkingService above)
+    if (this.detectStalkingPattern(sightings.rows)) {
+      await this.publishAlert(report.identifierHash, sightings.rows)
+    }
+  }
+
+  async publishAlert(identifierHash, sightings) {
+    // Queue notification for delivery
+    this.channel.publish('airtag.events', 'alert.stalking', Buffer.from(JSON.stringify({
+      identifierHash,
+      sightingCount: sightings.length,
+      firstSeen: sightings[0].created_at,
+      lastSeen: sightings[sightings.length - 1].created_at
+    })), { persistent: true })
+  }
+}
+```
+
+### Backpressure and Flow Control
+
+```javascript
+// Monitor queue depth and apply backpressure at API layer
+async function checkBackpressure() {
+  const queueInfo = await channel.checkQueue('location.reports')
+
+  if (queueInfo.messageCount > 500000) {
+    // Shed load: reject new reports temporarily
+    console.warn('Queue depth high, applying backpressure')
+    return { accept: false, retryAfter: 60 }
+  }
+
+  if (queueInfo.messageCount > 100000) {
+    // Slow down: add artificial delay
+    console.warn('Queue depth elevated, slowing intake')
+    return { accept: true, delay: 100 }
+  }
+
+  return { accept: true, delay: 0 }
+}
+```
+
+### Delivery Semantics Summary
+
+| Queue | Semantics | Handling |
+|-------|-----------|----------|
+| `location.reports` | At-least-once | Idempotent writes (ON CONFLICT DO NOTHING) |
+| `antistalk.analyze` | At-least-once | Idempotent analysis (stateless check) |
+| `notifications.push` | At-least-once | Dedupe in push service (1 hour window) |
+| `reports.cleanup` | At-most-once | Acceptable to miss some (cron backup) |
+
+### Local Development Setup
+
+```bash
+# Start RabbitMQ via Docker
+docker run -d --name airtag-rabbitmq \
+  -p 5672:5672 -p 15672:15672 \
+  rabbitmq:3-management
+
+# Or via Homebrew
+brew install rabbitmq && brew services start rabbitmq
+
+# Access management UI
+open http://localhost:15672  # guest/guest
+
+# Monitor queues from CLI
+rabbitmqctl list_queues name messages consumers
+```
+
+### docker-compose.yml Addition
+
+```yaml
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  valkey:
+    image: valkey/valkey:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+
+volumes:
+  rabbitmq_data:
+  valkey_data:
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |

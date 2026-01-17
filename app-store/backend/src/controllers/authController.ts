@@ -1,6 +1,15 @@
+/**
+ * @fileoverview Authentication controller for user management.
+ * Handles registration, login, logout, and profile management.
+ */
+
 import { Request, Response } from 'express';
 import { authService } from '../services/authService.js';
 
+/**
+ * Registers a new user account.
+ * POST /api/v1/auth/register
+ */
 export async function register(req: Request, res: Response): Promise<void> {
   const { email, password, username, displayName } = req.body;
 
@@ -33,6 +42,10 @@ export async function register(req: Request, res: Response): Promise<void> {
   });
 }
 
+/**
+ * Authenticates a user and creates a session.
+ * POST /api/v1/auth/login
+ */
 export async function login(req: Request, res: Response): Promise<void> {
   const { email, password } = req.body;
 
@@ -55,6 +68,10 @@ export async function login(req: Request, res: Response): Promise<void> {
   });
 }
 
+/**
+ * Logs out the current user by invalidating their session.
+ * POST /api/v1/auth/logout
+ */
 export async function logout(req: Request, res: Response): Promise<void> {
   if (req.sessionId) {
     await authService.logout(req.sessionId);
@@ -64,10 +81,20 @@ export async function logout(req: Request, res: Response): Promise<void> {
   res.json({ success: true });
 }
 
+/**
+ * Returns the current authenticated user's profile.
+ * GET /api/v1/auth/me
+ * Requires authentication.
+ */
 export async function me(req: Request, res: Response): Promise<void> {
   res.json({ data: req.user });
 }
 
+/**
+ * Updates the current user's profile.
+ * PUT /api/v1/auth/profile
+ * Requires authentication.
+ */
 export async function updateProfile(req: Request, res: Response): Promise<void> {
   const { displayName, avatarUrl } = req.body;
 
@@ -79,6 +106,11 @@ export async function updateProfile(req: Request, res: Response): Promise<void> 
   res.json({ data: user });
 }
 
+/**
+ * Changes the current user's password.
+ * PUT /api/v1/auth/password
+ * Requires authentication.
+ */
 export async function changePassword(req: Request, res: Response): Promise<void> {
   const { currentPassword, newPassword } = req.body;
 
@@ -96,6 +128,11 @@ export async function changePassword(req: Request, res: Response): Promise<void>
   res.json({ success: true });
 }
 
+/**
+ * Upgrades a user account to developer status.
+ * POST /api/v1/auth/developer
+ * Requires authentication.
+ */
 export async function becomeDeveloper(req: Request, res: Response): Promise<void> {
   const { name, email, website, description } = req.body;
 

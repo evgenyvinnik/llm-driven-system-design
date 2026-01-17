@@ -1,11 +1,47 @@
+/**
+ * @fileoverview Admin route component for crawler administration.
+ *
+ * The Admin panel provides administrative controls for the web crawler:
+ * - Add seed URLs to start crawling new sites
+ * - Recover stale URLs stuck in "in_progress" state
+ * - Reset statistics counters
+ * - Clear the entire URL frontier (danger zone)
+ * - Check system health (database and Redis connectivity)
+ *
+ * This page is intended for operators who need to manage crawler behavior
+ * and recover from error conditions.
+ *
+ * @module routes/Admin
+ */
+
 import { useState } from 'react';
 import { api } from '../services/api';
 
+/**
+ * Admin route component for crawler administration tasks.
+ *
+ * Provides four main sections:
+ * 1. Seed URLs - Add high-priority URLs to start crawling new domains
+ * 2. Recovery Actions - Recover stale URLs that got stuck
+ * 3. Statistics - Reset crawl counters
+ * 4. Danger Zone - Destructive operations like clearing the frontier
+ *
+ * All actions show loading state and result feedback.
+ *
+ * @returns Admin panel with crawler management controls
+ */
 export function Admin() {
   const [loading, setLoading] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [seedUrls, setSeedUrls] = useState('');
 
+  /**
+   * Generic action handler with loading state and result feedback.
+   * Wraps any async action with consistent error handling.
+   *
+   * @param action - Identifier for the action (used for loading state)
+   * @param fn - Async function to execute
+   */
   const handleAction = async (action: string, fn: () => Promise<unknown>) => {
     setLoading(action);
     setResult(null);
@@ -19,6 +55,11 @@ export function Admin() {
     }
   };
 
+  /**
+   * Handles adding seed URLs from the textarea.
+   * Parses the textarea content, filters valid URLs, and submits to API.
+   * Seed URLs are added with high priority (3) by default.
+   */
   const handleAddSeeds = async () => {
     const urls = seedUrls
       .split('\n')

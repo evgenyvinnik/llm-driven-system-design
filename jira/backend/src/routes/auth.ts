@@ -2,9 +2,16 @@ import { Router } from 'express';
 import { verifyPassword, createUser, getUserById, updateUser, searchUsers, getAllUsers } from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Authentication and user management routes.
+ * Handles login/logout, registration, and user profile operations.
+ */
 const router = Router();
 
-// Login
+/**
+ * POST /login
+ * Authenticates a user with email and password, creates a session.
+ */
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -26,7 +33,10 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Logout
+/**
+ * POST /logout
+ * Destroys the current session and clears the session cookie.
+ */
 router.post('/logout', (req, res) => {
   req.session.destroy((err) => {
     if (err) {
@@ -37,7 +47,10 @@ router.post('/logout', (req, res) => {
   });
 });
 
-// Register
+/**
+ * POST /register
+ * Creates a new user account and automatically logs them in.
+ */
 router.post('/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
@@ -58,12 +71,18 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// Get current user
+/**
+ * GET /me
+ * Returns the currently authenticated user's profile.
+ */
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
 
-// Update current user
+/**
+ * PATCH /me
+ * Updates the current user's profile (name, avatar_url).
+ */
 router.patch('/me', requireAuth, async (req, res) => {
   try {
     const { name, avatar_url } = req.body;
@@ -75,7 +94,10 @@ router.patch('/me', requireAuth, async (req, res) => {
   }
 });
 
-// Search users
+/**
+ * GET /search
+ * Searches users by name or email for autocomplete.
+ */
 router.get('/search', requireAuth, async (req, res) => {
   try {
     const { q, limit } = req.query;
@@ -90,7 +112,10 @@ router.get('/search', requireAuth, async (req, res) => {
   }
 });
 
-// Get all users (for dropdowns)
+/**
+ * GET /
+ * Returns all users for dropdown menus.
+ */
 router.get('/', requireAuth, async (req, res) => {
   try {
     const users = await getAllUsers();
@@ -101,7 +126,10 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// Get user by ID
+/**
+ * GET /:id
+ * Returns a specific user by ID.
+ */
 router.get('/:id', requireAuth, async (req, res) => {
   try {
     const user = await getUserById(req.params.id);

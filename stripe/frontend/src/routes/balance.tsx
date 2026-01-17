@@ -1,3 +1,13 @@
+/**
+ * Balance Route
+ *
+ * Balance overview page showing the merchant's account balance,
+ * transaction history, and financial summary statistics.
+ * Provides insight into available funds, fees paid, and refunds.
+ *
+ * @module routes/balance
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { getBalance, getBalanceSummary, listBalanceTransactions } from '@/services/api';
@@ -5,10 +15,20 @@ import { formatCurrency, formatDate } from '@/utils';
 import { StatusBadge } from '@/components';
 import type { Balance, BalanceSummary, BalanceTransaction } from '@/types';
 
+/**
+ * Route definition for the balance page (/balance).
+ */
 export const Route = createFileRoute('/balance')({
   component: BalancePage,
 });
 
+/**
+ * Balance page component.
+ * Displays current balance, financial summary, and a list of
+ * all balance transactions (charges and refunds).
+ *
+ * @returns The balance overview page
+ */
 function BalancePage() {
   const [balance, setBalance] = useState<Balance | null>(null);
   const [summary, setSummary] = useState<BalanceSummary | null>(null);
@@ -20,6 +40,9 @@ function BalancePage() {
     loadData();
   }, []);
 
+  /**
+   * Fetches balance, summary, and transaction data in parallel.
+   */
   async function loadData() {
     try {
       setLoading(true);

@@ -3,8 +3,13 @@ import { tokenizationService } from '../services/tokenization.js';
 import { AuthenticatedRequest, authMiddleware } from '../middleware/auth.js';
 import { z } from 'zod';
 
+/**
+ * Express router for payment card management endpoints.
+ * Handles card provisioning, retrieval, suspension, and removal.
+ */
 const router = Router();
 
+/** Zod schema for card provisioning request validation */
 const provisionCardSchema = z.object({
   pan: z.string().regex(/^\d{13,19}$/),
   expiry_month: z.number().min(1).max(12),
@@ -14,7 +19,11 @@ const provisionCardSchema = z.object({
   device_id: z.string().uuid(),
 });
 
-// Get all cards
+/**
+ * GET /api/cards
+ * Lists all provisioned cards for the authenticated user.
+ * Returns sanitized card data (no sensitive token information).
+ */
 router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const cards = await tokenizationService.getCards(req.userId!);
@@ -42,6 +51,11 @@ router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response)
 });
 
 // Provision a new card
+/**
+ * POST /api/cards
+ * Provisions a new payment card to a user's device.
+ * Tokenizes the card and stores it in the simulated Secure Element.
+ */
 router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const data = provisionCardSchema.parse(req.body);
@@ -62,6 +76,10 @@ router.post('/', authMiddleware, async (req: AuthenticatedRequest, res: Response
 });
 
 // Get a specific card
+/**
+ * GET /api/cards/:cardId
+ * Retrieves details of a specific card by ID.
+ */
 router.get('/:cardId', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const card = await tokenizationService.getCard(req.userId!, req.params.cardId);
@@ -93,6 +111,10 @@ router.get('/:cardId', authMiddleware, async (req: AuthenticatedRequest, res: Re
 });
 
 // Suspend a card
+/**
+ * POST /api/cards/:cardId/suspend
+ * Temporarily suspends a card, preventing transactions.
+ */
 router.post('/:cardId/suspend', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const reason = req.body.reason || 'user_request';
@@ -110,6 +132,10 @@ router.post('/:cardId/suspend', authMiddleware, async (req: AuthenticatedRequest
 });
 
 // Reactivate a card
+/**
+ * POST /api/cards/:cardId/reactivate
+ * Reactivates a previously suspended card.
+ */
 router.post('/:cardId/reactivate', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await tokenizationService.reactivateCard(req.userId!, req.params.cardId);
@@ -126,6 +152,10 @@ router.post('/:cardId/reactivate', authMiddleware, async (req: AuthenticatedRequ
 });
 
 // Remove a card
+/**
+ * DELETE /api/cards/:cardId
+ * Permanently removes a card from the user's wallet.
+ */
 router.delete('/:cardId', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await tokenizationService.removeCard(req.userId!, req.params.cardId);
@@ -142,6 +172,10 @@ router.delete('/:cardId', authMiddleware, async (req: AuthenticatedRequest, res:
 });
 
 // Set default card
+/**
+ * POST /api/cards/:cardId/default
+ * Sets a card as the user's default payment method.
+ */
 router.post('/:cardId/default', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await tokenizationService.setDefaultCard(req.userId!, req.params.cardId);

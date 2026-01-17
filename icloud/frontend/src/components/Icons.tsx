@@ -1,10 +1,26 @@
 import React from 'react';
 
+/**
+ * Props for the FileIcon component.
+ */
 interface FileIconProps {
+  /** Type of icon to display based on file type */
   type: 'folder' | 'file' | 'image' | 'video' | 'audio' | 'pdf' | 'doc' | 'spreadsheet' | 'presentation' | 'archive' | 'text';
+  /** Optional CSS class for sizing (defaults to 'w-6 h-6') */
   className?: string;
 }
 
+/**
+ * Renders an SVG icon for a file type.
+ *
+ * Provides visual identification for different file types in the file browser.
+ * Each icon is an inline SVG for crisp rendering at any size.
+ *
+ * @param props - Component props
+ * @param props.type - The file type to render an icon for
+ * @param props.className - Optional CSS class for sizing
+ * @returns SVG icon element
+ */
 export const FileIcon: React.FC<FileIconProps> = ({ type, className = 'w-6 h-6' }) => {
   const icons: Record<string, React.ReactNode> = {
     folder: (
@@ -67,11 +83,28 @@ export const FileIcon: React.FC<FileIconProps> = ({ type, className = 'w-6 h-6' 
   return <>{icons[type] || icons.file}</>;
 };
 
+/**
+ * Props for the SyncStatusIcon component.
+ */
 interface SyncStatusIconProps {
+  /** Current sync status to display */
   status: 'synced' | 'syncing' | 'pending' | 'conflict' | 'error';
+  /** Optional CSS class for sizing (defaults to 'w-4 h-4') */
   className?: string;
 }
 
+/**
+ * Renders an icon indicating a file's sync status.
+ *
+ * Provides visual feedback about whether a file is synced, syncing,
+ * pending, has a conflict, or encountered an error. Uses color coding
+ * and animations (spinning for syncing) for quick recognition.
+ *
+ * @param props - Component props
+ * @param props.status - The sync status to display
+ * @param props.className - Optional CSS class for sizing
+ * @returns Colored SVG icon or null for invalid status
+ */
 export const SyncStatusIcon: React.FC<SyncStatusIconProps> = ({ status, className = 'w-4 h-4' }) => {
   switch (status) {
     case 'synced':
@@ -110,10 +143,24 @@ export const SyncStatusIcon: React.FC<SyncStatusIconProps> = ({ status, classNam
   }
 };
 
+/**
+ * Props for the CloudIcon component.
+ */
 interface CloudIconProps {
+  /** Optional CSS class for sizing (defaults to 'w-8 h-8') */
   className?: string;
 }
 
+/**
+ * Renders the iCloud brand cloud icon.
+ *
+ * Uses a gradient fill matching the Apple iCloud branding.
+ * Used in the header and login/register pages.
+ *
+ * @param props - Component props
+ * @param props.className - Optional CSS class for sizing
+ * @returns SVG cloud icon with gradient fill
+ */
 export const CloudIcon: React.FC<CloudIconProps> = ({ className = 'w-8 h-8' }) => (
   <svg className={className} viewBox="0 0 50 50" fill="none">
     <defs>

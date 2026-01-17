@@ -5,12 +5,21 @@ import { MessageService } from '../services/messageService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { pool } from '../db/index.js';
 
+/**
+ * Discovery and swiping routes.
+ * Handles the core matching experience: deck generation, profile viewing, and swipe processing.
+ * All routes require authentication.
+ */
 const router = Router();
 const discoveryService = new DiscoveryService();
 const matchService = new MatchService();
 const messageService = new MessageService();
 
-// Get discovery deck
+/**
+ * GET /api/discovery/deck
+ * Returns a ranked deck of potential matches based on user preferences and location.
+ * Excludes already-swiped users and applies bidirectional preference matching.
+ */
 router.get('/deck', requireAuth, async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 50);
@@ -22,7 +31,10 @@ router.get('/deck', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get specific profile card
+/**
+ * GET /api/discovery/profile/:userId
+ * Returns a single profile card with distance calculated from requesting user.
+ */
 router.get('/profile/:userId', requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
@@ -40,7 +52,12 @@ router.get('/profile/:userId', requireAuth, async (req: Request, res: Response) 
   }
 });
 
-// Swipe on a user
+/**
+ * POST /api/discovery/swipe
+ * Records a swipe action (like/pass) and checks for mutual match.
+ * Returns match data if both users have liked each other.
+ * Publishes real-time notification to matched user via WebSocket.
+ */
 router.post('/swipe', requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId, direction } = req.body;
@@ -101,7 +118,11 @@ router.post('/swipe', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get users who liked you (premium feature - simplified for demo)
+/**
+ * GET /api/discovery/likes
+ * Returns users who have liked the authenticated user but haven't been swiped on yet.
+ * This is typically a premium feature in dating apps.
+ */
 router.get('/likes', requireAuth, async (req: Request, res: Response) => {
   try {
     const result = await pool.query(

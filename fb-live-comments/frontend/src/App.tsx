@@ -1,3 +1,13 @@
+/**
+ * Main Application Component
+ *
+ * Root component that orchestrates the live comments demo interface.
+ * Handles initial data loading, user/stream selection, and layout.
+ * Connects WebSocket when a user and stream are selected.
+ *
+ * @module App
+ */
+
 import { useEffect, useState } from 'react';
 import { useAppStore } from './stores/appStore';
 import { useWebSocket } from './hooks/useWebSocket';
@@ -12,6 +22,12 @@ import { StreamList } from './components/StreamList';
 import { UserSelector } from './components/UserSelector';
 import { User, Stream } from './types';
 
+/**
+ * Main application component.
+ * Renders the complete live comments demo with sidebar, video player, and chat.
+ *
+ * @returns The root application JSX
+ */
 function App() {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);

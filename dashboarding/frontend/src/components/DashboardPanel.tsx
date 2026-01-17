@@ -1,15 +1,38 @@
+/**
+ * @fileoverview Dashboard panel wrapper component.
+ *
+ * Provides a consistent card layout for all panel types and delegates
+ * rendering to the appropriate visualization component based on panel_type.
+ */
+
 import type { Panel } from '../types';
 import { TimeRange } from '../types';
 import { PanelChart } from './PanelChart';
 import { StatPanel } from './StatPanel';
 import { GaugePanel } from './GaugePanel';
 
+/**
+ * Props for the DashboardPanel component.
+ */
 interface DashboardPanelProps {
+  /** The panel configuration */
   panel: Panel;
+  /** ID of the parent dashboard */
   dashboardId: string;
+  /** Selected time range for data queries */
   timeRange: TimeRange;
 }
 
+/**
+ * Renders a dashboard panel with header and appropriate visualization.
+ *
+ * This component serves as a router that selects the correct visualization
+ * component (chart, stat, gauge, table) based on the panel's type property.
+ * All panels share a consistent card layout with title and metric name.
+ *
+ * @param props - Component props
+ * @returns The rendered panel card with visualization
+ */
 export function DashboardPanel({ panel, dashboardId, timeRange }: DashboardPanelProps) {
   const renderContent = () => {
     switch (panel.panel_type) {

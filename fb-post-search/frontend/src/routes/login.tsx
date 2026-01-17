@@ -1,7 +1,16 @@
+/**
+ * @fileoverview Login page route.
+ * Provides user authentication form.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Login form component.
+ * Handles username/password authentication and redirects on success.
+ */
 function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -89,6 +98,9 @@ function LoginPage() {
   );
 }
 
+/**
+ * TanStack Router file route for the login page.
+ */
 export const Route = createFileRoute('/login')({
   component: LoginPage,
 });

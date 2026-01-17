@@ -1,3 +1,9 @@
+/**
+ * Home page route (/).
+ * Displays portfolio summary, holdings, and recent activity.
+ * Requires authentication - redirects to login if not authenticated.
+ */
+
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
@@ -5,6 +11,7 @@ import { useQuoteStore } from '../stores/quoteStore';
 import { PortfolioSummary, HoldingsList } from '../components/Portfolio';
 import { usePortfolioStore } from '../stores/portfolioStore';
 
+/** Route definition with auth guard */
 export const Route = createFileRoute('/')({
   beforeLoad: () => {
     const { isAuthenticated } = useAuthStore.getState();
@@ -15,6 +22,10 @@ export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Main home page component.
+ * Shows portfolio, holdings, and recent order activity.
+ */
 function HomePage() {
   const { initializeConnection } = useQuoteStore();
   const { fetchWatchlists } = usePortfolioStore();
@@ -40,6 +51,10 @@ function HomePage() {
   );
 }
 
+/**
+ * Recent activity component showing the latest orders.
+ * Displays order status, symbol, quantity, and fill price.
+ */
 function RecentActivity() {
   const { orders, fetchOrders } = usePortfolioStore();
 

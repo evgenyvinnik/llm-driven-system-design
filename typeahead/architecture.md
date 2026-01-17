@@ -615,3 +615,1160 @@ CREATE TABLE filtered_phrases (
 | Storage | Pre-computed top-k | On-demand traversal | Latency |
 | Freshness | Short cache + trending | Real-time | Performance |
 | Sharding | By first char | By hash | Prefix locality |
+
+---
+
+## Consistency and Idempotency Semantics
+
+### Write Consistency Model
+
+The typeahead system uses **eventual consistency** for most operations, which is appropriate given the read-heavy workload and latency requirements.
+
+**Write Categories:**
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Query log ingestion | Eventual | Loss of a few queries is acceptable; high throughput matters |
+| Phrase count updates | Eventual | Aggregated counts tolerate minor drift |
+| Trending score updates | Eventual | Real-time approximation is sufficient |
+| Filter list updates | Strong | Inappropriate content must be blocked immediately |
+| User history updates | Eventual | Personalization can lag slightly |
+
+**Phrase Count Aggregation:**
+```javascript
+// Aggregation uses last-write-wins with timestamp ordering
+class PhraseCountAggregator {
+  async updateCount(phrase, deltaCount, timestamp) {
+    // Upsert with conflict resolution on timestamp
+    await db.query(`
+      INSERT INTO phrase_counts (phrase, count, last_updated)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (phrase) DO UPDATE
+      SET count = phrase_counts.count + EXCLUDED.count,
+          last_updated = GREATEST(phrase_counts.last_updated, EXCLUDED.last_updated)
+    `, [phrase, deltaCount, timestamp])
+  }
+}
+```
+
+### Idempotency for Core Writes
+
+**Query Log Ingestion:**
+Each query log message includes an idempotency key to prevent duplicate processing:
+
+```javascript
+// Message structure from Kafka
+{
+  idempotencyKey: "user123_1704067200000_abc123",  // userId_timestamp_randomSuffix
+  query: "weather forecast",
+  userId: "user123",
+  timestamp: 1704067200000,
+  sessionId: "session456"
+}
+
+class IdempotentAggregator {
+  constructor() {
+    // In-memory set for recent keys (last 5 minutes)
+    this.processedKeys = new Set()
+    this.keyExpiry = 300000  // 5 minutes
+  }
+
+  async processQuery(message) {
+    const { idempotencyKey } = message
+
+    // Check in-memory first (fast path)
+    if (this.processedKeys.has(idempotencyKey)) {
+      return { status: 'duplicate', processed: false }
+    }
+
+    // Check Redis for distributed deduplication
+    const exists = await redis.setnx(`idem:${idempotencyKey}`, '1')
+    if (!exists) {
+      return { status: 'duplicate', processed: false }
+    }
+
+    // Set expiry on the idempotency key
+    await redis.expire(`idem:${idempotencyKey}`, 300)
+
+    // Add to local cache
+    this.processedKeys.add(idempotencyKey)
+    setTimeout(() => this.processedKeys.delete(idempotencyKey), this.keyExpiry)
+
+    // Process the query
+    await this.doProcessQuery(message)
+    return { status: 'processed', processed: true }
+  }
+}
+```
+
+**Trie Update Idempotency:**
+Trie updates are idempotent by design since they use absolute counts rather than deltas:
+
+```javascript
+// Trie rebuild uses snapshot isolation
+class TrieRebuilder {
+  async rebuildFromSnapshot(snapshotId) {
+    // Check if this snapshot was already applied
+    const lastApplied = await redis.get('trie:last_snapshot')
+    if (lastApplied === snapshotId) {
+      console.log(`Snapshot ${snapshotId} already applied, skipping`)
+      return
+    }
+
+    // Build new trie from phrase_counts table
+    const phrases = await db.query(`
+      SELECT phrase, count FROM phrase_counts
+      WHERE is_filtered = FALSE
+      ORDER BY count DESC
+    `)
+
+    const newTrie = new Trie()
+    for (const { phrase, count } of phrases.rows) {
+      newTrie.insert(phrase, count)
+    }
+
+    // Atomic swap
+    this.trie = newTrie
+    await redis.set('trie:last_snapshot', snapshotId)
+  }
+}
+```
+
+### Replay Handling
+
+**Kafka Consumer Replay:**
+When a consumer restarts or replays from an earlier offset:
+
+```javascript
+class ReplayAwareConsumer {
+  constructor() {
+    this.highWaterMark = new Map()  // partition -> highest processed offset
+  }
+
+  async processMessage(message, partition, offset) {
+    // Skip if we have already processed a higher offset for this partition
+    const hwm = this.highWaterMark.get(partition) || -1
+    if (offset <= hwm) {
+      console.log(`Skipping replay: partition=${partition}, offset=${offset}, hwm=${hwm}`)
+      return
+    }
+
+    // Process with idempotency key
+    const result = await this.idempotentAggregator.processQuery(message)
+
+    // Update high water mark
+    if (result.processed) {
+      this.highWaterMark.set(partition, offset)
+      // Checkpoint periodically
+      if (offset % 1000 === 0) {
+        await this.checkpointOffsets()
+      }
+    }
+  }
+}
+```
+
+### Conflict Resolution
+
+**Concurrent Trie Updates:**
+When multiple aggregation workers update the same phrase:
+
+```javascript
+// Redis-based atomic counter updates
+class DistributedCounter {
+  async incrementPhrase(phrase, delta) {
+    // Atomic increment in Redis
+    const newCount = await redis.incrby(`phrase:${phrase}:count`, delta)
+
+    // Batch persist to PostgreSQL every 30 seconds (handled by separate job)
+    return newCount
+  }
+}
+
+// PostgreSQL conflict resolution uses SUM for counts
+class BatchPersister {
+  async persistCounts() {
+    const keys = await redis.keys('phrase:*:count')
+    const batch = []
+
+    for (const key of keys) {
+      const phrase = key.split(':')[1]
+      const count = await redis.getdel(key)  // Atomic get-and-delete
+      if (count) {
+        batch.push({ phrase, count: parseInt(count) })
+      }
+    }
+
+    // Upsert batch
+    await db.query(`
+      INSERT INTO phrase_counts (phrase, count, last_updated)
+      SELECT phrase, count, NOW() FROM UNNEST($1::phrase_count[])
+      ON CONFLICT (phrase) DO UPDATE
+      SET count = phrase_counts.count + EXCLUDED.count,
+          last_updated = NOW()
+    `, [batch])
+  }
+}
+```
+
+---
+
+## Observability
+
+### Metrics
+
+**Key Metrics to Instrument (Prometheus format):**
+
+```javascript
+// metrics.js - Using prom-client for Node.js
+const promClient = require('prom-client')
+
+// Request latency histogram
+const suggestionLatency = new promClient.Histogram({
+  name: 'typeahead_suggestion_latency_seconds',
+  help: 'Latency of suggestion requests',
+  labelNames: ['endpoint', 'cache_hit'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]  // 5ms to 500ms
+})
+
+// Request counter
+const suggestionRequests = new promClient.Counter({
+  name: 'typeahead_suggestion_requests_total',
+  help: 'Total suggestion requests',
+  labelNames: ['endpoint', 'status']
+})
+
+// Cache metrics
+const cacheHitRate = new promClient.Gauge({
+  name: 'typeahead_cache_hit_rate',
+  help: 'Cache hit rate (0-1)',
+  labelNames: ['cache_type']  // redis, local
+})
+
+// Trie metrics
+const trieNodeCount = new promClient.Gauge({
+  name: 'typeahead_trie_node_count',
+  help: 'Number of nodes in trie',
+  labelNames: ['shard_id']
+})
+
+const triePhraseCount = new promClient.Gauge({
+  name: 'typeahead_trie_phrase_count',
+  help: 'Number of phrases in trie',
+  labelNames: ['shard_id']
+})
+
+// Aggregation pipeline metrics
+const kafkaLag = new promClient.Gauge({
+  name: 'typeahead_kafka_consumer_lag',
+  help: 'Kafka consumer lag (messages behind)',
+  labelNames: ['partition']
+})
+
+const aggregationBufferSize = new promClient.Gauge({
+  name: 'typeahead_aggregation_buffer_size',
+  help: 'Current size of aggregation buffer'
+})
+
+const queriesFiltered = new promClient.Counter({
+  name: 'typeahead_queries_filtered_total',
+  help: 'Queries filtered out',
+  labelNames: ['reason']  // inappropriate, low_quality, duplicate
+})
+
+// Example usage in suggestion endpoint
+app.get('/api/v1/suggestions', async (req, res) => {
+  const timer = suggestionLatency.startTimer()
+  const prefix = req.query.q
+
+  try {
+    const cacheKey = `suggestions:${prefix}`
+    let cached = await redis.get(cacheKey)
+    let cacheHit = !!cached
+
+    let suggestions
+    if (cached) {
+      suggestions = JSON.parse(cached)
+    } else {
+      suggestions = await suggestionService.getSuggestions(prefix, req.userId)
+      await redis.setex(cacheKey, 60, JSON.stringify(suggestions))
+    }
+
+    timer({ endpoint: 'suggestions', cache_hit: cacheHit })
+    suggestionRequests.inc({ endpoint: 'suggestions', status: 'success' })
+
+    res.json({ suggestions })
+  } catch (error) {
+    timer({ endpoint: 'suggestions', cache_hit: 'false' })
+    suggestionRequests.inc({ endpoint: 'suggestions', status: 'error' })
+    res.status(500).json({ error: 'Internal error' })
+  }
+})
+```
+
+### SLI Dashboard Configuration
+
+**Grafana Dashboard Panels:**
+
+```yaml
+# grafana-dashboard.yaml
+panels:
+  - title: "Request Latency (P50, P95, P99)"
+    type: graph
+    queries:
+      - expr: histogram_quantile(0.50, rate(typeahead_suggestion_latency_seconds_bucket[5m]))
+        legend: P50
+      - expr: histogram_quantile(0.95, rate(typeahead_suggestion_latency_seconds_bucket[5m]))
+        legend: P95
+      - expr: histogram_quantile(0.99, rate(typeahead_suggestion_latency_seconds_bucket[5m]))
+        legend: P99
+    thresholds:
+      - value: 0.05  # 50ms SLO
+        color: red
+
+  - title: "Request Rate"
+    type: graph
+    queries:
+      - expr: rate(typeahead_suggestion_requests_total[1m])
+        legend: "{{status}}"
+
+  - title: "Cache Hit Rate"
+    type: gauge
+    queries:
+      - expr: typeahead_cache_hit_rate{cache_type="redis"}
+    thresholds:
+      - value: 0.8
+        color: yellow
+      - value: 0.9
+        color: green
+
+  - title: "Kafka Consumer Lag"
+    type: graph
+    queries:
+      - expr: sum(typeahead_kafka_consumer_lag)
+    thresholds:
+      - value: 10000
+        color: yellow
+      - value: 100000
+        color: red
+
+  - title: "Error Rate"
+    type: singlestat
+    queries:
+      - expr: |
+          rate(typeahead_suggestion_requests_total{status="error"}[5m])
+          / rate(typeahead_suggestion_requests_total[5m])
+    thresholds:
+      - value: 0.001  # 0.1% error rate
+        color: yellow
+      - value: 0.01   # 1% error rate
+        color: red
+```
+
+### Alert Thresholds
+
+```yaml
+# prometheus-alerts.yaml
+groups:
+  - name: typeahead_alerts
+    rules:
+      # Latency SLO breach
+      - alert: TypeaheadHighLatency
+        expr: histogram_quantile(0.99, rate(typeahead_suggestion_latency_seconds_bucket[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Typeahead P99 latency above 50ms"
+          description: "P99 latency is {{ $value | humanizeDuration }}"
+
+      # Error rate
+      - alert: TypeaheadHighErrorRate
+        expr: |
+          rate(typeahead_suggestion_requests_total{status="error"}[5m])
+          / rate(typeahead_suggestion_requests_total[5m]) > 0.01
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Typeahead error rate above 1%"
+
+      # Kafka lag
+      - alert: TypeaheadKafkaLagHigh
+        expr: sum(typeahead_kafka_consumer_lag) > 50000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Lag is {{ $value }} messages"
+
+      # Cache hit rate
+      - alert: TypeaheadLowCacheHitRate
+        expr: typeahead_cache_hit_rate{cache_type="redis"} < 0.7
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 70%"
+
+      # Trie size anomaly
+      - alert: TypeaheadTrieSizeAnomaly
+        expr: |
+          abs(typeahead_trie_phrase_count - avg_over_time(typeahead_trie_phrase_count[1h]))
+          / avg_over_time(typeahead_trie_phrase_count[1h]) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trie size changed by more than 20%"
+```
+
+### Structured Logging
+
+```javascript
+// logger.js - Using pino for structured logging
+const pino = require('pino')
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  },
+  base: {
+    service: 'typeahead',
+    version: process.env.APP_VERSION || '1.0.0',
+    env: process.env.NODE_ENV || 'development'
+  }
+})
+
+// Request logging middleware
+function requestLogger(req, res, next) {
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID()
+  req.requestId = requestId
+
+  const startTime = process.hrtime.bigint()
+
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6
+
+    logger.info({
+      type: 'request',
+      requestId,
+      method: req.method,
+      path: req.path,
+      query: req.query.q?.substring(0, 50),  // Truncate for privacy
+      userId: req.userId || 'anonymous',
+      statusCode: res.statusCode,
+      durationMs: durationMs.toFixed(2),
+      cacheHit: res.locals.cacheHit || false,
+      suggestionCount: res.locals.suggestionCount || 0
+    })
+  })
+
+  next()
+}
+
+// Aggregation pipeline logging
+class LoggingAggregator {
+  async processQuery(message) {
+    const { query, userId, idempotencyKey } = message
+
+    logger.debug({
+      type: 'query_ingested',
+      idempotencyKey,
+      queryLength: query.length,
+      userId: userId?.substring(0, 8)  // Partial for privacy
+    })
+
+    if (await this.isFiltered(query)) {
+      logger.info({
+        type: 'query_filtered',
+        reason: 'content_filter',
+        idempotencyKey
+      })
+      return
+    }
+
+    // ... process
+  }
+}
+```
+
+### Distributed Tracing
+
+```javascript
+// tracing.js - Using OpenTelemetry
+const { NodeTracerProvider } = require('@opentelemetry/sdk-trace-node')
+const { SimpleSpanProcessor } = require('@opentelemetry/sdk-trace-base')
+const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
+const { trace, context, SpanStatusCode } = require('@opentelemetry/api')
+
+// Initialize tracer
+const provider = new NodeTracerProvider()
+provider.addSpanProcessor(new SimpleSpanProcessor(new JaegerExporter({
+  endpoint: process.env.JAEGER_ENDPOINT || 'http://localhost:14268/api/traces'
+})))
+provider.register()
+
+const tracer = trace.getTracer('typeahead-service')
+
+// Traced suggestion handler
+async function getSuggestionsTraced(prefix, userId) {
+  return tracer.startActiveSpan('getSuggestions', async (span) => {
+    span.setAttribute('prefix.length', prefix.length)
+    span.setAttribute('user.id', userId || 'anonymous')
+
+    try {
+      // Check cache
+      const cacheSpan = tracer.startSpan('cache.get', {}, context.active())
+      const cached = await redis.get(`suggestions:${prefix}`)
+      cacheSpan.setAttribute('cache.hit', !!cached)
+      cacheSpan.end()
+
+      if (cached) {
+        span.setAttribute('cache.hit', true)
+        return JSON.parse(cached)
+      }
+
+      // Query trie shard
+      const trieSpan = tracer.startSpan('trie.query', {}, context.active())
+      const shardId = getShardForPrefix(prefix)
+      trieSpan.setAttribute('shard.id', shardId)
+      const suggestions = await queryTrieShard(shardId, prefix)
+      trieSpan.setAttribute('result.count', suggestions.length)
+      trieSpan.end()
+
+      // Apply ranking
+      const rankSpan = tracer.startSpan('ranking.apply', {}, context.active())
+      const ranked = await rankingService.rank(suggestions, { userId, prefix })
+      rankSpan.end()
+
+      span.setAttribute('result.count', ranked.length)
+      return ranked
+
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
+      throw error
+    } finally {
+      span.end()
+    }
+  })
+}
+```
+
+### Audit Logging
+
+```javascript
+// audit.js - Security and admin action logging
+class AuditLogger {
+  constructor() {
+    this.logger = pino({
+      level: 'info',
+      base: { type: 'audit' }
+    })
+  }
+
+  // Log filter list changes
+  logFilterChange(action, phrase, reason, adminUserId) {
+    this.logger.info({
+      event: 'filter_change',
+      action,  // 'add' or 'remove'
+      phrase: phrase.substring(0, 50),
+      reason,
+      adminUserId,
+      timestamp: new Date().toISOString(),
+      ipAddress: this.getClientIP()
+    })
+
+    // Also persist to database for compliance
+    db.query(`
+      INSERT INTO audit_log (event_type, action, target, actor_id, metadata, created_at)
+      VALUES ('filter_change', $1, $2, $3, $4, NOW())
+    `, [action, phrase, adminUserId, { reason }])
+  }
+
+  // Log trie rebuilds
+  logTrieRebuild(triggeredBy, snapshotId, phraseCount, durationMs) {
+    this.logger.info({
+      event: 'trie_rebuild',
+      triggeredBy,  // 'scheduled', 'manual', 'threshold'
+      snapshotId,
+      phraseCount,
+      durationMs,
+      timestamp: new Date().toISOString()
+    })
+  }
+
+  // Log cache invalidation
+  logCacheInvalidation(pattern, reason, adminUserId) {
+    this.logger.info({
+      event: 'cache_invalidation',
+      pattern,
+      reason,
+      adminUserId,
+      timestamp: new Date().toISOString()
+    })
+  }
+
+  // Log rate limit violations
+  logRateLimitViolation(userId, endpoint, currentRate, limit) {
+    this.logger.warn({
+      event: 'rate_limit_exceeded',
+      userId,
+      endpoint,
+      currentRate,
+      limit,
+      timestamp: new Date().toISOString()
+    })
+  }
+}
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency Keys
+
+```javascript
+// retry.js - Exponential backoff with jitter
+class RetryHandler {
+  constructor(options = {}) {
+    this.maxRetries = options.maxRetries || 3
+    this.baseDelayMs = options.baseDelayMs || 100
+    this.maxDelayMs = options.maxDelayMs || 5000
+  }
+
+  async withRetry(operation, idempotencyKey, context = {}) {
+    let lastError
+    let attempt = 0
+
+    while (attempt < this.maxRetries) {
+      try {
+        // Pass idempotency key to operation
+        return await operation({ idempotencyKey, attempt })
+      } catch (error) {
+        lastError = error
+        attempt++
+
+        // Don't retry non-retryable errors
+        if (this.isNonRetryable(error)) {
+          throw error
+        }
+
+        if (attempt < this.maxRetries) {
+          const delay = this.calculateDelay(attempt)
+          logger.warn({
+            event: 'retry_attempt',
+            idempotencyKey,
+            attempt,
+            delayMs: delay,
+            error: error.message,
+            ...context
+          })
+          await this.sleep(delay)
+        }
+      }
+    }
+
+    logger.error({
+      event: 'retry_exhausted',
+      idempotencyKey,
+      attempts: attempt,
+      error: lastError.message,
+      ...context
+    })
+
+    throw lastError
+  }
+
+  calculateDelay(attempt) {
+    // Exponential backoff with jitter
+    const exponentialDelay = this.baseDelayMs * Math.pow(2, attempt - 1)
+    const jitter = Math.random() * 0.3 * exponentialDelay
+    return Math.min(exponentialDelay + jitter, this.maxDelayMs)
+  }
+
+  isNonRetryable(error) {
+    // Don't retry validation errors
+    if (error.statusCode === 400) return true
+    // Don't retry auth errors
+    if (error.statusCode === 401 || error.statusCode === 403) return true
+    // Don't retry not found
+    if (error.statusCode === 404) return true
+    return false
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+
+// Usage in trie shard communication
+const retryHandler = new RetryHandler({ maxRetries: 3, baseDelayMs: 50 })
+
+async function queryShard(shardAddress, prefix) {
+  const idempotencyKey = `query_${prefix}_${Date.now()}`
+
+  return retryHandler.withRetry(
+    async ({ idempotencyKey, attempt }) => {
+      const response = await fetch(`${shardAddress}/query`, {
+        method: 'POST',
+        headers: {
+          'X-Idempotency-Key': idempotencyKey,
+          'X-Retry-Attempt': attempt.toString()
+        },
+        body: JSON.stringify({ prefix }),
+        timeout: 100  // 100ms timeout per attempt
+      })
+
+      if (!response.ok) {
+        const error = new Error(`Shard query failed: ${response.status}`)
+        error.statusCode = response.status
+        throw error
+      }
+
+      return response.json()
+    },
+    idempotencyKey,
+    { prefix, shardAddress }
+  )
+}
+```
+
+### Circuit Breaker Pattern
+
+```javascript
+// circuit-breaker.js
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.name = options.name || 'default'
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeoutMs = options.resetTimeoutMs || 30000
+    this.halfOpenRequests = options.halfOpenRequests || 3
+
+    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.successes = 0
+    this.lastFailureTime = null
+    this.halfOpenAttempts = 0
+  }
+
+  async execute(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
+        this.state = 'HALF_OPEN'
+        this.halfOpenAttempts = 0
+        logger.info({ event: 'circuit_half_open', circuit: this.name })
+      } else {
+        throw new CircuitOpenError(`Circuit ${this.name} is OPEN`)
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+
+    if (this.state === 'HALF_OPEN') {
+      this.halfOpenAttempts++
+      if (this.halfOpenAttempts >= this.halfOpenRequests) {
+        this.state = 'CLOSED'
+        logger.info({ event: 'circuit_closed', circuit: this.name })
+      }
+    }
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailureTime = Date.now()
+
+    if (this.state === 'HALF_OPEN') {
+      this.state = 'OPEN'
+      logger.warn({ event: 'circuit_reopened', circuit: this.name })
+    } else if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      logger.warn({
+        event: 'circuit_opened',
+        circuit: this.name,
+        failures: this.failures
+      })
+    }
+  }
+
+  getState() {
+    return {
+      name: this.name,
+      state: this.state,
+      failures: this.failures,
+      lastFailureTime: this.lastFailureTime
+    }
+  }
+}
+
+// Circuit breakers for each shard
+const shardCircuits = new Map()
+
+function getShardCircuit(shardId) {
+  if (!shardCircuits.has(shardId)) {
+    shardCircuits.set(shardId, new CircuitBreaker({
+      name: `shard_${shardId}`,
+      failureThreshold: 5,
+      resetTimeoutMs: 10000
+    }))
+  }
+  return shardCircuits.get(shardId)
+}
+
+async function queryShardWithCircuitBreaker(shardId, prefix) {
+  const circuit = getShardCircuit(shardId)
+
+  try {
+    return await circuit.execute(() => queryShard(shardAddresses[shardId], prefix))
+  } catch (error) {
+    if (error instanceof CircuitOpenError) {
+      // Fallback: return cached or empty results
+      logger.warn({
+        event: 'shard_circuit_open_fallback',
+        shardId,
+        prefix: prefix.substring(0, 3)
+      })
+      return await getCachedOrEmpty(prefix)
+    }
+    throw error
+  }
+}
+```
+
+### Graceful Degradation
+
+```javascript
+// degradation.js - Fallback strategies when components fail
+class DegradationHandler {
+  constructor() {
+    this.degradationFlags = {
+      skipPersonalization: false,
+      skipTrending: false,
+      useStaleCache: false,
+      reduceSuggestionCount: false
+    }
+  }
+
+  async getSuggestionsWithFallbacks(prefix, userId, options) {
+    let suggestions = []
+
+    // Primary path: try to get fresh suggestions
+    try {
+      suggestions = await this.primarySuggestionPath(prefix, userId)
+    } catch (error) {
+      logger.warn({ event: 'primary_path_failed', error: error.message })
+
+      // Fallback 1: Try stale cache
+      const staleCache = await redis.get(`suggestions:stale:${prefix}`)
+      if (staleCache) {
+        logger.info({ event: 'using_stale_cache', prefix: prefix.substring(0, 3) })
+        suggestions = JSON.parse(staleCache)
+        this.degradationFlags.useStaleCache = true
+      } else {
+        // Fallback 2: Return popular suggestions
+        logger.info({ event: 'using_popular_fallback' })
+        suggestions = await this.getPopularSuggestions(prefix)
+      }
+    }
+
+    // Try to apply personalization (skip if failing)
+    if (userId && !this.degradationFlags.skipPersonalization) {
+      try {
+        suggestions = await this.applyPersonalization(suggestions, userId)
+      } catch (error) {
+        logger.warn({ event: 'personalization_skipped', error: error.message })
+        this.degradationFlags.skipPersonalization = true
+      }
+    }
+
+    // Try to apply trending boost (skip if failing)
+    if (!this.degradationFlags.skipTrending) {
+      try {
+        suggestions = await this.applyTrendingBoost(suggestions)
+      } catch (error) {
+        logger.warn({ event: 'trending_skipped', error: error.message })
+        this.degradationFlags.skipTrending = true
+      }
+    }
+
+    // Reduce count if under heavy load
+    const limit = this.degradationFlags.reduceSuggestionCount ? 3 : options.limit || 5
+    return suggestions.slice(0, limit)
+  }
+
+  async getPopularSuggestions(prefix) {
+    // Pre-computed popular suggestions by first character
+    const cacheKey = `popular:${prefix.charAt(0).toLowerCase()}`
+    const cached = await redis.get(cacheKey)
+
+    if (cached) {
+      const allPopular = JSON.parse(cached)
+      return allPopular.filter(s =>
+        s.phrase.toLowerCase().startsWith(prefix.toLowerCase())
+      ).slice(0, 10)
+    }
+
+    return []
+  }
+}
+```
+
+### Backup and Restore (Local Development)
+
+```javascript
+// backup.js - Local development backup/restore procedures
+class BackupManager {
+  constructor(backupDir = './backups') {
+    this.backupDir = backupDir
+  }
+
+  // Backup trie state to JSON file
+  async backupTrie(trie, backupName) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `${this.backupDir}/trie_${backupName}_${timestamp}.json`
+
+    const serialized = trie.serialize()
+    await fs.writeFile(filename, serialized)
+
+    logger.info({
+      event: 'trie_backup_created',
+      filename,
+      sizeBytes: serialized.length
+    })
+
+    return filename
+  }
+
+  // Restore trie from backup
+  async restoreTrie(filename) {
+    const data = await fs.readFile(filename, 'utf-8')
+    const parsed = JSON.parse(data)
+
+    const trie = new Trie()
+    this.deserializeIntoTrie(trie.root, parsed)
+
+    logger.info({
+      event: 'trie_restored',
+      filename
+    })
+
+    return trie
+  }
+
+  deserializeIntoTrie(node, data) {
+    node.suggestions = data.suggestions || []
+    for (const [char, childData] of Object.entries(data.children || {})) {
+      node.children.set(char, new TrieNode())
+      this.deserializeIntoTrie(node.children.get(char), childData)
+    }
+  }
+
+  // Backup PostgreSQL tables
+  async backupDatabase(backupName) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `${this.backupDir}/db_${backupName}_${timestamp}.sql`
+
+    // Use pg_dump for PostgreSQL
+    await execPromise(`pg_dump -h localhost -U typeahead -d typeahead_dev -t phrase_counts -t filtered_phrases -f ${filename}`)
+
+    logger.info({
+      event: 'database_backup_created',
+      filename,
+      tables: ['phrase_counts', 'filtered_phrases']
+    })
+
+    return filename
+  }
+
+  // Restore database from backup
+  async restoreDatabase(filename) {
+    // Drop and recreate tables
+    await db.query('TRUNCATE phrase_counts, filtered_phrases')
+
+    // Restore from dump
+    await execPromise(`psql -h localhost -U typeahead -d typeahead_dev -f ${filename}`)
+
+    logger.info({
+      event: 'database_restored',
+      filename
+    })
+  }
+
+  // Redis backup (RDB snapshot)
+  async backupRedis(backupName) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `${this.backupDir}/redis_${backupName}_${timestamp}.rdb`
+
+    // Trigger Redis BGSAVE
+    await redis.bgsave()
+
+    // Wait for completion
+    let saving = true
+    while (saving) {
+      await new Promise(r => setTimeout(r, 100))
+      const info = await redis.info('persistence')
+      saving = info.includes('rdb_bgsave_in_progress:1')
+    }
+
+    // Copy the dump file
+    await execPromise(`cp /var/lib/redis/dump.rdb ${filename}`)
+
+    logger.info({
+      event: 'redis_backup_created',
+      filename
+    })
+
+    return filename
+  }
+
+  // List available backups
+  async listBackups() {
+    const files = await fs.readdir(this.backupDir)
+    return files
+      .filter(f => f.endsWith('.json') || f.endsWith('.sql') || f.endsWith('.rdb'))
+      .sort()
+      .reverse()
+  }
+}
+
+// Admin endpoints for backup/restore
+app.post('/api/v1/admin/backup', authMiddleware, async (req, res) => {
+  const { type, name } = req.body  // type: 'trie', 'database', 'redis', 'all'
+  const backupManager = new BackupManager()
+  const results = {}
+
+  if (type === 'trie' || type === 'all') {
+    results.trie = await backupManager.backupTrie(globalTrie, name)
+  }
+  if (type === 'database' || type === 'all') {
+    results.database = await backupManager.backupDatabase(name)
+  }
+  if (type === 'redis' || type === 'all') {
+    results.redis = await backupManager.backupRedis(name)
+  }
+
+  auditLogger.logBackup(type, name, req.userId, results)
+  res.json({ success: true, backups: results })
+})
+```
+
+### Health Checks
+
+```javascript
+// health.js - Comprehensive health check endpoints
+app.get('/health', async (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+app.get('/health/ready', async (req, res) => {
+  const checks = {
+    trie: { status: 'unknown' },
+    redis: { status: 'unknown' },
+    postgres: { status: 'unknown' },
+    kafka: { status: 'unknown' }
+  }
+
+  // Check trie is loaded
+  try {
+    const phraseCount = globalTrie ? globalTrie.getPhraseCount() : 0
+    checks.trie = {
+      status: phraseCount > 0 ? 'healthy' : 'degraded',
+      phraseCount
+    }
+  } catch (error) {
+    checks.trie = { status: 'unhealthy', error: error.message }
+  }
+
+  // Check Redis connectivity
+  try {
+    const pong = await redis.ping()
+    checks.redis = { status: pong === 'PONG' ? 'healthy' : 'unhealthy' }
+  } catch (error) {
+    checks.redis = { status: 'unhealthy', error: error.message }
+  }
+
+  // Check PostgreSQL connectivity
+  try {
+    const result = await db.query('SELECT 1')
+    checks.postgres = { status: 'healthy' }
+  } catch (error) {
+    checks.postgres = { status: 'unhealthy', error: error.message }
+  }
+
+  // Check Kafka consumer
+  try {
+    const lag = await getKafkaConsumerLag()
+    checks.kafka = {
+      status: lag < 10000 ? 'healthy' : 'degraded',
+      consumerLag: lag
+    }
+  } catch (error) {
+    checks.kafka = { status: 'unhealthy', error: error.message }
+  }
+
+  const allHealthy = Object.values(checks).every(c => c.status === 'healthy')
+  const anyUnhealthy = Object.values(checks).some(c => c.status === 'unhealthy')
+
+  const overallStatus = allHealthy ? 'healthy' : (anyUnhealthy ? 'unhealthy' : 'degraded')
+
+  res.status(overallStatus === 'unhealthy' ? 503 : 200).json({
+    status: overallStatus,
+    checks,
+    timestamp: new Date().toISOString()
+  })
+})
+
+// Circuit breaker status endpoint
+app.get('/health/circuits', async (req, res) => {
+  const circuits = {}
+  for (const [shardId, circuit] of shardCircuits) {
+    circuits[`shard_${shardId}`] = circuit.getState()
+  }
+  res.json({ circuits })
+})
+```
+
+### Multi-Region Disaster Recovery (Design Notes)
+
+For a local development project, true multi-region DR is not implemented. However, the architecture supports the following patterns if needed:
+
+**Active-Passive Setup:**
+```
+Primary Region (active):
+  - Receives all writes
+  - Handles read traffic
+  - Replicates to secondary
+
+Secondary Region (passive):
+  - Receives replicated data
+  - Read-only mode
+  - Can be promoted on primary failure
+
+Replication Strategy:
+  - PostgreSQL: Streaming replication (async, ~1s lag)
+  - Redis: Redis replication or Valkey cluster
+  - Kafka: MirrorMaker 2 for topic replication
+  - Trie: Rebuild from replicated PostgreSQL data
+```
+
+**Failover Procedure (documented for learning):**
+1. Detect primary region failure (health check timeout)
+2. Promote secondary PostgreSQL to primary
+3. Update DNS/load balancer to point to secondary
+4. Rebuild trie from promoted database
+5. Resume Kafka consumers in secondary region
+6. Mark old primary as secondary for repair

@@ -1,7 +1,17 @@
+/**
+ * URL Store
+ *
+ * Manages URL-related state using Zustand.
+ * Provides CRUD operations for the user's shortened URLs.
+ */
 import { create } from 'zustand';
 import { Url, CreateUrlInput } from '../types';
 import { api } from '../services/api';
 
+/**
+ * URL state interface.
+ * Includes URL list, loading state, and URL management actions.
+ */
 interface UrlState {
   urls: Url[];
   total: number;
@@ -16,6 +26,10 @@ interface UrlState {
   clearError: () => void;
 }
 
+/**
+ * URL store hook.
+ * Manages the list of user's URLs and provides actions for creating and deleting.
+ */
 export const useUrlStore = create<UrlState>()((set, get) => ({
   urls: [],
   total: 0,

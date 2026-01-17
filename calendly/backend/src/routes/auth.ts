@@ -3,10 +3,17 @@ import { userService } from '../services/userService.js';
 import { CreateUserSchema } from '../types/index.js';
 import { z } from 'zod';
 
+/**
+ * Express router for authentication endpoints.
+ * Handles user registration, login, logout, and session management.
+ */
 const router = Router();
 
 /**
- * POST /api/auth/register - Register a new user
+ * POST /api/auth/register - Register a new user.
+ * Creates a new account and automatically logs in the user.
+ * @body {email, password, name, time_zone} - User registration data
+ * @returns {User} The newly created user
  */
 router.post('/register', async (req: Request, res: Response) => {
   try {
@@ -39,7 +46,10 @@ router.post('/register', async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/auth/login - Login
+ * POST /api/auth/login - Authenticate a user.
+ * Validates credentials and establishes a session.
+ * @body {email, password} - User credentials
+ * @returns {User} The authenticated user
  */
 router.post('/login', async (req: Request, res: Response) => {
   try {
@@ -79,7 +89,9 @@ router.post('/login', async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/auth/logout - Logout
+ * POST /api/auth/logout - End the current session.
+ * Destroys the session and clears the session cookie.
+ * @returns {message} Success message
  */
 router.post('/logout', (req: Request, res: Response) => {
   req.session.destroy((err) => {
@@ -99,7 +111,9 @@ router.post('/logout', (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/auth/me - Get current user
+ * GET /api/auth/me - Get the current authenticated user.
+ * Used by frontend to check authentication status and get user data.
+ * @returns {User} The current user or 401 if not authenticated
  */
 router.get('/me', async (req: Request, res: Response) => {
   if (!req.session?.userId) {

@@ -1,7 +1,17 @@
+/**
+ * Video Player Store
+ *
+ * Global state for video playback using Zustand.
+ * Manages playback state, quality selection, volume, and progress tracking.
+ */
 import { create } from 'zustand';
 import { streamService } from '../services/streaming';
 import type { StreamManifest, StreamQuality } from '../types';
 
+/**
+ * Player state interface.
+ * Contains all playback-related state and control actions.
+ */
 interface PlayerState {
   isPlaying: boolean;
   manifest: StreamManifest | null;
@@ -21,20 +31,36 @@ interface PlayerState {
   episodeId: string | null;
 
   // Actions
+  /** Loads streaming manifest and initializes playback */
   loadManifest: (videoId: string, episodeId?: string) => Promise<void>;
+  /** Changes video quality level */
   setQuality: (quality: StreamQuality) => void;
+  /** Sets play/pause state */
   setPlaying: (playing: boolean) => void;
+  /** Sets volume level (0-1) */
   setVolume: (volume: number) => void;
+  /** Toggles mute state */
   toggleMute: () => void;
+  /** Updates current playback time */
   setCurrentTime: (time: number) => void;
+  /** Sets total video duration */
   setDuration: (duration: number) => void;
+  /** Sets buffered amount */
   setBuffered: (buffered: number) => void;
+  /** Sets fullscreen state */
   setFullscreen: (fullscreen: boolean) => void;
+  /** Shows/hides player controls */
   setShowControls: (show: boolean) => void;
+  /** Saves current progress to server */
   saveProgress: () => Promise<void>;
+  /** Resets player to initial state */
   reset: () => void;
 }
 
+/**
+ * Player store hook.
+ * Use this hook to access playback state and controls in components.
+ */
 export const usePlayerStore = create<PlayerState>((set, get) => ({
   isPlaying: false,
   manifest: null,

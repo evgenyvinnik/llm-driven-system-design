@@ -9,8 +9,17 @@ import type {
   ApiResponse,
 } from '../types';
 
+/**
+ * Base URL for API requests.
+ * Uses relative path for same-origin requests; configure for production.
+ */
 const API_BASE = '/api/v1';
 
+/**
+ * Constructs authorization headers from persisted auth state.
+ * Reads the API key from localStorage to add Bearer token.
+ * @returns Headers object with Content-Type and optional Authorization
+ */
 function getAuthHeaders(): HeadersInit {
   const apiKey = localStorage.getItem('payment-auth');
   if (apiKey) {
@@ -29,6 +38,14 @@ function getAuthHeaders(): HeadersInit {
   return { 'Content-Type': 'application/json' };
 }
 
+/**
+ * Generic API fetch wrapper with authentication and error handling.
+ * Automatically adds auth headers and parses JSON responses.
+ * @param endpoint - API endpoint path (without base URL)
+ * @param options - Fetch options (method, body, headers, etc.)
+ * @returns Parsed JSON response
+ * @throws Error with message from API response on failure
+ */
 async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -50,7 +67,17 @@ async function fetchApi<T>(
   return data;
 }
 
+// ============================================================================
 // Merchant API
+// ============================================================================
+
+/**
+ * Creates a new merchant account and returns API credentials.
+ * @param name - Business name for the merchant
+ * @param email - Contact email for the account
+ * @param defaultCurrency - Default currency for transactions
+ * @returns Merchant record with API key (only returned once)
+ */
 export async function createMerchant(
   name: string,
   email: string,
@@ -62,10 +89,20 @@ export async function createMerchant(
   });
 }
 
+/**
+ * Retrieves the current merchant's profile including balance.
+ * @returns Merchant profile data
+ */
 export async function getMerchantProfile(): Promise<Merchant> {
   return fetchApi('/merchants/me');
 }
 
+/**
+ * Retrieves aggregated dashboard statistics for the merchant.
+ * @param startDate - Optional start of reporting period
+ * @param endDate - Optional end of reporting period
+ * @returns Dashboard metrics including volume, fees, and rates
+ */
 export async function getDashboardStats(
   startDate?: Date,
   endDate?: Date
@@ -76,6 +113,13 @@ export async function getDashboardStats(
   return fetchApi(`/merchants/me/stats?${params}`);
 }
 
+/**
+ * Retrieves time-series transaction volume data for charts.
+ * @param startDate - Optional start of reporting period
+ * @param endDate - Optional end of reporting period
+ * @param granularity - Time bucket size (hour, day, or week)
+ * @returns Array of volume data points
+ */
 export async function getVolumeData(
   startDate?: Date,
   endDate?: Date,
@@ -88,7 +132,16 @@ export async function getVolumeData(
   return fetchApi(`/merchants/me/volume?${params}`);
 }
 
+// ============================================================================
 // Payments API
+// ============================================================================
+
+/**
+ * Creates a new payment transaction.
+ * Automatically generates an idempotency key to prevent duplicates.
+ * @param request - Payment details including amount and payment method
+ * @returns Created transaction record
+ */
 export async function createPayment(
   request: CreatePaymentRequest
 ): Promise<Transaction> {
@@ -102,10 +155,22 @@ export async function createPayment(
   });
 }
 
+/**
+ * Retrieves a specific payment by ID.
+ * @param id - UUID of the transaction
+ * @returns Transaction record
+ */
 export async function getPayment(id: string): Promise<Transaction> {
   return fetchApi(`/payments/${id}`);
 }
 
+/**
+ * Lists payments for the merchant with pagination.
+ * @param limit - Maximum number of payments to return
+ * @param offset - Number of payments to skip
+ * @param status - Optional status filter
+ * @returns Paginated list of transactions
+ */
 export async function listPayments(
   limit = 50,
   offset = 0,
@@ -118,14 +183,31 @@ export async function listPayments(
   return fetchApi(`/payments?${params}`);
 }
 
+/**
+ * Captures an authorized payment.
+ * @param id - UUID of the authorized transaction
+ * @returns Updated transaction with captured status
+ */
 export async function capturePayment(id: string): Promise<Transaction> {
   return fetchApi(`/payments/${id}/capture`, { method: 'POST' });
 }
 
+/**
+ * Voids an authorized payment before capture.
+ * @param id - UUID of the authorized transaction
+ * @returns Updated transaction with voided status
+ */
 export async function voidPayment(id: string): Promise<Transaction> {
   return fetchApi(`/payments/${id}/void`, { method: 'POST' });
 }
 
+/**
+ * Creates a refund for a captured payment.
+ * @param id - UUID of the transaction to refund
+ * @param amount - Optional partial refund amount in cents (full refund if omitted)
+ * @param reason - Optional reason for the refund
+ * @returns Created refund record
+ */
 export async function refundPayment(
   id: string,
   amount?: number,
@@ -141,7 +223,16 @@ export async function refundPayment(
   });
 }
 
+// ============================================================================
 // Refunds API
+// ============================================================================
+
+/**
+ * Lists all refunds for the merchant with pagination.
+ * @param limit - Maximum number of refunds to return
+ * @param offset - Number of refunds to skip
+ * @returns Paginated list of refunds
+ */
 export async function listRefunds(
   limit = 50,
   offset = 0
@@ -152,7 +243,17 @@ export async function listRefunds(
   return fetchApi(`/refunds?${params}`);
 }
 
+// ============================================================================
 // Chargebacks API
+// ============================================================================
+
+/**
+ * Lists all chargebacks for the merchant with pagination.
+ * @param limit - Maximum number of chargebacks to return
+ * @param offset - Number of chargebacks to skip
+ * @param status - Optional status filter
+ * @returns Paginated list of chargebacks
+ */
 export async function listChargebacks(
   limit = 50,
   offset = 0,
@@ -165,7 +266,16 @@ export async function listChargebacks(
   return fetchApi(`/chargebacks?${params}`);
 }
 
+// ============================================================================
 // Ledger API
+// ============================================================================
+
+/**
+ * Verifies that ledger debits equal credits for reconciliation.
+ * @param startDate - Optional start of verification period
+ * @param endDate - Optional end of verification period
+ * @returns Verification result with totals
+ */
 export async function verifyLedger(
   startDate?: Date,
   endDate?: Date
@@ -181,6 +291,12 @@ export async function verifyLedger(
   return fetchApi(`/ledger/verify?${params}`);
 }
 
+/**
+ * Retrieves ledger summary showing net changes by account.
+ * @param startDate - Optional start of reporting period
+ * @param endDate - Optional end of reporting period
+ * @returns Summary with account breakdowns and total volume
+ */
 export async function getLedgerSummary(
   startDate?: Date,
   endDate?: Date

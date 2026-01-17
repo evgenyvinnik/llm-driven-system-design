@@ -1,7 +1,26 @@
+/**
+ * Database seeder for the LinkedIn clone.
+ * Populates the database with sample data for development and testing.
+ * Creates users, companies, jobs, connections, posts, and skills.
+ *
+ * Usage: npx tsx src/seed.ts
+ *
+ * @module seed
+ */
 import { pool, query, queryOne, execute } from './utils/db.js';
 import bcrypt from 'bcryptjs';
 import { indexUser, indexJob } from './utils/elasticsearch.js';
 
+/**
+ * Seeds the database with sample data for development.
+ * Truncates all tables and creates fresh test data including:
+ * - 23 skills (technical and soft skills)
+ * - 5 companies across different industries
+ * - 8 users with profiles, experiences, education, and skills
+ * - 10 connections between users
+ * - 6 feed posts
+ * - 5 job postings with required skills
+ */
 async function seed() {
   console.log('Seeding database...');
 

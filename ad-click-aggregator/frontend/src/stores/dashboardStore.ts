@@ -1,25 +1,52 @@
+/**
+ * @fileoverview Zustand store for dashboard state management.
+ * Centralizes data fetching and state for the analytics dashboard.
+ * Provides reactive state updates and automatic refresh capabilities.
+ */
+
 import { create } from 'zustand';
 import type { SystemStats, RealTimeStats, Campaign, Ad, ClickEvent } from '../types';
 import { getSystemStats, getRealTimeStats, getCampaigns, getAds, getRecentClicks } from '../services/api';
 
+/**
+ * Dashboard state interface defining all managed data and actions.
+ */
 interface DashboardState {
+  /** System-wide statistics (totals, fraud rates) */
   stats: SystemStats | null;
+  /** Real-time click statistics (time series) */
   realTimeStats: RealTimeStats | null;
+  /** List of all campaigns */
   campaigns: Campaign[];
+  /** List of all ads */
   ads: Ad[];
+  /** Recent click events for monitoring */
   recentClicks: ClickEvent[];
+  /** Loading state for async operations */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
+  /** Timestamp of last successful refresh */
   lastUpdated: Date | null;
 
+  /** Fetches system-wide statistics */
   fetchStats: () => Promise<void>;
+  /** Fetches real-time click statistics */
   fetchRealTimeStats: (minutes?: number) => Promise<void>;
+  /** Fetches campaign list */
   fetchCampaigns: () => Promise<void>;
+  /** Fetches ad list */
   fetchAds: () => Promise<void>;
+  /** Fetches recent click events */
   fetchRecentClicks: (limit?: number, fraudOnly?: boolean) => Promise<void>;
+  /** Refreshes all dashboard data */
   refreshAll: () => Promise<void>;
 }
 
+/**
+ * Dashboard store with actions for fetching and managing analytics data.
+ * Uses Zustand for simple, performant state management.
+ */
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   stats: null,
   realTimeStats: null,

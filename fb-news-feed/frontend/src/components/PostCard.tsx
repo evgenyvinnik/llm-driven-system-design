@@ -1,3 +1,9 @@
+/**
+ * @fileoverview PostCard component for displaying individual posts in the feed.
+ * Includes author info, content, engagement stats, and interactive actions.
+ * Supports likes, comments, and sharing with expandable comment section.
+ */
+
 import { useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import type { Post } from '@/types';
@@ -8,11 +14,24 @@ import { useFeedStore } from '@/stores/feedStore';
 import { useAuthStore } from '@/stores/authStore';
 import { postsApi } from '@/services/api';
 
+/**
+ * Props for the PostCard component.
+ */
 interface PostCardProps {
+  /** Post data to display */
   post: Post;
+  /** Optional callback when post is deleted */
   onDelete?: () => void;
 }
 
+/**
+ * Renders a single post with full interactivity.
+ * Displays author, content, image (if any), engagement stats, and action buttons.
+ * Manages local state for comments section expansion and comment submission.
+ *
+ * @param props - PostCard props including post data and delete callback
+ * @returns JSX element rendering the post card
+ */
 export function PostCard({ post, onDelete }: PostCardProps) {
   const [showComments, setShowComments] = useState(false);
   const [commentText, setCommentText] = useState('');

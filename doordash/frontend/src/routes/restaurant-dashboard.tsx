@@ -6,10 +6,33 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Restaurant, Order, WSMessage } from '../types';
 
+/**
+ * Restaurant dashboard route configuration.
+ * Restricted to restaurant owners and admins.
+ */
 export const Route = createFileRoute('/restaurant-dashboard')({
   component: RestaurantDashboard,
 });
 
+/**
+ * Restaurant dashboard component for managing restaurant operations.
+ * Provides restaurant owner functionality for order management
+ * and restaurant settings.
+ *
+ * Features:
+ * - Restaurant selector (for owners with multiple restaurants)
+ * - Open/closed toggle for accepting orders
+ * - Active orders list with status update controls
+ * - Real-time new order notifications via WebSocket
+ * - Order status progression (Confirm, Prepare, Ready)
+ * - Menu management tab (placeholder for future implementation)
+ *
+ * Access Control:
+ * - Redirects non-owners to home page
+ * - Requires restaurant_owner or admin role
+ *
+ * @returns React component for the restaurant owner dashboard
+ */
 function RestaurantDashboard() {
   const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();

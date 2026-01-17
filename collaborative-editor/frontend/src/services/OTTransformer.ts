@@ -2,9 +2,32 @@ import { TextOperation, isRetain, isInsert, isDelete } from './TextOperation';
 import type { Op } from '../types';
 
 /**
- * OT Transformer for client-side operation transformation
+ * OT Transformer for client-side operation transformation.
+ *
+ * This class provides the transform and compose functions needed
+ * to handle concurrent operations in the client. When a remote
+ * operation arrives, the client must transform it against any
+ * pending local operations to maintain consistency.
+ *
+ * The transform function ensures that:
+ *   apply(apply(doc, op1), op2') = apply(apply(doc, op2), op1')
+ *
+ * This property guarantees convergence across all clients.
  */
 export class OTTransformer {
+  /**
+   * Transform op1 against op2.
+   *
+   * Given two operations that were created against the same document state,
+   * produces transformed versions that can be applied in either order
+   * while preserving the intended changes.
+   *
+   * @param op1 - The first operation
+   * @param op2 - The second operation (must have same baseLength as op1)
+   * @returns A tuple [op1', op2'] where op1' can be applied after op2,
+   *          and op2' can be applied after op1
+   * @throws Error if the operations have different base lengths
+   */
   static transform(
     op1: TextOperation,
     op2: TextOperation
@@ -130,6 +153,18 @@ export class OTTransformer {
     return [op1Prime, op2Prime];
   }
 
+  /**
+   * Compose two operations into a single operation.
+   *
+   * Creates a new operation that has the same effect as applying op1
+   * followed by op2. Used to combine multiple pending local operations
+   * into a single operation before sending to the server.
+   *
+   * @param op1 - The first operation to apply
+   * @param op2 - The second operation to apply (op2.baseLength must equal op1.targetLength)
+   * @returns A single operation equivalent to applying op1 then op2
+   * @throws Error if op1.targetLength does not match op2.baseLength
+   */
   static compose(op1: TextOperation, op2: TextOperation): TextOperation {
     if (op1.targetLength !== op2.baseLength) {
       throw new Error(
@@ -247,6 +282,19 @@ export class OTTransformer {
     return composed;
   }
 
+  /**
+   * Transform a cursor position against an operation.
+   *
+   * Adjusts a cursor position to account for insertions and deletions
+   * that occurred before or at the cursor location. Used to keep
+   * cursor positions accurate when applying remote operations.
+   *
+   * @param cursor - The current cursor position (zero-based index)
+   * @param op - The operation to transform against
+   * @param isOwnCursor - If true, inserts at the cursor position go after
+   *                      the cursor (used for the local user's cursor)
+   * @returns The new cursor position after the operation
+   */
   static transformCursor(
     cursor: number,
     op: TextOperation,

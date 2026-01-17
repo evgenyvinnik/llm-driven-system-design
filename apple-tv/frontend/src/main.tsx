@@ -1,3 +1,7 @@
+/**
+ * Application entry point.
+ * Initializes React with StrictMode and mounts the router provider.
+ */
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { RouterProvider } from '@tanstack/react-router';

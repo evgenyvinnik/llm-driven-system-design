@@ -2,11 +2,29 @@ import { useState, useEffect } from 'react';
 import type { User } from '../types';
 import { api } from '../services/api';
 
+/**
+ * Props for the UserSelector component.
+ */
 interface UserSelectorProps {
+  /** Currently selected user's ID, or null if none */
   selectedUserId: string | null;
+  /** Callback when a user is selected */
   onSelectUser: (userId: string) => void;
 }
 
+/**
+ * UserSelector - Dropdown for selecting the current user.
+ *
+ * In a real application, this would be replaced with proper authentication.
+ * For demo purposes, it allows switching between pre-seeded users.
+ *
+ * Displays:
+ * - Dropdown with all available users
+ * - Selected user's color indicator
+ *
+ * @param props - Component props
+ * @returns The UserSelector component
+ */
 export function UserSelector({ selectedUserId, onSelectUser }: UserSelectorProps) {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);

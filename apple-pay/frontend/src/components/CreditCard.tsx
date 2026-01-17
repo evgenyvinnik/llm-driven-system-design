@@ -1,27 +1,51 @@
+/**
+ * CreditCard component displays a visual representation of a payment card.
+ * Styled to look like a physical credit card with network branding.
+ */
 import type { Card } from '../types';
 
+/**
+ * Props for the CreditCard component.
+ */
 interface CreditCardProps {
+  /** Card data to display */
   card: Card;
+  /** Click handler for the card */
   onClick?: () => void;
+  /** Whether to show action buttons (suspend, remove, etc.) */
   showActions?: boolean;
+  /** Handler for suspend action */
   onSuspend?: () => void;
+  /** Handler for reactivate action */
   onReactivate?: () => void;
+  /** Handler for remove action */
   onRemove?: () => void;
+  /** Handler for set default action */
   onSetDefault?: () => void;
 }
 
+/** Gradient colors for each card network */
 const networkColors = {
   visa: 'from-blue-800 to-blue-600',
   mastercard: 'from-red-600 to-orange-500',
   amex: 'from-blue-500 to-cyan-400',
 };
 
+/** Logo text for each card network */
 const networkLogos = {
   visa: 'VISA',
   mastercard: 'MC',
   amex: 'AMEX',
 };
 
+/**
+ * Renders a credit card visualization with optional action buttons.
+ * Shows card details including last 4 digits, holder name, expiry, and network.
+ * Displays status badges for default and suspended states.
+ *
+ * @param props - CreditCard component props
+ * @returns JSX element representing a styled credit card
+ */
 export function CreditCard({
   card,
   onClick,
@@ -150,6 +174,12 @@ export function CreditCard({
   );
 }
 
+/**
+ * Skeleton loading component for credit card.
+ * Displays a shimmer animation placeholder while card data loads.
+ *
+ * @returns JSX element representing a loading credit card skeleton
+ */
 export function CreditCardSkeleton() {
   return (
     <div className="credit-card w-full max-w-sm">

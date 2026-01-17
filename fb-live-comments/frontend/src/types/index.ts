@@ -1,3 +1,14 @@
+/**
+ * Type Definitions Module
+ *
+ * Shared TypeScript interfaces and types for the live comments frontend.
+ * Mirrors backend types with appropriate adjustments for client-side use
+ * (e.g., dates as strings from JSON).
+ *
+ * @module types
+ */
+
+/** Represents a user in the system */
 export interface User {
   id: string;
   username: string;
@@ -10,6 +21,7 @@ export interface User {
   updated_at: string;
 }
 
+/** Represents a live stream */
 export interface Stream {
   id: string;
   title: string;
@@ -26,6 +38,7 @@ export interface Stream {
   updated_at: string;
 }
 
+/** Represents a comment with embedded user information */
 export interface Comment {
   id: string;
   stream_id: string;
@@ -45,12 +58,15 @@ export interface Comment {
   };
 }
 
+/** Available reaction types */
 export type ReactionType = 'like' | 'love' | 'haha' | 'wow' | 'sad' | 'angry';
 
+/** Map of reaction types to their counts */
 export interface ReactionCount {
   [key: string]: number;
 }
 
+/** WebSocket message types for real-time communication */
 export type WSMessageType =
   | 'join_stream'
   | 'leave_stream'
@@ -64,27 +80,32 @@ export type WSMessageType =
   | 'ping'
   | 'pong';
 
+/** Generic WebSocket message envelope */
 export interface WSMessage {
   type: WSMessageType;
   payload: unknown;
   timestamp?: number;
 }
 
+/** Payload for comments_batch message from server */
 export interface CommentsBatchPayload {
   stream_id: string;
   comments: Comment[];
 }
 
+/** Payload for reactions_batch message from server */
 export interface ReactionsBatchPayload {
   stream_id: string;
   counts: ReactionCount;
 }
 
+/** Payload for viewer_count message from server */
 export interface ViewerCountPayload {
   stream_id: string;
   count: number;
 }
 
+/** Payload for error message from server */
 export interface ErrorPayload {
   code: string;
   message: string;

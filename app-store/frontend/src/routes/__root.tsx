@@ -1,10 +1,20 @@
+/**
+ * @fileoverview Root route layout component.
+ * Wraps all pages with header, main content area, and footer.
+ */
+
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Header } from '../components/Header';
 
+/** Root route definition with layout component */
 export const Route = createRootRoute({
   component: RootLayout,
 });
 
+/**
+ * Root layout component.
+ * Provides consistent page structure across all routes.
+ */
 function RootLayout() {
   return (
     <div className="min-h-screen bg-gray-50">

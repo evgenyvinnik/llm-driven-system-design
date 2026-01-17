@@ -1,14 +1,35 @@
+/**
+ * @fileoverview Gauge panel component for displaying percentage-based metrics.
+ *
+ * Renders a semi-circular gauge with a needle indicating the current value.
+ * Designed for metrics that represent a percentage (0-100 scale).
+ * Supports threshold-based coloring.
+ */
+
 import { useState, useEffect } from 'react';
 import type { Panel, Threshold } from '../types';
 import { getPanelData } from '../services/api';
 import { TIME_RANGE_OPTIONS, TimeRange } from '../types';
 
+/**
+ * Props for the GaugePanel component.
+ */
 interface GaugePanelProps {
+  /** The panel configuration with query and display options */
   panel: Panel;
+  /** ID of the parent dashboard */
   dashboardId: string;
+  /** Selected time range for the query */
   timeRange: TimeRange;
 }
 
+/**
+ * Determines the display color based on value and threshold configuration.
+ *
+ * @param value - The metric value to evaluate
+ * @param thresholds - Optional array of threshold/color pairs
+ * @returns CSS color string for the value
+ */
 function getThresholdColor(value: number, thresholds?: Threshold[]): string {
   if (!thresholds || thresholds.length === 0) return '#82ca9d';
 
@@ -21,6 +42,16 @@ function getThresholdColor(value: number, thresholds?: Threshold[]): string {
   return '#82ca9d';
 }
 
+/**
+ * Renders a gauge panel with a semi-circular dial and needle.
+ *
+ * The gauge assumes values in a 0-100 range (percentage). The needle
+ * rotates from -90 to +90 degrees based on the value. Colors are
+ * applied based on threshold configuration.
+ *
+ * @param props - Component props
+ * @returns The rendered gauge or loading/error state
+ */
 export function GaugePanel({ panel, dashboardId, timeRange }: GaugePanelProps) {
   const [value, setValue] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);

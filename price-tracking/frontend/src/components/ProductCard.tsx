@@ -1,12 +1,25 @@
+/**
+ * Product display card component.
+ * Shows product image, title, price, status, and actions.
+ * @module components/ProductCard
+ */
 import { Link } from '@tanstack/react-router';
 import { Product } from '../types';
 import { formatDistanceToNow } from 'date-fns';
 
+/** Props for the ProductCard component */
 interface ProductCardProps {
+  /** Product data to display */
   product: Product;
+  /** Optional callback when remove button is clicked */
   onDelete?: (id: string) => void;
 }
 
+/**
+ * Renders a product card with image, details, and action buttons.
+ * Displays current price, target price, status badge, and watcher count.
+ * @param props - Component props
+ */
 export function ProductCard({ product, onDelete }: ProductCardProps) {
   const formatPrice = (price: number | null, currency: string = 'USD') => {
     if (price === null) return 'N/A';

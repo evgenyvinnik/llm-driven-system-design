@@ -1,6 +1,14 @@
 import { useState } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 
+/**
+ * Authentication form component for login and registration.
+ * Provides a toggle between login and sign-up modes with appropriate
+ * form fields for each. Displays iMessage branding and handles
+ * form submission with loading states and error display.
+ *
+ * @returns React component for authentication form
+ */
 export function AuthForm() {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
@@ -13,6 +21,12 @@ export function AuthForm() {
   const login = useAuthStore((state) => state.login);
   const register = useAuthStore((state) => state.register);
 
+  /**
+   * Handles form submission for both login and registration.
+   * Calls the appropriate auth store action based on current mode.
+   *
+   * @param e - Form submit event
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');

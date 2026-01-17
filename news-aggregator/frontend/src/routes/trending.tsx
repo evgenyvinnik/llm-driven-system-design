@@ -1,8 +1,18 @@
+/**
+ * Trending stories page route.
+ * Displays stories with the most coverage in the last 24 hours.
+ * @module routes/trending
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { feedApi } from '../services/api';
 import { StoryList } from '../components';
 import { TrendingUp } from 'lucide-react';
 
+/**
+ * Trending page route configuration.
+ * Prefetches trending stories on navigation.
+ */
 export const Route = createFileRoute('/trending')({
   loader: async () => {
     const response = await feedApi.getTrending();
@@ -11,6 +21,11 @@ export const Route = createFileRoute('/trending')({
   component: TrendingPage,
 });
 
+/**
+ * Trending stories page component.
+ * Shows stories ordered by article coverage.
+ * @returns Trending stories page with story grid
+ */
 function TrendingPage() {
   const { stories } = Route.useLoaderData();
 

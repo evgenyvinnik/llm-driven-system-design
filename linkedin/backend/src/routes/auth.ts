@@ -1,3 +1,10 @@
+/**
+ * Authentication routes for the LinkedIn clone.
+ * Handles user registration, login/logout, and session management.
+ * Uses session-based authentication stored in Redis.
+ *
+ * @module routes/auth
+ */
 import { Router, Request, Response } from 'express';
 import * as userService from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';

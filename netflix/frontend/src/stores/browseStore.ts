@@ -1,7 +1,17 @@
+/**
+ * Browse Store
+ *
+ * Global state for browsing content using Zustand.
+ * Manages homepage rows, continue watching, My List, and search results.
+ */
 import { create } from 'zustand';
 import { videoService } from '../services/videos';
 import type { Video, HomepageRow, ContinueWatchingItem } from '../types';
 
+/**
+ * Browse state interface.
+ * Contains browsing data and actions for content discovery.
+ */
 interface BrowseState {
   homepageRows: HomepageRow[];
   continueWatching: ContinueWatchingItem[];
@@ -12,16 +22,28 @@ interface BrowseState {
   error: string | null;
 
   // Actions
+  /** Loads personalized homepage rows */
   loadHomepage: () => Promise<void>;
+  /** Loads continue watching items */
   loadContinueWatching: () => Promise<void>;
+  /** Loads user's My List */
   loadMyList: () => Promise<void>;
+  /** Loads available genres */
   loadGenres: () => Promise<void>;
+  /** Searches videos by query */
   search: (query: string) => Promise<void>;
+  /** Clears search results */
   clearSearch: () => void;
+  /** Adds video to My List */
   addToMyList: (videoId: string) => Promise<void>;
+  /** Removes video from My List */
   removeFromMyList: (videoId: string) => Promise<void>;
 }
 
+/**
+ * Browse store hook.
+ * Use this hook to access browse state and actions in components.
+ */
 export const useBrowseStore = create<BrowseState>((set) => ({
   homepageRows: [],
   continueWatching: [],

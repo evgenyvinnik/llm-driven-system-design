@@ -1,9 +1,25 @@
+/**
+ * API Service for Bitly Frontend
+ *
+ * Provides typed methods for all backend API interactions.
+ * Handles response parsing, error handling, and credential management.
+ */
+
+/** Base URL for API endpoints */
 const API_BASE = '/api/v1';
 
+/** Standard API error response structure */
 interface ApiError {
   error: string;
 }
 
+/**
+ * Processes fetch responses and handles errors.
+ * Parses JSON for success responses, throws Error for failures.
+ * @param response - Fetch Response object
+ * @returns Parsed JSON response data
+ * @throws Error with message from API or generic error
+ */
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error: ApiError = await response.json();
@@ -18,8 +34,14 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+/**
+ * API client with methods organized by resource type.
+ * All methods include credentials for cookie-based authentication.
+ */
 export const api = {
-  // Auth endpoints
+  /**
+   * Authentication endpoints for user login, registration, and session management.
+   */
   auth: {
     async login(email: string, password: string) {
       const response = await fetch(`${API_BASE}/auth/login`, {
@@ -56,7 +78,9 @@ export const api = {
     },
   },
 
-  // URL endpoints
+  /**
+   * URL management endpoints for creating, listing, and managing shortened URLs.
+   */
   urls: {
     async create(data: import('../types').CreateUrlInput) {
       const response = await fetch(`${API_BASE}/urls`, {
@@ -101,7 +125,9 @@ export const api = {
     },
   },
 
-  // Analytics endpoints
+  /**
+   * Analytics endpoints for viewing URL click statistics.
+   */
   analytics: {
     async get(shortCode: string) {
       const response = await fetch(`${API_BASE}/analytics/${shortCode}`, {
@@ -111,7 +137,10 @@ export const api = {
     },
   },
 
-  // Admin endpoints
+  /**
+   * Admin endpoints for system management.
+   * Requires admin role for access.
+   */
   admin: {
     async getStats() {
       const response = await fetch(`${API_BASE}/admin/stats`, {

@@ -3,24 +3,47 @@ import type { Match, Message } from '../types';
 import { matchApi } from '../services/api';
 import { wsService } from '../services/websocket';
 
+/**
+ * Match and messaging store state and actions interface.
+ * Manages matches list, conversation messages, and real-time message updates.
+ */
 interface MatchState {
+  /** List of all matches for the current user */
   matches: Match[];
+  /** Currently active conversation match ID */
   currentMatchId: string | null;
+  /** Messages for the current conversation */
   messages: Message[];
+  /** Whether data is loading */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
+  /** Total unread message count across all matches */
   unreadCount: number;
 
+  /** Fetches all matches for the current user */
   loadMatches: () => Promise<void>;
+  /** Loads messages for a specific match conversation */
   loadMessages: (matchId: string) => Promise<void>;
+  /** Sends a message in the current conversation */
   sendMessage: (content: string) => Promise<void>;
+  /** Removes a match and all associated data */
   unmatch: (matchId: string) => Promise<void>;
+  /** Sets the currently active conversation */
   setCurrentMatch: (matchId: string | null) => void;
+  /** Adds a new message to the current conversation (from WebSocket) */
   addMessage: (message: Message) => void;
+  /** Refreshes total unread message count */
   loadUnreadCount: () => Promise<void>;
+  /** Subscribes to real-time message updates via WebSocket */
   subscribeToMessages: () => () => void;
 }
 
+/**
+ * Zustand store for matches and messaging.
+ * Handles match list, conversation history, message sending,
+ * and real-time updates via WebSocket subscription.
+ */
 export const useMatchStore = create<MatchState>((set, get) => ({
   matches: [],
   currentMatchId: null,

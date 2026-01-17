@@ -1,5 +1,14 @@
+/**
+ * StrokeThumbnail component - Renders drawing stroke data as a small preview.
+ * Used in the admin dashboard to display drawing thumbnails in the gallery.
+ * @module components/StrokeThumbnail
+ */
+
 import { useRef, useEffect } from 'react'
 
+/**
+ * A single point in a stroke.
+ */
 interface Point {
   x: number
   y: number
@@ -7,21 +16,38 @@ interface Point {
   timestamp?: number
 }
 
+/**
+ * A complete stroke with styling.
+ */
 interface Stroke {
   points: Point[]
   color: string
   width: number
 }
 
+/**
+ * Props for the StrokeThumbnail component.
+ */
 interface StrokeThumbnailProps {
+  /** The strokes to render */
   strokes: Stroke[]
+  /** Original canvas dimensions for scaling */
   canvasSize?: { width: number; height: number }
+  /** Thumbnail size in pixels (square) */
   size?: number
+  /** Background color for the thumbnail */
   backgroundColor?: string
 }
 
 /**
- * Renders stroke data as a canvas thumbnail
+ * Renders stroke data as a scaled-down canvas thumbnail.
+ * Useful for displaying drawing previews in galleries and lists.
+ *
+ * @param props - Component props
+ * @param props.strokes - Array of strokes to render
+ * @param props.canvasSize - Original canvas dimensions (default: 400x400)
+ * @param props.size - Thumbnail size in pixels (default: 100)
+ * @param props.backgroundColor - Background color (default: #fffef0 - post-it yellow)
  */
 export function StrokeThumbnail({
   strokes,
@@ -83,7 +109,12 @@ export function StrokeThumbnail({
 }
 
 /**
- * Placeholder when stroke data is not available
+ * Placeholder component shown when stroke data is unavailable.
+ * Displays a shape icon centered in a gray box.
+ *
+ * @param props - Component props
+ * @param props.size - Placeholder size in pixels (default: 100)
+ * @param props.shape - Shape name to display as icon (optional)
  */
 export function StrokeThumbnailPlaceholder({
   size = 100,
@@ -92,6 +123,9 @@ export function StrokeThumbnailPlaceholder({
   size?: number
   shape?: string
 }) {
+  /**
+   * Maps shape names to Unicode symbols for visual display.
+   */
   const getShapeIcon = (s: string): string => {
     const icons: Record<string, string> = {
       line: '—',

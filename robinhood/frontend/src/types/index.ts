@@ -1,3 +1,12 @@
+/**
+ * Core type definitions for the Robinhood trading frontend.
+ * These types mirror the backend API responses and are used
+ * throughout the application for type safety.
+ */
+
+/**
+ * Real-time stock quote with price and change data.
+ */
 export interface Quote {
   symbol: string;
   bid: number;
@@ -7,12 +16,17 @@ export interface Quote {
   high: number;
   low: number;
   volume: number;
+  /** Price change from market open */
   change: number;
+  /** Percentage change from market open */
   changePercent: number;
   timestamp: number;
   name?: string;
 }
 
+/**
+ * Authenticated user information returned from login/register.
+ */
 export interface User {
   id: string;
   email: string;
@@ -22,6 +36,9 @@ export interface User {
   buyingPower: number;
 }
 
+/**
+ * Raw position data from the backend.
+ */
 export interface Position {
   id: string;
   user_id: string;
@@ -33,6 +50,9 @@ export interface Position {
   updated_at: string;
 }
 
+/**
+ * A stock position held in the user's portfolio with calculated metrics.
+ */
 export interface PortfolioHolding {
   symbol: string;
   name: string;
@@ -46,6 +66,9 @@ export interface PortfolioHolding {
   dayChangePercent: number;
 }
 
+/**
+ * Complete portfolio summary with holdings and P&L metrics.
+ */
 export interface Portfolio {
   totalValue: number;
   totalCost: number;
@@ -57,6 +80,9 @@ export interface Portfolio {
   holdings: PortfolioHolding[];
 }
 
+/**
+ * A buy or sell order placed by the user.
+ */
 export interface Order {
   id: string;
   user_id: string;
@@ -77,6 +103,9 @@ export interface Order {
   updated_at: string;
 }
 
+/**
+ * User-created watchlist containing stock symbols.
+ */
 export interface Watchlist {
   id: string;
   user_id: string;
@@ -85,6 +114,9 @@ export interface Watchlist {
   items: WatchlistItem[];
 }
 
+/**
+ * A stock symbol in a watchlist with optional quote data.
+ */
 export interface WatchlistItem {
   id: string;
   watchlist_id: string;
@@ -93,6 +125,9 @@ export interface WatchlistItem {
   quote?: Quote;
 }
 
+/**
+ * User-configured price alert.
+ */
 export interface PriceAlert {
   id: string;
   user_id: string;
@@ -104,6 +139,9 @@ export interface PriceAlert {
   created_at: string;
 }
 
+/**
+ * Stock information for display in lists.
+ */
 export interface Stock {
   symbol: string;
   name: string;

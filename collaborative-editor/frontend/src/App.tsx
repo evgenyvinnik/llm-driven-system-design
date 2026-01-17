@@ -7,6 +7,19 @@ import { UserSelector } from './components/UserSelector';
 import { useEditorStore } from './stores/editorStore';
 import type { Document } from './types';
 
+/**
+ * App - Root component for the collaborative editor application.
+ *
+ * Manages the application's top-level state and routing:
+ * - When no document is selected, shows the document list
+ * - When a document is selected, shows the editor view
+ *
+ * Also handles:
+ * - User selection (simulated authentication)
+ * - WebSocket connection lifecycle
+ *
+ * @returns The App component
+ */
 function App() {
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null);

@@ -3,11 +3,20 @@ import { MatchService } from '../services/matchService.js';
 import { MessageService } from '../services/messageService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Match and messaging routes.
+ * Handles match list, conversation messages, read receipts, and unmatching.
+ * All routes require authentication.
+ */
 const router = Router();
 const matchService = new MatchService();
 const messageService = new MessageService();
 
-// Get all matches
+/**
+ * GET /api/matches
+ * Returns all matches for the authenticated user with unread message counts.
+ * Ordered by most recent activity (last message or match time).
+ */
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
     const matches = await matchService.getUserMatches(req.session.userId!);
@@ -27,7 +36,11 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get messages for a match
+/**
+ * GET /api/matches/:matchId/messages
+ * Returns paginated messages for a match conversation.
+ * Automatically marks retrieved messages as read.
+ */
 router.get('/:matchId/messages', requireAuth, async (req: Request, res: Response) => {
   try {
     const { matchId } = req.params;
@@ -48,7 +61,11 @@ router.get('/:matchId/messages', requireAuth, async (req: Request, res: Response
   }
 });
 
-// Send a message
+/**
+ * POST /api/matches/:matchId/messages
+ * Sends a new message in a match conversation.
+ * Validates content length (max 5000 chars) and publishes via WebSocket.
+ */
 router.post('/:matchId/messages', requireAuth, async (req: Request, res: Response) => {
   try {
     const { matchId } = req.params;
@@ -82,7 +99,10 @@ router.post('/:matchId/messages', requireAuth, async (req: Request, res: Respons
   }
 });
 
-// Mark messages as read
+/**
+ * POST /api/matches/:matchId/read
+ * Marks all unread messages in a match as read by the authenticated user.
+ */
 router.post('/:matchId/read', requireAuth, async (req: Request, res: Response) => {
   try {
     const { matchId } = req.params;
@@ -94,7 +114,11 @@ router.post('/:matchId/read', requireAuth, async (req: Request, res: Response) =
   }
 });
 
-// Unmatch
+/**
+ * DELETE /api/matches/:matchId
+ * Removes a match between two users.
+ * Deletes match record, all messages, and swipe history.
+ */
 router.delete('/:matchId', requireAuth, async (req: Request, res: Response) => {
   try {
     const { matchId } = req.params;
@@ -112,7 +136,11 @@ router.delete('/:matchId', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Get unread message count
+/**
+ * GET /api/matches/unread/count
+ * Returns total unread message count across all matches.
+ * Used for notification badge display.
+ */
 router.get('/unread/count', requireAuth, async (req: Request, res: Response) => {
   try {
     const count = await messageService.getUnreadCount(req.session.userId!);

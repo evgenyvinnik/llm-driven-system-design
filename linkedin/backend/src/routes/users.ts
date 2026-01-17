@@ -1,3 +1,10 @@
+/**
+ * User profile routes for the LinkedIn clone.
+ * Handles profile viewing, editing, and user search.
+ * Includes experience, education, and skills management.
+ *
+ * @module routes/users
+ */
 import { Router, Request, Response } from 'express';
 import * as userService from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';

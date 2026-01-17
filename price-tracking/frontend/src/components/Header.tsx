@@ -1,8 +1,19 @@
+/**
+ * Application header with navigation and user controls.
+ * Displays logo, navigation links, auth state, and unread alert badge.
+ * Polls for new alerts every 30 seconds when authenticated.
+ * @module components/Header
+ */
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useAlertStore } from '../stores/alertStore';
 import { useEffect } from 'react';
 
+/**
+ * Renders the main navigation header.
+ * Shows different content based on authentication state.
+ * Admin users see additional admin link.
+ */
 export function Header() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const { unreadCount, fetchUnreadCount } = useAlertStore();

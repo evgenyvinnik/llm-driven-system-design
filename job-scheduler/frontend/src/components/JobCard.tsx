@@ -1,15 +1,31 @@
+/**
+ * Job display components for listing and managing jobs.
+ * Provides card and table views with action buttons for job lifecycle operations.
+ * @module components/JobCard
+ */
+
 import { Link } from '@tanstack/react-router';
 import { Job, JobWithStats, JobStatus } from '../types';
 import { StatusBadge, Button } from './UI';
 
+/** Props for the JobCard component */
 interface JobCardProps {
+  /** Job data to display (may include execution statistics) */
   job: Job | JobWithStats;
+  /** Callback to pause the job */
   onPause?: (id: string) => void;
+  /** Callback to resume a paused job */
   onResume?: (id: string) => void;
+  /** Callback to trigger immediate execution */
   onTrigger?: (id: string) => void;
+  /** Callback to delete the job */
   onDelete?: (id: string) => void;
 }
 
+/**
+ * Card view for a single job with status, schedule, and actions.
+ * Displays job metadata and execution statistics if available.
+ */
 export function JobCard({ job, onPause, onResume, onTrigger, onDelete }: JobCardProps) {
   const stats = 'total_executions' in job ? job : null;
 
@@ -99,14 +115,24 @@ export function JobCard({ job, onPause, onResume, onTrigger, onDelete }: JobCard
   );
 }
 
+/** Props for the JobTable component */
 interface JobTableProps {
+  /** Array of jobs to display in table rows */
   jobs: (Job | JobWithStats)[];
+  /** Callback to pause a job */
   onPause?: (id: string) => void;
+  /** Callback to resume a paused job */
   onResume?: (id: string) => void;
+  /** Callback to trigger immediate execution */
   onTrigger?: (id: string) => void;
+  /** Callback to delete a job */
   onDelete?: (id: string) => void;
 }
 
+/**
+ * Table view for multiple jobs with sortable columns.
+ * Provides compact display with inline actions for job management.
+ */
 export function JobTable({ jobs, onPause, onResume, onTrigger, onDelete }: JobTableProps) {
   return (
     <div className="overflow-hidden shadow ring-1 ring-black ring-opacity-5 rounded-lg">

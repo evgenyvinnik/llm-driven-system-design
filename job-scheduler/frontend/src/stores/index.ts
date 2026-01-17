@@ -1,7 +1,17 @@
+/**
+ * Zustand stores for global application state management.
+ * Provides reactive state for jobs, executions, and system metrics.
+ * @module stores
+ */
+
 import { create } from 'zustand';
 import { Job, JobWithStats, JobExecution, SystemMetrics, Worker } from '../types';
 import * as api from '../services/api';
 
+/**
+ * Jobs state interface.
+ * Manages job list, selection, and CRUD operations.
+ */
 interface JobsState {
   jobs: (Job | JobWithStats)[];
   selectedJob: Job | null;
@@ -19,6 +29,10 @@ interface JobsState {
   triggerJob: (id: string) => Promise<JobExecution | null>;
 }
 
+/**
+ * Jobs store for managing job state and operations.
+ * Provides actions for CRUD operations and job lifecycle management.
+ */
 export const useJobsStore = create<JobsState>((set, get) => ({
   jobs: [],
   selectedJob: null,
@@ -127,6 +141,10 @@ export const useJobsStore = create<JobsState>((set, get) => ({
   },
 }));
 
+/**
+ * Metrics state interface.
+ * Manages system metrics and worker information.
+ */
 interface MetricsState {
   metrics: SystemMetrics | null;
   workers: Worker[];
@@ -136,6 +154,10 @@ interface MetricsState {
   fetchWorkers: () => Promise<void>;
 }
 
+/**
+ * Metrics store for dashboard data.
+ * Provides system-wide metrics and worker status information.
+ */
 export const useMetricsStore = create<MetricsState>((set) => ({
   metrics: null,
   workers: [],
@@ -162,6 +184,10 @@ export const useMetricsStore = create<MetricsState>((set) => ({
   },
 }));
 
+/**
+ * Executions state interface.
+ * Manages execution list, details, and operations.
+ */
 interface ExecutionsState {
   executions: JobExecution[];
   selectedExecution: JobExecution | null;
@@ -175,6 +201,10 @@ interface ExecutionsState {
   retryExecution: (id: string) => Promise<void>;
 }
 
+/**
+ * Executions store for managing execution state.
+ * Provides actions for viewing and managing job executions.
+ */
 export const useExecutionsStore = create<ExecutionsState>((set, get) => ({
   executions: [],
   selectedExecution: null,

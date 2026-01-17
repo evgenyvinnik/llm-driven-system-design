@@ -1,6 +1,15 @@
+/**
+ * @fileoverview Review controller for app review endpoints.
+ * Handles review CRUD, voting, and developer responses.
+ */
+
 import { Request, Response } from 'express';
 import { reviewService } from '../services/reviewService.js';
 
+/**
+ * Retrieves paginated reviews for an app.
+ * GET /api/v1/apps/:appId/reviews
+ */
 export async function getReviewsForApp(req: Request, res: Response): Promise<void> {
   const { appId } = req.params;
   const { page = '1', limit = '20', sortBy = 'recent' } = req.query;
@@ -14,12 +23,21 @@ export async function getReviewsForApp(req: Request, res: Response): Promise<voi
   res.json(reviews);
 }
 
+/**
+ * Gets rating distribution for an app.
+ * GET /api/v1/apps/:appId/ratings
+ */
 export async function getRatingSummary(req: Request, res: Response): Promise<void> {
   const { appId } = req.params;
   const summary = await reviewService.getRatingSummary(appId);
   res.json({ data: summary });
 }
 
+/**
+ * Creates a new review for an app.
+ * POST /api/v1/apps/:appId/reviews
+ * Requires authentication.
+ */
 export async function createReview(req: Request, res: Response): Promise<void> {
   const { appId } = req.params;
   const { rating, title, body } = req.body;
@@ -38,6 +56,11 @@ export async function createReview(req: Request, res: Response): Promise<void> {
   res.status(201).json({ data: review });
 }
 
+/**
+ * Updates an existing review.
+ * PUT /api/v1/reviews/:id
+ * Requires authentication (must own the review).
+ */
 export async function updateReview(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { rating, title, body } = req.body;
@@ -57,6 +80,11 @@ export async function updateReview(req: Request, res: Response): Promise<void> {
   res.json({ data: review });
 }
 
+/**
+ * Deletes a user's review.
+ * DELETE /api/v1/reviews/:id
+ * Requires authentication (must own the review).
+ */
 export async function deleteReview(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const deleted = await reviewService.deleteReview(id, req.user!.id);
@@ -69,6 +97,11 @@ export async function deleteReview(req: Request, res: Response): Promise<void> {
   res.json({ success: true });
 }
 
+/**
+ * Votes on a review's helpfulness.
+ * POST /api/v1/reviews/:id/vote
+ * Requires authentication.
+ */
 export async function voteReview(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { helpful } = req.body;
@@ -82,6 +115,11 @@ export async function voteReview(req: Request, res: Response): Promise<void> {
   res.json({ success: true });
 }
 
+/**
+ * Adds a developer response to a review.
+ * POST /api/v1/reviews/:id/respond
+ * Requires developer authentication.
+ */
 export async function respondToReview(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const { response } = req.body;

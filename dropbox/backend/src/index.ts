@@ -1,3 +1,14 @@
+/**
+ * Main application entry point for the Dropbox-clone backend.
+ * Sets up Express server with REST API routes and WebSocket server for real-time sync.
+ * Features:
+ * - REST API: /api/auth, /api/files, /api/share, /api/admin
+ * - WebSocket: /ws for real-time sync notifications
+ * - Rate limiting and CORS configuration
+ * - Graceful shutdown handling
+ * @module index
+ */
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -12,11 +23,12 @@ import adminRoutes from './routes/admin.js';
 import { redisSub, getSession } from './utils/redis.js';
 import { pool } from './utils/database.js';
 
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 const app = express();
 
-// Middleware
+// Middleware configuration
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
@@ -24,7 +36,7 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Rate limiting
+/** Rate limiter to prevent abuse - 1000 requests per 15 minutes per IP */
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 1000, // limit each IP to 1000 requests per windowMs
@@ -32,32 +44,40 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Health check
+/** Health check endpoint for load balancer and monitoring */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Routes
+// API route mounting
 app.use('/api/auth', authRoutes);
 app.use('/api/files', fileRoutes);
 app.use('/api/share', sharingRoutes);
 app.use('/api/admin', adminRoutes);
 
-// Error handling
+/** Global error handler for uncaught exceptions in routes */
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Create HTTP server
+/** HTTP server wrapping Express for WebSocket support */
 const server = http.createServer(app);
 
-// WebSocket server for real-time sync
+/**
+ * WebSocket server for real-time sync notifications.
+ * Clients connect with ?token=sessionToken to authenticate.
+ * Receives file change events via Redis pub/sub and forwards to connected clients.
+ */
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// Track connections by user ID
+/** Map of user IDs to their active WebSocket connections */
 const userConnections = new Map<string, Set<WebSocket>>();
 
+/**
+ * Handle new WebSocket connections.
+ * Validates session token and subscribes connection to user's sync channel.
+ */
 wss.on('connection', async (ws, req) => {
   // Extract token from query string
   const url = new URL(req.url || '', `http://localhost:${PORT}`);
@@ -103,7 +123,10 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-// Subscribe to sync events from Redis
+/**
+ * Subscribe to Redis pub/sub for sync events.
+ * Pattern sync:* matches all user-specific sync channels.
+ */
 redisSub.psubscribe('sync:*', (err) => {
   if (err) {
     console.error('Failed to subscribe to sync events:', err);
@@ -112,6 +135,10 @@ redisSub.psubscribe('sync:*', (err) => {
   }
 });
 
+/**
+ * Forward sync events from Redis to connected WebSocket clients.
+ * Parses channel name to find target user and broadcasts to their connections.
+ */
 redisSub.on('pmessage', (pattern, channel, message) => {
   // Extract user ID from channel (sync:userId)
   const userId = channel.split(':')[1];
@@ -126,7 +153,10 @@ redisSub.on('pmessage', (pattern, channel, message) => {
   }
 });
 
-// Graceful shutdown
+/**
+ * Graceful shutdown handler.
+ * Closes WebSocket connections and database pool before exiting.
+ */
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down...');
 
@@ -144,7 +174,7 @@ process.on('SIGTERM', async () => {
   });
 });
 
-// Start server
+/** Start the server and log connection info */
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`WebSocket available at ws://localhost:${PORT}/ws`);

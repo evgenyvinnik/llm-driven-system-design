@@ -6,10 +6,29 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Order, WSMessage } from '../types';
 
+/**
+ * Order detail page route configuration.
+ * Uses dynamic route parameter for order ID.
+ */
 export const Route = createFileRoute('/orders/$orderId')({
   component: OrderDetailPage,
 });
 
+/**
+ * Order detail page component showing full order information.
+ * Displays order details, progress tracker, and driver location.
+ *
+ * Features:
+ * - Full order details with items and pricing
+ * - Visual order progress tracker
+ * - Real-time status updates via WebSocket
+ * - Real-time driver location updates
+ * - Cancel order button (for PLACED orders)
+ * - Driver information display
+ * - ETA breakdown display
+ *
+ * @returns React component for the order detail page
+ */
 function OrderDetailPage() {
   const { orderId } = Route.useParams();
   const user = useAuthStore((s) => s.user);

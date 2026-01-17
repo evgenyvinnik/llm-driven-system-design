@@ -1,7 +1,17 @@
+/**
+ * Registration route - new user account creation.
+ * Collects required profile information for new accounts.
+ */
 import { createFileRoute, useNavigate, Link } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Registration page component.
+ * Handles new user account creation with profile details.
+ * Collects name, email, password, birthdate, gender, and bio.
+ * @returns Registration form element
+ */
 function RegisterPage() {
   const navigate = useNavigate();
   const { register, isLoading, error, clearError } = useAuthStore();

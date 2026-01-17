@@ -1,6 +1,22 @@
+/**
+ * Message Input Component
+ *
+ * Text input field for composing and sending chat messages.
+ * Supports both regular messages and slash commands (prefixed with /).
+ * Auto-focuses when the user joins a room and shows the current
+ * user's nickname with a hint for available commands.
+ */
+
 import { useState, useRef, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 
+/**
+ * Renders the message input bar at the bottom of the chat.
+ * Handles message submission and command detection.
+ * Hidden when no room is selected.
+ *
+ * @returns Message input form or null if not in a room
+ */
 export function MessageInput() {
   const [message, setMessage] = useState('');
   const { sendMessage, currentRoom, session } = useChatStore();

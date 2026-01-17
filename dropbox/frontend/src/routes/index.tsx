@@ -1,3 +1,10 @@
+/**
+ * Main file browser page route.
+ * Displays folder contents with upload, folder creation, sharing, and file management.
+ * Requires authentication; redirects to login if not authenticated.
+ * @module routes/index
+ */
+
 import { useState, useEffect } from 'react';
 import { createFileRoute, useNavigate, useSearch } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
@@ -13,6 +20,7 @@ import { MoveModal } from '../components/MoveModal';
 import { FileItem } from '../types';
 import { Loader2 } from 'lucide-react';
 
+/** Route definition for the main file browser at / */
 export const Route = createFileRoute('/')({
   validateSearch: (search: Record<string, unknown>) => {
     return {
@@ -22,6 +30,10 @@ export const Route = createFileRoute('/')({
   component: FileBrowser,
 });
 
+/**
+ * File browser component showing folder contents.
+ * Manages navigation, file operations, and modal states.
+ */
 function FileBrowser() {
   const navigate = useNavigate();
   const { folder: folderId } = useSearch({ from: '/' });

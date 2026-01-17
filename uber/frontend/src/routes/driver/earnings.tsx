@@ -1,8 +1,19 @@
+/**
+ * Driver earnings page - displays earnings summary and breakdown.
+ * Protected route that requires driver authentication.
+ */
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../../stores/authStore';
 import { useDriverStore } from '../../stores/driverStore';
 
+/**
+ * Earnings dashboard for drivers showing income statistics.
+ * Supports filtering by time period (today, week, month).
+ * Displays total earnings, ride count, average fare, distance, and hourly breakdown.
+ *
+ * @returns Driver earnings page component
+ */
 function DriverEarningsPage() {
   const user = useAuthStore((state) => state.user);
   const navigate = useNavigate();
@@ -18,6 +29,11 @@ function DriverEarningsPage() {
     fetchEarnings(period);
   }, [user, navigate, fetchEarnings, period]);
 
+  /**
+   * Format cents as USD currency string.
+   * @param cents - Amount in cents
+   * @returns Formatted currency string
+   */
   const formatCurrency = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
   if (!user) return null;

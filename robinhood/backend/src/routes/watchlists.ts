@@ -161,7 +161,10 @@ router.post('/alerts', async (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
-// Delete alert
+/**
+ * DELETE /api/watchlists/alerts/:alertId
+ * Deletes a price alert.
+ */
 router.delete('/alerts/:alertId', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
@@ -173,7 +176,10 @@ router.delete('/alerts/:alertId', async (req: AuthenticatedRequest, res: Respons
   }
 });
 
-// Get triggered alerts (from Redis)
+/**
+ * GET /api/watchlists/alerts/triggered
+ * Returns recently triggered alerts stored in Redis.
+ */
 router.get('/alerts/triggered', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
@@ -185,7 +191,10 @@ router.get('/alerts/triggered', async (req: AuthenticatedRequest, res: Response)
   }
 });
 
-// Clear triggered alerts
+/**
+ * DELETE /api/watchlists/alerts/triggered
+ * Clears all triggered alerts for the authenticated user.
+ */
 router.delete('/alerts/triggered', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;

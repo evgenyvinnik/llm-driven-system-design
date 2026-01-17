@@ -3,6 +3,15 @@ import { RouterProvider } from '@tanstack/react-router';
 import { router } from './router';
 import { useAuthStore } from './stores/authStore';
 
+/**
+ * Root application component.
+ *
+ * Initializes authentication state on mount by checking for an existing
+ * session cookie. Displays a loading spinner while auth state is being
+ * determined, then renders the router once ready.
+ *
+ * @returns Application with router or loading state
+ */
 const App: React.FC = () => {
   const { checkAuth, isLoading } = useAuthStore();
 

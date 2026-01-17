@@ -1,7 +1,18 @@
+/**
+ * Properties panel component for editing selected object attributes.
+ * Provides controls for position, size, rotation, fill, stroke, opacity,
+ * and type-specific properties like text content and font settings.
+ */
 import React, { useState } from 'react';
 import { useEditorStore } from '../stores/editorStore';
 import type { DesignObject } from '../types';
 
+/**
+ * PropertiesPanel component for editing design object properties.
+ * Displays when a single object is selected, shows placeholder otherwise.
+ * Changes are applied immediately via the editor store.
+ * @returns The rendered properties panel element
+ */
 export function PropertiesPanel() {
   const { canvasData, selectedIds, updateObject } = useEditorStore();
 
@@ -184,6 +195,13 @@ export function PropertiesPanel() {
   );
 }
 
+/**
+ * Section wrapper for grouping related properties.
+ * @param props - Component props
+ * @param props.title - Section header text
+ * @param props.children - Property controls to display
+ * @returns The rendered section element
+ */
 function PropertySection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="px-4 py-3 border-b border-figma-border">
@@ -193,13 +211,26 @@ function PropertySection({ title, children }: { title: string; children: React.R
   );
 }
 
+/**
+ * Numeric input with label and optional suffix.
+ * Manages local state for smooth editing, commits on blur or Enter.
+ * @param props - Component props
+ * @param props.label - Short label displayed before the input
+ * @param props.value - Current numeric value
+ * @param props.onChange - Callback when value is committed
+ * @param props.min - Optional minimum value
+ * @param props.max - Optional maximum value
+ * @param props.step - Step increment (default 1)
+ * @param props.suffix - Optional unit suffix (e.g., "px", "deg")
+ * @returns The rendered input element
+ */
 function PropertyInput({
   label,
   value,
   onChange,
-  min,
-  max,
-  step = 1,
+  min: _min,
+  max: _max,
+  step: _step = 1,
   suffix,
 }: {
   label: string;

@@ -1,13 +1,23 @@
+/**
+ * @fileoverview Developer dashboard route.
+ * Provides app management for developers.
+ */
+
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import type { App } from '../types';
 import api from '../services/api';
 
+/** Developer dashboard route definition */
 export const Route = createFileRoute('/developer')({
   component: DeveloperDashboard,
 });
 
+/**
+ * Developer dashboard component.
+ * Lists developer's apps and provides management actions.
+ */
 function DeveloperDashboard() {
   const navigate = useNavigate();
   const { user } = useAuthStore();

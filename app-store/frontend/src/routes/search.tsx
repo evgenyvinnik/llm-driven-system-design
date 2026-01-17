@@ -1,15 +1,28 @@
+/**
+ * @fileoverview Search results page route.
+ * Displays filtered and sorted search results.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useCatalogStore } from '../stores/catalogStore';
 import { AppCard } from '../components/AppCard';
 
+/**
+ * Search query parameters.
+ */
 interface SearchParams {
+  /** Search query string */
   q?: string;
+  /** Category filter */
   category?: string;
+  /** Price type filter */
   priceType?: 'free' | 'paid' | 'all';
+  /** Sort order */
   sortBy?: string;
 }
 
+/** Search page route definition with query validation */
 export const Route = createFileRoute('/search')({
   validateSearch: (search: Record<string, unknown>): SearchParams => {
     return {

@@ -1,3 +1,11 @@
+/**
+ * @fileoverview Time-series chart component for dashboard panels.
+ *
+ * Renders line, area, and bar charts using Recharts library.
+ * Automatically fetches and refreshes data based on the panel's query
+ * configuration and the selected time range.
+ */
+
 import { useState, useEffect } from 'react';
 import {
   LineChart,
@@ -18,12 +26,19 @@ import type { Panel, QueryResult, PanelOptions, Threshold } from '../types';
 import { getPanelData } from '../services/api';
 import { TIME_RANGE_OPTIONS, TimeRange } from '../types';
 
+/**
+ * Props for the PanelChart component.
+ */
 interface PanelChartProps {
+  /** The panel configuration with query and display options */
   panel: Panel;
+  /** ID of the parent dashboard */
   dashboardId: string;
+  /** Selected time range for the query */
   timeRange: TimeRange;
 }
 
+/** Color palette for multiple series in a chart */
 const COLORS = [
   '#8884d8',
   '#82ca9d',
@@ -35,6 +50,13 @@ const COLORS = [
   '#FF8042',
 ];
 
+/**
+ * Determines the display color based on value and threshold configuration.
+ *
+ * @param value - The metric value to evaluate
+ * @param thresholds - Optional array of threshold/color pairs
+ * @returns CSS color string for the value
+ */
 function getThresholdColor(value: number, thresholds?: Threshold[]): string {
   if (!thresholds || thresholds.length === 0) return '#82ca9d';
 
@@ -47,12 +69,29 @@ function getThresholdColor(value: number, thresholds?: Threshold[]): string {
   return '#82ca9d';
 }
 
+/**
+ * Formats a numeric value with decimals and optional unit.
+ *
+ * @param value - The numeric value to format
+ * @param options - Panel options containing decimals and unit
+ * @returns Formatted string representation
+ */
 function formatValue(value: number, options?: PanelOptions): string {
   const decimals = options?.decimals ?? 2;
   const formatted = value.toFixed(decimals);
   return options?.unit ? `${formatted}${options.unit}` : formatted;
 }
 
+/**
+ * Renders a time-series chart (line, area, or bar) for a dashboard panel.
+ *
+ * Fetches metric data from the API based on the panel's query configuration
+ * and selected time range. Automatically refreshes every 10 seconds.
+ * Supports multiple series with automatic color assignment.
+ *
+ * @param props - Component props
+ * @returns The rendered chart or loading/error state
+ */
 export function PanelChart({ panel, dashboardId, timeRange }: PanelChartProps) {
   const [data, setData] = useState<QueryResult[]>([]);
   const [loading, setLoading] = useState(true);

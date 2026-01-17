@@ -1,10 +1,20 @@
+/**
+ * Authentication routes for user registration, login, and session management.
+ * Endpoints: POST /register, POST /login, POST /logout, GET /me, PATCH /me
+ * @module routes/auth
+ */
+
 import { Router, Request, Response } from 'express';
 import { register, login, logout, updateUser, getUserById } from '../services/authService.js';
 import { authMiddleware, AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
 
-// Register
+/**
+ * POST /api/auth/register - Create a new user account.
+ * Body: { email: string, password: string, name: string }
+ * Returns: User profile and session token (also sets httpOnly cookie)
+ */
 router.post('/register', async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
@@ -36,7 +46,11 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 });
 
-// Login
+/**
+ * POST /api/auth/login - Authenticate and create a session.
+ * Body: { email: string, password: string }
+ * Returns: User profile and session token (also sets httpOnly cookie)
+ */
 router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -63,7 +77,10 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
-// Logout
+/**
+ * POST /api/auth/logout - Terminate the current session.
+ * Requires authentication. Clears session and removes cookie.
+ */
 router.post('/logout', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (req.token) {
@@ -78,7 +95,10 @@ router.post('/logout', authMiddleware, async (req: AuthRequest, res: Response) =
   }
 });
 
-// Get current user
+/**
+ * GET /api/auth/me - Get the current user's profile.
+ * Requires authentication. Returns up-to-date user profile data.
+ */
 router.get('/me', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
@@ -94,7 +114,11 @@ router.get('/me', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Update current user
+/**
+ * PATCH /api/auth/me - Update the current user's profile.
+ * Requires authentication.
+ * Body: { name?: string, password?: string }
+ */
 router.patch('/me', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {

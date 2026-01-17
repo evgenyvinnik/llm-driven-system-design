@@ -1,15 +1,30 @@
+/**
+ * VideoCard Component
+ *
+ * Displays a single video as a card in content rows.
+ * Features hover expansion with additional info and quick actions.
+ * Supports progress bar display for continue watching items.
+ */
 import React from 'react';
 import { Link } from '@tanstack/react-router';
 import { Play, Plus, Check, ChevronDown } from 'lucide-react';
 import type { Video } from '../types';
 import { useBrowseStore } from '../stores/browseStore';
 
+/** Props for VideoCard component */
 interface VideoCardProps {
+  /** Video to display */
   video: Video;
+  /** Whether to show progress bar */
   showProgress?: boolean;
+  /** Progress percentage (0-100) */
   progressPercent?: number;
 }
 
+/**
+ * Video card with hover expansion effect.
+ * Shows poster thumbnail, expands on hover to reveal actions and metadata.
+ */
 export function VideoCard({ video, showProgress, progressPercent = 0 }: VideoCardProps) {
   const [isHovered, setIsHovered] = React.useState(false);
   const [inMyList, setInMyList] = React.useState(false);

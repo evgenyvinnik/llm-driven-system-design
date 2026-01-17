@@ -1,11 +1,26 @@
+/**
+ * @fileoverview Review display components.
+ * Shows user reviews with voting and developer responses.
+ */
+
 import type { Review } from '../types';
 import { StarRating } from './AppCard';
 
+/**
+ * Props for the ReviewCard component.
+ */
 interface ReviewCardProps {
+  /** Review data to display */
   review: Review;
+  /** Callback when user votes on helpfulness */
   onVote?: (helpful: boolean) => void;
 }
 
+/**
+ * Displays a single user review with rating, content, and voting controls.
+ * Shows developer response if available.
+ * @param props - Component props
+ */
 export function ReviewCard({ review, onVote }: ReviewCardProps) {
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleDateString('en-US', {
@@ -86,12 +101,22 @@ export function ReviewCard({ review, onVote }: ReviewCardProps) {
   );
 }
 
+/**
+ * Props for the RatingBar component.
+ */
 interface RatingBarProps {
+  /** Star level (1-5) */
   star: number;
+  /** Number of reviews at this star level */
   count: number;
+  /** Total number of reviews */
   total: number;
 }
 
+/**
+ * Displays a single bar in the rating distribution chart.
+ * @param props - Component props
+ */
 export function RatingBar({ star, count, total }: RatingBarProps) {
   const percentage = total > 0 ? (count / total) * 100 : 0;
 

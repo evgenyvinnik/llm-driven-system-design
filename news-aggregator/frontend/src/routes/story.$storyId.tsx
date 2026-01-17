@@ -1,7 +1,17 @@
+/**
+ * Story detail page route.
+ * Displays full story information with all source articles.
+ * @module routes/story.$storyId
+ */
+
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { feedApi } from '../services/api';
 import { Clock, ExternalLink, Newspaper, TrendingUp, Zap, ArrowLeft } from 'lucide-react';
 
+/**
+ * Story page route configuration.
+ * Loads story by ID from URL parameter.
+ */
 export const Route = createFileRoute('/story/$storyId')({
   loader: async ({ params }) => {
     const story = await feedApi.getStory(params.storyId);
@@ -10,6 +20,11 @@ export const Route = createFileRoute('/story/$storyId')({
   component: StoryPage,
 });
 
+/**
+ * Format a date as a human-readable string.
+ * @param dateString - ISO 8601 timestamp string
+ * @returns Formatted date string (e.g., "Monday, January 1, 2024, 12:00 PM")
+ */
 function formatDate(dateString: string): string {
   const date = new Date(dateString);
   return date.toLocaleDateString('en-US', {
@@ -22,6 +37,11 @@ function formatDate(dateString: string): string {
   });
 }
 
+/**
+ * Story detail page component.
+ * Shows story headline, summary, topics, and all article sources.
+ * @returns Story detail page with article list
+ */
 function StoryPage() {
   const { story } = Route.useLoaderData();
 

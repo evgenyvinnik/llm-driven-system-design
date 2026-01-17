@@ -1,3 +1,10 @@
+/**
+ * User API routes.
+ * Provides endpoints for user authentication, preferences, and reading history.
+ * Supports registration, login/logout, and profile management.
+ * @module routes/user
+ */
+
 import { Router, Request, Response } from 'express';
 import {
   createUser,
@@ -14,7 +21,11 @@ import { sessionStore } from '../db/redis.js';
 
 const router = Router();
 
-// Register a new user
+/**
+ * POST /register - Register a new user
+ * Creates a user account and initializes an authenticated session.
+ * Returns the user profile and sets a session cookie.
+ */
 router.post('/register', async (req: Request, res: Response) => {
   try {
     const { username, email, password } = req.body;
@@ -54,7 +65,11 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 });
 
-// Login
+/**
+ * POST /login - Authenticate user
+ * Validates credentials and creates an authenticated session.
+ * Returns the user profile and sets a session cookie.
+ */
 router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -91,7 +106,10 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
-// Logout
+/**
+ * POST /logout - End user session
+ * Destroys the session and clears the session cookie.
+ */
 router.post('/logout', async (req: Request, res: Response) => {
   try {
     const sessionId = req.cookies?.session_id;
@@ -106,7 +124,11 @@ router.post('/logout', async (req: Request, res: Response) => {
   }
 });
 
-// Get current user
+/**
+ * GET /me - Get current user profile
+ * Returns the authenticated user's profile information.
+ * Requires authentication.
+ */
 router.get('/me', async (req: Request, res: Response) => {
   try {
     const session = req.session as { userId?: string } | undefined;
@@ -131,7 +153,11 @@ router.get('/me', async (req: Request, res: Response) => {
   }
 });
 
-// Get user preferences
+/**
+ * GET /preferences - Get user preferences
+ * Returns the user's topic and source preferences.
+ * Requires authentication.
+ */
 router.get('/preferences', async (req: Request, res: Response) => {
   try {
     const session = req.session as { userId?: string } | undefined;
@@ -147,7 +173,11 @@ router.get('/preferences', async (req: Request, res: Response) => {
   }
 });
 
-// Update user preferences
+/**
+ * PUT /preferences - Update user preferences
+ * Updates the user's topic and source preferences.
+ * Requires authentication.
+ */
 router.put('/preferences', async (req: Request, res: Response) => {
   try {
     const session = req.session as { userId?: string } | undefined;
@@ -170,7 +200,12 @@ router.put('/preferences', async (req: Request, res: Response) => {
   }
 });
 
-// Record article read
+/**
+ * POST /reading-history - Record article read
+ * Records that the user read an article and updates topic weights.
+ * Used for learning implicit preferences based on reading behavior.
+ * Requires authentication.
+ */
 router.post('/reading-history', async (req: Request, res: Response) => {
   try {
     const session = req.session as { userId?: string } | undefined;
@@ -192,7 +227,11 @@ router.post('/reading-history', async (req: Request, res: Response) => {
   }
 });
 
-// Get reading history
+/**
+ * GET /reading-history - Get user's reading history
+ * Returns recent articles the user has read.
+ * Requires authentication.
+ */
 router.get('/reading-history', async (req: Request, res: Response) => {
   try {
     const session = req.session as { userId?: string } | undefined;
@@ -209,7 +248,10 @@ router.get('/reading-history', async (req: Request, res: Response) => {
   }
 });
 
-// Get available topics for preferences
+/**
+ * GET /available-topics - Get available topics for preferences
+ * Returns all topics from recent stories for preference selection.
+ */
 router.get('/available-topics', async (_req: Request, res: Response) => {
   try {
     const topics = await getAvailableTopics();

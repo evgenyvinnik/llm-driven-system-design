@@ -433,7 +433,13 @@ export async function applyForJob(
   return application!;
 }
 
-// Get user's applications
+/**
+ * Retrieves all job applications for a user.
+ * Includes job details and company information.
+ *
+ * @param userId - The applicant's user ID
+ * @returns Array of applications with job details, ordered by recency
+ */
 export async function getUserApplications(userId: number): Promise<JobApplication[]> {
   return query<JobApplication>(
     `SELECT ja.*,
@@ -456,7 +462,14 @@ export async function getUserApplications(userId: number): Promise<JobApplicatio
   );
 }
 
-// Get applicants for a job
+/**
+ * Retrieves all applicants for a job.
+ * Includes applicant profile information.
+ * Ordered by match score descending for easy review.
+ *
+ * @param jobId - The job's unique identifier
+ * @returns Array of applications with applicant details
+ */
 export async function getJobApplicants(jobId: number): Promise<JobApplication[]> {
   return query<JobApplication>(
     `SELECT ja.*,
@@ -475,7 +488,14 @@ export async function getJobApplicants(jobId: number): Promise<JobApplication[]>
   );
 }
 
-// Update application status
+/**
+ * Updates the status of a job application.
+ * Used by recruiters to track applicant progress.
+ *
+ * @param applicationId - The application's unique identifier
+ * @param status - The new status (pending, reviewed, accepted, rejected)
+ * @returns The updated application, or null if not found
+ */
 export async function updateApplicationStatus(
   applicationId: number,
   status: 'pending' | 'reviewed' | 'accepted' | 'rejected'
@@ -488,7 +508,15 @@ export async function updateApplicationStatus(
   );
 }
 
-// Get recommended jobs for user
+/**
+ * Generates job recommendations for a user.
+ * Matches jobs based on the user's skills and excludes already-applied jobs.
+ * Ranked by skill match count.
+ *
+ * @param userId - The user to generate recommendations for
+ * @param limit - Maximum recommendations to return (default: 10)
+ * @returns Array of recommended jobs with match information
+ */
 export async function getRecommendedJobs(userId: number, limit = 10): Promise<Job[]> {
   const [userSkills, userExperiences] = await Promise.all([
     getUserSkills(userId),

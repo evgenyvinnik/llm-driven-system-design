@@ -1,8 +1,18 @@
 /**
- * Hybrid Logical Clock for CRDT operations
- * Provides causally-ordered timestamps even with clock drift
+ * @fileoverview Hybrid Logical Clock (HLC) for CRDT operations.
+ *
+ * HLCs combine physical timestamps with logical counters to provide
+ * causally-ordered timestamps even in the presence of clock drift.
+ * This is essential for ordering operations in a distributed system
+ * where multiple clients may be editing simultaneously.
+ *
+ * Reference: https://cse.buffalo.edu/tech-reports/2014-04.pdf
  */
 
+/**
+ * Represents a Hybrid Logical Clock timestamp.
+ * The combination of timestamp, counter, and nodeId ensures global uniqueness.
+ */
 export interface HLC {
   timestamp: number;
   counter: number;
@@ -16,7 +26,10 @@ let lastHLC: HLC = {
 };
 
 /**
- * Initialize HLC with a node ID
+ * Initializes the HLC with a unique node identifier.
+ * Must be called once at startup before generating timestamps.
+ *
+ * @param nodeId - Unique identifier for this server/client instance
  */
 export function initHLC(nodeId: string): void {
   lastHLC = {
@@ -27,7 +40,11 @@ export function initHLC(nodeId: string): void {
 }
 
 /**
- * Generate a new HLC timestamp
+ * Generates a new HLC timestamp for a local event.
+ * The timestamp is guaranteed to be greater than all previous timestamps
+ * from this node.
+ *
+ * @returns A new HLC timestamp
  */
 export function generateHLC(): HLC {
   const now = Date.now();
@@ -50,7 +67,11 @@ export function generateHLC(): HLC {
 }
 
 /**
- * Update local HLC based on received remote HLC
+ * Updates local HLC based on a received remote timestamp.
+ * Ensures the local clock stays synchronized with the cluster.
+ *
+ * @param remote - The HLC timestamp received from another node
+ * @returns The updated local HLC timestamp
  */
 export function receiveHLC(remote: HLC): HLC {
   const now = Date.now();
@@ -86,8 +107,11 @@ export function receiveHLC(remote: HLC): HLC {
 }
 
 /**
- * Compare two HLC timestamps
- * @returns negative if a < b, 0 if equal, positive if a > b
+ * Compares two HLC timestamps for ordering.
+ *
+ * @param a - First HLC timestamp
+ * @param b - Second HLC timestamp
+ * @returns Negative if a < b, 0 if equal, positive if a > b
  */
 export function compareHLC(a: HLC, b: HLC): number {
   if (a.timestamp !== b.timestamp) {
@@ -100,7 +124,11 @@ export function compareHLC(a: HLC, b: HLC): number {
 }
 
 /**
- * Convert HLC to a single comparable number (for database storage)
+ * Converts an HLC to a single sortable number for database storage.
+ * Combines timestamp and counter; works as long as counter < 999999.
+ *
+ * @param hlc - The HLC timestamp to convert
+ * @returns A sortable numeric representation
  */
 export function hlcToNumber(hlc: HLC): number {
   // Combine timestamp and counter into a single number
@@ -109,7 +137,12 @@ export function hlcToNumber(hlc: HLC): number {
 }
 
 /**
- * Convert number back to HLC (approximate, loses nodeId)
+ * Reconstructs an HLC from a numeric representation.
+ * Note: The nodeId is lost during numeric conversion.
+ *
+ * @param num - The numeric HLC representation
+ * @param nodeId - Optional nodeId to assign (defaults to empty string)
+ * @returns An HLC timestamp (approximate, without original nodeId)
  */
 export function numberToHLC(num: number, nodeId: string = ''): HLC {
   return {

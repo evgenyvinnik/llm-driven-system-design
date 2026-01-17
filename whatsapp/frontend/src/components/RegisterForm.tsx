@@ -1,10 +1,25 @@
+/**
+ * Registration Form Component
+ *
+ * Provides new user account creation interface.
+ * Validates password confirmation and displays error messages.
+ */
+
 import { useState, FormEvent } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Props for the RegisterForm component.
+ */
 interface RegisterFormProps {
+  /** Callback to switch to the login form */
   onSwitchToLogin: () => void;
 }
 
+/**
+ * Registration form with username, display name, and password fields.
+ * @param props - Component props including form switch callback
+ */
 export function RegisterForm({ onSwitchToLogin }: RegisterFormProps) {
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');

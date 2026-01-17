@@ -1,12 +1,25 @@
+/**
+ * Upload zone component with drag-and-drop support.
+ * Provides file upload button, folder creation, and upload progress display.
+ * Uses react-dropzone for drag-and-drop functionality.
+ * @module components/UploadZone
+ */
+
 import { useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { Upload, FolderPlus } from 'lucide-react';
 import { useFileStore } from '../stores/fileStore';
 
+/** Props for the UploadZone component */
 interface UploadZoneProps {
+  /** Callback when "New folder" button is clicked */
   onCreateFolder: () => void;
 }
 
+/**
+ * Renders the upload controls and drag-drop zone.
+ * Shows upload progress for files being uploaded.
+ */
 export function UploadZone({ onCreateFolder }: UploadZoneProps) {
   const { uploadFile, uploadingFiles } = useFileStore();
 

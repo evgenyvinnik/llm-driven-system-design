@@ -1,3 +1,10 @@
+/**
+ * File and folder management routes.
+ * Handles uploads (chunked and simple), downloads, folder operations, versioning.
+ * All routes require authentication.
+ * @module routes/files
+ */
+
 import { Router, Response } from 'express';
 import multer from 'multer';
 import {
@@ -21,7 +28,7 @@ import { getDownloadPresignedUrl } from '../utils/storage.js';
 
 const router = Router();
 
-// Configure multer for chunk uploads
+/** Multer configuration for handling file uploads in memory */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -29,10 +36,13 @@ const upload = multer({
   },
 });
 
-// Apply auth middleware to all routes
+// Require authentication for all file routes
 router.use(authMiddleware);
 
-// Get folder contents
+/**
+ * GET /api/files/folder - Get contents of root folder or specified folder.
+ * Query: folderId (optional) - folder to list contents of
+ */
 router.get('/folder', async (req: AuthRequest, res: Response) => {
   try {
     const folderId = req.query.folderId as string | undefined;
@@ -44,7 +54,9 @@ router.get('/folder', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get folder contents by ID
+/**
+ * GET /api/files/folder/:folderId - Get contents of a specific folder.
+ */
 router.get('/folder/:folderId', async (req: AuthRequest, res: Response) => {
   try {
     const contents = await getFolderContents(req.user!.id, req.params.folderId);
@@ -55,7 +67,10 @@ router.get('/folder/:folderId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Create folder
+/**
+ * POST /api/files/folder - Create a new folder.
+ * Body: { name: string, parentId?: string }
+ */
 router.post('/folder', async (req: AuthRequest, res: Response) => {
   try {
     const { name, parentId } = req.body;
@@ -73,7 +88,11 @@ router.post('/folder', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Initialize upload session
+/**
+ * POST /api/files/upload/init - Initialize a chunked upload session.
+ * Body: { fileName: string, fileSize: number, parentId?: string, chunkHashes: string[] }
+ * Returns: { uploadSessionId, chunksNeeded, totalChunks }
+ */
 router.post('/upload/init', async (req: AuthRequest, res: Response) => {
   try {
     const { fileName, fileSize, parentId, chunkHashes } = req.body;
@@ -105,7 +124,10 @@ router.post('/upload/init', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Upload chunk
+/**
+ * POST /api/files/upload/chunk - Upload a single chunk.
+ * Multipart form: chunk (file), uploadSessionId, chunkIndex, chunkHash
+ */
 router.post('/upload/chunk', upload.single('chunk'), async (req: AuthRequest, res: Response) => {
   try {
     const { uploadSessionId, chunkIndex, chunkHash } = req.body;
@@ -135,7 +157,10 @@ router.post('/upload/chunk', upload.single('chunk'), async (req: AuthRequest, re
   }
 });
 
-// Complete upload
+/**
+ * POST /api/files/upload/complete - Finalize an upload and create the file.
+ * Body: { uploadSessionId: string, chunkHashes: string[] }
+ */
 router.post('/upload/complete', async (req: AuthRequest, res: Response) => {
   try {
     const { uploadSessionId, chunkHashes } = req.body;
@@ -153,7 +178,11 @@ router.post('/upload/complete', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Simple file upload (for small files - combines init, chunk, and complete)
+/**
+ * POST /api/files/upload - Simple single-request file upload.
+ * For small files - automatically handles chunking, deduplication, and completion.
+ * Multipart form: file (required), parentId (optional)
+ */
 router.post('/upload', upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) {
@@ -215,7 +244,9 @@ router.post('/upload', upload.single('file'), async (req: AuthRequest, res: Resp
   }
 });
 
-// Get file info
+/**
+ * GET /api/files/file/:fileId - Get file or folder metadata.
+ */
 router.get('/file/:fileId', async (req: AuthRequest, res: Response) => {
   try {
     const file = await getFile(req.user!.id, req.params.fileId);
@@ -232,7 +263,10 @@ router.get('/file/:fileId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Download file
+/**
+ * GET /api/files/file/:fileId/download - Download a file.
+ * Returns file data with appropriate Content-Type and Content-Disposition headers.
+ */
 router.get('/file/:fileId/download', async (req: AuthRequest, res: Response) => {
   try {
     const { data, file } = await downloadFile(req.user!.id, req.params.fileId);
@@ -248,7 +282,10 @@ router.get('/file/:fileId/download', async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Get presigned download URLs for chunks (for parallel download)
+/**
+ * GET /api/files/file/:fileId/chunks - Get presigned URLs for parallel chunk download.
+ * Returns chunk metadata with presigned S3 URLs for direct download.
+ */
 router.get('/file/:fileId/chunks', async (req: AuthRequest, res: Response) => {
   try {
     const file = await getFile(req.user!.id, req.params.fileId);
@@ -275,7 +312,10 @@ router.get('/file/:fileId/chunks', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Rename file/folder
+/**
+ * PATCH /api/files/file/:fileId/rename - Rename a file or folder.
+ * Body: { name: string }
+ */
 router.patch('/file/:fileId/rename', async (req: AuthRequest, res: Response) => {
   try {
     const { name } = req.body;
@@ -293,7 +333,10 @@ router.patch('/file/:fileId/rename', async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Move file/folder
+/**
+ * PATCH /api/files/file/:fileId/move - Move a file or folder.
+ * Body: { parentId: string | null }
+ */
 router.patch('/file/:fileId/move', async (req: AuthRequest, res: Response) => {
   try {
     const { parentId } = req.body;
@@ -306,7 +349,9 @@ router.patch('/file/:fileId/move', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Delete file/folder
+/**
+ * DELETE /api/files/file/:fileId - Soft delete a file or folder.
+ */
 router.delete('/file/:fileId', async (req: AuthRequest, res: Response) => {
   try {
     await deleteItem(req.user!.id, req.params.fileId);
@@ -317,7 +362,9 @@ router.delete('/file/:fileId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Get file versions
+/**
+ * GET /api/files/file/:fileId/versions - Get version history for a file.
+ */
 router.get('/file/:fileId/versions', async (req: AuthRequest, res: Response) => {
   try {
     const versions = await getFileVersions(req.user!.id, req.params.fileId);
@@ -328,7 +375,9 @@ router.get('/file/:fileId/versions', async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Restore file version
+/**
+ * POST /api/files/file/:fileId/versions/:versionId/restore - Restore a previous version.
+ */
 router.post('/file/:fileId/versions/:versionId/restore', async (req: AuthRequest, res: Response) => {
   try {
     const file = await restoreFileVersion(

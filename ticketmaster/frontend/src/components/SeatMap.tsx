@@ -1,12 +1,30 @@
+/**
+ * Interactive seat map component for selecting seats in a venue section.
+ * Displays seats organized by row with color coding for pricing tiers and status.
+ * Supports seat selection for purchase workflow.
+ */
 import type { Seat } from '../types';
 
+/**
+ * Props for the SeatMap component.
+ */
 interface SeatMapProps {
+  /** Name of the section being displayed */
   section: string;
+  /** Array of seats in this section */
   seats: Seat[];
+  /** Currently selected seats by the user */
   selectedSeats: Seat[];
+  /** Callback when a seat is clicked */
   onSeatClick: (seat: Seat) => void;
 }
 
+/**
+ * Renders an interactive seat grid with visual indicators for status and pricing.
+ *
+ * @param props - Component props
+ * @returns The rendered seat map
+ */
 export function SeatMap({ section, seats, selectedSeats, onSeatClick }: SeatMapProps) {
   // Group seats by row
   const rows = seats.reduce(

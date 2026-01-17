@@ -652,3 +652,865 @@ CREATE TABLE templates (
 | Document storage | S3 with KMS | Database BLOBs | Scale, durability |
 | Workflow | State machine | Event-driven | Clarity, validation |
 | Authentication | Multi-factor | Email only | Security, compliance |
+
+---
+
+## Consistency and Idempotency Semantics
+
+### Consistency Model
+
+**Strong Consistency (PostgreSQL):**
+- All envelope state transitions, recipient status updates, and signature captures use PostgreSQL transactions
+- Read-after-write consistency for signing ceremonies ensures signers see their own updates immediately
+- The workflow state machine relies on strong consistency to prevent double-signing or invalid transitions
+
+**Eventual Consistency (Elasticsearch, Redis):**
+- Audit log indexing in Elasticsearch is eventually consistent (typically <1 second lag)
+- Search results for envelope history may lag behind writes
+- Redis session cache invalidation propagates within 100ms
+
+```javascript
+// Envelope state transition with strong consistency
+async function transitionState(envelopeId, newStatus, idempotencyKey) {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+
+    // Check for duplicate request using idempotency key
+    const existing = await client.query(`
+      SELECT * FROM idempotency_keys
+      WHERE key = $1 AND created_at > NOW() - INTERVAL '24 hours'
+    `, [idempotencyKey])
+
+    if (existing.rows.length > 0) {
+      await client.query('ROLLBACK')
+      return existing.rows[0].response  // Return cached response
+    }
+
+    // Lock envelope row for update
+    const envelope = await client.query(`
+      SELECT * FROM envelopes WHERE id = $1 FOR UPDATE
+    `, [envelopeId])
+
+    if (!envelope.rows[0]) {
+      throw new Error('Envelope not found')
+    }
+
+    const currentStatus = envelope.rows[0].status
+    const allowedTransitions = ENVELOPE_STATES[currentStatus]
+
+    if (!allowedTransitions.includes(newStatus)) {
+      throw new Error(`Invalid transition: ${currentStatus} -> ${newStatus}`)
+    }
+
+    // Perform update
+    const result = await client.query(`
+      UPDATE envelopes SET status = $2, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [envelopeId, newStatus])
+
+    // Store idempotency key with response
+    await client.query(`
+      INSERT INTO idempotency_keys (key, response, created_at)
+      VALUES ($1, $2, NOW())
+    `, [idempotencyKey, JSON.stringify(result.rows[0])])
+
+    await client.query('COMMIT')
+    return result.rows[0]
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+```
+
+### Idempotency for Core Operations
+
+**Idempotency Key Table:**
+```sql
+CREATE TABLE idempotency_keys (
+  key VARCHAR(255) PRIMARY KEY,
+  response JSONB NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Auto-cleanup old keys (run daily)
+CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
+```
+
+**Operations with Idempotency:**
+
+| Operation | Idempotency Key Format | Replay Behavior |
+|-----------|----------------------|-----------------|
+| Send envelope | `send:{envelopeId}:{userId}` | Return original response |
+| Capture signature | `sig:{fieldId}:{recipientId}` | Return existing signature |
+| Complete recipient | `complete:{recipientId}` | Return existing completion |
+| State transition | `transition:{envelopeId}:{newStatus}` | Return cached result |
+
+**Conflict Resolution:**
+
+```javascript
+// Signature capture with conflict detection
+async function captureSignatureWithConflict(recipientId, fieldId, signatureData, idempotencyKey) {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+
+    // Check idempotency first
+    const idempotent = await checkIdempotency(client, idempotencyKey)
+    if (idempotent) return idempotent
+
+    // Lock the field to prevent concurrent signing
+    const field = await client.query(`
+      SELECT * FROM document_fields WHERE id = $1 FOR UPDATE
+    `, [fieldId])
+
+    if (field.rows[0].completed) {
+      // Already signed - conflict
+      await client.query('ROLLBACK')
+      throw new ConflictError('Field already signed', {
+        existingSignatureId: field.rows[0].signature_id
+      })
+    }
+
+    // Proceed with signature capture
+    const signatureId = await createSignature(client, recipientId, fieldId, signatureData)
+
+    await storeIdempotency(client, idempotencyKey, { signatureId })
+    await client.query('COMMIT')
+
+    return { signatureId }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+```
+
+---
+
+## Async Queue Architecture (RabbitMQ)
+
+### Queue Topology
+
+For local development, we use RabbitMQ with a simple topology that supports fanout, background jobs, and backpressure.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     RabbitMQ Exchange                           │
+├─────────────────┬─────────────────────┬─────────────────────────┤
+│  docusign.direct│  docusign.fanout    │  docusign.delayed       │
+│  (direct)       │  (fanout)           │  (x-delayed-message)    │
+└────────┬────────┴──────────┬──────────┴────────────┬────────────┘
+         │                   │                       │
+    ┌────▼────┐         ┌────▼────┐            ┌────▼────┐
+    │ workflow │         │broadcast│            │ delayed │
+    │  queue   │         │ queue   │            │  queue  │
+    └────┬────┘         └────┬────┘            └────┬────┘
+         │                   │                       │
+    ┌────▼────┐         ┌────▼────┐            ┌────▼────┐
+    │Workflow │         │Notifier │            │Reminder │
+    │ Worker  │         │ Worker  │            │ Worker  │
+    └─────────┘         └─────────┘            └─────────┘
+```
+
+### Queue Configuration
+
+```javascript
+// queue/setup.js
+const amqp = require('amqplib')
+
+const QUEUES = {
+  WORKFLOW: 'docusign.workflow',
+  NOTIFICATIONS: 'docusign.notifications',
+  EMAIL: 'docusign.email',
+  PDF_PROCESSING: 'docusign.pdf',
+  REMINDERS: 'docusign.reminders',
+  DEAD_LETTER: 'docusign.dlq'
+}
+
+async function setupQueues(channel) {
+  // Dead letter exchange for failed messages
+  await channel.assertExchange('docusign.dlx', 'direct', { durable: true })
+  await channel.assertQueue(QUEUES.DEAD_LETTER, {
+    durable: true,
+    arguments: { 'x-message-ttl': 7 * 24 * 60 * 60 * 1000 } // 7 days
+  })
+  await channel.bindQueue(QUEUES.DEAD_LETTER, 'docusign.dlx', '')
+
+  // Main exchanges
+  await channel.assertExchange('docusign.direct', 'direct', { durable: true })
+  await channel.assertExchange('docusign.fanout', 'fanout', { durable: true })
+
+  // Workflow queue - processes state transitions
+  await channel.assertQueue(QUEUES.WORKFLOW, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'docusign.dlx',
+      'x-max-length': 10000  // Backpressure: max queue size
+    }
+  })
+  await channel.bindQueue(QUEUES.WORKFLOW, 'docusign.direct', 'workflow')
+
+  // Notifications queue - triggers email/SMS
+  await channel.assertQueue(QUEUES.NOTIFICATIONS, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'docusign.dlx',
+      'x-max-length': 50000
+    }
+  })
+  await channel.bindQueue(QUEUES.NOTIFICATIONS, 'docusign.direct', 'notification')
+
+  // Email queue - actual email sending
+  await channel.assertQueue(QUEUES.EMAIL, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'docusign.dlx',
+      'x-max-length': 100000
+    }
+  })
+  await channel.bindQueue(QUEUES.EMAIL, 'docusign.direct', 'email')
+
+  // PDF processing queue - document rendering, flattening
+  await channel.assertQueue(QUEUES.PDF_PROCESSING, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'docusign.dlx',
+      'x-max-length': 5000
+    }
+  })
+  await channel.bindQueue(QUEUES.PDF_PROCESSING, 'docusign.direct', 'pdf')
+
+  // Reminders queue - scheduled reminder checks
+  await channel.assertQueue(QUEUES.REMINDERS, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'docusign.dlx'
+    }
+  })
+
+  console.log('RabbitMQ queues configured')
+}
+```
+
+### Message Publishing with Delivery Guarantees
+
+```javascript
+// queue/publisher.js
+class QueuePublisher {
+  constructor(channel) {
+    this.channel = channel
+    this.confirmChannel = null
+  }
+
+  async initConfirmMode() {
+    // Publisher confirms for guaranteed delivery
+    this.confirmChannel = await this.channel.connection.createConfirmChannel()
+  }
+
+  async publishWorkflowEvent(event, options = {}) {
+    const message = {
+      id: uuid(),
+      type: event.type,
+      envelopeId: event.envelopeId,
+      data: event.data,
+      timestamp: new Date().toISOString(),
+      idempotencyKey: event.idempotencyKey || `${event.type}:${event.envelopeId}:${Date.now()}`
+    }
+
+    return new Promise((resolve, reject) => {
+      this.confirmChannel.publish(
+        'docusign.direct',
+        'workflow',
+        Buffer.from(JSON.stringify(message)),
+        {
+          persistent: true,  // Survive broker restart
+          messageId: message.id,
+          headers: {
+            'x-idempotency-key': message.idempotencyKey,
+            'x-retry-count': 0
+          }
+        },
+        (err) => {
+          if (err) {
+            reject(new Error('Message not confirmed by broker'))
+          } else {
+            resolve(message.id)
+          }
+        }
+      )
+    })
+  }
+
+  async publishNotification(notification) {
+    const message = {
+      id: uuid(),
+      recipientId: notification.recipientId,
+      type: notification.type,  // 'signing_request', 'reminder', 'completed'
+      envelopeId: notification.envelopeId,
+      channels: notification.channels || ['email'],  // 'email', 'sms'
+      timestamp: new Date().toISOString()
+    }
+
+    await this.confirmChannel.publish(
+      'docusign.direct',
+      'notification',
+      Buffer.from(JSON.stringify(message)),
+      { persistent: true, messageId: message.id }
+    )
+  }
+
+  async scheduledReminder(envelopeId, delayMs) {
+    // Use RabbitMQ delayed message plugin for local dev
+    // In production, use a scheduler like node-cron or pg-boss
+    const message = {
+      id: uuid(),
+      type: 'check_reminder',
+      envelopeId,
+      scheduledFor: new Date(Date.now() + delayMs).toISOString()
+    }
+
+    await this.channel.publish(
+      'docusign.direct',
+      'reminder',
+      Buffer.from(JSON.stringify(message)),
+      {
+        persistent: true,
+        headers: { 'x-delay': delayMs }
+      }
+    )
+  }
+}
+```
+
+### Consumer with Backpressure and Acknowledgment
+
+```javascript
+// queue/consumer.js
+class WorkflowConsumer {
+  constructor(channel, concurrency = 5) {
+    this.channel = channel
+    this.concurrency = concurrency
+  }
+
+  async start() {
+    // Prefetch limits concurrent message processing (backpressure)
+    await this.channel.prefetch(this.concurrency)
+
+    await this.channel.consume('docusign.workflow', async (msg) => {
+      if (!msg) return
+
+      const startTime = Date.now()
+      const message = JSON.parse(msg.content.toString())
+      const retryCount = msg.properties.headers['x-retry-count'] || 0
+
+      try {
+        // Check idempotency before processing
+        const processed = await this.checkProcessed(message.idempotencyKey)
+        if (processed) {
+          console.log(`Duplicate message ignored: ${message.id}`)
+          this.channel.ack(msg)
+          return
+        }
+
+        // Process the workflow event
+        await this.processEvent(message)
+
+        // Mark as processed
+        await this.markProcessed(message.idempotencyKey, message.id)
+
+        // Acknowledge success
+        this.channel.ack(msg)
+
+        console.log(`Processed ${message.type} in ${Date.now() - startTime}ms`)
+      } catch (error) {
+        console.error(`Error processing message ${message.id}:`, error)
+
+        if (retryCount < 3) {
+          // Requeue with incremented retry count
+          this.channel.nack(msg, false, false)  // Don't requeue directly
+
+          // Republish with delay and retry count
+          await this.republishWithRetry(message, retryCount + 1)
+        } else {
+          // Max retries exceeded, send to DLQ
+          console.error(`Message ${message.id} sent to DLQ after ${retryCount} retries`)
+          this.channel.nack(msg, false, false)  // Goes to DLQ via dead letter exchange
+        }
+      }
+    })
+  }
+
+  async republishWithRetry(message, retryCount) {
+    const delay = Math.min(1000 * Math.pow(2, retryCount), 60000)  // Exponential backoff, max 60s
+
+    await this.channel.publish(
+      'docusign.direct',
+      'workflow',
+      Buffer.from(JSON.stringify(message)),
+      {
+        persistent: true,
+        headers: {
+          'x-idempotency-key': message.idempotencyKey,
+          'x-retry-count': retryCount,
+          'x-delay': delay
+        }
+      }
+    )
+  }
+
+  async processEvent(message) {
+    switch (message.type) {
+      case 'envelope_sent':
+        await this.handleEnvelopeSent(message)
+        break
+      case 'recipient_completed':
+        await this.handleRecipientCompleted(message)
+        break
+      case 'envelope_completed':
+        await this.handleEnvelopeCompleted(message)
+        break
+      default:
+        console.warn(`Unknown event type: ${message.type}`)
+    }
+  }
+
+  async checkProcessed(idempotencyKey) {
+    const result = await redis.get(`processed:${idempotencyKey}`)
+    return result !== null
+  }
+
+  async markProcessed(idempotencyKey, messageId) {
+    // Keep for 24 hours
+    await redis.setex(`processed:${idempotencyKey}`, 86400, messageId)
+  }
+}
+```
+
+### Delivery Semantics Summary
+
+| Queue | Semantics | Reasoning |
+|-------|-----------|-----------|
+| workflow | At-least-once | State transitions are idempotent |
+| notifications | At-least-once | Duplicate notification is acceptable |
+| email | At-least-once | External email APIs handle dedup |
+| pdf | At-least-once | PDF generation is idempotent |
+| reminders | At-most-once | Missing reminder is acceptable |
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency Keys
+
+```javascript
+// shared/retry.js
+class RetryableOperation {
+  constructor(options = {}) {
+    this.maxRetries = options.maxRetries || 3
+    this.baseDelay = options.baseDelay || 1000
+    this.maxDelay = options.maxDelay || 30000
+  }
+
+  async execute(operation, idempotencyKey) {
+    let lastError
+    let attempt = 0
+
+    while (attempt < this.maxRetries) {
+      try {
+        // Check if already succeeded
+        const cached = await redis.get(`idempotent:${idempotencyKey}`)
+        if (cached) {
+          return JSON.parse(cached)
+        }
+
+        const result = await operation()
+
+        // Cache successful result
+        await redis.setex(`idempotent:${idempotencyKey}`, 86400, JSON.stringify(result))
+
+        return result
+      } catch (error) {
+        lastError = error
+        attempt++
+
+        if (!this.isRetryable(error)) {
+          throw error
+        }
+
+        if (attempt < this.maxRetries) {
+          const delay = Math.min(
+            this.baseDelay * Math.pow(2, attempt) + Math.random() * 1000,
+            this.maxDelay
+          )
+          await this.sleep(delay)
+        }
+      }
+    }
+
+    throw lastError
+  }
+
+  isRetryable(error) {
+    // Network errors, timeouts, and 5xx are retryable
+    if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') return true
+    if (error.response?.status >= 500) return true
+    if (error.message.includes('deadlock')) return true
+    return false
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+
+// Usage example
+const retryable = new RetryableOperation({ maxRetries: 3 })
+
+async function sendEnvelopeWithRetry(envelopeId, userId) {
+  const idempotencyKey = `send:${envelopeId}:${userId}`
+
+  return retryable.execute(async () => {
+    return await workflowEngine.sendEnvelope(envelopeId)
+  }, idempotencyKey)
+}
+```
+
+### Circuit Breaker Pattern
+
+```javascript
+// shared/circuitBreaker.js
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.name = options.name || 'default'
+    this.failureThreshold = options.failureThreshold || 5
+    this.successThreshold = options.successThreshold || 2
+    this.timeout = options.timeout || 30000  // 30 seconds open state
+
+    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.successes = 0
+    this.lastFailure = null
+    this.nextRetry = null
+  }
+
+  async execute(operation, fallback = null) {
+    if (this.state === 'OPEN') {
+      if (Date.now() < this.nextRetry) {
+        console.log(`Circuit ${this.name} is OPEN, using fallback`)
+        if (fallback) return fallback()
+        throw new Error(`Circuit ${this.name} is open`)
+      }
+      // Try to recover
+      this.state = 'HALF_OPEN'
+      console.log(`Circuit ${this.name} transitioning to HALF_OPEN`)
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      if (fallback && this.state === 'OPEN') {
+        return fallback()
+      }
+      throw error
+    }
+  }
+
+  onSuccess() {
+    if (this.state === 'HALF_OPEN') {
+      this.successes++
+      if (this.successes >= this.successThreshold) {
+        this.reset()
+        console.log(`Circuit ${this.name} CLOSED after recovery`)
+      }
+    } else {
+      this.failures = 0
+    }
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailure = Date.now()
+
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      this.nextRetry = Date.now() + this.timeout
+      console.log(`Circuit ${this.name} OPENED after ${this.failures} failures`)
+    }
+  }
+
+  reset() {
+    this.state = 'CLOSED'
+    this.failures = 0
+    this.successes = 0
+    this.lastFailure = null
+    this.nextRetry = null
+  }
+
+  getState() {
+    return {
+      name: this.name,
+      state: this.state,
+      failures: this.failures,
+      lastFailure: this.lastFailure,
+      nextRetry: this.nextRetry
+    }
+  }
+}
+
+// Circuit breakers for external services
+const circuits = {
+  email: new CircuitBreaker({ name: 'email', failureThreshold: 3, timeout: 60000 }),
+  sms: new CircuitBreaker({ name: 'sms', failureThreshold: 5, timeout: 120000 }),
+  s3: new CircuitBreaker({ name: 's3', failureThreshold: 3, timeout: 30000 }),
+  elasticsearch: new CircuitBreaker({ name: 'elasticsearch', failureThreshold: 5, timeout: 60000 })
+}
+
+// Example: S3 upload with circuit breaker
+async function uploadToS3(bucket, key, body) {
+  return circuits.s3.execute(
+    async () => {
+      return await s3.upload({ Bucket: bucket, Key: key, Body: body }).promise()
+    },
+    () => {
+      // Fallback: queue for retry later
+      return queuePublisher.publishPDFJob({
+        type: 's3_upload_retry',
+        bucket, key, body: body.toString('base64')
+      })
+    }
+  )
+}
+```
+
+### Local Development Disaster Recovery
+
+For a local learning project, we simulate multi-region DR concepts on a single machine.
+
+**Backup Strategy:**
+
+```bash
+# scripts/backup.sh - PostgreSQL backup
+#!/bin/bash
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p $BACKUP_DIR
+
+# Database backup
+pg_dump -h localhost -U docusign -d docusign_db -F c -f "$BACKUP_DIR/db.dump"
+
+# MinIO backup (sync to local folder)
+mc mirror minio/docusign-documents "$BACKUP_DIR/documents/"
+mc mirror minio/docusign-signatures "$BACKUP_DIR/signatures/"
+
+# Redis backup (RDB snapshot)
+redis-cli BGSAVE
+cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis.rdb"
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+**Restore Testing:**
+
+```bash
+# scripts/restore-test.sh - Verify backup can be restored
+#!/bin/bash
+BACKUP_DIR=$1
+TEST_DB="docusign_restore_test"
+
+echo "Testing restore from $BACKUP_DIR..."
+
+# Create test database
+createdb -h localhost -U docusign $TEST_DB
+
+# Restore database
+pg_restore -h localhost -U docusign -d $TEST_DB "$BACKUP_DIR/db.dump"
+
+# Verify critical tables
+psql -h localhost -U docusign -d $TEST_DB -c "
+SELECT
+  (SELECT COUNT(*) FROM envelopes) as envelopes,
+  (SELECT COUNT(*) FROM documents) as documents,
+  (SELECT COUNT(*) FROM signatures) as signatures,
+  (SELECT COUNT(*) FROM audit_events) as audit_events;
+"
+
+# Verify audit chain integrity
+psql -h localhost -U docusign -d $TEST_DB -c "
+SELECT envelope_id, COUNT(*) as events,
+       CASE WHEN COUNT(*) = COUNT(DISTINCT hash) THEN 'OK' ELSE 'CORRUPTED' END as chain_status
+FROM audit_events
+GROUP BY envelope_id;
+"
+
+# Cleanup
+dropdb -h localhost -U docusign $TEST_DB
+
+echo "Restore test completed"
+```
+
+**docker-compose.yml additions for local DR simulation:**
+
+```yaml
+services:
+  postgres-primary:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: docusign_db
+      POSTGRES_USER: docusign
+      POSTGRES_PASSWORD: docusign123
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+
+  postgres-replica:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: docusign_db
+      POSTGRES_USER: docusign
+      POSTGRES_PASSWORD: docusign123
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    # In production: configure streaming replication
+    # For learning: manual sync with pg_dump/pg_restore
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: docusign
+      RABBITMQ_DEFAULT_PASS: docusign123
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  rabbitmq-data:
+```
+
+### Graceful Degradation
+
+```javascript
+// shared/degradation.js
+class GracefulDegradation {
+  constructor() {
+    this.degradedFeatures = new Set()
+  }
+
+  async withFallback(feature, primary, fallback) {
+    if (this.degradedFeatures.has(feature)) {
+      console.log(`Feature ${feature} degraded, using fallback`)
+      return fallback()
+    }
+
+    try {
+      return await primary()
+    } catch (error) {
+      console.error(`Feature ${feature} failed, degrading:`, error.message)
+      this.degradedFeatures.add(feature)
+
+      // Auto-recover after 5 minutes
+      setTimeout(() => {
+        this.degradedFeatures.delete(feature)
+        console.log(`Feature ${feature} recovery attempted`)
+      }, 5 * 60 * 1000)
+
+      return fallback()
+    }
+  }
+}
+
+const degradation = new GracefulDegradation()
+
+// Example: Elasticsearch search with DB fallback
+async function searchEnvelopes(userId, query) {
+  return degradation.withFallback(
+    'elasticsearch_search',
+    // Primary: Elasticsearch
+    async () => {
+      return await elasticsearch.search({
+        index: 'envelopes',
+        body: { query: { bool: { must: [
+          { term: { sender_id: userId } },
+          { multi_match: { query, fields: ['name', 'recipients.email'] } }
+        ]}}}
+      })
+    },
+    // Fallback: PostgreSQL LIKE query (slower but functional)
+    async () => {
+      const result = await db.query(`
+        SELECT e.* FROM envelopes e
+        LEFT JOIN recipients r ON e.id = r.envelope_id
+        WHERE e.sender_id = $1
+          AND (e.name ILIKE $2 OR r.email ILIKE $2)
+        LIMIT 50
+      `, [userId, `%${query}%`])
+      return result.rows
+    }
+  )
+}
+```
+
+### Health Checks and Recovery
+
+```javascript
+// shared/health.js
+async function healthCheck() {
+  const checks = {
+    postgres: await checkPostgres(),
+    redis: await checkRedis(),
+    rabbitmq: await checkRabbitMQ(),
+    minio: await checkMinIO(),
+    elasticsearch: await checkElasticsearch()
+  }
+
+  const healthy = Object.values(checks).every(c => c.status === 'healthy')
+
+  return {
+    status: healthy ? 'healthy' : 'degraded',
+    timestamp: new Date().toISOString(),
+    checks
+  }
+}
+
+async function checkPostgres() {
+  try {
+    const start = Date.now()
+    await db.query('SELECT 1')
+    return { status: 'healthy', latencyMs: Date.now() - start }
+  } catch (error) {
+    return { status: 'unhealthy', error: error.message }
+  }
+}
+
+async function checkRabbitMQ() {
+  try {
+    const start = Date.now()
+    const conn = await amqp.connect(process.env.RABBITMQ_URL)
+    await conn.close()
+    return { status: 'healthy', latencyMs: Date.now() - start }
+  } catch (error) {
+    return { status: 'unhealthy', error: error.message }
+  }
+}
+
+// Expose health endpoint
+app.get('/health', async (req, res) => {
+  const health = await healthCheck()
+  res.status(health.status === 'healthy' ? 200 : 503).json(health)
+})
+```

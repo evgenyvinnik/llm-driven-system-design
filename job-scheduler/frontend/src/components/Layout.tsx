@@ -1,5 +1,15 @@
+/**
+ * Main layout component with navigation bar.
+ * Provides consistent page structure with navigation and content area.
+ * @module components/Layout
+ */
+
 import { Link, useRouterState } from '@tanstack/react-router';
 
+/**
+ * Application layout wrapper with navigation.
+ * @param children - Page content to render in the main area
+ */
 export function Layout({ children }: { children: React.ReactNode }) {
   const router = useRouterState();
   const currentPath = router.location.pathname;

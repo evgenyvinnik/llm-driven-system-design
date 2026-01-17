@@ -1,13 +1,24 @@
+/**
+ * Modal form for creating new jobs.
+ * Collects job configuration including handler, schedule, and payload.
+ * @module components/CreateJobModal
+ */
+
 import { useState } from 'react';
 import { CreateJobInput } from '../types';
 import { Button, Input, TextArea, Select, Modal } from './UI';
 
+/** Props for the CreateJobModal component */
 interface CreateJobModalProps {
+  /** Controls modal visibility */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
+  /** Async callback to create the job with collected input */
   onCreate: (input: CreateJobInput) => Promise<void>;
 }
 
+/** Available job handlers with display labels */
 const HANDLERS = [
   { value: 'test.echo', label: 'Test Echo' },
   { value: 'test.delay', label: 'Test Delay' },
@@ -17,6 +28,10 @@ const HANDLERS = [
   { value: 'system.cleanup', label: 'System Cleanup' },
 ];
 
+/**
+ * Form modal for job creation with validation.
+ * Handles form state, JSON payload parsing, and error display.
+ */
 export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProps) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');

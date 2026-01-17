@@ -1,14 +1,32 @@
+/**
+ * Post card component for displaying feed posts.
+ * Handles displaying post content, author info, and engagement features.
+ * Supports liking, commenting, and viewing post details.
+ *
+ * @module components/PostCard
+ */
 import { useState } from 'react';
 import { ThumbsUp, MessageCircle, Share2, Send } from 'lucide-react';
 import { Link } from '@tanstack/react-router';
 import type { Post, PostComment } from '../types';
 import { feedApi } from '../services/api';
 
+/**
+ * Props for the PostCard component.
+ */
 interface PostCardProps {
   post: Post;
   onLikeToggle?: (postId: number, liked: boolean) => void;
 }
 
+/**
+ * Displays a single post in the feed with engagement features.
+ * Includes author info, post content, like/comment counts, and action buttons.
+ * Comments section expands on demand with lazy loading.
+ *
+ * @param post - The post data to display
+ * @param onLikeToggle - Optional callback when like state changes
+ */
 export function PostCard({ post, onLikeToggle }: PostCardProps) {
   const [liked, setLiked] = useState(post.has_liked || false);
   const [likeCount, setLikeCount] = useState(post.like_count);

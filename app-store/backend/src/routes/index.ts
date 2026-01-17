@@ -1,3 +1,8 @@
+/**
+ * @fileoverview API route definitions for the App Store backend.
+ * Organizes routes by domain: auth, catalog, reviews, and developer.
+ */
+
 import { Router } from 'express';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import * as catalogController from '../controllers/catalogController.js';
@@ -6,14 +11,19 @@ import * as authController from '../controllers/authController.js';
 import * as developerController from '../controllers/developerController.js';
 import { authenticate, optionalAuth, requireDeveloper } from '../middleware/auth.js';
 
+/** Express router with all API routes */
 const router = Router();
 
+// =============================================================================
 // Health check
+// =============================================================================
 router.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Auth routes
+// =============================================================================
+// Auth routes - User authentication and profile management
+// =============================================================================
 router.post('/auth/register', asyncHandler(authController.register));
 router.post('/auth/login', asyncHandler(authController.login));
 router.post('/auth/logout', authenticate, asyncHandler(authController.logout));
@@ -22,7 +32,9 @@ router.put('/auth/profile', authenticate, asyncHandler(authController.updateProf
 router.post('/auth/change-password', authenticate, asyncHandler(authController.changePassword));
 router.post('/auth/become-developer', authenticate, asyncHandler(authController.becomeDeveloper));
 
-// Catalog routes (public)
+// =============================================================================
+// Catalog routes (public) - App discovery and browsing
+// =============================================================================
 router.get('/categories', asyncHandler(catalogController.getCategories));
 router.get('/categories/:slug', asyncHandler(catalogController.getCategoryBySlug));
 router.get('/apps', asyncHandler(catalogController.getApps));
@@ -32,7 +44,9 @@ router.get('/apps/suggest', asyncHandler(catalogController.getSearchSuggestions)
 router.get('/apps/:id', asyncHandler(catalogController.getAppById));
 router.post('/apps/:id/download', optionalAuth, asyncHandler(catalogController.downloadApp));
 
-// Review routes
+// =============================================================================
+// Review routes - App reviews and ratings
+// =============================================================================
 router.get('/apps/:appId/reviews', asyncHandler(reviewController.getReviewsForApp));
 router.get('/apps/:appId/ratings', asyncHandler(reviewController.getRatingSummary));
 router.post('/apps/:appId/reviews', authenticate, asyncHandler(reviewController.createReview));
@@ -41,7 +55,9 @@ router.delete('/reviews/:id', authenticate, asyncHandler(reviewController.delete
 router.post('/reviews/:id/vote', authenticate, asyncHandler(reviewController.voteReview));
 router.post('/reviews/:id/respond', authenticate, requireDeveloper, asyncHandler(reviewController.respondToReview));
 
-// Developer routes
+// =============================================================================
+// Developer routes - App management for developers
+// =============================================================================
 router.get('/developer/apps', authenticate, requireDeveloper, asyncHandler(developerController.getDeveloperApps));
 router.post('/developer/apps', authenticate, requireDeveloper, asyncHandler(developerController.createApp));
 router.put('/developer/apps/:id', authenticate, requireDeveloper, asyncHandler(developerController.updateApp));

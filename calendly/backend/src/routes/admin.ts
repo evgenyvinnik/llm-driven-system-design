@@ -6,13 +6,20 @@ import { emailService } from '../services/emailService.js';
 import { pool } from '../db/index.js';
 import { requireAdmin } from '../middleware/auth.js';
 
+/**
+ * Express router for admin-only operations.
+ * Provides system-wide statistics, user management, and monitoring.
+ * All routes require admin authentication.
+ */
 const router = Router();
 
 // All admin routes require admin authentication
 router.use(requireAdmin);
 
 /**
- * GET /api/admin/stats - Get system-wide statistics
+ * GET /api/admin/stats - Get system-wide statistics.
+ * Provides aggregate counts of users, meeting types, bookings, and emails.
+ * @returns System statistics object
  */
 router.get('/stats', async (req: Request, res: Response) => {
   try {
@@ -53,7 +60,9 @@ router.get('/stats', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/users - Get all users
+ * GET /api/admin/users - Get all users in the system.
+ * Returns full user list for admin management.
+ * @returns {User[]} Array of all users
  */
 router.get('/users', async (req: Request, res: Response) => {
   try {
@@ -72,7 +81,11 @@ router.get('/users', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/bookings - Get all bookings with filters
+ * GET /api/admin/bookings - Get all bookings with optional filters.
+ * Returns bookings with meeting type and host information.
+ * @query {limit} - Maximum number of results (default 100)
+ * @query {status} - Optional filter by status
+ * @returns {Booking[]} Array of bookings with details
  */
 router.get('/bookings', async (req: Request, res: Response) => {
   try {
@@ -114,7 +127,10 @@ router.get('/bookings', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/emails - Get email notification logs
+ * GET /api/admin/emails - Get email notification logs.
+ * For monitoring email delivery and debugging issues.
+ * @query {limit} - Maximum number of results (default 100)
+ * @returns Email notification records
  */
 router.get('/emails', async (req: Request, res: Response) => {
   try {
@@ -134,7 +150,10 @@ router.get('/emails', async (req: Request, res: Response) => {
 });
 
 /**
- * DELETE /api/admin/users/:id - Delete a user (admin only)
+ * DELETE /api/admin/users/:id - Delete a user account.
+ * Prevents admin from deleting their own account.
+ * @param {id} - User UUID
+ * @returns {message} Success message
  */
 router.delete('/users/:id', async (req: Request, res: Response) => {
   try {
@@ -170,7 +189,10 @@ router.delete('/users/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/bookings/recent - Get recent booking activity
+ * GET /api/admin/bookings/recent - Get recent booking activity.
+ * Aggregates daily booking counts for the last 30 days.
+ * Useful for activity monitoring and trends.
+ * @returns Daily booking and cancellation counts
  */
 router.get('/bookings/recent', async (req: Request, res: Response) => {
   try {

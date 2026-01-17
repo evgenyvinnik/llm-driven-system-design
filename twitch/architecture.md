@@ -334,3 +334,771 @@ CREATE TABLE channel_bans (
 | Chat transport | WebSocket + Pub/Sub | HTTP polling | Low latency |
 | VOD storage | Segment archive | Re-encode | Instant availability |
 | Transcoding | Per-stream workers | Shared | Isolation |
+
+---
+
+## Consistency and Idempotency Semantics
+
+### Write Consistency Models
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Stream key validation | Strong (PostgreSQL) | Must reject invalid keys immediately |
+| Go live / offline status | Strong (PostgreSQL) | Viewers need accurate live state |
+| Chat messages | Eventual (Redis pub/sub) | Slight delay acceptable; duplicates filtered client-side |
+| Viewer counts | Eventual (Redis counter) | Approximate counts are acceptable |
+| Subscriptions/payments | Strong (PostgreSQL with transactions) | Financial accuracy required |
+| Follow/unfollow | Strong (PostgreSQL) | User expects immediate feedback |
+| VOD segment writes | Eventual (S3/MinIO) | Segments processed in order by sequence number |
+
+### Idempotency Keys
+
+**Subscription Creation:**
+```javascript
+// Client generates idempotency key for payment operations
+const idempotencyKey = `sub:${userId}:${channelId}:${Date.now()}`
+
+// Server checks before processing
+async function createSubscription(userId, channelId, tier, idempotencyKey) {
+  // Check if already processed
+  const existing = await redis.get(`idempotency:${idempotencyKey}`)
+  if (existing) {
+    return JSON.parse(existing) // Return cached result
+  }
+
+  // Process subscription in transaction
+  const result = await db.transaction(async (tx) => {
+    const sub = await tx.insert(subscriptions).values({
+      user_id: userId,
+      channel_id: channelId,
+      tier: tier,
+      started_at: new Date(),
+      expires_at: addMonths(new Date(), 1)
+    }).returning()
+    return sub[0]
+  })
+
+  // Cache result with 24h TTL
+  await redis.setex(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(result))
+  return result
+}
+```
+
+**Stream Start Event:**
+```javascript
+// Prevent duplicate "go live" events from RTMP reconnects
+async function handleStreamConnect(channelId, streamKey) {
+  const lockKey = `stream_lock:${channelId}`
+  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 10)
+
+  if (!acquired) {
+    // Another connection is being processed
+    return { status: 'duplicate', action: 'reject' }
+  }
+
+  try {
+    const channel = await db.query.channels.findFirst({
+      where: eq(channels.stream_key, streamKey)
+    })
+
+    if (channel.is_live) {
+      // Already live - this is a reconnect, not a new stream
+      return { status: 'reconnect', streamId: channel.current_stream_id }
+    }
+
+    // New stream - create stream record
+    const stream = await startNewStream(channelId)
+    return { status: 'new', streamId: stream.id }
+  } finally {
+    await redis.del(lockKey)
+  }
+}
+```
+
+### Chat Message Deduplication
+
+```javascript
+// Client-side: Include message ID for dedup
+const messageId = `${userId}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+
+// Server-side: Track recent message IDs in Redis set with TTL
+async function processChatMessage(channelId, userId, messageId, content) {
+  const dedupKey = `chat_dedup:${channelId}`
+
+  // Check if already processed (SADD returns 0 if member exists)
+  const isNew = await redis.sadd(dedupKey, messageId)
+  if (!isNew) {
+    return { status: 'duplicate', dropped: true }
+  }
+
+  // Set TTL on the set (5 minutes window)
+  await redis.expire(dedupKey, 300)
+
+  // Broadcast message
+  await redis.publish(`chat:${channelId}`, JSON.stringify({
+    id: messageId,
+    userId,
+    content,
+    timestamp: Date.now()
+  }))
+
+  return { status: 'sent' }
+}
+```
+
+### Conflict Resolution
+
+**Concurrent Stream Updates (e.g., title change during live):**
+```sql
+-- Use optimistic locking with version column
+ALTER TABLE channels ADD COLUMN version INTEGER DEFAULT 1;
+
+-- Update only if version matches
+UPDATE channels
+SET title = $1, version = version + 1
+WHERE id = $2 AND version = $3
+RETURNING version;
+
+-- If no rows returned, fetch current state and retry or notify user
+```
+
+---
+
+## Observability
+
+### Metrics (Prometheus)
+
+**Key Metrics for Local Development:**
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'twitch-api'
+    static_configs:
+      - targets: ['localhost:3001', 'localhost:3002', 'localhost:3003']
+
+  - job_name: 'twitch-chat'
+    static_configs:
+      - targets: ['localhost:3010']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['localhost:9121']  # redis_exporter
+```
+
+**Application Metrics (Express middleware):**
+```javascript
+import { Registry, Counter, Histogram, Gauge } from 'prom-client'
+
+const register = new Registry()
+
+// HTTP request metrics
+const httpRequestDuration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+})
+
+// Business metrics
+const activeStreams = new Gauge({
+  name: 'twitch_active_streams',
+  help: 'Number of currently live streams'
+})
+
+const chatMessagesTotal = new Counter({
+  name: 'twitch_chat_messages_total',
+  help: 'Total chat messages processed',
+  labelNames: ['channel_id']
+})
+
+const wsConnections = new Gauge({
+  name: 'twitch_websocket_connections',
+  help: 'Active WebSocket connections',
+  labelNames: ['server_instance']
+})
+
+const viewerCount = new Gauge({
+  name: 'twitch_viewer_count',
+  help: 'Total viewers across all streams'
+})
+
+// Expose metrics endpoint
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType)
+  res.end(await register.metrics())
+})
+```
+
+### Structured Logging
+
+```javascript
+import pino from 'pino'
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  },
+  base: {
+    service: 'twitch-api',
+    instance: process.env.INSTANCE_ID || 'local'
+  }
+})
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now()
+  res.on('finish', () => {
+    logger.info({
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
+      user_id: req.session?.userId,
+      trace_id: req.headers['x-trace-id']
+    }, 'request completed')
+  })
+  next()
+})
+
+// Business event logging
+function logStreamEvent(eventType, channelId, metadata = {}) {
+  logger.info({
+    event_type: eventType,
+    channel_id: channelId,
+    ...metadata
+  }, `stream ${eventType}`)
+}
+
+// Usage
+logStreamEvent('go_live', 123, { title: 'Gaming Stream', category: 'Fortnite' })
+logStreamEvent('end_stream', 123, { duration_minutes: 120, peak_viewers: 450 })
+```
+
+### Distributed Tracing (OpenTelemetry)
+
+```javascript
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
+import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
+import { JaegerExporter } from '@opentelemetry/exporter-jaeger'
+import { trace } from '@opentelemetry/api'
+
+// Setup (in instrumentation.ts, loaded before app)
+const provider = new NodeTracerProvider()
+provider.addSpanProcessor(new SimpleSpanProcessor(
+  new JaegerExporter({ endpoint: 'http://localhost:14268/api/traces' })
+))
+provider.register()
+
+const tracer = trace.getTracer('twitch-api')
+
+// Trace chat message flow
+async function handleChatMessage(channelId, userId, message) {
+  const span = tracer.startSpan('chat.process_message')
+  span.setAttributes({
+    'chat.channel_id': channelId,
+    'chat.user_id': userId,
+    'chat.message_length': message.length
+  })
+
+  try {
+    // Validate
+    const validateSpan = tracer.startSpan('chat.validate', { parent: span })
+    const canChat = await validateChat(userId, channelId)
+    validateSpan.end()
+
+    if (!canChat) {
+      span.setStatus({ code: SpanStatusCode.OK, message: 'rate limited' })
+      return
+    }
+
+    // Publish
+    const publishSpan = tracer.startSpan('chat.publish_redis', { parent: span })
+    await redis.publish(`chat:${channelId}`, JSON.stringify({ userId, message }))
+    publishSpan.end()
+
+    span.setStatus({ code: SpanStatusCode.OK })
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
+    throw error
+  } finally {
+    span.end()
+  }
+}
+```
+
+### SLI Dashboards (Grafana)
+
+**Dashboard Panels for Local Development:**
+
+```json
+{
+  "panels": [
+    {
+      "title": "API Request Latency (p95)",
+      "type": "graph",
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))"
+      }]
+    },
+    {
+      "title": "Active Streams",
+      "type": "stat",
+      "targets": [{
+        "expr": "twitch_active_streams"
+      }]
+    },
+    {
+      "title": "Chat Messages/sec",
+      "type": "graph",
+      "targets": [{
+        "expr": "rate(twitch_chat_messages_total[1m])"
+      }]
+    },
+    {
+      "title": "WebSocket Connections",
+      "type": "graph",
+      "targets": [{
+        "expr": "sum(twitch_websocket_connections)"
+      }]
+    },
+    {
+      "title": "Error Rate",
+      "type": "graph",
+      "targets": [{
+        "expr": "sum(rate(http_request_duration_seconds_count{status_code=~\"5..\"}[5m])) / sum(rate(http_request_duration_seconds_count[5m]))"
+      }]
+    }
+  ]
+}
+```
+
+### Alert Thresholds
+
+| Alert | Condition | Severity | Action |
+|-------|-----------|----------|--------|
+| High API Latency | p95 > 500ms for 5 min | Warning | Check database queries |
+| Error Rate Spike | 5xx rate > 1% for 2 min | Critical | Check logs, rollback if needed |
+| Redis Connection Lost | Connection down > 30s | Critical | Chat will fail; restart Redis |
+| No Active Streams | 0 streams for 10 min (during expected hours) | Warning | Check ingest service |
+| WebSocket Saturation | Connections > 80% limit | Warning | Scale chat pods |
+| Database Pool Exhausted | Available connections < 5 | Critical | Increase pool or find leaks |
+
+**Alertmanager Config (for local testing):**
+```yaml
+# alertmanager.yml
+route:
+  receiver: 'console'
+  group_wait: 30s
+
+receivers:
+  - name: 'console'
+    webhook_configs:
+      - url: 'http://localhost:3099/alerts'  # Local webhook for testing
+```
+
+### Audit Logging
+
+```javascript
+// Audit log for security-sensitive operations
+const auditLogger = pino({
+  level: 'info',
+  base: { type: 'audit' }
+}).child({
+  destination: pino.destination('./logs/audit.log')
+})
+
+// Audit events
+function audit(action, actor, resource, details = {}) {
+  auditLogger.info({
+    action,
+    actor_id: actor.userId,
+    actor_ip: actor.ip,
+    resource_type: resource.type,
+    resource_id: resource.id,
+    details,
+    timestamp: new Date().toISOString()
+  })
+}
+
+// Usage examples
+audit('stream_key.regenerate', { userId: 123, ip: req.ip }, { type: 'channel', id: 456 })
+audit('user.ban', { userId: 123, ip: req.ip }, { type: 'user', id: 789 }, { reason: 'spam', channel_id: 456 })
+audit('subscription.create', { userId: 123, ip: req.ip }, { type: 'subscription', id: 101 }, { tier: 1, channel_id: 456 })
+audit('admin.login', { userId: 1, ip: req.ip }, { type: 'session', id: 'sess123' })
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency
+
+```javascript
+// Generic retry wrapper with exponential backoff
+async function withRetry(operation, options = {}) {
+  const {
+    maxRetries = 3,
+    baseDelayMs = 100,
+    maxDelayMs = 5000,
+    idempotencyKey = null,
+    retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED']
+  } = options
+
+  // Check if already completed (for idempotent operations)
+  if (idempotencyKey) {
+    const cached = await redis.get(`retry:${idempotencyKey}`)
+    if (cached) return JSON.parse(cached)
+  }
+
+  let lastError
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await operation()
+
+      // Cache successful result for idempotent operations
+      if (idempotencyKey) {
+        await redis.setex(`retry:${idempotencyKey}`, 3600, JSON.stringify(result))
+      }
+
+      return result
+    } catch (error) {
+      lastError = error
+
+      // Don't retry non-retryable errors
+      if (!retryableErrors.includes(error.code) && !error.retryable) {
+        throw error
+      }
+
+      if (attempt < maxRetries) {
+        const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs)
+        const jitter = delay * 0.1 * Math.random()
+        await sleep(delay + jitter)
+
+        logger.warn({
+          attempt: attempt + 1,
+          max_retries: maxRetries,
+          error: error.message,
+          next_delay_ms: delay
+        }, 'retrying operation')
+      }
+    }
+  }
+
+  throw lastError
+}
+
+// Usage: Retry VOD segment upload
+await withRetry(
+  () => s3.putObject({ bucket: 'vods', key: segmentKey, body: segmentData }),
+  { idempotencyKey: `segment:${streamId}:${sequence}`, maxRetries: 5 }
+)
+```
+
+### Circuit Breaker
+
+```javascript
+// Simple circuit breaker implementation
+class CircuitBreaker {
+  constructor(name, options = {}) {
+    this.name = name
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeoutMs = options.resetTimeoutMs || 30000
+    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.lastFailureTime = null
+  }
+
+  async call(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
+        this.state = 'HALF_OPEN'
+        logger.info({ circuit: this.name }, 'circuit breaker half-open, testing')
+      } else {
+        throw new Error(`Circuit breaker ${this.name} is OPEN`)
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+    if (this.state === 'HALF_OPEN') {
+      this.state = 'CLOSED'
+      logger.info({ circuit: this.name }, 'circuit breaker closed')
+    }
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailureTime = Date.now()
+
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      logger.error({ circuit: this.name, failures: this.failures }, 'circuit breaker opened')
+    }
+  }
+}
+
+// Circuit breakers for external dependencies
+const circuitBreakers = {
+  database: new CircuitBreaker('database', { failureThreshold: 3, resetTimeoutMs: 10000 }),
+  redis: new CircuitBreaker('redis', { failureThreshold: 5, resetTimeoutMs: 5000 }),
+  s3: new CircuitBreaker('s3', { failureThreshold: 5, resetTimeoutMs: 30000 })
+}
+
+// Usage
+async function getChannel(channelId) {
+  return circuitBreakers.database.call(async () => {
+    return db.query.channels.findFirst({ where: eq(channels.id, channelId) })
+  })
+}
+```
+
+### Graceful Degradation
+
+```javascript
+// Fallback strategies when services are unavailable
+
+// Chat: Fall back to local broadcast if Redis is down
+async function broadcastChatMessage(channelId, message) {
+  try {
+    await circuitBreakers.redis.call(() =>
+      redis.publish(`chat:${channelId}`, JSON.stringify(message))
+    )
+  } catch (error) {
+    logger.warn({ channel_id: channelId }, 'Redis unavailable, using local broadcast only')
+    // Only broadcast to local WebSocket connections
+    localBroadcast(channelId, message)
+  }
+}
+
+// Viewer count: Use cached value if Redis is down
+async function getViewerCount(channelId) {
+  try {
+    return await circuitBreakers.redis.call(() =>
+      redis.get(`viewers:${channelId}`)
+    )
+  } catch (error) {
+    // Return last known value from local cache
+    return localViewerCache.get(channelId) || 0
+  }
+}
+
+// VOD: Queue for retry if S3 upload fails
+async function uploadVodSegment(streamId, sequence, data) {
+  try {
+    await circuitBreakers.s3.call(() =>
+      s3.putObject({ bucket: 'vods', key: `${streamId}/${sequence}.ts`, body: data })
+    )
+  } catch (error) {
+    // Write to local disk and queue for retry
+    await fs.writeFile(`/tmp/vod-queue/${streamId}-${sequence}.ts`, data)
+    await db.insert(vod_upload_queue).values({
+      stream_id: streamId,
+      sequence,
+      local_path: `/tmp/vod-queue/${streamId}-${sequence}.ts`,
+      created_at: new Date()
+    })
+    logger.warn({ stream_id: streamId, sequence }, 'VOD segment queued for retry')
+  }
+}
+```
+
+### Local Development DR Simulation
+
+For learning purposes, simulate disaster recovery scenarios:
+
+```javascript
+// scripts/chaos.js - Simulate failures for testing
+import { program } from 'commander'
+
+program
+  .command('kill-redis')
+  .description('Stop Redis to test chat fallback')
+  .action(async () => {
+    await exec('docker-compose stop redis')
+    console.log('Redis stopped. Chat should fall back to local-only mode.')
+    console.log('Run "docker-compose start redis" to restore.')
+  })
+
+program
+  .command('slow-db')
+  .description('Add latency to database queries')
+  .action(async () => {
+    // Uses pg_sleep in a middleware
+    process.env.DB_ARTIFICIAL_DELAY_MS = '500'
+    console.log('Database queries will have 500ms artificial delay.')
+  })
+
+program
+  .command('fill-disk')
+  .description('Simulate disk full for VOD storage')
+  .action(async () => {
+    // Create a large temp file in the VOD directory
+    await exec('dd if=/dev/zero of=/tmp/vod-queue/filler bs=1M count=100')
+    console.log('Added 100MB filler file. VOD uploads may fail.')
+  })
+
+program.parse()
+```
+
+### Backup and Restore Testing
+
+**Database Backup (for local development):**
+
+```bash
+#!/bin/bash
+# scripts/backup.sh
+
+BACKUP_DIR="./backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# PostgreSQL backup
+docker-compose exec -T postgres pg_dump -U postgres twitch > "$BACKUP_DIR/twitch_$TIMESTAMP.sql"
+echo "Database backed up to $BACKUP_DIR/twitch_$TIMESTAMP.sql"
+
+# Redis backup (if persistence enabled)
+docker-compose exec redis redis-cli BGSAVE
+sleep 2
+docker cp twitch-redis:/data/dump.rdb "$BACKUP_DIR/redis_$TIMESTAMP.rdb"
+echo "Redis backed up to $BACKUP_DIR/redis_$TIMESTAMP.rdb"
+
+# MinIO/S3 backup (VOD segments)
+docker-compose exec minio mc mirror /data/vods "$BACKUP_DIR/vods_$TIMESTAMP"
+echo "VOD segments backed up"
+```
+
+**Restore Script:**
+
+```bash
+#!/bin/bash
+# scripts/restore.sh
+
+BACKUP_FILE=$1
+
+if [[ -z "$BACKUP_FILE" ]]; then
+  echo "Usage: ./restore.sh <backup_file.sql>"
+  exit 1
+fi
+
+# Drop and recreate database
+docker-compose exec -T postgres psql -U postgres -c "DROP DATABASE IF EXISTS twitch"
+docker-compose exec -T postgres psql -U postgres -c "CREATE DATABASE twitch"
+
+# Restore
+docker-compose exec -T postgres psql -U postgres twitch < "$BACKUP_FILE"
+echo "Database restored from $BACKUP_FILE"
+```
+
+**Backup Verification Test:**
+
+```javascript
+// tests/backup-restore.test.js
+import { describe, it, beforeAll, afterAll } from 'vitest'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+const execAsync = promisify(exec)
+
+describe('Backup and Restore', () => {
+  let backupFile
+
+  it('should create a backup', async () => {
+    const { stdout } = await execAsync('./scripts/backup.sh')
+    expect(stdout).toContain('Database backed up')
+
+    // Extract backup filename from output
+    const match = stdout.match(/twitch_\d+_\d+\.sql/)
+    backupFile = `./backups/${match[0]}`
+  })
+
+  it('should restore from backup', async () => {
+    // Insert test data
+    await db.insert(channels).values({ name: 'test_channel', stream_key: 'test123' })
+
+    // Restore (should remove test data)
+    await execAsync(`./scripts/restore.sh ${backupFile}`)
+
+    // Verify test data is gone
+    const channel = await db.query.channels.findFirst({
+      where: eq(channels.name, 'test_channel')
+    })
+    expect(channel).toBeUndefined()
+  })
+})
+```
+
+### Health Checks
+
+```javascript
+// Comprehensive health check endpoint
+app.get('/health', async (req, res) => {
+  const checks = {
+    postgres: { status: 'unknown', latency_ms: null },
+    redis: { status: 'unknown', latency_ms: null },
+    s3: { status: 'unknown', latency_ms: null }
+  }
+
+  // PostgreSQL
+  try {
+    const start = Date.now()
+    await db.execute(sql`SELECT 1`)
+    checks.postgres = { status: 'healthy', latency_ms: Date.now() - start }
+  } catch (error) {
+    checks.postgres = { status: 'unhealthy', error: error.message }
+  }
+
+  // Redis
+  try {
+    const start = Date.now()
+    await redis.ping()
+    checks.redis = { status: 'healthy', latency_ms: Date.now() - start }
+  } catch (error) {
+    checks.redis = { status: 'unhealthy', error: error.message }
+  }
+
+  // S3/MinIO
+  try {
+    const start = Date.now()
+    await s3.headBucket({ Bucket: 'vods' })
+    checks.s3 = { status: 'healthy', latency_ms: Date.now() - start }
+  } catch (error) {
+    checks.s3 = { status: 'unhealthy', error: error.message }
+  }
+
+  const allHealthy = Object.values(checks).every(c => c.status === 'healthy')
+  res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'healthy' : 'degraded',
+    checks,
+    timestamp: new Date().toISOString()
+  })
+})
+
+// Liveness probe (just checks process is running)
+app.get('/health/live', (req, res) => {
+  res.json({ status: 'alive' })
+})
+
+// Readiness probe (checks if ready to serve traffic)
+app.get('/health/ready', async (req, res) => {
+  try {
+    await db.execute(sql`SELECT 1`)
+    await redis.ping()
+    res.json({ status: 'ready' })
+  } catch (error) {
+    res.status(503).json({ status: 'not ready', error: error.message })
+  }
+})

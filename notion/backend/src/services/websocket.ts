@@ -1,3 +1,9 @@
+/**
+ * @fileoverview WebSocket server for real-time collaboration.
+ * Handles page subscriptions, operation broadcasting, and presence tracking.
+ * Uses Hybrid Logical Clocks (HLC) for causal ordering of operations.
+ */
+
 import { WebSocketServer, WebSocket } from 'ws';
 import { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
@@ -6,11 +12,14 @@ import pool from '../models/db.js';
 import type { WSMessage, Presence, Operation } from '../types/index.js';
 import { generateHLC, hlcToNumber, initHLC } from '../utils/hlc.js';
 
-// Initialize HLC for this server instance
+/** Unique identifier for this server instance (used in HLC) */
 const serverId = uuidv4().slice(0, 8);
 initHLC(serverId);
 
-// Client connection tracking
+/**
+ * Represents an authenticated WebSocket connection.
+ * Tracks user identity, current page subscription, and activity timestamp.
+ */
 interface ClientConnection {
   ws: WebSocket;
   userId: string;
@@ -19,9 +28,19 @@ interface ClientConnection {
   lastSeen: number;
 }
 
+/** Map of client ID to connection data */
 const clients = new Map<string, ClientConnection>();
-const pageSubscriptions = new Map<string, Set<string>>(); // pageId -> Set of clientIds
 
+/** Map of page ID to set of subscribed client IDs */
+const pageSubscriptions = new Map<string, Set<string>>();
+
+/**
+ * Sets up the WebSocket server on an existing HTTP server.
+ * Handles authentication, message routing, and connection lifecycle.
+ *
+ * @param server - The HTTP server to attach WebSocket to
+ * @returns The configured WebSocketServer instance
+ */
 export function setupWebSocket(server: Server): WebSocketServer {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -146,6 +165,13 @@ export function setupWebSocket(server: Server): WebSocketServer {
   return wss;
 }
 
+/**
+ * Routes incoming WebSocket messages to appropriate handlers.
+ * Updates the connection's lastSeen timestamp for timeout tracking.
+ *
+ * @param clientId - The unique client connection ID
+ * @param message - The parsed WebSocket message
+ */
 async function handleMessage(clientId: string, message: WSMessage): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn) return;
@@ -178,6 +204,13 @@ async function handleMessage(clientId: string, message: WSMessage): Promise<void
   }
 }
 
+/**
+ * Subscribes a client to real-time updates for a page.
+ * Verifies access permissions and broadcasts presence to other viewers.
+ *
+ * @param clientId - The client connection ID
+ * @param payload - Contains the pageId to subscribe to
+ */
 async function handleSubscribe(clientId: string, payload: { pageId: string }): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn) return;
@@ -252,6 +285,12 @@ async function handleSubscribe(clientId: string, payload: { pageId: string }): P
   }, clientId);
 }
 
+/**
+ * Unsubscribes a client from the current page.
+ * Removes presence data and notifies other viewers.
+ *
+ * @param clientId - The client connection ID
+ */
 async function handleUnsubscribe(clientId: string): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn || !conn.pageId) return;
@@ -288,6 +327,13 @@ async function handleUnsubscribe(clientId: string): Promise<void> {
   }));
 }
 
+/**
+ * Handles an editing operation from a client.
+ * Persists to database with HLC timestamp and broadcasts to other subscribers.
+ *
+ * @param clientId - The client connection ID
+ * @param operation - The block operation (insert, update, delete, move)
+ */
 async function handleOperation(clientId: string, operation: Operation): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn || !conn.pageId) {
@@ -340,6 +386,13 @@ async function handleOperation(clientId: string, operation: Operation): Promise<
   }
 }
 
+/**
+ * Updates a client's cursor position and broadcasts to other viewers.
+ * Used for showing collaborative cursors in the editor.
+ *
+ * @param clientId - The client connection ID
+ * @param payload - Contains optional cursor position (block_id, offset)
+ */
 async function handlePresenceUpdate(clientId: string, payload: Partial<Presence>): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn || !conn.pageId) return;
@@ -366,6 +419,13 @@ async function handlePresenceUpdate(clientId: string, payload: Partial<Presence>
   }, clientId);
 }
 
+/**
+ * Handles a sync request from a client returning to a page.
+ * Returns all operations since the given timestamp for catching up.
+ *
+ * @param clientId - The client connection ID
+ * @param payload - Contains the timestamp to sync from
+ */
 async function handleSync(clientId: string, payload: { since: number }): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn || !conn.pageId) {
@@ -390,6 +450,14 @@ async function handleSync(clientId: string, payload: { since: number }): Promise
   }));
 }
 
+/**
+ * Broadcasts a message to all clients subscribed to a page.
+ * Optionally excludes a specific client (e.g., the sender).
+ *
+ * @param pageId - The page to broadcast to
+ * @param message - The message object to send
+ * @param excludeClientId - Optional client ID to exclude from broadcast
+ */
 function broadcastToPage(pageId: string, message: WSMessage, excludeClientId?: string): void {
   const subscribers = pageSubscriptions.get(pageId);
   if (!subscribers) return;

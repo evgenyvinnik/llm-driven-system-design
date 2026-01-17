@@ -1,9 +1,20 @@
+/**
+ * Application header component.
+ * Displays app branding, notification bell with badge, and user menu.
+ */
+
 import { useStore } from '../stores/useStore';
 
 interface HeaderProps {
   onNotificationsClick: () => void;
 }
 
+/**
+ * Header component with navigation and user controls.
+ *
+ * @param onNotificationsClick - Callback when notification bell is clicked
+ * @returns Application header bar
+ */
 export function Header({ onNotificationsClick }: HeaderProps) {
   const { user, logout, unreadCount } = useStore();
 

@@ -1,3 +1,10 @@
+/**
+ * Worker service for the job scheduler system.
+ * Polls the queue for pending executions and processes them using registered handlers.
+ * Supports concurrent job processing, retry logic, and graceful shutdown.
+ * @module worker
+ */
+
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -9,16 +16,28 @@ import { ExecutionStatus, JobStatus } from '../types';
 import { getHandler, ExecutionContext } from './handlers';
 import { migrate } from '../db/migrate';
 
+/** Unique worker ID for this instance */
 const WORKER_ID = process.env.WORKER_ID || `worker-${Date.now()}`;
+/** Maximum number of jobs to process concurrently */
 const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || '5', 10);
+/** How often to poll the queue in milliseconds */
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '100', 10);
 
+/**
+ * Worker class that processes job executions.
+ * Continuously polls the queue and runs jobs using their registered handlers.
+ * Tracks statistics and maintains heartbeat for monitoring.
+ */
 class Worker {
   private running: boolean = false;
   private activeJobs: number = 0;
   private jobsCompleted: number = 0;
   private jobsFailed: number = 0;
 
+  /**
+   * Starts the worker service.
+   * Runs migrations, registers the worker in Redis, and begins the poll loop.
+   */
   async start(): Promise<void> {
     logger.info(`Starting worker: ${WORKER_ID}`, {
       maxConcurrentJobs: MAX_CONCURRENT_JOBS,
@@ -38,6 +57,10 @@ class Worker {
     logger.info('Worker started');
   }
 
+  /**
+   * Stops the worker service gracefully.
+   * Waits for active jobs to complete before exiting.
+   */
   async stop(): Promise<void> {
     logger.info('Stopping worker...');
     this.running = false;
@@ -62,6 +85,10 @@ class Worker {
     });
   }
 
+  /**
+   * Main poll loop that dequeues and processes jobs.
+   * Respects concurrency limits and handles errors gracefully.
+   */
   private async runLoop(): Promise<void> {
     while (this.running) {
       try {
@@ -90,6 +117,12 @@ class Worker {
     }
   }
 
+  /**
+   * Processes a single job execution.
+   * Acquires locks, runs the handler, and updates status on completion.
+   * @param executionId - UUID of the execution to process
+   * @param jobId - UUID of the associated job
+   */
   private async processJob(executionId: string, jobId: string): Promise<void> {
     this.activeJobs++;
 
@@ -188,6 +221,13 @@ class Worker {
     }
   }
 
+  /**
+   * Handles job execution failure.
+   * Implements exponential backoff retry logic or moves to dead letter queue.
+   * @param executionId - UUID of the failed execution
+   * @param jobId - UUID of the associated job
+   * @param error - The error that caused the failure
+   */
   private async handleFailure(
     executionId: string,
     jobId: string,
@@ -250,6 +290,10 @@ class Worker {
     await distributedLock.release(jobId, executionId);
   }
 
+  /**
+   * Registers this worker in Redis for monitoring.
+   * Called on startup to make the worker visible to the dashboard.
+   */
   private async registerWorker(): Promise<void> {
     // Store worker info in Redis for monitoring
     const { redis } = await import('../queue/redis');
@@ -267,11 +311,18 @@ class Worker {
     );
   }
 
+  /**
+   * Removes this worker from Redis on shutdown.
+   */
   private async unregisterWorker(): Promise<void> {
     const { redis } = await import('../queue/redis');
     await redis.hdel('job_scheduler:workers', WORKER_ID);
   }
 
+  /**
+   * Updates the worker's heartbeat in Redis.
+   * Called after each job to update stats and last seen time.
+   */
   private async updateHeartbeat(): Promise<void> {
     const { redis } = await import('../queue/redis');
     await redis.hset(
@@ -288,10 +339,15 @@ class Worker {
     );
   }
 
+  /** Helper function for async delays */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /**
+   * Returns current worker statistics.
+   * @returns Object with worker ID, running state, and job counts
+   */
   getStats() {
     return {
       workerId: WORKER_ID,
@@ -303,8 +359,13 @@ class Worker {
   }
 }
 
+/** Singleton worker instance */
 const worker = new Worker();
 
+/**
+ * Graceful shutdown handlers.
+ * Ensures the worker completes active jobs before exiting.
+ */
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('Received SIGTERM, shutting down...');

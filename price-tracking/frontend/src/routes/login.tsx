@@ -1,7 +1,17 @@
+/**
+ * Login page route for user authentication.
+ * Provides email/password form for existing users.
+ * Redirects to home if already authenticated.
+ * @module routes/login
+ */
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Login page component.
+ * Handles form submission and auth state.
+ */
 function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');

@@ -1,7 +1,23 @@
-// Test Results Component
+/**
+ * @fileoverview Test Results component for displaying rate limit test outcomes.
+ *
+ * Shows a summary of test results and a scrollable table of individual results.
+ * Summary includes:
+ * - Total tests run
+ * - Allowed vs denied counts
+ * - Average latency
+ *
+ * Each result row shows timestamp, status, remaining quota, and latency.
+ */
 
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 
+/**
+ * Test results display component.
+ * Shows summary statistics and a detailed table of individual test results.
+ *
+ * @returns Test results summary and table
+ */
 export function TestResults() {
   const { testResults } = useRateLimiterStore();
 

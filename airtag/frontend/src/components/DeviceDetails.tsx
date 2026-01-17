@@ -1,3 +1,9 @@
+/**
+ * Device details panel component.
+ * Shows device info, status, and actions like play sound and lost mode.
+ * Provides device deletion with confirmation.
+ */
+
 import { useState } from 'react';
 import { useStore } from '../stores/useStore';
 import { Device } from '../types';
@@ -7,6 +13,14 @@ interface DeviceDetailsProps {
   onClose: () => void;
 }
 
+/**
+ * Device details component.
+ * Displays comprehensive device information and management controls.
+ *
+ * @param device - The device to display details for
+ * @param onClose - Callback to close the details panel
+ * @returns Device details panel with actions
+ */
 export function DeviceDetails({ device, onClose }: DeviceDetailsProps) {
   const {
     lostModeSettings,

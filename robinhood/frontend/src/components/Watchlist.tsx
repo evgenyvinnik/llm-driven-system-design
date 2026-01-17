@@ -1,3 +1,8 @@
+/**
+ * Watchlist and stock search components.
+ * Allows users to track stocks, add to watchlists, and search for new symbols.
+ */
+
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import { usePortfolioStore } from '../stores/portfolioStore';
@@ -6,6 +11,10 @@ import { QuoteCard } from './QuoteDisplay';
 import { quotesApi } from '../services/api';
 import type { Stock } from '../types';
 
+/**
+ * Displays all user watchlists with their items and real-time quotes.
+ * Allows removing items from watchlists.
+ */
 export function WatchlistView() {
   const { watchlists, fetchWatchlists, removeFromWatchlist } = usePortfolioStore();
   const { quotes, subscribe, unsubscribe } = useQuoteStore();
@@ -67,11 +76,21 @@ export function WatchlistView() {
   );
 }
 
+/**
+ * Props for the AddToWatchlistModal component.
+ */
 interface AddToWatchlistModalProps {
+  /** Stock symbol to add to a watchlist */
   symbol: string;
+  /** Callback to close the modal */
   onClose: () => void;
 }
 
+/**
+ * Modal dialog for adding a stock to an existing or new watchlist.
+ * @param symbol - Stock symbol to add
+ * @param onClose - Callback to close the modal
+ */
 export function AddToWatchlistModal({ symbol, onClose }: AddToWatchlistModalProps) {
   const { watchlists, fetchWatchlists, addToWatchlist, createWatchlist } = usePortfolioStore();
   const [newWatchlistName, setNewWatchlistName] = useState('');
@@ -163,6 +182,10 @@ export function AddToWatchlistModal({ symbol, onClose }: AddToWatchlistModalProp
   );
 }
 
+/**
+ * Stock search component with filter functionality.
+ * Displays all available stocks in a searchable grid with real-time quotes.
+ */
 export function StockSearch() {
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [search, setSearch] = useState('');

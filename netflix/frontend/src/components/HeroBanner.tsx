@@ -1,12 +1,25 @@
+/**
+ * HeroBanner Component
+ *
+ * Large featured content banner displayed at the top of the browse page.
+ * Shows featured video with backdrop image, title, description, and action buttons.
+ * Includes gradient overlays for text readability.
+ */
 import React from 'react';
 import { Link } from '@tanstack/react-router';
 import { Play, Info } from 'lucide-react';
 import type { Video } from '../types';
 
+/** Props for HeroBanner component */
 interface HeroBannerProps {
+  /** Video to feature in the banner */
   video: Video;
 }
 
+/**
+ * Hero banner for featuring a video on the homepage.
+ * Displays large backdrop with overlaid content info and action buttons.
+ */
 export function HeroBanner({ video }: HeroBannerProps) {
   // Use a placeholder backdrop for demo
   const backdropUrl = video.backdropUrl || '/placeholder-backdrop.jpg';

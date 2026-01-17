@@ -1,5 +1,20 @@
+/**
+ * Stream Info Component
+ *
+ * Header bar showing current stream title, connection status, and viewer count.
+ * Provides real-time feedback on WebSocket connection state.
+ *
+ * @module components/StreamInfo
+ */
+
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Renders the stream information header.
+ * Shows title, connection indicator, and live viewer count.
+ *
+ * @returns Stream info bar JSX or null if no stream selected
+ */
 export function StreamInfo() {
   const currentStream = useAppStore((state) => state.currentStream);
   const viewerCount = useAppStore((state) => state.viewerCount);

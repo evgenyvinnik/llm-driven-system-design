@@ -1,3 +1,10 @@
+/**
+ * File and folder sharing routes.
+ * Supports shared links (public URLs) and folder shares (user-specific).
+ * Shared links work without auth; management routes require auth.
+ * @module routes/sharing
+ */
+
 import { Router, Request, Response } from 'express';
 import {
   createSharedLink,
@@ -18,7 +25,10 @@ import { FileItem } from '../types/index.js';
 
 const router = Router();
 
-// Create shared link (requires auth)
+/**
+ * POST /api/share/link - Create a shared link for a file.
+ * Requires auth. Body: { fileId, accessLevel?, password?, expiresInHours?, maxDownloads? }
+ */
 router.post('/link', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { fileId, accessLevel, password, expiresInHours, maxDownloads } = req.body;
@@ -45,7 +55,9 @@ router.post('/link', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Get user's shared links
+/**
+ * GET /api/share/links - Get all shared links created by the current user.
+ */
 router.get('/links', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const links = await getUserSharedLinks(req.user!.id);
@@ -56,7 +68,9 @@ router.get('/links', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-// Delete shared link
+/**
+ * DELETE /api/share/link/:linkId - Delete a shared link.
+ */
 router.delete('/link/:linkId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     await deleteSharedLink(req.user!.id, req.params.linkId);
@@ -67,7 +81,10 @@ router.delete('/link/:linkId', authMiddleware, async (req: AuthRequest, res: Res
   }
 });
 
-// Access shared link - get file info
+/**
+ * GET /api/share/:token - Access a shared link and get file info.
+ * Query: password (if link is password-protected)
+ */
 router.get('/:token', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { password } = req.query;
@@ -88,7 +105,10 @@ router.get('/:token', optionalAuthMiddleware, async (req: AuthRequest, res: Resp
   }
 });
 
-// Download from shared link
+/**
+ * GET /api/share/:token/download - Download a file via shared link.
+ * Query: password (if required). Increments download counter.
+ */
 router.get('/:token/download', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { password } = req.query;
@@ -136,7 +156,10 @@ router.get('/:token/download', optionalAuthMiddleware, async (req: AuthRequest, 
   }
 });
 
-// Share folder with user
+/**
+ * POST /api/share/folder - Share a folder with another user.
+ * Body: { folderId, email, accessLevel: 'view' | 'edit' }
+ */
 router.post('/folder', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { folderId, email, accessLevel } = req.body;
@@ -159,7 +182,9 @@ router.post('/folder', authMiddleware, async (req: AuthRequest, res: Response) =
   }
 });
 
-// Get folders shared with me
+/**
+ * GET /api/share/shared-with-me - Get folders shared with the current user.
+ */
 router.get('/shared-with-me', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const folders = await getSharedWithMe(req.user!.id);
@@ -170,7 +195,9 @@ router.get('/shared-with-me', authMiddleware, async (req: AuthRequest, res: Resp
   }
 });
 
-// Get folder shares
+/**
+ * GET /api/share/folder/:folderId - Get users a folder is shared with.
+ */
 router.get('/folder/:folderId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const shares = await getFolderShares(req.user!.id, req.params.folderId);
@@ -181,7 +208,9 @@ router.get('/folder/:folderId', authMiddleware, async (req: AuthRequest, res: Re
   }
 });
 
-// Remove folder share
+/**
+ * DELETE /api/share/folder/:folderId/:userId - Remove a user from a folder share.
+ */
 router.delete('/folder/:folderId/:userId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     await removeFolderShare(req.user!.id, req.params.folderId, req.params.userId);

@@ -1,7 +1,18 @@
+/**
+ * @fileoverview Application header component.
+ * Contains logo, navigation, and authentication controls.
+ */
+
 import { Link } from '@tanstack/react-router';
 import { Search, User, LogOut, Settings } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Site header with navigation and authentication controls.
+ * Shows login/signup for unauthenticated users, user info and logout for authenticated.
+ * Displays admin link for users with admin role.
+ * @returns Sticky header with logo, nav, and auth controls
+ */
 export function Header() {
   const { user, isAuthenticated, logout } = useAuthStore();
 

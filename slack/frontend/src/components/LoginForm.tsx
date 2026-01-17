@@ -1,8 +1,19 @@
+/**
+ * @fileoverview Login and registration form component.
+ * Handles user authentication with email/password and provides demo credentials.
+ */
+
 import { useState, useEffect } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { authApi, workspaceApi } from '../services/api';
 import { useAuthStore, useWorkspaceStore } from '../stores';
 
+/**
+ * Login/Registration form component.
+ * Allows users to sign in or create a new account.
+ * On successful auth, fetches workspaces and navigates appropriately.
+ * Shows demo credentials for testing purposes.
+ */
 export function LoginForm() {
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('');

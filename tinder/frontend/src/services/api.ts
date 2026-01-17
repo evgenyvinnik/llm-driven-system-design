@@ -1,5 +1,20 @@
+/**
+ * API client module for communicating with the backend.
+ * Provides typed wrappers around fetch for all API endpoints.
+ * Handles credentials, JSON serialization, and error responses.
+ */
+
+/** Base URL for API requests (proxied in development via Vite) */
 const API_BASE = '/api';
 
+/**
+ * Generic request helper that wraps fetch with common configuration.
+ * Automatically includes credentials and handles JSON response parsing.
+ * @param endpoint - API endpoint path (appended to API_BASE)
+ * @param options - Fetch options (method, body, headers)
+ * @returns Parsed JSON response
+ * @throws Error with message from API response
+ */
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -21,7 +36,10 @@ async function request<T>(
   return response.json();
 }
 
-// Auth
+/**
+ * Authentication API endpoints.
+ * Handles login, registration, logout, and current user retrieval.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     request<{ id: string; email: string; name: string; is_admin: boolean }>('/auth/login', {
@@ -51,7 +69,10 @@ export const authApi = {
     request<import('../types').User>('/auth/me'),
 };
 
-// Users
+/**
+ * User profile and settings API endpoints.
+ * Handles profile updates, location, preferences, and photo management.
+ */
 export const userApi = {
   getProfile: () =>
     request<import('../types').User>('/users/profile'),
@@ -111,7 +132,10 @@ export const userApi = {
     }),
 };
 
-// Discovery
+/**
+ * Discovery and swiping API endpoints.
+ * Handles deck retrieval, profile viewing, and swipe actions.
+ */
 export const discoveryApi = {
   getDeck: (limit = 20) =>
     request<import('../types').DiscoveryCard[]>(`/discovery/deck?limit=${limit}`),
@@ -131,7 +155,10 @@ export const discoveryApi = {
     ),
 };
 
-// Matches
+/**
+ * Match and messaging API endpoints.
+ * Handles match list, messages, read receipts, and unmatching.
+ */
 export const matchApi = {
   getMatches: () =>
     request<import('../types').Match[]>('/matches'),
@@ -161,7 +188,10 @@ export const matchApi = {
     request<{ count: number }>('/matches/unread/count'),
 };
 
-// Admin
+/**
+ * Admin dashboard API endpoints.
+ * Provides statistics, user management, and activity monitoring.
+ */
 export const adminApi = {
   getStats: () =>
     request<import('../types').AdminStats>('/admin/stats'),

@@ -503,4 +503,5 @@ export class ReviewService {
   }
 }
 
+/** Singleton instance of the review service */
 export const reviewService = new ReviewService();

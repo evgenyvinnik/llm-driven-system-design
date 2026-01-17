@@ -1,3 +1,12 @@
+/**
+ * Main App component for the Doodle Trainer application.
+ * Provides a simple hash-based router for three views:
+ * - Drawing game (default): Users draw shapes to generate training data
+ * - Admin dashboard: Data management and model training
+ * - Implementor portal: Test trained models with live inference
+ * @module App
+ */
+
 import { useState, useCallback, useEffect } from 'react'
 import { PostItCanvas } from './components/PostItCanvas'
 import { AdminDashboard } from './routes/admin/AdminDashboard'
@@ -6,14 +15,22 @@ import { submitDrawing, getUserStats } from './services/api'
 import { sounds, isSoundEnabled, setSoundEnabled } from './utils/sounds'
 import './App.css'
 
+/** Available shape types for the drawing game */
 type Shape = 'line' | 'heart' | 'circle' | 'square' | 'triangle'
+
+/** Available views in the application */
 type View = 'draw' | 'admin' | 'implement'
 
+/** Ordered list of shapes for the drawing cycle */
 const SHAPES: Shape[] = ['line', 'heart', 'circle', 'square', 'triangle']
 
-// Milestone thresholds for celebrations
+/** Drawing count thresholds that trigger celebration animations */
 const MILESTONES = [5, 10, 25, 50, 100, 250, 500, 1000]
 
+/**
+ * Root application component.
+ * Manages routing, game state, and user statistics.
+ */
 function App() {
   // Router state (simple hash-based routing)
   const [view, setView] = useState<View>(() => {
@@ -35,9 +52,10 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [soundOn, setSoundOn] = useState(isSoundEnabled())
 
+  /** Current shape to draw in the cycle */
   const currentShape = SHAPES[currentShapeIndex]
 
-  // Listen to hash changes
+  /** Listen to hash changes for navigation */
   useEffect(() => {
     const handleHashChange = () => {
       const hash = window.location.hash.slice(1)
@@ -49,7 +67,7 @@ function App() {
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
 
-  // Load user stats on mount
+  /** Load user stats on mount */
   useEffect(() => {
     const loadStats = async () => {
       try {
@@ -66,7 +84,7 @@ function App() {
     loadStats()
   }, [])
 
-  // Toggle sound
+  /** Toggle sound effects on/off */
   const toggleSound = () => {
     const newValue = !soundOn
     setSoundOn(newValue)
@@ -74,6 +92,10 @@ function App() {
     if (newValue) sounds.click()
   }
 
+  /**
+   * Handles drawing submission.
+   * Submits to backend, updates stats, plays sounds, and cycles to next shape.
+   */
   const handleComplete = useCallback(
     async (strokeData: {
       strokes: Array<{
@@ -132,6 +154,9 @@ function App() {
     [currentShape, submitting, totalDrawings]
   )
 
+  /**
+   * Navigates to a different view using hash routing.
+   */
   const navigate = (newView: View) => {
     window.location.hash = newView === 'draw' ? '' : newView
     setView(newView)

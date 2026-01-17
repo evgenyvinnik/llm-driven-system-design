@@ -1,13 +1,29 @@
+/**
+ * @fileoverview Search input component with typeahead suggestions.
+ * Features autocomplete, trending searches, recent searches, and keyboard navigation.
+ */
+
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, X, TrendingUp, Clock, Hash, User } from 'lucide-react';
 import { useSearchStore } from '../stores/searchStore';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Props for the SearchBar component.
+ */
 interface SearchBarProps {
+  /** Callback triggered when a search is executed */
   onSearch?: (query: string) => void;
+  /** Whether to focus the input on mount */
   autoFocus?: boolean;
 }
 
+/**
+ * Search input with typeahead suggestions dropdown.
+ * Shows suggestions as user types, and displays trending/recent searches when empty.
+ * @param props - SearchBar props
+ * @returns Search bar component with suggestions dropdown
+ */
 export function SearchBar({ onSearch, autoFocus = false }: SearchBarProps) {
   const [inputValue, setInputValue] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);

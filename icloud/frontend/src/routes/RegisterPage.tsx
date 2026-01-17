@@ -4,6 +4,15 @@ import { useAuthStore } from '../stores/authStore';
 import { CloudIcon } from '../components/Icons';
 import { generateDeviceName } from '../utils/helpers';
 
+/**
+ * Registration page component for new user signup.
+ *
+ * Provides a form for users to create an account with email and password.
+ * Validates password confirmation and minimum length before submitting.
+ * On successful registration, connects the WebSocket and redirects to /drive.
+ *
+ * @returns Registration form page
+ */
 export const RegisterPage: React.FC = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');

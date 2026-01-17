@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Individual block component for rendering different block types.
+ * Supports text editing, block type conversion, and nested child blocks.
+ */
+
 import { useRef, useEffect, useState } from 'react';
 import type { Block, BlockType, RichText } from '@/types';
 import {
@@ -19,20 +24,35 @@ import {
 } from 'lucide-react';
 import { useEditorStore } from '@/stores/editor';
 
+/**
+ * Props for the BlockComponent.
+ */
 interface BlockComponentProps {
+  /** The block data to render */
   block: Block;
+  /** Direct child blocks (for toggle/nesting) */
   childBlocks: Block[];
+  /** All blocks in the page (for recursive child lookup) */
   allBlocks: Block[];
+  /** Whether this block currently has focus */
   isFocused: boolean;
+  /** Called when the block gains focus */
   onFocus: () => void;
+  /** Called when block content changes */
   onUpdate: (content: RichText[]) => void;
+  /** Called to change the block type */
   onChangeType: (type: BlockType) => void;
+  /** Called to delete the block */
   onDelete: () => void;
+  /** Called to add a new block after this one */
   onAddBlock: (type?: BlockType) => void;
+  /** Keyboard event handler for navigation */
   onKeyDown: (e: React.KeyboardEvent) => void;
+  /** Called when a slash command is detected */
   onSlashCommand: (command: string) => void;
 }
 
+/** Icon mapping for each block type in the type menu */
 const BLOCK_TYPE_ICONS: Record<BlockType, React.ReactNode> = {
   text: <Type className="w-4 h-4" />,
   heading_1: <Heading1 className="w-4 h-4" />,
@@ -52,6 +72,13 @@ const BLOCK_TYPE_ICONS: Record<BlockType, React.ReactNode> = {
   database: <Type className="w-4 h-4" />,
 };
 
+/**
+ * BlockComponent renders a single block with type-specific styling.
+ * Handles contentEditable text input, focus management, and block type menu.
+ *
+ * @param props - Component props
+ * @returns The rendered block element
+ */
 export default function BlockComponent({
   block,
   childBlocks,
@@ -409,6 +436,12 @@ export default function BlockComponent({
   );
 }
 
+/**
+ * Returns the placeholder text for a given block type.
+ *
+ * @param type - The block type
+ * @returns Placeholder string for the block
+ */
 function getPlaceholder(type: BlockType): string {
   switch (type) {
     case 'heading_1':

@@ -1,14 +1,29 @@
+/**
+ * Modal dialog for sharing files and folders.
+ * Supports creating shareable links with password, expiration, and download limits.
+ * For folders, also allows sharing with specific users via email.
+ * @module components/ShareModal
+ */
+
 import { useState } from 'react';
 import { X, Copy, Check, Lock } from 'lucide-react';
 import { FileItem, SharedLink } from '../types';
 import { sharingApi } from '../services/api';
 
+/** Props for the ShareModal component */
 interface ShareModalProps {
+  /** Whether the modal is currently visible */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
+  /** The file or folder to share (null if none selected) */
   item: FileItem | null;
 }
 
+/**
+ * Renders a modal dialog for sharing files and folders.
+ * Creates shareable links and manages folder access for specific users.
+ */
 export function ShareModal({ isOpen, onClose, item }: ShareModalProps) {
   const [link, setLink] = useState<SharedLink | null>(null);
   const [isLoading, setIsLoading] = useState(false);

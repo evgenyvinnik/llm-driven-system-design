@@ -1,11 +1,21 @@
+/**
+ * @fileoverview Categories listing page route.
+ * Displays all app categories for browsing.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useCatalogStore } from '../stores/catalogStore';
 
+/** Categories page route definition */
 export const Route = createFileRoute('/categories')({
   component: CategoriesPage,
 });
 
+/**
+ * Categories listing page component.
+ * Shows all categories with icons and subcategory counts.
+ */
 function CategoriesPage() {
   const navigate = useNavigate();
   const { categories, fetchCategories } = useCatalogStore();

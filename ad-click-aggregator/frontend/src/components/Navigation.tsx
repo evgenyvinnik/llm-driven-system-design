@@ -1,5 +1,17 @@
+/**
+ * @fileoverview Main navigation component for the dashboard.
+ * Renders the top navigation bar with links to all sections.
+ * Uses TanStack Router for client-side navigation.
+ */
+
 import { Link, useRouterState } from '@tanstack/react-router';
 
+/**
+ * Top navigation bar with links to all dashboard sections.
+ * Highlights the currently active route.
+ *
+ * @returns Navigation bar element
+ */
 export function Navigation() {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;

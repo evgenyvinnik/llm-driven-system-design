@@ -1,9 +1,20 @@
+/**
+ * Admin dashboard route - platform statistics and management.
+ * Provides admins with overview of platform metrics and activity.
+ */
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useState, useEffect } from 'react';
 import { adminApi } from '../services/api';
 import type { AdminStats } from '../types';
 
+/**
+ * Admin dashboard page component.
+ * Displays platform statistics including user counts, match rates,
+ * messaging activity, and recent signups/matches.
+ * Restricted to admin users only.
+ * @returns Admin dashboard element with statistics and activity feed
+ */
 function AdminPage() {
   const { isAuthenticated, user } = useAuthStore();
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -233,6 +244,15 @@ function AdminPage() {
   );
 }
 
+/**
+ * Reusable statistics card component for the admin dashboard.
+ * Displays a metric with title, value, and subtitle.
+ * @param props - StatCard props
+ * @param props.title - Label for the statistic
+ * @param props.value - Main value to display
+ * @param props.subtitle - Additional context or comparison
+ * @returns Stat card element
+ */
 function StatCard({
   title,
   value,

@@ -1,6 +1,16 @@
 import bcrypt from 'bcryptjs';
 import { pool, elasticsearch, redis } from './index.js';
 
+/**
+ * Database seeding script for development and testing.
+ * Creates sample users, preferences, photos, swipes, matches, and messages.
+ * Run with: npm run db:seed
+ */
+
+/**
+ * Sample user data for seeding.
+ * Includes one admin user and multiple regular users with varied profiles.
+ */
 const SAMPLE_USERS = [
   {
     email: 'admin@example.com',
@@ -128,6 +138,10 @@ const SAMPLE_USERS = [
   },
 ];
 
+/**
+ * Sample Unsplash photo URLs for user profile pictures.
+ * Uses Unsplash's image resizing service for consistent dimensions.
+ */
 const SAMPLE_PHOTOS = [
   'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&h=600&fit=crop',
   'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=600&fit=crop',
@@ -141,6 +155,11 @@ const SAMPLE_PHOTOS = [
   'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=400&h=600&fit=crop',
 ];
 
+/**
+ * Main seeding function that populates the database with sample data.
+ * Clears existing data, creates users with preferences and photos,
+ * indexes in Elasticsearch, and creates sample matches with messages.
+ */
 async function seed() {
   console.log('Starting database seed...');
 

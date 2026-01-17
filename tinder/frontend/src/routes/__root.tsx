@@ -1,7 +1,17 @@
+/**
+ * Root route component for the application.
+ * Handles initial auth check and provides the layout wrapper for all routes.
+ */
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Root component that wraps all child routes.
+ * Performs initial authentication check on mount.
+ * Shows loading spinner while verifying auth state.
+ * @returns Root layout element with Outlet for child routes
+ */
 function RootComponent() {
   const { checkAuth, isLoading } = useAuthStore();
 

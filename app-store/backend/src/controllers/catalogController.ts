@@ -1,13 +1,26 @@
+/**
+ * @fileoverview Catalog controller for public app store endpoints.
+ * Handles app listing, search, categories, and downloads.
+ */
+
 import { Request, Response } from 'express';
 import { catalogService } from '../services/catalogService.js';
 import { searchService } from '../services/searchService.js';
 import { config } from '../config/index.js';
 
+/**
+ * Retrieves all top-level categories with subcategories.
+ * GET /api/v1/categories
+ */
 export async function getCategories(req: Request, res: Response): Promise<void> {
   const categories = await catalogService.getCategories();
   res.json({ data: categories });
 }
 
+/**
+ * Retrieves a single category by its URL slug.
+ * GET /api/v1/categories/:slug
+ */
 export async function getCategoryBySlug(req: Request, res: Response): Promise<void> {
   const { slug } = req.params;
   const category = await catalogService.getCategoryBySlug(slug);
@@ -20,6 +33,15 @@ export async function getCategoryBySlug(req: Request, res: Response): Promise<vo
   res.json({ data: category });
 }
 
+/**
+ * Retrieves a paginated list of apps with optional filtering.
+ * GET /api/v1/apps
+ * @query category - Filter by category slug
+ * @query page - Page number (default: 1)
+ * @query limit - Items per page (default: 20, max: 50)
+ * @query sortBy - Sort order: downloads, rating, date
+ * @query priceType - Filter by price: free, paid, or all
+ */
 export async function getApps(req: Request, res: Response): Promise<void> {
   const {
     category,
@@ -49,6 +71,10 @@ export async function getApps(req: Request, res: Response): Promise<void> {
   res.json(apps);
 }
 
+/**
+ * Retrieves a single app by ID with similar apps.
+ * GET /api/v1/apps/:id
+ */
 export async function getAppById(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const app = await catalogService.getAppById(id);
@@ -64,6 +90,13 @@ export async function getAppById(req: Request, res: Response): Promise<void> {
   res.json({ data: { ...app, similarApps: similar } });
 }
 
+/**
+ * Retrieves top-ranked apps for charts.
+ * GET /api/v1/charts
+ * @query type - Chart type: free, paid, grossing, new
+ * @query category - Optional category slug filter
+ * @query limit - Number of apps (default: 20, max: 50)
+ */
 export async function getTopApps(req: Request, res: Response): Promise<void> {
   const { type = 'free', category, limit = '20' } = req.query;
 
@@ -82,6 +115,15 @@ export async function getTopApps(req: Request, res: Response): Promise<void> {
   res.json({ data: apps });
 }
 
+/**
+ * Searches apps using full-text search with Elasticsearch.
+ * GET /api/v1/search
+ * @query q - Search query string
+ * @query category - Optional category filter
+ * @query priceType - Filter: free, paid, all
+ * @query minRating - Minimum rating filter
+ * @query sortBy - Sort: relevance, rating, downloads, date
+ */
 export async function searchApps(req: Request, res: Response): Promise<void> {
   const {
     q = '',
@@ -106,12 +148,22 @@ export async function searchApps(req: Request, res: Response): Promise<void> {
   res.json(results);
 }
 
+/**
+ * Provides search autocomplete suggestions.
+ * GET /api/v1/search/suggest
+ * @query q - Partial search query
+ */
 export async function getSearchSuggestions(req: Request, res: Response): Promise<void> {
   const { q = '' } = req.query;
   const suggestions = await searchService.suggest(q as string, 5);
   res.json({ data: suggestions });
 }
 
+/**
+ * Records an app download and returns download URL.
+ * POST /api/v1/apps/:id/download
+ * @param id - App UUID
+ */
 export async function downloadApp(req: Request, res: Response): Promise<void> {
   const { id } = req.params;
   const app = await catalogService.getAppById(id);

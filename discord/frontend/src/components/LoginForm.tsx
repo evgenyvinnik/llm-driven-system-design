@@ -1,6 +1,21 @@
+/**
+ * Login Form Component
+ *
+ * Entry point UI for unauthenticated users. Displays a nickname input form
+ * that connects users to the Baby Discord server. Validates nickname length
+ * (2-50 characters) and displays connection errors.
+ */
+
 import { useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 
+/**
+ * Renders the login form for Baby Discord.
+ * Handles nickname validation and connection initiation.
+ * Shows loading state during connection and error messages on failure.
+ *
+ * @returns Login form centered on a dark background
+ */
 export function LoginForm() {
   const [nickname, setNickname] = useState('');
   const { connect, isConnecting, connectionError } = useChatStore();

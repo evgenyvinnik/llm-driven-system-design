@@ -1,6 +1,15 @@
+/**
+ * Main navigation header component.
+ * Displays the site logo, navigation links, and user authentication status.
+ * Shows different options for authenticated vs. guest users.
+ */
 import { Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/auth.store';
 
+/**
+ * Header component with navigation and auth controls.
+ * @returns The rendered header element
+ */
 export function Header() {
   const { user, isAuthenticated, logout } = useAuthStore();
 

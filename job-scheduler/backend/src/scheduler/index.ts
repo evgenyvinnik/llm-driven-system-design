@@ -252,13 +252,22 @@ class Scheduler {
     return this.leaderElection.getIsLeader();
   }
 
+  /**
+   * Gets this scheduler's unique instance identifier.
+   * @returns The instance ID string
+   */
   getInstanceId(): string {
     return INSTANCE_ID;
   }
 }
 
+/** Singleton scheduler instance */
 const scheduler = new Scheduler();
 
+/**
+ * Graceful shutdown handlers for SIGTERM and SIGINT signals.
+ * Ensures the scheduler releases leadership before exiting.
+ */
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('Received SIGTERM, shutting down...');

@@ -2,9 +2,16 @@ import { Router } from 'express';
 import * as projectService from '../services/projectService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Project management routes.
+ * Handles CRUD operations for projects, members, sprints, boards, labels, and components.
+ */
 const router = Router();
 
-// Get all projects
+/**
+ * GET /
+ * Returns all projects.
+ */
 router.get('/', requireAuth, async (req, res) => {
   try {
     const projects = await projectService.getAllProjects();
@@ -15,7 +22,10 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// Get project by ID or key
+/**
+ * GET /:idOrKey
+ * Returns a project by UUID or project key.
+ */
 router.get('/:idOrKey', requireAuth, async (req, res) => {
   try {
     const { idOrKey } = req.params;
@@ -39,7 +49,10 @@ router.get('/:idOrKey', requireAuth, async (req, res) => {
   }
 });
 
-// Create project
+/**
+ * POST /
+ * Creates a new project with the current user as lead.
+ */
 router.post('/', requireAuth, async (req, res) => {
   try {
     const { key, name, description, workflowId, permissionSchemeId } = req.body;
@@ -72,7 +85,10 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-// Update project
+/**
+ * PATCH /:id
+ * Updates a project's details.
+ */
 router.patch('/:id', requireAuth, async (req, res) => {
   try {
     const { name, description, lead_id, workflow_id, permission_scheme_id } = req.body;
@@ -96,7 +112,10 @@ router.patch('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Delete project
+/**
+ * DELETE /:id
+ * Deletes a project and all its data.
+ */
 router.delete('/:id', requireAuth, async (req, res) => {
   try {
     const deleted = await projectService.deleteProject(req.params.id);
@@ -112,7 +131,10 @@ router.delete('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Get project members
+/**
+ * GET /:id/members
+ * Returns all members of a project with their roles.
+ */
 router.get('/:id/members', requireAuth, async (req, res) => {
   try {
     const members = await projectService.getProjectMembers(req.params.id);
@@ -123,7 +145,10 @@ router.get('/:id/members', requireAuth, async (req, res) => {
   }
 });
 
-// Add project member
+/**
+ * POST /:id/members
+ * Adds a user to the project with a specified role.
+ */
 router.post('/:id/members', requireAuth, async (req, res) => {
   try {
     const { userId, roleId } = req.body;
@@ -140,7 +165,10 @@ router.post('/:id/members', requireAuth, async (req, res) => {
   }
 });
 
-// Remove project member
+/**
+ * DELETE /:id/members/:userId
+ * Removes a user from the project.
+ */
 router.delete('/:id/members/:userId', requireAuth, async (req, res) => {
   try {
     await projectService.removeProjectMember(req.params.id, req.params.userId);
@@ -151,7 +179,10 @@ router.delete('/:id/members/:userId', requireAuth, async (req, res) => {
   }
 });
 
-// Get project sprints
+/**
+ * GET /:id/sprints
+ * Returns all sprints for a project.
+ */
 router.get('/:id/sprints', requireAuth, async (req, res) => {
   try {
     const sprints = await projectService.getSprintsByProject(req.params.id);
@@ -162,7 +193,10 @@ router.get('/:id/sprints', requireAuth, async (req, res) => {
   }
 });
 
-// Create sprint
+/**
+ * POST /:id/sprints
+ * Creates a new sprint in the project.
+ */
 router.post('/:id/sprints', requireAuth, async (req, res) => {
   try {
     const { name, goal, startDate, endDate } = req.body;
@@ -186,7 +220,10 @@ router.post('/:id/sprints', requireAuth, async (req, res) => {
   }
 });
 
-// Get project boards
+/**
+ * GET /:id/boards
+ * Returns all boards for a project.
+ */
 router.get('/:id/boards', requireAuth, async (req, res) => {
   try {
     const boards = await projectService.getBoardsByProject(req.params.id);
@@ -197,7 +234,10 @@ router.get('/:id/boards', requireAuth, async (req, res) => {
   }
 });
 
-// Create board
+/**
+ * POST /:id/boards
+ * Creates a new board (kanban or scrum) for the project.
+ */
 router.post('/:id/boards', requireAuth, async (req, res) => {
   try {
     const { name, type, filterJql, columnConfig } = req.body;
@@ -221,7 +261,10 @@ router.post('/:id/boards', requireAuth, async (req, res) => {
   }
 });
 
-// Get project labels
+/**
+ * GET /:id/labels
+ * Returns all labels for a project.
+ */
 router.get('/:id/labels', requireAuth, async (req, res) => {
   try {
     const labels = await projectService.getLabelsByProject(req.params.id);
@@ -232,7 +275,10 @@ router.get('/:id/labels', requireAuth, async (req, res) => {
   }
 });
 
-// Create label
+/**
+ * POST /:id/labels
+ * Creates or updates a label in the project.
+ */
 router.post('/:id/labels', requireAuth, async (req, res) => {
   try {
     const { name, color } = req.body;
@@ -249,7 +295,10 @@ router.post('/:id/labels', requireAuth, async (req, res) => {
   }
 });
 
-// Get project components
+/**
+ * GET /:id/components
+ * Returns all components for a project.
+ */
 router.get('/:id/components', requireAuth, async (req, res) => {
   try {
     const components = await projectService.getComponentsByProject(req.params.id);
@@ -260,7 +309,10 @@ router.get('/:id/components', requireAuth, async (req, res) => {
   }
 });
 
-// Create component
+/**
+ * POST /:id/components
+ * Creates a new component in the project.
+ */
 router.post('/:id/components', requireAuth, async (req, res) => {
   try {
     const { name, description, leadId } = req.body;
@@ -283,7 +335,10 @@ router.post('/:id/components', requireAuth, async (req, res) => {
   }
 });
 
-// Get project roles
+/**
+ * GET /roles/all
+ * Returns all available project roles.
+ */
 router.get('/roles/all', requireAuth, async (req, res) => {
   try {
     const roles = await projectService.getProjectRoles();

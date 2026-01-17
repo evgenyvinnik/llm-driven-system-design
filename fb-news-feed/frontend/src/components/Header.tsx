@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Header component with navigation, search, and user menu.
+ * Provides site-wide navigation including logo, search bar, and user controls.
+ * Search results appear in a dropdown with real-time filtering.
+ */
+
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { Avatar } from './Avatar';
@@ -5,6 +11,13 @@ import { useAuthStore } from '@/stores/authStore';
 import { usersApi } from '@/services/api';
 import type { User } from '@/types';
 
+/**
+ * Site header with logo, search, navigation, and user menu.
+ * Shows login button when unauthenticated, profile dropdown when authenticated.
+ * Search fetches users in real-time as user types.
+ *
+ * @returns JSX element rendering the header
+ */
 export function Header() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const [searchQuery, setSearchQuery] = useState('');

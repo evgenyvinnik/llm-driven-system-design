@@ -1,3 +1,10 @@
+/**
+ * Main entry point for the LinkedIn clone backend server.
+ * Configures Express with middleware, session handling, and route mounting.
+ * Initializes Elasticsearch indices and starts the HTTP server.
+ *
+ * @module index
+ */
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
@@ -53,7 +60,10 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize and start server
+/**
+ * Initializes the server by setting up Elasticsearch indices
+ * and starting the Express HTTP listener.
+ */
 async function start() {
   try {
     // Initialize Elasticsearch indices

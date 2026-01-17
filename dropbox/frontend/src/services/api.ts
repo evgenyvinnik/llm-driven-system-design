@@ -1,5 +1,21 @@
+/**
+ * API client for communicating with the Dropbox-clone backend.
+ * Provides typed methods for authentication, file operations, sharing, and admin functions.
+ * All requests include credentials (cookies) for session-based authentication.
+ * @module services/api
+ */
+
+/** Base URL for API endpoints */
 const API_BASE = '/api';
 
+/**
+ * Generic fetch wrapper with error handling and JSON parsing.
+ * Automatically includes credentials and Content-Type header.
+ * @param endpoint - API endpoint path (appended to API_BASE)
+ * @param options - Fetch request options
+ * @returns Parsed JSON response of type T
+ * @throws Error with message from API response
+ */
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -21,7 +37,10 @@ async function request<T>(
   return response.json();
 }
 
-// Auth API
+/**
+ * Authentication API methods.
+ * Handles login, registration, logout, and session validation.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     request<{ user: import('../types').User; token: string }>('/auth/login', {
@@ -42,7 +61,10 @@ export const authApi = {
     request<{ user: import('../types').User }>('/auth/me'),
 };
 
-// Files API
+/**
+ * File and folder management API methods.
+ * Handles folder navigation, file uploads/downloads, and file operations.
+ */
 export const filesApi = {
   getFolder: (folderId?: string) =>
     request<import('../types').FolderContents>(
@@ -55,6 +77,13 @@ export const filesApi = {
       body: JSON.stringify({ name, parentId }),
     }),
 
+  /**
+   * Uploads a file with progress tracking.
+   * Uses XMLHttpRequest for progress events (not supported by fetch).
+   * @param file - File to upload
+   * @param parentId - Optional parent folder ID
+   * @param onProgress - Callback for upload progress (0-100)
+   */
   uploadFile: async (
     file: File,
     parentId?: string,
@@ -127,7 +156,10 @@ export const filesApi = {
     }),
 };
 
-// Sharing API
+/**
+ * Sharing API methods.
+ * Handles shared links and folder sharing with specific users.
+ */
 export const sharingApi = {
   createLink: (
     fileId: string,
@@ -170,7 +202,11 @@ export const sharingApi = {
     request<{ message: string }>(`/share/folder/${folderId}/${userId}`, { method: 'DELETE' }),
 };
 
-// Admin API
+/**
+ * Admin API methods.
+ * System management, user administration, and maintenance operations.
+ * Requires admin role.
+ */
 export const adminApi = {
   getStats: () =>
     request<import('../types').SystemStats>('/admin/stats'),

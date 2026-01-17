@@ -1,13 +1,31 @@
+/**
+ * Layout component provides the main application shell.
+ * Includes header with title and sign out, main content area,
+ * and bottom navigation tabs.
+ */
 import { useEffect } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores';
 
+/**
+ * Props for the Layout component.
+ */
 interface LayoutProps {
+  /** Child content to render in the main area */
   children: React.ReactNode;
+  /** Page title shown in the header */
   title?: string;
+  /** Whether to show a back button in the header */
   showBack?: boolean;
 }
 
+/**
+ * Renders the main application layout with header, content, and navigation.
+ * Automatically redirects to login page if user is not authenticated.
+ *
+ * @param props - Layout component props
+ * @returns JSX element representing the app shell, or null if not logged in
+ */
 export function Layout({ children, title, showBack }: LayoutProps) {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
@@ -67,6 +85,15 @@ export function Layout({ children, title, showBack }: LayoutProps) {
   );
 }
 
+/**
+ * Navigation link component for bottom tab bar.
+ * Renders an icon and label with active state styling.
+ *
+ * @param to - Route path to navigate to
+ * @param icon - Icon key (wallet, history, pay, store)
+ * @param label - Text label for the nav item
+ * @returns JSX element representing a navigation tab
+ */
 function NavLink({ to, icon, label }: { to: string; icon: string; label: string }) {
   const icons = {
     wallet: (

@@ -1,7 +1,22 @@
-// Test Configuration Component
+/**
+ * @fileoverview Test Configuration component for rate limit testing parameters.
+ *
+ * Provides form inputs for configuring rate limit tests including:
+ * - Identifier (API key, user ID, etc.)
+ * - Limit and window settings for window-based algorithms
+ * - Bucket capacity and rates for bucket-based algorithms
+ *
+ * Dynamically shows/hides fields based on the selected algorithm.
+ */
 
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 
+/**
+ * Configuration form for rate limit test parameters.
+ * Adapts the displayed fields based on the currently selected algorithm.
+ *
+ * @returns Configuration form with algorithm-specific inputs
+ */
 export function TestConfiguration() {
   const {
     identifier,

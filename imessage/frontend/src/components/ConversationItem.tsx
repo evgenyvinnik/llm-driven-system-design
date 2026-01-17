@@ -1,15 +1,35 @@
 import type { Conversation } from '@/types';
 import { useAuthStore } from '@/stores/authStore';
 
+/**
+ * Props for the ConversationItem component.
+ */
 interface ConversationItemProps {
+  /** The conversation to display */
   conversation: Conversation;
+  /** Whether this conversation is currently selected */
   isSelected: boolean;
+  /** Callback when the conversation is clicked */
   onClick: () => void;
 }
 
+/**
+ * Renders a single conversation row in the conversation list.
+ * Displays avatar, name, last message preview, timestamp, and unread count.
+ * Highlights when selected with iMessage-style blue background.
+ *
+ * @param props - Component props
+ * @returns React component for a conversation list item
+ */
 export function ConversationItem({ conversation, isSelected, onClick }: ConversationItemProps) {
   const user = useAuthStore((state) => state.user);
 
+  /**
+   * Gets the display name for the conversation.
+   * For groups, uses group name. For direct chats, shows the other participant.
+   *
+   * @returns Display name string
+   */
   const getDisplayName = () => {
     if (conversation.type === 'group') {
       return conversation.name || 'Group Chat';
@@ -18,6 +38,12 @@ export function ConversationItem({ conversation, isSelected, onClick }: Conversa
     return otherParticipant?.display_name || otherParticipant?.username || 'Unknown';
   };
 
+  /**
+   * Extracts initials from a name for avatar placeholder.
+   *
+   * @param name - Full name to extract initials from
+   * @returns Up to 2 uppercase initials
+   */
   const getInitials = (name: string) => {
     return name
       .split(' ')
@@ -27,6 +53,12 @@ export function ConversationItem({ conversation, isSelected, onClick }: Conversa
       .slice(0, 2);
   };
 
+  /**
+   * Gets the avatar URL for display.
+   * For groups, uses group avatar. For direct chats, uses the other participant's avatar.
+   *
+   * @returns Avatar URL or null if none set
+   */
   const getAvatarUrl = () => {
     if (conversation.type === 'group') {
       return conversation.avatar_url;
@@ -35,6 +67,14 @@ export function ConversationItem({ conversation, isSelected, onClick }: Conversa
     return otherParticipant?.avatar_url;
   };
 
+  /**
+   * Formats a timestamp for display in the conversation list.
+   * Shows time for today, "Yesterday" for yesterday, weekday for last week,
+   * and date for older messages.
+   *
+   * @param dateString - ISO date string to format
+   * @returns Human-readable relative time string
+   */
   const formatTime = (dateString: string) => {
     const date = new Date(dateString);
     const now = new Date();

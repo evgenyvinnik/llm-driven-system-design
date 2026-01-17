@@ -1,12 +1,23 @@
 import { useMemo } from 'react';
 
+/**
+ * Props for the ReignsAvatar component.
+ */
 interface ReignsAvatarProps {
+  /** Seed string for deterministic avatar generation */
   seed: string;
+  /** Size of the avatar in pixels (default: 400) */
   size?: number;
+  /** Additional CSS classes */
   className?: string;
 }
 
-// Seeded random number generator for deterministic results
+/**
+ * Seeded random number generator for deterministic results.
+ * Produces the same sequence of numbers for the same seed.
+ * @param seed - String to seed the generator
+ * @returns Function that returns next random number (0-1)
+ */
 function seededRandom(seed: string) {
   let hash = 0;
   for (let i = 0; i < seed.length; i++) {
@@ -21,7 +32,7 @@ function seededRandom(seed: string) {
   };
 }
 
-// Color palettes inspired by Reigns: Her Majesty medieval aesthetic
+/** Skin color palettes with base, shadow, and highlight colors */
 const SKIN_PALETTES = [
   { base: '#F5DEB3', shadow: '#DEB887', highlight: '#FFF8DC' },  // Wheat
   { base: '#D2B48C', shadow: '#BC8F8F', highlight: '#F5DEB3' },  // Tan
@@ -31,6 +42,7 @@ const SKIN_PALETTES = [
   { base: '#F4E4D0', shadow: '#E8D4B8', highlight: '#FFFAF0' },  // Cream
 ];
 
+/** Hair color palettes with base and highlight colors */
 const HAIR_COLORS = [
   { base: '#2C1810', highlight: '#4A3728' },  // Dark brown
   { base: '#8B4513', highlight: '#A0522D' },  // Saddle brown
@@ -42,6 +54,7 @@ const HAIR_COLORS = [
   { base: '#D2691E', highlight: '#E9967A' },  // Chocolate
 ];
 
+/** Eye color options */
 const EYE_COLORS = [
   '#4169E1',  // Royal blue
   '#228B22',  // Forest green
@@ -53,6 +66,7 @@ const EYE_COLORS = [
   '#8B7355',  // Hazel
 ];
 
+/** Medieval-inspired clothing color palettes */
 const CLOTHING_PALETTES = [
   { primary: '#8B0000', secondary: '#FFD700', accent: '#FFF8DC' },  // Royal red
   { primary: '#191970', secondary: '#C0C0C0', accent: '#B8860B' },  // Midnight blue
@@ -64,6 +78,7 @@ const CLOTHING_PALETTES = [
   { primary: '#2E8B57', secondary: '#F0FFF0', accent: '#DAA520' },  // Sea green
 ];
 
+/** Metallic accessory colors */
 const ACCESSORY_COLORS = [
   '#FFD700',  // Gold
   '#C0C0C0',  // Silver
@@ -71,10 +86,16 @@ const ACCESSORY_COLORS = [
   '#CD853F',  // Peru (bronze)
 ];
 
+/** Gender options for avatar */
 type Gender = 'masculine' | 'feminine';
+/** Hair style options */
 type HairStyle = 'short' | 'medium' | 'long' | 'bald' | 'wavy' | 'braided';
+/** Face shape options */
 type FaceShape = 'oval' | 'round' | 'angular' | 'square';
 
+/**
+ * All features that define an avatar's appearance.
+ */
 interface AvatarFeatures {
   gender: Gender;
   skinPalette: typeof SKIN_PALETTES[0];
@@ -95,6 +116,11 @@ interface AvatarFeatures {
   cheekbones: number;
 }
 
+/**
+ * Generates deterministic avatar features from a seed string.
+ * @param seed - Seed string for random generation
+ * @returns Complete avatar feature set
+ */
 function generateFeatures(seed: string): AvatarFeatures {
   const random = seededRandom(seed);
 
@@ -125,7 +151,16 @@ function generateFeatures(seed: string): AvatarFeatures {
   };
 }
 
-// SVG path generators for different face elements
+/**
+ * Generates SVG path data for different face shapes.
+ * Creates smooth curves that define the face outline for the avatar.
+ * @param shape - The type of face shape to generate
+ * @param centerX - X coordinate of the face center
+ * @param centerY - Y coordinate of the face center
+ * @param width - Width of the face
+ * @param height - Height of the face
+ * @returns SVG path data string for the face outline
+ */
 function getFaceShape(shape: FaceShape, centerX: number, centerY: number, width: number, height: number): string {
   switch (shape) {
     case 'oval':
@@ -165,6 +200,14 @@ function getFaceShape(shape: FaceShape, centerX: number, centerY: number, width:
   }
 }
 
+/**
+ * Procedural avatar component inspired by Reigns: Her Majesty art style.
+ * Generates deterministic, medieval-portrait-styled avatars from a seed string.
+ * Used to provide unique profile pictures for users without uploaded photos.
+ * Features include customizable face shapes, hair styles, clothing, and accessories.
+ * @param props - ReignsAvatar component props
+ * @returns SVG element containing the generated avatar
+ */
 export default function ReignsAvatar({ seed, size = 400, className = '' }: ReignsAvatarProps) {
   const features = useMemo(() => generateFeatures(seed), [seed]);
 

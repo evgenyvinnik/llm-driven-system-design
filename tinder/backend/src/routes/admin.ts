@@ -5,12 +5,23 @@ import { MatchService } from '../services/matchService.js';
 import { MessageService } from '../services/messageService.js';
 import { pool } from '../db/index.js';
 
+/**
+ * Admin dashboard routes for platform management.
+ * Provides statistics, user management, and moderation capabilities.
+ * All routes require admin privileges.
+ */
 const router = Router();
 const userService = new UserService();
 const matchService = new MatchService();
 const messageService = new MessageService();
 
-// Middleware to check admin status
+/**
+ * Middleware that verifies the authenticated user has admin privileges.
+ * Checks is_admin flag on user record in database.
+ * @param req - Express request with session
+ * @param res - Express response
+ * @param next - Next middleware function
+ */
 async function requireAdmin(req: Request, res: Response, next: () => void) {
   if (!req.session.userId) {
     res.status(401).json({ error: 'Authentication required' });
@@ -26,7 +37,11 @@ async function requireAdmin(req: Request, res: Response, next: () => void) {
   next();
 }
 
-// Get dashboard stats
+/**
+ * GET /api/admin/stats
+ * Returns aggregate platform statistics for the admin dashboard.
+ * Includes user counts, match stats, message stats, and activity metrics.
+ */
 router.get('/stats', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const [userStats, matchStats, messageStats, activeStats] = await Promise.all([
@@ -68,7 +83,11 @@ router.get('/stats', requireAuth, requireAdmin, async (req: Request, res: Respon
   }
 });
 
-// Get all users
+/**
+ * GET /api/admin/users
+ * Returns paginated list of all users for user management.
+ * Excludes sensitive data like password hashes.
+ */
 router.get('/users', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
@@ -91,7 +110,10 @@ router.get('/users', requireAuth, requireAdmin, async (req: Request, res: Respon
   }
 });
 
-// Get user details
+/**
+ * GET /api/admin/users/:userId
+ * Returns detailed profile for a specific user including photos and preferences.
+ */
 router.get('/users/:userId', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const profile = await userService.getUserProfile(req.params.userId);
@@ -108,7 +130,11 @@ router.get('/users/:userId', requireAuth, requireAdmin, async (req: Request, res
   }
 });
 
-// Ban/suspend user
+/**
+ * POST /api/admin/users/:userId/ban
+ * Bans a user by hiding them from discovery.
+ * Sets show_me preference to false, preventing them from appearing in swipe decks.
+ */
 router.post('/users/:userId/ban', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
@@ -126,7 +152,10 @@ router.post('/users/:userId/ban', requireAuth, requireAdmin, async (req: Request
   }
 });
 
-// Unban user
+/**
+ * POST /api/admin/users/:userId/unban
+ * Unbans a user by restoring their discovery visibility.
+ */
 router.post('/users/:userId/unban', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
@@ -143,7 +172,12 @@ router.post('/users/:userId/unban', requireAuth, requireAdmin, async (req: Reque
   }
 });
 
-// Delete user
+/**
+ * DELETE /api/admin/users/:userId
+ * Permanently deletes a user and all associated data.
+ * Cascades to delete matches, messages, photos, and preferences.
+ * Prevents self-deletion.
+ */
 router.delete('/users/:userId', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
@@ -163,7 +197,11 @@ router.delete('/users/:userId', requireAuth, requireAdmin, async (req: Request, 
   }
 });
 
-// Get recent activity
+/**
+ * GET /api/admin/activity
+ * Returns recent platform activity including latest matches and signups.
+ * Used for admin dashboard activity feed.
+ */
 router.get('/activity', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const [recentMatches, recentSignups] = await Promise.all([

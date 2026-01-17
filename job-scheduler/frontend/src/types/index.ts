@@ -1,4 +1,12 @@
-// Types shared with backend
+/**
+ * Frontend type definitions for the job scheduler.
+ * These types mirror the backend types for consistent data handling.
+ * @module types
+ */
+
+/**
+ * Job status enum representing the lifecycle state of a job.
+ */
 export enum JobStatus {
   SCHEDULED = 'SCHEDULED',
   QUEUED = 'QUEUED',
@@ -8,6 +16,9 @@ export enum JobStatus {
   FAILED = 'FAILED',
 }
 
+/**
+ * Execution status enum representing the state of a job execution.
+ */
 export enum ExecutionStatus {
   PENDING = 'PENDING',
   RUNNING = 'RUNNING',
@@ -18,6 +29,7 @@ export enum ExecutionStatus {
   DEDUPLICATED = 'DEDUPLICATED',
 }
 
+/** Job definition for display and management */
 export interface Job {
   id: string;
   name: string;
@@ -36,6 +48,7 @@ export interface Job {
   updated_at: string;
 }
 
+/** Job with aggregated execution statistics */
 export interface JobWithStats extends Job {
   total_executions: number;
   successful_executions: number;
@@ -44,6 +57,7 @@ export interface JobWithStats extends Job {
   avg_duration_ms: number | null;
 }
 
+/** Record of a single job execution attempt */
 export interface JobExecution {
   id: string;
   job_id: string;
@@ -60,6 +74,7 @@ export interface JobExecution {
   logs?: ExecutionLog[];
 }
 
+/** Log entry from a job execution */
 export interface ExecutionLog {
   id: string;
   execution_id: string;
@@ -69,6 +84,7 @@ export interface ExecutionLog {
   created_at: string;
 }
 
+/** Input for creating a new job */
 export interface CreateJobInput {
   name: string;
   description?: string;
@@ -83,6 +99,7 @@ export interface CreateJobInput {
   timeout_ms?: number;
 }
 
+/** Input for updating an existing job */
 export interface UpdateJobInput {
   name?: string;
   description?: string;
@@ -96,6 +113,7 @@ export interface UpdateJobInput {
   timeout_ms?: number;
 }
 
+/** Standard API response wrapper */
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
@@ -103,6 +121,7 @@ export interface ApiResponse<T> {
   message?: string;
 }
 
+/** Paginated response with metadata */
 export interface PaginatedResponse<T> {
   items: T[];
   total: number;
@@ -111,6 +130,7 @@ export interface PaginatedResponse<T> {
   total_pages: number;
 }
 
+/** Aggregated system metrics for dashboard */
 export interface SystemMetrics {
   jobs: {
     total_jobs: number;
@@ -131,6 +151,7 @@ export interface SystemMetrics {
   };
 }
 
+/** Information about a worker process */
 export interface Worker {
   id: string;
   status: 'idle' | 'busy' | 'active';
@@ -141,6 +162,7 @@ export interface Worker {
   started_at?: string;
 }
 
+/** Hourly execution statistics for charting */
 export interface ExecutionStats {
   hour: string;
   completed: number;

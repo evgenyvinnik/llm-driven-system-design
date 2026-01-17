@@ -1,17 +1,36 @@
+/**
+ * @fileoverview Main navigation bar component.
+ *
+ * Provides site-wide navigation with links to Dashboards, Alerts,
+ * and Metrics pages. Shows the current date.
+ */
+
 import { Link, useLocation } from '@tanstack/react-router';
 import { clsx } from 'clsx';
 
+/**
+ * Navigation item configuration.
+ */
 interface NavItem {
   path: string;
   label: string;
 }
 
+/** Primary navigation items */
 const navItems: NavItem[] = [
   { path: '/', label: 'Dashboards' },
   { path: '/alerts', label: 'Alerts' },
   { path: '/metrics', label: 'Metrics' },
 ];
 
+/**
+ * Renders the main navigation bar.
+ *
+ * Displays the application title, navigation links with active state
+ * highlighting, and the current date. Styled with the dashboard theme.
+ *
+ * @returns The rendered navigation bar
+ */
 export function Navbar() {
   const location = useLocation();
 

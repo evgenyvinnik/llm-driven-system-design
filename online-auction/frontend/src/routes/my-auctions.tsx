@@ -5,10 +5,26 @@ import { api } from '../services/api';
 import { AuctionCard } from '../components/AuctionCard';
 import type { Auction } from '../types';
 
+/**
+ * Route definition for user's auctions page (/my-auctions).
+ * Protected route - redirects unauthenticated users to login.
+ */
 export const Route = createFileRoute('/my-auctions')({
   component: MyAuctionsPage,
 });
 
+/**
+ * Page displaying user's auction activity.
+ *
+ * Provides two tabbed views:
+ * - Selling: Auctions created by the user
+ * - Bidding: Auctions where the user has placed bids
+ *
+ * Fetches both lists in parallel on mount.
+ * Includes quick link to create new auction.
+ *
+ * @returns JSX element for the my auctions page
+ */
 function MyAuctionsPage() {
   const navigate = useNavigate();
   const { isAuthenticated } = useAuthStore();

@@ -4,10 +4,17 @@ import { requireAuth } from '../middleware/auth.js';
 import { CreateMeetingTypeSchema, UpdateMeetingTypeSchema } from '../types/index.js';
 import { z } from 'zod';
 
+/**
+ * Express router for meeting type (event type) management.
+ * Meeting types define the scheduling options hosts offer to invitees.
+ */
 const router = Router();
 
 /**
- * GET /api/meeting-types - Get all meeting types for the current user
+ * GET /api/meeting-types - Get all meeting types for the current user.
+ * Requires authentication.
+ * @query {active} - If 'true', only return active meeting types
+ * @returns {MeetingType[]} Array of meeting types
  */
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -28,7 +35,10 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/meeting-types/:id - Get a specific meeting type
+ * GET /api/meeting-types/:id - Get a specific meeting type with host info.
+ * Public endpoint for booking pages. Only returns active meeting types.
+ * @param {id} - Meeting type UUID
+ * @returns {MeetingType} Meeting type with user details
  */
 router.get('/:id', async (req: Request, res: Response) => {
   try {
@@ -55,7 +65,10 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/meeting-types - Create a new meeting type
+ * POST /api/meeting-types - Create a new meeting type.
+ * Requires authentication. Validates slug uniqueness per user.
+ * @body {name, slug, description, duration_minutes, buffer_before_minutes, buffer_after_minutes, max_bookings_per_day, color}
+ * @returns {MeetingType} The newly created meeting type
  */
 router.post('/', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -96,7 +109,11 @@ router.post('/', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * PUT /api/meeting-types/:id - Update a meeting type
+ * PUT /api/meeting-types/:id - Update an existing meeting type.
+ * Requires authentication and ownership. Validates slug uniqueness if changed.
+ * @param {id} - Meeting type UUID
+ * @body Partial meeting type fields to update
+ * @returns {MeetingType} The updated meeting type
  */
 router.put('/:id', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -147,7 +164,10 @@ router.put('/:id', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * DELETE /api/meeting-types/:id - Delete a meeting type
+ * DELETE /api/meeting-types/:id - Delete a meeting type.
+ * Requires authentication and ownership. Permanently removes the meeting type.
+ * @param {id} - Meeting type UUID
+ * @returns {message} Success message
  */
 router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
   try {

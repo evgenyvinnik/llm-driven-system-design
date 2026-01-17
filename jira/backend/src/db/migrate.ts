@@ -1,5 +1,15 @@
+/**
+ * Database migration script.
+ * Creates the complete database schema for the Jira clone application.
+ * Includes tables for users, projects, issues, workflows, and related entities.
+ */
+
 import { pool } from '../config/database.js';
 
+/**
+ * Complete database schema definition.
+ * Includes all tables, indexes, and constraints for the application.
+ */
 const schema = `
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -228,6 +238,10 @@ CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project_id);
 CREATE INDEX IF NOT EXISTS idx_sprints_status ON sprints(status);
 `;
 
+/**
+ * Runs the database migration to create all tables.
+ * Executes the schema SQL and reports success or failure.
+ */
 async function migrate() {
   console.log('Running migrations...');
 

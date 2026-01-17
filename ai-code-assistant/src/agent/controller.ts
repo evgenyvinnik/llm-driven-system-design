@@ -1,8 +1,20 @@
 /**
- * Agent Controller - Core orchestration loop for the AI coding assistant
+ * Agent Controller - Core orchestration loop for the AI coding assistant.
  *
- * This is the heart of the system - the agentic loop that coordinates
- * between the user, LLM, and tools.
+ * This is the heart of the evylcode system - the agentic loop that coordinates
+ * between the user, LLM, and tools. It implements the following cycle:
+ *
+ * 1. Receive user input
+ * 2. Send context to LLM
+ * 3. Parse LLM response for tool calls
+ * 4. Execute tools with permission checks
+ * 5. Feed tool results back to LLM
+ * 6. Repeat until LLM returns without tool calls
+ *
+ * The controller handles error recovery, permission management, and
+ * conversation state throughout this process.
+ *
+ * @module agent/controller
  */
 
 import type {
@@ -19,6 +31,10 @@ import type { PermissionManager } from '../permissions/manager.js';
 import type { SessionManager } from '../session/manager.js';
 import type { CLIInterface } from '../cli/interface.js';
 
+/**
+ * System prompt that instructs the LLM on its role and available tools.
+ * This is prepended to every conversation context.
+ */
 const SYSTEM_PROMPT = `You are an AI coding assistant that helps developers write, debug, and understand code.
 
 You have access to the following tools:
@@ -42,15 +58,41 @@ When using tools:
 - Combine multiple reads into a single response when appropriate
 `;
 
+/**
+ * Orchestrates the interaction between user, LLM, and tools.
+ *
+ * The AgentController manages:
+ * - The agentic loop (user -> LLM -> tools -> LLM -> ...)
+ * - Conversation state and message history
+ * - Tool execution with permission checks
+ * - Session persistence
+ * - Error handling and recovery
+ */
 export class AgentController {
+  /** LLM provider for generating responses */
   private llm: LLMProvider;
+  /** Registry of available tools */
   private tools: ToolRegistry;
+  /** Permission manager for access control */
   private permissions: PermissionManager;
+  /** Session manager for persistence */
   private session: SessionManager;
+  /** CLI interface for user interaction */
   private cli: CLIInterface;
+  /** Current working directory */
   private workingDirectory: string;
+  /** Current agent state */
   private state: AgentState;
 
+  /**
+   * Creates a new AgentController.
+   * @param llm - LLM provider for generating responses
+   * @param tools - Tool registry with available tools
+   * @param permissions - Permission manager for access control
+   * @param session - Session manager for persistence
+   * @param cli - CLI interface for user interaction
+   * @param workingDirectory - Current working directory
+   */
   constructor(
     llm: LLMProvider,
     tools: ToolRegistry,
@@ -76,7 +118,9 @@ export class AgentController {
   }
 
   /**
-   * Run the agentic loop for a user input
+   * Run the agentic loop for a user input.
+   * This is the main entry point for processing user requests.
+   * @param userInput - The user's natural language request
    */
   async run(userInput: string): Promise<void> {
     if (this.state.isRunning) {
@@ -109,7 +153,9 @@ export class AgentController {
   }
 
   /**
-   * The main agentic loop
+   * Execute the main agentic loop.
+   * Iterates between LLM calls and tool execution until complete.
+   * Includes a safety limit to prevent infinite loops.
    */
   private async executeLoop(): Promise<void> {
     let iteration = 0;
@@ -176,7 +222,10 @@ export class AgentController {
   }
 
   /**
-   * Execute tool calls, handling permissions
+   * Execute tool calls, handling permissions for each.
+   * Auto-approved tools run in parallel, approval-required tools run sequentially.
+   * @param calls - Array of tool calls from the LLM
+   * @returns Array of tool execution results
    */
   private async executeTools(calls: ToolCall[]): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
@@ -230,7 +279,11 @@ export class AgentController {
   }
 
   /**
-   * Execute a single tool with CLI display
+   * Execute a single tool with CLI display.
+   * Shows the tool call and its result to the user.
+   * @param call - The tool call to execute
+   * @param context - Execution context with permissions
+   * @returns The tool execution result
    */
   private async executeToolWithDisplay(call: ToolCall, context: ToolContext): Promise<ToolResult> {
     this.cli.printToolCall(call.name, call.parameters);
@@ -244,7 +297,8 @@ export class AgentController {
   }
 
   /**
-   * Create tool execution context
+   * Create a tool execution context.
+   * @returns Context with working directory and permissions
    */
   private createToolContext(): ToolContext {
     return {
@@ -254,7 +308,9 @@ export class AgentController {
   }
 
   /**
-   * Get messages formatted for LLM context
+   * Get messages formatted for LLM context.
+   * Prepends the system prompt to the conversation.
+   * @returns Array of messages including system prompt
    */
   private getContextMessages(): Message[] {
     const systemMessage: Message = {
@@ -267,7 +323,10 @@ export class AgentController {
   }
 
   /**
-   * Describe what a tool operation does
+   * Generate a human-readable description of a tool operation.
+   * Used for permission request display.
+   * @param call - The tool call to describe
+   * @returns Description of the operation
    */
   private describeToolOperation(call: ToolCall): string {
     switch (call.name) {
@@ -283,7 +342,10 @@ export class AgentController {
   }
 
   /**
-   * Get details about a tool call for permission display
+   * Get details about a tool call for permission display.
+   * Returns the target file path or command.
+   * @param call - The tool call
+   * @returns Details string (file path or command)
    */
   private getToolDetails(call: ToolCall): string {
     switch (call.name) {
@@ -299,7 +361,8 @@ export class AgentController {
   }
 
   /**
-   * Clear conversation history
+   * Clear the conversation history.
+   * Used for /clear command.
    */
   clearHistory(): void {
     this.state.messages = [];
@@ -307,7 +370,8 @@ export class AgentController {
   }
 
   /**
-   * Get current state
+   * Get a copy of the current agent state.
+   * @returns Clone of the current state
    */
   getState(): AgentState {
     return { ...this.state };

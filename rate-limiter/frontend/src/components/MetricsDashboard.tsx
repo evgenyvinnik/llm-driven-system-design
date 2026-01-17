@@ -1,8 +1,24 @@
-// Metrics Dashboard Component
+/**
+ * @fileoverview Metrics Dashboard component for displaying rate limiting statistics.
+ *
+ * Shows aggregated metrics from the last 5 minutes including:
+ * - Total, allowed, and denied request counts
+ * - Success rate percentage
+ * - Average and P99 latency
+ * - Active identifier count
+ *
+ * Auto-refreshes every 2 seconds for near real-time updates.
+ */
 
 import { useEffect } from 'react';
 import { useRateLimiterStore } from '../stores/rateLimiterStore';
 
+/**
+ * Dashboard component showing rate limiting metrics.
+ * Displays key performance indicators in a grid layout.
+ *
+ * @returns Metrics dashboard with auto-refreshing statistics
+ */
 export function MetricsDashboard() {
   const { metrics, fetchMetrics } = useRateLimiterStore();
 
@@ -60,12 +76,25 @@ export function MetricsDashboard() {
   );
 }
 
+/**
+ * Props for the MetricCard component.
+ */
 interface MetricCardProps {
+  /** Label text displayed above the value */
   label: string;
+  /** Value to display */
   value: string;
+  /** Color theme for the value text */
   color?: 'green' | 'red' | 'default';
 }
 
+/**
+ * Individual metric card for displaying a single statistic.
+ * Used within the MetricsDashboard grid.
+ *
+ * @param props - Card properties
+ * @returns Styled metric card
+ */
 function MetricCard({ label, value, color = 'default' }: MetricCardProps) {
   const colorClasses = {
     green: 'text-green-600',

@@ -1,12 +1,30 @@
+/**
+ * ActiveCall Component
+ *
+ * Full-screen view displayed during an active or connecting call.
+ * Shows remote video as the main view with local video in picture-in-picture.
+ * Displays call status, duration timer, and control buttons.
+ */
+
 import { useState, useEffect } from 'react';
 import { useStore } from '../stores/useStore';
 import { VideoPlayer } from './VideoPlayer';
 import { CallControls } from './CallControls';
 
+/**
+ * Props for the ActiveCall component.
+ */
 interface ActiveCallProps {
+  /** Callback invoked when user ends the call */
   onEndCall: () => void;
 }
 
+/**
+ * Renders the active call screen with video streams and controls.
+ *
+ * @param props - Component props with end call handler
+ * @returns Full-screen call view with local/remote video and controls
+ */
 export function ActiveCall({ onEndCall }: ActiveCallProps) {
   const { callState, localStream, remoteStream } = useStore();
   const [duration, setDuration] = useState(0);

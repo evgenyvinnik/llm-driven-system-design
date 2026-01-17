@@ -1,8 +1,19 @@
+/**
+ * Authentication state management store.
+ * Handles user login, registration, logout, and session persistence.
+ * Uses Zustand with persist middleware to store token in localStorage.
+ * @module stores/authStore
+ */
+
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { User } from '../types';
 import { authApi } from '../services/api';
 
+/**
+ * Authentication state interface.
+ * Contains user data, loading/error state, and authentication actions.
+ */
 interface AuthState {
   user: User | null;
   token: string | null;
@@ -16,6 +27,10 @@ interface AuthState {
   clearError: () => void;
 }
 
+/**
+ * Zustand store for authentication state.
+ * Persists only the token to localStorage for session restoration.
+ */
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({

@@ -1,3 +1,11 @@
+/**
+ * App Component
+ *
+ * Root component for the FaceTime application.
+ * Manages authentication flow, displays appropriate screens based on
+ * login and call state, and coordinates between components.
+ */
+
 import { useState, useEffect, useCallback } from 'react';
 import { useStore } from './stores/useStore';
 import { signalingService } from './services/signaling';
@@ -9,6 +17,12 @@ import { IncomingCall } from './components/IncomingCall';
 import { ActiveCall } from './components/ActiveCall';
 import type { User } from './types';
 
+/**
+ * Main application component.
+ * Handles user authentication, contact management, and call routing.
+ *
+ * @returns The appropriate screen based on authentication and call state
+ */
 function App() {
   const [users, setUsers] = useState<User[]>([]);
   const [isLoading, setIsLoading] = useState(true);

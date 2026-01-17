@@ -1,3 +1,11 @@
+/**
+ * Main application component that composes the r/place UI.
+ *
+ * Layout:
+ * - Header: Title, toolbar (zoom controls), and auth panel
+ * - Main: Interactive canvas area
+ * - Footer: Color palette and cooldown timer
+ */
 import { useEffect } from 'react';
 import { useAppStore } from './stores/appStore';
 import { Canvas } from './components/Canvas';
@@ -6,6 +14,10 @@ import { CooldownTimer } from './components/CooldownTimer';
 import { AuthPanel } from './components/AuthPanel';
 import { Toolbar } from './components/Toolbar';
 
+/**
+ * Root application component.
+ * Initializes the application on mount and renders the main layout.
+ */
 function App() {
   const { initialize, isLoading } = useAppStore();
 

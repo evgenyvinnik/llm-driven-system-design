@@ -1,11 +1,29 @@
 import type { MenuItem } from '../types';
 import { useCartStore } from '../stores/cartStore';
 
+/**
+ * Props for the MenuItemCard component.
+ */
 interface Props {
+  /** Menu item data to display */
   item: MenuItem;
+  /** ID of the restaurant this item belongs to */
   restaurantId: number;
 }
 
+/**
+ * Menu item card component for displaying and adding items to cart.
+ * Shows item name, description, price, and provides quantity controls.
+ *
+ * Features:
+ * - "Add" button for items not in cart
+ * - Quantity increment/decrement controls for items in cart
+ * - Disabled state for unavailable items
+ * - Integrates with cart store for state management
+ *
+ * @param props - Component props containing menu item and restaurant ID
+ * @returns React component rendering a menu item with cart controls
+ */
 export function MenuItemCard({ item }: Props) {
   const addItem = useCartStore((s) => s.addItem);
   const items = useCartStore((s) => s.items);

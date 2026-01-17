@@ -599,3 +599,573 @@ CREATE TABLE friendships (
 | Feed architecture | Fan-out on write | Fan-in on read | Read performance |
 | Transfer speed | Instant (in-app) | Batch processing | User experience |
 | Funding | Automatic waterfall | User selects each time | UX simplicity |
+
+---
+
+## Observability
+
+### Metrics
+
+Key metrics to expose via Prometheus (or similar) for a payment platform:
+
+**Business Metrics:**
+- `venmo_transfers_total{status,funding_source}` - Counter of completed/failed transfers
+- `venmo_transfer_amount_cents` - Histogram of transfer amounts (buckets: 100, 500, 1000, 5000, 10000, 50000 cents)
+- `venmo_cashout_total{speed,status}` - Instant vs standard cashout counts
+- `venmo_payment_requests_total{status}` - Pending, paid, declined, expired
+
+**System Metrics:**
+- `venmo_api_request_duration_seconds{endpoint,method}` - Request latency histogram
+- `venmo_db_query_duration_seconds{query_type}` - Database query times
+- `venmo_balance_cache_hit_ratio` - Redis cache effectiveness
+- `venmo_feed_fanout_duration_seconds` - Time to fan out to friends' feeds
+
+**Infrastructure Metrics:**
+- `venmo_postgres_connections_active` - Connection pool usage
+- `venmo_redis_memory_used_bytes` - Cache memory consumption
+- `venmo_cassandra_read_latency_seconds` - Feed read performance
+- `venmo_queue_depth{queue_name}` - Pending jobs in RabbitMQ
+
+### Logging Strategy
+
+Structured JSON logs with correlation IDs for request tracing:
+
+```javascript
+// Log format for transfers
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "level": "info",
+  "service": "transfer-service",
+  "correlation_id": "req-abc123",
+  "user_id": "user-456",
+  "event": "transfer_completed",
+  "transfer_id": "txn-789",
+  "amount_cents": 5000,
+  "funding_source": "balance",
+  "duration_ms": 45
+}
+```
+
+**Log Levels:**
+- `ERROR`: Failed transfers, insufficient funds, external API failures
+- `WARN`: Retry attempts, rate limit approaches, slow queries (>200ms)
+- `INFO`: Successful transfers, cashouts, login events
+- `DEBUG`: Full request/response payloads (local dev only)
+
+**Sensitive Data Handling:**
+- Never log full account numbers - mask to last 4 digits
+- Redact session tokens and API keys
+- Log user_id but not PII (names, emails) at INFO level
+
+### Distributed Tracing
+
+Trace spans for a typical transfer request:
+
+```
+[transfer-api] POST /transfers (parent span)
+  ├── [auth] validate_session (5ms)
+  ├── [postgres] SELECT wallet FOR UPDATE (12ms)
+  ├── [postgres] check_funding_sources (8ms)
+  ├── [postgres] UPDATE wallets (debit) (6ms)
+  ├── [postgres] UPDATE wallets (credit) (6ms)
+  ├── [postgres] INSERT transfer (4ms)
+  ├── [redis] invalidate_balance_cache (2ms)
+  ├── [rabbitmq] publish_feed_fanout (3ms)
+  └── [push-service] send_notification (async, 50ms)
+```
+
+For local development, use Jaeger with Docker:
+```yaml
+# docker-compose.yml addition
+jaeger:
+  image: jaegertracing/all-in-one:1.50
+  ports:
+    - "16686:16686"  # UI
+    - "6831:6831/udp"  # Thrift
+```
+
+### SLI Dashboards
+
+**Transfer Service SLIs:**
+
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| Transfer success rate | 99.9% | < 99.5% for 5 min |
+| Transfer latency p50 | < 100ms | > 150ms for 5 min |
+| Transfer latency p99 | < 500ms | > 800ms for 2 min |
+| Balance cache hit rate | > 90% | < 80% for 10 min |
+
+**Feed Service SLIs:**
+
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| Feed load latency p95 | < 200ms | > 400ms for 5 min |
+| Fan-out completion rate | 99.9% | < 99% for 5 min |
+| Feed item lag | < 5 sec | > 30 sec for 2 min |
+
+**Infrastructure SLIs:**
+
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| PostgreSQL connection pool usage | < 80% | > 90% for 5 min |
+| Redis memory usage | < 75% | > 85% for 10 min |
+| Cassandra read latency p99 | < 50ms | > 100ms for 5 min |
+
+### Audit Logging
+
+Financial systems require immutable audit trails. Store audit logs separately from application logs:
+
+```sql
+-- Audit log table (append-only, no updates/deletes)
+CREATE TABLE audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  timestamp TIMESTAMP DEFAULT NOW(),
+  actor_id UUID,                    -- User or system performing action
+  actor_type VARCHAR(20),           -- 'user', 'admin', 'system'
+  action VARCHAR(50) NOT NULL,      -- 'transfer', 'cashout', 'link_bank', 'login'
+  resource_type VARCHAR(30),        -- 'wallet', 'transfer', 'payment_method'
+  resource_id UUID,
+  ip_address INET,
+  user_agent TEXT,
+  request_id VARCHAR(50),           -- Correlation ID
+  details JSONB,                    -- Action-specific data
+  outcome VARCHAR(20) NOT NULL      -- 'success', 'failure', 'denied'
+);
+
+CREATE INDEX idx_audit_actor ON audit_log(actor_id, timestamp DESC);
+CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id);
+CREATE INDEX idx_audit_action ON audit_log(action, timestamp DESC);
+```
+
+**Audited Events:**
+- All money movements (transfers, cashouts, charges)
+- Payment method changes (add/remove bank, card)
+- Authentication events (login, logout, failed attempts)
+- Administrative actions (account freezes, limit changes)
+- Privacy setting changes
+
+---
+
+## Failure Handling
+
+### Idempotency Keys
+
+Prevent duplicate transfers when clients retry:
+
+```javascript
+async function transferWithIdempotency(idempotencyKey, senderId, receiverId, amount, note) {
+  // Check for existing transfer with this key
+  const existing = await db.query(`
+    SELECT * FROM transfers WHERE idempotency_key = $1 AND sender_id = $2
+  `, [idempotencyKey, senderId])
+
+  if (existing.rows.length > 0) {
+    const transfer = existing.rows[0]
+    // Return cached result (success or failure)
+    if (transfer.status === 'completed') {
+      return { success: true, transfer, cached: true }
+    }
+    if (transfer.status === 'failed') {
+      throw new Error(transfer.failure_reason)
+    }
+  }
+
+  // No existing transfer - create new one
+  try {
+    const transfer = await processTransfer(senderId, receiverId, amount, note)
+    await db.query(`
+      UPDATE transfers SET idempotency_key = $2 WHERE id = $1
+    `, [transfer.id, idempotencyKey])
+    return { success: true, transfer, cached: false }
+  } catch (error) {
+    // Record failure for idempotency
+    await db.query(`
+      INSERT INTO transfer_attempts (idempotency_key, sender_id, status, failure_reason)
+      VALUES ($1, $2, 'failed', $3)
+    `, [idempotencyKey, senderId, error.message])
+    throw error
+  }
+}
+```
+
+**Idempotency Key Schema:**
+```sql
+ALTER TABLE transfers ADD COLUMN idempotency_key VARCHAR(64);
+CREATE UNIQUE INDEX idx_transfers_idempotency ON transfers(sender_id, idempotency_key);
+
+-- Track failed attempts too
+CREATE TABLE transfer_attempts (
+  id SERIAL PRIMARY KEY,
+  idempotency_key VARCHAR(64) NOT NULL,
+  sender_id UUID NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  failure_reason TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(sender_id, idempotency_key)
+);
+```
+
+**Key Format:** Client generates `{userId}-{timestamp}-{random}` or UUID v4
+
+### Retry Strategy
+
+```javascript
+const RETRY_CONFIG = {
+  transfer: {
+    maxRetries: 3,
+    initialDelay: 100,      // ms
+    maxDelay: 2000,         // ms
+    backoffMultiplier: 2,
+    retryableErrors: ['ETIMEDOUT', 'ECONNRESET', 'DATABASE_UNAVAILABLE']
+  },
+  externalPayment: {
+    maxRetries: 5,
+    initialDelay: 500,
+    maxDelay: 30000,
+    backoffMultiplier: 2,
+    retryableErrors: ['NETWORK_ERROR', 'RATE_LIMITED', 'TEMPORARY_FAILURE']
+  }
+}
+
+async function retryWithBackoff(operation, config) {
+  let lastError
+  let delay = config.initialDelay
+
+  for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      lastError = error
+      const isRetryable = config.retryableErrors.some(e =>
+        error.code === e || error.message.includes(e)
+      )
+
+      if (!isRetryable || attempt === config.maxRetries) {
+        throw error
+      }
+
+      console.warn(`Attempt ${attempt} failed, retrying in ${delay}ms`, {
+        error: error.message,
+        operation: operation.name
+      })
+
+      await sleep(delay + Math.random() * 100)  // Add jitter
+      delay = Math.min(delay * config.backoffMultiplier, config.maxDelay)
+    }
+  }
+  throw lastError
+}
+```
+
+### Circuit Breakers
+
+Protect the system when external services fail:
+
+```javascript
+class CircuitBreaker {
+  constructor(name, options = {}) {
+    this.name = name
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeout = options.resetTimeout || 30000  // 30 seconds
+    this.halfOpenRequests = options.halfOpenRequests || 3
+
+    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.successes = 0
+    this.lastFailureTime = null
+    this.halfOpenAttempts = 0
+  }
+
+  async execute(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeout) {
+        this.state = 'HALF_OPEN'
+        this.halfOpenAttempts = 0
+      } else {
+        throw new Error(`Circuit breaker ${this.name} is OPEN`)
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+    if (this.state === 'HALF_OPEN') {
+      this.halfOpenAttempts++
+      if (this.halfOpenAttempts >= this.halfOpenRequests) {
+        this.state = 'CLOSED'
+        console.info(`Circuit breaker ${this.name} closed`)
+      }
+    }
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailureTime = Date.now()
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      console.error(`Circuit breaker ${this.name} opened after ${this.failures} failures`)
+    }
+  }
+}
+
+// Usage for external payment providers
+const bankAPICircuit = new CircuitBreaker('bank-api', {
+  failureThreshold: 3,
+  resetTimeout: 60000
+})
+
+const cardNetworkCircuit = new CircuitBreaker('card-network', {
+  failureThreshold: 5,
+  resetTimeout: 30000
+})
+```
+
+### Backup and Restore
+
+**PostgreSQL Backup Strategy (Local Development):**
+
+```bash
+#!/bin/bash
+# backup.sh - Run daily via cron or manually
+
+BACKUP_DIR="/backups/postgres"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+DB_NAME="venmo"
+
+# Create logical backup
+pg_dump -Fc $DB_NAME > $BACKUP_DIR/venmo_$TIMESTAMP.dump
+
+# Keep last 7 days of backups
+find $BACKUP_DIR -name "*.dump" -mtime +7 -delete
+
+# Verify backup integrity
+pg_restore --list $BACKUP_DIR/venmo_$TIMESTAMP.dump > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "Backup verified: venmo_$TIMESTAMP.dump"
+else
+  echo "ERROR: Backup verification failed!"
+  exit 1
+fi
+```
+
+**Restore Testing Procedure:**
+
+```bash
+#!/bin/bash
+# restore-test.sh - Monthly restore verification
+
+TEST_DB="venmo_restore_test"
+LATEST_BACKUP=$(ls -t /backups/postgres/*.dump | head -1)
+
+# Create test database
+createdb $TEST_DB
+
+# Restore backup
+pg_restore -d $TEST_DB $LATEST_BACKUP
+
+# Run validation queries
+psql $TEST_DB << EOF
+SELECT COUNT(*) AS user_count FROM users;
+SELECT COUNT(*) AS transfer_count FROM transfers;
+SELECT SUM(balance) AS total_balance FROM wallets;
+EOF
+
+# Cleanup
+dropdb $TEST_DB
+```
+
+**Redis Backup (Balance Cache):**
+
+For local development, Redis data is ephemeral (cache only). On restart:
+1. Cache misses hit PostgreSQL
+2. Cache warms up organically with traffic
+3. No explicit backup needed for cache data
+
+**Cassandra Backup (Feed Data):**
+
+```bash
+# Snapshot all keyspaces
+nodetool snapshot venmo_feeds
+
+# Snapshots stored in data_directory/keyspace/table/snapshots/
+# Copy to backup location
+cp -r /var/lib/cassandra/data/venmo_feeds/*/snapshots/latest /backups/cassandra/
+```
+
+### Disaster Recovery (Local Dev Simulation)
+
+For learning purposes, simulate failures:
+
+```javascript
+// Chaos testing helpers for local development
+const chaosConfig = {
+  enabled: process.env.CHAOS_ENABLED === 'true',
+  failureRate: 0.1,  // 10% of requests fail
+  latencyInjection: { min: 100, max: 500 }  // Add 100-500ms delay
+}
+
+function maybeFail(serviceName) {
+  if (!chaosConfig.enabled) return
+
+  if (Math.random() < chaosConfig.failureRate) {
+    throw new Error(`[CHAOS] Simulated ${serviceName} failure`)
+  }
+}
+
+async function maybeDelay() {
+  if (!chaosConfig.enabled) return
+
+  const delay = chaosConfig.latencyInjection.min +
+    Math.random() * (chaosConfig.latencyInjection.max - chaosConfig.latencyInjection.min)
+  await sleep(delay)
+}
+```
+
+---
+
+## Cost Optimization
+
+### Storage Tiering
+
+**PostgreSQL (Hot Data):**
+- Active wallets, recent transfers (last 90 days)
+- Estimated size: ~500 bytes per transfer, ~200 bytes per user
+- For 1M users with 50 transfers each: ~25 GB
+
+**Cassandra (Warm Data):**
+- Feed items (last 30 days by default)
+- Older items can use shorter TTL or move to cheaper storage
+- TTL of 30 days: items auto-expire
+
+```cql
+-- Feed items with automatic expiration
+INSERT INTO feed_items (user_id, timestamp, transfer_id, ...)
+VALUES (?, ?, ?, ...)
+USING TTL 2592000;  -- 30 days in seconds
+```
+
+**Archive Strategy (Cold Data):**
+- Transfers older than 1 year: export to Parquet files
+- Store in MinIO/S3 with infrequent access tier
+- Query via ad-hoc tools when needed (compliance, disputes)
+
+```sql
+-- Monthly archive job
+INSERT INTO transfers_archive
+SELECT * FROM transfers
+WHERE created_at < NOW() - INTERVAL '1 year';
+
+DELETE FROM transfers
+WHERE created_at < NOW() - INTERVAL '1 year';
+```
+
+### Cache Sizing
+
+**Redis Memory Budget (Local Dev):**
+
+| Cache Type | Key Pattern | Estimated Size | TTL |
+|------------|-------------|----------------|-----|
+| Balance cache | `balance:{userId}` | 100 bytes/user | 5 min |
+| Session cache | `session:{token}` | 500 bytes/session | 24 hr |
+| Rate limit | `ratelimit:{userId}:{action}` | 50 bytes/key | 1 min |
+| User profile | `user:{userId}` | 1 KB/user | 15 min |
+
+**Memory Calculation for 10K active users:**
+- Balance: 10K * 100 bytes = 1 MB
+- Sessions: 10K * 500 bytes = 5 MB
+- Rate limits: 10K * 5 actions * 50 bytes = 2.5 MB
+- Profiles: 10K * 1 KB = 10 MB
+- **Total: ~20 MB** (allocate 64 MB for headroom)
+
+```bash
+# redis.conf for local development
+maxmemory 64mb
+maxmemory-policy allkeys-lru
+```
+
+**Cache Invalidation Strategy:**
+- Balance: Invalidate on any wallet modification
+- Sessions: TTL-based expiration only
+- User profiles: Invalidate on profile update, TTL fallback
+
+### Queue Retention
+
+**RabbitMQ Settings:**
+
+| Queue | Purpose | TTL | Max Length |
+|-------|---------|-----|------------|
+| `feed-fanout` | Async feed updates | 1 hour | 100K messages |
+| `notifications` | Push notifications | 30 min | 50K messages |
+| `cashout-batch` | Standard ACH processing | 24 hours | 10K messages |
+| `audit-log` | Async audit writes | 1 hour | 200K messages |
+
+```javascript
+// Queue declaration with limits
+await channel.assertQueue('feed-fanout', {
+  durable: true,
+  arguments: {
+    'x-message-ttl': 3600000,      // 1 hour
+    'x-max-length': 100000,         // 100K messages
+    'x-overflow': 'reject-publish'  // Reject new messages when full
+  }
+})
+```
+
+**Dead Letter Handling:**
+```javascript
+// Failed messages go to DLQ for investigation
+await channel.assertQueue('feed-fanout-dlq', { durable: true })
+await channel.assertQueue('feed-fanout', {
+  arguments: {
+    'x-dead-letter-exchange': '',
+    'x-dead-letter-routing-key': 'feed-fanout-dlq'
+  }
+})
+```
+
+### Compute vs Storage Tradeoffs
+
+| Component | Compute-Heavy | Storage-Heavy | Recommendation |
+|-----------|---------------|---------------|----------------|
+| Feed generation | Fan-in on read (query per request) | Fan-out on write (store per friend) | **Storage**: Pre-compute feeds for fast reads |
+| Balance calculation | Sum ledger entries on read | Maintain balance column | **Storage**: Single source of truth column |
+| Transfer history | Query on demand | Denormalize with sender/receiver details | **Hybrid**: Store IDs, hydrate on read with cache |
+| Friend suggestions | Compute graph analysis per request | Pre-compute and cache | **Compute with cache**: Weekly batch job + cache |
+
+**Local Development Resource Allocation:**
+
+```yaml
+# docker-compose.yml resource limits
+services:
+  postgres:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+  redis:
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+  cassandra:
+    deploy:
+      resources:
+        limits:
+          memory: 1G  # Cassandra is memory-hungry
+  rabbitmq:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+```
+
+**Total local dev footprint: ~2 GB RAM** - reasonable for development laptops.

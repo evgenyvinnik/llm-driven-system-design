@@ -241,6 +241,434 @@ When Redis is unavailable, requests are allowed to pass (fail-open) because:
 - Use secure Redis connections in production
 - Implement IP-based fallback for missing API keys
 
+## Async Queue/Stream for Background Jobs
+
+### Queue Architecture
+
+For background jobs and fanout operations, we use RabbitMQ as the message broker. This handles async workloads without impacting the critical path of rate limit checks.
+
+```
+┌─────────────────┐     ┌────────────────┐     ┌──────────────────┐
+│  API Gateway    │────▶│   RabbitMQ     │────▶│  Worker Nodes    │
+│  (Publishers)   │     │   (Broker)     │     │  (Consumers)     │
+└─────────────────┘     └────────────────┘     └──────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+              ┌─────▼─────┐        ┌──────▼──────┐
+              │  Metrics  │        │   Audit     │
+              │  Queue    │        │   Queue     │
+              └───────────┘        └─────────────┘
+```
+
+### Queue Types and Purpose
+
+| Queue Name | Purpose | Delivery Semantics | TTL |
+|------------|---------|-------------------|-----|
+| `ratelimit.metrics.aggregate` | Batch metrics for PostgreSQL | At-least-once | 1 hour |
+| `ratelimit.audit.events` | Rate limit decision audit log | At-least-once | 24 hours |
+| `ratelimit.rules.sync` | Config change fanout to API nodes | At-most-once | 5 minutes |
+| `ratelimit.alerts.trigger` | Threshold breach notifications | At-least-once | 30 minutes |
+
+### Message Schemas
+
+**Metrics Aggregation Message:**
+```json
+{
+  "message_id": "uuid-v4",
+  "timestamp": 1704067200,
+  "window_minute": "2024-01-01T00:00:00Z",
+  "metrics": {
+    "total_checks": 15420,
+    "allowed": 14893,
+    "denied": 527,
+    "p50_latency_ms": 0.8,
+    "p99_latency_ms": 3.2
+  },
+  "node_id": "gateway-1"
+}
+```
+
+**Audit Event Message:**
+```json
+{
+  "message_id": "uuid-v4",
+  "idempotency_key": "check:{identifier}:{timestamp_ms}",
+  "event_type": "rate_limit_decision",
+  "identifier": "api_key_abc123",
+  "algorithm": "sliding_window",
+  "allowed": false,
+  "remaining": 0,
+  "limit": 100,
+  "timestamp": 1704067200123
+}
+```
+
+### Delivery Semantics and Backpressure
+
+**At-least-once delivery** for metrics and audit:
+- Publisher confirms enabled (`channel.confirmSelect()`)
+- Consumer sends ACK only after successful processing
+- Dead-letter queue (DLQ) for messages that fail 3 retries
+
+**Backpressure handling:**
+- Prefetch limit of 100 messages per consumer
+- Queue length alarm at 10,000 messages triggers scaling
+- Circuit breaker on queue publish after 5 consecutive failures
+
+### Local Development Setup
+
+```yaml
+# docker-compose.yml addition
+rabbitmq:
+  image: rabbitmq:3.12-management
+  ports:
+    - "5672:5672"   # AMQP
+    - "15672:15672" # Management UI
+  environment:
+    RABBITMQ_DEFAULT_USER: ratelimit
+    RABBITMQ_DEFAULT_PASS: ratelimit_dev
+  volumes:
+    - rabbitmq_data:/var/lib/rabbitmq
+```
+
+**Native installation (macOS):**
+```bash
+brew install rabbitmq
+brew services start rabbitmq
+# Create vhost and user
+rabbitmqctl add_vhost ratelimit
+rabbitmqctl add_user ratelimit ratelimit_dev
+rabbitmqctl set_permissions -p ratelimit ratelimit ".*" ".*" ".*"
+```
+
+## Failure Handling
+
+### Retry Strategy with Idempotency Keys
+
+All retryable operations use idempotency keys to prevent duplicate processing.
+
+**Idempotency Key Format:**
+```
+{operation}:{identifier}:{timestamp_bucket}
+```
+
+Example: `check:api_key_abc123:1704067200000` (1-second bucket for rate checks)
+
+**Retry Configuration:**
+```typescript
+const retryConfig = {
+  maxRetries: 3,
+  initialDelayMs: 100,
+  maxDelayMs: 2000,
+  backoffMultiplier: 2,
+  jitterFactor: 0.25  // 25% random jitter
+};
+```
+
+**Retry Flow:**
+1. First attempt fails -> wait 100ms (+ 0-25ms jitter)
+2. Second attempt fails -> wait 200ms (+ 0-50ms jitter)
+3. Third attempt fails -> wait 400ms (+ 0-100ms jitter)
+4. After 3 failures -> fail-open for rate checks, DLQ for async jobs
+
+### Circuit Breaker Pattern
+
+Each external dependency has its own circuit breaker:
+
+| Dependency | Failure Threshold | Recovery Timeout | Half-Open Requests |
+|------------|------------------|------------------|-------------------|
+| Redis Primary | 5 failures in 30s | 10 seconds | 3 |
+| Redis Replica | 10 failures in 60s | 30 seconds | 5 |
+| PostgreSQL | 5 failures in 60s | 30 seconds | 2 |
+| RabbitMQ | 5 failures in 30s | 15 seconds | 3 |
+
+**Circuit Breaker States:**
+```
+CLOSED -> (failures exceed threshold) -> OPEN
+OPEN -> (recovery timeout) -> HALF_OPEN
+HALF_OPEN -> (success) -> CLOSED
+HALF_OPEN -> (failure) -> OPEN
+```
+
+**Implementation (using opossum library):**
+```typescript
+import CircuitBreaker from 'opossum';
+
+const redisBreaker = new CircuitBreaker(redisOperation, {
+  timeout: 3000,           // 3s operation timeout
+  errorThresholdPercentage: 50,
+  resetTimeout: 10000,     // 10s before trying again
+  volumeThreshold: 5       // Minimum requests before opening
+});
+
+redisBreaker.on('open', () => {
+  logger.warn('Redis circuit opened - failing open for rate checks');
+  metrics.increment('circuit_breaker.redis.open');
+});
+
+redisBreaker.fallback(() => ({
+  allowed: true,           // Fail-open
+  fallback: true,
+  remaining: -1,
+  resetAt: Date.now() + 60000
+}));
+```
+
+### Disaster Recovery (Local Development Simulation)
+
+For learning purposes, we simulate multi-region behavior with multiple local instances.
+
+**Simulated Setup:**
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Local Machine                                                  │
+│                                                                │
+│  "Region A" (Primary)          "Region B" (Replica)           │
+│  ┌─────────────────┐           ┌─────────────────┐            │
+│  │ Redis :6379     │◀─────────▶│ Redis :6380     │            │
+│  │ (Master)        │  Replicate│ (Slave)         │            │
+│  └─────────────────┘           └─────────────────┘            │
+│  ┌─────────────────┐           ┌─────────────────┐            │
+│  │ API :3001       │           │ API :3002       │            │
+│  └─────────────────┘           └─────────────────┘            │
+│  ┌─────────────────┐           ┌─────────────────┐            │
+│  │ PostgreSQL :5432│◀─────────▶│ PG Read :5433   │            │
+│  │ (Primary)       │ Streaming │ (Replica)       │            │
+│  └─────────────────┘           └─────────────────┘            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Failover Procedure (manual for learning):**
+1. Detect primary failure (health check fails 3 times)
+2. Promote Redis replica: `redis-cli -p 6380 REPLICAOF NO ONE`
+3. Update API config to point to new primary
+4. Promote PostgreSQL replica if needed
+5. Verify state consistency
+
+**Backup and Restore Testing:**
+
+Redis backup (RDB snapshot):
+```bash
+# Create backup
+redis-cli BGSAVE
+cp /var/lib/redis/dump.rdb ./backups/redis-$(date +%Y%m%d).rdb
+
+# Restore (stop Redis first)
+cp ./backups/redis-20240101.rdb /var/lib/redis/dump.rdb
+redis-server
+```
+
+PostgreSQL backup:
+```bash
+# Backup
+pg_dump -h localhost -U ratelimit -d ratelimit_db > ./backups/pg-$(date +%Y%m%d).sql
+
+# Restore
+psql -h localhost -U ratelimit -d ratelimit_db < ./backups/pg-20240101.sql
+```
+
+**Backup Testing Schedule (for learning):**
+- Weekly: Practice Redis failover
+- Monthly: Practice full restore from backup
+- Document recovery time and any issues encountered
+
+## Data Lifecycle Policies
+
+### Redis TTL Strategy
+
+All rate limit keys have explicit TTLs to prevent unbounded growth.
+
+| Key Pattern | TTL | Rationale |
+|-------------|-----|-----------|
+| `ratelimit:fixed:*` | 2x window size | Covers full window + buffer |
+| `ratelimit:sliding:*` | 2x window size | Covers current + previous window |
+| `ratelimit:log:*` | window size + 1 minute | Sliding log entries auto-expire |
+| `ratelimit:token:*` | 24 hours | Reset daily inactive buckets |
+| `ratelimit:leaky:*` | 24 hours | Reset daily inactive buckets |
+| `metrics:*` | 1 hour | Aggregated to PostgreSQL |
+| `metrics:latencies:*` | 15 minutes | Short-lived detailed data |
+
+**Implementation:**
+```typescript
+// Set TTL when writing
+await redis.setex(key, ttlSeconds, value);
+
+// For hash keys
+await redis.hset(key, field, value);
+await redis.expire(key, ttlSeconds);
+```
+
+### PostgreSQL Data Retention
+
+| Table | Hot Storage | Warm Storage | Cold Storage | Delete |
+|-------|-------------|--------------|--------------|--------|
+| `rate_limit_rules` | Indefinite | N/A | N/A | Manual |
+| `metrics_hourly` | 7 days | 30 days (compressed) | 1 year | After 1 year |
+| `audit_events` | 24 hours | 7 days | 30 days | After 30 days |
+| `alert_history` | 7 days | 30 days | 90 days | After 90 days |
+
+**Archival Schema:**
+```sql
+-- Hot table (current data)
+CREATE TABLE metrics_hourly (
+    id SERIAL PRIMARY KEY,
+    hour_bucket TIMESTAMP NOT NULL,
+    identifier VARCHAR(255),
+    total_checks BIGINT,
+    allowed BIGINT,
+    denied BIGINT,
+    p50_latency_ms DECIMAL(8,2),
+    p99_latency_ms DECIMAL(8,2),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Warm table (compressed, older data)
+CREATE TABLE metrics_hourly_archive (
+    id SERIAL PRIMARY KEY,
+    hour_bucket TIMESTAMP NOT NULL,
+    data JSONB NOT NULL,  -- Compressed aggregates
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Partition by month for easier archival
+CREATE TABLE audit_events (
+    id BIGSERIAL,
+    event_time TIMESTAMP NOT NULL,
+    identifier VARCHAR(255),
+    event_data JSONB
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE audit_events_2024_01 PARTITION OF audit_events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+```
+
+**Archival Cron Job (runs daily at 3 AM):**
+```bash
+#!/bin/bash
+# archive_old_data.sh
+
+# Archive metrics older than 7 days
+psql -c "
+INSERT INTO metrics_hourly_archive (hour_bucket, data)
+SELECT hour_bucket, jsonb_build_object(
+    'total_checks', SUM(total_checks),
+    'allowed', SUM(allowed),
+    'denied', SUM(denied)
+)
+FROM metrics_hourly
+WHERE hour_bucket < NOW() - INTERVAL '7 days'
+GROUP BY hour_bucket;
+
+DELETE FROM metrics_hourly
+WHERE hour_bucket < NOW() - INTERVAL '7 days';
+"
+
+# Drop partitions older than 30 days
+psql -c "DROP TABLE IF EXISTS audit_events_$(date -d '30 days ago' +%Y_%m);"
+```
+
+### Cold Storage (MinIO/S3 for Local Dev)
+
+For audit logs and historical metrics beyond warm storage:
+
+```yaml
+# docker-compose.yml addition
+minio:
+  image: minio/minio
+  ports:
+    - "9000:9000"
+    - "9001:9001"
+  environment:
+    MINIO_ROOT_USER: ratelimit
+    MINIO_ROOT_PASSWORD: ratelimit_dev
+  command: server /data --console-address ":9001"
+  volumes:
+    - minio_data:/data
+```
+
+**Cold Storage Structure:**
+```
+s3://ratelimit-archive/
+├── metrics/
+│   └── year=2024/month=01/metrics-2024-01-01.parquet
+├── audit/
+│   └── year=2024/month=01/day=01/audit-2024-01-01.jsonl.gz
+└── backups/
+    ├── redis/
+    │   └── dump-2024-01-01.rdb.gz
+    └── postgres/
+        └── backup-2024-01-01.sql.gz
+```
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Replay missed audit events**
+```bash
+# Identify gap
+psql -c "SELECT MIN(event_time), MAX(event_time) FROM audit_events;"
+
+# Replay from RabbitMQ DLQ
+# 1. Move messages from DLQ back to main queue
+rabbitmqctl eval 'rabbit_amqqueue:move_messages(<<"audit_dlq">>, <<"audit_events">>).'
+
+# 2. Or replay from cold storage
+aws s3 cp s3://ratelimit-archive/audit/year=2024/month=01/day=15/ ./replay/
+gunzip ./replay/*.gz
+# Import via worker script
+node scripts/replay-audit.js ./replay/
+```
+
+**Scenario 2: Backfill metrics after outage**
+```typescript
+// scripts/backfill-metrics.ts
+async function backfillMetricsFromRedis(startTime: Date, endTime: Date) {
+  // Scan Redis for metrics keys in time range
+  const keys = await redis.keys(`metrics:${formatMinute(startTime)}*`);
+
+  for (const key of keys) {
+    const data = await redis.hgetall(key);
+    await insertMetricsToPostgres({
+      hour_bucket: parseHourFromKey(key),
+      total_checks: parseInt(data.total),
+      allowed: parseInt(data.allowed),
+      denied: parseInt(data.denied),
+      backfilled: true
+    });
+  }
+}
+```
+
+**Scenario 3: Restore rate limit state after Redis failure**
+```bash
+# If Redis data is lost, rate limits reset naturally
+# No backfill needed - counters start fresh
+# Log the incident for audit purposes
+
+# For token/leaky bucket, you may want to restore from backup
+# to preserve accumulated tokens/water levels
+redis-cli -p 6379 --rdb ./backups/redis-latest.rdb
+```
+
+### Data Cleanup Commands
+
+```bash
+# Manual cleanup commands for local development
+
+# Clear all rate limit keys (testing)
+redis-cli KEYS "ratelimit:*" | xargs -r redis-cli DEL
+
+# Clear metrics older than 1 hour
+redis-cli KEYS "metrics:*" | while read key; do
+  if [[ $(redis-cli TTL "$key") -lt 0 ]]; then
+    redis-cli DEL "$key"
+  fi
+done
+
+# Vacuum PostgreSQL after large deletes
+psql -c "VACUUM ANALYZE metrics_hourly;"
+```
+
 ## Future Optimizations
 
 1. **Local Caching**: Hybrid approach with local counters synced periodically

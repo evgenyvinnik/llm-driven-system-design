@@ -2,11 +2,27 @@ import { useState, useEffect } from 'react';
 import type { Document, User } from '../types';
 import { api } from '../services/api';
 
+/**
+ * Props for the DocumentList component.
+ */
 interface DocumentListProps {
+  /** Callback when a document is selected */
   onSelectDocument: (document: Document) => void;
+  /** Currently selected user's ID (for creating documents) */
   selectedUserId: string;
 }
 
+/**
+ * DocumentList - Displays a list of all documents and allows creating new ones.
+ *
+ * Features:
+ * - Lists all documents sorted by last update time
+ * - Allows creating new documents
+ * - Clicking a document selects it for editing
+ *
+ * @param props - Component props
+ * @returns The DocumentList component
+ */
 export function DocumentList({ onSelectDocument, selectedUserId }: DocumentListProps) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);

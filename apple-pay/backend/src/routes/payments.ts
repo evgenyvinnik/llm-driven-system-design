@@ -4,8 +4,13 @@ import { biometricService } from '../services/biometric.js';
 import { AuthenticatedRequest, authMiddleware, biometricMiddleware } from '../middleware/auth.js';
 import { z } from 'zod';
 
+/**
+ * Express router for payment and biometric authentication endpoints.
+ * Handles biometric auth flow, payment processing, and transaction history.
+ */
 const router = Router();
 
+/** Zod schema for payment request validation */
 const paymentSchema = z.object({
   card_id: z.string().uuid(),
   amount: z.number().positive(),
@@ -14,17 +19,22 @@ const paymentSchema = z.object({
   transaction_type: z.enum(['nfc', 'in_app', 'web']),
 });
 
+/** Zod schema for biometric auth initiation validation */
 const initiateAuthSchema = z.object({
   device_id: z.string().uuid(),
   auth_type: z.enum(['face_id', 'touch_id', 'passcode']),
 });
 
+/** Zod schema for biometric verification validation */
 const verifyAuthSchema = z.object({
   session_id: z.string().uuid(),
   response: z.string(),
 });
 
-// Initiate biometric authentication
+/**
+ * POST /api/payments/biometric/initiate
+ * Initiates a biometric authentication session for payment authorization.
+ */
 router.post('/biometric/initiate', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const data = initiateAuthSchema.parse(req.body);
@@ -43,6 +53,10 @@ router.post('/biometric/initiate', authMiddleware, async (req: AuthenticatedRequ
   }
 });
 
+/**
+ * POST /api/payments/biometric/verify
+ * Verifies a biometric authentication response.
+ */
 // Verify biometric authentication
 router.post('/biometric/verify', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -63,6 +77,10 @@ router.post('/biometric/verify', authMiddleware, async (req: AuthenticatedReques
   }
 });
 
+/**
+ * POST /api/payments/biometric/simulate
+ * Simulates successful biometric authentication for demo purposes.
+ */
 // Simulate biometric success (for demo purposes)
 router.post('/biometric/simulate', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -84,6 +102,10 @@ router.post('/biometric/simulate', authMiddleware, async (req: AuthenticatedRequ
   }
 });
 
+/**
+ * GET /api/payments/biometric/:sessionId
+ * Retrieves the status of a biometric session.
+ */
 // Get biometric session status
 router.get('/biometric/:sessionId', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -100,6 +122,10 @@ router.get('/biometric/:sessionId', authMiddleware, async (req: AuthenticatedReq
   }
 });
 
+/**
+ * POST /api/payments/pay
+ * Processes a payment transaction. Requires biometric verification.
+ */
 // Process payment (requires biometric verification)
 router.post('/pay', authMiddleware, biometricMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -127,6 +153,10 @@ router.post('/pay', authMiddleware, biometricMiddleware, async (req: Authenticat
   }
 });
 
+/**
+ * GET /api/payments/transactions/:transactionId
+ * Retrieves details of a specific transaction.
+ */
 // Get transaction by ID
 router.get('/transactions/:transactionId', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -146,6 +176,10 @@ router.get('/transactions/:transactionId', authMiddleware, async (req: Authentic
   }
 });
 
+/**
+ * GET /api/payments/transactions
+ * Lists transactions for the authenticated user with pagination.
+ */
 // Get user's transactions
 router.get('/transactions', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {

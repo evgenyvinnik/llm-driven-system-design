@@ -1,6 +1,12 @@
 import { Link, useLocation } from '@tanstack/react-router';
 import { useMatchStore } from '../stores/matchStore';
 
+/**
+ * Bottom navigation bar for the main app.
+ * Shows tabs for Discover, Messages (with unread badge), and Profile.
+ * Highlights the currently active route.
+ * @returns Bottom navigation element
+ */
 export default function BottomNav() {
   const location = useLocation();
   const { unreadCount } = useMatchStore();

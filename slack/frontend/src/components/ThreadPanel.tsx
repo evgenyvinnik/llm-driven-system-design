@@ -1,9 +1,20 @@
+/**
+ * @fileoverview Thread panel component for viewing and replying to threads.
+ * Displays the parent message and all replies in a side panel.
+ */
+
 import { useState, useRef, useEffect } from 'react';
 import { messageApi } from '../services/api';
 import { useAuthStore, useMessageStore, useUIStore } from '../stores';
 import { formatMessageTime, groupReactions, getInitials } from '../utils';
 import type { Message } from '../types';
 
+/**
+ * Thread panel component.
+ * Displays a thread conversation with the parent message and replies.
+ * Provides a reply input for adding new messages to the thread.
+ * Renders as a slide-out panel on the right side of the screen.
+ */
 export function ThreadPanel() {
   const [newReply, setNewReply] = useState('');
   const repliesEndRef = useRef<HTMLDivElement>(null);

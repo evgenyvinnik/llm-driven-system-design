@@ -1,13 +1,34 @@
+/**
+ * BiometricModal component simulates biometric authentication.
+ * Displays Face ID, Touch ID, or passcode authentication UI.
+ * In a real implementation, this would trigger native device APIs.
+ */
 import { useState } from 'react';
 
+/**
+ * Props for the BiometricModal component.
+ */
 interface BiometricModalProps {
+  /** Whether the modal is visible */
   isOpen: boolean;
+  /** Type of biometric authentication to display */
   authType: 'face_id' | 'touch_id' | 'passcode';
+  /** Callback when authentication succeeds */
   onSuccess: () => void;
+  /** Callback when user cancels authentication */
   onCancel: () => void;
+  /** Whether authentication is in progress */
   isLoading?: boolean;
 }
 
+/**
+ * Renders a modal dialog for biometric authentication simulation.
+ * Shows appropriate UI for Face ID, Touch ID, or passcode entry.
+ * Includes a "Simulate Success" button for demo purposes.
+ *
+ * @param props - BiometricModal component props
+ * @returns JSX element representing the biometric auth modal, or null if not open
+ */
 export function BiometricModal({
   isOpen,
   authType,

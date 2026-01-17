@@ -1,10 +1,25 @@
+/**
+ * Event card component for displaying event summary in listings.
+ * Shows event image, name, date, venue, category, and availability status.
+ * Links to the event detail page when clicked.
+ */
 import { Link } from '@tanstack/react-router';
 import type { Event } from '../types';
 
+/**
+ * Props for the EventCard component.
+ */
 interface EventCardProps {
+  /** The event to display */
   event: Event;
 }
 
+/**
+ * Displays an event as a clickable card with image, details, and status badges.
+ *
+ * @param props - Component props containing the event
+ * @returns The rendered event card
+ */
 export function EventCard({ event }: EventCardProps) {
   const eventDate = new Date(event.event_date);
   const onSaleDate = new Date(event.on_sale_date);

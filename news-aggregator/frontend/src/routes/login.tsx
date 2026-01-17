@@ -1,12 +1,28 @@
+/**
+ * Login and registration page route.
+ * Provides forms for user authentication and account creation.
+ * @module routes/login
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores';
 import { LogIn, UserPlus } from 'lucide-react';
 
+/**
+ * Login page route configuration.
+ * No data loading required - form-driven page.
+ */
 export const Route = createFileRoute('/login')({
   component: LoginPage,
 });
 
+/**
+ * Login page component.
+ * Provides login and registration forms with toggle.
+ * Handles form validation and auth store integration.
+ * @returns Login/registration form page
+ */
 function LoginPage() {
   const navigate = useNavigate();
   const { login, register, isLoading, error } = useAuthStore();
@@ -19,6 +35,10 @@ function LoginPage() {
   });
   const [formError, setFormError] = useState<string | null>(null);
 
+  /**
+   * Handle form submission for login or registration.
+   * Validates form data and calls appropriate auth method.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);

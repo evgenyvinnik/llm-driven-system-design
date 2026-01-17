@@ -1,8 +1,18 @@
+/**
+ * @fileoverview Global state stores for the application using Zustand.
+ * Contains stores for authentication, workspaces, and page navigation.
+ * These stores provide reactive state management and async actions.
+ */
+
 import { create } from 'zustand';
 import type { User, Workspace, Page } from '@/types';
 import { authApi, workspacesApi, pagesApi } from '@/services/api';
 import { wsService } from '@/services/websocket';
 
+/**
+ * Authentication state interface.
+ * Manages user session, login/logout actions, and auth state verification.
+ */
 interface AuthState {
   user: User | null;
   token: string | null;
@@ -14,6 +24,11 @@ interface AuthState {
   checkAuth: () => Promise<void>;
 }
 
+/**
+ * Authentication store for managing user sessions.
+ * Handles login, logout, registration, and session restoration.
+ * Automatically connects/disconnects WebSocket on auth state changes.
+ */
 export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   token: localStorage.getItem('token'),
@@ -63,6 +78,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 }));
 
+/**
+ * Workspace state interface.
+ * Manages the list of available workspaces and current workspace selection.
+ */
 interface WorkspaceState {
   workspaces: Workspace[];
   currentWorkspace: Workspace | null;
@@ -72,6 +91,10 @@ interface WorkspaceState {
   createWorkspace: (name: string, icon?: string) => Promise<Workspace>;
 }
 
+/**
+ * Workspace store for managing user workspaces.
+ * Automatically selects the first workspace if none is selected.
+ */
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   workspaces: [],
   currentWorkspace: null,
@@ -107,6 +130,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 }));
 
+/**
+ * Page state interface.
+ * Manages the hierarchical page tree, current page selection, and expansion state.
+ */
 interface PageState {
   pages: Page[];
   currentPage: Page | null;
@@ -126,6 +153,10 @@ interface PageState {
   toggleExpanded: (pageId: string) => void;
 }
 
+/**
+ * Page store for managing page hierarchy and navigation.
+ * Supports nested pages, CRUD operations, and tree expansion state.
+ */
 export const usePageStore = create<PageState>((set, get) => ({
   pages: [],
   currentPage: null,

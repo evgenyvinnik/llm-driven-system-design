@@ -5,10 +5,29 @@ import { MenuItemCard } from '../components/MenuItemCard';
 import { useCartStore } from '../stores/cartStore';
 import type { Restaurant, MenuByCategory } from '../types';
 
+/**
+ * Restaurant detail page route configuration.
+ * Uses dynamic route parameter for restaurant ID.
+ */
 export const Route = createFileRoute('/restaurant/$restaurantId')({
   component: RestaurantPage,
 });
 
+/**
+ * Restaurant detail page component displaying menu and restaurant info.
+ * Shows the full restaurant menu organized by category with add-to-cart
+ * functionality.
+ *
+ * Features:
+ * - Restaurant header with image, name, rating, and details
+ * - Menu items organized by category
+ * - Add to cart controls on each item
+ * - Floating cart summary bar when items are in cart
+ * - Loading and error states
+ * - "Closed" overlay when restaurant is not accepting orders
+ *
+ * @returns React component for the restaurant detail page
+ */
 function RestaurantPage() {
   const { restaurantId } = Route.useParams();
   const [restaurant, setRestaurant] = useState<Restaurant | null>(null);

@@ -1,6 +1,16 @@
+/**
+ * URL Shortener Component
+ *
+ * Main form for creating shortened URLs.
+ * Supports both basic URL shortening and advanced options (custom codes, expiration).
+ */
 import React, { useState } from 'react';
 import { useUrlStore } from '../stores/urlStore';
 
+/**
+ * URL shortening form with advanced options.
+ * Displays the created short URL on success with copy functionality.
+ */
 export function UrlShortener() {
   const [longUrl, setLongUrl] = useState('');
   const [customCode, setCustomCode] = useState('');

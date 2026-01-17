@@ -2,9 +2,16 @@ import { Router } from 'express';
 import * as searchService from '../services/searchService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Search routes for issue discovery.
+ * Provides JQL search, quick search, suggestions, and filter aggregations.
+ */
 const router = Router();
 
-// Search issues with JQL
+/**
+ * GET /
+ * Searches issues using JQL and/or full-text search.
+ */
 router.get('/', requireAuth, async (req, res) => {
   try {
     const {
@@ -40,7 +47,10 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// Quick search
+/**
+ * GET /quick
+ * Performs a quick text search for type-ahead functionality.
+ */
 router.get('/quick', requireAuth, async (req, res) => {
   try {
     const { q, projectId, limit } = req.query;
@@ -62,7 +72,10 @@ router.get('/quick', requireAuth, async (req, res) => {
   }
 });
 
-// Get search suggestions
+/**
+ * GET /suggestions
+ * Returns autocomplete suggestions for a field value.
+ */
 router.get('/suggestions', requireAuth, async (req, res) => {
   try {
     const { field, prefix, projectId } = req.query;
@@ -84,7 +97,10 @@ router.get('/suggestions', requireAuth, async (req, res) => {
   }
 });
 
-// Get filter aggregations
+/**
+ * GET /aggregations
+ * Returns filter facet counts for building filter UI.
+ */
 router.get('/aggregations', requireAuth, async (req, res) => {
   try {
     const { projectId } = req.query;
@@ -100,7 +116,10 @@ router.get('/aggregations', requireAuth, async (req, res) => {
   }
 });
 
-// Validate JQL
+/**
+ * POST /validate
+ * Validates JQL syntax without executing the query.
+ */
 router.post('/validate', requireAuth, (req, res) => {
   const { jql } = req.body;
 

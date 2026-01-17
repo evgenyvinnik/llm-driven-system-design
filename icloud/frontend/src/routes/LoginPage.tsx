@@ -4,6 +4,15 @@ import { useAuthStore } from '../stores/authStore';
 import { CloudIcon } from '../components/Icons';
 import { generateDeviceName } from '../utils/helpers';
 
+/**
+ * Login page component for user authentication.
+ *
+ * Provides a form for users to sign in with email and password.
+ * On successful login, connects the WebSocket and redirects to /drive.
+ * Displays demo account credentials for testing purposes.
+ *
+ * @returns Login form page
+ */
 export const LoginPage: React.FC = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');

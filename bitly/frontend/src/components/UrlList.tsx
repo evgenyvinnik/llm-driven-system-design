@@ -1,8 +1,19 @@
+/**
+ * URL List Component
+ *
+ * Displays the user's shortened URLs with management actions.
+ * Includes analytics modal and delete confirmation.
+ */
 import React, { useEffect, useState } from 'react';
 import { Url, UrlAnalytics } from '../types';
 import { useUrlStore } from '../stores/urlStore';
 import { api } from '../services/api';
 
+/**
+ * Formats a date string to a human-readable format.
+ * @param dateString - ISO date string
+ * @returns Formatted date string (e.g., "Jan 15, 2024")
+ */
 function formatDate(dateString: string): string {
   return new Date(dateString).toLocaleDateString('en-US', {
     year: 'numeric',
@@ -11,6 +22,10 @@ function formatDate(dateString: string): string {
   });
 }
 
+/**
+ * Modal component for displaying URL analytics.
+ * Shows total clicks, daily trends, referrers, and device breakdown.
+ */
 function AnalyticsModal({ shortCode, onClose }: { shortCode: string; onClose: () => void }) {
   const [analytics, setAnalytics] = useState<UrlAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
@@ -106,6 +121,10 @@ function AnalyticsModal({ shortCode, onClose }: { shortCode: string; onClose: ()
   );
 }
 
+/**
+ * Displays a list of the user's shortened URLs.
+ * Provides actions for viewing analytics and deleting URLs.
+ */
 export function UrlList() {
   const { urls, total, isLoading, error, loadUrls, deleteUrl } = useUrlStore();
   const [selectedUrl, setSelectedUrl] = useState<string | null>(null);

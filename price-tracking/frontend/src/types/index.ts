@@ -1,3 +1,10 @@
+/**
+ * Type definitions for the Price Tracking frontend application.
+ * Mirrors backend types for consistent API communication.
+ * @module types
+ */
+
+/** Authenticated user information */
 export interface User {
   id: string;
   email: string;
@@ -7,6 +14,7 @@ export interface User {
   updated_at: string;
 }
 
+/** Product being tracked for price changes */
 export interface Product {
   id: string;
   url: string;
@@ -26,6 +34,7 @@ export interface Product {
   watcher_count?: number;
 }
 
+/** Individual price history record */
 export interface PriceHistory {
   id: string;
   product_id: string;
@@ -35,6 +44,7 @@ export interface PriceHistory {
   availability: boolean;
 }
 
+/** Aggregated daily price statistics for charts */
 export interface DailyPrice {
   day: string;
   min_price: number;
@@ -43,6 +53,7 @@ export interface DailyPrice {
   data_points: number;
 }
 
+/** Price drop notification alert */
 export interface Alert {
   id: string;
   user_id: string;
@@ -56,35 +67,43 @@ export interface Alert {
   product: Product;
 }
 
+/** Error response from API */
 export interface ApiError {
   error: string;
 }
 
+/** Response from login/register endpoints */
 export interface AuthResponse {
   user: User;
   token: string;
 }
 
+/** Response wrapper for products list */
 export interface ProductsResponse {
   products: Product[];
 }
 
+/** Response wrapper for single product */
 export interface ProductResponse {
   product: Product;
 }
 
+/** Response wrapper for alerts list */
 export interface AlertsResponse {
   alerts: Alert[];
 }
 
+/** Response wrapper for price history */
 export interface PriceHistoryResponse {
   history: PriceHistory[];
 }
 
+/** Response wrapper for daily price aggregates */
 export interface DailyPricesResponse {
   daily: DailyPrice[];
 }
 
+/** Admin dashboard statistics */
 export interface AdminStats {
   users: number;
   products: number;

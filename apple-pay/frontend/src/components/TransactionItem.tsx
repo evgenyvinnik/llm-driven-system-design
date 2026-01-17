@@ -1,10 +1,20 @@
+/**
+ * TransactionItem component displays a single transaction in the history list.
+ * Shows merchant name, status, amount, and transaction type icon.
+ */
 import type { Transaction } from '../types';
 
+/**
+ * Props for the TransactionItem component.
+ */
 interface TransactionItemProps {
+  /** Transaction data to display */
   transaction: Transaction;
+  /** Click handler for viewing transaction details */
   onClick?: () => void;
 }
 
+/** Color classes for each transaction status */
 const statusColors = {
   pending: 'text-apple-orange',
   approved: 'text-apple-green',
@@ -12,6 +22,7 @@ const statusColors = {
   refunded: 'text-apple-gray-500',
 };
 
+/** Human-readable labels for each transaction status */
 const statusLabels = {
   pending: 'Pending',
   approved: 'Approved',
@@ -19,6 +30,7 @@ const statusLabels = {
   refunded: 'Refunded',
 };
 
+/** SVG icons for each transaction type */
 const typeIcons = {
   nfc: (
     <svg className="w-6 h-6" viewBox="0 0 24 24" fill="currentColor">
@@ -37,6 +49,13 @@ const typeIcons = {
   ),
 };
 
+/**
+ * Formats a number as currency with the specified currency code.
+ *
+ * @param amount - The numeric amount to format
+ * @param currency - ISO 4217 currency code (e.g., 'USD')
+ * @returns Formatted currency string
+ */
 function formatCurrency(amount: number, currency: string): string {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -44,6 +63,14 @@ function formatCurrency(amount: number, currency: string): string {
   }).format(amount);
 }
 
+/**
+ * Formats a date string into a human-readable relative format.
+ * Shows time for today, "Yesterday" for yesterday, day name for
+ * last week, and month/day for older dates.
+ *
+ * @param dateString - ISO date string to format
+ * @returns Human-readable date string
+ */
 function formatDate(dateString: string): string {
   const date = new Date(dateString);
   const now = new Date();
@@ -61,6 +88,13 @@ function formatDate(dateString: string): string {
   }
 }
 
+/**
+ * Renders a transaction list item with merchant, status, amount, and type.
+ * Shows refunds in green with a plus sign. Displays last 4 card digits.
+ *
+ * @param props - TransactionItem component props
+ * @returns JSX element representing a transaction row
+ */
 export function TransactionItem({ transaction, onClick }: TransactionItemProps) {
   const isRefund = transaction.amount < 0;
 
@@ -100,6 +134,12 @@ export function TransactionItem({ transaction, onClick }: TransactionItemProps) 
   );
 }
 
+/**
+ * Skeleton loading component for transaction item.
+ * Displays a shimmer animation placeholder while transaction data loads.
+ *
+ * @returns JSX element representing a loading transaction skeleton
+ */
 export function TransactionSkeleton() {
   return (
     <div className="flex items-center gap-4 p-4 bg-white rounded-xl">

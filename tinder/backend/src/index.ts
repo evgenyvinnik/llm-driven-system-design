@@ -14,8 +14,16 @@ import discoveryRoutes from './routes/discovery.js';
 import matchRoutes from './routes/matches.js';
 import adminRoutes from './routes/admin.js';
 
+/**
+ * Main application entry point for the Tinder-like matching platform backend.
+ * Sets up Express server with WebSocket support for real-time messaging.
+ */
+
+/** Express application instance */
 const app = express();
+/** HTTP server wrapping Express for WebSocket support */
 const server = createServer(app);
+/** Server port from environment or default 3000 */
 const PORT = parseInt(process.env.PORT || '3000');
 
 // Middleware
@@ -49,7 +57,11 @@ app.use('/api/discovery', discoveryRoutes);
 app.use('/api/matches', matchRoutes);
 app.use('/api/admin', adminRoutes);
 
-// Health check
+/**
+ * GET /api/health
+ * Health check endpoint for monitoring and load balancer health probes.
+ * Returns Redis connection status and server timestamp.
+ */
 app.get('/api/health', async (_req, res) => {
   try {
     const redisStatus = await redis.ping();
@@ -63,16 +75,19 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
-// Error handler
+/** Global error handler for uncaught exceptions */
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize WebSocket gateway
+/** WebSocket gateway instance for real-time messaging */
 let wsGateway: WebSocketGateway;
 
-// Start server
+/**
+ * Initializes all services and starts the HTTP server.
+ * Tests database connections, initializes Elasticsearch index, and sets up WebSocket gateway.
+ */
 async function start() {
   try {
     console.log('Testing database connections...');
@@ -96,7 +111,7 @@ async function start() {
   }
 }
 
-// Graceful shutdown
+/** Graceful shutdown handler - closes WebSocket and HTTP server cleanly */
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down...');
   if (wsGateway) {

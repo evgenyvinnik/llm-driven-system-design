@@ -5,6 +5,14 @@ import { useAuthStore } from '@/stores/authStore';
 import { api } from '@/services/api';
 import type { User } from '@/types';
 
+/**
+ * Sidebar component displaying the list of user's conversations.
+ * Includes user search for starting new conversations, current user info,
+ * and logout functionality. Supports both viewing existing conversations
+ * and creating new direct message threads.
+ *
+ * @returns React component for the conversation list sidebar
+ */
 export function ConversationList() {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<User[]>([]);
@@ -46,6 +54,12 @@ export function ConversationList() {
     return () => clearTimeout(debounce);
   }, [searchQuery]);
 
+  /**
+   * Creates a new direct conversation with the selected user and selects it.
+   * Closes the new conversation panel and clears search state.
+   *
+   * @param targetUser - The user to start a conversation with
+   */
   const handleStartConversation = async (targetUser: User) => {
     try {
       const conversation = await createDirectConversation(targetUser.id);

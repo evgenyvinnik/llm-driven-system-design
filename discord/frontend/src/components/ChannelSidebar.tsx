@@ -1,5 +1,21 @@
+/**
+ * Channel Sidebar Component
+ *
+ * Secondary sidebar showing channel details and user information.
+ * Displays the current room name, member count, and a list of all
+ * available rooms. Includes user panel at the bottom showing the
+ * logged-in user's nickname and a disconnect button.
+ */
+
 import { useChatStore } from '../stores/chatStore';
 
+/**
+ * Renders the channel sidebar with room details and user controls.
+ * Shows current room information when in a room, otherwise prompts
+ * to select a room. User panel at bottom provides session info and logout.
+ *
+ * @returns Sidebar with channel info and user panel
+ */
 export function ChannelSidebar() {
   const { session, currentRoom, rooms, leaveRoom, disconnect } = useChatStore();
 

@@ -1,3 +1,13 @@
+/**
+ * Customers Route
+ *
+ * Customer management page for viewing and managing customer records.
+ * Provides customer creation, deletion, and displays associated payment methods.
+ * Implements a master-detail layout similar to the payments page.
+ *
+ * @module routes/customers
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { listCustomers, createCustomer, deleteCustomer, listPaymentMethods } from '@/services/api';
@@ -5,10 +15,20 @@ import { formatDate } from '@/utils';
 import { CardDisplay } from '@/components';
 import type { Customer, PaymentMethod } from '@/types';
 
+/**
+ * Route definition for the customers page (/customers).
+ */
 export const Route = createFileRoute('/customers')({
   component: CustomersPage,
 });
 
+/**
+ * Customers page component.
+ * Lists all customers with ability to view details, associated payment methods,
+ * create new customers, and delete existing ones.
+ *
+ * @returns The customers management page
+ */
 function CustomersPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
@@ -27,6 +47,9 @@ function CustomersPage() {
     }
   }, [selectedCustomer]);
 
+  /**
+   * Fetches the list of customers from the API.
+   */
   async function loadCustomers() {
     try {
       setLoading(true);
@@ -39,6 +62,10 @@ function CustomersPage() {
     }
   }
 
+  /**
+   * Fetches payment methods for a specific customer.
+   * @param customerId - The customer ID to load payment methods for
+   */
   async function loadPaymentMethods(customerId: string) {
     try {
       const result = await listPaymentMethods({ customer: customerId });
@@ -49,6 +76,10 @@ function CustomersPage() {
     }
   }
 
+  /**
+   * Creates a new customer with the provided data.
+   * @param data - Customer creation data
+   */
   async function handleCreate(data: { name: string; email: string; phone: string }) {
     try {
       await createCustomer(data);
@@ -59,6 +90,10 @@ function CustomersPage() {
     }
   }
 
+  /**
+   * Deletes a customer after user confirmation.
+   * @param id - Customer ID to delete
+   */
   async function handleDelete(id: string) {
     if (!confirm('Are you sure you want to delete this customer?')) return;
 
@@ -219,6 +254,14 @@ function CustomersPage() {
   );
 }
 
+/**
+ * Modal dialog for creating a new customer.
+ * Collects name, email, and phone information via a form.
+ *
+ * @param props - Modal props
+ * @param props.onClose - Callback to close the modal
+ * @param props.onCreate - Callback with customer data when form is submitted
+ */
 function CreateCustomerModal({
   onClose,
   onCreate,
@@ -231,6 +274,9 @@ function CreateCustomerModal({
   const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(false);
 
+  /**
+   * Handles form submission and calls onCreate callback.
+   */
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);

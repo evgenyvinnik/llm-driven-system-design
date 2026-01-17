@@ -1,9 +1,26 @@
+/**
+ * CallControls Component
+ *
+ * Provides in-call control buttons for muting audio, toggling video,
+ * and ending the call. Displays current state with visual feedback.
+ */
+
 import { useStore } from '../stores/useStore';
 
+/**
+ * Props for the CallControls component.
+ */
 interface CallControlsProps {
+  /** Callback invoked when user clicks the end call button */
   onEndCall: () => void;
 }
 
+/**
+ * Renders call control buttons with current mute/video state.
+ *
+ * @param props - Component props containing end call handler
+ * @returns Control bar with mute, end call, and video toggle buttons
+ */
 export function CallControls({ onEndCall }: CallControlsProps) {
   const { isMuted, isVideoOff, toggleMute, toggleVideo, callState } = useStore();
 

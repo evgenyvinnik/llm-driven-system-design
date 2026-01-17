@@ -1,21 +1,65 @@
+/**
+ * @fileoverview Feed state store using Zustand.
+ * Manages the home feed posts with infinite scroll pagination.
+ * Provides optimistic updates for likes to improve perceived performance.
+ */
+
 import { create } from 'zustand';
 import type { Post } from '@/types';
 import { feedApi, postsApi } from '@/services/api';
 
+/**
+ * Feed state interface.
+ * Contains posts array and pagination state for infinite scroll.
+ */
 interface FeedState {
+  /** Array of posts currently loaded in the feed */
   posts: Post[];
+  /** Cursor for pagination (timestamp of last post) */
   cursor: string | null;
+  /** Whether more posts are available to load */
   hasMore: boolean;
+  /** Whether a fetch operation is in progress */
   isLoading: boolean;
+  /** Error message if fetch failed */
   error: string | null;
+  /**
+   * Fetches posts from the API with optional reset.
+   * @param reset - If true, clears existing posts and starts fresh
+   */
   fetchFeed: (reset?: boolean) => Promise<void>;
+  /**
+   * Adds a new post to the top of the feed (after creating).
+   * @param post - The newly created post
+   */
   addPost: (post: Post) => void;
+  /**
+   * Removes a post from the feed (after deletion).
+   * @param postId - ID of the post to remove
+   */
   removePost: (postId: string) => void;
+  /**
+   * Updates a post's properties in the feed.
+   * @param postId - ID of the post to update
+   * @param updates - Partial post data to merge
+   */
   updatePost: (postId: string, updates: Partial<Post>) => void;
+  /**
+   * Likes a post with optimistic update and rollback on failure.
+   * @param postId - ID of the post to like
+   */
   likePost: (postId: string) => Promise<void>;
+  /**
+   * Unlikes a post with optimistic update and rollback on failure.
+   * @param postId - ID of the post to unlike
+   */
   unlikePost: (postId: string) => Promise<void>;
 }
 
+/**
+ * Zustand store for feed state.
+ * Implements cursor-based pagination and optimistic UI updates.
+ */
 export const useFeedStore = create<FeedState>((set, get) => ({
   posts: [],
   cursor: null,

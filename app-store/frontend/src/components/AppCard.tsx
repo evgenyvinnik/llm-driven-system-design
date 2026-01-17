@@ -1,12 +1,28 @@
+/**
+ * @fileoverview App card and star rating components.
+ * Used throughout the store for displaying app listings.
+ */
+
 import clsx from 'clsx';
 import type { App } from '../types';
 
+/**
+ * Props for the AppCard component.
+ */
 interface AppCardProps {
+  /** App data to display */
   app: Partial<App>;
+  /** Click handler for the card */
   onClick?: () => void;
+  /** Display size variant */
   size?: 'small' | 'medium' | 'large';
 }
 
+/**
+ * Displays an app listing card with icon, name, developer, rating, and price.
+ * Supports three size variants for different contexts.
+ * @param props - Component props
+ */
 export function AppCard({ app, onClick, size = 'medium' }: AppCardProps) {
   const iconSize = {
     small: 'w-12 h-12',
@@ -78,12 +94,22 @@ export function AppCard({ app, onClick, size = 'medium' }: AppCardProps) {
   );
 }
 
+/**
+ * Props for the StarRating component.
+ */
 interface StarRatingProps {
+  /** Rating value (0-5) */
   rating: number;
+  /** Display size variant */
   size?: 'small' | 'medium' | 'large';
+  /** Whether to show numeric value */
   showValue?: boolean;
 }
 
+/**
+ * Displays a star rating visualization with filled, half, and empty stars.
+ * @param props - Component props
+ */
 export function StarRating({ rating, size = 'medium', showValue = false }: StarRatingProps) {
   const starSize = {
     small: 'w-3 h-3',
@@ -136,6 +162,11 @@ export function StarRating({ rating, size = 'medium', showValue = false }: StarR
   );
 }
 
+/**
+ * Formats a number with K/M suffixes for readability.
+ * @param num - Number to format
+ * @returns Formatted string (e.g., "1.2K", "3.5M")
+ */
 function formatNumber(num: number): string {
   if (num >= 1000000) {
     return (num / 1000000).toFixed(1) + 'M';

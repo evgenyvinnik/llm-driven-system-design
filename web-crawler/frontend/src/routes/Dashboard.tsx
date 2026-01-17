@@ -1,9 +1,38 @@
+/**
+ * @fileoverview Dashboard route component for the web crawler.
+ *
+ * The Dashboard is the main landing page that provides a real-time overview
+ * of the crawler's activity and performance. It displays:
+ * - Crawl statistics (pages crawled, failed, links discovered)
+ * - Frontier status (pending, in-progress, completed URLs)
+ * - Worker health and heartbeat status
+ * - Top domains by page count
+ * - Recently crawled pages
+ *
+ * The dashboard auto-polls the API every 5 seconds to provide live updates.
+ *
+ * @module routes/Dashboard
+ */
+
 import { useEffect } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
 import { StatCard } from '../components/StatCard';
 import { RecentPagesTable } from '../components/RecentPagesTable';
 import { WorkerStatus } from '../components/WorkerStatus';
 
+/**
+ * Dashboard route component displaying real-time crawler statistics.
+ *
+ * Features:
+ * - Auto-polling for live updates (5-second interval)
+ * - Loading skeleton while fetching initial data
+ * - Responsive grid layout for stat cards
+ * - Worker health monitoring
+ * - Top domains visualization
+ * - Recent pages table with status badges
+ *
+ * @returns Dashboard page with live crawler metrics
+ */
 export function Dashboard() {
   const { stats, statsLoading, fetchStats, startPolling, stopPolling } = useCrawlerStore();
 
@@ -13,6 +42,13 @@ export function Dashboard() {
     return () => stopPolling();
   }, [fetchStats, startPolling, stopPolling]);
 
+  /**
+   * Formats byte count into human-readable string.
+   * Uses decimal units (KB, MB, GB) for display.
+   *
+   * @param bytes - Raw byte count
+   * @returns Formatted string with appropriate unit
+   */
   const formatBytes = (bytes: number): string => {
     if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
     if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(2)} MB`;

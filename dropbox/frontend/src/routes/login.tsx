@@ -1,11 +1,23 @@
+/**
+ * Login page route.
+ * Provides email/password authentication form.
+ * Redirects to main file browser on successful login.
+ * @module routes/login
+ */
+
 import { useState } from 'react';
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 
+/** Route definition for the login page at /login */
 export const Route = createFileRoute('/login')({
   component: Login,
 });
 
+/**
+ * Login form component.
+ * Handles user authentication with demo account hints.
+ */
 function Login() {
   const navigate = useNavigate();
   const { login, isLoading, error, clearError } = useAuthStore();

@@ -1,11 +1,26 @@
+/**
+ * File browser component for the application home page.
+ * Displays a grid of recent design files and allows creating new files.
+ * Shows file thumbnails, active user counts, and last edit dates.
+ */
 import React, { useState, useEffect } from 'react';
 import { api } from '../services/api';
 import type { DesignFile } from '../types';
 
+/**
+ * Props for the FileBrowser component.
+ */
 interface FileBrowserProps {
+  /** Callback when a file is selected for editing */
   onSelectFile: (fileId: string) => void;
 }
 
+/**
+ * FileBrowser component showing all available design files.
+ * Provides file creation, selection, and deletion functionality.
+ * @param props - Component props
+ * @returns The rendered file browser page
+ */
 export function FileBrowser({ onSelectFile }: FileBrowserProps) {
   const [files, setFiles] = useState<DesignFile[]>([]);
   const [loading, setLoading] = useState(true);

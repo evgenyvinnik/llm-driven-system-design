@@ -1,3 +1,13 @@
+/**
+ * WebSocket Hook Module
+ *
+ * Custom React hook for managing WebSocket connections to the live comments server.
+ * Handles connection lifecycle, automatic reconnection, message routing, and
+ * provides functions for sending comments and reactions.
+ *
+ * @module hooks/useWebSocket
+ */
+
 import { useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../stores/appStore';
 import {
@@ -9,11 +19,30 @@ import {
   ReactionType,
 } from '../types';
 
+/** WebSocket server URL (connects to backend on port 3001) */
 const WS_URL = `ws://${window.location.hostname}:3001`;
 
+/**
+ * Custom hook for WebSocket communication with the live comments server.
+ *
+ * Manages:
+ * - Connection establishment and auto-reconnection
+ * - Heartbeat pings to maintain connection
+ * - Message routing to appropriate store actions
+ * - Sending comments and reactions
+ *
+ * @param streamId - ID of the stream to join (null if none selected)
+ * @param userId - ID of the current user (null if not logged in)
+ * @returns Object with sendComment and sendReaction functions
+ */
 export function useWebSocket(streamId: string | null, userId: string | null) {
+  /** Reference to the WebSocket connection */
   const wsRef = useRef<WebSocket | null>(null);
+
+  /** Timeout ID for reconnection attempts */
   const reconnectTimeoutRef = useRef<number | null>(null);
+
+  /** Interval ID for heartbeat pings */
   const pingIntervalRef = useRef<number | null>(null);
 
   const {
@@ -24,6 +53,10 @@ export function useWebSocket(streamId: string | null, userId: string | null) {
     addFloatingReaction,
   } = useAppStore();
 
+  /**
+   * Establishes WebSocket connection and sets up event handlers.
+   * Joins the specified stream after connection is established.
+   */
   const connect = useCallback(() => {
     if (!streamId || !userId) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -82,6 +115,11 @@ export function useWebSocket(streamId: string | null, userId: string | null) {
     wsRef.current = ws;
   }, [streamId, userId, setIsConnected]);
 
+  /**
+   * Routes incoming WebSocket messages to appropriate store actions.
+   *
+   * @param message - Parsed WebSocket message
+   */
   const handleMessage = (message: WSMessage) => {
     switch (message.type) {
       case 'comments_batch': {
@@ -120,6 +158,11 @@ export function useWebSocket(streamId: string | null, userId: string | null) {
     }
   };
 
+  /**
+   * Sends a comment to the current stream via WebSocket.
+   *
+   * @param content - Text content of the comment
+   */
   const sendComment = useCallback(
     (content: string) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -141,6 +184,11 @@ export function useWebSocket(streamId: string | null, userId: string | null) {
     [streamId, userId]
   );
 
+  /**
+   * Sends a reaction to the current stream via WebSocket.
+   *
+   * @param reactionType - Type of reaction to send
+   */
   const sendReaction = useCallback(
     (reactionType: ReactionType) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {

@@ -1,13 +1,23 @@
+/**
+ * @fileoverview App detail page route.
+ * Shows full app information, screenshots, reviews, and similar apps.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useCatalogStore } from '../stores/catalogStore';
 import { AppCard, StarRating } from '../components/AppCard';
 import { ReviewCard, RatingBar } from '../components/ReviewCard';
 
+/** App detail page route definition */
 export const Route = createFileRoute('/app/$id')({
   component: AppDetailPage,
 });
 
+/**
+ * App detail page component.
+ * Displays comprehensive app information including screenshots, ratings, reviews.
+ */
 function AppDetailPage() {
   const { id } = Route.useParams();
   const navigate = useNavigate();

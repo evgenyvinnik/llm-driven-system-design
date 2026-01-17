@@ -14,7 +14,10 @@ import type {
   SelectionRange,
 } from '../types/index.js';
 
-// Client colors for presence indicators
+/**
+ * Predefined colors for presence indicators.
+ * Assigned to clients in round-robin fashion.
+ */
 const COLORS = [
   '#3B82F6', // blue
   '#10B981', // green
@@ -26,25 +29,53 @@ const COLORS = [
   '#F97316', // orange
 ];
 
+/**
+ * Represents an active WebSocket connection with associated metadata.
+ */
 interface ClientConnection {
+  /** The WebSocket connection */
   ws: WebSocket;
+  /** The document this client is editing */
   documentId: string;
+  /** Unique session ID for this connection */
   clientId: string;
+  /** The authenticated user's ID */
   userId: string;
+  /** User's display name */
   displayName: string;
+  /** Assigned color for presence UI */
   color: string;
 }
 
 /**
  * SyncServer manages WebSocket connections and coordinates
  * real-time document synchronization.
+ *
+ * This is the main orchestration layer for collaborative editing. It:
+ * - Accepts WebSocket connections on the /ws endpoint
+ * - Authenticates users and validates document access
+ * - Routes messages to the appropriate DocumentState
+ * - Broadcasts changes to all connected clients
+ * - Handles disconnections and cleanup
+ *
+ * One SyncServer instance serves all documents. DocumentState instances
+ * are created on-demand when clients connect to a document.
  */
 export class SyncServer {
+  /** The WebSocket server instance */
   private wss: WebSocketServer;
+  /** Active document states, keyed by document ID */
   private documents: Map<string, DocumentState>;
+  /** Active client connections, keyed by WebSocket */
   private clients: Map<WebSocket, ClientConnection>;
+  /** Color assignment counter for presence colors */
   private colorIndex: number;
 
+  /**
+   * Create a new SyncServer attached to an HTTP server.
+   *
+   * @param server - The HTTP server to attach the WebSocket server to
+   */
   constructor(server: Server) {
     this.wss = new WebSocketServer({ server, path: '/ws' });
     this.documents = new Map();
@@ -58,6 +89,15 @@ export class SyncServer {
     console.log('WebSocket server initialized');
   }
 
+  /**
+   * Handle a new WebSocket connection.
+   *
+   * Validates the documentId and userId from query params, loads
+   * the document state, and sends the initial state to the client.
+   *
+   * @param ws - The WebSocket connection
+   * @param req - The HTTP request containing query parameters
+   */
   private async handleConnection(ws: WebSocket, req: { url?: string }): Promise<void> {
     // Parse URL to get documentId and userId
     const url = new URL(req.url || '/', 'http://localhost');
@@ -156,6 +196,14 @@ export class SyncServer {
     }
   }
 
+  /**
+   * Handle an incoming WebSocket message.
+   *
+   * Routes the message to the appropriate handler based on message type.
+   *
+   * @param ws - The WebSocket that sent the message
+   * @param data - The raw message data (JSON string)
+   */
   private async handleMessage(ws: WebSocket, data: string): Promise<void> {
     const connection = this.clients.get(ws);
     if (!connection) return;
@@ -184,6 +232,17 @@ export class SyncServer {
     }
   }
 
+  /**
+   * Handle an operation message from a client.
+   *
+   * Applies the operation using OT, acknowledges to the sender,
+   * and broadcasts the transformed operation to other clients.
+   *
+   * @param ws - The WebSocket that sent the operation
+   * @param connection - The client connection metadata
+   * @param docState - The document state
+   * @param message - The operation message
+   */
   private async handleOperation(
     ws: WebSocket,
     connection: ClientConnection,
@@ -229,6 +288,17 @@ export class SyncServer {
     }
   }
 
+  /**
+   * Handle a cursor position update from a client.
+   *
+   * Updates the client's cursor in the document state and
+   * broadcasts to other clients.
+   *
+   * @param ws - The WebSocket that sent the update
+   * @param connection - The client connection metadata
+   * @param docState - The document state
+   * @param message - The cursor message
+   */
   private async handleCursor(
     ws: WebSocket,
     connection: ClientConnection,
@@ -250,6 +320,17 @@ export class SyncServer {
     );
   }
 
+  /**
+   * Handle a selection update from a client.
+   *
+   * Updates the client's selection in the document state and
+   * broadcasts to other clients.
+   *
+   * @param ws - The WebSocket that sent the update
+   * @param connection - The client connection metadata
+   * @param docState - The document state
+   * @param message - The selection message
+   */
   private async handleSelection(
     ws: WebSocket,
     connection: ClientConnection,
@@ -271,6 +352,14 @@ export class SyncServer {
     );
   }
 
+  /**
+   * Handle a client disconnection.
+   *
+   * Removes the client from the document state, broadcasts
+   * the leave event, and cleans up empty documents.
+   *
+   * @param ws - The WebSocket that disconnected
+   */
   private async handleDisconnect(ws: WebSocket): Promise<void> {
     const connection = this.clients.get(ws);
     if (!connection) return;
@@ -302,12 +391,25 @@ export class SyncServer {
     console.log(`Client ${connection.clientId} disconnected`);
   }
 
+  /**
+   * Send a message to a specific WebSocket client.
+   *
+   * @param ws - The target WebSocket
+   * @param message - The message to send
+   */
   private send(ws: WebSocket, message: WSMessage): void {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(message));
     }
   }
 
+  /**
+   * Broadcast a message to all clients in a document.
+   *
+   * @param documentId - The document to broadcast to
+   * @param message - The message to send
+   * @param excludeWs - Optional WebSocket to exclude from broadcast
+   */
   private broadcast(documentId: string, message: WSMessage, excludeWs?: WebSocket): void {
     for (const [ws, connection] of this.clients.entries()) {
       if (connection.documentId === documentId && ws !== excludeWs) {
@@ -316,6 +418,12 @@ export class SyncServer {
     }
   }
 
+  /**
+   * Get the next color for a new client.
+   * Colors are assigned in round-robin fashion.
+   *
+   * @returns A hex color string
+   */
   private getNextColor(): string {
     const color = COLORS[this.colorIndex % COLORS.length];
     this.colorIndex++;
@@ -323,7 +431,8 @@ export class SyncServer {
   }
 
   /**
-   * Close all connections
+   * Close all WebSocket connections and shut down the server.
+   * Should be called during graceful shutdown.
    */
   close(): void {
     this.wss.close();

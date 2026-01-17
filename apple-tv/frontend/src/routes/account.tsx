@@ -6,6 +6,17 @@ import { subscriptionApi, watchProgressApi } from '../services/api';
 import type { SubscriptionPlan } from '../types';
 import { Check, CreditCard, History, User, Settings } from 'lucide-react';
 
+/**
+ * Account settings page with user information and subscription management.
+ * Provides tabs for account overview, subscription plans, and watch history.
+ *
+ * Features:
+ * - Account overview with user details and quick actions
+ * - Subscription tab showing current plan and available upgrades
+ * - Watch history tab with clear history option
+ * - Sign out functionality
+ * - Requires authentication
+ */
 function AccountPage() {
   const navigate = useNavigate();
   const { user, logout } = useAuthStore();
@@ -253,6 +264,12 @@ function AccountPage() {
   );
 }
 
+/**
+ * Watch history tab component showing recently viewed content.
+ * Displays a list of watched items with timestamps and clear history option.
+ *
+ * @returns Watch history section with list of viewed content
+ */
 function WatchHistoryTab() {
   const [history, setHistory] = useState<unknown[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -349,6 +366,10 @@ function WatchHistoryTab() {
   );
 }
 
+/**
+ * Route configuration for account page (/account).
+ * User settings and subscription management.
+ */
 export const Route = createFileRoute('/account')({
   component: AccountPage,
 });

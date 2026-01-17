@@ -1,3 +1,12 @@
+/**
+ * Chat Layout Component
+ *
+ * Main layout container for the messaging interface.
+ * Manages the two-column layout with conversation list and chat view.
+ * Handles responsive design for mobile/desktop viewing.
+ * Initializes the WebSocket connection for real-time messaging.
+ */
+
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useWebSocket } from '../hooks/useWebSocket';
@@ -5,6 +14,10 @@ import { ConversationList } from './ConversationList';
 import { ChatView } from './ChatView';
 import { NewChatDialog } from './NewChatDialog';
 
+/**
+ * Main chat layout with sidebar and message area.
+ * Responsive design shows sidebar on mobile when no chat selected.
+ */
 export function ChatLayout() {
   const { logout } = useAuthStore();
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);

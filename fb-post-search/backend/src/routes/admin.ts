@@ -1,7 +1,17 @@
+/**
+ * @fileoverview Admin API routes.
+ * Defines endpoints for administrative operations. All routes require admin role.
+ */
+
 import { Router } from 'express';
 import * as adminController from '../controllers/adminController.js';
 import { requireAdmin } from '../middleware/auth.js';
 
+/**
+ * Express router for admin-only endpoints.
+ * Base path: /api/v1/admin
+ * All routes are protected by requireAdmin middleware.
+ */
 const router = Router();
 
 // All admin routes require admin authentication

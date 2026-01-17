@@ -1,19 +1,40 @@
+/**
+ * Zustand store for alert notification state management.
+ * Handles fetching, reading, and deleting price drop alerts.
+ * @module stores/alertStore
+ */
 import { create } from 'zustand';
 import { Alert } from '../types';
 import * as alertService from '../services/alerts';
 
+/**
+ * Alert state shape.
+ */
 interface AlertState {
+  /** List of alert notifications */
   alerts: Alert[];
+  /** Count of unread alerts for badge */
   unreadCount: number;
+  /** True while loading alerts */
   isLoading: boolean;
+  /** Error message if operation failed */
   error: string | null;
+  /** Fetches all alerts, optionally filtered to unread only */
   fetchAlerts: (unreadOnly?: boolean) => Promise<void>;
+  /** Fetches just the unread count for badge display */
   fetchUnreadCount: () => Promise<void>;
+  /** Marks a single alert as read */
   markAsRead: (alertId: string) => Promise<void>;
+  /** Marks all alerts as read */
   markAllAsRead: () => Promise<void>;
+  /** Deletes an alert */
   deleteAlert: (alertId: string) => Promise<void>;
 }
 
+/**
+ * Global alert store.
+ * Use with: const { alerts, unreadCount, fetchAlerts } = useAlertStore();
+ */
 export const useAlertStore = create<AlertState>((set, get) => ({
   alerts: [],
   unreadCount: 0,

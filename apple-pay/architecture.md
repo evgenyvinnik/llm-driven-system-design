@@ -515,6 +515,493 @@ CREATE TABLE merchants (
 
 ---
 
+## Capacity Planning and Traffic Estimates
+
+This section provides realistic traffic estimates for a local development simulation, scaled down from production but maintaining realistic ratios.
+
+### Local Development Scale
+
+| Metric | Local Dev Value | Production Equivalent |
+|--------|-----------------|----------------------|
+| DAU (Daily Active Users) | 100 simulated users | 50M users |
+| MAU (Monthly Active Users) | 500 simulated users | 500M users |
+| Provisioned cards | 200 cards | 1B cards |
+| Transactions/day | 500 | 500M |
+
+### Request Rate Estimates
+
+**Provisioning Service:**
+- Peak RPS: 2 requests/second (local) = 10K RPS production
+- Payload size: ~2KB (encrypted card data + device attestation)
+- Burst capacity: 5 RPS for 30 seconds
+
+**Transaction Processing:**
+- Peak RPS: 5 requests/second (local) = 20K RPS production
+- NFC payload: ~500 bytes (EMV data + cryptogram)
+- In-app payload: ~2KB (encrypted payment token)
+- P99 latency target: 300ms for NFC, 500ms for in-app
+
+**Token Lifecycle:**
+- Peak RPS: 0.5 requests/second (local)
+- Mostly bursty during "lost device" scenarios
+
+### Component Sizing (Local Development)
+
+**PostgreSQL:**
+- Single instance, no sharding needed at local scale
+- Tables sized for ~10K rows each (cards, transactions)
+- Connection pool: 10 connections sufficient
+
+**Valkey/Redis Cache:**
+- Memory: 256MB sufficient
+- Keys: ~1K active session keys + ~500 token lookup cache entries
+- Eviction policy: `allkeys-lru`
+
+**RabbitMQ (optional async processing):**
+- Single queue for transaction notifications
+- Message throughput: 10 messages/second peak
+- Message size: ~1KB (transaction events)
+
+### Sharding Strategy (Production Reference)
+
+For production scale, transactions would shard by:
+- **Primary key**: `token_ref` hash (distributes load across token usage)
+- **Time-based partitioning**: Monthly partitions for transactions table
+- **Shard count**: 16 shards handles 500M daily transactions
+
+```sql
+-- Example: Hash-based routing for local simulation
+CREATE OR REPLACE FUNCTION get_shard_id(token_ref VARCHAR)
+RETURNS INTEGER AS $$
+BEGIN
+  -- For local dev: always returns 0 (single shard)
+  -- Production: RETURN abs(hashtext(token_ref)) % 16;
+  RETURN 0;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+---
+
+## Consistency and Idempotency Semantics
+
+Payment systems require careful consistency guarantees. This section defines the semantics for each write operation.
+
+### Transaction Consistency Model
+
+| Operation | Consistency Level | Rationale |
+|-----------|------------------|-----------|
+| Card provisioning | Strong (serializable) | Must prevent duplicate tokens |
+| Transaction authorization | Strong (serializable) | Financial accuracy |
+| Transaction history reads | Eventual (read-your-writes) | Performance acceptable |
+| Token status updates | Strong | Security-critical |
+
+### Idempotency Implementation
+
+All mutation endpoints require idempotency keys to handle network retries safely.
+
+```javascript
+class IdempotencyService {
+  constructor(redis) {
+    this.redis = redis
+    this.TTL_SECONDS = 86400 // 24 hours
+  }
+
+  async executeOnce(idempotencyKey, operation) {
+    const cacheKey = `idempotency:${idempotencyKey}`
+
+    // Check for existing result
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      const parsed = JSON.parse(cached)
+      if (parsed.status === 'completed') {
+        return { replayed: true, result: parsed.result }
+      }
+      if (parsed.status === 'in_progress') {
+        throw new Error('Request already in progress')
+      }
+    }
+
+    // Mark as in-progress with short TTL (prevents concurrent execution)
+    const lockAcquired = await this.redis.set(
+      cacheKey,
+      JSON.stringify({ status: 'in_progress', startedAt: Date.now() }),
+      'NX',
+      'EX',
+      60 // 60 second lock for operation
+    )
+
+    if (!lockAcquired) {
+      throw new Error('Request already in progress')
+    }
+
+    try {
+      const result = await operation()
+
+      // Store completed result
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify({ status: 'completed', result, completedAt: Date.now() }),
+        'EX',
+        this.TTL_SECONDS
+      )
+
+      return { replayed: false, result }
+    } catch (error) {
+      // Clear in-progress state on failure (allow retry)
+      await this.redis.del(cacheKey)
+      throw error
+    }
+  }
+}
+```
+
+### Replay Handling
+
+**Transaction Authorization Replays:**
+```javascript
+class TransactionService {
+  async processTransaction(idempotencyKey, transactionData) {
+    return this.idempotency.executeOnce(idempotencyKey, async () => {
+      // Check if transaction already exists by terminal+reference
+      const existing = await db.query(`
+        SELECT * FROM transactions
+        WHERE terminal_id = $1 AND terminal_reference = $2
+      `, [transactionData.terminalId, transactionData.terminalReference])
+
+      if (existing.rows.length > 0) {
+        // Return existing result (terminal retry scenario)
+        return existing.rows[0]
+      }
+
+      // Process new transaction with serializable isolation
+      return db.transaction('SERIALIZABLE', async (tx) => {
+        // Validate token is still active
+        const card = await tx.query(`
+          SELECT * FROM provisioned_cards
+          WHERE token_ref = $1 AND status = 'active'
+          FOR UPDATE
+        `, [transactionData.tokenRef])
+
+        if (card.rows.length === 0) {
+          throw new Error('Token not active')
+        }
+
+        // Insert transaction
+        const result = await tx.query(`
+          INSERT INTO transactions (id, token_ref, terminal_id, terminal_reference, amount, currency, status)
+          VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+          RETURNING *
+        `, [uuid(), transactionData.tokenRef, transactionData.terminalId,
+            transactionData.terminalReference, transactionData.amount, transactionData.currency])
+
+        return result.rows[0]
+      })
+    })
+  }
+}
+```
+
+### Conflict Resolution
+
+**Token Provisioning Conflicts:**
+- Same card on same device: Reject (card already provisioned)
+- Same card on different device: Allow (per-device tokens)
+- Concurrent provisioning attempts: First-write-wins via database unique constraint
+
+```sql
+-- Prevent duplicate card+device combinations
+ALTER TABLE provisioned_cards
+ADD CONSTRAINT unique_card_device UNIQUE (user_id, device_id, last4, network);
+```
+
+**Token Status Conflicts:**
+- Suspend vs. active payment: Suspend takes precedence (security)
+- Multiple suspend requests: Idempotent (no-op if already suspended)
+- Reactivate during payment: Queue reactivation until payment completes
+
+### Application Transaction Counter (ATC)
+
+The ATC in the Secure Element provides natural replay protection for NFC payments:
+
+```javascript
+class CryptogramValidator {
+  async validateCryptogram(tokenRef, cryptogram, claimedATC) {
+    // Get last known ATC for this token
+    const lastATC = await this.redis.get(`atc:${tokenRef}`)
+
+    if (lastATC && claimedATC <= parseInt(lastATC)) {
+      // Replay attack detected - ATC must always increase
+      return { valid: false, reason: 'ATC_REPLAY' }
+    }
+
+    // Validate cryptogram with network...
+    const networkResult = await this.validateWithNetwork(tokenRef, cryptogram)
+
+    if (networkResult.valid) {
+      // Update ATC watermark
+      await this.redis.set(`atc:${tokenRef}`, claimedATC.toString())
+    }
+
+    return networkResult
+  }
+}
+```
+
+---
+
+## Caching and Edge Strategy
+
+### Cache Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Request Flow                              │
+└─────────────────────────────────────────────────────────────────┘
+
+   Client Request
+         │
+         ▼
+┌─────────────────┐    Cache Miss    ┌─────────────────┐
+│   Edge Cache    │ ───────────────► │   Application   │
+│   (CDN Layer)   │                  │     Server      │
+│                 │ ◄─────────────── │                 │
+│ Static assets   │    Cache Fill    │                 │
+│ Card art images │                  │                 │
+└─────────────────┘                  └────────┬────────┘
+                                              │
+                                              ▼
+                                     ┌─────────────────┐
+                                     │  Valkey/Redis   │
+                                     │  (L2 Cache)     │
+                                     │                 │
+                                     │ - Token lookups │
+                                     │ - Sessions      │
+                                     │ - Rate limits   │
+                                     └────────┬────────┘
+                                              │ Cache Miss
+                                              ▼
+                                     ┌─────────────────┐
+                                     │   PostgreSQL    │
+                                     │  (Source of     │
+                                     │   Truth)        │
+                                     └─────────────────┘
+```
+
+### Caching Strategy by Data Type
+
+| Data Type | Pattern | TTL | Invalidation |
+|-----------|---------|-----|--------------|
+| Token lookup (active) | Cache-aside | 5 minutes | On status change |
+| Token lookup (suspended) | No cache | - | - |
+| User's card list | Cache-aside | 2 minutes | On add/remove |
+| Transaction history | Cache-aside | 30 seconds | On new transaction |
+| Card art images | CDN/Write-through | 24 hours | On card update |
+| Merchant info | Cache-aside | 1 hour | Manual refresh |
+| ATC watermarks | Write-through | No expiry | On transaction |
+
+### Cache-Aside Implementation
+
+```javascript
+class TokenCacheService {
+  constructor(redis, db) {
+    this.redis = redis
+    this.db = db
+    this.TOKEN_TTL = 300 // 5 minutes
+  }
+
+  async getActiveToken(tokenRef) {
+    const cacheKey = `token:${tokenRef}`
+
+    // Try cache first
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      const token = JSON.parse(cached)
+      // Don't return cached suspended tokens
+      if (token.status !== 'active') {
+        await this.redis.del(cacheKey)
+        return null
+      }
+      return token
+    }
+
+    // Cache miss - fetch from database
+    const result = await this.db.query(`
+      SELECT token_ref, network, status, device_id, user_id
+      FROM provisioned_cards
+      WHERE token_ref = $1 AND status = 'active'
+    `, [tokenRef])
+
+    if (result.rows.length === 0) {
+      return null
+    }
+
+    const token = result.rows[0]
+
+    // Populate cache
+    await this.redis.set(
+      cacheKey,
+      JSON.stringify(token),
+      'EX',
+      this.TOKEN_TTL
+    )
+
+    return token
+  }
+
+  async invalidateToken(tokenRef) {
+    await this.redis.del(`token:${tokenRef}`)
+  }
+}
+```
+
+### Write-Through for Critical Data
+
+ATC watermarks use write-through to ensure durability:
+
+```javascript
+class ATCService {
+  async updateATC(tokenRef, newATC) {
+    const cacheKey = `atc:${tokenRef}`
+
+    // Write to both cache and database atomically
+    await this.db.transaction(async (tx) => {
+      await tx.query(`
+        INSERT INTO token_atc (token_ref, last_atc, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (token_ref)
+        DO UPDATE SET last_atc = $2, updated_at = NOW()
+        WHERE token_atc.last_atc < $2
+      `, [tokenRef, newATC])
+
+      // Update cache after successful DB write
+      await this.redis.set(cacheKey, newATC.toString())
+    })
+  }
+
+  async getATC(tokenRef) {
+    const cacheKey = `atc:${tokenRef}`
+
+    // Check cache
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      return parseInt(cached)
+    }
+
+    // Fallback to database
+    const result = await this.db.query(
+      'SELECT last_atc FROM token_atc WHERE token_ref = $1',
+      [tokenRef]
+    )
+
+    const atc = result.rows[0]?.last_atc || 0
+
+    // Warm cache
+    await this.redis.set(cacheKey, atc.toString())
+
+    return atc
+  }
+}
+```
+
+### Cache Invalidation Rules
+
+```javascript
+class CacheInvalidationService {
+  constructor(redis) {
+    this.redis = redis
+  }
+
+  // Called when token status changes
+  async onTokenStatusChange(tokenRef, userId) {
+    await Promise.all([
+      this.redis.del(`token:${tokenRef}`),
+      this.redis.del(`user_cards:${userId}`)
+    ])
+  }
+
+  // Called when new card is provisioned
+  async onCardProvisioned(userId) {
+    await this.redis.del(`user_cards:${userId}`)
+  }
+
+  // Called when transaction is processed
+  async onTransactionProcessed(tokenRef, userId) {
+    await this.redis.del(`tx_history:${userId}`)
+    // Token cache stays valid - status unchanged
+  }
+
+  // Batch invalidation for lost device
+  async onDeviceLost(userId, deviceId) {
+    // Get all affected token refs
+    const tokens = await this.db.query(
+      'SELECT token_ref FROM provisioned_cards WHERE device_id = $1',
+      [deviceId]
+    )
+
+    const pipeline = this.redis.pipeline()
+    for (const token of tokens.rows) {
+      pipeline.del(`token:${token.token_ref}`)
+    }
+    pipeline.del(`user_cards:${userId}`)
+
+    await pipeline.exec()
+  }
+}
+```
+
+### Local Development Cache Configuration
+
+```javascript
+// config/cache.js
+module.exports = {
+  redis: {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: process.env.REDIS_PORT || 6379,
+    maxRetriesPerRequest: 3,
+    retryDelayMs: 100
+  },
+  ttl: {
+    token: 300,        // 5 minutes
+    userCards: 120,    // 2 minutes
+    txHistory: 30,     // 30 seconds
+    merchantInfo: 3600 // 1 hour
+  },
+  // For local dev, cache is optional - graceful degradation
+  fallbackOnError: true
+}
+```
+
+### CDN/Edge Strategy (Production Reference)
+
+For local development, we skip CDN, but document the production pattern:
+
+```javascript
+// Static asset URLs with cache headers
+class CardArtService {
+  getCardArtUrl(cardArtId) {
+    // Local dev: serve from local storage
+    if (process.env.NODE_ENV === 'development') {
+      return `/static/card-art/${cardArtId}.png`
+    }
+
+    // Production: CDN URL with cache busting
+    return `https://cdn.applepay.example.com/card-art/${cardArtId}.png?v=${this.getVersion(cardArtId)}`
+  }
+
+  // Cache headers for card art responses
+  getCardArtHeaders() {
+    return {
+      'Cache-Control': 'public, max-age=86400', // 24 hours
+      'CDN-Cache-Control': 'max-age=604800',    // 7 days at edge
+      'Vary': 'Accept-Encoding'
+    }
+  }
+}
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -523,3 +1010,7 @@ CREATE TABLE merchants (
 | Token scope | Per-device | Shared across devices | Revocation |
 | Auth method | Biometric + SE | PIN only | Security + UX |
 | Cryptogram | Network-specific | Universal | Compatibility |
+| Token cache | Cache-aside with 5min TTL | No cache | Latency vs freshness |
+| ATC storage | Write-through | Cache-aside | Durability critical |
+| Idempotency | Redis with 24h TTL | Database only | Performance |
+| Transaction consistency | Serializable | Read-committed | Financial accuracy |

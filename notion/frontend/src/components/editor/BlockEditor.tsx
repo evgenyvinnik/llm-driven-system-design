@@ -1,15 +1,34 @@
+/**
+ * @fileoverview Main block editor component for page content editing.
+ * Renders a list of blocks with keyboard navigation, slash commands,
+ * and block CRUD operations.
+ */
+
 import { useRef, useCallback, useEffect } from 'react';
 import type { Block, Page, BlockType, RichText } from '@/types';
 import { useEditorStore } from '@/stores/editor';
 import BlockComponent from '@/components/blocks/BlockComponent';
 import { Plus, GripVertical } from 'lucide-react';
 
+/**
+ * Props for the BlockEditor component.
+ */
 interface BlockEditorProps {
+  /** The ID of the page being edited */
   pageId: string;
+  /** All blocks belonging to this page */
   blocks: Block[];
+  /** Child pages to display at the bottom */
   childPages: Page[];
 }
 
+/**
+ * BlockEditor provides the main editing interface for a page.
+ * Handles block rendering, keyboard shortcuts, and slash commands.
+ *
+ * @param props - Component props
+ * @returns The rendered block editor
+ */
 export default function BlockEditor({ pageId, blocks, childPages }: BlockEditorProps) {
   const {
     addBlock,

@@ -2,18 +2,35 @@ import { create } from 'zustand';
 import type { DiscoveryCard, SwipeResult } from '../types';
 import { discoveryApi } from '../services/api';
 
+/**
+ * Discovery store state and actions interface.
+ * Manages the swipe deck, current card position, and match detection.
+ */
 interface DiscoveryState {
+  /** Array of discovery cards in the current deck */
   deck: DiscoveryCard[];
+  /** Index of the current card being shown */
   currentIndex: number;
+  /** Whether deck is loading */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
+  /** Most recent match (shown in match modal) */
   lastMatch: SwipeResult['match'] | null;
 
+  /** Fetches a new deck of potential matches */
   loadDeck: () => Promise<void>;
+  /** Processes a swipe action and advances to next card */
   swipe: (direction: 'like' | 'pass') => Promise<SwipeResult>;
+  /** Clears the last match (after modal dismissed) */
   clearMatch: () => void;
 }
 
+/**
+ * Zustand store for discovery/swiping functionality.
+ * Manages the deck of potential matches, handles swipe actions,
+ * and detects matches for modal display.
+ */
 export const useDiscoveryStore = create<DiscoveryState>((set, get) => ({
   deck: [],
   currentIndex: 0,

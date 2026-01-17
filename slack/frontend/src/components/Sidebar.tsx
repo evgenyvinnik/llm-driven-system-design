@@ -1,13 +1,29 @@
+/**
+ * @fileoverview Workspace sidebar navigation component.
+ * Displays channels, DMs, and provides workspace controls.
+ */
+
 import { useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore, useWorkspaceStore, useChannelStore, useUIStore } from '../stores';
 import { channelApi, authApi } from '../services/api';
 import type { Channel, DMChannel } from '../types';
 
+/**
+ * Props for the Sidebar component.
+ */
 interface SidebarProps {
+  /** ID of the currently viewed channel for highlighting */
   currentChannelId?: string;
 }
 
+/**
+ * Workspace sidebar component.
+ * Shows the workspace name, search bar, channel list, DM list,
+ * and user profile with logout. Allows creating new channels.
+ * @param props - Component props
+ * @param props.currentChannelId - The ID of the currently active channel
+ */
 export function Sidebar({ currentChannelId }: SidebarProps) {
   const [isCreatingChannel, setIsCreatingChannel] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');

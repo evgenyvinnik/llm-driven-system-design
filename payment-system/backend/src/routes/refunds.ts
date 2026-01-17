@@ -2,12 +2,17 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { RefundService, ChargebackService } from '../services/refund.service.js';
 
+/**
+ * Refund routes module.
+ * Provides endpoints for listing and retrieving refunds,
+ * plus an embedded chargebacks endpoint.
+ */
 const router = Router();
 const refundService = new RefundService();
 const chargebackService = new ChargebackService();
 
 /**
- * List all refunds for merchant
+ * Lists all refunds for the authenticated merchant with pagination.
  * GET /api/v1/refunds
  */
 router.get('/', async (req: Request, res: Response) => {
@@ -35,7 +40,8 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 /**
- * Get a specific refund
+ * Retrieves a specific refund by ID.
+ * Only returns refunds owned by the authenticated merchant.
  * GET /api/v1/refunds/:id
  */
 router.get('/:id', async (req: Request, res: Response) => {
@@ -65,8 +71,9 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * List chargebacks for merchant
- * GET /api/v1/chargebacks
+ * Lists chargebacks for the authenticated merchant.
+ * Note: This endpoint is deprecated; use /api/v1/chargebacks instead.
+ * GET /api/v1/refunds/chargebacks
  */
 router.get('/chargebacks', async (req: Request, res: Response) => {
   try {

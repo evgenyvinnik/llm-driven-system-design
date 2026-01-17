@@ -1,10 +1,39 @@
+/**
+ * Renders collaborator cursor and selection overlays for real-time presence.
+ * Shows where other users are in the spreadsheet with colored indicators.
+ *
+ * @module components/CollaboratorCursors
+ */
+
 import { useSpreadsheetStore } from '../stores/spreadsheet';
 
+/**
+ * Props for the CollaboratorCursors component.
+ */
 interface CollaboratorCursorsProps {
+  /**
+   * Function to get the width of a specific column.
+   * @param index - Column index
+   * @returns Width in pixels
+   */
   getColumnWidth: (index: number) => number;
+
+  /**
+   * Function to get the height of a specific row.
+   * @param index - Row index
+   * @returns Height in pixels
+   */
   getRowHeight: (index: number) => number;
 }
 
+/**
+ * Displays cursor positions and selections of other collaborators.
+ * Each collaborator has a unique color for their cursor and name label.
+ * Selection ranges are shown with semi-transparent overlays.
+ *
+ * @param props - Functions to calculate cell positions
+ * @returns Cursor and selection overlay elements
+ */
 export function CollaboratorCursors({
   getColumnWidth,
   getRowHeight,
@@ -12,7 +41,14 @@ export function CollaboratorCursors({
   const collaborators = useSpreadsheetStore((state) => state.collaborators);
   const userId = useSpreadsheetStore((state) => state.userId);
 
-  // Calculate position for a cell
+  /**
+   * Calculates the pixel position and size of a cell.
+   * Sums row heights and column widths up to the target position.
+   *
+   * @param row - Cell row index
+   * @param col - Cell column index
+   * @returns Position object with top, left, width, and height
+   */
   const getCellPosition = (row: number, col: number) => {
     let top = 0;
     let left = 0;
@@ -30,6 +66,7 @@ export function CollaboratorCursors({
 
   return (
     <>
+      {/* Cursor indicators for each collaborator */}
       {Array.from(collaborators.values())
         .filter((collab) => collab.userId !== userId && collab.cursor)
         .map((collab) => {
@@ -40,7 +77,7 @@ export function CollaboratorCursors({
 
           return (
             <div key={collab.userId}>
-              {/* Cursor outline */}
+              {/* Cursor outline around the cell */}
               <div
                 style={{
                   position: 'absolute',
@@ -53,7 +90,7 @@ export function CollaboratorCursors({
                   zIndex: 5,
                 }}
               />
-              {/* Name label */}
+              {/* Name label above the cursor */}
               <div
                 style={{
                   position: 'absolute',
@@ -82,6 +119,7 @@ export function CollaboratorCursors({
           const { selection } = collab;
           if (!selection) return null;
 
+          // Calculate bounding box for the selection range
           const startPos = getCellPosition(
             Math.min(selection.startRow, selection.endRow),
             Math.min(selection.startCol, selection.endCol)
@@ -100,7 +138,7 @@ export function CollaboratorCursors({
                 left: startPos.left,
                 width: endPos.left + endPos.width - startPos.left,
                 height: endPos.top + endPos.height - startPos.top,
-                backgroundColor: `${collab.color}20`,
+                backgroundColor: `${collab.color}20`, // 20% opacity
                 border: `1px solid ${collab.color}`,
                 pointerEvents: 'none',
                 zIndex: 4,

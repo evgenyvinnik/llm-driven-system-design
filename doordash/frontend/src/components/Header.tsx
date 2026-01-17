@@ -2,11 +2,26 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useCartStore } from '../stores/cartStore';
 
+/**
+ * Application header component with navigation and user actions.
+ * Displays different navigation options based on user role:
+ * - Customers see: Restaurants, Orders, Cart
+ * - Restaurant owners see: Dashboard
+ * - Drivers see: Dashboard
+ * - Unauthenticated users see: Login/Signup
+ *
+ * The header is sticky and provides the main navigation for the app.
+ *
+ * @returns React component for the application header
+ */
 export function Header() {
   const { user, logout } = useAuthStore();
   const itemCount = useCartStore((s) => s.itemCount());
   const navigate = useNavigate();
 
+  /**
+   * Handles user logout and redirects to home page.
+   */
   const handleLogout = async () => {
     await logout();
     navigate({ to: '/' });

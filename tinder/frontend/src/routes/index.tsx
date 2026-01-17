@@ -1,3 +1,7 @@
+/**
+ * Home/Discovery route - main swipe interface.
+ * Shows the card deck for discovering potential matches.
+ */
 import { createFileRoute, Navigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useDiscoveryStore } from '../stores/discoveryStore';
@@ -7,6 +11,12 @@ import SwipeCard from '../components/SwipeCard';
 import MatchModal from '../components/MatchModal';
 import BottomNav from '../components/BottomNav';
 
+/**
+ * Main discovery page component.
+ * Displays swipeable profile cards and handles like/pass actions.
+ * Manages location updates, WebSocket subscriptions, and match modals.
+ * @returns Discovery page element with swipe cards and navigation
+ */
 function HomePage() {
   const { isAuthenticated, user, updateLocation } = useAuthStore();
   const { deck, currentIndex, isLoading, loadDeck, swipe, lastMatch, clearMatch } =

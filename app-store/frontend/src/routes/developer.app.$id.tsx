@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Developer app management page route.
+ * Provides detailed app editing, review management, and analytics for developers.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
@@ -6,10 +11,16 @@ import { ReviewCard } from '../components/ReviewCard';
 import type { App, Review, RatingSummary } from '../types';
 import api from '../services/api';
 
+/** Developer app management page route definition */
 export const Route = createFileRoute('/developer/app/$id')({
   component: DeveloperAppPage,
 });
 
+/**
+ * Developer app management page component.
+ * Provides tabs for app details editing, review responses, and analytics.
+ * Requires developer or admin role for access.
+ */
 function DeveloperAppPage() {
   const { id } = Route.useParams();
   const navigate = useNavigate();
@@ -31,6 +42,10 @@ function DeveloperAppPage() {
     fetchAppData();
   }, [id, user, navigate]);
 
+  /**
+   * Fetches all app data including details, reviews, and ratings.
+   * Runs on component mount and when app ID changes.
+   */
   const fetchAppData = async () => {
     try {
       const [appRes, reviewsRes, ratingsRes] = await Promise.all([
@@ -49,6 +64,10 @@ function DeveloperAppPage() {
     }
   };
 
+  /**
+   * Saves edited app metadata to the server.
+   * Updates local state on success and exits edit mode.
+   */
   const handleSave = async () => {
     try {
       const response = await api.put<{ data: App }>(`/developer/apps/${id}`, editData);
@@ -59,6 +78,10 @@ function DeveloperAppPage() {
     }
   };
 
+  /**
+   * Submits the app for publishing/review.
+   * Changes app status from draft to pending review.
+   */
   const handlePublish = async () => {
     try {
       const response = await api.post<{ data: App }>(`/developer/apps/${id}/publish`);
@@ -68,6 +91,11 @@ function DeveloperAppPage() {
     }
   };
 
+  /**
+   * Submits a developer response to a user review.
+   * @param reviewId - ID of the review to respond to
+   * @param response - Developer's response text
+   */
   const handleRespondToReview = async (reviewId: string, response: string) => {
     try {
       const result = await api.post<{ data: Review }>(`/reviews/${reviewId}/respond`, { response });
@@ -88,6 +116,11 @@ function DeveloperAppPage() {
     );
   }
 
+  /**
+   * Maps app status to corresponding Tailwind CSS color classes.
+   * @param status - Current app status
+   * @returns CSS class string for badge styling
+   */
   const getStatusColor = (status: App['status']) => {
     const colors: Record<string, string> = {
       draft: 'bg-gray-100 text-gray-700',
@@ -330,6 +363,11 @@ function DeveloperAppPage() {
   );
 }
 
+/**
+ * Inline form component for developer review responses.
+ * Expands from a button to a full text area when activated.
+ * @param onSubmit - Callback to handle response submission
+ */
 function ResponseForm({ onSubmit }: { onSubmit: (response: string) => void }) {
   const [isOpen, setIsOpen] = useState(false);
   const [response, setResponse] = useState('');

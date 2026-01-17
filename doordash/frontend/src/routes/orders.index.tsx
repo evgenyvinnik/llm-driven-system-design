@@ -6,10 +6,28 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Order, WSMessage } from '../types';
 
+/**
+ * Orders list page route configuration.
+ * Shows customer's order history.
+ */
 export const Route = createFileRoute('/orders')({
   component: OrdersPage,
 });
 
+/**
+ * Orders list page component showing customer's order history.
+ * Displays all orders with real-time status updates via WebSocket.
+ *
+ * Features:
+ * - List of order cards with summary information
+ * - Real-time status updates via WebSocket
+ * - Loading state with spinner
+ * - Empty state with link to browse restaurants
+ * - Login prompt for unauthenticated users
+ * - Clickable order cards linking to order detail
+ *
+ * @returns React component for the orders list page
+ */
 function OrdersPage() {
   const user = useAuthStore((s) => s.user);
   const [orders, setOrders] = useState<Order[]>([]);

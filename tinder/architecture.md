@@ -308,6 +308,608 @@ user:{user_id}:location   -> JSON { latitude, longitude }
 - Rate limiting per user
 - CORS configuration
 
+## Data Lifecycle Policies
+
+### Retention and TTL Settings
+
+#### PostgreSQL Data Retention
+
+| Table | Retention Policy | Rationale |
+|-------|-----------------|-----------|
+| `users` | Indefinite (until account deletion) | Core user data |
+| `user_preferences` | Indefinite | Tied to user lifecycle |
+| `photos` | Indefinite (cleanup on deletion) | User-managed content |
+| `swipes` | 90 days | No need to store old swipes; users rarely re-swipe |
+| `matches` | Indefinite (until unmatch) | Ongoing relationships |
+| `messages` | 365 days after match end | Compliance and storage optimization |
+
+**Cleanup Script (run weekly via cron):**
+```sql
+-- Delete old swipes (run as scheduled job)
+DELETE FROM swipes
+WHERE created_at < NOW() - INTERVAL '90 days';
+
+-- Archive messages from ended matches older than 1 year
+DELETE FROM messages
+WHERE match_id IN (
+    SELECT id FROM matches WHERE unmatched_at < NOW() - INTERVAL '365 days'
+);
+```
+
+#### Redis TTL Configuration
+
+| Key Pattern | TTL | Purpose |
+|-------------|-----|---------|
+| `swipes:{user_id}:liked` | 24 hours | Session-level swipe deduplication |
+| `swipes:{user_id}:passed` | 24 hours | Passed users reset daily |
+| `likes:received:{user_id}` | 7 days | "Likes You" feature window |
+| `user:{user_id}:location` | 1 hour | Location cache freshness |
+| `session:{session_id}` | 24 hours | Login sessions |
+| `rate_limit:{user_id}` | 1 hour | Sliding window rate limiting |
+
+**Implementation in Redis:**
+```bash
+# Set TTL when writing swipes
+SADD swipes:user123:liked user456
+EXPIRE swipes:user123:liked 86400
+
+# Location cache with shorter TTL
+SET user:user123:location '{"lat":40.7,"lng":-74.0}' EX 3600
+```
+
+#### Elasticsearch Index Lifecycle
+
+For local development, use simple index management:
+```bash
+# Create index with date suffix for rotation
+PUT /users-2024-01
+
+# Alias for seamless rotation
+POST /_aliases
+{
+  "actions": [
+    { "add": { "index": "users-2024-01", "alias": "users" } }
+  ]
+}
+```
+
+**Monthly rotation script:**
+```bash
+#!/bin/bash
+CURRENT_MONTH=$(date +%Y-%m)
+PREV_MONTH=$(date -d "3 months ago" +%Y-%m)
+
+# Create new index
+curl -X PUT "localhost:9200/users-${CURRENT_MONTH}"
+
+# Reindex active users
+curl -X POST "localhost:9200/_reindex" -H 'Content-Type: application/json' -d'{
+  "source": {"index": "users"},
+  "dest": {"index": "users-'${CURRENT_MONTH}'"}
+}'
+
+# Delete old indices (keep 3 months)
+curl -X DELETE "localhost:9200/users-${PREV_MONTH}"
+```
+
+### Archival to Cold Storage
+
+For a local learning project, "cold storage" means exporting to files:
+
+**Archive old messages (run monthly):**
+```sql
+-- Export to JSON before deletion
+COPY (
+    SELECT json_agg(m.*)
+    FROM messages m
+    JOIN matches ma ON m.match_id = ma.id
+    WHERE ma.unmatched_at < NOW() - INTERVAL '365 days'
+) TO '/tmp/archived_messages.json';
+```
+
+**Local archival with MinIO (S3-compatible):**
+```bash
+# Archive script
+DATE=$(date +%Y-%m)
+pg_dump -t messages --where="sent_at < NOW() - INTERVAL '1 year'" \
+  tinder_db | gzip > messages_archive_${DATE}.sql.gz
+
+# Upload to MinIO cold bucket
+mc cp messages_archive_${DATE}.sql.gz minio/tinder-archive/
+```
+
+### Backfill and Replay Procedures
+
+#### Elasticsearch Reindex from PostgreSQL
+
+When Elasticsearch data gets out of sync or index mapping changes:
+
+```bash
+# 1. Create new index with updated mapping
+curl -X PUT "localhost:9200/users-v2" -H 'Content-Type: application/json' -d'
+{
+  "mappings": {
+    "properties": {
+      "id": { "type": "keyword" },
+      "name": { "type": "text" },
+      "gender": { "type": "keyword" },
+      "age": { "type": "integer" },
+      "location": { "type": "geo_point" },
+      "last_active": { "type": "date" },
+      "show_me": { "type": "boolean" }
+    }
+  }
+}'
+
+# 2. Backfill from PostgreSQL (Node.js script)
+npm run backfill:elasticsearch
+
+# 3. Swap alias atomically
+curl -X POST "localhost:9200/_aliases" -d'
+{
+  "actions": [
+    { "remove": { "index": "users-v1", "alias": "users" } },
+    { "add": { "index": "users-v2", "alias": "users" } }
+  ]
+}'
+```
+
+**Backfill script (backend/src/scripts/backfill-es.ts):**
+```typescript
+import { pool } from '../shared/db';
+import { esClient } from '../shared/elasticsearch';
+
+async function backfillUsers() {
+  const batchSize = 100;
+  let offset = 0;
+
+  while (true) {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.name, u.gender, u.latitude, u.longitude, u.last_active,
+             EXTRACT(YEAR FROM AGE(u.birthdate)) as age,
+             p.show_me
+      FROM users u
+      JOIN user_preferences p ON u.id = p.user_id
+      WHERE u.latitude IS NOT NULL
+      ORDER BY u.id
+      LIMIT $1 OFFSET $2
+    `, [batchSize, offset]);
+
+    if (rows.length === 0) break;
+
+    const operations = rows.flatMap(user => [
+      { index: { _index: 'users-v2', _id: user.id } },
+      {
+        id: user.id,
+        name: user.name,
+        gender: user.gender,
+        age: user.age,
+        location: { lat: user.latitude, lon: user.longitude },
+        last_active: user.last_active,
+        show_me: user.show_me
+      }
+    ]);
+
+    await esClient.bulk({ operations });
+    offset += batchSize;
+    console.log(`Indexed ${offset} users`);
+  }
+}
+```
+
+#### Redis Cache Warmup
+
+After Redis restart or cache flush:
+
+```typescript
+// backend/src/scripts/warm-cache.ts
+async function warmSwipeCache() {
+  const { rows } = await pool.query(`
+    SELECT swiper_id, array_agg(swiped_id) as swiped_users, direction
+    FROM swipes
+    WHERE created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY swiper_id, direction
+  `);
+
+  for (const row of rows) {
+    const key = `swipes:${row.swiper_id}:${row.direction === 'right' ? 'liked' : 'passed'}`;
+    await redis.sadd(key, ...row.swiped_users);
+    await redis.expire(key, 86400);
+  }
+}
+```
+
+---
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+For local development with multiple instances, practice blue-green deployments:
+
+#### Blue-Green Deployment (Local)
+
+```bash
+# Current setup: blue on ports 3001-3003
+# New version: green on ports 3011-3013
+
+# 1. Start green instances
+PORT=3011 npm run dev &
+PORT=3012 npm run dev &
+PORT=3013 npm run dev &
+
+# 2. Health check green instances
+for port in 3011 3012 3013; do
+  curl -f http://localhost:$port/health || exit 1
+done
+
+# 3. Update nginx to route to green
+sed -i 's/300[123]/301[123]/g' /usr/local/etc/nginx/nginx.conf
+nginx -s reload
+
+# 4. Drain and stop blue instances
+kill $(lsof -ti:3001) $(lsof -ti:3002) $(lsof -ti:3003)
+```
+
+#### Canary Rollout (Local Simulation)
+
+```nginx
+# nginx.conf - route 10% to canary
+upstream api {
+    server localhost:3001 weight=9;
+    server localhost:3002 weight=9;
+    server localhost:3011 weight=2;  # canary instance
+}
+```
+
+**Canary validation checklist:**
+- [ ] Error rate < 1% for 15 minutes
+- [ ] p95 latency within 10% of baseline
+- [ ] No increase in 5xx responses
+- [ ] Match detection still working (check Redis pub/sub)
+
+### Schema Migrations
+
+#### Migration File Naming
+
+```
+backend/src/db/migrations/
+  001_initial_schema.sql
+  002_add_swipe_timestamp.sql
+  003_add_message_read_at.sql
+  004_add_user_verified_column.sql
+```
+
+#### Migration Runner
+
+```typescript
+// backend/src/db/migrate.ts
+import { pool } from '../shared/db';
+import * as fs from 'fs';
+import * as path from 'path';
+
+async function migrate() {
+  // Create migrations table if not exists
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  // Get applied migrations
+  const { rows } = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
+  const applied = new Set(rows.map(r => r.version));
+
+  // Apply pending migrations
+  const migrationsDir = path.join(__dirname, 'migrations');
+  const files = fs.readdirSync(migrationsDir).sort();
+
+  for (const file of files) {
+    const version = parseInt(file.split('_')[0]);
+    if (applied.has(version)) continue;
+
+    console.log(`Applying migration ${file}...`);
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+
+    await pool.query('BEGIN');
+    try {
+      await pool.query(sql);
+      await pool.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
+      await pool.query('COMMIT');
+      console.log(`Migration ${file} applied successfully`);
+    } catch (err) {
+      await pool.query('ROLLBACK');
+      throw err;
+    }
+  }
+}
+```
+
+**Run migrations:**
+```bash
+npm run db:migrate
+```
+
+#### Safe Migration Practices
+
+**Adding columns (non-breaking):**
+```sql
+-- 004_add_user_verified_column.sql
+ALTER TABLE users ADD COLUMN verified BOOLEAN DEFAULT false;
+CREATE INDEX CONCURRENTLY idx_users_verified ON users(verified);
+```
+
+**Renaming columns (breaking - requires coordination):**
+```sql
+-- Step 1: Add new column
+ALTER TABLE users ADD COLUMN display_name VARCHAR(100);
+UPDATE users SET display_name = name;
+
+-- Step 2: Deploy code that reads both columns
+-- Step 3: Deploy code that writes to both columns
+-- Step 4: Deploy code that only uses new column
+-- Step 5: Drop old column
+ALTER TABLE users DROP COLUMN name;
+```
+
+### Rollback Runbooks
+
+#### API Rollback
+
+**Symptoms:** High error rate, increased latency, failed health checks
+
+**Immediate actions:**
+```bash
+# 1. Check which version is running
+curl localhost:3001/health | jq '.version'
+
+# 2. Identify the issue
+docker logs tinder-api-1 --tail 100
+
+# 3. Rollback to previous version
+git checkout HEAD~1
+npm run build
+pm2 restart all
+
+# Alternative: If using Docker
+docker-compose down
+docker-compose -f docker-compose.rollback.yml up -d
+```
+
+#### Database Rollback
+
+**For each migration, create a corresponding down migration:**
+```sql
+-- migrations/004_add_user_verified_column.down.sql
+DROP INDEX IF EXISTS idx_users_verified;
+ALTER TABLE users DROP COLUMN IF EXISTS verified;
+```
+
+**Rollback script:**
+```bash
+#!/bin/bash
+VERSION=$1
+psql $DATABASE_URL < migrations/${VERSION}_*.down.sql
+psql $DATABASE_URL -c "DELETE FROM schema_migrations WHERE version = $VERSION"
+```
+
+#### Elasticsearch Rollback
+
+```bash
+# 1. Check current alias
+curl localhost:9200/_cat/aliases?v
+
+# 2. Identify previous index
+curl localhost:9200/_cat/indices?v
+
+# 3. Switch alias back to previous index
+curl -X POST "localhost:9200/_aliases" -d'
+{
+  "actions": [
+    { "remove": { "index": "users-v2", "alias": "users" } },
+    { "add": { "index": "users-v1", "alias": "users" } }
+  ]
+}'
+```
+
+#### Redis Rollback
+
+Redis is ephemeral cache - rollback means invalidation:
+```bash
+# Flush specific key patterns
+redis-cli KEYS "swipes:*" | xargs redis-cli DEL
+
+# Or run cache warmup script
+npm run cache:warm
+```
+
+---
+
+## Capacity and Cost Guardrails
+
+### Alert Thresholds
+
+Configure these alerts for local monitoring with Prometheus/Grafana:
+
+#### Queue and Pub/Sub Lag
+
+```yaml
+# prometheus/alerts.yml
+groups:
+  - name: tinder_alerts
+    rules:
+      - alert: RedisPubSubBacklog
+        expr: redis_pubsub_channels > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis Pub/Sub backlog growing"
+
+      - alert: WebSocketConnectionsHigh
+        expr: websocket_connections_total > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket connections exceeding capacity"
+```
+
+**Local development thresholds:**
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Redis memory usage | > 100MB | > 200MB |
+| Pub/Sub pending messages | > 50 | > 200 |
+| WebSocket connections | > 100 | > 500 |
+
+#### Storage Growth Alerts
+
+```yaml
+# prometheus/alerts.yml (continued)
+      - alert: PostgresTableBloat
+        expr: pg_stat_user_tables_n_dead_tup{table="swipes"} > 100000
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Swipes table needs vacuuming"
+
+      - alert: ElasticsearchDiskUsage
+        expr: elasticsearch_filesystem_data_used_percent > 80
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elasticsearch disk usage high"
+
+      - alert: MinioStorageHigh
+        expr: minio_bucket_usage_total_bytes{bucket="photos"} > 1073741824  # 1GB
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Photo storage exceeding 1GB"
+```
+
+**Storage growth targets (local dev):**
+| Resource | Target Limit | Action When Exceeded |
+|----------|--------------|---------------------|
+| PostgreSQL | 500MB | Run cleanup scripts, archive old data |
+| Elasticsearch | 200MB | Delete old indices, reduce replica count |
+| MinIO photos | 1GB | Compress images, delete test uploads |
+| Redis | 100MB | Reduce TTLs, evict stale keys |
+
+#### Cache Hit Rate Targets
+
+```typescript
+// backend/src/middleware/cache-metrics.ts
+import { Counter, Gauge } from 'prom-client';
+
+const cacheHits = new Counter({
+  name: 'cache_hits_total',
+  help: 'Total cache hits',
+  labelNames: ['cache_type']
+});
+
+const cacheMisses = new Counter({
+  name: 'cache_misses_total',
+  help: 'Total cache misses',
+  labelNames: ['cache_type']
+});
+
+const cacheHitRate = new Gauge({
+  name: 'cache_hit_rate',
+  help: 'Cache hit rate percentage',
+  labelNames: ['cache_type']
+});
+```
+
+**Target hit rates:**
+| Cache Type | Target Hit Rate | Investigation Threshold |
+|------------|-----------------|------------------------|
+| User location | > 80% | < 60% |
+| Swipe history | > 90% | < 75% |
+| Session data | > 95% | < 85% |
+| Discovery deck | > 70% | < 50% |
+
+**Alert rule:**
+```yaml
+      - alert: LowCacheHitRate
+        expr: cache_hit_rate{cache_type="swipe_history"} < 0.75
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Swipe cache hit rate below 75%"
+```
+
+### Cost Control (Local Development)
+
+Since this is a local project, "cost" translates to resource consumption:
+
+#### Docker Resource Limits
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    mem_limit: 512m
+    cpus: '0.5'
+
+  redis:
+    mem_limit: 128m
+    cpus: '0.25'
+
+  elasticsearch:
+    mem_limit: 512m
+    cpus: '0.5'
+    environment:
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"
+
+  minio:
+    mem_limit: 256m
+    cpus: '0.25'
+```
+
+#### Monitoring Dashboard Queries
+
+**Grafana dashboard panels:**
+
+```promql
+# API request rate
+rate(http_requests_total[5m])
+
+# p95 latency by endpoint
+histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+
+# Cache hit rate
+sum(rate(cache_hits_total[5m])) / (sum(rate(cache_hits_total[5m])) + sum(rate(cache_misses_total[5m])))
+
+# Active WebSocket connections
+websocket_connections_active
+
+# Redis memory usage
+redis_memory_used_bytes
+
+# PostgreSQL connections
+pg_stat_activity_count
+```
+
+### Capacity Planning Checklist
+
+Before running load tests or demos:
+
+- [ ] PostgreSQL has at least 500MB free disk space
+- [ ] Redis memory limit set to 128MB with LRU eviction
+- [ ] Elasticsearch heap set to 256MB (half of container memory)
+- [ ] MinIO bucket has lifecycle policy for test data cleanup
+- [ ] All services have health check endpoints responding
+- [ ] Prometheus scraping all targets successfully
+- [ ] Grafana dashboard loaded with key metrics
+
+---
+
 ## Future Optimizations
 
 - Bloom filters for swipe history (memory reduction)

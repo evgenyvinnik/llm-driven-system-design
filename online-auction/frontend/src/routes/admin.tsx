@@ -4,15 +4,27 @@ import { useAuthStore } from '../stores/authStore';
 import { api } from '../services/api';
 import type { Auction, User } from '../types';
 
+/**
+ * Route definition for admin dashboard (/admin).
+ * Protected route - only accessible to users with admin role.
+ */
 export const Route = createFileRoute('/admin')({
   component: AdminPage,
 });
 
+/**
+ * Platform statistics for the admin dashboard.
+ */
 interface AdminStats {
+  /** Total registered users */
   users: number;
+  /** Total auctions created */
   auctions: number;
+  /** Total bids placed */
   bids: number;
+  /** Currently active auctions */
   activeAuctions: number;
+  /** Real-time WebSocket connection metrics */
   websocket: {
     connectedClients: number;
     totalSubscriptions: number;
@@ -20,6 +32,21 @@ interface AdminStats {
   };
 }
 
+/**
+ * Admin dashboard page for platform management.
+ *
+ * Provides three tabbed views:
+ * - Overview: Platform-wide statistics and WebSocket metrics
+ * - Users: User management with role assignment
+ * - Auctions: Auction listing with force-close capability
+ *
+ * Admin-only features:
+ * - Promote/demote users to admin role
+ * - Force-close active auctions (emergency action)
+ * - View real-time platform health metrics
+ *
+ * @returns JSX element for the admin dashboard
+ */
 function AdminPage() {
   const navigate = useNavigate();
   const { user, isAuthenticated } = useAuthStore();

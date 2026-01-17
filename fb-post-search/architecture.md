@@ -306,6 +306,433 @@ For production scale, we'd use an event-driven pipeline with Kafka.
 4. **Rate Limiting**: IP-based limiting on search endpoints
 5. **SQL Injection**: Parameterized queries throughout
 
+## Data Lifecycle Policies
+
+### Retention and TTL
+
+| Data Type | Retention Period | Storage Tier | Rationale |
+|-----------|------------------|--------------|-----------|
+| **Posts (PostgreSQL)** | Forever | Primary | Source of truth, never deleted (soft delete only) |
+| **Posts (Elasticsearch)** | 2 years hot, 5 years warm | Hot/Warm | Active search index; older posts rarely searched |
+| **Search History** | 90 days | Primary | Privacy and storage efficiency |
+| **Session Data (Redis)** | 24 hours | Memory | Short-lived auth sessions |
+| **Visibility Cache (Redis)** | 15 minutes | Memory | Invalidated on friendship changes |
+| **Trending Searches (Redis)** | 24 hours rolling | Memory | Recency-weighted rankings |
+
+### TTL Implementation
+
+**Elasticsearch Index Lifecycle Management (ILM):**
+```json
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "30d"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "60d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "allocate": { "require": { "data": "warm" } }
+        }
+      },
+      "cold": {
+        "min_age": "730d",
+        "actions": {
+          "freeze": {}
+        }
+      },
+      "delete": {
+        "min_age": "1825d",
+        "actions": { "delete": {} }
+      }
+    }
+  }
+}
+```
+
+**Redis TTL Configuration (Local Development):**
+```bash
+# Set in Redis config or per-key
+# Visibility sets: 15 minutes
+SET visibility:user123 "{...}" EX 900
+
+# Session data: 24 hours
+SET session:abc123 "{...}" EX 86400
+
+# Search suggestions: 1 hour
+SET suggestions:birth "{...}" EX 3600
+```
+
+### Cold Storage Archival
+
+**Local Development Setup:**
+- Use MinIO as S3-compatible cold storage
+- Archive posts older than 2 years to MinIO buckets
+- Keep metadata in PostgreSQL with `archived_at` timestamp
+
+**Archival Process:**
+1. Daily cron job identifies posts older than 2 years not yet archived
+2. Export post content to JSON, compress with gzip
+3. Upload to MinIO bucket: `archives/posts/YYYY/MM/post-{id}.json.gz`
+4. Update PostgreSQL: `SET archived_at = NOW(), content = NULL`
+5. Delete from Elasticsearch warm tier
+
+**Retrieval:**
+- Search only returns archived post ID + metadata
+- On-demand retrieval from MinIO when user clicks "View archived post"
+- Cache retrieved archived posts in Redis for 1 hour
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Elasticsearch Index Corruption**
+```bash
+# 1. Create new index with current mapping
+curl -X PUT "localhost:9200/posts_v2" -H 'Content-Type: application/json' -d @mappings.json
+
+# 2. Reindex from PostgreSQL (local development script)
+npm run db:reindex-posts
+
+# 3. Alias swap for zero-downtime
+curl -X POST "localhost:9200/_aliases" -d '{
+  "actions": [
+    { "remove": { "index": "posts_v1", "alias": "posts" } },
+    { "add": { "index": "posts_v2", "alias": "posts" } }
+  ]
+}'
+```
+
+**Scenario 2: Replay from Event Log (if Kafka is used)**
+```bash
+# Reset consumer group offset to replay events
+kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --group post-indexer \
+  --topic post-events \
+  --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
+  --execute
+
+# Restart indexer to replay
+npm run dev:indexer
+```
+
+**Scenario 3: Partial Reindex (date range)**
+```sql
+-- Find posts needing reindex
+SELECT id FROM posts
+WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31'
+  AND updated_at > indexed_at;
+
+-- Mark for reindex queue
+UPDATE posts SET needs_reindex = true WHERE ...;
+```
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+**Local Development (Multi-Instance Testing):**
+```bash
+# Start 3 instances on different ports
+npm run dev:server1  # Port 3001
+npm run dev:server2  # Port 3002
+npm run dev:server3  # Port 3003
+npm run dev:lb       # Nginx on port 3000, round-robin
+```
+
+**Canary Deployment Pattern:**
+1. Deploy new version to `server1` only (33% traffic)
+2. Monitor for 10 minutes: error rate, latency, ES query patterns
+3. If healthy, deploy to `server2` (66% traffic)
+4. Monitor for 10 minutes
+5. Complete rollout to `server3` (100% traffic)
+
+**Feature Flags (Simple Implementation):**
+```typescript
+// config/features.ts
+export const features = {
+  newRankingAlgorithm: process.env.FEATURE_NEW_RANKING === 'true',
+  bloomFilterVisibility: false, // Disabled until stable
+  mlReranking: false,
+};
+
+// Usage in search service
+if (features.newRankingAlgorithm) {
+  results = await applyNewRanking(results);
+} else {
+  results = await applyLegacyRanking(results);
+}
+```
+
+### Schema Migrations
+
+**PostgreSQL Migrations:**
+```bash
+# Migration file naming: 001_create_users.sql, 002_create_posts.sql, etc.
+# Located in: backend/src/db/migrations/
+
+# Run migrations
+npm run db:migrate
+
+# Rollback last migration
+npm run db:rollback
+
+# Check migration status
+npm run db:status
+```
+
+**Migration Best Practices (enforced by code review):**
+- Always add columns as nullable or with defaults
+- Never drop columns in the same release that removes code using them
+- Use `CREATE INDEX CONCURRENTLY` for large tables
+- Add rollback SQL in comments at top of migration file
+
+**Example Migration with Rollback:**
+```sql
+-- Migration: 015_add_indexed_at_to_posts.sql
+-- Rollback: ALTER TABLE posts DROP COLUMN indexed_at;
+
+ALTER TABLE posts ADD COLUMN indexed_at TIMESTAMP;
+CREATE INDEX CONCURRENTLY idx_posts_indexed_at ON posts(indexed_at);
+```
+
+**Elasticsearch Mapping Changes:**
+```bash
+# For adding new fields (non-breaking):
+curl -X PUT "localhost:9200/posts/_mapping" -d '{
+  "properties": {
+    "new_field": { "type": "keyword" }
+  }
+}'
+
+# For breaking changes (requires reindex):
+# 1. Create posts_v2 with new mapping
+# 2. Reindex: POST _reindex { "source": {"index": "posts_v1"}, "dest": {"index": "posts_v2"} }
+# 3. Swap alias
+```
+
+### Rollback Runbooks
+
+**Runbook 1: Application Rollback**
+```bash
+# Symptoms: Error rate spike, 5xx responses
+# Time to execute: 2 minutes
+
+# 1. Check current version
+git log --oneline -1
+
+# 2. Rollback to previous commit
+git checkout HEAD~1
+
+# 3. Restart services
+npm run dev:restart-all
+
+# 4. Verify health
+curl http://localhost:3000/health
+
+# 5. Post-incident: Document what went wrong
+```
+
+**Runbook 2: Database Migration Rollback**
+```bash
+# Symptoms: Application errors related to schema
+# Time to execute: 5 minutes
+
+# 1. Stop all application instances
+pkill -f "node.*server"
+
+# 2. Execute rollback SQL (from migration file comments)
+psql -U postgres -d fb_search -c "ALTER TABLE posts DROP COLUMN indexed_at;"
+
+# 3. Revert application code
+git checkout HEAD~1
+
+# 4. Restart services
+npm run dev:restart-all
+```
+
+**Runbook 3: Elasticsearch Recovery**
+```bash
+# Symptoms: Search returning errors, cluster red/yellow
+# Time to execute: 10-30 minutes
+
+# 1. Check cluster health
+curl localhost:9200/_cluster/health?pretty
+
+# 2. If yellow (unassigned replicas), usually self-heals. Wait 5 min.
+
+# 3. If red (unassigned primary shards):
+# Check which shards are unassigned
+curl localhost:9200/_cat/shards?h=index,shard,prirep,state,unassigned.reason
+
+# 4. For local dev, simplest fix is often:
+docker-compose down
+docker-compose up -d elasticsearch
+npm run db:reindex-posts  # Rebuild index from PostgreSQL
+```
+
+**Runbook 4: Redis Cache Clear**
+```bash
+# Symptoms: Stale data, visibility filtering wrong
+# Time to execute: 1 minute
+
+# 1. Clear all visibility caches
+redis-cli KEYS "visibility:*" | xargs redis-cli DEL
+
+# 2. Clear all sessions (forces re-login)
+redis-cli KEYS "session:*" | xargs redis-cli DEL
+
+# 3. Clear search suggestions
+redis-cli KEYS "suggestions:*" | xargs redis-cli DEL
+```
+
+## Capacity and Cost Guardrails
+
+### Alert Thresholds
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| **Search latency p95** | > 300ms | > 500ms | Check ES cluster, add caching |
+| **Elasticsearch heap** | > 70% | > 85% | Increase JVM heap or add nodes |
+| **Kafka consumer lag** | > 10,000 | > 100,000 | Scale indexer instances |
+| **PostgreSQL connections** | > 80 | > 95 | Check connection leaks |
+| **Redis memory** | > 70% | > 85% | Increase maxmemory or evict |
+| **Disk usage (ES)** | > 75% | > 85% | Add nodes or archive old data |
+| **Cache hit rate** | < 80% | < 60% | Review TTLs, increase cache size |
+| **Error rate** | > 0.5% | > 2% | Check logs, rollback if needed |
+
+### Local Development Alerts (docker-compose)
+
+Add Prometheus alerting rules for local testing:
+```yaml
+# prometheus/alerts.yml
+groups:
+  - name: fb-post-search
+    rules:
+      - alert: HighSearchLatency
+        expr: histogram_quantile(0.95, rate(search_latency_seconds_bucket[5m])) > 0.3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Search p95 latency above 300ms"
+
+      - alert: ElasticsearchClusterYellow
+        expr: elasticsearch_cluster_health_status{color="yellow"} == 1
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: LowCacheHitRate
+        expr: rate(redis_cache_hits[5m]) / (rate(redis_cache_hits[5m]) + rate(redis_cache_misses[5m])) < 0.8
+        for: 10m
+        labels:
+          severity: warning
+```
+
+### Storage Growth Monitoring
+
+**Elasticsearch Index Size:**
+```bash
+# Check index sizes
+curl localhost:9200/_cat/indices?v&s=store.size:desc
+
+# Expected growth for local dev: ~50MB/day with sample data
+# Alert if posts index grows > 10GB (local) or > 100GB (per shard, prod)
+```
+
+**PostgreSQL Table Sizes:**
+```sql
+-- Check table sizes
+SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
+
+-- Estimated local dev sizes after 1 month:
+-- posts: ~100MB
+-- users: ~10MB
+-- search_history: ~50MB (with 90-day TTL cleanup)
+```
+
+### Cache Hit Rate Targets
+
+| Cache | Target Hit Rate | TTL | Size Limit (Local) |
+|-------|-----------------|-----|-------------------|
+| Visibility sets | > 90% | 15 min | 100MB |
+| Search suggestions | > 85% | 1 hour | 50MB |
+| User profiles | > 95% | 5 min | 20MB |
+| Session data | N/A (not a cache) | 24 hours | 10MB |
+
+**Monitoring Cache Performance:**
+```bash
+# Redis cache stats
+redis-cli INFO stats | grep -E "(keyspace_hits|keyspace_misses)"
+
+# Calculate hit rate
+# hit_rate = keyspace_hits / (keyspace_hits + keyspace_misses)
+```
+
+### Queue Lag Monitoring
+
+**Kafka Consumer Lag (if using event-driven indexing):**
+```bash
+# Check consumer lag
+kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --describe --group post-indexer
+
+# Healthy: LAG < 1000 per partition
+# Warning: LAG > 10,000
+# Critical: LAG > 100,000 (posts not searchable for minutes)
+```
+
+**Indexing Lag Metric:**
+```typescript
+// Track time between post creation and searchability
+const indexingLag = Date.now() - post.created_at.getTime();
+metrics.histogram('indexing_lag_ms', indexingLag);
+
+// Target: p99 < 5000ms (5 seconds)
+// Alert if p99 > 30000ms (30 seconds)
+```
+
+### Cost Optimization Guidelines
+
+**Local Development Resource Limits (docker-compose):**
+```yaml
+services:
+  elasticsearch:
+    mem_limit: 2g  # Don't exceed 2GB locally
+    environment:
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+
+  postgres:
+    mem_limit: 512m
+
+  redis:
+    mem_limit: 256m
+    command: redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru
+```
+
+**Cost Tradeoffs:**
+| Decision | Cost Implication | Mitigation |
+|----------|------------------|------------|
+| 2-year hot index retention | High ES storage | ILM to warm tier at 60 days |
+| 15-min visibility cache TTL | More Redis memory | LRU eviction, monitor hit rate |
+| Real-time indexing | Higher ES write load | Batch indexing option for bulk imports |
+| Full-text + engagement scoring | Complex ES queries | Query caching for popular searches |
+
 ## Future Optimizations
 
 1. **Bloom Filters**: Compact visibility set representation

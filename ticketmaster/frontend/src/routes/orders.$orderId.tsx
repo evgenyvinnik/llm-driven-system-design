@@ -1,13 +1,22 @@
+/**
+ * Order detail page route.
+ * Shows comprehensive order information including event, seats, and payment details.
+ * Displays confirmation message for successfully completed orders.
+ */
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { checkoutApi } from '../services/api';
 import { useAuthStore } from '../stores/auth.store';
 import type { Order } from '../types';
 
+/** Route configuration for order detail page */
 export const Route = createFileRoute('/orders/$orderId')({
   component: OrderDetailPage,
 });
 
+/**
+ * Order detail page component with full order information.
+ */
 function OrderDetailPage() {
   const { orderId } = Route.useParams();
   const { isAuthenticated } = useAuthStore();

@@ -1,61 +1,105 @@
+/**
+ * Global state management store for the Find My application.
+ * Uses Zustand for lightweight, hook-based state management.
+ * Handles authentication, device management, location tracking, and notifications.
+ */
+
 import { create } from 'zustand';
 import { User, Device, Location, LostMode, Notification } from '../types';
 import { authApi, devicesApi, locationsApi, lostModeApi, notificationsApi } from '../services/api';
 
+/**
+ * Application state and actions interface.
+ * Defines all state properties and action methods available in the store.
+ */
 interface AppState {
-  // Auth
+  // Auth state
+  /** Currently authenticated user or null if not logged in */
   user: User | null;
+  /** Global loading indicator for async operations */
   isLoading: boolean;
+  /** Last error message for display to user */
   error: string | null;
 
-  // Devices
+  // Devices state
+  /** List of user's registered devices */
   devices: Device[];
+  /** Currently selected device for detail/map view */
   selectedDevice: Device | null;
 
-  // Locations
+  // Locations state
+  /** Location history for the selected device */
   locations: Location[];
 
-  // Lost Mode
+  // Lost Mode state
+  /** Lost mode settings indexed by device ID */
   lostModeSettings: Record<string, LostMode>;
 
-  // Notifications
+  // Notifications state
+  /** List of user notifications */
   notifications: Notification[];
+  /** Count of unread notifications for badge display */
   unreadCount: number;
 
   // Auth actions
+  /** Authenticate with email and password */
   login: (email: string, password: string) => Promise<void>;
+  /** Create a new user account */
   register: (email: string, password: string, name: string) => Promise<void>;
+  /** End the current session */
   logout: () => Promise<void>;
+  /** Check if user has a valid session on app load */
   checkAuth: () => Promise<void>;
 
   // Device actions
+  /** Fetch all devices for the current user */
   fetchDevices: () => Promise<void>;
+  /** Register a new device */
   createDevice: (data: { device_type: string; name: string; emoji?: string }) => Promise<Device>;
+  /** Update device properties */
   updateDevice: (id: string, data: { name?: string; emoji?: string; is_active?: boolean }) => Promise<void>;
+  /** Remove a device */
   deleteDevice: (id: string) => Promise<void>;
+  /** Select a device to view details and location */
   selectDevice: (device: Device | null) => void;
+  /** Trigger sound playback on a device */
   playSound: (id: string) => Promise<void>;
 
   // Location actions
+  /** Fetch location history for a device */
   fetchLocations: (deviceId: string) => Promise<void>;
+  /** Simulate a location report for testing */
   simulateLocation: (deviceId: string, location: { latitude: number; longitude: number }) => Promise<void>;
 
   // Lost Mode actions
+  /** Fetch lost mode settings for a device */
   fetchLostMode: (deviceId: string) => Promise<void>;
+  /** Update lost mode settings */
   updateLostMode: (deviceId: string, data: { enabled: boolean; contact_phone?: string; contact_email?: string; message?: string }) => Promise<void>;
+  /** Quickly enable lost mode */
   enableLostMode: (deviceId: string) => Promise<void>;
+  /** Turn off lost mode */
   disableLostMode: (deviceId: string) => Promise<void>;
 
   // Notification actions
+  /** Fetch all notifications */
   fetchNotifications: () => Promise<void>;
+  /** Fetch unread notification count */
   fetchUnreadCount: () => Promise<void>;
+  /** Mark a single notification as read */
   markAsRead: (id: string) => Promise<void>;
+  /** Mark all notifications as read */
   markAllAsRead: () => Promise<void>;
 
   // UI actions
+  /** Clear the current error message */
   clearError: () => void;
 }
 
+/**
+ * Main application store hook.
+ * Provides all state and actions for the Find My frontend.
+ */
 export const useStore = create<AppState>((set, get) => ({
   // Initial state
   user: null,

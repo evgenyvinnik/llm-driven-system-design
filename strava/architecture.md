@@ -347,6 +347,311 @@ for (const follower of followers.rows) {
 - **SQL Injection**: Parameterized queries only
 - **Rate Limiting**: Consider for production
 
+## Data Lifecycle Policies
+
+### Retention and TTL Policies
+
+| Data Type | Hot Storage | Warm/Archive | Deletion | Rationale |
+|-----------|-------------|--------------|----------|-----------|
+| Activities | Indefinite | N/A | Manual by user | Core user data, never auto-delete |
+| GPS Points | 1 year full resolution | Downsample after 1 year | Keep downsampled indefinitely | Reduce storage while preserving routes |
+| Segment Efforts | 2 years | Archive to cold storage | Delete after 5 years | Historical leaderboards less relevant |
+| Activity Feeds | 30 days in Redis | N/A | Auto-expire | Reconstructible from database |
+| Session Data | 24 hours | N/A | Redis TTL | Security best practice |
+| Leaderboards | Indefinite in Redis | Rebuild from DB if lost | N/A | Small dataset, high read frequency |
+
+### GPS Point Downsampling Strategy
+
+After 1 year, reduce GPS resolution to save storage while preserving route shape:
+
+```sql
+-- Downsample to every 5th point (80% reduction)
+DELETE FROM gps_points
+WHERE activity_id IN (
+  SELECT id FROM activities
+  WHERE created_at < NOW() - INTERVAL '1 year'
+)
+AND point_index % 5 != 0;
+
+-- Update polyline (encoded route unaffected, stored separately)
+```
+
+### Cold Storage Archival (Local Development)
+
+For local development, cold storage is simulated using compressed SQL dumps:
+
+```bash
+# Archive old segment efforts to compressed file
+pg_dump -t segment_efforts --where="created_at < NOW() - INTERVAL '2 years'" \
+  strava_db | gzip > archives/efforts_$(date +%Y%m).sql.gz
+
+# Delete archived records from active database
+DELETE FROM segment_efforts WHERE created_at < NOW() - INTERVAL '2 years';
+```
+
+### Backfill and Replay Procedures
+
+**Scenario 1: Redis Cache Lost**
+```bash
+# Rebuild leaderboards from PostgreSQL
+npm run rebuild:leaderboards
+
+# Script implementation:
+# SELECT segment_id, user_id, MIN(elapsed_time) as best_time
+# FROM segment_efforts
+# GROUP BY segment_id, user_id
+# -> ZADD to Redis sorted sets
+```
+
+**Scenario 2: Activity Feed Reconstruction**
+```bash
+# Rebuild user feeds from follows + activities
+npm run rebuild:feeds
+
+# For each user:
+#   1. Get all followed users
+#   2. Get their activities from last 30 days
+#   3. ZADD to feed:{user_id} with activity timestamps
+```
+
+**Scenario 3: Segment Effort Reprocessing**
+```bash
+# Re-run segment matching for specific activities
+npm run reprocess:segments --activity-id=<uuid>
+npm run reprocess:segments --date-range="2024-01-01,2024-01-31"
+```
+
+## Deployment and Operations
+
+### Rollout Strategy (Local Multi-Instance)
+
+For learning distributed systems locally, run multiple instances:
+
+```bash
+# Terminal 1: Backend instance A (port 3001)
+PORT=3001 npm run dev
+
+# Terminal 2: Backend instance B (port 3002)
+PORT=3002 npm run dev
+
+# Terminal 3: Simple load balancer (nginx or node-based)
+npm run dev:lb  # Routes to 3001/3002 round-robin
+```
+
+**Rolling deployment simulation:**
+1. Start new version on port 3003
+2. Health check: `curl http://localhost:3003/health`
+3. Update load balancer to include 3003
+4. Remove 3001 from load balancer
+5. Stop old instance on 3001
+6. Repeat for 3002
+
+### Schema Migration Runbook
+
+**Before running migrations:**
+```bash
+# 1. Check current migration status
+npm run db:status
+
+# 2. Review pending migrations
+ls backend/src/db/migrations/
+
+# 3. Take database backup (local)
+pg_dump strava_db > backup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+**Running migrations:**
+```bash
+# Apply all pending migrations
+npm run db:migrate
+
+# Verify migration success
+npm run db:status
+```
+
+**Migration file naming:**
+```
+001_create_users.sql
+002_create_activities.sql
+003_add_polyline_to_activities.sql
+004_create_segments.sql
+```
+
+### Rollback Runbook
+
+**Application Rollback:**
+```bash
+# 1. Identify last known good commit
+git log --oneline -10
+
+# 2. Checkout and rebuild
+git checkout <commit-hash>
+npm install && npm run build
+
+# 3. Restart services
+npm run dev
+```
+
+**Database Rollback (if migration fails):**
+```bash
+# Option A: Restore from backup
+psql strava_db < backup_20240115_143022.sql
+
+# Option B: Run down migration (if implemented)
+npm run db:rollback
+
+# Option C: Manual fix (document the SQL)
+psql strava_db -c "DROP TABLE IF EXISTS new_table;"
+psql strava_db -c "ALTER TABLE activities DROP COLUMN IF EXISTS new_column;"
+```
+
+**Redis Rollback:**
+```bash
+# Redis data is reconstructible from PostgreSQL
+# If corruption occurs, flush and rebuild
+
+redis-cli FLUSHDB
+npm run rebuild:leaderboards
+npm run rebuild:feeds
+```
+
+### Health Check Endpoints
+
+```javascript
+// GET /health - Basic liveness
+{ "status": "ok", "timestamp": "2024-01-15T10:30:00Z" }
+
+// GET /health/ready - Readiness (dependencies)
+{
+  "status": "ok",
+  "postgres": "connected",
+  "redis": "connected",
+  "latency_ms": { "postgres": 2, "redis": 1 }
+}
+```
+
+## Capacity and Cost Guardrails
+
+### Monitoring Alerts (Local Development)
+
+Even for local development, practice setting up alerts. Use console logging or a simple dashboard:
+
+**Queue Lag Alerts (if using RabbitMQ/Kafka for background jobs):**
+```javascript
+// Check every 30 seconds
+const QUEUE_LAG_THRESHOLD = 100; // messages
+
+async function checkQueueHealth() {
+  const pendingJobs = await queue.getJobCounts();
+  if (pendingJobs.waiting > QUEUE_LAG_THRESHOLD) {
+    console.warn(`[ALERT] Queue lag: ${pendingJobs.waiting} pending jobs`);
+  }
+}
+```
+
+**Segment Matching Duration:**
+```javascript
+const SEGMENT_MATCH_WARN_MS = 5000;
+
+const start = Date.now();
+await matchSegments(activity);
+const duration = Date.now() - start;
+
+if (duration > SEGMENT_MATCH_WARN_MS) {
+  console.warn(`[ALERT] Slow segment matching: ${duration}ms for activity ${activity.id}`);
+}
+```
+
+### Storage Growth Monitoring
+
+Track database size weekly to catch unexpected growth:
+
+```sql
+-- Check table sizes
+SELECT
+  relname as table_name,
+  pg_size_pretty(pg_total_relation_size(relid)) as total_size,
+  pg_size_pretty(pg_relation_size(relid)) as data_size
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
+```
+
+**Expected growth (learning project):**
+| Table | Expected Size | Alert Threshold |
+|-------|---------------|-----------------|
+| gps_points | 50 MB/month | > 500 MB total |
+| activities | 5 MB/month | > 50 MB total |
+| segment_efforts | 1 MB/month | > 20 MB total |
+
+### Cache Hit Rate Targets
+
+Monitor Redis cache effectiveness:
+
+```javascript
+// Track cache hits/misses
+const cacheStats = { hits: 0, misses: 0 };
+
+async function getCachedFeed(userId) {
+  const cached = await redis.get(`feed:${userId}`);
+  if (cached) {
+    cacheStats.hits++;
+    return JSON.parse(cached);
+  }
+  cacheStats.misses++;
+  // ... fetch from DB
+}
+
+// Log hit rate every 5 minutes
+setInterval(() => {
+  const total = cacheStats.hits + cacheStats.misses;
+  const hitRate = total > 0 ? (cacheStats.hits / total * 100).toFixed(1) : 0;
+  console.log(`[METRICS] Cache hit rate: ${hitRate}% (${cacheStats.hits}/${total})`);
+  cacheStats.hits = 0;
+  cacheStats.misses = 0;
+}, 300000);
+```
+
+**Target hit rates:**
+| Cache Type | Target | Action if Below |
+|------------|--------|-----------------|
+| Activity feeds | > 80% | Increase TTL or pre-warm on follow |
+| Leaderboards | > 95% | Check for missing ZADD on effort creation |
+| User profiles | > 70% | Acceptable, profiles change frequently |
+
+### Resource Limits (Local Development)
+
+Prevent runaway processes from consuming system resources:
+
+```javascript
+// Limit concurrent segment matching
+const CONCURRENT_MATCH_LIMIT = 3;
+const matchQueue = new PQueue({ concurrency: CONCURRENT_MATCH_LIMIT });
+
+// Limit GPS points per activity (prevent DoS via huge uploads)
+const MAX_GPS_POINTS = 50000; // ~14 hours at 1 point/second
+
+// Limit feed size to prevent Redis bloat
+const MAX_FEED_SIZE = 1000;
+await redis.zremrangebyrank(`feed:${userId}`, 0, -MAX_FEED_SIZE - 1);
+```
+
+### Cost Estimation (If Deployed)
+
+For reference, rough cloud costs at learning scale:
+
+| Resource | Specification | Monthly Cost |
+|----------|---------------|--------------|
+| PostgreSQL | db.t3.micro (1 vCPU, 1GB) | ~$15 |
+| Redis | cache.t3.micro (0.5GB) | ~$12 |
+| Compute | t3.small (2 vCPU, 2GB) | ~$15 |
+| Storage | 20GB gp3 | ~$2 |
+| **Total** | | **~$44/month** |
+
+Cost guardrails for cloud deployment:
+- Set billing alerts at $25, $50, $75
+- Use Reserved Instances after validating usage patterns
+- Enable auto-scaling with max instance limits
+
 ## Future Optimizations
 
 1. **Real-time updates**: WebSocket for live kudos/comments

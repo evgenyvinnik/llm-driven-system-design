@@ -1,5 +1,21 @@
+/**
+ * @fileoverview REST API client for communicating with the backend.
+ * Provides typed methods for all CRUD operations on workspaces, pages,
+ * blocks, and databases. Uses fetch with credentials for session auth.
+ */
+
+/** Base URL for all API requests (proxied in development) */
 const API_BASE = '/api';
 
+/**
+ * Generic fetch wrapper with error handling and JSON parsing.
+ * Automatically includes credentials and Content-Type headers.
+ *
+ * @param endpoint - API endpoint path (appended to API_BASE)
+ * @param options - Fetch options (method, body, headers, etc.)
+ * @returns Parsed JSON response
+ * @throws Error with message from API or generic failure message
+ */
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -21,7 +37,10 @@ async function request<T>(
   return response.json();
 }
 
-// Auth API
+/**
+ * Authentication API endpoints.
+ * Handles user registration, login, logout, and session verification.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     request<{ user: import('@/types').User; token: string }>('/auth/login', {
@@ -42,7 +61,10 @@ export const authApi = {
     request<{ user: import('@/types').User }>('/auth/me'),
 };
 
-// Workspaces API
+/**
+ * Workspace management API endpoints.
+ * Workspaces are top-level containers for pages and team collaboration.
+ */
 export const workspacesApi = {
   list: () =>
     request<{ workspaces: import('@/types').Workspace[] }>('/workspaces'),
@@ -66,7 +88,10 @@ export const workspacesApi = {
     request<{ message: string }>(`/workspaces/${id}`, { method: 'DELETE' }),
 };
 
-// Pages API
+/**
+ * Page management API endpoints.
+ * Pages are documents that contain blocks and can be nested hierarchically.
+ */
 export const pagesApi = {
   list: (workspaceId: string, parentId?: string | null) => {
     const params = new URLSearchParams({ workspace_id: workspaceId });
@@ -113,7 +138,10 @@ export const pagesApi = {
     request<{ ancestors: import('@/types').Page[] }>(`/pages/${id}/tree`),
 };
 
-// Blocks API
+/**
+ * Block management API endpoints.
+ * Blocks are the fundamental content units within pages.
+ */
 export const blocksApi = {
   list: (pageId: string, parentBlockId?: string | null) => {
     const params = new URLSearchParams({ page_id: pageId });
@@ -169,7 +197,10 @@ export const blocksApi = {
     }),
 };
 
-// Databases API
+/**
+ * Database API endpoints.
+ * Databases are special pages with structured data, views, and rows.
+ */
 export const databasesApi = {
   get: (id: string, viewId?: string) => {
     const params = viewId ? `?view_id=${viewId}` : '';

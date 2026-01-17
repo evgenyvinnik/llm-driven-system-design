@@ -1,13 +1,31 @@
+/**
+ * @fileoverview Property cell component for rendering and editing database values.
+ * Provides type-specific input controls for each property type.
+ */
+
 import { useState, useRef, useEffect } from 'react';
 import type { PropertySchema } from '@/types';
 import { Check, ChevronDown } from 'lucide-react';
 
+/**
+ * Props for the PropertyCell component.
+ */
 interface PropertyCellProps {
+  /** Property schema defining type and options */
   property: PropertySchema;
+  /** Current value of the property */
   value: unknown;
+  /** Callback when value changes */
   onChange: (value: unknown) => void;
 }
 
+/**
+ * PropertyCell renders an editable cell for a database property.
+ * Provides type-appropriate input controls (text, number, select, checkbox, etc.).
+ *
+ * @param props - Component props
+ * @returns The rendered property cell
+ */
 export default function PropertyCell({ property, value, onChange }: PropertyCellProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);

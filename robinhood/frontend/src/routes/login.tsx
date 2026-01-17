@@ -1,11 +1,22 @@
+/**
+ * Login page route (/login).
+ * Provides email/password authentication form.
+ * Pre-filled with demo credentials for easy testing.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/** Route definition for login page */
 export const Route = createFileRoute('/login')({
   component: LoginPage,
 });
 
+/**
+ * Login page component with authentication form.
+ * Redirects to home page on successful login.
+ */
 function LoginPage() {
   const [email, setEmail] = useState('demo@example.com');
   const [password, setPassword] = useState('password');

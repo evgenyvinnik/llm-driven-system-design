@@ -15,13 +15,25 @@ import {
   startOfDay,
 } from 'date-fns';
 
+/**
+ * Props for the CalendarPicker component.
+ */
 interface CalendarPickerProps {
+  /** Currently selected date, or null if none selected */
   selectedDate: Date | null;
+  /** Callback when a date is selected */
   onSelectDate: (date: Date) => void;
+  /** Array of available date strings (YYYY-MM-DD format) for filtering */
   availableDates?: string[];
+  /** Minimum selectable date (defaults to today) */
   minDate?: Date;
 }
 
+/**
+ * Interactive calendar component for date selection.
+ * Supports month navigation, highlighting today, and filtering by available dates.
+ * Used in the booking flow for invitees to select meeting dates.
+ */
 export function CalendarPicker({
   selectedDate,
   onSelectDate,

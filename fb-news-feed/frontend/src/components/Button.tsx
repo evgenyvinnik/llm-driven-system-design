@@ -1,12 +1,25 @@
+/**
+ * @fileoverview Reusable Button component with multiple variants and sizes.
+ * Supports loading states and extends native button attributes.
+ */
+
 import { cn } from '@/utils';
 
+/**
+ * Props for the Button component.
+ */
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  /** Visual style variant */
   variant?: 'primary' | 'secondary' | 'ghost' | 'danger';
+  /** Size variant affecting padding and font size */
   size?: 'sm' | 'md' | 'lg';
+  /** Whether to show loading spinner and disable button */
   isLoading?: boolean;
+  /** Button content */
   children: React.ReactNode;
 }
 
+/** Tailwind classes for each variant */
 const variantClasses = {
   primary: 'bg-facebook-blue text-white hover:bg-blue-600 active:bg-blue-700',
   secondary: 'bg-gray-200 text-facebook-text hover:bg-gray-300 active:bg-gray-400',
@@ -14,12 +27,20 @@ const variantClasses = {
   danger: 'bg-red-500 text-white hover:bg-red-600 active:bg-red-700',
 };
 
+/** Tailwind classes for each size */
 const sizeClasses = {
   sm: 'px-3 py-1.5 text-sm',
   md: 'px-4 py-2 text-sm',
   lg: 'px-6 py-3 text-base',
 };
 
+/**
+ * Styled button component with variant and size options.
+ * Displays loading spinner when isLoading is true.
+ *
+ * @param props - Button props including variant, size, isLoading, and native button attrs
+ * @returns JSX element rendering the button
+ */
 export function Button({
   variant = 'primary',
   size = 'md',

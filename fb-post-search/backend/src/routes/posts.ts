@@ -1,7 +1,16 @@
+/**
+ * @fileoverview Post API routes.
+ * Defines endpoints for post CRUD operations, feed, and likes.
+ */
+
 import { Router } from 'express';
 import * as postController from '../controllers/postController.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 
+/**
+ * Express router for post-related endpoints.
+ * Base path: /api/v1/posts
+ */
 const router = Router();
 
 // POST /api/v1/posts - Create a new post

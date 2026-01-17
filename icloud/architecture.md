@@ -616,3 +616,961 @@ CREATE TABLE album_subscribers (
 | Storage | Chunked, content-addressed | Whole file | Deduplication, delta |
 | Encryption | Per-file keys | Single user key | Key rotation, sharing |
 | Photos | Optimized on-device | Full sync | Device storage limits |
+
+---
+
+## Caching and Edge Strategy
+
+### CDN Layer (Static Assets and Photo Derivatives)
+
+**Architecture:**
+```
+Client -> CloudFront/CDN -> Origin (MinIO/S3)
+                         -> API Gateway (cache miss)
+```
+
+**What to Cache at CDN:**
+- Photo derivatives (thumbnails, previews) - high read frequency
+- Public shared album assets
+- Static UI assets and app bundles
+
+**CDN Configuration:**
+```javascript
+const cdnConfig = {
+  // Photo derivatives - long cache, versioned by hash
+  photoDerivatives: {
+    ttl: 31536000,  // 1 year (immutable content-addressed)
+    cacheKey: 'derivative-hash',
+    headers: {
+      'Cache-Control': 'public, max-age=31536000, immutable'
+    }
+  },
+
+  // Shared album metadata - short cache
+  sharedAlbumMeta: {
+    ttl: 60,  // 1 minute
+    staleWhileRevalidate: 300,
+    headers: {
+      'Cache-Control': 'public, max-age=60, stale-while-revalidate=300'
+    }
+  }
+}
+```
+
+### Redis/Valkey Cache Layer
+
+**Cache-Aside Pattern (Read-Heavy Data):**
+
+Used for data that is read frequently but written infrequently.
+
+```javascript
+class CacheAside {
+  constructor(redis, db, defaultTTL = 3600) {
+    this.redis = redis
+    this.db = db
+    this.defaultTTL = defaultTTL
+  }
+
+  async getFileMetadata(fileId) {
+    const cacheKey = `file:meta:${fileId}`
+
+    // 1. Try cache first
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      return JSON.parse(cached)
+    }
+
+    // 2. Cache miss - fetch from database
+    const metadata = await this.db.query(
+      'SELECT * FROM files WHERE id = $1',
+      [fileId]
+    )
+
+    // 3. Populate cache
+    if (metadata.rows[0]) {
+      await this.redis.setex(
+        cacheKey,
+        this.defaultTTL,
+        JSON.stringify(metadata.rows[0])
+      )
+    }
+
+    return metadata.rows[0]
+  }
+
+  // Invalidate on write
+  async updateFileMetadata(fileId, updates) {
+    await this.db.query(
+      'UPDATE files SET name = $2, modified_at = NOW() WHERE id = $1',
+      [fileId, updates.name]
+    )
+
+    // Invalidate cache
+    await this.redis.del(`file:meta:${fileId}`)
+  }
+}
+```
+
+**Write-Through Pattern (Sync State):**
+
+Used for critical data where cache and DB must stay consistent.
+
+```javascript
+class WriteThrough {
+  async updateSyncState(deviceId, userId, syncToken) {
+    const cacheKey = `sync:state:${deviceId}:${userId}`
+    const data = {
+      lastSyncToken: syncToken,
+      lastSyncAt: new Date().toISOString()
+    }
+
+    // Write to both cache AND database atomically
+    await Promise.all([
+      this.redis.setex(cacheKey, 86400, JSON.stringify(data)),
+      this.db.query(`
+        INSERT INTO device_sync_state (device_id, user_id, last_sync_token, last_sync_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (device_id, user_id)
+        DO UPDATE SET last_sync_token = $3, last_sync_at = NOW()
+      `, [deviceId, userId, syncToken])
+    ])
+
+    return data
+  }
+}
+```
+
+### TTL Strategy by Data Type
+
+| Data Type | TTL | Pattern | Invalidation |
+|-----------|-----|---------|--------------|
+| File metadata | 1 hour | Cache-aside | On file update/delete |
+| User storage quota | 5 minutes | Cache-aside | On upload/delete |
+| Sync state cursor | 24 hours | Write-through | On sync completion |
+| Photo derivatives | Forever | CDN + content-hash | Never (immutable) |
+| Chunk existence | 1 hour | Cache-aside | On chunk upload |
+| Device list | 15 minutes | Cache-aside | On device register/remove |
+
+### Cache Invalidation Rules
+
+```javascript
+class CacheInvalidator {
+  constructor(redis, pubsub) {
+    this.redis = redis
+    this.pubsub = pubsub
+  }
+
+  // Explicit invalidation on write operations
+  async onFileUpdated(fileId, userId) {
+    const keys = [
+      `file:meta:${fileId}`,
+      `user:files:${userId}:list`,
+      `user:storage:${userId}`
+    ]
+    await this.redis.del(...keys)
+
+    // Notify other cache instances via pub/sub
+    await this.pubsub.publish('cache:invalidate', {
+      keys,
+      timestamp: Date.now()
+    })
+  }
+
+  // Bulk invalidation for folder operations
+  async onFolderDeleted(folderId, userId) {
+    // Use scan to find all matching keys (avoid KEYS in production)
+    const pattern = `file:meta:${folderId}:*`
+    let cursor = '0'
+
+    do {
+      const [newCursor, keys] = await this.redis.scan(
+        cursor, 'MATCH', pattern, 'COUNT', 100
+      )
+      cursor = newCursor
+
+      if (keys.length > 0) {
+        await this.redis.del(...keys)
+      }
+    } while (cursor !== '0')
+  }
+}
+```
+
+### Local Development Cache Setup
+
+```yaml
+# docker-compose.yml addition
+services:
+  valkey:
+    image: valkey/valkey:7-alpine
+    ports:
+      - "6379:6379"
+    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+```
+
+---
+
+## Observability
+
+### Metrics Collection
+
+**Key Metrics by Category:**
+
+```javascript
+const metrics = {
+  // Sync performance
+  'sync.duration_ms': 'histogram',      // Time to complete sync cycle
+  'sync.files_uploaded': 'counter',     // Files uploaded per sync
+  'sync.files_downloaded': 'counter',   // Files downloaded per sync
+  'sync.conflicts_detected': 'counter', // Conflicts found
+  'sync.conflicts_resolved': 'counter', // Auto-resolved conflicts
+
+  // Storage operations
+  'storage.chunk_upload_ms': 'histogram',   // Chunk upload latency
+  'storage.chunk_download_ms': 'histogram', // Chunk download latency
+  'storage.dedup_hits': 'counter',          // Chunks skipped (already exist)
+  'storage.bytes_uploaded': 'counter',      // Total bytes uploaded
+
+  // Cache performance
+  'cache.hit_rate': 'gauge',           // Cache hit ratio
+  'cache.miss_count': 'counter',       // Cache misses
+  'cache.eviction_count': 'counter',   // Keys evicted
+
+  // API health
+  'api.request_duration_ms': 'histogram', // Request latency by endpoint
+  'api.error_rate': 'gauge',              // 5xx error rate
+  'api.active_connections': 'gauge'       // WebSocket connections
+}
+```
+
+**Prometheus Instrumentation Example:**
+
+```javascript
+import { Registry, Histogram, Counter, Gauge } from 'prom-client'
+
+const registry = new Registry()
+
+const syncDuration = new Histogram({
+  name: 'icloud_sync_duration_seconds',
+  help: 'Duration of sync operations',
+  labelNames: ['device_type', 'result'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [registry]
+})
+
+const conflictsDetected = new Counter({
+  name: 'icloud_conflicts_total',
+  help: 'Total number of sync conflicts detected',
+  labelNames: ['file_type', 'resolution'],
+  registers: [registry]
+})
+
+// Usage in sync engine
+async function sync() {
+  const timer = syncDuration.startTimer({ device_type: 'mac' })
+  try {
+    await performSync()
+    timer({ result: 'success' })
+  } catch (err) {
+    timer({ result: 'error' })
+    throw err
+  }
+}
+```
+
+### Structured Logging
+
+**Log Format (JSON Lines):**
+
+```javascript
+const logger = {
+  info: (event, data) => console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'info',
+    event,
+    ...data,
+    service: 'sync-service',
+    version: process.env.APP_VERSION
+  })),
+
+  error: (event, error, data) => console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'error',
+    event,
+    error: {
+      message: error.message,
+      stack: error.stack,
+      code: error.code
+    },
+    ...data,
+    service: 'sync-service'
+  }))
+}
+
+// Example log entries
+logger.info('sync.started', {
+  userId: 'user-123',
+  deviceId: 'device-456',
+  filesChanged: 15
+})
+
+logger.info('chunk.uploaded', {
+  userId: 'user-123',
+  fileId: 'file-789',
+  chunkHash: 'abc123...',
+  sizeBytes: 4194304,
+  durationMs: 450,
+  deduplicated: false
+})
+
+logger.error('sync.failed', error, {
+  userId: 'user-123',
+  deviceId: 'device-456',
+  phase: 'upload'
+})
+```
+
+### Distributed Tracing
+
+**OpenTelemetry Integration:**
+
+```javascript
+import { trace, SpanKind } from '@opentelemetry/api'
+
+const tracer = trace.getTracer('icloud-sync')
+
+async function uploadFile(fileId, filePath) {
+  return tracer.startActiveSpan('file.upload', {
+    kind: SpanKind.CLIENT,
+    attributes: {
+      'file.id': fileId,
+      'file.path': filePath
+    }
+  }, async (span) => {
+    try {
+      // Chunking phase
+      const chunks = await tracer.startActiveSpan('file.chunk', async (chunkSpan) => {
+        const result = await splitIntoChunks(filePath)
+        chunkSpan.setAttribute('chunk.count', result.length)
+        chunkSpan.end()
+        return result
+      })
+
+      // Upload each chunk
+      for (const chunk of chunks) {
+        await tracer.startActiveSpan('chunk.upload', {
+          attributes: { 'chunk.hash': chunk.hash, 'chunk.size': chunk.size }
+        }, async (uploadSpan) => {
+          await uploadChunkToStorage(chunk)
+          uploadSpan.end()
+        })
+      }
+
+      span.setStatus({ code: 0 })
+    } catch (error) {
+      span.setStatus({ code: 2, message: error.message })
+      span.recordException(error)
+      throw error
+    } finally {
+      span.end()
+    }
+  })
+}
+```
+
+### SLI Dashboard Definitions
+
+**Grafana Dashboard Panels:**
+
+| Panel | Query | Purpose |
+|-------|-------|---------|
+| Sync Success Rate | `rate(icloud_sync_duration_seconds_count{result="success"}[5m]) / rate(icloud_sync_duration_seconds_count[5m])` | Track sync reliability |
+| P95 Sync Latency | `histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m]))` | Sync performance |
+| Conflict Rate | `rate(icloud_conflicts_total[1h])` | Data consistency health |
+| Cache Hit Rate | `rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m]))` | Cache effectiveness |
+| Storage Dedup Ratio | `rate(storage_dedup_hits_total[1h]) / rate(storage_chunks_processed_total[1h])` | Storage efficiency |
+| Active WebSocket Connections | `icloud_websocket_connections` | Real-time sync capacity |
+
+### Alert Thresholds
+
+```yaml
+# alerts.yml
+groups:
+  - name: icloud-slis
+    rules:
+      - alert: SyncLatencyHigh
+        expr: histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync P95 latency exceeds 10 seconds"
+
+      - alert: SyncErrorRateHigh
+        expr: rate(icloud_sync_duration_seconds_count{result="error"}[5m]) / rate(icloud_sync_duration_seconds_count[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sync error rate exceeds 5%"
+
+      - alert: CacheHitRateLow
+        expr: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m])) < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 80%"
+
+      - alert: ConflictRateSpike
+        expr: rate(icloud_conflicts_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusual spike in sync conflicts"
+
+      - alert: StorageQuotaExceeded
+        expr: icloud_user_storage_used_bytes / icloud_user_storage_quota_bytes > 0.95
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "User approaching storage quota limit"
+```
+
+### Audit Logging
+
+**Security and Compliance Events:**
+
+```javascript
+class AuditLogger {
+  constructor(db) {
+    this.db = db
+  }
+
+  async log(event) {
+    await this.db.query(`
+      INSERT INTO audit_log (
+        event_type, user_id, device_id, resource_type, resource_id,
+        action, metadata, ip_address, user_agent, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+    `, [
+      event.type,
+      event.userId,
+      event.deviceId,
+      event.resourceType,
+      event.resourceId,
+      event.action,
+      JSON.stringify(event.metadata),
+      event.ipAddress,
+      event.userAgent
+    ])
+  }
+}
+
+// Audit events to capture
+const auditEvents = {
+  // Authentication
+  'auth.login': { retention: '2 years' },
+  'auth.logout': { retention: '2 years' },
+  'auth.device_registered': { retention: '2 years' },
+  'auth.device_removed': { retention: '2 years' },
+
+  // Data access
+  'file.shared': { retention: '1 year' },
+  'file.downloaded': { retention: '90 days' },
+  'album.shared': { retention: '1 year' },
+  'album.unshared': { retention: '1 year' },
+
+  // Administrative
+  'admin.user_suspended': { retention: '5 years' },
+  'admin.data_export': { retention: '5 years' },
+  'admin.data_deleted': { retention: '5 years' }
+}
+
+// Usage
+await auditLogger.log({
+  type: 'file.shared',
+  userId: 'user-123',
+  deviceId: 'device-456',
+  resourceType: 'file',
+  resourceId: 'file-789',
+  action: 'create_share_link',
+  metadata: {
+    shareType: 'public',
+    expiresAt: '2024-12-31'
+  },
+  ipAddress: req.ip,
+  userAgent: req.headers['user-agent']
+})
+```
+
+**Audit Log Schema:**
+
+```sql
+CREATE TABLE audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  event_type VARCHAR(100) NOT NULL,
+  user_id UUID,
+  device_id UUID,
+  resource_type VARCHAR(50),
+  resource_id UUID,
+  action VARCHAR(100) NOT NULL,
+  metadata JSONB,
+  ip_address INET,
+  user_agent TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_user_time ON audit_log(user_id, created_at DESC);
+CREATE INDEX idx_audit_event_type ON audit_log(event_type, created_at DESC);
+CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id, created_at DESC);
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Idempotency Keys
+
+**Idempotent Upload Operations:**
+
+```javascript
+class IdempotentUploader {
+  constructor(redis, storage, db) {
+    this.redis = redis
+    this.storage = storage
+    this.db = db
+  }
+
+  async uploadFile(idempotencyKey, fileId, fileData, userId) {
+    const lockKey = `upload:lock:${idempotencyKey}`
+    const resultKey = `upload:result:${idempotencyKey}`
+
+    // Check if this request was already processed
+    const existingResult = await this.redis.get(resultKey)
+    if (existingResult) {
+      return JSON.parse(existingResult)
+    }
+
+    // Acquire lock to prevent duplicate processing
+    const lockAcquired = await this.redis.set(
+      lockKey,
+      'locked',
+      'NX',
+      'EX',
+      300  // 5 minute lock
+    )
+
+    if (!lockAcquired) {
+      // Another request is processing this - wait and return result
+      await this.waitForResult(resultKey)
+      return JSON.parse(await this.redis.get(resultKey))
+    }
+
+    try {
+      // Perform the actual upload
+      const result = await this.performUpload(fileId, fileData, userId)
+
+      // Store result for 24 hours
+      await this.redis.setex(resultKey, 86400, JSON.stringify(result))
+
+      return result
+    } finally {
+      await this.redis.del(lockKey)
+    }
+  }
+
+  async waitForResult(resultKey, maxWaitMs = 30000) {
+    const startTime = Date.now()
+    while (Date.now() - startTime < maxWaitMs) {
+      const result = await this.redis.get(resultKey)
+      if (result) return
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    throw new Error('Timeout waiting for upload result')
+  }
+}
+```
+
+**Client-Side Retry with Exponential Backoff:**
+
+```javascript
+class RetryClient {
+  constructor(maxRetries = 3, baseDelayMs = 1000) {
+    this.maxRetries = maxRetries
+    this.baseDelayMs = baseDelayMs
+  }
+
+  async uploadWithRetry(fileId, fileData) {
+    // Generate idempotency key from file content hash
+    const idempotencyKey = crypto
+      .createHash('sha256')
+      .update(fileId + fileData.slice(0, 1024))
+      .digest('hex')
+
+    let lastError
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        const response = await fetch('/api/v1/files/upload', {
+          method: 'POST',
+          headers: {
+            'Idempotency-Key': idempotencyKey,
+            'Content-Type': 'application/octet-stream'
+          },
+          body: fileData
+        })
+
+        if (response.ok) {
+          return await response.json()
+        }
+
+        // Don't retry 4xx errors (client error)
+        if (response.status >= 400 && response.status < 500) {
+          throw new Error(`Client error: ${response.status}`)
+        }
+
+        lastError = new Error(`Server error: ${response.status}`)
+      } catch (error) {
+        lastError = error
+      }
+
+      if (attempt < this.maxRetries) {
+        // Exponential backoff with jitter
+        const delay = this.baseDelayMs * Math.pow(2, attempt)
+        const jitter = delay * 0.2 * Math.random()
+        await new Promise(r => setTimeout(r, delay + jitter))
+      }
+    }
+
+    throw lastError
+  }
+}
+```
+
+### Circuit Breaker Pattern
+
+**Storage Service Circuit Breaker:**
+
+```javascript
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeoutMs = options.resetTimeoutMs || 30000
+    this.halfOpenMaxCalls = options.halfOpenMaxCalls || 3
+
+    this.state = 'closed'  // closed, open, half-open
+    this.failureCount = 0
+    this.successCount = 0
+    this.lastFailureTime = null
+    this.halfOpenCalls = 0
+  }
+
+  async execute(fn) {
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailureTime >= this.resetTimeoutMs) {
+        this.state = 'half-open'
+        this.halfOpenCalls = 0
+      } else {
+        throw new Error('Circuit breaker is open')
+      }
+    }
+
+    if (this.state === 'half-open' && this.halfOpenCalls >= this.halfOpenMaxCalls) {
+      throw new Error('Circuit breaker half-open limit reached')
+    }
+
+    try {
+      const result = await fn()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    if (this.state === 'half-open') {
+      this.successCount++
+      if (this.successCount >= this.halfOpenMaxCalls) {
+        this.state = 'closed'
+        this.failureCount = 0
+        this.successCount = 0
+      }
+    } else {
+      this.failureCount = 0
+    }
+  }
+
+  onFailure() {
+    this.failureCount++
+    this.lastFailureTime = Date.now()
+
+    if (this.state === 'half-open') {
+      this.state = 'open'
+    } else if (this.failureCount >= this.failureThreshold) {
+      this.state = 'open'
+    }
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime
+    }
+  }
+}
+
+// Usage
+const storageBreaker = new CircuitBreaker({
+  failureThreshold: 5,
+  resetTimeoutMs: 30000
+})
+
+async function uploadChunk(hash, data) {
+  return storageBreaker.execute(async () => {
+    return await minioClient.putObject('chunks', hash, data)
+  })
+}
+```
+
+**Circuit Breaker Middleware:**
+
+```javascript
+const circuitBreakers = {
+  storage: new CircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30000 }),
+  database: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 60000 }),
+  externalApi: new CircuitBreaker({ failureThreshold: 10, resetTimeoutMs: 120000 })
+}
+
+// Health endpoint shows circuit breaker states
+app.get('/health/circuits', (req, res) => {
+  res.json({
+    storage: circuitBreakers.storage.getState(),
+    database: circuitBreakers.database.getState(),
+    externalApi: circuitBreakers.externalApi.getState()
+  })
+})
+```
+
+### Multi-Region Disaster Recovery (Conceptual)
+
+**For Local Development Learning:**
+
+While full multi-region DR is impractical locally, understand the patterns:
+
+```javascript
+// Simulated region failover for learning
+class RegionManager {
+  constructor() {
+    this.regions = [
+      { id: 'primary', endpoint: 'http://localhost:3001', healthy: true },
+      { id: 'secondary', endpoint: 'http://localhost:3002', healthy: true }
+    ]
+    this.activeRegion = this.regions[0]
+  }
+
+  async healthCheck() {
+    for (const region of this.regions) {
+      try {
+        const response = await fetch(`${region.endpoint}/health`, {
+          timeout: 5000
+        })
+        region.healthy = response.ok
+      } catch {
+        region.healthy = false
+      }
+    }
+  }
+
+  getActiveEndpoint() {
+    // Return first healthy region
+    const healthy = this.regions.find(r => r.healthy)
+    if (!healthy) {
+      throw new Error('No healthy regions available')
+    }
+    return healthy.endpoint
+  }
+
+  async failover() {
+    await this.healthCheck()
+    const newActive = this.regions.find(r => r.healthy && r.id !== this.activeRegion.id)
+
+    if (newActive) {
+      console.log(`Failing over from ${this.activeRegion.id} to ${newActive.id}`)
+      this.activeRegion = newActive
+      return true
+    }
+    return false
+  }
+}
+```
+
+**DR Checklist for Production:**
+
+| Component | Primary | Secondary | RPO | RTO |
+|-----------|---------|-----------|-----|-----|
+| PostgreSQL | us-east-1 | us-west-2 | 1 minute (async replication) | 15 minutes |
+| MinIO/S3 | us-east-1 | us-west-2 | 0 (cross-region replication) | 5 minutes |
+| Valkey/Redis | us-east-1 | us-west-2 | 5 minutes | 10 minutes |
+| Cassandra | Multi-DC | Multi-DC | 0 (multi-master) | 0 (automatic) |
+
+### Backup and Restore Testing
+
+**Automated Backup Verification:**
+
+```javascript
+class BackupValidator {
+  constructor(db, storage) {
+    this.db = db
+    this.storage = storage
+  }
+
+  // Run nightly in non-production environments
+  async validateBackups() {
+    const report = {
+      timestamp: new Date().toISOString(),
+      checks: []
+    }
+
+    // 1. Verify PostgreSQL backup exists and is recent
+    const pgBackup = await this.checkPostgresBackup()
+    report.checks.push({
+      name: 'postgresql_backup',
+      status: pgBackup.valid ? 'pass' : 'fail',
+      lastBackup: pgBackup.timestamp,
+      sizeBytes: pgBackup.size
+    })
+
+    // 2. Verify chunk storage backup/replication
+    const storageBackup = await this.checkStorageReplication()
+    report.checks.push({
+      name: 'storage_replication',
+      status: storageBackup.inSync ? 'pass' : 'fail',
+      lagBytes: storageBackup.replicationLag
+    })
+
+    // 3. Sample restore test (restore random file)
+    const restoreTest = await this.sampleRestoreTest()
+    report.checks.push({
+      name: 'sample_restore',
+      status: restoreTest.success ? 'pass' : 'fail',
+      durationMs: restoreTest.duration,
+      fileId: restoreTest.fileId
+    })
+
+    return report
+  }
+
+  async checkPostgresBackup() {
+    // Check backup exists in storage
+    const backups = await this.storage.listObjects('backups', 'pg/')
+    const latest = backups.sort((a, b) => b.lastModified - a.lastModified)[0]
+
+    const ageHours = (Date.now() - latest.lastModified.getTime()) / 3600000
+
+    return {
+      valid: ageHours < 24,  // Backup should be less than 24 hours old
+      timestamp: latest.lastModified,
+      size: latest.size
+    }
+  }
+
+  async sampleRestoreTest() {
+    const startTime = Date.now()
+
+    // Pick a random file from the database
+    const randomFile = await this.db.query(`
+      SELECT id, content_hash FROM files
+      WHERE is_deleted = false
+      ORDER BY RANDOM()
+      LIMIT 1
+    `)
+
+    if (!randomFile.rows[0]) {
+      return { success: true, duration: 0, fileId: null }
+    }
+
+    const fileId = randomFile.rows[0].id
+    const expectedHash = randomFile.rows[0].content_hash
+
+    try {
+      // Attempt to reconstruct file from chunks
+      const manifest = await this.getFileManifest(fileId)
+      const chunks = []
+
+      for (const chunk of manifest.chunks) {
+        const data = await this.storage.getObject('chunks', chunk.hash)
+        chunks.push(data)
+      }
+
+      // Verify reconstructed file hash
+      const reconstructed = Buffer.concat(chunks)
+      const actualHash = crypto
+        .createHash('sha256')
+        .update(reconstructed)
+        .digest('hex')
+
+      return {
+        success: actualHash === expectedHash,
+        duration: Date.now() - startTime,
+        fileId
+      }
+    } catch (error) {
+      return {
+        success: false,
+        duration: Date.now() - startTime,
+        fileId,
+        error: error.message
+      }
+    }
+  }
+}
+```
+
+**Backup Schedule:**
+
+```yaml
+# backup-schedule.yml
+backups:
+  postgresql:
+    type: pg_dump
+    frequency: daily
+    retention: 30 days
+    destination: s3://icloud-backups/pg/
+
+  postgresql_wal:
+    type: continuous
+    retention: 7 days
+    destination: s3://icloud-backups/pg-wal/
+
+  chunk_storage:
+    type: cross-region-replication
+    frequency: continuous
+    destination: s3://icloud-chunks-replica/
+
+restore_tests:
+  frequency: weekly
+  scope: sample  # full, sample, metadata-only
+  notification: ops-team@example.com
+```
+
+**Local Development Backup Commands:**
+
+```bash
+# Backup PostgreSQL
+pg_dump -h localhost -U icloud icloud_db > backup_$(date +%Y%m%d).sql
+
+# Restore PostgreSQL
+psql -h localhost -U icloud icloud_db < backup_20240115.sql
+
+# Backup MinIO bucket
+mc mirror minio/icloud-chunks ./backup-chunks/
+
+# Restore MinIO bucket
+mc mirror ./backup-chunks/ minio/icloud-chunks
+```

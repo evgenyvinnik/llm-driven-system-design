@@ -1,11 +1,23 @@
+/**
+ * Login route component for user authentication.
+ * Provides both sign-in and sign-up forms with demo credentials.
+ */
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores';
 
+/** Route configuration for /login */
 export const Route = createFileRoute('/login')({
   component: LoginPage,
 });
 
+/**
+ * Login page component with tabbed sign-in/sign-up forms.
+ * Pre-fills demo credentials for easy testing.
+ * Redirects to home after successful authentication.
+ *
+ * @returns JSX element representing the login page
+ */
 function LoginPage() {
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('demo@example.com');

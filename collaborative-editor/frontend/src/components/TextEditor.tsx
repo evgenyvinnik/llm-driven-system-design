@@ -2,10 +2,27 @@ import { useRef, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../stores/editorStore';
 import { TextOperation } from '../services/TextOperation';
 
+/**
+ * Props for the TextEditor component.
+ */
 interface TextEditorProps {
+  /** If true, the editor is read-only */
   readOnly?: boolean;
 }
 
+/**
+ * TextEditor - The main collaborative text editing component.
+ *
+ * Renders a textarea that syncs with the collaborative editing store.
+ * Handles:
+ * - Converting user input into OT operations
+ * - Syncing content changes from remote operations
+ * - Managing cursor position during edits
+ * - IME composition handling for international input
+ *
+ * @param props - Component props
+ * @returns The TextEditor component
+ */
 export function TextEditor({ readOnly = false }: TextEditorProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastContentRef = useRef<string>('');
@@ -94,7 +111,15 @@ export function TextEditor({ readOnly = false }: TextEditorProps) {
 }
 
 /**
- * Create an operation from the diff between old and new values
+ * Create an operation from the diff between old and new text values.
+ *
+ * Uses a simple diff algorithm to find the common prefix and suffix,
+ * then generates the appropriate retain/delete/insert operations.
+ *
+ * @param oldValue - The text before the change
+ * @param newValue - The text after the change
+ * @param cursorPos - The current cursor position (for future use)
+ * @returns A TextOperation representing the change
  */
 function createOperationFromDiff(
   oldValue: string,

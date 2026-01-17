@@ -1,9 +1,19 @@
+/**
+ * @fileoverview Editor state store for block-based content editing.
+ * Manages blocks, selection state, and real-time collaboration features.
+ * Implements optimistic updates with rollback on failure.
+ */
+
 import { create } from 'zustand';
 import type { Block, Operation, Presence, RichText, BlockType } from '@/types';
 import { blocksApi, pagesApi } from '@/services/api';
 import { wsService } from '@/services/websocket';
 import { v4 as uuidv4 } from './uuid';
 
+/**
+ * Editor state interface.
+ * Contains block data, selection state, presence info, and CRUD actions.
+ */
 interface EditorState {
   blocks: Block[];
   selectedBlockId: string | null;
@@ -36,7 +46,12 @@ interface EditorState {
   updatePresencePosition: (userId: string, cursorPosition?: { block_id: string; offset: number }) => void;
 }
 
-// Simple UUID generator
+/**
+ * Generates a random UUID v4 for temporary IDs.
+ * Used for optimistic updates before server confirmation.
+ *
+ * @returns A UUID v4 string
+ */
 function generateId(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
     const r = Math.random() * 16 | 0;
@@ -45,6 +60,11 @@ function generateId(): string {
   });
 }
 
+/**
+ * Editor store for managing block content and real-time collaboration.
+ * Implements optimistic updates with rollback, and broadcasts operations
+ * via WebSocket for real-time sync with other users.
+ */
 export const useEditorStore = create<EditorState>((set, get) => ({
   blocks: [],
   selectedBlockId: null,

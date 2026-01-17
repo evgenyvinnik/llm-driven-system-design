@@ -1,7 +1,17 @@
+/**
+ * AddCardForm component for provisioning new payment cards.
+ * Provides form fields for card number, expiry, CVV, and holder name.
+ * Includes test card buttons for demo purposes.
+ */
 import { useState } from 'react';
 
+/**
+ * Props for the AddCardForm component.
+ */
 interface AddCardFormProps {
+  /** Target device ID for card provisioning */
   deviceId: string;
+  /** Submit handler - receives card data and provisions to device */
   onSubmit: (data: {
     pan: string;
     expiry_month: number;
@@ -10,10 +20,20 @@ interface AddCardFormProps {
     card_holder_name: string;
     device_id: string;
   }) => Promise<void>;
+  /** Callback when user cancels the form */
   onCancel: () => void;
+  /** Whether form submission is in progress */
   isLoading?: boolean;
 }
 
+/**
+ * Renders a form for adding a new payment card to a device.
+ * Includes validation, formatting, and test card quick-fill buttons.
+ * Card numbers are validated for length before submission.
+ *
+ * @param props - AddCardForm component props
+ * @returns JSX element representing the add card form
+ */
 export function AddCardForm({ deviceId, onSubmit, onCancel, isLoading }: AddCardFormProps) {
   const [pan, setPan] = useState('');
   const [expiryMonth, setExpiryMonth] = useState('');

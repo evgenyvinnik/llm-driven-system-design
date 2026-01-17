@@ -1,9 +1,20 @@
+/**
+ * Profile route - user profile view and editing.
+ * Allows users to view and update their profile information.
+ */
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useState } from 'react';
 import BottomNav from '../components/BottomNav';
 import ReignsAvatar from '../components/ReignsAvatar';
 
+/**
+ * Profile page component.
+ * Displays user profile with avatar, bio, and work/education info.
+ * Supports inline editing of profile fields.
+ * Links to preferences and provides logout functionality.
+ * @returns Profile page element with edit capabilities
+ */
 function ProfilePage() {
   const { isAuthenticated, user, logout, updateProfile } = useAuthStore();
   const [isEditing, setIsEditing] = useState(false);

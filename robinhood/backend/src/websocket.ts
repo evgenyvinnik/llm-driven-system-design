@@ -4,16 +4,33 @@ import { pool } from '../database.js';
 import { quoteService } from '../services/quoteService.js';
 import type { Quote, User } from '../types/index.js';
 
+/**
+ * Extended WebSocket with user context and subscription state.
+ */
 interface ExtendedWebSocket extends WebSocket {
+  /** Authenticated user ID if logged in */
   userId?: string;
+  /** Set of stock symbols the client has subscribed to */
   subscribedSymbols: Set<string>;
+  /** Heartbeat flag for connection health monitoring */
   isAlive: boolean;
 }
 
+/**
+ * WebSocket handler for real-time quote streaming.
+ * Manages client connections, subscriptions, and quote broadcasts.
+ * Supports optional authentication via session token for user-specific features.
+ */
 export class WebSocketHandler {
   private wss: WebSocketServer;
+  /** Map of user ID to WebSocket for authenticated clients */
   private clients: Map<string, ExtendedWebSocket> = new Map();
 
+  /**
+   * Creates a new WebSocket handler attached to the HTTP server.
+   * Sets up connection handling, heartbeat monitoring, and quote subscriptions.
+   * @param server - HTTP server to attach WebSocket server to
+   */
   constructor(server: import('http').Server) {
     this.wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -39,6 +56,13 @@ export class WebSocketHandler {
     });
   }
 
+  /**
+   * Handles new WebSocket connections.
+   * Initializes subscription state, authenticates if token provided,
+   * and sets up message/close/error handlers.
+   * @param ws - WebSocket connection
+   * @param req - Incoming HTTP request with optional token query param
+   */
   private async handleConnection(ws: ExtendedWebSocket, req: IncomingMessage): Promise<void> {
     ws.subscribedSymbols = new Set();
     ws.isAlive = true;
@@ -85,6 +109,11 @@ export class WebSocketHandler {
     }));
   }
 
+  /**
+   * Validates a session token and retrieves the associated user.
+   * @param token - Bearer token from session
+   * @returns User object if valid, null otherwise
+   */
   private async authenticateToken(token: string): Promise<User | null> {
     try {
       const result = await pool.query<User>(
@@ -100,6 +129,12 @@ export class WebSocketHandler {
     }
   }
 
+  /**
+   * Processes incoming WebSocket messages.
+   * Handles subscribe, unsubscribe, subscribe_all, unsubscribe_all, and ping.
+   * @param ws - WebSocket connection
+   * @param message - Parsed message with type and optional symbols array
+   */
   private handleMessage(ws: ExtendedWebSocket, message: { type: string; symbols?: string[] }): void {
     switch (message.type) {
       case 'subscribe':
@@ -149,6 +184,11 @@ export class WebSocketHandler {
     }
   }
 
+  /**
+   * Broadcasts quote updates to all connected clients.
+   * Filters quotes to only send symbols each client has subscribed to.
+   * @param quotes - Array of updated quotes to broadcast
+   */
   private broadcastQuotes(quotes: Quote[]): void {
     this.wss.clients.forEach((client) => {
       const ws = client as ExtendedWebSocket;
@@ -166,7 +206,13 @@ export class WebSocketHandler {
     });
   }
 
-  // Send notification to specific user
+  /**
+   * Sends a message to a specific authenticated user.
+   * Used for user-specific notifications like order fills or alerts.
+   * @param userId - ID of the user to send to
+   * @param type - Message type
+   * @param data - Message payload
+   */
   sendToUser(userId: string, type: string, data: unknown): void {
     const ws = this.clients.get(userId);
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -174,7 +220,11 @@ export class WebSocketHandler {
     }
   }
 
-  // Broadcast to all connected clients
+  /**
+   * Broadcasts a message to all connected clients.
+   * @param type - Message type
+   * @param data - Message payload
+   */
   broadcast(type: string, data: unknown): void {
     this.wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {

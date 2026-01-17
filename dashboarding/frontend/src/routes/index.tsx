@@ -1,12 +1,32 @@
+/**
+ * @fileoverview Dashboards list page.
+ *
+ * Displays all available dashboards in a grid layout with options to
+ * create new dashboards and delete existing ones.
+ */
+
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import type { Dashboard } from '../types';
 import { getDashboards, createDashboard, deleteDashboard } from '../services/api';
 
+/**
+ * Route configuration for the dashboards index page.
+ */
 export const Route = createFileRoute('/')({
   component: DashboardsPage,
 });
 
+/**
+ * Dashboards list page component.
+ *
+ * Features:
+ * - Grid display of all dashboards with name, description, panel count
+ * - Create new dashboard form with name and description inputs
+ * - Delete dashboard functionality with confirmation
+ *
+ * @returns The rendered dashboards list page
+ */
 function DashboardsPage() {
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
   const [loading, setLoading] = useState(true);

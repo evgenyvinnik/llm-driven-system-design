@@ -738,6 +738,862 @@ CREATE INDEX idx_profiles_user ON user_profiles(user_id);
 
 ---
 
+## Consistency and Idempotency Semantics
+
+### Consistency Model by Operation
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Watch progress updates | Eventual (last-write-wins) | User only has one active playback session; conflicts rare |
+| Download initiation | Strong (serializable) | Must enforce download limits accurately |
+| Content ingestion | Strong (per-content) | Encoding jobs depend on consistent state |
+| License grants | Strong | Security-critical; must not double-issue |
+| Watchlist add/remove | Eventual | Low conflict risk; UI can handle stale reads |
+| Profile creation | Strong | Must enforce max profiles per account |
+
+### Idempotency Keys
+
+All mutating API endpoints accept an `Idempotency-Key` header to handle client retries safely.
+
+```javascript
+// Middleware for idempotent writes
+async function idempotencyMiddleware(req, res, next) {
+  const idempotencyKey = req.headers['idempotency-key']
+  if (!idempotencyKey) {
+    return next() // Non-idempotent request, proceed normally
+  }
+
+  const cacheKey = `idempotency:${req.userId}:${idempotencyKey}`
+
+  // Check if we already processed this request
+  const cached = await redis.get(cacheKey)
+  if (cached) {
+    const response = JSON.parse(cached)
+    return res.status(response.status).json(response.body)
+  }
+
+  // Store pending state to detect concurrent duplicates
+  const lockKey = `${cacheKey}:lock`
+  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 30)
+  if (!acquired) {
+    return res.status(409).json({ error: 'Request already in progress' })
+  }
+
+  // Wrap response to capture and cache result
+  const originalJson = res.json.bind(res)
+  res.json = async (body) => {
+    await redis.setex(cacheKey, 86400, JSON.stringify({
+      status: res.statusCode,
+      body
+    }))
+    await redis.del(lockKey)
+    return originalJson(body)
+  }
+
+  next()
+}
+```
+
+### Key Idempotency Patterns
+
+**Download Initiation:**
+```javascript
+async initiateDownload(userId, contentId, deviceId, quality, idempotencyKey) {
+  // Use composite key: user + content + device + quality
+  const downloadKey = `download:${userId}:${contentId}:${deviceId}:${quality}`
+
+  // Check for existing pending/active download
+  const existing = await db.query(`
+    SELECT id, status, license_expires FROM downloads
+    WHERE user_id = $1 AND content_id = $2 AND device_id = $3
+    AND status IN ('pending', 'downloading', 'complete')
+  `, [userId, contentId, deviceId])
+
+  if (existing.rows.length > 0) {
+    // Return existing download (idempotent)
+    return existing.rows[0]
+  }
+
+  // Create new download within transaction
+  return await db.transaction(async (tx) => {
+    const count = await tx.query(`
+      SELECT COUNT(*) FROM downloads WHERE user_id = $1 AND status = 'complete'
+    `, [userId])
+
+    if (count.rows[0].count >= 25) {
+      throw new Error('Download limit reached')
+    }
+
+    return await tx.query(`
+      INSERT INTO downloads (id, user_id, content_id, device_id, quality, status)
+      VALUES ($1, $2, $3, $4, $5, 'pending')
+      RETURNING *
+    `, [uuid(), userId, contentId, deviceId, quality])
+  })
+}
+```
+
+**Watch Progress (Last-Write-Wins):**
+```javascript
+// Client includes local timestamp; server uses it for conflict resolution
+async updateProgress(userId, contentId, position, clientTimestamp) {
+  await db.query(`
+    INSERT INTO watch_progress (user_id, content_id, position, client_timestamp, updated_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    ON CONFLICT (user_id, content_id)
+    DO UPDATE SET
+      position = CASE
+        WHEN watch_progress.client_timestamp < $4 THEN $3
+        ELSE watch_progress.position
+      END,
+      client_timestamp = GREATEST(watch_progress.client_timestamp, $4),
+      updated_at = NOW()
+  `, [userId, contentId, position, clientTimestamp])
+}
+```
+
+### Replay Handling
+
+- **Transcoding jobs**: Job ID derived from content ID + profile hash; worker checks completion before starting
+- **License grants**: License ID is deterministic (hash of user + content + device + timestamp window); duplicate requests return same license
+- **Notification delivery**: Each notification has unique ID; client deduplicates on receipt
+
+---
+
+## Observability
+
+### Metrics (Prometheus)
+
+**Key Application Metrics:**
+```javascript
+// metrics.js - Prometheus metrics for local development
+const promClient = require('prom-client')
+
+// Request latency histogram
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+})
+
+// Playback start latency (time to first frame)
+const playbackStartLatency = new promClient.Histogram({
+  name: 'playback_start_latency_seconds',
+  help: 'Time from play request to first frame rendered',
+  labelNames: ['device_type', 'quality'],
+  buckets: [0.5, 1, 1.5, 2, 2.5, 3, 5, 10]
+})
+
+// Active streams gauge
+const activeStreams = new promClient.Gauge({
+  name: 'active_streams_total',
+  help: 'Number of currently active video streams',
+  labelNames: ['quality', 'device_type']
+})
+
+// Transcoding job duration
+const transcodingDuration = new promClient.Histogram({
+  name: 'transcoding_job_duration_seconds',
+  help: 'Duration of transcoding jobs',
+  labelNames: ['resolution', 'codec'],
+  buckets: [60, 300, 600, 1800, 3600, 7200]
+})
+
+// DRM license issuance
+const licenseRequests = new promClient.Counter({
+  name: 'drm_license_requests_total',
+  help: 'Total DRM license requests',
+  labelNames: ['status', 'device_type']
+})
+
+// CDN cache hit ratio
+const cdnCacheHits = new promClient.Counter({
+  name: 'cdn_cache_hits_total',
+  help: 'CDN cache hit count',
+  labelNames: ['edge_location', 'content_type']
+})
+
+const cdnCacheMisses = new promClient.Counter({
+  name: 'cdn_cache_misses_total',
+  help: 'CDN cache miss count',
+  labelNames: ['edge_location', 'content_type']
+})
+```
+
+### SLI Definitions and Alert Thresholds
+
+| SLI | Target | Warning Threshold | Critical Threshold |
+|-----|--------|-------------------|-------------------|
+| Playback start latency (p95) | < 2s | > 2.5s | > 4s |
+| API availability | 99.9% | < 99.5% | < 99% |
+| Streaming availability | 99.99% | < 99.95% | < 99.9% |
+| Manifest generation latency (p95) | < 100ms | > 150ms | > 300ms |
+| DRM license latency (p95) | < 200ms | > 300ms | > 500ms |
+| CDN cache hit rate | > 95% | < 90% | < 80% |
+| Transcoding success rate | > 99% | < 98% | < 95% |
+
+**Alerting Rules (Prometheus format):**
+```yaml
+# alerts.yml
+groups:
+  - name: apple-tv-streaming
+    rules:
+      - alert: HighPlaybackLatency
+        expr: histogram_quantile(0.95, rate(playback_start_latency_seconds_bucket[5m])) > 2.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Playback start latency exceeds 2.5s (p95)"
+
+      - alert: CriticalPlaybackLatency
+        expr: histogram_quantile(0.95, rate(playback_start_latency_seconds_bucket[5m])) > 4
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Playback start latency exceeds 4s (p95)"
+
+      - alert: LowCacheHitRate
+        expr: rate(cdn_cache_hits_total[10m]) / (rate(cdn_cache_hits_total[10m]) + rate(cdn_cache_misses_total[10m])) < 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDN cache hit rate below 90%"
+
+      - alert: TranscodingFailureSpike
+        expr: rate(transcoding_job_failures_total[5m]) / rate(transcoding_job_total[5m]) > 0.02
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcoding failure rate exceeds 2%"
+
+      - alert: DRMLicenseErrors
+        expr: rate(drm_license_requests_total{status="error"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High rate of DRM license failures"
+```
+
+### Structured Logging
+
+```javascript
+// Structured logging with correlation IDs
+const logger = require('pino')({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  }
+})
+
+// Request logging middleware
+function requestLogger(req, res, next) {
+  const requestId = req.headers['x-request-id'] || uuid()
+  req.log = logger.child({
+    requestId,
+    userId: req.userId,
+    method: req.method,
+    path: req.path
+  })
+
+  const start = Date.now()
+  res.on('finish', () => {
+    req.log.info({
+      statusCode: res.statusCode,
+      duration: Date.now() - start,
+      contentLength: res.get('content-length')
+    }, 'request completed')
+  })
+
+  next()
+}
+
+// Example: Playback event logging
+async function logPlaybackEvent(event) {
+  logger.info({
+    event: 'playback',
+    action: event.action, // 'start', 'pause', 'seek', 'quality_change', 'error'
+    userId: event.userId,
+    contentId: event.contentId,
+    deviceId: event.deviceId,
+    position: event.position,
+    quality: event.quality,
+    bufferHealth: event.bufferHealth,
+    bandwidth: event.bandwidth
+  }, `playback:${event.action}`)
+}
+```
+
+### Distributed Tracing
+
+```javascript
+// OpenTelemetry setup for local development
+const { NodeTracerProvider } = require('@opentelemetry/node')
+const { SimpleSpanProcessor } = require('@opentelemetry/tracing')
+const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
+
+const provider = new NodeTracerProvider()
+provider.addSpanProcessor(new SimpleSpanProcessor(
+  new JaegerExporter({
+    serviceName: 'apple-tv-api',
+    endpoint: 'http://localhost:14268/api/traces'
+  })
+))
+provider.register()
+
+const tracer = provider.getTracer('apple-tv')
+
+// Example: Trace playback request flow
+async function handlePlaybackRequest(req, res) {
+  const span = tracer.startSpan('playback.request')
+  span.setAttribute('user.id', req.userId)
+  span.setAttribute('content.id', req.params.contentId)
+
+  try {
+    // Check subscription
+    const subSpan = tracer.startSpan('subscription.check', { parent: span })
+    const subscription = await checkSubscription(req.userId)
+    subSpan.end()
+
+    // Generate manifest
+    const manifestSpan = tracer.startSpan('manifest.generate', { parent: span })
+    const manifest = await generateManifest(req.params.contentId)
+    manifestSpan.setAttribute('variant.count', manifest.variants.length)
+    manifestSpan.end()
+
+    // Issue DRM license
+    const drmSpan = tracer.startSpan('drm.license', { parent: span })
+    const license = await issueLicense(req.userId, req.params.contentId)
+    drmSpan.end()
+
+    span.setStatus({ code: 'OK' })
+    return { manifest, license }
+  } catch (error) {
+    span.recordException(error)
+    span.setStatus({ code: 'ERROR', message: error.message })
+    throw error
+  } finally {
+    span.end()
+  }
+}
+```
+
+### Audit Logging
+
+```javascript
+// Security-relevant events logged separately for compliance
+const auditLogger = require('pino')({
+  level: 'info',
+  transport: {
+    target: 'pino/file',
+    options: { destination: './logs/audit.log' }
+  }
+})
+
+// Audit events
+const AuditEvents = {
+  LICENSE_ISSUED: 'drm.license.issued',
+  LICENSE_REVOKED: 'drm.license.revoked',
+  DOWNLOAD_STARTED: 'download.started',
+  DOWNLOAD_DELETED: 'download.deleted',
+  DEVICE_REGISTERED: 'device.registered',
+  DEVICE_REMOVED: 'device.removed',
+  PROFILE_CREATED: 'profile.created',
+  PROFILE_DELETED: 'profile.deleted',
+  SUBSCRIPTION_CHANGED: 'subscription.changed',
+  CONTENT_ACCESSED: 'content.accessed'
+}
+
+async function auditLog(event, data) {
+  auditLogger.info({
+    timestamp: new Date().toISOString(),
+    event,
+    userId: data.userId,
+    deviceId: data.deviceId,
+    contentId: data.contentId,
+    ipAddress: data.ipAddress,
+    userAgent: data.userAgent,
+    details: data.details
+  })
+
+  // Also store in database for querying
+  await db.query(`
+    INSERT INTO audit_log (event, user_id, device_id, content_id, ip_address, details, created_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+  `, [event, data.userId, data.deviceId, data.contentId, data.ipAddress, JSON.stringify(data.details)])
+}
+
+// Example usage
+await auditLog(AuditEvents.LICENSE_ISSUED, {
+  userId: user.id,
+  deviceId: device.id,
+  contentId: content.id,
+  ipAddress: req.ip,
+  userAgent: req.headers['user-agent'],
+  details: { licenseType: 'streaming', expiresAt: license.expiresAt }
+})
+```
+
+### Local Development Dashboard
+
+For local development, use a simple Grafana dashboard with docker-compose:
+
+```yaml
+# docker-compose.observability.yml
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # Collector
+```
+
+---
+
+## Failure Handling
+
+### Retry Strategy with Backoff
+
+```javascript
+// Configurable retry with exponential backoff
+class RetryHandler {
+  constructor(options = {}) {
+    this.maxRetries = options.maxRetries || 3
+    this.baseDelay = options.baseDelay || 100 // ms
+    this.maxDelay = options.maxDelay || 10000 // ms
+    this.retryableErrors = options.retryableErrors || [
+      'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'
+    ]
+  }
+
+  async execute(fn, context = {}) {
+    let lastError
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await fn()
+      } catch (error) {
+        lastError = error
+
+        if (!this.isRetryable(error) || attempt === this.maxRetries) {
+          throw error
+        }
+
+        const delay = Math.min(
+          this.baseDelay * Math.pow(2, attempt) + Math.random() * 100,
+          this.maxDelay
+        )
+
+        logger.warn({
+          attempt: attempt + 1,
+          maxRetries: this.maxRetries,
+          delay,
+          error: error.message,
+          ...context
+        }, 'Retrying operation')
+
+        await this.sleep(delay)
+      }
+    }
+
+    throw lastError
+  }
+
+  isRetryable(error) {
+    if (error.statusCode >= 500) return true
+    if (error.statusCode === 429) return true // Rate limited
+    if (this.retryableErrors.includes(error.code)) return true
+    return false
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+
+// Usage with idempotency key
+const retry = new RetryHandler({ maxRetries: 3 })
+
+async function fetchWithRetry(url, options) {
+  return retry.execute(
+    () => fetch(url, {
+      ...options,
+      headers: {
+        ...options.headers,
+        'Idempotency-Key': options.idempotencyKey || uuid()
+      }
+    }),
+    { operation: 'fetch', url }
+  )
+}
+```
+
+### Circuit Breaker Pattern
+
+```javascript
+// Circuit breaker for external service calls (CDN, DRM server)
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeout = options.resetTimeout || 30000 // 30 seconds
+    this.halfOpenRequests = options.halfOpenRequests || 3
+
+    this.state = 'CLOSED'
+    this.failures = 0
+    this.successes = 0
+    this.lastFailureTime = null
+    this.halfOpenAttempts = 0
+  }
+
+  async execute(fn, fallback) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeout) {
+        this.state = 'HALF_OPEN'
+        this.halfOpenAttempts = 0
+      } else {
+        logger.warn({ state: this.state }, 'Circuit breaker open, using fallback')
+        return fallback()
+      }
+    }
+
+    try {
+      const result = await fn()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      if (fallback) {
+        return fallback()
+      }
+      throw error
+    }
+  }
+
+  onSuccess() {
+    if (this.state === 'HALF_OPEN') {
+      this.halfOpenAttempts++
+      if (this.halfOpenAttempts >= this.halfOpenRequests) {
+        this.state = 'CLOSED'
+        this.failures = 0
+        logger.info('Circuit breaker closed')
+      }
+    }
+    this.failures = 0
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailureTime = Date.now()
+
+    if (this.state === 'HALF_OPEN') {
+      this.state = 'OPEN'
+      logger.warn('Circuit breaker opened from half-open state')
+    } else if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      logger.warn({ failures: this.failures }, 'Circuit breaker opened')
+    }
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failures: this.failures,
+      lastFailureTime: this.lastFailureTime
+    }
+  }
+}
+
+// Circuit breakers for each external dependency
+const circuitBreakers = {
+  drm: new CircuitBreaker({ failureThreshold: 3, resetTimeout: 60000 }),
+  cdn: new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 }),
+  transcoding: new CircuitBreaker({ failureThreshold: 10, resetTimeout: 120000 })
+}
+
+// Example: DRM license with fallback
+async function getLicense(userId, contentId, deviceId) {
+  return circuitBreakers.drm.execute(
+    async () => {
+      return await drmService.issueLicense(userId, contentId, deviceId)
+    },
+    async () => {
+      // Fallback: Return cached license if available
+      const cached = await redis.get(`license:${userId}:${contentId}:${deviceId}`)
+      if (cached) {
+        logger.info('Using cached DRM license (circuit open)')
+        return JSON.parse(cached)
+      }
+      throw new Error('DRM service unavailable and no cached license')
+    }
+  )
+}
+```
+
+### Graceful Degradation
+
+```javascript
+// Degraded service modes when dependencies fail
+class DegradedModeHandler {
+  constructor() {
+    this.degradedFeatures = new Set()
+  }
+
+  enableDegradedMode(feature) {
+    this.degradedFeatures.add(feature)
+    logger.warn({ feature }, 'Enabling degraded mode')
+  }
+
+  disableDegradedMode(feature) {
+    this.degradedFeatures.delete(feature)
+    logger.info({ feature }, 'Disabling degraded mode')
+  }
+
+  isDegraed(feature) {
+    return this.degradedFeatures.has(feature)
+  }
+}
+
+const degradedMode = new DegradedModeHandler()
+
+// Example: Recommendations degrade gracefully
+async function getRecommendations(userId) {
+  if (degradedMode.isDegraded('recommendations')) {
+    // Return static popular content instead
+    return await getPopularContent()
+  }
+
+  try {
+    return await recommendationService.getPersonalized(userId)
+  } catch (error) {
+    logger.error({ error, userId }, 'Recommendation service failed')
+    degradedMode.enableDegradedMode('recommendations')
+    setTimeout(() => degradedMode.disableDegradedMode('recommendations'), 60000)
+    return await getPopularContent()
+  }
+}
+
+// Example: Quality degradation under load
+async function selectPlaybackQuality(userId, contentId, deviceInfo, networkConditions) {
+  const maxQuality = cdnService.getMaxBitrate(deviceInfo)
+
+  // Check system load
+  const systemLoad = await getSystemLoad()
+  if (systemLoad > 0.9) {
+    // Reduce max quality to shed load
+    return Math.min(maxQuality, 4500) // Cap at 1080p/4.5Mbps
+  }
+
+  // Check CDN health
+  const cdnHealth = circuitBreakers.cdn.getState()
+  if (cdnHealth.state !== 'CLOSED') {
+    return Math.min(maxQuality, 3000) // Cap at 720p/3Mbps
+  }
+
+  return maxQuality
+}
+```
+
+### Backup and Restore (Local Development)
+
+```bash
+#!/bin/bash
+# scripts/backup.sh - Backup PostgreSQL and essential data
+
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+# PostgreSQL dump
+pg_dump -h localhost -U postgres -d appletv \
+  --format=custom \
+  --file="$BACKUP_DIR/appletv.dump"
+
+# Export critical tables as CSV for quick inspection
+psql -h localhost -U postgres -d appletv -c \
+  "COPY content TO STDOUT WITH CSV HEADER" > "$BACKUP_DIR/content.csv"
+
+psql -h localhost -U postgres -d appletv -c \
+  "COPY user_profiles TO STDOUT WITH CSV HEADER" > "$BACKUP_DIR/profiles.csv"
+
+# Redis snapshot (if using persistence)
+if [ -f /var/lib/redis/dump.rdb ]; then
+  cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis.rdb"
+fi
+
+# MinIO bucket list (content storage)
+mc ls local/videos --recursive > "$BACKUP_DIR/minio-inventory.txt"
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+```bash
+#!/bin/bash
+# scripts/restore.sh - Restore from backup
+
+BACKUP_DIR=$1
+
+if [ -z "$BACKUP_DIR" ]; then
+  echo "Usage: ./restore.sh <backup_directory>"
+  exit 1
+fi
+
+# Restore PostgreSQL
+pg_restore -h localhost -U postgres -d appletv \
+  --clean --if-exists \
+  "$BACKUP_DIR/appletv.dump"
+
+# Restore Redis
+if [ -f "$BACKUP_DIR/redis.rdb" ]; then
+  redis-cli SHUTDOWN NOSAVE
+  cp "$BACKUP_DIR/redis.rdb" /var/lib/redis/dump.rdb
+  redis-server &
+fi
+
+echo "Restore completed from: $BACKUP_DIR"
+```
+
+### Backup Verification Testing
+
+```javascript
+// tests/backup-restore.test.js
+const { exec } = require('child_process')
+const db = require('../src/shared/db')
+
+describe('Backup and Restore', () => {
+  let originalContentCount
+  let backupDir
+
+  beforeAll(async () => {
+    // Record current state
+    const result = await db.query('SELECT COUNT(*) FROM content')
+    originalContentCount = parseInt(result.rows[0].count)
+
+    // Create backup
+    const { stdout } = await execPromise('./scripts/backup.sh')
+    backupDir = stdout.trim().split(': ')[1]
+  })
+
+  test('backup creates valid dump file', async () => {
+    const { stdout } = await execPromise(`pg_restore --list ${backupDir}/appletv.dump`)
+    expect(stdout).toContain('content')
+    expect(stdout).toContain('watch_progress')
+  })
+
+  test('restore recovers data correctly', async () => {
+    // Insert test data
+    await db.query(`INSERT INTO content (id, title, duration) VALUES ($1, $2, $3)`,
+      ['test-backup-id', 'Backup Test', 3600])
+
+    // Restore from backup
+    await execPromise(`./scripts/restore.sh ${backupDir}`)
+
+    // Verify test data is gone (restored to backup state)
+    const result = await db.query('SELECT * FROM content WHERE id = $1', ['test-backup-id'])
+    expect(result.rows.length).toBe(0)
+
+    // Verify original count restored
+    const countResult = await db.query('SELECT COUNT(*) FROM content')
+    expect(parseInt(countResult.rows[0].count)).toBe(originalContentCount)
+  })
+
+  afterAll(async () => {
+    // Cleanup backup
+    await execPromise(`rm -rf ${backupDir}`)
+  })
+})
+
+function execPromise(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) reject(error)
+      else resolve({ stdout, stderr })
+    })
+  })
+}
+```
+
+### Multi-Region Considerations (Learning Notes)
+
+For local development, we simulate multi-region behavior. In production:
+
+1. **Active-Active Regions**: Each region handles reads/writes independently
+   - Watch progress uses last-write-wins with vector clocks
+   - Content catalog replicated asynchronously (eventual consistency acceptable)
+   - DRM licenses region-local (user connects to nearest region)
+
+2. **Failover Strategy**:
+   - DNS-based failover with health checks (30s TTL)
+   - CDN automatically routes to healthy origins
+   - Session affinity via regional cookie
+
+3. **Data Replication**:
+   - PostgreSQL: Streaming replication to read replicas, async to other regions
+   - Redis: Redis Cluster with cross-region replication disabled (region-local cache)
+   - MinIO: Cross-region replication for video segments (eventual consistency)
+
+**Local Simulation:**
+```yaml
+# docker-compose.multiregion.yml - Simulate two regions
+services:
+  # Region A
+  api-region-a:
+    build: .
+    ports:
+      - "3001:3000"
+    environment:
+      - REGION=us-west
+      - DATABASE_URL=postgresql://postgres:pass@db-a:5432/appletv
+
+  db-a:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=appletv
+      - POSTGRES_PASSWORD=pass
+
+  # Region B
+  api-region-b:
+    build: .
+    ports:
+      - "3002:3000"
+    environment:
+      - REGION=us-east
+      - DATABASE_URL=postgresql://postgres:pass@db-b:5432/appletv
+
+  db-b:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=appletv
+      - POSTGRES_PASSWORD=pass
+
+  # Load balancer simulating geo-routing
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx-geo.conf:/etc/nginx/nginx.conf
+```
+
+---
+
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Reason |
@@ -747,3 +1603,6 @@ CREATE INDEX idx_profiles_user ON user_profiles(user_id);
 | Encoding | HEVC + H.264 | AV1 | Device support |
 | CDN strategy | Multi-CDN | Single CDN | Reliability |
 | Offline | License-based | Time-based | Flexibility |
+| Watch progress consistency | Eventual (LWW) | Strong | Low conflict, better latency |
+| Retries | Exponential backoff | Fixed interval | Avoids thundering herd |
+| Circuit breaker | Per-service | Global | Isolates failures |

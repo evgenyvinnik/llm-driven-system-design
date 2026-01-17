@@ -1,12 +1,33 @@
-// Metric data point for ingestion
+/**
+ * @fileoverview Type definitions for the Dashboarding backend.
+ *
+ * Defines TypeScript interfaces for:
+ * - Metric data structures (ingestion, storage, rollups)
+ * - Dashboard and panel configuration
+ * - Alert rules and instances
+ * - Query parameters and results
+ * - User authentication
+ */
+
+// ============================================================================
+// Metric Types
+// ============================================================================
+
+/**
+ * Metric data point for ingestion via the API.
+ */
 export interface MetricDataPoint {
   name: string;
   value: number;
   tags: Record<string, string>;
-  timestamp: number; // Unix milliseconds
+  /** Unix timestamp in milliseconds */
+  timestamp: number;
 }
 
-// Metric definition stored in database
+/**
+ * Metric definition stored in the database.
+ * Represents a unique metric name + tag combination.
+ */
 export interface MetricDefinition {
   id: number;
   name: string;
@@ -14,14 +35,18 @@ export interface MetricDefinition {
   created_at: Date;
 }
 
-// Stored metric value
+/**
+ * Raw metric value stored in the time-series table.
+ */
 export interface MetricValue {
   time: Date;
   metric_id: number;
   value: number;
 }
 
-// Aggregated metric for rollups
+/**
+ * Pre-aggregated metric for hourly/daily rollup tables.
+ */
 export interface AggregatedMetric {
   time: Date;
   metric_id: number;
@@ -31,7 +56,13 @@ export interface AggregatedMetric {
   count: number;
 }
 
-// Dashboard
+// ============================================================================
+// Dashboard Types
+// ============================================================================
+
+/**
+ * Dashboard containing multiple visualization panels.
+ */
 export interface Dashboard {
   id: string;
   user_id: string | null;
@@ -43,12 +74,21 @@ export interface Dashboard {
   updated_at: Date;
 }
 
+/**
+ * Grid layout configuration for a dashboard.
+ */
 export interface DashboardLayout {
   columns: number;
   rows: number;
 }
 
-// Panel (widget on dashboard)
+// ============================================================================
+// Panel Types
+// ============================================================================
+
+/**
+ * Visualization panel (widget) on a dashboard.
+ */
 export interface Panel {
   id: string;
   dashboard_id: string;
@@ -61,16 +101,26 @@ export interface Panel {
   updated_at: Date;
 }
 
+/**
+ * Supported panel visualization types.
+ */
 export type PanelType = 'line_chart' | 'area_chart' | 'bar_chart' | 'gauge' | 'stat' | 'table';
 
+/**
+ * Query configuration for fetching panel data.
+ */
 export interface PanelQuery {
   metric_name: string;
   tags?: Record<string, string>;
   aggregation: 'avg' | 'min' | 'max' | 'sum' | 'count';
-  interval?: string; // e.g., '1m', '5m', '1h'
+  /** Time bucket interval, e.g., '1m', '5m', '1h' */
+  interval?: string;
   group_by?: string[];
 }
 
+/**
+ * Grid position and size of a panel.
+ */
 export interface PanelPosition {
   x: number;
   y: number;
@@ -78,6 +128,9 @@ export interface PanelPosition {
   height: number;
 }
 
+/**
+ * Display options for panel visualization.
+ */
 export interface PanelOptions {
   color?: string;
   unit?: string;
@@ -86,12 +139,21 @@ export interface PanelOptions {
   legend?: boolean;
 }
 
+/**
+ * Threshold configuration for color-coded values.
+ */
 export interface Threshold {
   value: number;
   color: string;
 }
 
-// Alert Rule
+// ============================================================================
+// Alert Types
+// ============================================================================
+
+/**
+ * Configuration for an alerting rule.
+ */
 export interface AlertRule {
   id: string;
   name: string;
@@ -107,20 +169,31 @@ export interface AlertRule {
   updated_at: Date;
 }
 
+/**
+ * Threshold condition for triggering an alert.
+ */
 export interface AlertCondition {
   operator: '>' | '<' | '>=' | '<=' | '==' | '!=';
   threshold: number;
   aggregation: 'avg' | 'min' | 'max' | 'sum' | 'count';
 }
 
+/**
+ * Alert severity levels.
+ */
 export type AlertSeverity = 'info' | 'warning' | 'critical';
 
+/**
+ * Notification channel configuration for alerts.
+ */
 export interface AlertNotification {
   channel: 'console' | 'webhook';
   target: string;
 }
 
-// Active alert instance
+/**
+ * Instance of a triggered alert (firing or resolved).
+ */
 export interface AlertInstance {
   id: string;
   rule_id: string;
@@ -131,7 +204,13 @@ export interface AlertInstance {
   notification_sent: boolean;
 }
 
-// User
+// ============================================================================
+// User Types
+// ============================================================================
+
+/**
+ * User account for authentication.
+ */
 export interface User {
   id: string;
   username: string;
@@ -142,7 +221,13 @@ export interface User {
   updated_at: Date;
 }
 
-// Query parameters
+// ============================================================================
+// Query Types
+// ============================================================================
+
+/**
+ * Parameters for a time-series metric query.
+ */
 export interface MetricQueryParams {
   metric_name: string;
   tags?: Record<string, string>;
@@ -153,18 +238,30 @@ export interface MetricQueryParams {
   group_by?: string[];
 }
 
+/**
+ * Result from a time-series query.
+ */
 export interface QueryResult {
   metric_name: string;
   tags: Record<string, string>;
   data: DataPoint[];
 }
 
+/**
+ * Single data point in a time-series.
+ */
 export interface DataPoint {
   time: Date;
   value: number;
 }
 
-// Session
+// ============================================================================
+// Session Types
+// ============================================================================
+
+/**
+ * Express session data extension for user authentication.
+ */
 declare module 'express-session' {
   interface SessionData {
     userId?: string;

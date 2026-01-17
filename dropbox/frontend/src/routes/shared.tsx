@@ -1,3 +1,10 @@
+/**
+ * Shared with me page route.
+ * Displays files and folders shared with the current user by others.
+ * Requires authentication; redirects to login if not authenticated.
+ * @module routes/shared
+ */
+
 import { useEffect, useState } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
@@ -8,10 +15,15 @@ import { FileItem } from '../types';
 import { Loader2 } from 'lucide-react';
 import { formatBytes, formatRelativeDate } from '../utils/format';
 
+/** Route definition for the shared items page at /shared */
 export const Route = createFileRoute('/shared')({
   component: SharedWithMe,
 });
 
+/**
+ * Shared items list component.
+ * Shows files and folders that others have shared with the current user.
+ */
 function SharedWithMe() {
   const navigate = useNavigate();
   const { user, isLoading: authLoading, checkAuth } = useAuthStore();

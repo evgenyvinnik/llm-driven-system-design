@@ -1,7 +1,16 @@
+/**
+ * @fileoverview Main navigation header component.
+ * Provides site navigation, search, and user authentication controls.
+ */
+
 import { useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Site header with navigation, search, and user menu.
+ * Shows different navigation items based on user role.
+ */
 export function Header() {
   const [searchQuery, setSearchQuery] = useState('');
   const navigate = useNavigate();

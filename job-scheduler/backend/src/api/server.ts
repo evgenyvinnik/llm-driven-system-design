@@ -1,3 +1,10 @@
+/**
+ * REST API server for the job scheduler.
+ * Provides endpoints for managing jobs, executions, workers, and system metrics.
+ * Used by the frontend dashboard and can be consumed by external clients.
+ * @module api/server
+ */
+
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -17,14 +24,19 @@ import {
   ExecutionStatus,
 } from '../types';
 
+/** Express application instance */
 const app = express();
+/** API server port from environment */
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// Middleware configuration
 app.use(cors());
 app.use(express.json());
 
-// Request logging
+/**
+ * Request logging middleware.
+ * Logs method, URL, status, and response time for all requests.
+ */
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   res.on('finish', () => {
@@ -37,7 +49,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Error handler wrapper
+/**
+ * Wraps async route handlers to properly catch and forward errors.
+ * @param fn - Async route handler function
+ * @returns Express middleware that catches promise rejections
+ */
 function asyncHandler(
   fn: (req: Request, res: Response) => Promise<void>
 ): (req: Request, res: Response, next: NextFunction) => void {
@@ -46,7 +62,9 @@ function asyncHandler(
   };
 }
 
-// Health check endpoints
+// === Health Check Endpoints ===
+
+/** GET /api/v1/health - Check database and Redis connectivity */
 app.get('/api/v1/health', asyncHandler(async (req, res) => {
   const [dbOk, redisOk] = await Promise.all([dbHealthCheck(), redisHealthCheck()]);
 
@@ -59,9 +77,9 @@ app.get('/api/v1/health', asyncHandler(async (req, res) => {
   res.status(healthy ? 200 : 503).json(response);
 }));
 
-// === Job Management ===
+// === Job Management Endpoints ===
 
-// Create a job
+/** POST /api/v1/jobs - Create a new job */
 app.post('/api/v1/jobs', asyncHandler(async (req, res) => {
   const input: CreateJobInput = req.body;
 
@@ -82,7 +100,7 @@ app.post('/api/v1/jobs', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof job>);
 }));
 
-// List jobs
+/** GET /api/v1/jobs - List jobs with pagination and optional filtering */
 app.get('/api/v1/jobs', asyncHandler(async (req, res) => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
@@ -99,7 +117,7 @@ app.get('/api/v1/jobs', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof result>);
 }));
 
-// Get a job by ID
+/** GET /api/v1/jobs/:id - Get a single job by ID */
 app.get('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   const job = await db.getJob(req.params.id);
 
@@ -117,7 +135,7 @@ app.get('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof job>);
 }));
 
-// Update a job
+/** PUT /api/v1/jobs/:id - Update an existing job */
 app.put('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   const input: UpdateJobInput = req.body;
   const job = await db.updateJob(req.params.id, input);
@@ -137,7 +155,7 @@ app.put('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof job>);
 }));
 
-// Delete a job
+/** DELETE /api/v1/jobs/:id - Delete a job and its executions */
 app.delete('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   const deleted = await db.deleteJob(req.params.id);
 
@@ -155,7 +173,7 @@ app.delete('/api/v1/jobs/:id', asyncHandler(async (req, res) => {
   } as ApiResponse<never>);
 }));
 
-// Pause a job
+/** POST /api/v1/jobs/:id/pause - Pause a job */
 app.post('/api/v1/jobs/:id/pause', asyncHandler(async (req, res) => {
   const job = await db.pauseJob(req.params.id);
 
@@ -174,7 +192,7 @@ app.post('/api/v1/jobs/:id/pause', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof job>);
 }));
 
-// Resume a job
+/** POST /api/v1/jobs/:id/resume - Resume a paused job */
 app.post('/api/v1/jobs/:id/resume', asyncHandler(async (req, res) => {
   const job = await db.resumeJob(req.params.id);
 
@@ -193,7 +211,7 @@ app.post('/api/v1/jobs/:id/resume', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof job>);
 }));
 
-// Trigger immediate execution
+/** POST /api/v1/jobs/:id/trigger - Trigger immediate job execution */
 app.post('/api/v1/jobs/:id/trigger', asyncHandler(async (req, res) => {
   const job = await db.getJob(req.params.id);
 
@@ -221,9 +239,9 @@ app.post('/api/v1/jobs/:id/trigger', asyncHandler(async (req, res) => {
   } as ApiResponse<{ job: typeof job; execution: typeof execution }>);
 }));
 
-// === Execution Management ===
+// === Execution Management Endpoints ===
 
-// List executions for a job
+/** GET /api/v1/jobs/:id/executions - List executions for a specific job */
 app.get('/api/v1/jobs/:id/executions', asyncHandler(async (req, res) => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
@@ -237,7 +255,7 @@ app.get('/api/v1/jobs/:id/executions', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof result>);
 }));
 
-// Get execution details
+/** GET /api/v1/executions/:id - Get execution details with logs */
 app.get('/api/v1/executions/:id', asyncHandler(async (req, res) => {
   const execution = await db.getExecution(req.params.id);
 
@@ -258,7 +276,7 @@ app.get('/api/v1/executions/:id', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof execution & { logs: typeof logs }>);
 }));
 
-// Cancel an execution
+/** POST /api/v1/executions/:id/cancel - Cancel a pending or running execution */
 app.post('/api/v1/executions/:id/cancel', asyncHandler(async (req, res) => {
   const execution = await db.getExecution(req.params.id);
 
@@ -291,7 +309,7 @@ app.post('/api/v1/executions/:id/cancel', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof updated>);
 }));
 
-// Retry a failed execution
+/** POST /api/v1/executions/:id/retry - Retry a failed or cancelled execution */
 app.post('/api/v1/executions/:id/retry', asyncHandler(async (req, res) => {
   const execution = await db.getExecution(req.params.id);
 
@@ -331,9 +349,9 @@ app.post('/api/v1/executions/:id/retry', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof newExecution>);
 }));
 
-// === Metrics & Monitoring ===
+// === Metrics & Monitoring Endpoints ===
 
-// Get system metrics
+/** GET /api/v1/metrics - Get aggregated system metrics */
 app.get('/api/v1/metrics', asyncHandler(async (req, res) => {
   const [dbMetrics, queueStats] = await Promise.all([
     db.getSystemMetrics(),
@@ -367,7 +385,7 @@ app.get('/api/v1/metrics', asyncHandler(async (req, res) => {
   }>);
 }));
 
-// Get execution statistics
+/** GET /api/v1/metrics/executions - Get hourly execution statistics */
 app.get('/api/v1/metrics/executions', asyncHandler(async (req, res) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const stats = await db.getExecutionStats(hours);
@@ -378,7 +396,7 @@ app.get('/api/v1/metrics/executions', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof stats>);
 }));
 
-// Get workers
+/** GET /api/v1/workers - Get list of registered workers */
 app.get('/api/v1/workers', asyncHandler(async (req, res) => {
   const { redis } = await import('../queue/redis');
   const workers = await redis.hgetall('job_scheduler:workers');
@@ -391,7 +409,7 @@ app.get('/api/v1/workers', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof workerList>);
 }));
 
-// Get dead letter queue items
+/** GET /api/v1/dead-letter - Get items from the dead letter queue */
 app.get('/api/v1/dead-letter', asyncHandler(async (req, res) => {
   const start = parseInt(req.query.start as string) || 0;
   const count = parseInt(req.query.count as string) || 100;
@@ -404,7 +422,10 @@ app.get('/api/v1/dead-letter', asyncHandler(async (req, res) => {
   } as ApiResponse<typeof items>);
 }));
 
-// Error handler
+/**
+ * Global error handler middleware.
+ * Logs unhandled errors and returns a standardized error response.
+ */
 app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   logger.error('Unhandled error', { error: err.message, stack: err.stack });
 
@@ -415,7 +436,10 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   } as ApiResponse<never>);
 });
 
-// Start server
+/**
+ * Starts the API server.
+ * Runs database migrations before listening for requests.
+ */
 async function start() {
   // Run migrations
   await migrate();

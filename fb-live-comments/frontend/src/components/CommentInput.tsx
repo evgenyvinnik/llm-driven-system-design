@@ -1,10 +1,29 @@
+/**
+ * Comment Input Component
+ *
+ * Text input and submit button for posting new comments.
+ * Handles form submission and input state.
+ *
+ * @module components/CommentInput
+ */
+
 import { useState, FormEvent } from 'react';
 
+/** Props for the CommentInput component */
 interface CommentInputProps {
+  /** Callback when a comment is submitted */
   onSubmit: (content: string) => void;
+  /** Whether input is disabled (e.g., not connected) */
   disabled?: boolean;
 }
 
+/**
+ * Renders the comment input form.
+ * Clears input after successful submission.
+ *
+ * @param props - Component props with onSubmit handler
+ * @returns Comment input form JSX
+ */
 export function CommentInput({ onSubmit, disabled }: CommentInputProps) {
   const [content, setContent] = useState('');
 

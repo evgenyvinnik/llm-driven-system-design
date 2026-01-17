@@ -1,10 +1,28 @@
+/**
+ * Toolbar component with zoom controls and connection status indicator.
+ *
+ * Features:
+ * - Zoom in/out buttons
+ * - Reset view button (centers canvas at 100% zoom)
+ * - WebSocket connection status indicator
+ */
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Renders zoom controls and connection status in the header toolbar.
+ */
 export function Toolbar() {
   const { zoom, setZoom, setPanOffset, config, isConnected } = useAppStore();
 
+  /** Increases zoom by 50%. */
   const handleZoomIn = () => setZoom(zoom * 1.5);
+
+  /** Decreases zoom by 33%. */
   const handleZoomOut = () => setZoom(zoom / 1.5);
+
+  /**
+   * Resets view to 100% zoom and centers the canvas in the viewport.
+   */
   const handleReset = () => {
     setZoom(1);
     if (config) {

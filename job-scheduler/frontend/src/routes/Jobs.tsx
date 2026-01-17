@@ -1,9 +1,19 @@
+/**
+ * Jobs list page with CRUD operations.
+ * Provides paginated job listing with create, pause, resume, trigger, and delete actions.
+ * @module routes/Jobs
+ */
+
 import { useEffect, useState } from 'react';
 import { useJobsStore } from '../stores';
 import { Button, Spinner, Pagination } from '../components/UI';
 import { JobTable } from '../components/JobCard';
 import { CreateJobModal } from '../components/CreateJobModal';
 
+/**
+ * Jobs management page with table view and pagination.
+ * Includes modal for creating new jobs.
+ */
 export function JobsPage() {
   const {
     jobs,

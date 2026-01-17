@@ -1,3 +1,9 @@
+/**
+ * Bitly URL Shortener - Main Server Entry Point
+ *
+ * This is the main application file that configures and starts the Express server.
+ * It sets up middleware, routes, and handles graceful shutdown.
+ */
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -16,6 +22,7 @@ import analyticsRoutes from './routes/analytics.js';
 import adminRoutes from './routes/admin.js';
 import redirectRoutes from './routes/redirect.js';
 
+/** Express application instance */
 const app = express();
 
 // Security middleware
@@ -55,7 +62,10 @@ const createUrlLimiter = rateLimit({
 // Apply general rate limit to API routes
 app.use('/api', generalLimiter);
 
-// Health check
+/**
+ * Health check endpoint.
+ * Used by load balancers and monitoring to verify server availability.
+ */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -76,7 +86,11 @@ app.use('/', redirectRoutes);
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-// Graceful shutdown
+/**
+ * Handles graceful shutdown of the server.
+ * Closes database and Redis connections before exiting.
+ * @param signal - The signal that triggered the shutdown (SIGTERM or SIGINT)
+ */
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
@@ -94,7 +108,10 @@ async function shutdown(signal: string): Promise<void> {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Start server
+/**
+ * Initializes and starts the HTTP server.
+ * Tests database connection and initializes the key service before listening.
+ */
 async function start(): Promise<void> {
   try {
     // Test database connection

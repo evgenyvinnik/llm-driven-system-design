@@ -1,7 +1,16 @@
 import type { ApiResponse, User, MeetingType, Booking, AvailabilityRule, TimeSlot, DashboardStats } from '../types';
 
+/** Base URL for API endpoints */
 const API_BASE = '/api';
 
+/**
+ * Generic API fetch wrapper with JSON handling and credentials.
+ * Automatically includes Content-Type header and credentials for session cookies.
+ * @template T - The expected response data type
+ * @param endpoint - API endpoint path (e.g., '/auth/login')
+ * @param options - Fetch options (method, body, headers, etc.)
+ * @returns Promise resolving to the API response
+ */
 async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -19,7 +28,10 @@ async function fetchApi<T>(
   return data;
 }
 
-// Auth API
+/**
+ * Authentication API endpoints.
+ * Handles user login, registration, logout, and session validation.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     fetchApi<User>('/auth/login', {
@@ -40,7 +52,10 @@ export const authApi = {
     fetchApi<User>('/auth/me'),
 };
 
-// Meeting Types API
+/**
+ * Meeting Types API endpoints.
+ * Manages event types that hosts offer to invitees.
+ */
 export const meetingTypesApi = {
   list: (activeOnly = false) =>
     fetchApi<MeetingType[]>(`/meeting-types${activeOnly ? '?active=true' : ''}`),
@@ -83,7 +98,10 @@ export const meetingTypesApi = {
     fetchApi<void>(`/meeting-types/${id}`, { method: 'DELETE' }),
 };
 
-// Availability API
+/**
+ * Availability API endpoints.
+ * Manages availability rules and calculates bookable time slots.
+ */
 export const availabilityApi = {
   getRules: () =>
     fetchApi<AvailabilityRule[]>('/availability/rules'),
@@ -105,7 +123,10 @@ export const availabilityApi = {
     ),
 };
 
-// Bookings API
+/**
+ * Bookings API endpoints.
+ * Handles booking creation, retrieval, rescheduling, and cancellation.
+ */
 export const bookingsApi = {
   list: (status?: string, upcoming = false) => {
     const params = new URLSearchParams();
@@ -146,7 +167,10 @@ export const bookingsApi = {
     }),
 };
 
-// Admin API
+/**
+ * Admin API endpoints.
+ * System-wide statistics and user management for administrators.
+ */
 export const adminApi = {
   getStats: () =>
     fetchApi<{

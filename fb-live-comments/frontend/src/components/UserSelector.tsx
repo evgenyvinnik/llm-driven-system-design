@@ -1,11 +1,31 @@
+/**
+ * User Selector Component
+ *
+ * Row of user buttons for selecting which user to comment as.
+ * Used in the demo to simulate different users.
+ *
+ * @module components/UserSelector
+ */
+
 import { User } from '../types';
 
+/** Props for the UserSelector component */
 interface UserSelectorProps {
+  /** Array of available users */
   users: User[];
+  /** ID of the currently selected user */
   selectedId: string | null;
+  /** Callback when a user is selected */
   onSelect: (user: User) => void;
 }
 
+/**
+ * Renders the user selection buttons.
+ * Allows switching between different user identities in the demo.
+ *
+ * @param props - Component props with users and selection handler
+ * @returns User selector JSX
+ */
 export function UserSelector({ users, selectedId, onSelect }: UserSelectorProps) {
   return (
     <div className="flex flex-col gap-2">

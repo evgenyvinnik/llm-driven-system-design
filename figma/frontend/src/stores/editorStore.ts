@@ -1,7 +1,39 @@
+/**
+ * Zustand store for the design editor state.
+ * Manages canvas data, selection, tools, viewport, collaboration, and undo/redo history.
+ * Provides a centralized state management solution for the editor UI.
+ */
 import { create } from 'zustand';
-import type { DesignObject, Tool, Viewport, PresenceState, CanvasData } from '../types';
+import type { DesignObject, Tool, Viewport, PresenceState, CanvasData, Operation } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 
+/**
+ * Operation sender function type - will be set by WebSocket hook
+ */
+type OperationSender = (operations: Operation[]) => void;
+
+// Global reference to the operation sender (set by WebSocket hook)
+let operationSender: OperationSender | null = null;
+
+/**
+ * Register the operation sender function from the WebSocket hook
+ */
+export function setOperationSender(sender: OperationSender | null): void {
+  operationSender = sender;
+}
+
+/**
+ * Helper to create and send an operation via WebSocket
+ */
+function sendOperation(operation: Operation): void {
+  if (operationSender) {
+    operationSender([operation]);
+  }
+}
+
+/**
+ * Editor state interface defining all state properties and actions.
+ */
 interface EditorState {
   // File state
   fileId: string | null;
@@ -26,7 +58,7 @@ interface EditorState {
   history: CanvasData[];
 
   // Actions
-  setFileId: (id: string) => void;
+  setFileId: (id: string | null) => void;
   setFileName: (name: string) => void;
   setCanvasData: (data: CanvasData) => void;
   setSelectedIds: (ids: string[]) => void;
@@ -52,17 +84,28 @@ interface EditorState {
   pushHistory: () => void;
 }
 
+/**
+ * Default viewport state with no pan and 100% zoom.
+ */
 const defaultViewport: Viewport = {
   x: 0,
   y: 0,
   zoom: 1,
 };
 
+/**
+ * Default empty canvas with a single page.
+ */
 const defaultCanvasData: CanvasData = {
   objects: [],
   pages: [{ id: 'page-1', name: 'Page 1', objects: [] }],
 };
 
+/**
+ * The main editor store hook.
+ * Provides access to editor state and actions throughout the application.
+ * Uses Zustand for performant, minimal re-renders.
+ */
 export const useEditorStore = create<EditorState>((set, get) => ({
   // Initial state
   fileId: null,
@@ -84,32 +127,50 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setCanvasData: (data) => set({ canvasData: data }),
   setSelectedIds: (ids) => set({ selectedIds: ids }),
   setActiveTool: (tool) => set({ activeTool: tool }),
-  setViewport: (viewport) => set((state) => ({
-    viewport: { ...state.viewport, ...viewport },
-  })),
+  setViewport: (viewport) =>
+    set((state) => ({
+      viewport: { ...state.viewport, ...viewport },
+    })),
 
   setCollaborators: (collaborators) => set({ collaborators }),
 
-  updateCollaborator: (presence) => set((state) => {
-    const existing = state.collaborators.findIndex(c => c.userId === presence.userId);
-    if (existing !== -1) {
-      const updated = [...state.collaborators];
-      updated[existing] = presence;
-      return { collaborators: updated };
-    }
-    return { collaborators: [...state.collaborators, presence] };
-  }),
+  updateCollaborator: (presence) =>
+    set((state) => {
+      const existing = state.collaborators.findIndex((c) => c.userId === presence.userId);
+      if (existing !== -1) {
+        const updated = [...state.collaborators];
+        updated[existing] = presence;
+        return { collaborators: updated };
+      }
+      return { collaborators: [...state.collaborators, presence] };
+    }),
 
-  removeCollaborator: (userId) => set((state) => ({
-    collaborators: state.collaborators.filter(c => c.userId !== userId),
-  })),
+  removeCollaborator: (userId) =>
+    set((state) => ({
+      collaborators: state.collaborators.filter((c) => c.userId !== userId),
+    })),
 
   setUserInfo: (userId, userName, userColor) => set({ userId, userName, userColor }),
 
-  // Object operations
+  // Object operations - send operations via WebSocket for multi-user sync
   addObject: (obj) => {
     const state = get();
     state.pushHistory();
+
+    // Create and send operation for multi-user sync
+    const operation: Operation = {
+      id: uuidv4(),
+      fileId: state.fileId || '',
+      userId: state.userId,
+      operationType: 'create',
+      objectId: obj.id,
+      newValue: obj,
+      timestamp: Date.now(),
+      clientId: state.userId,
+    };
+    sendOperation(operation);
+
+    // Apply locally (optimistic update)
     set((state) => ({
       canvasData: {
         ...state.canvasData,
@@ -122,10 +183,25 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   updateObject: (id, updates) => {
     const state = get();
     state.pushHistory();
+
+    // Create and send operation for multi-user sync
+    const operation: Operation = {
+      id: uuidv4(),
+      fileId: state.fileId || '',
+      userId: state.userId,
+      operationType: 'update',
+      objectId: id,
+      newValue: updates,
+      timestamp: Date.now(),
+      clientId: state.userId,
+    };
+    sendOperation(operation);
+
+    // Apply locally (optimistic update)
     set((state) => ({
       canvasData: {
         ...state.canvasData,
-        objects: state.canvasData.objects.map(obj =>
+        objects: state.canvasData.objects.map((obj) =>
           obj.id === id ? { ...obj, ...updates } : obj
         ),
       },
@@ -135,18 +211,32 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   deleteObject: (id) => {
     const state = get();
     state.pushHistory();
+
+    // Create and send operation for multi-user sync
+    const operation: Operation = {
+      id: uuidv4(),
+      fileId: state.fileId || '',
+      userId: state.userId,
+      operationType: 'delete',
+      objectId: id,
+      timestamp: Date.now(),
+      clientId: state.userId,
+    };
+    sendOperation(operation);
+
+    // Apply locally (optimistic update)
     set((state) => ({
       canvasData: {
         ...state.canvasData,
-        objects: state.canvasData.objects.filter(obj => obj.id !== id),
+        objects: state.canvasData.objects.filter((obj) => obj.id !== id),
       },
-      selectedIds: state.selectedIds.filter(sid => sid !== id),
+      selectedIds: state.selectedIds.filter((sid) => sid !== id),
     }));
   },
 
   duplicateObject: (id) => {
     const state = get();
-    const obj = state.canvasData.objects.find(o => o.id === id);
+    const obj = state.canvasData.objects.find((o) => o.id === id);
     if (!obj) return;
 
     state.pushHistory();
@@ -158,6 +248,20 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       y: obj.y + 20,
     };
 
+    // Create and send operation for multi-user sync
+    const operation: Operation = {
+      id: uuidv4(),
+      fileId: state.fileId || '',
+      userId: state.userId,
+      operationType: 'create',
+      objectId: newObj.id,
+      newValue: newObj,
+      timestamp: Date.now(),
+      clientId: state.userId,
+    };
+    sendOperation(operation);
+
+    // Apply locally (optimistic update)
     set((state) => ({
       canvasData: {
         ...state.canvasData,
@@ -170,9 +274,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   moveObjectInLayer: (id, direction) => {
     const state = get();
     state.pushHistory();
+
     set((state) => {
       const objects = [...state.canvasData.objects];
-      const index = objects.findIndex(o => o.id === id);
+      const index = objects.findIndex((o) => o.id === id);
       if (index === -1) return state;
 
       let newIndex = index;
@@ -194,6 +299,20 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       if (newIndex !== index) {
         const [obj] = objects.splice(index, 1);
         objects.splice(newIndex, 0, obj);
+
+        // Create and send operation for multi-user sync
+        const operation: Operation = {
+          id: uuidv4(),
+          fileId: state.fileId || '',
+          userId: state.userId,
+          operationType: 'move',
+          objectId: id,
+          oldValue: index,
+          newValue: newIndex,
+          timestamp: Date.now(),
+          clientId: state.userId,
+        };
+        sendOperation(operation);
       }
 
       return {
@@ -206,31 +325,34 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   // History
-  pushHistory: () => set((state) => {
-    const newHistory = state.history.slice(0, state.historyIndex + 1);
-    newHistory.push(JSON.parse(JSON.stringify(state.canvasData)));
-    return {
-      history: newHistory.slice(-50), // Keep last 50 states
-      historyIndex: Math.min(newHistory.length - 1, 49),
-    };
-  }),
+  pushHistory: () =>
+    set((state) => {
+      const newHistory = state.history.slice(0, state.historyIndex + 1);
+      newHistory.push(JSON.parse(JSON.stringify(state.canvasData)));
+      return {
+        history: newHistory.slice(-50), // Keep last 50 states
+        historyIndex: Math.min(newHistory.length - 1, 49),
+      };
+    }),
 
-  undo: () => set((state) => {
-    if (state.historyIndex < 0) return state;
-    const newIndex = state.historyIndex - 1;
-    if (newIndex < 0) return state;
-    return {
-      canvasData: JSON.parse(JSON.stringify(state.history[newIndex])),
-      historyIndex: newIndex,
-    };
-  }),
+  undo: () =>
+    set((state) => {
+      if (state.historyIndex < 0) return state;
+      const newIndex = state.historyIndex - 1;
+      if (newIndex < 0) return state;
+      return {
+        canvasData: JSON.parse(JSON.stringify(state.history[newIndex])),
+        historyIndex: newIndex,
+      };
+    }),
 
-  redo: () => set((state) => {
-    if (state.historyIndex >= state.history.length - 1) return state;
-    const newIndex = state.historyIndex + 1;
-    return {
-      canvasData: JSON.parse(JSON.stringify(state.history[newIndex])),
-      historyIndex: newIndex,
-    };
-  }),
+  redo: () =>
+    set((state) => {
+      if (state.historyIndex >= state.history.length - 1) return state;
+      const newIndex = state.historyIndex + 1;
+      return {
+        canvasData: JSON.parse(JSON.stringify(state.history[newIndex])),
+        historyIndex: newIndex,
+      };
+    }),
 }));

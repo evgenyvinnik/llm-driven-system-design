@@ -1,7 +1,18 @@
+/**
+ * File browser state management store.
+ * Handles folder navigation, file uploads, and file operations.
+ * Tracks upload progress and manages file selection.
+ * @module stores/fileStore
+ */
+
 import { create } from 'zustand';
 import { FileItem, FolderContents } from '../types';
 import { filesApi } from '../services/api';
 
+/**
+ * Represents a file currently being uploaded.
+ * Tracks upload progress and status.
+ */
 interface UploadingFile {
   id: string;
   name: string;
@@ -11,6 +22,10 @@ interface UploadingFile {
   error?: string;
 }
 
+/**
+ * File store state interface.
+ * Contains current folder data, upload queue, and file operations.
+ */
 interface FileState {
   currentFolder: FolderContents | null;
   isLoading: boolean;
@@ -30,6 +45,10 @@ interface FileState {
   refresh: () => Promise<void>;
 }
 
+/**
+ * Zustand store for file browser state.
+ * Provides methods for navigating folders, uploading files, and managing file operations.
+ */
 export const useFileStore = create<FileState>((set, get) => ({
   currentFolder: null,
   isLoading: false,

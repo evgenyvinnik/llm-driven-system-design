@@ -1,3 +1,9 @@
+/**
+ * Stock detail page route (/stock/$symbol).
+ * Displays comprehensive stock information, real-time quotes, and trading interface.
+ * Requires authentication.
+ */
+
 import { createFileRoute, redirect, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
@@ -8,6 +14,7 @@ import { PriceDisplay } from '../components/QuoteDisplay';
 import { AddToWatchlistModal } from '../components/Watchlist';
 import { quotesApi } from '../services/api';
 
+/** Route definition with auth guard for stock detail pages */
 export const Route = createFileRoute('/stock/$symbol')({
   beforeLoad: () => {
     const { isAuthenticated } = useAuthStore.getState();
@@ -18,6 +25,10 @@ export const Route = createFileRoute('/stock/$symbol')({
   component: StockDetailPage,
 });
 
+/**
+ * Extended stock details beyond real-time quote data.
+ * Includes fundamental analysis metrics and company information.
+ */
 interface StockDetails {
   symbol: string;
   name: string;
@@ -30,6 +41,11 @@ interface StockDetails {
   description: string;
 }
 
+/**
+ * Stock detail page component.
+ * Displays real-time quotes, position info, statistics, company description,
+ * and provides a trade form for buying/selling the stock.
+ */
 function StockDetailPage() {
   const { symbol } = useParams({ from: '/stock/$symbol' });
   const [details, setDetails] = useState<StockDetails | null>(null);
@@ -196,6 +212,12 @@ function StockDetailPage() {
   );
 }
 
+/**
+ * Single statistic display component.
+ * Renders a label/value pair for stock metrics.
+ * @param props.label - Metric name (e.g., "Open", "Volume")
+ * @param props.value - Formatted metric value
+ */
 function StatItem({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -205,6 +227,11 @@ function StatItem({ label, value }: { label: string; value: string }) {
   );
 }
 
+/**
+ * Formats large volume numbers with K/M/B suffixes.
+ * @param volume - Raw volume number
+ * @returns Formatted string (e.g., "1.50M", "2.30B")
+ */
 function formatVolume(volume: number): string {
   if (volume >= 1000000000) {
     return (volume / 1000000000).toFixed(2) + 'B';
@@ -218,6 +245,11 @@ function formatVolume(volume: number): string {
   return volume.toString();
 }
 
+/**
+ * Formats market capitalization with currency prefix and T/B/M suffixes.
+ * @param marketCap - Raw market cap in dollars
+ * @returns Formatted string (e.g., "$1.50T", "$250.00B")
+ */
 function formatMarketCap(marketCap: number): string {
   if (marketCap >= 1000000000000) {
     return '$' + (marketCap / 1000000000000).toFixed(2) + 'T';

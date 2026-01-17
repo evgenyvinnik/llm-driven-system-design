@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Home page route with search functionality.
+ * Main entry point for users to search posts.
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useCallback } from 'react';
 import { SearchBar } from '../components/SearchBar';
@@ -5,6 +10,10 @@ import { SearchResults } from '../components/SearchResults';
 import { SearchFilters } from '../components/SearchFilters';
 import { useSearchStore } from '../stores/searchStore';
 
+/**
+ * Home page component with search interface.
+ * Displays search bar, filters, and results.
+ */
 function IndexPage() {
   const { query, search, setQuery } = useSearchStore();
 
@@ -56,6 +65,9 @@ function IndexPage() {
   );
 }
 
+/**
+ * TanStack Router file route for the home page.
+ */
 export const Route = createFileRoute('/')({
   component: IndexPage,
 });

@@ -1,12 +1,22 @@
+/**
+ * @fileoverview Category detail page route.
+ * Shows apps within a specific category.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useCatalogStore } from '../stores/catalogStore';
 import { AppCard } from '../components/AppCard';
 
+/** Category detail page route definition */
 export const Route = createFileRoute('/category/$slug')({
   component: CategoryPage,
 });
 
+/**
+ * Category detail page component.
+ * Lists all apps in the selected category.
+ */
 function CategoryPage() {
   const { slug } = Route.useParams();
   const navigate = useNavigate();

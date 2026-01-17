@@ -1,6 +1,16 @@
+/**
+ * Root layout component for the application.
+ * Wraps all pages with header navigation and main content area.
+ * @module routes/__root
+ */
+
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Header } from '../components';
 
+/**
+ * Root route configuration.
+ * Provides consistent layout with header and centered content area.
+ */
 export const Route = createRootRoute({
   component: () => (
     <div className="min-h-screen bg-gray-50">

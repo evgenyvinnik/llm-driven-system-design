@@ -398,6 +398,672 @@ docker-compose up -d  # PostgreSQL, Valkey, Kafka
 
 ---
 
+## Failure Handling
+
+### Idempotency Keys
+
+**Problem**: Network failures can cause duplicate requests (user clicks "Tweet" twice, or client retries after timeout).
+
+**Solution**: Idempotency keys for all write operations.
+
+```javascript
+// Client sends unique key with each request
+POST /api/tweets
+Headers: Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+// Server tracks completed operations in Redis
+async function handleTweetCreate(req, res) {
+  const idempotencyKey = req.headers['idempotency-key']
+  const cacheKey = `idempotency:tweet:${req.user.id}:${idempotencyKey}`
+
+  // Check if we already processed this request
+  const cached = await redis.get(cacheKey)
+  if (cached) {
+    return res.json(JSON.parse(cached)) // Return cached response
+  }
+
+  // Process the request
+  const tweet = await createTweet(req.body)
+
+  // Cache the result for 24 hours
+  await redis.setex(cacheKey, 86400, JSON.stringify(tweet))
+
+  return res.json(tweet)
+}
+```
+
+**Local Implementation**: Store idempotency keys in Redis with 24-hour TTL. For learning, focus on tweet creation and follow/unfollow operations.
+
+### Retry Strategy
+
+**Exponential Backoff with Jitter**:
+```javascript
+const RETRY_CONFIG = {
+  maxAttempts: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 5000,
+}
+
+async function withRetry(operation, context) {
+  for (let attempt = 1; attempt <= RETRY_CONFIG.maxAttempts; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      if (!isRetryable(error) || attempt === RETRY_CONFIG.maxAttempts) {
+        throw error
+      }
+
+      const delay = Math.min(
+        RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt - 1),
+        RETRY_CONFIG.maxDelayMs
+      )
+      const jitter = delay * 0.2 * Math.random()
+
+      console.log(`Retry ${attempt}/${RETRY_CONFIG.maxAttempts} for ${context} in ${delay + jitter}ms`)
+      await sleep(delay + jitter)
+    }
+  }
+}
+
+function isRetryable(error) {
+  // Retry on network errors, timeouts, 503s
+  // Do NOT retry on 4xx client errors
+  return error.code === 'ECONNRESET' ||
+         error.code === 'ETIMEDOUT' ||
+         error.status === 503
+}
+```
+
+### Circuit Breaker Pattern
+
+**Purpose**: Prevent cascading failures when a downstream service is unhealthy.
+
+```javascript
+class CircuitBreaker {
+  constructor(name, options = {}) {
+    this.name = name
+    this.failureThreshold = options.failureThreshold || 5
+    this.resetTimeoutMs = options.resetTimeoutMs || 30000
+    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
+    this.failures = 0
+    this.lastFailureTime = null
+  }
+
+  async call(operation) {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
+        this.state = 'HALF_OPEN'
+      } else {
+        throw new Error(`Circuit breaker ${this.name} is OPEN`)
+      }
+    }
+
+    try {
+      const result = await operation()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0
+    this.state = 'CLOSED'
+  }
+
+  onFailure() {
+    this.failures++
+    this.lastFailureTime = Date.now()
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'OPEN'
+      console.error(`Circuit breaker ${this.name} tripped to OPEN`)
+    }
+  }
+}
+
+// Usage for fanout service
+const fanoutCircuit = new CircuitBreaker('fanout-service', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30000,
+})
+
+async function fanoutWithProtection(tweetId, authorId) {
+  return fanoutCircuit.call(() => fanoutTweet(tweetId, authorId))
+}
+```
+
+**Local Circuit Breakers**:
+| Service | Failure Threshold | Reset Timeout | Fallback Behavior |
+|---------|-------------------|---------------|-------------------|
+| Redis timeline | 5 failures | 30s | Serve from PostgreSQL |
+| Trend service | 3 failures | 60s | Return cached/empty trends |
+| Fanout worker | 5 failures | 30s | Queue for retry |
+
+### Graceful Degradation
+
+When services fail, the system should degrade gracefully:
+
+1. **Redis down**: Fall back to PostgreSQL for timeline queries (slower but works)
+2. **Kafka down**: Queue tweets in Redis list, process when Kafka recovers
+3. **Trend service down**: Return stale trends from cache or empty list
+
+```javascript
+async function getHomeTimeline(userId) {
+  try {
+    // Primary: Redis timeline cache
+    return await getTimelineFromRedis(userId)
+  } catch (redisError) {
+    console.warn('Redis unavailable, falling back to PostgreSQL', redisError)
+
+    // Fallback: Direct database query
+    return await getTimelineFromDatabase(userId)
+  }
+}
+```
+
+### Backup and Restore (Local Development)
+
+**PostgreSQL Backup Script** (`scripts/backup.sh`):
+```bash
+#!/bin/bash
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="./backups"
+
+mkdir -p $BACKUP_DIR
+
+# Dump PostgreSQL
+pg_dump -h localhost -U twitter -d twitter_dev \
+  --format=custom \
+  --file="${BACKUP_DIR}/twitter_${TIMESTAMP}.dump"
+
+# Keep last 7 backups
+ls -t ${BACKUP_DIR}/*.dump | tail -n +8 | xargs -r rm
+
+echo "Backup created: ${BACKUP_DIR}/twitter_${TIMESTAMP}.dump"
+```
+
+**Restore Script** (`scripts/restore.sh`):
+```bash
+#!/bin/bash
+BACKUP_FILE=$1
+
+if [ -z "$BACKUP_FILE" ]; then
+  echo "Usage: ./restore.sh <backup_file>"
+  exit 1
+fi
+
+# Restore PostgreSQL
+pg_restore -h localhost -U twitter -d twitter_dev \
+  --clean --if-exists \
+  "$BACKUP_FILE"
+
+echo "Restored from: $BACKUP_FILE"
+```
+
+**Testing Backups** (add to weekly dev routine):
+```bash
+# 1. Create backup
+./scripts/backup.sh
+
+# 2. Create test database
+createdb twitter_restore_test
+
+# 3. Restore to test database
+pg_restore -h localhost -U twitter -d twitter_restore_test backups/latest.dump
+
+# 4. Verify row counts
+psql -d twitter_restore_test -c "SELECT 'users', count(*) FROM users UNION ALL SELECT 'tweets', count(*) FROM tweets"
+
+# 5. Cleanup
+dropdb twitter_restore_test
+```
+
+---
+
+## Data Lifecycle Policies
+
+### Retention and TTL Configuration
+
+| Data Type | Hot Storage | TTL | Archive Strategy |
+|-----------|-------------|-----|------------------|
+| Tweets | PostgreSQL | Forever (soft delete) | None for learning |
+| Timeline cache | Redis | 7 days | Auto-expires |
+| Trend buckets | Redis | 2 hours | Auto-expires |
+| Idempotency keys | Redis | 24 hours | Auto-expires |
+| Session data | Redis | 7 days | Auto-expires |
+| Deleted tweets | PostgreSQL | 30 days | Hard delete via cron |
+
+**Redis TTL Configuration**:
+```javascript
+// Timeline entries: 7 days
+await redis.lpush(`timeline:${userId}`, tweetId)
+await redis.expire(`timeline:${userId}`, 7 * 24 * 60 * 60)
+
+// Trend buckets: 2 hours (auto-expire after window closes)
+await redis.incr(`trend:${hashtag}:${bucket}`)
+await redis.expire(`trend:${hashtag}:${bucket}`, 2 * 60 * 60)
+
+// Session: 7 days
+await redis.setex(`session:${sessionId}`, 7 * 24 * 60 * 60, userData)
+```
+
+### Soft Delete Pattern
+
+Tweets use soft delete to preserve timeline integrity:
+
+```sql
+-- Soft delete column
+ALTER TABLE tweets ADD COLUMN deleted_at TIMESTAMP DEFAULT NULL;
+CREATE INDEX idx_tweets_deleted ON tweets(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- Soft delete operation
+UPDATE tweets SET deleted_at = NOW() WHERE id = $1;
+
+-- Query excludes deleted tweets
+SELECT * FROM tweets WHERE author_id = $1 AND deleted_at IS NULL;
+```
+
+**Hard Delete Cleanup Job** (run weekly):
+```sql
+-- Delete tweets soft-deleted more than 30 days ago
+DELETE FROM likes WHERE tweet_id IN (
+  SELECT id FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days'
+);
+
+DELETE FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days';
+
+-- Log count for monitoring
+SELECT 'Cleaned up', count(*) FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days';
+```
+
+### Archival to Cold Storage (Production Concept)
+
+For learning purposes, understand the pattern even if not implemented locally:
+
+```javascript
+// Conceptual: Archive old tweets to S3/MinIO
+async function archiveOldTweets(olderThanDays = 365) {
+  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
+
+  // 1. Export to JSONL file
+  const oldTweets = await db.query(`
+    SELECT * FROM tweets
+    WHERE created_at < $1
+    ORDER BY created_at
+  `, [cutoff])
+
+  const filename = `tweets_archive_${cutoff.toISOString().split('T')[0]}.jsonl`
+  await writeToMinIO('archives', filename, oldTweets.map(JSON.stringify).join('\n'))
+
+  // 2. Replace with tombstone reference
+  await db.query(`
+    UPDATE tweets
+    SET content = '[ARCHIVED]',
+        media_urls = NULL,
+        archived_at = NOW(),
+        archive_location = $2
+    WHERE created_at < $1
+  `, [cutoff, `s3://archives/${filename}`])
+}
+```
+
+### Backfill and Replay Procedures
+
+**Timeline Cache Rebuild** (if Redis data is lost):
+```javascript
+async function rebuildTimelineCache(userId) {
+  console.log(`Rebuilding timeline cache for user ${userId}`)
+
+  // 1. Get users this person follows (excluding celebrities)
+  const following = await db.query(`
+    SELECT f.following_id, u.is_celebrity
+    FROM follows f
+    JOIN users u ON f.following_id = u.id
+    WHERE f.follower_id = $1 AND u.is_celebrity = FALSE
+  `, [userId])
+
+  // 2. Get recent tweets from followed users
+  const followingIds = following.rows.map(r => r.following_id)
+  const tweets = await db.query(`
+    SELECT id FROM tweets
+    WHERE author_id = ANY($1)
+      AND deleted_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT 800
+  `, [followingIds])
+
+  // 3. Rebuild Redis list
+  const tweetIds = tweets.rows.map(t => t.id)
+  if (tweetIds.length > 0) {
+    await redis.del(`timeline:${userId}`)
+    await redis.rpush(`timeline:${userId}`, ...tweetIds)
+    await redis.expire(`timeline:${userId}`, 7 * 24 * 60 * 60)
+  }
+
+  console.log(`Rebuilt timeline for user ${userId} with ${tweetIds.length} tweets`)
+}
+
+// Rebuild all timelines (run after Redis recovery)
+async function rebuildAllTimelines() {
+  const users = await db.query('SELECT id FROM users')
+  for (const user of users.rows) {
+    await rebuildTimelineCache(user.id)
+  }
+}
+```
+
+**Kafka Event Replay** (conceptual):
+```javascript
+// Replay events from a specific offset to reprocess
+async function replayEvents(topic, fromOffset, toOffset) {
+  const consumer = kafka.consumer({ groupId: 'replay-consumer' })
+  await consumer.connect()
+
+  await consumer.subscribe({ topic, fromBeginning: false })
+  consumer.seek({ topic, partition: 0, offset: fromOffset })
+
+  await consumer.run({
+    eachMessage: async ({ message, offset }) => {
+      if (parseInt(offset) > toOffset) {
+        await consumer.disconnect()
+        return
+      }
+
+      const event = JSON.parse(message.value)
+      await processEvent(event) // Same handler as normal processing
+    }
+  })
+}
+```
+
+---
+
+## Deployment and Operations
+
+### Rollout Strategy
+
+**Blue-Green Deployment (Local Simulation)**:
+```bash
+# Run two versions simultaneously on different ports
+# Blue (current): Ports 3001, 3002
+# Green (new): Ports 3003, 3004
+
+# 1. Start green instances
+PORT=3003 npm run start &
+PORT=3004 npm run start &
+
+# 2. Run smoke tests against green
+curl -f http://localhost:3003/health
+curl -f http://localhost:3003/api/timeline/home -H "Cookie: session=..."
+
+# 3. Update load balancer to point to green
+# (In nginx.conf, change upstream servers)
+
+# 4. Drain and stop blue instances
+kill $(lsof -ti:3001)
+kill $(lsof -ti:3002)
+```
+
+**Canary Releases** (conceptual):
+```nginx
+# nginx.conf - Route 10% of traffic to canary
+upstream api_servers {
+    server localhost:3001 weight=45;
+    server localhost:3002 weight=45;
+    server localhost:3003 weight=10;  # Canary
+}
+```
+
+**Feature Flags**:
+```javascript
+// Simple feature flag check
+const FEATURES = {
+  NEW_TREND_ALGORITHM: process.env.FF_NEW_TREND_ALGO === 'true',
+  ASYNC_FANOUT: process.env.FF_ASYNC_FANOUT === 'true',
+}
+
+async function getTrends() {
+  if (FEATURES.NEW_TREND_ALGORITHM) {
+    return getNewTrends()  // New implementation
+  }
+  return getLegacyTrends()  // Safe fallback
+}
+```
+
+### Schema Migrations
+
+**Migration File Structure** (`backend/src/db/migrations/`):
+```
+001_initial_schema.sql
+002_add_is_celebrity.sql
+003_add_deleted_at.sql
+004_add_trend_indexes.sql
+```
+
+**Migration Runner** (`backend/src/db/migrate.js`):
+```javascript
+const fs = require('fs')
+const path = require('path')
+const pool = require('./pool')
+
+async function migrate() {
+  // Create migrations tracking table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version VARCHAR(50) PRIMARY KEY,
+      applied_at TIMESTAMP DEFAULT NOW()
+    )
+  `)
+
+  // Get applied migrations
+  const { rows: applied } = await pool.query(
+    'SELECT version FROM schema_migrations ORDER BY version'
+  )
+  const appliedVersions = new Set(applied.map(r => r.version))
+
+  // Get pending migrations
+  const migrationsDir = path.join(__dirname, 'migrations')
+  const files = fs.readdirSync(migrationsDir).sort()
+
+  for (const file of files) {
+    const version = file.replace('.sql', '')
+    if (appliedVersions.has(version)) continue
+
+    console.log(`Applying migration: ${file}`)
+
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8')
+
+    await pool.query('BEGIN')
+    try {
+      await pool.query(sql)
+      await pool.query(
+        'INSERT INTO schema_migrations (version) VALUES ($1)',
+        [version]
+      )
+      await pool.query('COMMIT')
+      console.log(`Applied: ${file}`)
+    } catch (error) {
+      await pool.query('ROLLBACK')
+      console.error(`Failed: ${file}`, error)
+      throw error
+    }
+  }
+
+  console.log('All migrations applied')
+}
+
+migrate().catch(console.error).finally(() => pool.end())
+```
+
+**Safe Migration Practices**:
+```sql
+-- 003_add_deleted_at.sql
+
+-- Always use IF NOT EXISTS for additive changes
+ALTER TABLE tweets ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP DEFAULT NULL;
+
+-- Create indexes CONCURRENTLY to avoid locking (PostgreSQL)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tweets_deleted
+  ON tweets(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- For column renames, use a multi-step process:
+-- Step 1: Add new column
+-- Step 2: Backfill data
+-- Step 3: Update application to use new column
+-- Step 4: Drop old column (in next release)
+```
+
+### Rollback Runbooks
+
+**Scenario 1: Bad Application Deploy**
+```bash
+# Symptoms: 5xx errors spike, latency increase
+
+# 1. Check recent deployments
+git log --oneline -5
+
+# 2. Identify the bad commit
+# Look for correlation between deploy time and error spike
+
+# 3. Revert to previous version
+git revert HEAD
+npm run build
+npm run start
+
+# OR restore from known-good tag
+git checkout v1.2.3
+npm run build
+npm run start
+
+# 4. Notify team and investigate root cause
+```
+
+**Scenario 2: Bad Database Migration**
+```bash
+# Symptoms: Application errors referencing schema
+
+# 1. Identify the failing migration
+psql -c "SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5"
+
+# 2. Check migration file for DOWN script
+cat backend/src/db/migrations/003_add_deleted_at.sql
+
+# 3. Apply rollback SQL manually
+psql -f backend/src/db/migrations/003_add_deleted_at.down.sql
+
+# 4. Remove from migrations table
+psql -c "DELETE FROM schema_migrations WHERE version = '003_add_deleted_at'"
+
+# 5. Fix migration and reapply
+npm run db:migrate
+```
+
+**Scenario 3: Redis Data Corruption**
+```bash
+# Symptoms: Timeline showing wrong tweets, trends broken
+
+# 1. Identify scope of corruption
+redis-cli KEYS "timeline:*" | wc -l
+redis-cli KEYS "trend:*" | wc -l
+
+# 2. Option A: Clear and rebuild specific keys
+redis-cli DEL timeline:123
+node -e "require('./src/db/rebuild').rebuildTimelineCache(123)"
+
+# 3. Option B: Full Redis flush and rebuild
+redis-cli FLUSHDB
+npm run rebuild:timelines
+npm run rebuild:trends
+
+# 4. Verify rebuild completed
+redis-cli KEYS "timeline:*" | wc -l
+```
+
+**Scenario 4: Kafka Consumer Lag**
+```bash
+# Symptoms: Fanout delayed, tweets not appearing in timelines
+
+# 1. Check consumer lag
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group fanout-workers
+
+# 2. If lag is high, scale up consumers temporarily
+PORT=3005 npm run dev:fanout-worker &
+PORT=3006 npm run dev:fanout-worker &
+
+# 3. Monitor until lag clears
+watch -n 5 'kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group fanout-workers'
+
+# 4. Scale back down once caught up
+```
+
+### Health Check Endpoints
+
+```javascript
+// Comprehensive health check for monitoring
+app.get('/health', async (req, res) => {
+  const checks = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    services: {}
+  }
+
+  // PostgreSQL check
+  try {
+    await pool.query('SELECT 1')
+    checks.services.postgres = { status: 'ok' }
+  } catch (error) {
+    checks.services.postgres = { status: 'error', message: error.message }
+    checks.status = 'degraded'
+  }
+
+  // Redis check
+  try {
+    await redis.ping()
+    checks.services.redis = { status: 'ok' }
+  } catch (error) {
+    checks.services.redis = { status: 'error', message: error.message }
+    checks.status = 'degraded'
+  }
+
+  // Kafka check (if applicable)
+  try {
+    const admin = kafka.admin()
+    await admin.connect()
+    await admin.listTopics()
+    await admin.disconnect()
+    checks.services.kafka = { status: 'ok' }
+  } catch (error) {
+    checks.services.kafka = { status: 'error', message: error.message }
+    checks.status = 'degraded'
+  }
+
+  const statusCode = checks.status === 'ok' ? 200 : 503
+  res.status(statusCode).json(checks)
+})
+
+// Readiness probe (for load balancer)
+app.get('/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1')
+    await redis.ping()
+    res.status(200).send('ready')
+  } catch (error) {
+    res.status(503).send('not ready')
+  }
+})
+
+// Liveness probe (for process manager)
+app.get('/live', (req, res) => {
+  res.status(200).send('alive')
+})
+```
+
+---
+
 ## Future Optimizations
 
 1. **GraphQL** for flexible client queries

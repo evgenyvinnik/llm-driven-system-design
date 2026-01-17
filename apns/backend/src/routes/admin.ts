@@ -6,12 +6,37 @@ import db from "../db/index.js";
 import { generateUUID, hashPassword, verifyPassword, generateRandomToken } from "../utils/index.js";
 import { setSession, getSession, deleteSession } from "../db/redis.js";
 
+/**
+ * Admin Dashboard Routes.
+ *
+ * Provides authentication and administrative endpoints for the APNs management dashboard.
+ * Includes session-based authentication and dashboard statistics.
+ *
+ * Routes:
+ * - POST /login - Authenticate admin user
+ * - POST /logout - End admin session
+ * - GET /me - Get current user info
+ * - GET /stats - Dashboard statistics
+ * - GET /devices - List all devices (paginated)
+ * - GET /notifications - List all notifications (paginated)
+ * - GET /feedback - List all feedback (paginated)
+ * - POST /broadcast - Send to all devices
+ * - POST /cleanup - Clean up expired notifications
+ * - POST /users - Create admin user
+ */
 const router = Router();
 
-// Session expiration: 24 hours
+/** Session time-to-live: 24 hours in seconds */
 const SESSION_TTL = 24 * 60 * 60;
 
-// Login
+/**
+ * Admin login endpoint.
+ * Validates credentials and creates a session token.
+ *
+ * @route POST /api/v1/admin/login
+ * @body {username, password}
+ * @returns {token, user: {id, username, role}}
+ */
 router.post("/login", async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
@@ -84,7 +109,14 @@ router.post("/login", async (req: Request, res: Response) => {
   }
 });
 
-// Logout
+/**
+ * Admin logout endpoint.
+ * Deletes the session token from Redis.
+ *
+ * @route POST /api/v1/admin/logout
+ * @header Authorization: Bearer <token>
+ * @returns 204 No Content
+ */
 router.post("/logout", async (req: Request, res: Response) => {
   try {
     const authHeader = req.headers.authorization;
@@ -103,7 +135,14 @@ router.post("/logout", async (req: Request, res: Response) => {
   }
 });
 
-// Get current user
+/**
+ * Get current authenticated user.
+ * Validates the session token and returns user info.
+ *
+ * @route GET /api/v1/admin/me
+ * @header Authorization: Bearer <token>
+ * @returns {id, username, role}
+ */
 router.get("/me", async (req: Request, res: Response) => {
   try {
     const authHeader = req.headers.authorization;
@@ -142,7 +181,13 @@ router.get("/me", async (req: Request, res: Response) => {
   }
 });
 
-// Dashboard stats
+/**
+ * Get dashboard statistics.
+ * Returns aggregate stats for notifications, devices, topics, and recent activity.
+ *
+ * @route GET /api/v1/admin/stats
+ * @returns {notifications, devices, topics, recent_notifications}
+ */
 router.get("/stats", async (req: Request, res: Response) => {
   try {
     const [notificationStats, deviceStats, topicStats] = await Promise.all([
@@ -171,7 +216,14 @@ router.get("/stats", async (req: Request, res: Response) => {
   }
 });
 
-// List all devices (paginated)
+/**
+ * List all registered devices with pagination.
+ *
+ * @route GET /api/v1/admin/devices
+ * @query limit - Max results (default 100)
+ * @query offset - Results to skip (default 0)
+ * @returns {devices: DeviceToken[], total: number}
+ */
 router.get("/devices", async (req: Request, res: Response) => {
   try {
     const { limit, offset } = req.query;
@@ -191,7 +243,16 @@ router.get("/devices", async (req: Request, res: Response) => {
   }
 });
 
-// List all notifications (paginated)
+/**
+ * List all notifications with pagination and filters.
+ *
+ * @route GET /api/v1/admin/notifications
+ * @query device_id - Filter by device ID
+ * @query status - Filter by status
+ * @query limit - Max results (default 100)
+ * @query offset - Results to skip (default 0)
+ * @returns {notifications: Notification[], total: number}
+ */
 router.get("/notifications", async (req: Request, res: Response) => {
   try {
     const { device_id, status, limit, offset } = req.query;
@@ -213,7 +274,14 @@ router.get("/notifications", async (req: Request, res: Response) => {
   }
 });
 
-// List all feedback (paginated)
+/**
+ * List all feedback entries with pagination.
+ *
+ * @route GET /api/v1/admin/feedback
+ * @query limit - Max results (default 100)
+ * @query offset - Results to skip (default 0)
+ * @returns {feedback: FeedbackEntry[], total: number}
+ */
 router.get("/feedback", async (req: Request, res: Response) => {
   try {
     const { limit, offset } = req.query;
@@ -233,7 +301,14 @@ router.get("/feedback", async (req: Request, res: Response) => {
   }
 });
 
-// Broadcast notification to all devices
+/**
+ * Broadcast a notification to all valid devices.
+ * Warning: This can send to many devices, use with caution.
+ *
+ * @route POST /api/v1/admin/broadcast
+ * @body {payload, priority?, expiration?}
+ * @returns {total_devices, sent, failed}
+ */
 router.post("/broadcast", async (req: Request, res: Response) => {
   try {
     const { payload, priority, expiration } = req.body;
@@ -279,7 +354,13 @@ router.post("/broadcast", async (req: Request, res: Response) => {
   }
 });
 
-// Cleanup expired notifications
+/**
+ * Trigger cleanup of expired notifications.
+ * Marks expired pending/queued notifications as expired.
+ *
+ * @route POST /api/v1/admin/cleanup
+ * @returns {cleaned: number}
+ */
 router.post("/cleanup", async (req: Request, res: Response) => {
   try {
     const cleaned = await pushService.cleanupExpiredNotifications();
@@ -296,7 +377,14 @@ router.post("/cleanup", async (req: Request, res: Response) => {
   }
 });
 
-// Create admin user
+/**
+ * Create a new admin user.
+ * Only accessible by existing admins.
+ *
+ * @route POST /api/v1/admin/users
+ * @body {username, password, role?}
+ * @returns {id, username, role}
+ */
 router.post("/users", async (req: Request, res: Response) => {
   try {
     const { username, password, role } = req.body;

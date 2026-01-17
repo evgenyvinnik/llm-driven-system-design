@@ -1,3 +1,10 @@
+/**
+ * User settings page route.
+ * Displays profile info, storage usage, and account management options.
+ * Requires authentication; redirects to login if not authenticated.
+ * @module routes/settings
+ */
+
 import { useEffect } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
@@ -5,10 +12,15 @@ import { Sidebar } from '../components/Sidebar';
 import { Loader2 } from 'lucide-react';
 import { formatBytes, getStoragePercentage, getStorageColor } from '../utils/format';
 
+/** Route definition for the settings page at /settings */
 export const Route = createFileRoute('/settings')({
   component: Settings,
 });
 
+/**
+ * Settings page component.
+ * Shows user profile, storage quota, and account actions.
+ */
 function Settings() {
   const navigate = useNavigate();
   const { user, isLoading, checkAuth } = useAuthStore();

@@ -1,7 +1,16 @@
+/**
+ * @fileoverview Search API routes.
+ * Defines endpoints for full-text search, suggestions, trending, and history.
+ */
+
 import { Router } from 'express';
 import * as searchController from '../controllers/searchController.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 
+/**
+ * Express router for search-related endpoints.
+ * Base path: /api/v1/search
+ */
 const router = Router();
 
 // POST /api/v1/search - Main search endpoint

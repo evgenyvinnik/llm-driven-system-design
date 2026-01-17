@@ -1,13 +1,30 @@
+/**
+ * Conversation List Component
+ *
+ * Displays the sidebar list of user's conversations.
+ * Shows conversation name, last message preview, unread count,
+ * typing indicators, and online status for participants.
+ */
+
 import { useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useAuthStore } from '../stores/authStore';
 import { Conversation } from '../types';
 
+/**
+ * Props for the ConversationList component.
+ */
 interface ConversationListProps {
+  /** Callback when a conversation is selected */
   onSelectConversation: (conversationId: string) => void;
+  /** Callback to open the new chat dialog */
   onNewChat: () => void;
 }
 
+/**
+ * Sidebar conversation list with search and new chat functionality.
+ * @param props - Component props with selection and new chat callbacks
+ */
 export function ConversationList({ onSelectConversation, onNewChat }: ConversationListProps) {
   const { user } = useAuthStore();
   const {

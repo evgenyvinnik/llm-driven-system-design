@@ -1,3 +1,15 @@
+/**
+ * AdminDashboard component - Data management and model training interface.
+ * Provides tabs for:
+ * - Overview: Statistics and recent training jobs
+ * - Drawings: Gallery with filtering, flag, and delete capabilities
+ * - Quality: Batch quality analysis and statistics
+ * - Training: Model training and activation
+ *
+ * Requires authentication - shows login form if not logged in.
+ * @module routes/admin/AdminDashboard
+ */
+
 import { useState, useEffect, useCallback } from 'react'
 import {
   getAdminStats,
@@ -23,7 +35,13 @@ import {
 import { DrawingCard } from '../../components/DrawingCard'
 import './AdminDashboard.css'
 
-// Login Component
+/**
+ * Login form component for admin authentication.
+ * Validates email format and password length before submission.
+ *
+ * @param props - Component props
+ * @param props.onLogin - Callback when login succeeds with user data
+ */
 function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -35,11 +53,16 @@ function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
     password: false,
   })
 
-  // Validation
+  /** Check if email has valid format */
   const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  /** Check if password meets minimum length */
   const passwordValid = password.length >= 6
+  /** Form is valid when both fields pass validation */
   const formValid = emailValid && passwordValid
 
+  /**
+   * Returns email validation error message, if any.
+   */
   const getEmailError = () => {
     if (!touched.email) return null
     if (!email) return 'Email is required'
@@ -47,6 +70,9 @@ function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
     return null
   }
 
+  /**
+   * Returns password validation error message, if any.
+   */
   const getPasswordError = () => {
     if (!touched.password) return null
     if (!password) return 'Password is required'
@@ -54,6 +80,9 @@ function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
     return null
   }
 
+  /**
+   * Handles form submission - validates and attempts login.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setTouched({ email: true, password: true })
@@ -137,6 +166,10 @@ function AdminLogin({ onLogin }: { onLogin: (user: AdminUser) => void }) {
   )
 }
 
+/**
+ * Main admin dashboard component.
+ * Manages authentication state and provides tabbed interface for data management.
+ */
 export function AdminDashboard() {
   const [user, setUser] = useState<AdminUser | null>(null)
   const [authChecked, setAuthChecked] = useState(false)
@@ -176,6 +209,9 @@ export function AdminDashboard() {
       .catch(() => setAuthChecked(true))
   }, [])
 
+  /**
+   * Loads all dashboard data (stats, drawings, models).
+   */
   const loadData = useCallback(async () => {
     try {
       setLoading(true)
@@ -201,11 +237,13 @@ export function AdminDashboard() {
     }
   }, [user, loadData])
 
+  /** Logs out the current admin user */
   const handleLogout = async () => {
     await adminLogout()
     setUser(null)
   }
 
+  /** Starts a new training job */
   const handleStartTraining = async () => {
     try {
       setTrainingInProgress(true)
@@ -219,6 +257,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Activates a trained model for inference */
   const handleActivateModel = async (modelId: string) => {
     try {
       await activateModel(modelId)
@@ -228,6 +267,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Flags or unflags a drawing */
   const handleFlagDrawing = async (drawingId: string, flagged: boolean) => {
     try {
       await flagDrawing(drawingId, flagged)
@@ -239,6 +279,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Soft-deletes a drawing */
   const handleDeleteDrawing = async (drawingId: string) => {
     try {
       await deleteDrawing(drawingId)
@@ -250,6 +291,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Restores a soft-deleted drawing */
   const handleRestoreDrawing = async (drawingId: string) => {
     try {
       await restoreDrawing(drawingId)
@@ -261,6 +303,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Loads drawings with current filter settings */
   const loadFilteredDrawings = async () => {
     try {
       const data = await getDrawings(1, 20, {
@@ -275,6 +318,7 @@ export function AdminDashboard() {
     }
   }
 
+  /** Resets all filters and reloads data */
   const clearFilters = () => {
     setFilters({
       shape: '',
@@ -792,6 +836,15 @@ export function AdminDashboard() {
   )
 }
 
+/**
+ * StatCard component - Displays a single statistic with title and value.
+ *
+ * @param props - Component props
+ * @param props.title - Label for the statistic
+ * @param props.value - The statistic value
+ * @param props.subtitle - Optional secondary text
+ * @param props.color - Color theme (blue, green, red, purple)
+ */
 function StatCard({
   title,
   value,

@@ -1,3 +1,10 @@
+/**
+ * @fileoverview Metrics explorer page.
+ *
+ * Provides an interactive interface for browsing available metrics,
+ * viewing their time-series data, and exploring tag dimensions.
+ */
+
 import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { format } from 'date-fns';
@@ -15,10 +22,24 @@ import { getMetricNames, getMetricDefinitions, queryMetrics } from '../services/
 import { TimeRangeSelector } from '../components/TimeRangeSelector';
 import { TIME_RANGE_OPTIONS } from '../types';
 
+/**
+ * Route configuration for the metrics explorer page.
+ */
 export const Route = createFileRoute('/metrics')({
   component: MetricsPage,
 });
 
+/**
+ * Metrics explorer page component.
+ *
+ * Features:
+ * - List of available metric names in sidebar
+ * - Time-series chart for selected metric
+ * - Table of metric instances (name + tag combinations)
+ * - Time range selector for chart window
+ *
+ * @returns The rendered metrics explorer page
+ */
 function MetricsPage() {
   const [metricNames, setMetricNames] = useState<string[]>([]);
   const [definitions, setDefinitions] = useState<MetricDefinition[]>([]);

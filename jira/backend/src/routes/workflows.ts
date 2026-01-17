@@ -3,9 +3,16 @@ import * as workflowService from '../services/workflowService.js';
 import * as projectService from '../services/projectService.js';
 import { requireAuth } from '../middleware/auth.js';
 
+/**
+ * Workflow management routes.
+ * Handles CRUD for workflows, statuses, transitions, sprints, and boards.
+ */
 const router = Router();
 
-// Get all workflows
+/**
+ * GET /
+ * Returns all workflow definitions.
+ */
 router.get('/', requireAuth, async (req, res) => {
   try {
     const workflows = await workflowService.getAllWorkflows();
@@ -16,7 +23,10 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// Get workflow by ID
+/**
+ * GET /:id
+ * Returns a workflow by ID with all statuses and transitions.
+ */
 router.get('/:id', requireAuth, async (req, res) => {
   try {
     const workflowId = parseInt(req.params.id, 10);
@@ -33,7 +43,10 @@ router.get('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Get workflow for project
+/**
+ * GET /project/:projectId
+ * Returns the workflow assigned to a project.
+ */
 router.get('/project/:projectId', requireAuth, async (req, res) => {
   try {
     const workflow = await workflowService.getWorkflowByProject(req.params.projectId);
@@ -49,7 +62,10 @@ router.get('/project/:projectId', requireAuth, async (req, res) => {
   }
 });
 
-// Create workflow
+/**
+ * POST /
+ * Creates a new workflow definition.
+ */
 router.post('/', requireAuth, async (req, res) => {
   try {
     const { name, description } = req.body;
@@ -66,7 +82,10 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-// Create status for workflow
+/**
+ * POST /:id/statuses
+ * Creates a status in a workflow.
+ */
 router.post('/:id/statuses', requireAuth, async (req, res) => {
   try {
     const workflowId = parseInt(req.params.id, 10);
@@ -96,7 +115,10 @@ router.post('/:id/statuses', requireAuth, async (req, res) => {
   }
 });
 
-// Update status
+/**
+ * PATCH /statuses/:id
+ * Updates a status definition.
+ */
 router.patch('/statuses/:id', requireAuth, async (req, res) => {
   try {
     const statusId = parseInt(req.params.id, 10);
@@ -120,7 +142,10 @@ router.patch('/statuses/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Create transition for workflow
+/**
+ * POST /:id/transitions
+ * Creates a transition between statuses in a workflow.
+ */
 router.post('/:id/transitions', requireAuth, async (req, res) => {
   try {
     const workflowId = parseInt(req.params.id, 10);
@@ -147,7 +172,10 @@ router.post('/:id/transitions', requireAuth, async (req, res) => {
   }
 });
 
-// Get statuses for workflow
+/**
+ * GET /:id/statuses
+ * Returns all statuses for a workflow.
+ */
 router.get('/:id/statuses', requireAuth, async (req, res) => {
   try {
     const workflowId = parseInt(req.params.id, 10);
@@ -159,7 +187,10 @@ router.get('/:id/statuses', requireAuth, async (req, res) => {
   }
 });
 
-// Sprints routes
+/**
+ * GET /sprints/:id
+ * Returns a sprint by ID.
+ */
 router.get('/sprints/:id', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
@@ -176,6 +207,10 @@ router.get('/sprints/:id', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * PATCH /sprints/:id
+ * Updates a sprint's details.
+ */
 router.patch('/sprints/:id', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
@@ -200,6 +235,10 @@ router.patch('/sprints/:id', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /sprints/:id/start
+ * Starts a sprint (closes any currently active sprint).
+ */
 router.post('/sprints/:id/start', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
@@ -216,6 +255,10 @@ router.post('/sprints/:id/start', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /sprints/:id/complete
+ * Completes a sprint.
+ */
 router.post('/sprints/:id/complete', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
@@ -232,7 +275,10 @@ router.post('/sprints/:id/complete', requireAuth, async (req, res) => {
   }
 });
 
-// Boards routes
+/**
+ * GET /boards/:id
+ * Returns a board by ID.
+ */
 router.get('/boards/:id', requireAuth, async (req, res) => {
   try {
     const boardId = parseInt(req.params.id, 10);

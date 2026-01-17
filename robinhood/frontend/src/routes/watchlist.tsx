@@ -1,9 +1,16 @@
+/**
+ * Watchlist page route (/watchlist).
+ * Manages user's stock watchlists and price alerts.
+ * Requires authentication.
+ */
+
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
 import { WatchlistView } from '../components/Watchlist';
 
+/** Route definition with auth guard */
 export const Route = createFileRoute('/watchlist')({
   beforeLoad: () => {
     const { isAuthenticated } = useAuthStore.getState();
@@ -14,6 +21,11 @@ export const Route = createFileRoute('/watchlist')({
   component: WatchlistPage,
 });
 
+/**
+ * Watchlist page component.
+ * Provides interface for creating/deleting watchlists and managing price alerts.
+ * Displays all user watchlists with their stocks and active price alerts.
+ */
 function WatchlistPage() {
   const {
     watchlists,

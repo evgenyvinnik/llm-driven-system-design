@@ -1,8 +1,15 @@
+/**
+ * Orders page route (/orders).
+ * Displays user's order history with status, fill information, and cancellation options.
+ * Requires authentication.
+ */
+
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
 
+/** Route definition with auth guard */
 export const Route = createFileRoute('/orders')({
   beforeLoad: () => {
     const { isAuthenticated } = useAuthStore.getState();
@@ -13,6 +20,11 @@ export const Route = createFileRoute('/orders')({
   component: OrdersPage,
 });
 
+/**
+ * Orders page component.
+ * Lists all user orders with real-time status updates (auto-refreshes every 5 seconds).
+ * Provides cancel functionality for pending orders.
+ */
 function OrdersPage() {
   const { orders, fetchOrders, cancelOrder, isLoading } = usePortfolioStore();
 
@@ -136,6 +148,11 @@ function OrdersPage() {
   );
 }
 
+/**
+ * Returns the appropriate color class for an order status.
+ * @param status - Order status string
+ * @returns Tailwind color class for the status text
+ */
 function getStatusColor(status: string): string {
   switch (status) {
     case 'filled':

@@ -1,12 +1,27 @@
+/**
+ * @fileoverview Test click generation page route component.
+ * Provides tools for sending test click events to validate the system.
+ * Includes single click and batch generation capabilities.
+ */
+
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { useDashboardStore } from '../stores/dashboardStore'
 import { TestClickForm } from '../components/TestClickForm'
 
+/**
+ * Route definition for the test page.
+ */
 export const Route = createFileRoute('/test')({
   component: TestPage,
 })
 
+/**
+ * Test click generation interface.
+ * Provides forms for sending test clicks and documentation.
+ *
+ * @returns Test form and usage instructions
+ */
 function TestPage() {
   const { ads, campaigns, fetchAds, fetchCampaigns, refreshAll } = useDashboardStore()
 

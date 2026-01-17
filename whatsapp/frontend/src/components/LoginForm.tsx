@@ -1,10 +1,26 @@
+/**
+ * Login Form Component
+ *
+ * Provides user authentication interface with username/password fields.
+ * Displays error messages and loading states during authentication.
+ * Includes demo account hints for development convenience.
+ */
+
 import { useState, FormEvent } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Props for the LoginForm component.
+ */
 interface LoginFormProps {
+  /** Callback to switch to the registration form */
   onSwitchToRegister: () => void;
 }
 
+/**
+ * Login form with username and password authentication.
+ * @param props - Component props including form switch callback
+ */
 export function LoginForm({ onSwitchToRegister }: LoginFormProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');

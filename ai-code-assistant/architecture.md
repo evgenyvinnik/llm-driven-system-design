@@ -1123,6 +1123,920 @@ npm run build:binary  # Uses pkg or similar
 7. **Learning mode** - Track patterns, improve suggestions
 8. **Offline mode** - Local LLM fallback
 
+## Consistency and Idempotency Semantics
+
+### Overview
+
+The AI Code Assistant operates primarily as a single-user CLI tool, but consistency and idempotency matter for:
+- Session state persistence
+- Tool execution replay (on errors/retries)
+- Concurrent tool execution
+- File system operations
+
+### Consistency Model
+
+**Strong Consistency for:**
+- **Session state** - All session writes (messages, permissions) are synchronous and immediately visible
+- **File edits** - Uses atomic write-then-rename pattern to prevent partial writes
+- **Permission grants** - Immediately persisted and enforced
+
+**Eventual Consistency for:**
+- **Context summarization** - Background compression of old messages (can lag behind)
+- **History indexing** - Session search index updates asynchronously
+
+```typescript
+// Atomic file write pattern
+class AtomicFileWriter {
+  async write(filePath: string, content: string): Promise<void> {
+    const tempPath = `${filePath}.tmp.${Date.now()}`;
+
+    try {
+      // Write to temp file
+      await fs.writeFile(tempPath, content, 'utf-8');
+
+      // Sync to disk before rename
+      const fd = await fs.open(tempPath, 'r');
+      await fd.sync();
+      await fd.close();
+
+      // Atomic rename
+      await fs.rename(tempPath, filePath);
+    } catch (error) {
+      // Clean up temp file on failure
+      await fs.unlink(tempPath).catch(() => {});
+      throw error;
+    }
+  }
+}
+```
+
+### Idempotency Handling
+
+#### Tool Execution Idempotency
+
+Each tool call receives a unique ID from the LLM. This ID is used to:
+1. Prevent duplicate execution on retry
+2. Cache results for replay
+3. Track execution history
+
+```typescript
+interface IdempotentToolExecutor {
+  private executionCache: Map<string, ToolResult>;
+  private cacheFile: string;
+
+  async execute(toolCall: ToolCall): Promise<ToolResult> {
+    const idempotencyKey = toolCall.id; // UUID from LLM
+
+    // Check if already executed
+    if (this.executionCache.has(idempotencyKey)) {
+      console.log(`[Replay] Using cached result for ${toolCall.name}`);
+      return this.executionCache.get(idempotencyKey)!;
+    }
+
+    // Execute and cache
+    const result = await this.tools.get(toolCall.name)!.execute(
+      toolCall.params,
+      this.context
+    );
+
+    this.executionCache.set(idempotencyKey, result);
+    await this.persistCache(); // Survive process restarts
+
+    return result;
+  }
+
+  // Expire old entries (older than current session)
+  async cleanupCache(): Promise<void> {
+    const sessionStart = this.session.startedAt.getTime();
+    for (const [key, result] of this.executionCache) {
+      if (result.timestamp < sessionStart) {
+        this.executionCache.delete(key);
+      }
+    }
+  }
+}
+```
+
+#### File Edit Conflict Resolution
+
+When editing files, conflicts can occur if the file changed between read and edit:
+
+```typescript
+interface EditOperation {
+  filePath: string;
+  oldString: string;
+  newString: string;
+  expectedChecksum?: string; // SHA256 of file at read time
+}
+
+class ConflictAwareEditor {
+  async edit(operation: EditOperation): Promise<EditResult> {
+    const currentContent = await fs.readFile(operation.filePath, 'utf-8');
+    const currentChecksum = this.checksum(currentContent);
+
+    // Detect if file changed since last read
+    if (operation.expectedChecksum &&
+        operation.expectedChecksum !== currentChecksum) {
+      return {
+        success: false,
+        error: 'File modified since last read. Please read again.',
+        conflictType: 'stale_read',
+        suggestion: 'Use Read tool to get current content'
+      };
+    }
+
+    // Check uniqueness of old_string
+    const occurrences = currentContent.split(operation.oldString).length - 1;
+
+    if (occurrences === 0) {
+      return {
+        success: false,
+        error: 'String not found - may have been edited',
+        conflictType: 'missing_target'
+      };
+    }
+
+    if (occurrences > 1 && !operation.replaceAll) {
+      return {
+        success: false,
+        error: `Ambiguous: found ${occurrences} occurrences`,
+        conflictType: 'ambiguous_target',
+        suggestion: 'Provide more context or use replace_all'
+      };
+    }
+
+    // Perform edit with atomic write
+    const newContent = currentContent.replace(operation.oldString, operation.newString);
+    await this.atomicWriter.write(operation.filePath, newContent);
+
+    return { success: true, newChecksum: this.checksum(newContent) };
+  }
+
+  private checksum(content: string): string {
+    return crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
+  }
+}
+```
+
+#### Retry Semantics
+
+| Operation | Retry Behavior | Notes |
+|-----------|---------------|-------|
+| File Read | Safe to retry | Always returns current state |
+| File Write | Idempotent via checksum | Same content = no-op |
+| File Edit | Conflict detection | Fails if file changed |
+| Bash Command | Not automatically retried | User must approve re-execution |
+| LLM API Call | Automatic retry with backoff | 3 attempts, exponential delay |
+
+```typescript
+// LLM API retry configuration
+const retryConfig = {
+  maxRetries: 3,
+  initialDelayMs: 1000,
+  maxDelayMs: 10000,
+  backoffMultiplier: 2,
+  retryableErrors: [
+    'rate_limit_exceeded',
+    'overloaded',
+    'timeout',
+    'connection_error'
+  ]
+};
+```
+
+## Caching Strategy
+
+### Cache Architecture
+
+For local development, we use a simple in-memory cache with optional file persistence. In production scenarios, this would extend to Redis/Valkey.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Caching Layers                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │   In-Memory  │───▶│  File Cache  │───▶│  Redis/CDN   │      │
+│  │   (LRU)      │    │  (Optional)  │    │ (Production) │      │
+│  └──────────────┘    └──────────────┘    └──────────────┘      │
+│       │                    │                    │               │
+│       ▼                    ▼                    ▼               │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Cache Usage                            │  │
+│  │  • File content checksums (5 min TTL)                    │  │
+│  │  • LLM response cache for identical prompts (10 min)     │  │
+│  │  • Tool execution results by idempotency key             │  │
+│  │  • Session state (persisted on change)                   │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Cache-Aside Pattern (Primary)
+
+Used for most operations where we can tolerate a cache miss:
+
+```typescript
+class CacheAside<T> {
+  private cache: LRUCache<string, CacheEntry<T>>;
+
+  constructor(options: { maxSize: number; defaultTtlMs: number }) {
+    this.cache = new LRUCache({
+      max: options.maxSize,
+      ttl: options.defaultTtlMs
+    });
+  }
+
+  async get(key: string, loader: () => Promise<T>): Promise<T> {
+    // Check cache first
+    const cached = this.cache.get(key);
+    if (cached && !this.isExpired(cached)) {
+      return cached.value;
+    }
+
+    // Cache miss - load from source
+    const value = await loader();
+
+    // Store in cache
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+
+    return value;
+  }
+
+  invalidate(key: string): void {
+    this.cache.delete(key);
+  }
+
+  invalidatePattern(pattern: RegExp): void {
+    for (const key of this.cache.keys()) {
+      if (pattern.test(key)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+```
+
+### Write-Through for Critical State
+
+Used for session state and permissions where consistency is critical:
+
+```typescript
+class WriteThrough<T> {
+  private cache: Map<string, T>;
+  private storage: Storage;
+
+  async set(key: string, value: T): Promise<void> {
+    // Write to storage first (source of truth)
+    await this.storage.write(key, value);
+
+    // Then update cache
+    this.cache.set(key, value);
+  }
+
+  async get(key: string): Promise<T | undefined> {
+    // Always check cache first (it's in sync due to write-through)
+    if (this.cache.has(key)) {
+      return this.cache.get(key);
+    }
+
+    // Cold start - load from storage
+    const value = await this.storage.read(key);
+    if (value) {
+      this.cache.set(key, value);
+    }
+    return value;
+  }
+}
+```
+
+### Cache Configuration
+
+| Cache Type | Strategy | TTL | Max Size | Invalidation |
+|------------|----------|-----|----------|--------------|
+| File checksums | Cache-aside | 5 min | 1000 entries | On file write |
+| LLM responses | Cache-aside | 10 min | 100 entries | Manual only |
+| Tool results | Write-through | Session | 500 entries | On session end |
+| Session state | Write-through | Persistent | N/A | Never (explicit save) |
+| Glob results | Cache-aside | 30 sec | 200 entries | On any file change |
+
+### TTL and Invalidation Rules
+
+```typescript
+const cacheConfig = {
+  fileChecksums: {
+    ttlMs: 5 * 60 * 1000,      // 5 minutes
+    maxEntries: 1000,
+    invalidateOn: ['file:write', 'file:edit', 'file:delete']
+  },
+
+  llmResponses: {
+    ttlMs: 10 * 60 * 1000,     // 10 minutes
+    maxEntries: 100,
+    // Only cache identical prompts with same context
+    keyGenerator: (messages: Message[]) => {
+      return crypto.createHash('sha256')
+        .update(JSON.stringify(messages))
+        .digest('hex');
+    }
+  },
+
+  globResults: {
+    ttlMs: 30 * 1000,          // 30 seconds
+    maxEntries: 200,
+    invalidateOn: ['file:*']   // Any file operation
+  },
+
+  grepResults: {
+    ttlMs: 60 * 1000,          // 1 minute
+    maxEntries: 100,
+    invalidateOn: ['file:write', 'file:edit']
+  }
+};
+
+// File watcher triggers cache invalidation
+class CacheInvalidator {
+  private watcher: FSWatcher;
+  private caches: Map<string, CacheAside<unknown>>;
+
+  constructor(workingDir: string) {
+    this.watcher = chokidar.watch(workingDir, {
+      ignoreInitial: true,
+      ignored: ['node_modules', '.git']
+    });
+
+    this.watcher.on('all', (event, path) => {
+      this.handleFileChange(event, path);
+    });
+  }
+
+  private handleFileChange(event: string, filePath: string): void {
+    // Invalidate file checksum cache
+    this.caches.get('fileChecksums')?.invalidate(filePath);
+
+    // Invalidate glob caches that might include this file
+    this.caches.get('globResults')?.invalidatePattern(
+      new RegExp(path.dirname(filePath))
+    );
+
+    // Invalidate grep results
+    this.caches.get('grepResults')?.invalidatePattern(/./);
+  }
+}
+```
+
+### Production Extension (Redis)
+
+For multi-instance deployments or shared caching:
+
+```typescript
+// Redis cache implementation (production)
+class RedisCache<T> implements CacheProvider<T> {
+  private client: Redis;
+  private prefix: string;
+
+  constructor(redisUrl: string, prefix: string = 'evylcode:') {
+    this.client = new Redis(redisUrl);
+    this.prefix = prefix;
+  }
+
+  async get(key: string): Promise<T | undefined> {
+    const data = await this.client.get(this.prefix + key);
+    return data ? JSON.parse(data) : undefined;
+  }
+
+  async set(key: string, value: T, ttlMs?: number): Promise<void> {
+    const data = JSON.stringify(value);
+    if (ttlMs) {
+      await this.client.psetex(this.prefix + key, ttlMs, data);
+    } else {
+      await this.client.set(this.prefix + key, data);
+    }
+  }
+
+  async invalidate(key: string): Promise<void> {
+    await this.client.del(this.prefix + key);
+  }
+
+  async invalidatePattern(pattern: string): Promise<void> {
+    const keys = await this.client.keys(this.prefix + pattern);
+    if (keys.length > 0) {
+      await this.client.del(...keys);
+    }
+  }
+}
+```
+
+## Observability
+
+### Metrics Collection
+
+Using a lightweight metrics library for local development, compatible with Prometheus in production:
+
+```typescript
+interface Metrics {
+  // Counters
+  toolExecutionCount: Counter;
+  llmApiCalls: Counter;
+  permissionDenials: Counter;
+  cacheHits: Counter;
+  cacheMisses: Counter;
+  errors: Counter;
+
+  // Histograms
+  toolExecutionDuration: Histogram;
+  llmResponseTime: Histogram;
+  contextTokenCount: Histogram;
+
+  // Gauges
+  activeContextTokens: Gauge;
+  cachedEntries: Gauge;
+  sessionMessageCount: Gauge;
+}
+
+class MetricsCollector {
+  private metrics: Map<string, number[]> = new Map();
+  private counters: Map<string, number> = new Map();
+  private gauges: Map<string, number> = new Map();
+
+  // Counter operations
+  increment(name: string, labels?: Record<string, string>): void {
+    const key = this.labeledKey(name, labels);
+    this.counters.set(key, (this.counters.get(key) || 0) + 1);
+  }
+
+  // Histogram operations
+  observe(name: string, value: number, labels?: Record<string, string>): void {
+    const key = this.labeledKey(name, labels);
+    const values = this.metrics.get(key) || [];
+    values.push(value);
+    this.metrics.set(key, values);
+  }
+
+  // Gauge operations
+  set(name: string, value: number): void {
+    this.gauges.set(name, value);
+  }
+
+  // Get statistics
+  getStats(name: string): MetricStats {
+    const values = this.metrics.get(name) || [];
+    if (values.length === 0) return { count: 0 };
+
+    const sorted = [...values].sort((a, b) => a - b);
+    return {
+      count: values.length,
+      min: sorted[0],
+      max: sorted[sorted.length - 1],
+      mean: values.reduce((a, b) => a + b, 0) / values.length,
+      p50: sorted[Math.floor(sorted.length * 0.5)],
+      p95: sorted[Math.floor(sorted.length * 0.95)],
+      p99: sorted[Math.floor(sorted.length * 0.99)]
+    };
+  }
+
+  // Export in Prometheus format
+  toPrometheusFormat(): string {
+    const lines: string[] = [];
+
+    for (const [key, value] of this.counters) {
+      lines.push(`${key}_total ${value}`);
+    }
+
+    for (const [key, value] of this.gauges) {
+      lines.push(`${key} ${value}`);
+    }
+
+    for (const [key, values] of this.metrics) {
+      const stats = this.getStats(key);
+      lines.push(`${key}_count ${stats.count}`);
+      lines.push(`${key}_sum ${values.reduce((a, b) => a + b, 0)}`);
+    }
+
+    return lines.join('\n');
+  }
+}
+```
+
+### Key Metrics and SLIs
+
+| Metric | Type | Description | Alert Threshold |
+|--------|------|-------------|-----------------|
+| `tool_execution_duration_seconds` | Histogram | Time to execute each tool | p99 > 30s |
+| `llm_response_time_seconds` | Histogram | LLM API latency | p95 > 10s |
+| `llm_api_errors_total` | Counter | Failed LLM API calls | > 5/minute |
+| `tool_execution_errors_total` | Counter | Failed tool executions | > 10/minute |
+| `context_tokens_used` | Gauge | Current context window usage | > 90% capacity |
+| `cache_hit_ratio` | Gauge | Cache effectiveness | < 50% |
+| `permission_denials_total` | Counter | User denied operations | N/A (informational) |
+| `session_duration_seconds` | Histogram | How long users stay in sessions | N/A (informational) |
+
+### Structured Logging
+
+```typescript
+interface LogEntry {
+  timestamp: string;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  context: {
+    sessionId?: string;
+    toolName?: string;
+    traceId?: string;
+    spanId?: string;
+  };
+  metadata?: Record<string, unknown>;
+}
+
+class StructuredLogger {
+  private logFile: WriteStream;
+  private level: LogLevel;
+
+  constructor(config: LogConfig) {
+    this.level = config.level;
+    if (config.logFile) {
+      this.logFile = fs.createWriteStream(config.logFile, { flags: 'a' });
+    }
+  }
+
+  log(level: LogLevel, message: string, context?: Partial<LogEntry['context']>): void {
+    if (this.shouldLog(level)) {
+      const entry: LogEntry = {
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+        context: {
+          sessionId: this.currentSessionId,
+          traceId: this.currentTraceId,
+          ...context
+        }
+      };
+
+      // Console output (human-readable)
+      this.writeConsole(entry);
+
+      // File output (JSON for parsing)
+      this.writeFile(entry);
+    }
+  }
+
+  private writeConsole(entry: LogEntry): void {
+    const color = this.levelColor(entry.level);
+    const prefix = `[${entry.timestamp}] [${entry.level.toUpperCase()}]`;
+    console.log(color(`${prefix} ${entry.message}`));
+  }
+
+  private writeFile(entry: LogEntry): void {
+    if (this.logFile) {
+      this.logFile.write(JSON.stringify(entry) + '\n');
+    }
+  }
+
+  // Convenience methods
+  debug(message: string, context?: Partial<LogEntry['context']>): void {
+    this.log('debug', message, context);
+  }
+
+  info(message: string, context?: Partial<LogEntry['context']>): void {
+    this.log('info', message, context);
+  }
+
+  warn(message: string, context?: Partial<LogEntry['context']>): void {
+    this.log('warn', message, context);
+  }
+
+  error(message: string, error?: Error, context?: Partial<LogEntry['context']>): void {
+    this.log('error', message, {
+      ...context,
+      error: error ? { message: error.message, stack: error.stack } : undefined
+    });
+  }
+}
+```
+
+### Distributed Tracing
+
+For understanding the flow of multi-tool operations:
+
+```typescript
+interface Span {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  operationName: string;
+  startTime: number;
+  endTime?: number;
+  tags: Record<string, string>;
+  logs: SpanLog[];
+}
+
+class Tracer {
+  private spans: Map<string, Span> = new Map();
+  private currentSpanId?: string;
+
+  startSpan(operationName: string, tags?: Record<string, string>): Span {
+    const span: Span = {
+      traceId: this.currentTraceId || crypto.randomUUID(),
+      spanId: crypto.randomUUID(),
+      parentSpanId: this.currentSpanId,
+      operationName,
+      startTime: Date.now(),
+      tags: tags || {},
+      logs: []
+    };
+
+    this.spans.set(span.spanId, span);
+    this.currentSpanId = span.spanId;
+
+    return span;
+  }
+
+  endSpan(span: Span): void {
+    span.endTime = Date.now();
+    this.currentSpanId = span.parentSpanId;
+
+    // Log span completion
+    this.logger.debug(`Span completed: ${span.operationName}`, {
+      traceId: span.traceId,
+      spanId: span.spanId,
+      durationMs: span.endTime - span.startTime
+    });
+  }
+
+  // Decorator for automatic tracing
+  traced(operationName: string) {
+    return (target: any, propertyKey: string, descriptor: PropertyDescriptor) => {
+      const original = descriptor.value;
+
+      descriptor.value = async function(...args: any[]) {
+        const span = tracer.startSpan(operationName);
+        try {
+          const result = await original.apply(this, args);
+          span.tags['status'] = 'success';
+          return result;
+        } catch (error) {
+          span.tags['status'] = 'error';
+          span.tags['error'] = error.message;
+          throw error;
+        } finally {
+          tracer.endSpan(span);
+        }
+      };
+    };
+  }
+}
+
+// Usage example
+class AgentController {
+  @tracer.traced('agent.run')
+  async run(userInput: string): Promise<void> {
+    // ... implementation
+  }
+
+  @tracer.traced('agent.executeTool')
+  async executeTool(toolCall: ToolCall): Promise<ToolResult> {
+    // ... implementation
+  }
+}
+```
+
+### Audit Logging
+
+Security-sensitive operations are logged for audit purposes:
+
+```typescript
+interface AuditEvent {
+  timestamp: string;
+  eventType: 'permission_grant' | 'permission_deny' | 'file_write' |
+             'file_delete' | 'command_execute' | 'session_start' | 'session_end';
+  sessionId: string;
+  userId?: string;
+  details: {
+    target?: string;        // File path or command
+    operation?: string;     // Specific operation
+    approved?: boolean;     // For permission events
+    result?: 'success' | 'failure';
+  };
+  metadata?: Record<string, unknown>;
+}
+
+class AuditLogger {
+  private auditFile: WriteStream;
+
+  constructor(auditLogPath: string) {
+    // Append-only audit log
+    this.auditFile = fs.createWriteStream(auditLogPath, {
+      flags: 'a',
+      mode: 0o600  // Read/write only for owner
+    });
+  }
+
+  log(event: AuditEvent): void {
+    const entry = JSON.stringify({
+      ...event,
+      timestamp: new Date().toISOString()
+    });
+
+    this.auditFile.write(entry + '\n');
+  }
+
+  // Audit-logged permission check
+  async checkPermissionWithAudit(request: PermissionRequest): Promise<boolean> {
+    const approved = await this.permissionManager.check(request);
+
+    this.log({
+      timestamp: new Date().toISOString(),
+      eventType: approved ? 'permission_grant' : 'permission_deny',
+      sessionId: this.session.id,
+      details: {
+        target: request.details,
+        operation: request.operation,
+        approved
+      }
+    });
+
+    return approved;
+  }
+
+  // Audit-logged file operations
+  async auditFileWrite(filePath: string, operation: 'write' | 'edit' | 'delete'): void {
+    this.log({
+      timestamp: new Date().toISOString(),
+      eventType: operation === 'delete' ? 'file_delete' : 'file_write',
+      sessionId: this.session.id,
+      details: {
+        target: filePath,
+        operation,
+        result: 'success'
+      }
+    });
+  }
+}
+```
+
+### Dashboard Configuration (Grafana)
+
+For production deployments, here's a sample dashboard configuration:
+
+```json
+{
+  "dashboard": {
+    "title": "evylcode CLI Metrics",
+    "panels": [
+      {
+        "title": "LLM Response Time",
+        "type": "graph",
+        "targets": [{
+          "expr": "histogram_quantile(0.95, rate(llm_response_time_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        }]
+      },
+      {
+        "title": "Tool Execution Rate",
+        "type": "graph",
+        "targets": [{
+          "expr": "rate(tool_execution_count_total[1m])",
+          "legendFormat": "{{tool_name}}"
+        }]
+      },
+      {
+        "title": "Error Rate",
+        "type": "stat",
+        "targets": [{
+          "expr": "rate(errors_total[5m])"
+        }],
+        "thresholds": {
+          "steps": [
+            { "value": 0, "color": "green" },
+            { "value": 0.1, "color": "yellow" },
+            { "value": 1, "color": "red" }
+          ]
+        }
+      },
+      {
+        "title": "Cache Hit Ratio",
+        "type": "gauge",
+        "targets": [{
+          "expr": "cache_hits_total / (cache_hits_total + cache_misses_total)"
+        }],
+        "thresholds": {
+          "steps": [
+            { "value": 0, "color": "red" },
+            { "value": 0.5, "color": "yellow" },
+            { "value": 0.8, "color": "green" }
+          ]
+        }
+      },
+      {
+        "title": "Context Token Usage",
+        "type": "graph",
+        "targets": [{
+          "expr": "context_tokens_used / context_tokens_max * 100",
+          "legendFormat": "% used"
+        }]
+      }
+    ]
+  }
+}
+```
+
+### Alert Rules
+
+```yaml
+# Prometheus alerting rules
+groups:
+  - name: evylcode-alerts
+    rules:
+      - alert: HighLLMLatency
+        expr: histogram_quantile(0.95, rate(llm_response_time_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM API response time is high"
+          description: "p95 latency is {{ $value }}s (threshold: 10s)"
+
+      - alert: LLMAPIErrors
+        expr: rate(llm_api_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM API errors detected"
+          description: "Error rate: {{ $value }}/s"
+
+      - alert: ContextWindowNearLimit
+        expr: context_tokens_used / context_tokens_max > 0.9
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Context window nearly full"
+          description: "Using {{ $value | humanizePercentage }} of context window"
+
+      - alert: LowCacheHitRate
+        expr: cache_hits_total / (cache_hits_total + cache_misses_total) < 0.5
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Cache hit rate is low"
+          description: "Consider adjusting cache TTLs or size"
+```
+
+### Local Development Observability
+
+For local development without full Prometheus/Grafana stack:
+
+```typescript
+// Simple terminal-based dashboard
+class LocalDashboard {
+  private metrics: MetricsCollector;
+  private refreshInterval: number = 5000;
+
+  start(): void {
+    setInterval(() => this.render(), this.refreshInterval);
+  }
+
+  private render(): void {
+    console.clear();
+    console.log(chalk.bold('=== evylcode Metrics ===\n'));
+
+    // LLM Stats
+    const llmStats = this.metrics.getStats('llm_response_time');
+    console.log(chalk.cyan('LLM Response Time:'));
+    console.log(`  p50: ${llmStats.p50?.toFixed(0)}ms  p95: ${llmStats.p95?.toFixed(0)}ms  p99: ${llmStats.p99?.toFixed(0)}ms`);
+
+    // Tool execution
+    const toolCount = this.metrics.getCounter('tool_execution_count');
+    const errorCount = this.metrics.getCounter('tool_execution_errors');
+    console.log(chalk.cyan('\nTool Executions:'));
+    console.log(`  Total: ${toolCount}  Errors: ${errorCount}  Success Rate: ${((toolCount - errorCount) / toolCount * 100).toFixed(1)}%`);
+
+    // Cache
+    const hits = this.metrics.getCounter('cache_hits');
+    const misses = this.metrics.getCounter('cache_misses');
+    const hitRate = hits / (hits + misses) * 100;
+    console.log(chalk.cyan('\nCache:'));
+    console.log(`  Hits: ${hits}  Misses: ${misses}  Hit Rate: ${hitRate.toFixed(1)}%`);
+
+    // Context
+    const tokens = this.metrics.getGauge('context_tokens_used');
+    const maxTokens = 128000;
+    console.log(chalk.cyan('\nContext:'));
+    console.log(`  Tokens: ${tokens}/${maxTokens} (${(tokens/maxTokens*100).toFixed(1)}%)`);
+  }
+}
+
+// Enable with --metrics flag
+if (config.showMetrics) {
+  const dashboard = new LocalDashboard(metrics);
+  dashboard.start();
+}
+```
+
 ## References
 
 - [Anthropic Tool Use Documentation](https://docs.anthropic.com/claude/docs/tool-use)

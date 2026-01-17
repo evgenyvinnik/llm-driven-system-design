@@ -9,9 +9,31 @@ import {
 } from "../utils/index.js";
 import { SendNotificationRequest, NotificationPriority } from "../types/index.js";
 
+/**
+ * Notification Routes.
+ *
+ * Handles sending push notifications to devices and topics.
+ * Provides status checking and notification listing endpoints.
+ *
+ * Routes:
+ * - POST /device/:deviceToken - Send to device by token
+ * - POST /device-id/:deviceId - Send to device by ID
+ * - POST /topic/:topic - Send to topic subscribers
+ * - GET /:notificationId - Get notification details
+ * - GET / - List notifications with filters
+ * - GET /:notificationId/status - Get notification status
+ */
 const router = Router();
 
-// Send notification to a device by token
+/**
+ * Send a notification to a device by its raw token.
+ * Creates a notification record and attempts delivery.
+ *
+ * @route POST /api/v1/notifications/device/:deviceToken
+ * @param deviceToken - 64-character hex device token
+ * @body {payload, priority?, expiration?, collapse_id?}
+ * @returns {notification_id, status}
+ */
 router.post("/device/:deviceToken", async (req: Request, res: Response) => {
   try {
     const { deviceToken } = req.params;
@@ -60,7 +82,15 @@ router.post("/device/:deviceToken", async (req: Request, res: Response) => {
   }
 });
 
-// Send notification to a device by ID
+/**
+ * Send a notification to a device by its server-assigned ID.
+ * Similar to token-based sending but uses internal device ID.
+ *
+ * @route POST /api/v1/notifications/device-id/:deviceId
+ * @param deviceId - UUID device identifier
+ * @body {payload, priority?, expiration?, collapse_id?}
+ * @returns {notification_id, status}
+ */
 router.post("/device-id/:deviceId", async (req: Request, res: Response) => {
   try {
     const { deviceId } = req.params;
@@ -102,7 +132,15 @@ router.post("/device-id/:deviceId", async (req: Request, res: Response) => {
   }
 });
 
-// Send notification to a topic
+/**
+ * Send a notification to all subscribers of a topic.
+ * Queues notifications for all valid devices subscribed to the topic.
+ *
+ * @route POST /api/v1/notifications/topic/:topic
+ * @param topic - Topic name
+ * @body {payload, priority?, expiration?, collapse_id?}
+ * @returns {notification_id, status, queued_count}
+ */
 router.post("/topic/:topic", async (req: Request, res: Response) => {
   try {
     const { topic } = req.params;
@@ -142,7 +180,14 @@ router.post("/topic/:topic", async (req: Request, res: Response) => {
   }
 });
 
-// Get notification by ID
+/**
+ * Get a notification by its ID.
+ * Returns full notification details including payload.
+ *
+ * @route GET /api/v1/notifications/:notificationId
+ * @param notificationId - UUID notification identifier
+ * @returns Notification record
+ */
 router.get("/:notificationId", async (req: Request, res: Response) => {
   try {
     const { notificationId } = req.params;
@@ -166,7 +211,17 @@ router.get("/:notificationId", async (req: Request, res: Response) => {
   }
 });
 
-// List notifications with filters
+/**
+ * List notifications with optional filters.
+ * Supports filtering by device ID and status, with pagination.
+ *
+ * @route GET /api/v1/notifications
+ * @query device_id - Filter by device ID
+ * @query status - Filter by status (pending, queued, delivered, failed, expired)
+ * @query limit - Max results (default 100)
+ * @query offset - Results to skip (default 0)
+ * @returns {notifications: Notification[], total: number}
+ */
 router.get("/", async (req: Request, res: Response) => {
   try {
     const { device_id, status, limit, offset } = req.query;
@@ -188,7 +243,14 @@ router.get("/", async (req: Request, res: Response) => {
   }
 });
 
-// Get notification delivery status
+/**
+ * Get just the status of a notification.
+ * Lighter weight than fetching the full notification.
+ *
+ * @route GET /api/v1/notifications/:notificationId/status
+ * @param notificationId - UUID notification identifier
+ * @returns {notification_id, status, created_at, updated_at}
+ */
 router.get("/:notificationId/status", async (req: Request, res: Response) => {
   try {
     const { notificationId } = req.params;

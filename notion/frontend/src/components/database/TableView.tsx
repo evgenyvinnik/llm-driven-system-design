@@ -1,16 +1,36 @@
+/**
+ * @fileoverview Table view for database visualization.
+ * Renders database rows in a spreadsheet-like table format.
+ */
+
 import { useState } from 'react';
 import type { DatabaseRow, PropertySchema } from '@/types';
 import { Plus, Trash2, MoreHorizontal } from 'lucide-react';
 import PropertyCell from './PropertyCell';
 
+/**
+ * Props for the TableView component.
+ */
 interface TableViewProps {
+  /** Database rows to display */
   rows: DatabaseRow[];
+  /** Column definitions from the database schema */
   schema: PropertySchema[];
+  /** Callback to add a new row */
   onAddRow: () => void;
+  /** Callback to update a row's properties */
   onUpdateRow: (rowId: string, properties: Record<string, unknown>) => void;
+  /** Callback to delete a row */
   onDeleteRow: (rowId: string) => void;
 }
 
+/**
+ * TableView displays database rows in a traditional table format.
+ * Each column corresponds to a property in the schema.
+ *
+ * @param props - Component props
+ * @returns The rendered table view
+ */
 export default function TableView({
   rows,
   schema,

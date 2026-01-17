@@ -334,6 +334,515 @@ Key metrics to track:
 - Input validation on all endpoints
 - CORS configuration for frontend
 
+## Consistency and Idempotency Semantics
+
+This section defines how the system handles consistency, replays, and conflicts for core write operations.
+
+### Consistency Model by Operation
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Ride request | Strong (PostgreSQL transaction) | Must prevent double-booking |
+| Driver location update | Eventual (Redis overwrite) | Latest location always wins |
+| Ride state transition | Strong (row-level lock) | State machine must be atomic |
+| Payment capture | Strong (external idempotency) | Financial correctness required |
+| Driver availability toggle | Eventual (Redis + DB sync) | Small delay acceptable |
+| Rating submission | Strong (upsert with conflict) | One rating per ride per party |
+
+### Idempotency Key Strategy
+
+All mutating API endpoints accept an `X-Idempotency-Key` header (client-generated UUID). The system uses Redis to track processed requests:
+
+```javascript
+// Idempotency middleware
+async function idempotencyMiddleware(req, res, next) {
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  if (!idempotencyKey) return next();
+
+  const cacheKey = `idempotency:${req.userId}:${idempotencyKey}`;
+
+  // Check if request was already processed
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    const { status, body } = JSON.parse(cached);
+    return res.status(status).json(body);
+  }
+
+  // Store pending marker to prevent concurrent duplicate requests
+  const acquired = await redis.set(cacheKey, 'pending', 'NX', 'EX', 60);
+  if (!acquired) {
+    return res.status(409).json({ error: 'Request in progress' });
+  }
+
+  // Capture response to cache
+  const originalJson = res.json.bind(res);
+  res.json = async (body) => {
+    await redis.set(cacheKey, JSON.stringify({
+      status: res.statusCode,
+      body
+    }), 'EX', 86400); // Cache for 24 hours
+    return originalJson(body);
+  };
+
+  next();
+}
+```
+
+**Key TTLs:**
+- In-flight lock: 60 seconds
+- Completed response cache: 24 hours
+- Payment idempotency keys: 7 days (for dispute resolution)
+
+### Conflict Resolution Rules
+
+**Ride State Machine Conflicts:**
+
+```
+requested -> [matched, cancelled]
+matched -> [driver_arrived, cancelled]
+driver_arrived -> [in_progress, cancelled]
+in_progress -> [completed]
+completed -> (terminal)
+cancelled -> (terminal)
+```
+
+State transitions use optimistic locking with version numbers:
+
+```sql
+UPDATE rides
+SET status = 'matched',
+    driver_id = $1,
+    version = version + 1
+WHERE id = $2
+  AND status = 'requested'
+  AND version = $3
+RETURNING *;
+```
+
+If no rows are updated, the operation is rejected (stale state or already transitioned).
+
+**Concurrent Driver Matching:**
+
+When multiple matching workers target the same driver for different rides:
+1. First `UPDATE drivers SET is_available = false WHERE is_available = true` wins
+2. Losing requests re-enter the matching queue
+3. Driver assignment is wrapped in a PostgreSQL transaction with the ride update
+
+**Location Update Conflicts:**
+
+Location updates are last-write-wins by design. Redis GEOADD overwrites previous coordinates. The `driver:location:{id}` hash includes a timestamp to detect stale updates if needed:
+
+```javascript
+// Reject location updates older than 10 seconds
+if (Date.now() - incomingTimestamp > 10000) {
+  return; // Silently drop stale update
+}
+```
+
+## Async Queue Architecture (RabbitMQ)
+
+This section introduces an async queue layer for fanout, background jobs, and backpressure handling.
+
+### Queue Topology
+
+```
+                            ┌──────────────────┐
+                            │   ride.events    │ (fanout exchange)
+                            └────────┬─────────┘
+           ┌─────────────────────────┼─────────────────────────┐
+           ▼                         ▼                         ▼
+   ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+   │ notifications │         │   analytics   │         │    billing    │
+   │    queue      │         │    queue      │         │    queue      │
+   └───────────────┘         └───────────────┘         └───────────────┘
+           │                         │                         │
+           ▼                         ▼                         ▼
+   ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+   │  Push/SMS/    │         │  Event sink   │         │  Payment      │
+   │  Email worker │         │  (Postgres)   │         │  processor    │
+   └───────────────┘         └───────────────┘         └───────────────┘
+```
+
+### Queue Definitions
+
+```javascript
+// RabbitMQ setup for local development
+const QUEUES = {
+  // Ride lifecycle events (fanout to multiple consumers)
+  RIDE_EVENTS: {
+    exchange: 'ride.events',
+    type: 'fanout',
+    queues: ['notifications', 'analytics', 'billing']
+  },
+
+  // Driver matching (work queue with single consumer per message)
+  MATCHING: {
+    queue: 'matching.requests',
+    durable: true,
+    prefetch: 5 // Process 5 concurrent matches per worker
+  },
+
+  // Background jobs (delayed/scheduled)
+  BACKGROUND: {
+    queue: 'background.jobs',
+    deadLetterExchange: 'background.dlx',
+    messageTtl: 300000 // 5 minute max processing time
+  }
+};
+```
+
+### Delivery Semantics
+
+| Queue | Semantics | Ack Strategy | Retry Policy |
+|-------|-----------|--------------|--------------|
+| ride.events (notifications) | At-least-once | Manual ack after send | 3 retries, then DLQ |
+| ride.events (analytics) | At-most-once | Auto ack | No retries (best effort) |
+| ride.events (billing) | At-least-once | Manual ack after DB commit | 5 retries with backoff |
+| matching.requests | At-least-once | Manual ack after match | Immediate retry, then requeue |
+| background.jobs | At-least-once | Manual ack | 3 retries, then DLQ |
+
+### Message Schemas
+
+```typescript
+// Ride event envelope
+interface RideEvent {
+  eventId: string;       // UUID for deduplication
+  eventType: 'requested' | 'matched' | 'completed' | 'cancelled';
+  rideId: string;
+  timestamp: number;
+  payload: {
+    riderId?: string;
+    driverId?: string;
+    fare?: number;
+    location?: { lat: number; lng: number };
+  };
+}
+
+// Matching request
+interface MatchingRequest {
+  requestId: string;     // Idempotency key
+  rideId: string;
+  pickupLocation: { lat: number; lng: number };
+  vehicleType: string;
+  maxWaitSeconds: number;
+  attempt: number;       // For retry tracking
+}
+```
+
+### Backpressure Handling
+
+**Producer-side (API servers):**
+
+```javascript
+// Check queue depth before accepting new ride requests
+async function checkBackpressure() {
+  const queueInfo = await channel.checkQueue('matching.requests');
+  if (queueInfo.messageCount > 100) {
+    throw new ServiceUnavailableError('High demand - please retry');
+  }
+}
+```
+
+**Consumer-side (matching workers):**
+
+```javascript
+// Prefetch limit prevents overwhelming workers
+channel.prefetch(5);
+
+// Reject and requeue if worker is overloaded
+if (process.memoryUsage().heapUsed > 500 * 1024 * 1024) {
+  channel.nack(message, false, true); // Requeue
+  return;
+}
+```
+
+### Dead Letter Queue (DLQ) Processing
+
+Failed messages after max retries go to DLQ for manual inspection:
+
+```javascript
+// DLQ consumer for alerting and manual processing
+channel.consume('background.dlq', async (msg) => {
+  const payload = JSON.parse(msg.content.toString());
+
+  // Log for alerting
+  console.error('DLQ message:', {
+    originalQueue: msg.properties.headers['x-first-death-queue'],
+    reason: msg.properties.headers['x-first-death-reason'],
+    payload
+  });
+
+  // Store in PostgreSQL for admin review
+  await db.query(`
+    INSERT INTO failed_jobs (queue, payload, error_reason, created_at)
+    VALUES ($1, $2, $3, NOW())
+  `, [
+    msg.properties.headers['x-first-death-queue'],
+    JSON.stringify(payload),
+    msg.properties.headers['x-first-death-reason']
+  ]);
+
+  channel.ack(msg);
+});
+```
+
+### Local Development Setup
+
+Add to `docker-compose.yml`:
+
+```yaml
+rabbitmq:
+  image: rabbitmq:3-management
+  ports:
+    - "5672:5672"
+    - "15672:15672"
+  environment:
+    RABBITMQ_DEFAULT_USER: uber
+    RABBITMQ_DEFAULT_PASS: uber
+  volumes:
+    - rabbitmq_data:/var/lib/rabbitmq
+```
+
+## Failure Handling and Resilience
+
+This section covers retry strategies, circuit breakers, disaster recovery, and backup/restore procedures.
+
+### Retry Strategy with Idempotency Keys
+
+**API Layer Retries:**
+
+```javascript
+// Axios client with retry configuration
+const apiClient = axios.create({
+  timeout: 5000,
+  headers: { 'X-Idempotency-Key': () => uuidv4() }
+});
+
+axiosRetry(apiClient, {
+  retries: 3,
+  retryDelay: (retryCount) => {
+    // Exponential backoff: 100ms, 200ms, 400ms
+    return Math.pow(2, retryCount) * 100;
+  },
+  retryCondition: (error) => {
+    // Retry on network errors and 5xx, but not 4xx
+    return axiosRetry.isNetworkOrIdempotentRequestError(error)
+      || (error.response?.status >= 500);
+  }
+});
+```
+
+**Queue Consumer Retries:**
+
+```javascript
+// Retry with exponential backoff for queue messages
+async function processWithRetry(message, handler) {
+  const attempt = (message.properties.headers['x-retry-count'] || 0) + 1;
+  const maxRetries = 3;
+
+  try {
+    await handler(message);
+    channel.ack(message);
+  } catch (error) {
+    if (attempt >= maxRetries) {
+      // Send to DLQ
+      channel.reject(message, false);
+    } else {
+      // Requeue with delay using message TTL
+      const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+      channel.publish('', 'matching.requests.delayed', message.content, {
+        headers: { 'x-retry-count': attempt },
+        expiration: delay.toString()
+      });
+      channel.ack(message);
+    }
+  }
+}
+```
+
+### Circuit Breaker Implementation
+
+```javascript
+const CircuitBreaker = require('opossum');
+
+// Circuit breaker for external services (e.g., payment gateway)
+const paymentCircuit = new CircuitBreaker(capturePayment, {
+  timeout: 10000,           // 10 second timeout
+  errorThresholdPercentage: 50,  // Open after 50% failures
+  resetTimeout: 30000,      // Try again after 30 seconds
+  volumeThreshold: 5        // Minimum 5 requests before tripping
+});
+
+paymentCircuit.on('open', () => {
+  console.warn('Payment circuit OPEN - payments disabled');
+  // Alert ops team
+});
+
+paymentCircuit.on('halfOpen', () => {
+  console.info('Payment circuit HALF-OPEN - testing');
+});
+
+paymentCircuit.on('close', () => {
+  console.info('Payment circuit CLOSED - payments restored');
+});
+
+// Fallback behavior when circuit is open
+paymentCircuit.fallback(() => {
+  return { status: 'pending', message: 'Payment queued for retry' };
+});
+
+// Usage
+async function completeRide(rideId, fare) {
+  const payment = await paymentCircuit.fire(rideId, fare);
+  // ...
+}
+```
+
+**Circuit Breakers by Service:**
+
+| Service | Timeout | Error Threshold | Reset Timeout | Fallback |
+|---------|---------|-----------------|---------------|----------|
+| Payment gateway | 10s | 50% | 30s | Queue for later |
+| Routing/ETA API | 3s | 70% | 15s | Return cached ETA |
+| Push notifications | 2s | 80% | 10s | Queue in Redis |
+| SMS gateway | 5s | 50% | 60s | Queue in DB |
+
+### Graceful Degradation Modes
+
+When components fail, the system degrades gracefully:
+
+| Failure | Degradation | User Impact |
+|---------|-------------|-------------|
+| Redis down | Use PostgreSQL for matching (slower) | Matching takes 2-5s instead of <1s |
+| RabbitMQ down | Queue messages in Redis, process later | Notifications delayed |
+| Payment gateway down | Accept ride, queue payment capture | Payment processed within 1 hour |
+| WebSocket server down | Fall back to polling (5s interval) | Higher latency for updates |
+
+### Multi-Region DR (Production Reference)
+
+For local development, we simulate multi-region with multiple instances:
+
+```bash
+# Simulate "region A" (primary)
+REGION=A PORT=3001 npm run dev:server1
+
+# Simulate "region B" (secondary)
+REGION=B PORT=3002 npm run dev:server2
+```
+
+**Production DR strategy (reference architecture):**
+
+```
+                    ┌─────────────────┐
+                    │   Global LB     │
+                    │  (Route 53/CF)  │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼                             ▼
+       ┌─────────────┐               ┌─────────────┐
+       │  Region A   │               │  Region B   │
+       │  (Primary)  │               │  (Standby)  │
+       └──────┬──────┘               └──────┬──────┘
+              │                             │
+    ┌─────────┼─────────┐         ┌─────────┼─────────┐
+    ▼         ▼         ▼         ▼         ▼         ▼
+ ┌─────┐  ┌─────┐  ┌─────┐   ┌─────┐  ┌─────┐  ┌─────┐
+ │ API │  │Redis│  │ PG  │   │ API │  │Redis│  │ PG  │
+ │     │  │     │  │     │   │     │  │     │  │replica
+ └─────┘  └─────┘  └─────┘   └─────┘  └─────┘  └─────┘
+              │         │                         ▲
+              └─────────┼─────────────────────────┘
+                        │ (async replication)
+```
+
+**Failover triggers:**
+- Primary region health check fails for 30 seconds
+- Database replication lag exceeds 5 minutes
+- Manual operator intervention
+
+**RTO/RPO targets:**
+- RTO (Recovery Time Objective): 5 minutes
+- RPO (Recovery Point Objective): 30 seconds of data loss acceptable
+
+### Backup and Restore Procedures
+
+**PostgreSQL Backups:**
+
+```bash
+# Daily full backup (local dev)
+pg_dump -h localhost -U uber uber_dev > backup_$(date +%Y%m%d).sql
+
+# Restore from backup
+psql -h localhost -U uber uber_dev < backup_20240115.sql
+```
+
+**Automated backup script (cron job):**
+
+```bash
+#!/bin/bash
+# backup.sh - Run daily at 2 AM
+
+BACKUP_DIR="/backups/postgres"
+RETENTION_DAYS=7
+
+# Create backup
+pg_dump -h localhost -U uber -Fc uber_dev > \
+  "$BACKUP_DIR/uber_$(date +%Y%m%d_%H%M%S).dump"
+
+# Clean old backups
+find "$BACKUP_DIR" -name "*.dump" -mtime +$RETENTION_DAYS -delete
+
+# Verify backup is readable
+pg_restore --list "$BACKUP_DIR/uber_$(date +%Y%m%d)*.dump" > /dev/null
+if [ $? -ne 0 ]; then
+  echo "ALERT: Backup verification failed!" | mail -s "Backup Error" ops@example.com
+fi
+```
+
+**Redis Persistence:**
+
+```bash
+# Redis RDB snapshot (already configured in docker-compose)
+# Manually trigger snapshot
+redis-cli BGSAVE
+
+# Check last save time
+redis-cli LASTSAVE
+```
+
+**Backup Restore Testing (Monthly Drill):**
+
+```bash
+# 1. Stop services
+docker-compose stop api
+
+# 2. Create test database
+docker exec uber-postgres createdb -U uber uber_restore_test
+
+# 3. Restore backup
+cat backup_20240115.sql | docker exec -i uber-postgres psql -U uber uber_restore_test
+
+# 4. Verify row counts match
+docker exec uber-postgres psql -U uber -c "SELECT COUNT(*) FROM rides" uber_restore_test
+
+# 5. Run smoke tests against restored DB
+DATABASE_URL=postgres://uber:uber@localhost:5432/uber_restore_test npm run test:smoke
+
+# 6. Cleanup
+docker exec uber-postgres dropdb -U uber uber_restore_test
+```
+
+**Data Recovery Scenarios:**
+
+| Scenario | Recovery Method | Expected Time |
+|----------|-----------------|---------------|
+| Accidental row deletion | Point-in-time recovery from WAL | 15 minutes |
+| Table corruption | Restore from daily backup | 30 minutes |
+| Full database loss | Restore from backup + replay WAL | 1 hour |
+| Redis data loss | Application re-populates from PostgreSQL | 5 minutes |
+| Complete data center loss | Promote standby region | 5 minutes |
+
 ## Future Optimizations
 
 - [ ] Batch matching for high-demand zones

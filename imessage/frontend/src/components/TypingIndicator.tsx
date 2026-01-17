@@ -1,10 +1,27 @@
 import type { TypingUser } from '@/types';
 
+/**
+ * Props for the TypingIndicator component.
+ */
 interface TypingIndicatorProps {
+  /** List of users currently typing in the conversation */
   users: TypingUser[];
 }
 
+/**
+ * Displays an animated typing indicator showing which users are typing.
+ * Shows individual names for 1-2 users, or "X people are typing" for more.
+ * Features animated bouncing dots typical of messaging apps.
+ *
+ * @param props - Component props with typing users
+ * @returns React component for typing indicator
+ */
 export function TypingIndicator({ users }: TypingIndicatorProps) {
+  /**
+   * Generates human-readable text for who is typing.
+   *
+   * @returns Descriptive text like "Alice is typing" or "3 people are typing"
+   */
   const getTypingText = () => {
     if (users.length === 1) {
       return `${users[0].displayName || users[0].username} is typing`;

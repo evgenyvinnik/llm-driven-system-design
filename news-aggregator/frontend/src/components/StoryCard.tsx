@@ -1,12 +1,28 @@
+/**
+ * Story card and list components for displaying news stories.
+ * @module components/StoryCard
+ */
+
 import { Link } from '@tanstack/react-router';
 import { Clock, Newspaper, TrendingUp, Zap } from 'lucide-react';
 import type { Story } from '../types';
 
+/**
+ * Props for the StoryCard component.
+ */
 interface StoryCardProps {
+  /** Story data to display */
   story: Story;
+  /** Whether to render as a featured (larger) card */
   featured?: boolean;
 }
 
+/**
+ * Format a timestamp as human-readable relative time.
+ * Returns "Just now", "Xm ago", "Xh ago", "Xd ago", or a date string.
+ * @param dateString - ISO 8601 timestamp string
+ * @returns Formatted relative time string
+ */
 function formatTimeAgo(dateString: string): string {
   const date = new Date(dateString);
   const now = new Date();
@@ -22,6 +38,15 @@ function formatTimeAgo(dateString: string): string {
   return date.toLocaleDateString();
 }
 
+/**
+ * Card component for displaying a single news story.
+ * Shows story title, summary, topic, source count, and breaking/trending badges.
+ * Links to the story detail page.
+ * @param props - Component props
+ * @param props.story - Story data to display
+ * @param props.featured - Whether to render as featured (default: false)
+ * @returns Story card element linking to story detail page
+ */
 export function StoryCard({ story, featured = false }: StoryCardProps) {
   return (
     <Link
@@ -93,11 +118,25 @@ export function StoryCard({ story, featured = false }: StoryCardProps) {
   );
 }
 
+/**
+ * Props for the StoryList component.
+ */
 interface StoryListProps {
+  /** Array of stories to display */
   stories: Story[];
+  /** Whether the list is currently loading */
   loading?: boolean;
 }
 
+/**
+ * Grid of story cards with loading and empty states.
+ * Renders first story as featured (larger) card.
+ * Shows skeleton loading animation when loading with no stories.
+ * @param props - Component props
+ * @param props.stories - Array of stories to display
+ * @param props.loading - Whether the list is loading (default: false)
+ * @returns Grid of story cards, loading skeleton, or empty state
+ */
 export function StoryList({ stories, loading }: StoryListProps) {
   if (loading && stories.length === 0) {
     return (

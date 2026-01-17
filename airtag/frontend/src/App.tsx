@@ -1,3 +1,9 @@
+/**
+ * Main application component for the Find My frontend.
+ * Handles authentication state, device management, and renders the primary UI.
+ * Shows login form when unauthenticated, or the device list and map when logged in.
+ */
+
 import { useEffect, useState } from 'react';
 import { useStore } from './stores/useStore';
 import { LoginForm } from './components/LoginForm';
@@ -9,6 +15,13 @@ import { MapView } from './components/MapView';
 import { NotificationsPanel } from './components/NotificationsPanel';
 import { AdminDashboard } from './components/AdminDashboard';
 
+/**
+ * Root application component.
+ * Manages authentication check on load and periodic location refresh.
+ * Provides tab switching between device view and admin dashboard for admin users.
+ *
+ * @returns The main application layout or login form
+ */
 function App() {
   const {
     user,

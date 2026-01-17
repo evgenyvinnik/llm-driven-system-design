@@ -1,4 +1,9 @@
-// Main App Component
+/**
+ * @fileoverview Main App component for the Rate Limiter dashboard.
+ *
+ * Provides the top-level layout with header, main content area, and footer.
+ * Orchestrates all dashboard components for testing and monitoring rate limiting.
+ */
 
 import { HealthStatus } from './components/HealthStatus';
 import { MetricsDashboard } from './components/MetricsDashboard';
@@ -7,6 +12,12 @@ import { TestConfiguration } from './components/TestConfiguration';
 import { TestRunner } from './components/TestRunner';
 import { TestResults } from './components/TestResults';
 
+/**
+ * Root application component.
+ * Renders the complete rate limiter dashboard with all interactive components.
+ *
+ * @returns The main application layout
+ */
 export default function App() {
   return (
     <div className="min-h-screen bg-gray-100">

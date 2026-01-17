@@ -1,16 +1,42 @@
+/**
+ * Main spreadsheet grid component with virtualized rendering.
+ * Uses TanStack Virtual for efficient rendering of large datasets.
+ * Handles keyboard navigation, cell selection, and scroll management.
+ *
+ * @module components/SpreadsheetGrid
+ */
+
 import { useRef, useEffect, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useSpreadsheetStore, getColumnLetter } from '../stores/spreadsheet';
 import { Cell } from './Cell';
 import { CollaboratorCursors } from './CollaboratorCursors';
 
+/** Maximum number of rows to virtualize */
 const MAX_ROWS = 1000;
-const MAX_COLS = 26; // A-Z for simplicity
+
+/** Maximum number of columns (A-Z for simplicity) */
+const MAX_COLS = 26;
+
+/** Default row height in pixels */
 const DEFAULT_ROW_HEIGHT = 32;
+
+/** Default column width in pixels */
 const DEFAULT_COL_WIDTH = 100;
+
+/** Height of the column header row */
 const HEADER_HEIGHT = 24;
+
+/** Width of the row number column */
 const ROW_HEADER_WIDTH = 50;
 
+/**
+ * Renders the main spreadsheet grid with virtualized rows and columns.
+ * Includes frozen row/column headers, keyboard navigation, and
+ * collaborator cursor overlays for real-time presence.
+ *
+ * @returns The complete spreadsheet grid component
+ */
 export function SpreadsheetGrid() {
   const containerRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -24,16 +50,29 @@ export function SpreadsheetGrid() {
   const commitEdit = useSpreadsheetStore((state) => state.commitEdit);
   const setEditValue = useSpreadsheetStore((state) => state.setEditValue);
 
+  /**
+   * Returns the width for a specific column, using custom width if set.
+   *
+   * @param index - Column index
+   * @returns Width in pixels
+   */
   const getColumnWidth = useCallback(
     (index: number) => columnWidths.get(index) ?? DEFAULT_COL_WIDTH,
     [columnWidths]
   );
 
+  /**
+   * Returns the height for a specific row, using custom height if set.
+   *
+   * @param index - Row index
+   * @returns Height in pixels
+   */
   const getRowHeight = useCallback(
     (index: number) => rowHeights.get(index) ?? DEFAULT_ROW_HEIGHT,
     [rowHeights]
   );
 
+  // Row virtualizer for vertical scrolling
   const rowVirtualizer = useVirtualizer({
     count: MAX_ROWS,
     getScrollElement: () => containerRef.current,
@@ -41,6 +80,7 @@ export function SpreadsheetGrid() {
     overscan: 10,
   });
 
+  // Column virtualizer for horizontal scrolling
   const columnVirtualizer = useVirtualizer({
     horizontal: true,
     count: MAX_COLS,
@@ -49,7 +89,10 @@ export function SpreadsheetGrid() {
     overscan: 5,
   });
 
-  // Keyboard navigation
+  /**
+   * Keyboard navigation effect.
+   * Handles arrow keys, Enter, Tab, and character input for editing.
+   */
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Ignore if typing in input
@@ -107,7 +150,10 @@ export function SpreadsheetGrid() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [activeCell, editingCell, moveActiveCell, startEditing, commitEdit, setEditValue]);
 
-  // Prevent scroll on selection
+  /**
+   * Global mouse up handler to end selection on document.
+   * Ensures selection stops even if mouse leaves the grid.
+   */
   useEffect(() => {
     const handleMouseUp = () => {
       useSpreadsheetStore.getState().stopSelecting();

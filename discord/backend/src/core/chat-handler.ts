@@ -1,3 +1,15 @@
+/**
+ * Chat Handler Module
+ *
+ * Orchestrates command execution for the chat system.
+ * This is the main entry point for handling user input - it parses commands,
+ * executes the appropriate handler, and returns results to the caller.
+ *
+ * The ChatHandler is transport-agnostic: it receives sessionId and input,
+ * and returns CommandResult. The transport adapters (TCP, HTTP) handle
+ * protocol-specific concerns.
+ */
+
 import type {
   Session,
   ParsedCommand,
@@ -12,9 +24,21 @@ import { messageRouter } from './message-router.js';
 import * as dbOps from '../db/index.js';
 import { logger } from '../utils/logger.js';
 
+/**
+ * Main command handler for the chat system.
+ *
+ * Processes user input (commands and messages) and coordinates between
+ * the various managers (connection, room, history) to execute actions.
+ * All command handlers are private methods that return CommandResult.
+ */
 export class ChatHandler {
   /**
-   * Handle a command or message from a session
+   * Handle user input from any transport.
+   * Parses the input into a command and executes it.
+   *
+   * @param sessionId - ID of the user's session
+   * @param input - Raw input string from the user
+   * @returns Result of command execution
    */
   async handleInput(sessionId: string, input: string): Promise<CommandResult> {
     const session = connectionManager.getSession(sessionId);
@@ -27,7 +51,12 @@ export class ChatHandler {
   }
 
   /**
-   * Execute a parsed command
+   * Execute a parsed command.
+   * Routes to the appropriate handler based on command type.
+   *
+   * @param session - The user's session
+   * @param command - Parsed command to execute
+   * @returns Result of command execution
    */
   private async executeCommand(
     session: Session,
@@ -78,7 +107,10 @@ export class ChatHandler {
   }
 
   /**
-   * /help - Display available commands
+   * Handle /help command.
+   * Returns list of available commands.
+   *
+   * @returns Command result with help text
    */
   private handleHelp(): CommandResult {
     return {
@@ -88,7 +120,12 @@ export class ChatHandler {
   }
 
   /**
-   * /nick <name> - Change nickname
+   * Handle /nick command.
+   * Changes the user's nickname if valid and available.
+   *
+   * @param session - User's session
+   * @param args - Command arguments (expected: [newNickname])
+   * @returns Command result
    */
   private async handleNick(
     session: Session,
@@ -137,7 +174,11 @@ export class ChatHandler {
   }
 
   /**
-   * /list - List users in current room
+   * Handle /list command.
+   * Shows users currently in the same room.
+   *
+   * @param session - User's session
+   * @returns Command result with user list
    */
   private handleList(session: Session): CommandResult {
     if (!session.currentRoom) {
@@ -158,7 +199,11 @@ export class ChatHandler {
   }
 
   /**
-   * /quit - Disconnect
+   * Handle /quit command.
+   * Disconnects the user from the server.
+   *
+   * @param session - User's session
+   * @returns Command result with disconnect flag
    */
   private async handleQuit(session: Session): Promise<CommandResult> {
     // Leave current room if in one
@@ -175,7 +220,12 @@ export class ChatHandler {
   }
 
   /**
-   * /create <room> - Create a new room
+   * Handle /create command.
+   * Creates a new room and auto-joins the user.
+   *
+   * @param session - User's session
+   * @param args - Command arguments (expected: [roomName])
+   * @returns Command result
    */
   private async handleCreate(
     session: Session,
@@ -216,7 +266,12 @@ export class ChatHandler {
   }
 
   /**
-   * /join <room> - Join an existing room
+   * Handle /join command.
+   * Joins an existing room and shows recent history.
+   *
+   * @param session - User's session
+   * @param args - Command arguments (expected: [roomName])
+   * @returns Command result with room info and history
    */
   private async handleJoin(
     session: Session,
@@ -267,7 +322,10 @@ export class ChatHandler {
   }
 
   /**
-   * /rooms - List all available rooms
+   * Handle /rooms command.
+   * Lists all available rooms with member counts.
+   *
+   * @returns Command result with room list
    */
   private async handleRooms(): Promise<CommandResult> {
     const rooms = await roomManager.listRooms();
@@ -292,7 +350,11 @@ export class ChatHandler {
   }
 
   /**
-   * /leave - Leave current room
+   * Handle /leave command.
+   * Leaves the current room.
+   *
+   * @param session - User's session
+   * @returns Command result
    */
   private async handleLeave(session: Session): Promise<CommandResult> {
     if (!session.currentRoom) {
@@ -318,7 +380,12 @@ export class ChatHandler {
   }
 
   /**
-   * /dm <user> <message> - Send direct message
+   * Handle /dm command.
+   * Sends a direct message to another user.
+   *
+   * @param session - User's session
+   * @param args - Command arguments (expected: [targetNickname, ...message])
+   * @returns Command result
    */
   private async handleDM(
     session: Session,
@@ -352,7 +419,12 @@ export class ChatHandler {
   }
 
   /**
-   * Handle a regular chat message
+   * Handle a regular chat message (not a command).
+   * Saves to history and broadcasts to the room.
+   *
+   * @param session - User's session
+   * @param args - Message content as array (will be joined)
+   * @returns Command result with message ID
    */
   private async handleMessage(
     session: Session,
@@ -404,7 +476,10 @@ export class ChatHandler {
   }
 
   /**
-   * Handle user disconnect
+   * Handle user disconnect cleanup.
+   * Called when a connection is closed (TCP disconnect or HTTP session end).
+   *
+   * @param sessionId - ID of the disconnecting session
    */
   async handleDisconnect(sessionId: string): Promise<void> {
     const session = connectionManager.getSession(sessionId);
@@ -424,5 +499,6 @@ export class ChatHandler {
   }
 }
 
+/** Singleton instance of the chat handler */
 export const chatHandler = new ChatHandler();
 export default chatHandler;

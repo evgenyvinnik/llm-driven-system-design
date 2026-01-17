@@ -1,14 +1,29 @@
+/**
+ * Execution display components for monitoring job runs.
+ * Provides list view and detailed execution information with logs.
+ * @module components/ExecutionList
+ */
+
 import { Link } from '@tanstack/react-router';
 import { JobExecution, ExecutionStatus } from '../types';
 import { StatusBadge, Button } from './UI';
 
+/** Props for the ExecutionList component */
 interface ExecutionListProps {
+  /** Array of executions to display */
   executions: JobExecution[];
+  /** Whether to show links to parent jobs */
   showJobLink?: boolean;
+  /** Callback to cancel a running execution */
   onCancel?: (id: string) => void;
+  /** Callback to retry a failed execution */
   onRetry?: (id: string) => void;
 }
 
+/**
+ * Table view of job executions with status and actions.
+ * Shows execution ID, status, timing, and worker information.
+ */
 export function ExecutionList({ executions, showJobLink, onCancel, onRetry }: ExecutionListProps) {
   if (executions.length === 0) {
     return (
@@ -125,12 +140,20 @@ export function ExecutionList({ executions, showJobLink, onCancel, onRetry }: Ex
   );
 }
 
+/** Props for the ExecutionDetail component */
 interface ExecutionDetailProps {
+  /** Execution data including logs and result */
   execution: JobExecution;
+  /** Callback to cancel this execution */
   onCancel?: () => void;
+  /** Callback to retry this execution */
   onRetry?: () => void;
 }
 
+/**
+ * Detailed view of a single execution.
+ * Shows full timing, worker, error/result data, and execution logs.
+ */
 export function ExecutionDetail({ execution, onCancel, onRetry }: ExecutionDetailProps) {
   const duration =
     execution.started_at && execution.completed_at

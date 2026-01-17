@@ -5,10 +5,25 @@ import { api } from '../services/api';
 import { AuctionCard } from '../components/AuctionCard';
 import type { Auction } from '../types';
 
+/**
+ * Route definition for watchlist page (/watchlist).
+ * Protected route - redirects unauthenticated users to login.
+ */
 export const Route = createFileRoute('/watchlist')({
   component: WatchlistPage,
 });
 
+/**
+ * User's watchlist page component.
+ *
+ * Displays grid of auctions the user has marked as "watching".
+ * Watching an auction provides notifications for bidding activity.
+ *
+ * Shows helpful empty state with instructions when no auctions
+ * are being watched.
+ *
+ * @returns JSX element for the watchlist page
+ */
 function WatchlistPage() {
   const navigate = useNavigate();
   const { isAuthenticated } = useAuthStore();

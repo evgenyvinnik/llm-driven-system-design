@@ -1,9 +1,22 @@
+/**
+ * Preferences route - discovery settings configuration.
+ * Allows users to set their matching preferences.
+ */
 import { createFileRoute, Navigate, Link } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useState, useEffect } from 'react';
 import { userApi } from '../services/api';
 import type { UserPreferences } from '../types';
 
+/**
+ * Preferences page component.
+ * Manages user discovery preferences including:
+ * - Gender interests (who to show)
+ * - Age range filters
+ * - Maximum distance
+ * - Profile visibility toggle
+ * @returns Preferences form element
+ */
 function PreferencesPage() {
   const { isAuthenticated } = useAuthStore();
   const [preferences, setPreferences] = useState<UserPreferences | null>(null);

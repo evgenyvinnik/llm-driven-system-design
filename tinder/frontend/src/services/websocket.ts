@@ -1,19 +1,35 @@
+/**
+ * WebSocket client service for real-time communication.
+ * Handles connection management, authentication, message routing, and reconnection.
+ */
+
+/** Generic WebSocket message structure with type discriminator */
 type WebSocketMessage = {
   type: string;
   [key: string]: unknown;
 };
 
+/** Handler function for processing incoming WebSocket messages */
 type MessageHandler = (message: WebSocketMessage) => void;
 
+/**
+ * Singleton WebSocket service that manages the client-side WebSocket connection.
+ * Provides event-based message handling with automatic reconnection.
+ */
 class WebSocketService {
   private ws: WebSocket | null = null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
+  /** Map of message type to array of handler functions */
   private handlers: Map<string, MessageHandler[]> = new Map();
   private userId: string | null = null;
   private isConnecting = false;
 
+  /**
+   * Establishes WebSocket connection and authenticates with the server.
+   * @param userId - User ID to authenticate with
+   */
   connect(userId: string): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) {
       return;
@@ -62,6 +78,9 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Closes the WebSocket connection and resets state.
+   */
   disconnect(): void {
     if (this.ws) {
       this.ws.close();
@@ -71,6 +90,10 @@ class WebSocketService {
     this.reconnectAttempts = 0;
   }
 
+  /**
+   * Attempts to reconnect with exponential backoff.
+   * Stops after maxReconnectAttempts.
+   */
   private attemptReconnect(): void {
     if (this.reconnectAttempts >= this.maxReconnectAttempts || !this.userId) {
       return;
@@ -88,12 +111,20 @@ class WebSocketService {
     }, delay);
   }
 
+  /**
+   * Sends a message through the WebSocket connection.
+   * @param message - Message object to send (will be JSON stringified)
+   */
   send(message: WebSocketMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
     }
   }
 
+  /**
+   * Dispatches incoming message to registered handlers.
+   * @param message - Parsed message from server
+   */
   private handleMessage(message: WebSocketMessage): void {
     const handlers = this.handlers.get(message.type) || [];
     handlers.forEach((handler) => handler(message));
@@ -103,6 +134,12 @@ class WebSocketService {
     allHandlers.forEach((handler) => handler(message));
   }
 
+  /**
+   * Registers a handler for a specific message type.
+   * @param type - Message type to listen for (or 'all' for all messages)
+   * @param handler - Function to call when message is received
+   * @returns Unsubscribe function to remove the handler
+   */
   on(type: string, handler: MessageHandler): () => void {
     const handlers = this.handlers.get(type) || [];
     handlers.push(handler);
@@ -119,6 +156,11 @@ class WebSocketService {
     };
   }
 
+  /**
+   * Removes a handler for a specific message type.
+   * @param type - Message type to remove handler from
+   * @param handler - Specific handler to remove (or undefined to remove all)
+   */
   off(type: string, handler?: MessageHandler): void {
     if (handler) {
       const handlers = this.handlers.get(type) || [];
@@ -132,6 +174,11 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Sends a typing indicator to another user in a match.
+   * @param matchId - The match conversation ID
+   * @param recipientId - The user to notify about typing
+   */
   sendTyping(matchId: string, recipientId: string): void {
     this.send({
       type: 'typing',
@@ -140,9 +187,14 @@ class WebSocketService {
     });
   }
 
+  /**
+   * Checks if the WebSocket connection is currently open.
+   * @returns True if connected, false otherwise
+   */
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 }
 
+/** Singleton instance of the WebSocket service for use across the application */
 export const wsService = new WebSocketService();

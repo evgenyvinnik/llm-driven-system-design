@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Dashboard home page route component.
+ * Displays system-wide statistics, real-time charts, and recent clicks.
+ * Auto-refreshes data every 30 seconds for live monitoring.
+ */
+
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { useDashboardStore } from '../stores/dashboardStore'
@@ -5,10 +11,19 @@ import { StatCard } from '../components/StatCard'
 import { ClickChart } from '../components/ClickChart'
 import { ClickTable } from '../components/ClickTable'
 
+/**
+ * Route definition for the dashboard home page.
+ */
 export const Route = createFileRoute('/')({
   component: Dashboard,
 })
 
+/**
+ * Main dashboard view showing KPIs, time series, and recent activity.
+ * Fetches and displays real-time analytics data with auto-refresh.
+ *
+ * @returns Dashboard layout with stats, charts, and tables
+ */
 function Dashboard() {
   const { stats, realTimeStats, recentClicks, isLoading, error, lastUpdated, refreshAll } =
     useDashboardStore()

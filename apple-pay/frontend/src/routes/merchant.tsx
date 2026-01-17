@@ -1,12 +1,25 @@
+/**
+ * Merchant demo route showcasing the merchant integration perspective.
+ * Demonstrates how merchants create payment sessions and view transactions.
+ */
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { Layout } from '../components/Layout';
 import api from '../services/api';
 
+/** Route configuration for /merchant */
 export const Route = createFileRoute('/merchant')({
   component: MerchantPage,
 });
 
+/**
+ * Merchant demo page for exploring the merchant API integration.
+ * Allows viewing merchant details, creating payment sessions,
+ * viewing recent transactions, and exploring available API endpoints.
+ * This page demonstrates the merchant-side integration workflow.
+ *
+ * @returns JSX element representing the merchant demo interface
+ */
 function MerchantPage() {
   const [merchants, setMerchants] = useState<any[]>([]);
   const [selectedMerchant, setSelectedMerchant] = useState<string | null>(null);

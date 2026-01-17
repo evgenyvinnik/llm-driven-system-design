@@ -1,6 +1,12 @@
+/**
+ * Modal for adding a new device to the user's account.
+ * Provides a two-step wizard: device type selection, then naming.
+ */
+
 import { useState } from 'react';
 import { useStore } from '../stores/useStore';
 
+/** Available device types with display names and emojis */
 const deviceTypes = [
   { type: 'airtag', name: 'AirTag', emoji: '&#9898;' },
   { type: 'iphone', name: 'iPhone', emoji: '&#128241;' },
@@ -14,6 +20,14 @@ interface AddDeviceModalProps {
   onClose: () => void;
 }
 
+/**
+ * Add device modal component.
+ * Two-step form: first select device type, then enter name and optional emoji.
+ *
+ * @param isOpen - Whether the modal is visible
+ * @param onClose - Callback to close the modal
+ * @returns Modal dialog for adding devices
+ */
 export function AddDeviceModal({ isOpen, onClose }: AddDeviceModalProps) {
   const [step, setStep] = useState(1);
   const [selectedType, setSelectedType] = useState('');

@@ -1,9 +1,27 @@
+/**
+ * Comment Item Component
+ *
+ * Displays a single comment with user avatar, name, and content.
+ * Supports visual styling for pinned and highlighted comments.
+ *
+ * @module components/CommentItem
+ */
+
 import { Comment } from '../types';
 
+/** Props for the CommentItem component */
 interface CommentItemProps {
+  /** Comment to display */
   comment: Comment;
 }
 
+/**
+ * Renders a single comment with user information.
+ * Applies special styling for pinned/highlighted comments.
+ *
+ * @param props - Component props containing the comment
+ * @returns Comment item JSX
+ */
 export function CommentItem({ comment }: CommentItemProps) {
   const { user } = comment;
 

@@ -1,6 +1,19 @@
+/**
+ * Authentication panel component for user login, registration, and session management.
+ *
+ * Features:
+ * - Login/register form with validation
+ * - Anonymous guest access option
+ * - User info display when authenticated
+ * - Logout functionality
+ */
 import { useState } from 'react';
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Authentication panel that adapts its UI based on authentication state.
+ * Shows login/register form when not authenticated, user info when authenticated.
+ */
 export function AuthPanel() {
   const { user, isAuthenticated, login, register, logout, loginAnonymous } = useAppStore();
   const [mode, setMode] = useState<'login' | 'register'>('login');
@@ -9,6 +22,10 @@ export function AuthPanel() {
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
+  /**
+   * Handles form submission for login or registration.
+   * Clears form on success, shows error on failure.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -29,6 +46,9 @@ export function AuthPanel() {
     }
   };
 
+  /**
+   * Creates an anonymous guest session for quick access.
+   */
   const handleAnonymous = async () => {
     setError(null);
     setIsLoading(true);
@@ -41,6 +61,9 @@ export function AuthPanel() {
     }
   };
 
+  /**
+   * Logs out the current user.
+   */
   const handleLogout = async () => {
     try {
       await logout();

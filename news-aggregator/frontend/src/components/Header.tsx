@@ -1,13 +1,31 @@
+/**
+ * Application header component.
+ * Provides navigation, search, and user authentication controls.
+ * @module components/Header
+ */
+
 import { Link, useRouter } from '@tanstack/react-router';
 import { Newspaper, Search, Settings, LogIn, LogOut, User, Shield } from 'lucide-react';
 import { useAuthStore } from '../stores';
 import { useState } from 'react';
 
+/**
+ * Main application header with navigation and auth controls.
+ * Displays differently based on authentication state:
+ * - Logged out: Shows sign in button
+ * - Logged in: Shows user info, settings, and logout
+ * - Admin: Additionally shows admin dashboard link
+ * @returns Header element with navigation, search, and auth controls
+ */
 export function Header() {
   const { user, logout } = useAuthStore();
   const router = useRouter();
   const [searchQuery, setSearchQuery] = useState('');
 
+  /**
+   * Handle search form submission.
+   * Navigates to search page with query parameter.
+   */
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     if (searchQuery.trim()) {
@@ -15,6 +33,10 @@ export function Header() {
     }
   };
 
+  /**
+   * Handle user logout.
+   * Clears session and redirects to home page.
+   */
   const handleLogout = async () => {
     await logout();
     router.navigate({ to: '/' });

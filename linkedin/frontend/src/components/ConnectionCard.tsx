@@ -1,8 +1,18 @@
+/**
+ * Connection card component for displaying user connection cards.
+ * Used in PYMK suggestions, connection lists, and search results.
+ * Supports connect button and remove connection actions.
+ *
+ * @module components/ConnectionCard
+ */
 import { Link } from '@tanstack/react-router';
 import type { User, PYMKCandidate } from '../types';
 import { connectionsApi } from '../services/api';
 import { useState } from 'react';
 
+/**
+ * Props for the ConnectionCard component.
+ */
 interface ConnectionCardProps {
   user: User;
   pymkData?: PYMKCandidate;
@@ -12,6 +22,18 @@ interface ConnectionCardProps {
   onRemove?: () => void;
 }
 
+/**
+ * Displays a user card with connection actions.
+ * Shows profile photo, name, headline, and optional PYMK match reasons.
+ * Provides connect button for suggestions and remove button for existing connections.
+ *
+ * @param user - The user to display
+ * @param pymkData - Optional PYMK data with match reasons
+ * @param onConnect - Callback when connection request is sent
+ * @param showConnectButton - Whether to show the connect button
+ * @param showRemoveButton - Whether to show the remove connection button
+ * @param onRemove - Callback when connection is removed
+ */
 export function ConnectionCard({
   user,
   pymkData,

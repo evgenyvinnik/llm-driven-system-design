@@ -149,7 +149,10 @@ router.get('/devices', authMiddleware, async (req: AuthenticatedRequest, res: Re
   }
 });
 
-// Remove device
+/**
+ * DELETE /api/auth/devices/:deviceId
+ * Removes a device and all its provisioned cards.
+ */
 router.delete('/devices/:deviceId', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await authService.removeDevice(req.userId!, req.params.deviceId);
@@ -165,7 +168,10 @@ router.delete('/devices/:deviceId', authMiddleware, async (req: AuthenticatedReq
   }
 });
 
-// Report device lost
+/**
+ * POST /api/auth/devices/:deviceId/lost
+ * Reports a device as lost, suspending all its payment cards.
+ */
 router.post('/devices/:deviceId/lost', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const result = await authService.reportDeviceLost(req.userId!, req.params.deviceId);

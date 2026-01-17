@@ -1,3 +1,14 @@
+/**
+ * Formatting utilities for display in the UI.
+ * Provides human-readable formatting for bytes, dates, and storage indicators.
+ * @module utils/format
+ */
+
+/**
+ * Formats a byte count into a human-readable string.
+ * @param bytes - Number of bytes to format
+ * @returns Formatted string like "1.5 MB" or "256 KB"
+ */
 export function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
 
@@ -8,6 +19,11 @@ export function formatBytes(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/**
+ * Formats a date into a localized string with date and time.
+ * @param date - Date string or Date object to format
+ * @returns Formatted date string like "Jan 15, 2024, 03:45 PM"
+ */
 export function formatDate(date: string | Date): string {
   const d = new Date(date);
   return d.toLocaleDateString('en-US', {
@@ -19,6 +35,13 @@ export function formatDate(date: string | Date): string {
   });
 }
 
+/**
+ * Formats a date as a relative time string.
+ * Shows "Just now", "X minutes ago", etc. for recent dates.
+ * Falls back to absolute date for dates over 7 days old.
+ * @param date - Date string or Date object to format
+ * @returns Relative time string like "2 hours ago"
+ */
 export function formatRelativeDate(date: string | Date): string {
   const d = new Date(date);
   const now = new Date();
@@ -42,6 +65,13 @@ export function formatRelativeDate(date: string | Date): string {
   }
 }
 
+/**
+ * Determines the icon type for a file based on its MIME type.
+ * Used to display appropriate icons in the file browser.
+ * @param mimeType - MIME type of the file
+ * @param isFolder - Whether the item is a folder
+ * @returns Icon type string (folder, image, video, audio, pdf, etc.)
+ */
 export function getFileIcon(mimeType: string | null, isFolder: boolean): string {
   if (isFolder) return 'folder';
 
@@ -60,11 +90,23 @@ export function getFileIcon(mimeType: string | null, isFolder: boolean): string 
   return 'file';
 }
 
+/**
+ * Calculates storage usage percentage.
+ * @param used - Bytes used
+ * @param quota - Total quota in bytes
+ * @returns Percentage of storage used (0-100)
+ */
 export function getStoragePercentage(used: number, quota: number): number {
   if (quota === 0) return 0;
   return Math.min(100, (used / quota) * 100);
 }
 
+/**
+ * Returns the Tailwind CSS class for storage bar color.
+ * Red for >= 90%, yellow for >= 75%, blue otherwise.
+ * @param percentage - Storage usage percentage
+ * @returns Tailwind background color class
+ */
 export function getStorageColor(percentage: number): string {
   if (percentage >= 90) return 'bg-red-500';
   if (percentage >= 75) return 'bg-yellow-500';

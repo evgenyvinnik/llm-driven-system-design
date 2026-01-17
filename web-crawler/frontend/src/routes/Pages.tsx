@@ -1,6 +1,34 @@
+/**
+ * @fileoverview Pages route component for browsing crawled content.
+ *
+ * The Pages view provides a searchable, paginated interface for exploring
+ * all pages that have been crawled by the system. Operators can:
+ * - Search pages by URL or title
+ * - Filter by domain
+ * - View page metadata (status code, size, links, duration)
+ * - Navigate through paginated results
+ *
+ * This view is useful for verifying crawl results, debugging issues,
+ * and understanding the scope of indexed content.
+ *
+ * @module routes/Pages
+ */
+
 import { useEffect, useState } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
 
+/**
+ * Pages route component for browsing crawled page records.
+ *
+ * Features:
+ * - Debounced search (300ms delay)
+ * - Domain filtering
+ * - Paginated table with 25 items per page
+ * - Status code badges (2xx green, 3xx yellow, 4xx/5xx red)
+ * - Clickable URLs that open in new tabs
+ *
+ * @returns Paginated pages browser
+ */
 export function Pages() {
   const { pages, pagesTotal, pagesLoading, fetchPages } = useCrawlerStore();
   const [search, setSearch] = useState('');
@@ -15,12 +43,24 @@ export function Pages() {
     return () => clearTimeout(timeoutId);
   }, [fetchPages, offset, domain, search]);
 
+  /**
+   * Formats byte count into human-readable string.
+   *
+   * @param bytes - Raw byte count
+   * @returns Formatted string with KB/MB/B suffix
+   */
   const formatBytes = (bytes: number): string => {
     if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
     if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)} KB`;
     return `${bytes} B`;
   };
 
+  /**
+   * Formats ISO date string into localized display format.
+   *
+   * @param dateString - ISO date string from the API
+   * @returns Localized date/time string
+   */
   const formatDate = (dateString: string): string => {
     const date = new Date(dateString);
     return date.toLocaleString();

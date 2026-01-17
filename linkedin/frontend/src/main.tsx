@@ -1,3 +1,9 @@
+/**
+ * Application entry point for the LinkedIn clone frontend.
+ * Sets up React with TanStack Router for client-side routing.
+ *
+ * @module main
+ */
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RouterProvider, createRouter } from '@tanstack/react-router';

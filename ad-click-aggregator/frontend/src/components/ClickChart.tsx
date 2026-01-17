@@ -1,10 +1,27 @@
+/**
+ * @fileoverview Time-series chart component for click data visualization.
+ * Uses Recharts library to display clicks over time with responsive sizing.
+ */
+
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
+/**
+ * Props for the ClickChart component.
+ */
 interface ClickChartProps {
+  /** Array of time series data points */
   data: { timestamp: string; clicks: number }[];
+  /** Optional chart title */
   title?: string;
 }
 
+/**
+ * Renders a line chart showing click counts over time.
+ * Automatically formats timestamps for display.
+ *
+ * @param props - Chart data and configuration
+ * @returns Responsive line chart in a styled container
+ */
 export function ClickChart({ data, title = 'Clicks Over Time' }: ClickChartProps) {
   const formattedData = data.map((item) => ({
     ...item,

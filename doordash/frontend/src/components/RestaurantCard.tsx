@@ -1,10 +1,28 @@
 import { Link } from '@tanstack/react-router';
 import type { Restaurant } from '../types';
 
+/**
+ * Props for the RestaurantCard component.
+ */
 interface Props {
+  /** Restaurant data to display */
   restaurant: Restaurant;
 }
 
+/**
+ * Restaurant card component for displaying restaurant information.
+ * Shows restaurant image, name, rating, cuisine type, delivery time, and fee.
+ * Used in the restaurant listing/discovery page.
+ *
+ * Features:
+ * - Displays restaurant image with fallback to initial letter
+ * - Shows "Closed" overlay when restaurant is not accepting orders
+ * - Displays rating, cuisine type, and estimated delivery time
+ * - Shows distance when available (based on user location)
+ *
+ * @param props - Component props containing restaurant data
+ * @returns React component rendering a clickable restaurant card
+ */
 export function RestaurantCard({ restaurant }: Props) {
   return (
     <Link

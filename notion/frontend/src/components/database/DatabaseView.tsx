@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Database view container component.
+ * Manages view switching, row data fetching, and renders the appropriate
+ * view type (table, board, or list).
+ */
+
 import { useState, useEffect } from 'react';
 import type { Page, DatabaseView as DBView, DatabaseRow, PropertySchema } from '@/types';
 import { databasesApi } from '@/services/api';
@@ -6,13 +12,21 @@ import TableView from './TableView';
 import BoardView from './BoardView';
 import ListView from './ListView';
 
+/**
+ * Props for the DatabaseView component.
+ */
 interface DatabaseViewProps {
+  /** The database page containing schema information */
   database: Page;
+  /** Available views for this database */
   views: DBView[];
+  /** Currently selected view ID */
   activeViewId: string | null;
+  /** Callback when switching views */
   onViewChange: (viewId: string) => void;
 }
 
+/** Icon mapping for each view type */
 const VIEW_ICONS = {
   table: Table,
   board: Columns,
@@ -21,6 +35,13 @@ const VIEW_ICONS = {
   gallery: Columns,
 };
 
+/**
+ * DatabaseView manages database visualization and CRUD operations.
+ * Supports multiple view types with tabs for switching between them.
+ *
+ * @param props - Component props
+ * @returns The rendered database view
+ */
 export default function DatabaseView({
   database,
   views,

@@ -1,10 +1,29 @@
+/**
+ * IncomingCall Component
+ *
+ * Full-screen overlay displayed when receiving an incoming call.
+ * Shows caller information with accept and decline buttons.
+ * Features animated ring effect and gradient background.
+ */
+
 import { useStore } from '../stores/useStore';
 
+/**
+ * Props for the IncomingCall component.
+ */
 interface IncomingCallProps {
+  /** Callback invoked when user accepts the call */
   onAnswer: () => void;
+  /** Callback invoked when user declines the call */
   onDecline: () => void;
 }
 
+/**
+ * Renders the incoming call screen with caller info and action buttons.
+ *
+ * @param props - Component props with answer/decline handlers
+ * @returns Full-screen incoming call overlay or null if no caller
+ */
 export function IncomingCall({ onAnswer, onDecline }: IncomingCallProps) {
   const { callState } = useStore();
   const caller = callState.caller;

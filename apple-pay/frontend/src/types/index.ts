@@ -1,3 +1,13 @@
+/**
+ * Frontend type definitions for the Apple Pay demo application.
+ * These types mirror the backend entities but omit sensitive fields
+ * that should not be exposed to the client.
+ */
+
+/**
+ * Represents an authenticated user in the Apple Pay system.
+ * Excludes password_hash and other sensitive backend fields.
+ */
 export interface User {
   id: string;
   email: string;
@@ -5,6 +15,10 @@ export interface User {
   role: 'user' | 'admin';
 }
 
+/**
+ * Represents a registered Apple device that can be used for payments.
+ * Each device has a unique Secure Element for storing payment tokens.
+ */
 export interface Device {
   id: string;
   user_id: string;
@@ -16,6 +30,10 @@ export interface Device {
   created_at: string;
 }
 
+/**
+ * Represents a payment card provisioned to a device.
+ * Contains display information only - no sensitive token data.
+ */
 export interface Card {
   id: string;
   network: 'visa' | 'mastercard' | 'amex';
@@ -34,6 +52,10 @@ export interface Card {
   suspend_reason?: string;
 }
 
+/**
+ * Represents a payment transaction record.
+ * Contains all details needed for transaction history display.
+ */
 export interface Transaction {
   id: string;
   card_id: string;
@@ -54,6 +76,9 @@ export interface Transaction {
   network?: string;
 }
 
+/**
+ * Represents a merchant that can accept Apple Pay payments.
+ */
 export interface Merchant {
   id: string;
   name: string;
@@ -62,11 +87,18 @@ export interface Merchant {
   status: 'active' | 'inactive';
 }
 
+/**
+ * Represents a biometric authentication session.
+ * Used to authorize payment transactions.
+ */
 export interface BiometricSession {
   sessionId: string;
   challenge: string;
 }
 
+/**
+ * Result of a payment processing attempt.
+ */
 export interface PaymentResult {
   success: boolean;
   transaction_id?: string;

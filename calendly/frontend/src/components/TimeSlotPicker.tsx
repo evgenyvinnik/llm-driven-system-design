@@ -1,13 +1,25 @@
 import type { TimeSlot } from '../types';
 import { formatInTimezone } from '../utils/time';
 
+/**
+ * Props for the TimeSlotPicker component.
+ */
 interface TimeSlotPickerProps {
+  /** Array of available time slots */
   slots: TimeSlot[];
+  /** Currently selected slot, or null if none selected */
   selectedSlot: TimeSlot | null;
+  /** Callback when a slot is selected */
   onSelectSlot: (slot: TimeSlot) => void;
+  /** Timezone for displaying slot times */
   timezone: string;
 }
 
+/**
+ * Time slot selection component for booking flow.
+ * Displays available time slots as selectable buttons.
+ * Shows message if no slots are available for the selected date.
+ */
 export function TimeSlotPicker({
   slots,
   selectedSlot,

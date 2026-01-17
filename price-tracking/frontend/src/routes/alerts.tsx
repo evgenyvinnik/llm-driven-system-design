@@ -1,9 +1,19 @@
+/**
+ * Alerts page route displaying price drop notifications.
+ * Shows all alerts with ability to mark as read or delete.
+ * Requires authentication.
+ * @module routes/alerts
+ */
 import { createFileRoute, Navigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useAlertStore } from '../stores/alertStore';
 import { useEffect } from 'react';
 import { AlertItem } from '../components/AlertItem';
 
+/**
+ * Alerts page component.
+ * Lists all user alerts with unread count and bulk actions.
+ */
 function AlertsPage() {
   const { isAuthenticated } = useAuthStore();
   const { alerts, isLoading, fetchAlerts, markAsRead, markAllAsRead, deleteAlert } = useAlertStore();

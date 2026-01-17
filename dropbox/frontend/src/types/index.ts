@@ -1,20 +1,33 @@
+/**
+ * Type definitions for the Dropbox-clone frontend.
+ * These types mirror the backend API response structures.
+ * @module types
+ */
+
+/** Represents an authenticated user in the system */
 export interface User {
   id: string;
   email: string;
   name: string;
   role: 'user' | 'admin';
+  /** Storage quota in bytes */
   quotaBytes: number;
+  /** Current storage usage in bytes */
   usedBytes: number;
 }
 
+/** Represents a file or folder in the storage hierarchy */
 export interface FileItem {
   id: string;
   userId: string;
+  /** ID of parent folder, null for root level items */
   parentId: string | null;
   name: string;
   isFolder: boolean;
+  /** Size in bytes (0 for folders) */
   size: number;
   mimeType: string | null;
+  /** SHA-256 hash of file content for deduplication */
   contentHash: string | null;
   version: number;
   syncStatus: 'synced' | 'syncing' | 'pending' | 'error';
@@ -22,6 +35,7 @@ export interface FileItem {
   updatedAt: string;
 }
 
+/** Represents a historical version of a file */
 export interface FileVersion {
   id: string;
   fileId: string;
@@ -32,6 +46,7 @@ export interface FileVersion {
   createdBy: string | null;
 }
 
+/** Represents a public shareable link to a file */
 export interface SharedLink {
   id: string;
   fileId: string;
@@ -45,6 +60,7 @@ export interface SharedLink {
   fileName?: string;
 }
 
+/** Represents a folder shared directly with a specific user */
 export interface FolderShare {
   id: string;
   folderId: string;
@@ -55,18 +71,21 @@ export interface FolderShare {
   name?: string;
 }
 
+/** Response from folder listing with navigation breadcrumbs */
 export interface FolderContents {
   folder: FileItem | null;
   items: FileItem[];
   breadcrumbs: Array<{ id: string; name: string }>;
 }
 
+/** Response from upload session initialization */
 export interface UploadSession {
   uploadSessionId: string;
   chunksNeeded: string[];
   totalChunks: number;
 }
 
+/** System-wide statistics for admin dashboard */
 export interface SystemStats {
   totalUsers: number;
   totalFiles: number;

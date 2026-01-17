@@ -9,10 +9,18 @@ import {
 import { isValidTimezone } from '../utils/time.js';
 import { z } from 'zod';
 
+/**
+ * Express router for booking management.
+ * Handles booking creation, retrieval, rescheduling, and cancellation.
+ */
 const router = Router();
 
 /**
- * GET /api/bookings - Get bookings for the current user
+ * GET /api/bookings - Get bookings for the current user.
+ * Requires authentication.
+ * @query {status} - Optional filter by status (confirmed, cancelled, rescheduled)
+ * @query {upcoming} - If 'true', only return future bookings
+ * @returns {Booking[]} Array of bookings with details
  */
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -35,7 +43,9 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/bookings/stats - Get dashboard statistics
+ * GET /api/bookings/stats - Get dashboard statistics for the current user.
+ * Requires authentication.
+ * @returns {DashboardStats} Aggregated booking statistics
  */
 router.get('/stats', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -55,7 +65,10 @@ router.get('/stats', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/bookings/:id - Get a specific booking
+ * GET /api/bookings/:id - Get a specific booking with details.
+ * Public endpoint for confirmation pages.
+ * @param {id} - Booking UUID
+ * @returns {Booking} Booking with meeting type and host details
  */
 router.get('/:id', async (req: Request, res: Response) => {
   try {
@@ -82,7 +95,11 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/bookings - Create a new booking
+ * POST /api/bookings - Create a new booking.
+ * Public endpoint for invitees. Implements double-booking prevention.
+ * Sends confirmation emails on success.
+ * @body {meeting_type_id, start_time, invitee_name, invitee_email, invitee_timezone, notes}
+ * @returns {Booking} The newly created booking
  */
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -121,7 +138,12 @@ router.post('/', async (req: Request, res: Response) => {
 });
 
 /**
- * PUT /api/bookings/:id/reschedule - Reschedule a booking
+ * PUT /api/bookings/:id/reschedule - Reschedule an existing booking.
+ * Can be called by authenticated hosts or invitees via booking link.
+ * Validates new slot availability.
+ * @param {id} - Booking UUID
+ * @body {new_start_time} - New start time in ISO 8601 format
+ * @returns {Booking} The updated booking
  */
 router.put('/:id/reschedule', async (req: Request, res: Response) => {
   try {
@@ -154,7 +176,12 @@ router.put('/:id/reschedule', async (req: Request, res: Response) => {
 });
 
 /**
- * DELETE /api/bookings/:id - Cancel a booking
+ * DELETE /api/bookings/:id - Cancel a booking.
+ * Can be called by authenticated hosts or invitees via booking link.
+ * Frees up the time slot for new bookings.
+ * @param {id} - Booking UUID
+ * @body {reason} - Optional cancellation reason
+ * @returns {Booking} The cancelled booking
  */
 router.delete('/:id', async (req: Request, res: Response) => {
   try {

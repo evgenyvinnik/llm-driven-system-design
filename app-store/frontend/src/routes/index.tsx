@@ -1,12 +1,22 @@
+/**
+ * @fileoverview Home page route.
+ * Displays top app charts, new releases, and category browsing.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useCatalogStore } from '../stores/catalogStore';
 import { AppCard } from '../components/AppCard';
 
+/** Home page route definition */
 export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Home page component.
+ * Shows top free/paid apps, new releases, and category grid.
+ */
 function HomePage() {
   const navigate = useNavigate();
   const { categories, topApps, fetchCategories, fetchTopApps, isLoading } = useCatalogStore();
@@ -143,6 +153,11 @@ function HomePage() {
   );
 }
 
+/**
+ * Maps category icon names to emoji representations.
+ * @param icon - Icon name from the API
+ * @returns Emoji string for the category
+ */
 function getCategoryIcon(icon: string | null): string {
   const icons: Record<string, string> = {
     gamepad: '🎮',

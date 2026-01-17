@@ -583,3 +583,553 @@ CREATE INDEX idx_feedback_app ON feedback_queue(app_bundle_id, timestamp);
 | Device connection | Long-lived TCP | Polling | Latency, efficiency |
 | Storage | Store-and-forward | Drop if offline | Delivery guarantee |
 | Token storage | Hashed | Plain | Security |
+
+---
+
+## Consistency and Idempotency Semantics
+
+### Write Consistency Model
+
+**Token Registration: Strong Consistency**
+- Device token registration uses PostgreSQL with `ON CONFLICT` upserts
+- Each registration is idempotent: re-registering the same token updates `last_seen` rather than creating duplicates
+- The `token_hash` UNIQUE constraint ensures no duplicate tokens exist
+
+**Notification Delivery: Eventually Consistent with At-Least-Once Semantics**
+- Notifications may be delivered more than once (device reconnects mid-delivery, network failures)
+- Clients must handle duplicate notifications using the `notification_id`
+- The delivery log records final status but may lag the actual delivery
+
+**Pending Notifications: Last-Write-Wins with Collapse**
+- When using `collapse_id`, newer notifications replace older ones via `ON CONFLICT DO UPDATE`
+- Without `collapse_id`, each notification is independent
+- Expiration is checked at delivery time, not queue time
+
+### Idempotency Keys
+
+**Provider-Supplied Notification IDs:**
+```javascript
+// In APNsGateway.queueNotification()
+const notificationId = headers['apns-id'] || uuid()
+
+// Idempotent insert pattern
+await db.query(`
+  INSERT INTO delivery_log (notification_id, device_id, status, created_at)
+  VALUES ($1, $2, 'queued', NOW())
+  ON CONFLICT (notification_id) DO NOTHING
+`, [notificationId, device.device_id])
+```
+
+Providers can supply their own `apns-id` header. If they retry the same notification:
+1. The delivery_log entry already exists (conflict)
+2. We skip the insert and return the existing notification status
+3. The notification is not re-queued
+
+**Replay Handling:**
+```javascript
+class DeduplicationService {
+  // Redis-based deduplication window (24 hours)
+  async checkAndMark(notificationId) {
+    const key = `dedup:${notificationId}`
+    const exists = await redis.set(key, '1', 'NX', 'EX', 86400)
+    return exists === null // true = duplicate
+  }
+}
+```
+
+For local development, a 24-hour deduplication window is sufficient. Providers retrying failed requests within this window receive the original response.
+
+### Conflict Resolution
+
+**Token Conflicts:**
+- Same token, different app: Rejected (token tied to single app)
+- Same token, same app: Update device_info and last_seen
+- Token invalidation during send: Notification fails with `Unregistered` error
+
+**Pending Notification Conflicts:**
+```sql
+-- collapse_id causes replacement, not duplication
+INSERT INTO pending_notifications (id, device_id, payload, priority, collapse_id)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (device_id, collapse_id)
+DO UPDATE SET payload = $3, priority = $4, created_at = NOW()
+```
+
+When two notifications with the same collapse_id arrive:
+1. The second overwrites the first
+2. Only the latest payload is stored
+3. Original notification_id is lost (intentional for "replace" semantics)
+
+---
+
+## Caching Strategy
+
+### Cache Topology
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Provider API Request                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Redis (Valkey) - L1 Cache                       │
+│  - Device token lookups                                      │
+│  - Connection server mappings                                │
+│  - Rate limit counters                                       │
+└─────────────────────────────────────────────────────────────┘
+                              │ cache miss
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    PostgreSQL                                │
+│  - Source of truth for tokens                                │
+│  - Pending notifications                                     │
+│  - Delivery logs                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Cache-Aside Pattern for Token Lookups
+
+Token lookups are read-heavy and latency-sensitive. We use cache-aside with lazy loading:
+
+```javascript
+class TokenRegistry {
+  async lookup(token) {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+    const cacheKey = `token:${tokenHash}`
+
+    // 1. Check cache first
+    const cached = await redis.get(cacheKey)
+    if (cached) {
+      return JSON.parse(cached)
+    }
+
+    // 2. Cache miss - query database
+    const result = await db.query(`
+      SELECT * FROM device_tokens
+      WHERE token_hash = $1 AND is_valid = true
+    `, [tokenHash])
+
+    if (result.rows.length === 0) {
+      // Cache negative result to prevent repeated DB hits
+      await redis.setex(`token:${tokenHash}:invalid`, 300, '1')
+      return null
+    }
+
+    // 3. Populate cache
+    const device = result.rows[0]
+    await redis.setex(cacheKey, 3600, JSON.stringify(device)) // 1 hour TTL
+
+    return device
+  }
+
+  async invalidateToken(token, reason) {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+
+    // Invalidate in database
+    await db.query(`
+      UPDATE device_tokens
+      SET is_valid = false, invalidated_at = NOW(), invalidation_reason = $2
+      WHERE token_hash = $1
+    `, [tokenHash, reason])
+
+    // Explicit cache invalidation
+    await redis.del(`token:${tokenHash}`)
+    await redis.setex(`token:${tokenHash}:invalid`, 3600, reason)
+
+    await this.feedbackService.reportInvalidToken(token, reason)
+  }
+}
+```
+
+### TTL Configuration
+
+| Cache Key Pattern | TTL | Rationale |
+|-------------------|-----|-----------|
+| `token:{hash}` | 1 hour | Device tokens are stable; 1-hour TTL balances freshness vs DB load |
+| `token:{hash}:invalid` | 1 hour | Prevents repeated lookups for known-bad tokens |
+| `conn:{deviceId}` | 5 minutes | Connection server location; short TTL handles reconnects |
+| `rate:device:{id}` | 1 minute | Sliding window for per-device rate limiting |
+| `rate:app:{bundleId}` | 1 minute | Sliding window for per-app rate limiting |
+| `dedup:{notificationId}` | 24 hours | Idempotency window for notification retries |
+
+### Write-Through for Connection State
+
+Device connection state uses write-through caching because it must be immediately consistent:
+
+```javascript
+class PushService {
+  async onDeviceConnect(deviceId, connection) {
+    // Write-through: update Redis immediately
+    await redis.setex(`conn:${deviceId}`, 300, JSON.stringify({
+      serverId: this.serverId,
+      connectedAt: Date.now()
+    }))
+
+    this.connections.set(deviceId, connection)
+    await this.deliverPendingNotifications(deviceId, connection)
+  }
+
+  async onDeviceDisconnect(deviceId) {
+    // Immediate invalidation
+    await redis.del(`conn:${deviceId}`)
+    this.connections.delete(deviceId)
+  }
+}
+```
+
+### Cache Invalidation Rules
+
+1. **Token changes**: Invalidate on registration update or token invalidation
+2. **Connection changes**: Write-through on connect, delete on disconnect
+3. **Rate limits**: TTL-based expiration only (no manual invalidation)
+4. **Deduplication**: TTL-based expiration only
+
+### Local Development Notes
+
+For local development with a single Redis instance:
+
+```bash
+# Start Valkey/Redis
+docker-compose up -d valkey
+
+# Monitor cache activity
+redis-cli monitor
+
+# Check cache hit ratio (approximate)
+redis-cli INFO stats | grep keyspace
+```
+
+---
+
+## Observability
+
+### Metrics
+
+Expose Prometheus metrics on `/metrics` endpoint:
+
+```javascript
+const promClient = require('prom-client')
+
+// Request metrics
+const httpRequestDuration = new promClient.Histogram({
+  name: 'apns_http_request_duration_seconds',
+  help: 'Duration of HTTP requests',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5]
+})
+
+// Notification metrics
+const notificationsSent = new promClient.Counter({
+  name: 'apns_notifications_sent_total',
+  help: 'Total notifications sent',
+  labelNames: ['priority', 'status'] // status: delivered, queued, expired, failed
+})
+
+const notificationDeliveryLatency = new promClient.Histogram({
+  name: 'apns_notification_delivery_seconds',
+  help: 'Time from notification receipt to delivery',
+  labelNames: ['priority'],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+})
+
+// Queue metrics
+const pendingNotificationsGauge = new promClient.Gauge({
+  name: 'apns_pending_notifications',
+  help: 'Number of pending notifications for offline devices'
+})
+
+// Connection metrics
+const activeConnections = new promClient.Gauge({
+  name: 'apns_active_device_connections',
+  help: 'Number of active device connections'
+})
+
+// Token metrics
+const tokenOperations = new promClient.Counter({
+  name: 'apns_token_operations_total',
+  help: 'Token registry operations',
+  labelNames: ['operation'] // register, invalidate, lookup_hit, lookup_miss
+})
+
+// Cache metrics
+const cacheHits = new promClient.Counter({
+  name: 'apns_cache_hits_total',
+  help: 'Cache hits',
+  labelNames: ['cache'] // token, connection
+})
+
+const cacheMisses = new promClient.Counter({
+  name: 'apns_cache_misses_total',
+  help: 'Cache misses',
+  labelNames: ['cache']
+})
+```
+
+### Structured Logging
+
+Use JSON-formatted logs for easy parsing:
+
+```javascript
+const pino = require('pino')
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  }
+})
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now()
+  res.on('finish', () => {
+    logger.info({
+      type: 'http_request',
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
+      request_id: req.headers['x-request-id']
+    })
+  })
+  next()
+})
+
+// Notification delivery logging
+async function logDelivery(notification, result) {
+  logger.info({
+    type: 'notification_delivery',
+    notification_id: notification.id,
+    device_id: notification.deviceId,
+    priority: notification.priority,
+    status: result.delivered ? 'delivered' : (result.queued ? 'queued' : 'failed'),
+    latency_ms: Date.now() - notification.createdAt
+  })
+}
+
+// Error logging with context
+function logError(error, context) {
+  logger.error({
+    type: 'error',
+    error: error.message,
+    stack: error.stack,
+    ...context
+  })
+}
+```
+
+### Distributed Tracing
+
+Add trace context propagation for request flows:
+
+```javascript
+const { trace, context, propagation } = require('@opentelemetry/api')
+
+const tracer = trace.getTracer('apns-service')
+
+// Trace notification delivery
+async function deliverWithTracing(notification) {
+  const span = tracer.startSpan('deliver_notification', {
+    attributes: {
+      'notification.id': notification.id,
+      'notification.priority': notification.priority,
+      'device.id': notification.deviceId
+    }
+  })
+
+  try {
+    const result = await pushService.deliverNotification(notification)
+    span.setAttributes({
+      'notification.status': result.delivered ? 'delivered' : 'queued'
+    })
+    return result
+  } catch (error) {
+    span.recordException(error)
+    span.setStatus({ code: SpanStatusCode.ERROR })
+    throw error
+  } finally {
+    span.end()
+  }
+}
+```
+
+### SLI Dashboard (Grafana)
+
+Key panels for a local Grafana dashboard:
+
+**Delivery SLIs:**
+```promql
+# Delivery success rate (target: 99.99%)
+sum(rate(apns_notifications_sent_total{status="delivered"}[5m])) /
+sum(rate(apns_notifications_sent_total[5m]))
+
+# High-priority delivery latency p99 (target: < 500ms)
+histogram_quantile(0.99,
+  rate(apns_notification_delivery_seconds_bucket{priority="10"}[5m])
+)
+
+# Notification throughput
+sum(rate(apns_notifications_sent_total[1m])) * 60
+```
+
+**Infrastructure Health:**
+```promql
+# Active device connections
+apns_active_device_connections
+
+# Pending notification backlog
+apns_pending_notifications
+
+# Cache hit ratio
+sum(rate(apns_cache_hits_total[5m])) /
+(sum(rate(apns_cache_hits_total[5m])) + sum(rate(apns_cache_misses_total[5m])))
+
+# Token lookup latency p95
+histogram_quantile(0.95, rate(apns_http_request_duration_seconds_bucket{route="/lookup"}[5m]))
+```
+
+### Alert Thresholds
+
+Configure alerts in Prometheus alerting rules:
+
+```yaml
+groups:
+  - name: apns-alerts
+    rules:
+      # Delivery success rate dropping
+      - alert: DeliverySuccessRateLow
+        expr: |
+          sum(rate(apns_notifications_sent_total{status="delivered"}[5m])) /
+          sum(rate(apns_notifications_sent_total[5m])) < 0.99
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification delivery success rate below 99%"
+
+      # High-priority latency SLO breach
+      - alert: HighPriorityLatencyHigh
+        expr: |
+          histogram_quantile(0.99, rate(apns_notification_delivery_seconds_bucket{priority="10"}[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High-priority notification p99 latency exceeds 500ms"
+
+      # Pending notification backlog growing
+      - alert: PendingBacklogHigh
+        expr: apns_pending_notifications > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pending notification backlog exceeds 10,000"
+
+      # Cache hit ratio low
+      - alert: CacheHitRatioLow
+        expr: |
+          sum(rate(apns_cache_hits_total{cache="token"}[5m])) /
+          (sum(rate(apns_cache_hits_total{cache="token"}[5m])) + sum(rate(apns_cache_misses_total{cache="token"}[5m]))) < 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Token cache hit ratio below 80%"
+
+      # No active connections (local dev: expect at least 1 test device)
+      - alert: NoActiveConnections
+        expr: apns_active_device_connections == 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "No active device connections"
+```
+
+### Audit Logging
+
+Security-relevant events are logged to a separate audit log:
+
+```javascript
+const auditLogger = pino({
+  level: 'info'
+}, pino.destination('./logs/audit.log'))
+
+// Token lifecycle events
+function auditTokenEvent(event, tokenHash, context) {
+  auditLogger.info({
+    type: 'token_audit',
+    event,  // 'registered', 'invalidated', 'lookup_failed'
+    token_hash_prefix: tokenHash.substring(0, 8),
+    app_bundle_id: context.appBundleId,
+    timestamp: new Date().toISOString(),
+    actor: context.actor,  // 'provider', 'system', 'admin'
+    reason: context.reason
+  })
+}
+
+// Provider authentication events
+function auditAuthEvent(event, providerId, context) {
+  auditLogger.info({
+    type: 'auth_audit',
+    event,  // 'auth_success', 'auth_failure', 'token_expired'
+    provider_id: providerId,
+    ip_address: context.ip,
+    timestamp: new Date().toISOString(),
+    user_agent: context.userAgent
+  })
+}
+
+// Admin operations
+function auditAdminEvent(event, adminId, context) {
+  auditLogger.info({
+    type: 'admin_audit',
+    event,  // 'bulk_invalidate', 'view_feedback', 'rate_limit_change'
+    admin_id: adminId,
+    timestamp: new Date().toISOString(),
+    details: context.details
+  })
+}
+```
+
+### Local Development Setup
+
+Add to `docker-compose.yml` for local observability stack:
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  grafana-data:
+```
+
+Prometheus scrape config (`prometheus.yml`):
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'apns'
+    static_configs:
+      - targets: ['host.docker.internal:3000']  # API server
+```

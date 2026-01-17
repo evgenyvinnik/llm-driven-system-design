@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Admin dashboard route.
+ * Provides system statistics, user management, and administrative controls.
+ */
+
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import {
@@ -15,6 +20,11 @@ import { api } from '../services/api';
 import { useAuthStore } from '../stores/authStore';
 import type { AdminStats, User, Post, SearchHistoryEntry } from '../types';
 
+/**
+ * Admin dashboard component.
+ * Displays system stats, health status, and management tables.
+ * Restricted to users with admin role.
+ */
 function AdminPage() {
   const { user, isAuthenticated } = useAuthStore();
   const navigate = useNavigate();
@@ -398,6 +408,10 @@ function AdminPage() {
   );
 }
 
+/**
+ * Statistics card component for the admin dashboard.
+ * Displays a metric with an icon and color-coded styling.
+ */
 function StatCard({
   icon: Icon,
   label,
@@ -436,6 +450,10 @@ function StatCard({
   );
 }
 
+/**
+ * Health status indicator component.
+ * Shows a green check or red alert based on service status.
+ */
 function HealthIndicator({ label, status }: { label: string; status: boolean }) {
   return (
     <div className="flex items-center gap-1.5">
@@ -451,6 +469,9 @@ function HealthIndicator({ label, status }: { label: string; status: boolean }) 
   );
 }
 
+/**
+ * TanStack Router file route for the admin dashboard.
+ */
 export const Route = createFileRoute('/admin')({
   component: AdminPage,
 });

@@ -1,15 +1,30 @@
+/**
+ * Modal dialog for moving files and folders to a different location.
+ * Provides a folder browser to select destination directory.
+ * @module components/MoveModal
+ */
+
 import { useState, useEffect } from 'react';
 import { X, Folder, ChevronRight } from 'lucide-react';
 import { FileItem, FolderContents } from '../types';
 import { filesApi } from '../services/api';
 
+/** Props for the MoveModal component */
 interface MoveModalProps {
+  /** Whether the modal is currently visible */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
+  /** The file or folder to move (null if none selected) */
   item: FileItem | null;
+  /** Callback to move item to selected folder (null for root) */
   onMove: (parentId: string | null) => Promise<void>;
 }
 
+/**
+ * Renders a modal for moving files and folders.
+ * Displays a navigable folder tree to select the destination.
+ */
 export function MoveModal({ isOpen, onClose, item, onMove }: MoveModalProps) {
   const [currentFolder, setCurrentFolder] = useState<FolderContents | null>(null);
   const [isLoading, setIsLoading] = useState(false);

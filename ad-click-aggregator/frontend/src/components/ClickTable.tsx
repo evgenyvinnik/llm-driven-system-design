@@ -1,10 +1,27 @@
+/**
+ * @fileoverview Table component for displaying click event data.
+ * Shows recent clicks with timestamp, ad info, device, country, and fraud status.
+ */
+
 import type { ClickEvent } from '../types';
 
+/**
+ * Props for the ClickTable component.
+ */
 interface ClickTableProps {
+  /** Array of click events to display */
   clicks: ClickEvent[];
+  /** Optional table title */
   title?: string;
 }
 
+/**
+ * Renders a table of click events with fraud status indicators.
+ * Displays empty state message when no clicks are available.
+ *
+ * @param props - Click data and configuration
+ * @returns Styled table element with click details
+ */
 export function ClickTable({ clicks, title = 'Recent Clicks' }: ClickTableProps) {
   return (
     <div className="rounded-lg border border-gray-200 bg-white">

@@ -1,8 +1,18 @@
+/**
+ * @fileoverview Workspace selection and management component.
+ * Allows users to select, create, or join workspaces.
+ */
+
 import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { workspaceApi } from '../services/api';
 import { useWorkspaceStore } from '../stores';
 
+/**
+ * Workspace selection component.
+ * Displays the user's workspaces and provides options to create
+ * a new workspace or join an existing one by domain.
+ */
 export function WorkspaceSelect() {
   const [mode, setMode] = useState<'list' | 'create' | 'join'>('list');
   const [name, setName] = useState('');

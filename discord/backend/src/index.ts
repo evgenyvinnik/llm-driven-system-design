@@ -1,3 +1,21 @@
+/**
+ * Baby Discord Server Entry Point
+ *
+ * This is the main entry point for the Baby Discord server.
+ * It initializes all components and starts both TCP and HTTP servers.
+ *
+ * Startup sequence:
+ * 1. Load environment variables
+ * 2. Verify database connection
+ * 3. Load message history into memory
+ * 4. Connect to Redis for pub/sub (optional - degrades gracefully)
+ * 5. Subscribe to existing room channels
+ * 6. Start TCP server (for netcat clients)
+ * 7. Start HTTP server (for browser clients)
+ *
+ * The server supports graceful shutdown on SIGTERM/SIGINT.
+ */
+
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -8,13 +26,22 @@ import { db } from './db/index.js';
 import { logger } from './utils/logger.js';
 import type { PubSubMessage, ChatMessage } from './types/index.js';
 
+/** Instance ID for multi-instance deployments */
 const instanceId = process.env.INSTANCE_ID || '1';
+/** TCP server port (default: 9001) */
 const tcpPort = parseInt(process.env.TCP_PORT || '9001', 10);
+/** HTTP server port (default: 3001) */
 const httpPort = parseInt(process.env.HTTP_PORT || '3001', 10);
 
+/** TCP server instance */
 let tcpServer: TCPServer;
+/** HTTP server instance */
 let httpServer: HTTPServer;
 
+/**
+ * Initialize and start the Baby Discord server.
+ * Sets up all components and begins accepting connections.
+ */
 async function main() {
   logger.info(`Starting Baby Discord instance ${instanceId}`);
 
@@ -71,7 +98,12 @@ async function main() {
   }
 }
 
-// Graceful shutdown
+/**
+ * Perform graceful shutdown.
+ * Closes all connections in reverse order of initialization.
+ *
+ * @param signal - The signal that triggered shutdown (SIGTERM or SIGINT)
+ */
 async function shutdown(signal: string) {
   logger.info(`Received ${signal}, shutting down gracefully...`);
 

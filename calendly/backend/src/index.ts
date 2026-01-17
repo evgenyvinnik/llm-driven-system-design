@@ -13,23 +13,37 @@ import adminRoutes from './routes/admin.js';
 // Redis session store
 import RedisStore from 'connect-redis';
 
+/**
+ * Express application for the Calendly API server.
+ * Provides RESTful endpoints for scheduling and booking management.
+ */
 const app = express();
+
+/** Server port from environment or default to 3001 */
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// CORS configuration for frontend requests
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
 }));
 
+// Parse JSON request bodies
 app.use(express.json());
 
-// Session configuration with Redis
+/**
+ * Redis-backed session store.
+ * Sessions are prefixed with 'calendly:session:' in Redis.
+ */
 const redisStore = new RedisStore({
   client: redis,
   prefix: 'calendly:session:',
 });
 
+/**
+ * Session middleware configuration.
+ * Uses Redis for session storage with secure cookie settings.
+ */
 app.use(session({
   store: redisStore,
   secret: process.env.SESSION_SECRET || 'calendly-secret-key-change-in-production',
@@ -43,7 +57,10 @@ app.use(session({
   },
 }));
 
-// Health check
+/**
+ * Health check endpoint.
+ * Returns status of database and Redis connections.
+ */
 app.get('/health', async (req, res) => {
   const dbHealthy = await testDatabaseConnection();
   const redisHealthy = await testRedisConnection();
@@ -55,14 +72,17 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// API Routes
+// Mount API route handlers
 app.use('/api/auth', authRoutes);
 app.use('/api/meeting-types', meetingTypesRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/bookings', bookingsRoutes);
 app.use('/api/admin', adminRoutes);
 
-// Error handling
+/**
+ * Global error handler for unhandled errors.
+ * Logs the error and returns a generic 500 response.
+ */
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
@@ -71,7 +91,9 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   });
 });
 
-// 404 handler
+/**
+ * 404 handler for unmatched routes.
+ */
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -79,7 +101,10 @@ app.use((req, res) => {
   });
 });
 
-// Start server
+/**
+ * Initializes and starts the API server.
+ * Tests database and Redis connections before listening.
+ */
 async function start() {
   console.log('Starting Calendly API server...');
 

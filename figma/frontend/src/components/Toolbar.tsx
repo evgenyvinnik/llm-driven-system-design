@@ -1,7 +1,15 @@
+/**
+ * Toolbar component for the design editor.
+ * Displays the application logo, file name, tool selection buttons,
+ * undo/redo controls, and collaborator avatars.
+ */
 import React from 'react';
 import { useEditorStore } from '../stores/editorStore';
 import type { Tool } from '../types';
 
+/**
+ * Available tools with their keyboard shortcuts and icons.
+ */
 const tools: { id: Tool; label: string; icon: string }[] = [
   { id: 'select', label: 'Select (V)', icon: 'V' },
   { id: 'rectangle', label: 'Rectangle (R)', icon: 'R' },
@@ -10,6 +18,11 @@ const tools: { id: Tool; label: string; icon: string }[] = [
   { id: 'hand', label: 'Hand (H)', icon: 'H' },
 ];
 
+/**
+ * Toolbar component providing access to design tools and actions.
+ * Includes keyboard shortcuts for tool switching (V, R, O, T, H).
+ * @returns The rendered toolbar element
+ */
 export function Toolbar() {
   const { activeTool, setActiveTool, fileName, collaborators, undo, redo } = useEditorStore();
 

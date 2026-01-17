@@ -4,11 +4,18 @@ import { paymentService } from '../services/payment.js';
 import { generateCryptogram } from '../utils/crypto.js';
 import { z } from 'zod';
 
+/**
+ * Express router for merchant-facing API endpoints.
+ * Provides endpoints for merchants to process Apple Pay payments,
+ * manage payment sessions, and handle refunds.
+ * Note: In production, these endpoints would require merchant API key authentication.
+ */
 const router = Router();
 
 // Merchant API for processing Apple Pay payments
 // In a real system, this would use merchant API keys for authentication
 
+/** Zod schema for merchant payment processing validation */
 const merchantPaymentSchema = z.object({
   token_dpan: z.string(),
   cryptogram: z.string(),
@@ -16,11 +23,16 @@ const merchantPaymentSchema = z.object({
   currency: z.string().length(3).default('USD'),
 });
 
+/** Zod schema for refund request validation */
 const refundSchema = z.object({
   transaction_id: z.string().uuid(),
   amount: z.number().positive().optional(),
 });
 
+/**
+ * GET /api/merchants/:merchantId
+ * Retrieves information about a specific merchant.
+ */
 // Get merchant info
 router.get('/:merchantId', async (req: Request, res: Response) => {
   try {
@@ -40,6 +52,10 @@ router.get('/:merchantId', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/merchants
+ * Lists all active merchants (for demo purposes).
+ */
 // List all merchants (for demo)
 router.get('/', async (_req: Request, res: Response) => {
   try {
@@ -55,6 +71,11 @@ router.get('/', async (_req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/merchants/:merchantId/sessions
+ * Creates a payment session for in-app or web checkout.
+ * Returns a session ID that can be used with the Apple Pay JS API.
+ */
 // Create a payment session (for in-app/web payments)
 router.post('/:merchantId/sessions', async (req: Request, res: Response) => {
   try {
@@ -94,6 +115,11 @@ router.post('/:merchantId/sessions', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/merchants/:merchantId/process
+ * Processes an Apple Pay payment with token and cryptogram.
+ * Simulates the merchant-side integration with card networks.
+ */
 // Process a payment (simulated merchant integration)
 router.post('/:merchantId/process', async (req: Request, res: Response) => {
   try {
@@ -141,6 +167,11 @@ router.post('/:merchantId/process', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/merchants/:merchantId/refund
+ * Refunds a previously completed transaction.
+ * Supports partial refunds when amount is specified.
+ */
 // Refund a transaction
 router.post('/:merchantId/refund', async (req: Request, res: Response) => {
   try {
@@ -170,6 +201,11 @@ router.post('/:merchantId/refund', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/merchants/:merchantId/transactions
+ * Lists all transactions for a specific merchant.
+ * Supports pagination via limit and offset query parameters.
+ */
 // Get merchant transactions
 router.get('/:merchantId/transactions', async (req: Request, res: Response) => {
   try {

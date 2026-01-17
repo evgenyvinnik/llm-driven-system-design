@@ -11,6 +11,11 @@ import type { Operation, TextOperation, DeleteOperation } from '../types/index.j
 /**
  * Transform operation op1 against op2.
  * Returns the transformed op1 that should be applied after op2.
+ * This is the core of OT - ensures convergent document state.
+ *
+ * @param op1 - The operation to transform
+ * @param op2 - The operation that op1 must be transformed against
+ * @returns The transformed version of op1
  */
 export function transform(op1: Operation, op2: Operation): Operation {
   // Insert vs Insert
@@ -43,7 +48,12 @@ export function transform(op1: Operation, op2: Operation): Operation {
 }
 
 /**
- * Transform insert against insert
+ * Transform insert against insert.
+ * Adjusts position based on relative insertion points.
+ *
+ * @param op1 - Insert operation to transform
+ * @param op2 - Insert operation that was applied first
+ * @returns Transformed insert operation
  */
 function transformInsertInsert(op1: TextOperation, op2: TextOperation): TextOperation {
   if (op1.position < op2.position) {
@@ -66,7 +76,12 @@ function transformInsertInsert(op1: TextOperation, op2: TextOperation): TextOper
 }
 
 /**
- * Transform insert against delete
+ * Transform insert against delete.
+ * Adjusts insert position if delete removed characters before it.
+ *
+ * @param op1 - Insert operation to transform
+ * @param op2 - Delete operation that was applied first
+ * @returns Transformed insert operation
  */
 function transformInsertDelete(op1: TextOperation, op2: DeleteOperation): TextOperation {
   if (op1.position <= op2.position) {
@@ -88,7 +103,12 @@ function transformInsertDelete(op1: TextOperation, op2: DeleteOperation): TextOp
 }
 
 /**
- * Transform delete against insert
+ * Transform delete against insert.
+ * Adjusts delete position if insert added characters before it.
+ *
+ * @param op1 - Delete operation to transform
+ * @param op2 - Insert operation that was applied first
+ * @returns Transformed delete operation
  */
 function transformDeleteInsert(op1: DeleteOperation, op2: TextOperation): DeleteOperation {
   if (op1.position >= op2.position) {
@@ -111,7 +131,12 @@ function transformDeleteInsert(op1: DeleteOperation, op2: TextOperation): Delete
 }
 
 /**
- * Transform delete against delete
+ * Transform delete against delete.
+ * Handles overlapping deletions by adjusting position and length.
+ *
+ * @param op1 - Delete operation to transform
+ * @param op2 - Delete operation that was applied first
+ * @returns Transformed delete operation
  */
 function transformDeleteDelete(op1: DeleteOperation, op2: DeleteOperation): DeleteOperation {
   // If op1 is entirely before op2
@@ -168,7 +193,12 @@ function transformDeleteDelete(op1: DeleteOperation, op2: DeleteOperation): Dele
 }
 
 /**
- * Transform an array of operations against another array
+ * Transform an array of operations against another array.
+ * Each operation in ops1 is transformed against all operations in ops2.
+ *
+ * @param ops1 - Operations to transform
+ * @param ops2 - Operations to transform against
+ * @returns Transformed array of operations
  */
 export function transformOperations(ops1: Operation[], ops2: Operation[]): Operation[] {
   let transformed = [...ops1];
@@ -181,7 +211,12 @@ export function transformOperations(ops1: Operation[], ops2: Operation[]): Opera
 }
 
 /**
- * Apply an operation to a text string
+ * Apply an operation to a text string.
+ * Returns the resulting text after the operation is applied.
+ *
+ * @param text - Original text string
+ * @param op - Operation to apply
+ * @returns Resulting text after operation
  */
 export function applyOperationToText(text: string, op: Operation): string {
   switch (op.type) {
@@ -201,7 +236,11 @@ export function applyOperationToText(text: string, op: Operation): string {
 }
 
 /**
- * Compose multiple operations into one
+ * Compose multiple operations into one.
+ * Filters out no-op operations (empty inserts/deletes).
+ *
+ * @param ops - Array of operations to compose
+ * @returns Filtered array of non-empty operations
  */
 export function composeOperations(ops: Operation[]): Operation[] {
   // Simple implementation: just return the operations array
@@ -215,7 +254,12 @@ export function composeOperations(ops: Operation[]): Operation[] {
 }
 
 /**
- * Calculate the inverse of an operation (for undo)
+ * Calculate the inverse of an operation (for undo).
+ * Insert becomes delete, delete becomes insert.
+ *
+ * @param op - Operation to invert
+ * @param originalText - Text before operation was applied (needed for delete inversion)
+ * @returns Inverse operation that undoes the original
  */
 export function invertOperation(op: Operation, originalText: string): Operation {
   switch (op.type) {
@@ -239,7 +283,13 @@ export function invertOperation(op: Operation, originalText: string): Operation 
 }
 
 /**
- * Transform anchor positions (for comments/suggestions)
+ * Transform anchor positions for comments/suggestions.
+ * Updates anchor positions to remain valid after an operation is applied.
+ *
+ * @param start - Start position of anchor
+ * @param end - End position of anchor
+ * @param op - Operation to transform anchor against
+ * @returns New anchor positions after operation
  */
 export function transformAnchor(
   start: number,

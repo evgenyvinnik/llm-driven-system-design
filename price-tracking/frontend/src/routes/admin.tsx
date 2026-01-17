@@ -1,9 +1,19 @@
+/**
+ * Admin dashboard page for system monitoring.
+ * Shows statistics, product status, and scrape activity.
+ * Requires authentication and admin role.
+ * @module routes/admin
+ */
 import { createFileRoute, Navigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { useEffect, useState } from 'react';
 import api from '../services/api';
 import { AdminStats } from '../types';
 
+/**
+ * Admin dashboard page component.
+ * Displays system statistics and monitoring data.
+ */
 function AdminPage() {
   const { isAuthenticated, user } = useAuthStore();
   const [stats, setStats] = useState<AdminStats | null>(null);

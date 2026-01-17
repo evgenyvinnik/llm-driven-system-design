@@ -1,15 +1,35 @@
+/**
+ * @fileoverview List view for database visualization.
+ * Displays database rows in a compact list format with inline properties.
+ */
+
 import type { DatabaseRow, PropertySchema } from '@/types';
 import { Plus, Trash2 } from 'lucide-react';
 import PropertyCell from './PropertyCell';
 
+/**
+ * Props for the ListView component.
+ */
 interface ListViewProps {
+  /** Database rows to display */
   rows: DatabaseRow[];
+  /** Column definitions from the database schema */
   schema: PropertySchema[];
+  /** Callback to add a new row */
   onAddRow: () => void;
+  /** Callback to update a row's properties */
   onUpdateRow: (rowId: string, properties: Record<string, unknown>) => void;
+  /** Callback to delete a row */
   onDeleteRow: (rowId: string) => void;
 }
 
+/**
+ * ListView displays database rows in a simple list format.
+ * Shows the title prominently with a few properties inline.
+ *
+ * @param props - Component props
+ * @returns The rendered list view
+ */
 export default function ListView({
   rows,
   schema,

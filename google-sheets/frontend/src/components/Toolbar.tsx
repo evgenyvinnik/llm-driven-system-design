@@ -1,5 +1,22 @@
+/**
+ * Toolbar component displaying spreadsheet title, formula bar, and presence indicators.
+ * Shows connection status and active collaborators.
+ *
+ * @module components/Toolbar
+ */
+
 import { useSpreadsheetStore, getColumnLetter } from '../stores/spreadsheet';
 
+/**
+ * Renders the spreadsheet toolbar with title, formula bar, and collaboration indicators.
+ * Displays:
+ * - Spreadsheet logo and title
+ * - Collaborator avatars with colors
+ * - Connection status indicator
+ * - Current cell reference and formula/value
+ *
+ * @returns The toolbar component with all subcomponents
+ */
 export function Toolbar() {
   const title = useSpreadsheetStore((state) => state.title);
   const isConnected = useSpreadsheetStore((state) => state.isConnected);
@@ -7,6 +24,7 @@ export function Toolbar() {
   const collaborators = useSpreadsheetStore((state) => state.collaborators);
   const getCell = useSpreadsheetStore((state) => state.getCell);
 
+  // Get active cell data and format cell reference (e.g., "A1", "B2")
   const activeCellData = activeCell ? getCell(activeCell.row, activeCell.col) : null;
   const cellReference = activeCell
     ? `${getColumnLetter(activeCell.col)}${activeCell.row + 1}`
@@ -43,7 +61,7 @@ export function Toolbar() {
           >
             S
           </div>
-          {/* Title */}
+          {/* Title input (read-only for now) */}
           <input
             type="text"
             value={title}
@@ -61,7 +79,7 @@ export function Toolbar() {
 
         {/* Connection status and collaborators */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          {/* Collaborator avatars */}
+          {/* Collaborator avatars - stacked with overlap */}
           <div style={{ display: 'flex', gap: '-8px' }}>
             {Array.from(collaborators.values()).map((collab) => (
               <div
@@ -87,7 +105,7 @@ export function Toolbar() {
             ))}
           </div>
 
-          {/* Connection indicator */}
+          {/* Connection indicator with colored dot */}
           <div
             style={{
               display: 'flex',
@@ -121,7 +139,7 @@ export function Toolbar() {
           gap: 8,
         }}
       >
-        {/* Cell reference */}
+        {/* Cell reference display (e.g., "A1") */}
         <div
           style={{
             width: 60,
@@ -136,7 +154,7 @@ export function Toolbar() {
           {cellReference || '-'}
         </div>
 
-        {/* Formula/value display */}
+        {/* Formula/value display (shows raw value including formulas) */}
         <div
           style={{
             flex: 1,

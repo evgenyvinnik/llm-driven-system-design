@@ -2,10 +2,27 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Registration page route configuration.
+ * Provides new user account creation.
+ */
 export const Route = createFileRoute('/register')({
   component: RegisterPage,
 });
 
+/**
+ * Registration page component for new user sign-up.
+ * Provides a form for creating customer, restaurant owner, or driver accounts.
+ *
+ * Features:
+ * - Role selection (Order Food, Sell Food, Deliver Food)
+ * - Name, email, phone, and password inputs
+ * - Error display with dismiss button
+ * - Loading state during registration
+ * - Redirect to home on successful registration
+ *
+ * @returns React component for the registration page
+ */
 function RegisterPage() {
   const navigate = useNavigate();
   const { register, isLoading, error, clearError } = useAuthStore();

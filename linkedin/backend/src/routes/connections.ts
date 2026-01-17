@@ -1,3 +1,10 @@
+/**
+ * Connection routes for the LinkedIn clone.
+ * Manages the professional network graph - connection requests,
+ * acceptance/rejection, and network analysis (PYMK, mutual connections).
+ *
+ * @module routes/connections
+ */
 import { Router, Request, Response } from 'express';
 import * as connectionService from '../services/connectionService.js';
 import { requireAuth } from '../middleware/auth.js';

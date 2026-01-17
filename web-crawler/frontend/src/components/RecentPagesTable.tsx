@@ -1,17 +1,63 @@
+/**
+ * @fileoverview Table component for displaying recently crawled pages.
+ *
+ * Displays a table of recently crawled pages with:
+ * - URL/title (clickable to open in new tab)
+ * - Domain
+ * - HTTP status code (color-coded badge)
+ * - Crawl duration
+ * - Relative time since crawl
+ *
+ * Includes loading state with skeleton placeholder.
+ *
+ * @module components/RecentPagesTable
+ */
+
+/**
+ * Data structure for a recently crawled page.
+ */
 interface RecentPage {
+  /** The URL that was crawled */
   url: string;
+  /** Domain hostname */
   domain: string;
+  /** Extracted page title */
   title: string;
+  /** HTTP status code */
   statusCode: number;
+  /** ISO timestamp when crawled */
   crawledAt: string;
+  /** Crawl duration in milliseconds */
   durationMs: number;
 }
 
+/**
+ * Props for the RecentPagesTable component.
+ */
 interface RecentPagesTableProps {
+  /** Array of recently crawled pages to display */
   pages: RecentPage[];
+  /** Whether the data is loading (shows skeleton) */
   loading?: boolean;
 }
 
+/**
+ * Table displaying recently crawled pages.
+ *
+ * Shows a list of the most recently crawled URLs with their metadata.
+ * Used on the dashboard to show real-time crawl activity.
+ *
+ * @param props - Component props
+ * @returns React component rendering the table
+ *
+ * @example
+ * ```tsx
+ * <RecentPagesTable
+ *   pages={stats.recentPages}
+ *   loading={isLoading}
+ * />
+ * ```
+ */
 export function RecentPagesTable({ pages, loading }: RecentPagesTableProps) {
   if (loading) {
     return (
@@ -92,6 +138,17 @@ export function RecentPagesTable({ pages, loading }: RecentPagesTableProps) {
   );
 }
 
+/**
+ * Badge component for displaying HTTP status codes.
+ *
+ * Color-coded based on status code range:
+ * - 2xx: Green (success)
+ * - 3xx: Yellow (redirect)
+ * - 4xx/5xx: Red (error)
+ *
+ * @param props - Component props with status code
+ * @returns React component rendering the badge
+ */
 function StatusBadge({ code }: { code: number }) {
   const color =
     code >= 200 && code < 300
@@ -109,6 +166,17 @@ function StatusBadge({ code }: { code: number }) {
   );
 }
 
+/**
+ * Formats a timestamp as a relative "time ago" string.
+ *
+ * @param dateString - ISO date string to format
+ * @returns Human-readable relative time (e.g., "5m ago")
+ *
+ * @example
+ * ```typescript
+ * formatTimeAgo('2024-01-16T12:00:00Z'); // "5m ago"
+ * ```
+ */
 function formatTimeAgo(dateString: string): string {
   const date = new Date(dateString);
   const now = new Date();

@@ -1,3 +1,8 @@
+/**
+ * Main Express server entry point for the Jira clone backend.
+ * Configures middleware, session management, routes, and server lifecycle.
+ */
+
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
@@ -27,7 +32,10 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Session configuration
+/**
+ * Session store using Redis for distributed session management.
+ * Prefixes keys with 'jira:session:' for easy identification.
+ */
 const redisStore = new RedisStore({
   client: redis,
   prefix: 'jira:session:',
@@ -48,7 +56,10 @@ app.use(
   })
 );
 
-// Health check
+/**
+ * Health check endpoint.
+ * Verifies database and Redis connectivity for load balancer health checks.
+ */
 app.get('/health', async (req, res) => {
   try {
     // Check database
@@ -78,7 +89,10 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
+/**
+ * Starts the Express server.
+ * Initializes Elasticsearch index and begins listening for requests.
+ */
 async function start() {
   try {
     // Initialize Elasticsearch index
@@ -96,7 +110,10 @@ async function start() {
 
 start();
 
-// Graceful shutdown
+/**
+ * Graceful shutdown handler.
+ * Closes database pool and Redis connection before exiting.
+ */
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully');
   await pool.end();

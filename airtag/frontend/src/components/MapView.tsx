@@ -1,9 +1,15 @@
+/**
+ * Map view component for displaying device location history.
+ * Uses Leaflet with OpenStreetMap tiles.
+ * Supports location history visualization and click-to-simulate for testing.
+ */
+
 import { useEffect, useRef, useState } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap, Polyline } from 'react-leaflet';
 import L from 'leaflet';
 import { Location, Device } from '../types';
 
-// Fix for default marker icon
+/** Fix for Leaflet default marker icon paths in webpack/vite */
 delete (L.Icon.Default.prototype as { _getIconUrl?: () => string })._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
@@ -11,7 +17,12 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 });
 
-// Custom marker icon
+/**
+ * Create a custom colored marker icon.
+ *
+ * @param color - CSS color for the marker
+ * @returns Leaflet DivIcon with custom styling
+ */
 const createCustomIcon = (color: string) =>
   L.divIcon({
     className: 'custom-marker',
@@ -27,6 +38,10 @@ interface MapViewProps {
   onMapClick?: (lat: number, lng: number) => void;
 }
 
+/**
+ * Internal component that updates map view when locations change.
+ * Centers the map on the first (most recent) location.
+ */
 function MapUpdater({ locations }: { locations: Location[] }) {
   const map = useMap();
   const hasSetView = useRef(false);
@@ -42,6 +57,9 @@ function MapUpdater({ locations }: { locations: Location[] }) {
   return null;
 }
 
+/**
+ * Internal component that handles map click events for location simulation.
+ */
 function ClickHandler({ onClick }: { onClick: (lat: number, lng: number) => void }) {
   const map = useMap();
 
@@ -58,6 +76,16 @@ function ClickHandler({ onClick }: { onClick: (lat: number, lng: number) => void
   return null;
 }
 
+/**
+ * Main map view component.
+ * Displays device locations with markers and optional history path.
+ * Supports click-to-simulate for testing location reports.
+ *
+ * @param locations - Array of location history for the device
+ * @param device - The device being displayed
+ * @param onMapClick - Optional callback for simulating location reports
+ * @returns Interactive map with location markers
+ */
 export function MapView({ locations, device, onMapClick }: MapViewProps) {
   const [showHistory, setShowHistory] = useState(false);
 

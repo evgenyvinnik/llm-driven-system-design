@@ -1,18 +1,38 @@
+/**
+ * Zustand store for authentication state management.
+ * Handles login, registration, logout, and session persistence.
+ * @module stores/authStore
+ */
 import { create } from 'zustand';
 import { User } from '../types';
 import * as authService from '../services/auth';
 
+/**
+ * Authentication state shape.
+ */
 interface AuthState {
+  /** Currently authenticated user or null */
   user: User | null;
+  /** True while checking initial auth state */
   isLoading: boolean;
+  /** True if user is authenticated */
   isAuthenticated: boolean;
+  /** Logs in with email and password */
   login: (email: string, password: string) => Promise<void>;
+  /** Registers a new account */
   register: (email: string, password: string) => Promise<void>;
+  /** Logs out the current user */
   logout: () => Promise<void>;
+  /** Checks if there's a valid session on app load */
   checkAuth: () => Promise<void>;
+  /** Updates user settings */
   updateSettings: (settings: { email_notifications?: boolean }) => Promise<void>;
 }
 
+/**
+ * Global authentication store.
+ * Use with: const { user, isAuthenticated, login } = useAuthStore();
+ */
 export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   isLoading: true,

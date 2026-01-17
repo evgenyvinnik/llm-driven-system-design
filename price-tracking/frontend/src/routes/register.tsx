@@ -1,7 +1,17 @@
+/**
+ * Registration page route for new user signup.
+ * Provides email/password form with confirmation.
+ * Redirects to home if already authenticated.
+ * @module routes/register
+ */
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
+/**
+ * Registration page component.
+ * Validates password requirements and handles form submission.
+ */
 function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');

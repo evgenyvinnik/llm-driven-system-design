@@ -1,7 +1,19 @@
+/**
+ * Admin dashboard component.
+ * Displays system-wide statistics for users, devices, lost mode, and anti-stalking.
+ * Auto-refreshes every 30 seconds.
+ */
+
 import { useEffect, useState } from 'react';
 import { adminApi } from '../services/api';
 import { AdminStats } from '../types';
 
+/**
+ * Admin dashboard component.
+ * Shows statistics cards for system monitoring.
+ *
+ * @returns Admin dashboard with statistics
+ */
 export function AdminDashboard() {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -154,6 +166,16 @@ export function AdminDashboard() {
   );
 }
 
+/**
+ * Statistics card for displaying a single metric.
+ *
+ * @param title - Card title
+ * @param value - Primary numeric value
+ * @param subtitle - Secondary description text
+ * @param icon - HTML entity for icon display
+ * @param highlight - Whether to use highlight (red) styling
+ * @returns Styled statistics card
+ */
 function StatCard({
   title,
   value,

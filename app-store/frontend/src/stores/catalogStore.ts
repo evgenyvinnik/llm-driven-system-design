@@ -1,34 +1,64 @@
+/**
+ * @fileoverview Catalog state management using Zustand.
+ * Handles app browsing, search, categories, and reviews.
+ */
+
 import { create } from 'zustand';
 import type { Category, App, PaginatedResponse, RatingSummary, Review } from '../types';
 import api from '../services/api';
 
+/**
+ * Catalog store state and actions.
+ */
 interface CatalogState {
+  /** All available categories */
   categories: Category[];
+  /** Current list of apps (for listing pages) */
   apps: App[];
+  /** Currently viewed app with similar apps */
   currentApp: (App & { similarApps?: Partial<App>[] }) | null;
+  /** Reviews for the current app */
   currentReviews: Review[];
+  /** Rating distribution for the current app */
   currentRatings: RatingSummary | null;
+  /** Search results */
   searchResults: Partial<App>[];
+  /** Top apps by chart type */
   topApps: { free: App[]; paid: App[]; new: App[] };
+  /** Current pagination state */
   pagination: {
     page: number;
     limit: number;
     total: number;
     totalPages: number;
   } | null;
+  /** True when a data fetch is in progress */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
 
+  /** Fetches all categories from the API */
   fetchCategories: () => Promise<void>;
+  /** Fetches a paginated list of apps */
   fetchApps: (params?: Record<string, string>) => Promise<void>;
+  /** Fetches a single app by ID */
   fetchApp: (id: string) => Promise<void>;
+  /** Fetches top apps for a chart type */
   fetchTopApps: (type: 'free' | 'paid' | 'new', category?: string) => Promise<void>;
+  /** Performs a search query */
   searchApps: (query: string, params?: Record<string, string>) => Promise<void>;
+  /** Fetches reviews for an app */
   fetchReviews: (appId: string, page?: number) => Promise<void>;
+  /** Fetches rating summary for an app */
   fetchRatings: (appId: string) => Promise<void>;
+  /** Clears current app data */
   clearCurrentApp: () => void;
 }
 
+/**
+ * Zustand store for catalog state.
+ * Manages app browsing, search, and detail views.
+ */
 export const useCatalogStore = create<CatalogState>((set, get) => ({
   categories: [],
   apps: [],

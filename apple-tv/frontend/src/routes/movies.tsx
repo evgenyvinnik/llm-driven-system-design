@@ -6,6 +6,17 @@ import type { Content } from '../types';
 import { formatDurationHuman } from '../utils';
 import { Play } from 'lucide-react';
 
+/**
+ * Movies catalog page displaying all available movies.
+ * Shows a grid of movie thumbnails with hover effects and metadata.
+ *
+ * Features:
+ * - Responsive grid layout (2-5 columns based on viewport)
+ * - Thumbnail with hover zoom and play overlay
+ * - Featured badge for promoted content
+ * - Duration and rating display
+ * - Links to content detail page
+ */
 function MoviesPage() {
   const [movies, setMovies] = useState<Content[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -78,6 +89,10 @@ function MoviesPage() {
   );
 }
 
+/**
+ * Route configuration for movies page (/movies).
+ * Displays the full movie catalog for browsing.
+ */
 export const Route = createFileRoute('/movies')({
   component: MoviesPage,
 });

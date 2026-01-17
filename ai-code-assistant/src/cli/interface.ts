@@ -1,5 +1,17 @@
 /**
- * CLI Interface - Terminal interaction layer for evylcode
+ * CLI Interface - Terminal interaction layer for evylcode.
+ *
+ * This module provides all terminal UI functionality including:
+ * - Styled prompts with evylcode branding
+ * - Colorful output formatting with chalk
+ * - Loading spinners for long operations
+ * - Permission confirmation dialogs
+ * - Help and tool listing displays
+ *
+ * The interface is designed with a polished aesthetic using coral (#FF6B6B)
+ * and teal (#4ECDC4) colors for the evylcode brand identity.
+ *
+ * @module cli/interface
  */
 
 import * as readline from 'readline';
@@ -7,9 +19,13 @@ import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
 import type { CLIConfig } from '../types/index.js';
 
+/** Current CLI version */
 const VERSION = '1.0.0';
 
-// ASCII art logo for evylcode
+/**
+ * ASCII art logo for evylcode branding.
+ * Uses coral for "EVYL" and teal for "CODE".
+ */
 const LOGO = `
 ${chalk.hex('#FF6B6B')('   _____ _    _ __     __ _      ')}${chalk.hex('#4ECDC4')('  _____ ____  _____  ______ ')}
 ${chalk.hex('#FF6B6B')('  |  ___| |  | |\\ \\   / /| |     ')}${chalk.hex('#4ECDC4')(' / ____/ __ \\|  __ \\|  ____|')}
@@ -19,11 +35,28 @@ ${chalk.hex('#FF6B6B')('  | |___| |__| |   | |   | |____ ')}${chalk.hex('#4ECDC4
 ${chalk.hex('#FF6B6B')('  |______\\____/    |_|   |______|')}${chalk.hex('#4ECDC4')(' \\_____\\____/|_____/|______|')}
 `;
 
+/**
+ * CLI interface for terminal interaction.
+ *
+ * Provides a polished terminal experience with:
+ * - Branded prompts and output formatting
+ * - Colorful status indicators
+ * - Spinner for async operations
+ * - Interactive confirmation dialogs
+ * - Streaming text output support
+ */
 export class CLIInterface {
+  /** Readline interface for user input */
   private rl: readline.Interface;
+  /** Loading spinner instance */
   private spinner: Ora | null = null;
+  /** CLI configuration options */
   private config: CLIConfig;
 
+  /**
+   * Creates a new CLIInterface.
+   * @param config - Partial configuration (defaults are applied)
+   */
   constructor(config: Partial<CLIConfig> = {}) {
     this.config = {
       theme: 'dark',
@@ -45,7 +78,8 @@ export class CLIInterface {
   }
 
   /**
-   * Display welcome banner
+   * Display the welcome banner with logo and instructions.
+   * Shows ASCII art, version, and available commands.
    */
   showWelcome(): void {
     console.log(LOGO);
@@ -78,7 +112,8 @@ export class CLIInterface {
   }
 
   /**
-   * Show a greeting message
+   * Show a time-based greeting message.
+   * Displays appropriate greeting based on time of day.
    */
   showGreeting(): void {
     const hour = new Date().getHours();
@@ -108,7 +143,10 @@ export class CLIInterface {
   }
 
   /**
-   * Prompt for user input with styled prompt
+   * Prompt for user input with styled prompt.
+   * Uses the evylcode branded prompt by default.
+   * @param promptText - Custom prompt text (optional)
+   * @returns The user's input string
    */
   async prompt(promptText: string = ''): Promise<string> {
     const styledPrompt = promptText || (
@@ -125,7 +163,10 @@ export class CLIInterface {
   }
 
   /**
-   * Confirm an action with the user
+   * Confirm an action with the user.
+   * Displays a styled permission box and prompts for y/n/a response.
+   * @param description - Description of the action requiring confirmation
+   * @returns True if approved (y, yes, a, always), false otherwise
    */
   async confirm(description: string): Promise<boolean> {
     console.log();
@@ -151,7 +192,8 @@ export class CLIInterface {
   }
 
   /**
-   * Show a spinner for long operations
+   * Start a loading spinner for long operations.
+   * @param text - Status text to display alongside the spinner
    */
   startSpinner(text: string): void {
     if (this.spinner) {
@@ -165,7 +207,9 @@ export class CLIInterface {
   }
 
   /**
-   * Stop the spinner
+   * Stop the current spinner.
+   * @param success - Whether the operation succeeded (affects icon)
+   * @param text - Optional completion text to display
    */
   stopSpinner(success: boolean = true, text?: string): void {
     if (this.spinner) {
@@ -179,7 +223,9 @@ export class CLIInterface {
   }
 
   /**
-   * Stream output character by character
+   * Stream output character by character.
+   * Used for LLM streaming responses.
+   * @param stream - Async iterable of text chunks
    */
   async streamOutput(stream: AsyncIterable<string>): Promise<void> {
     for await (const chunk of stream) {
@@ -189,7 +235,9 @@ export class CLIInterface {
   }
 
   /**
-   * Print assistant message with formatting
+   * Print an assistant message with styled formatting.
+   * Displays in a teal-bordered box with Claude branding.
+   * @param content - The message content to display
    */
   printAssistant(content: string): void {
     console.log();
@@ -208,7 +256,10 @@ export class CLIInterface {
   }
 
   /**
-   * Print tool call information
+   * Print tool call information.
+   * Shows the tool name and parameters being executed.
+   * @param toolName - Name of the tool being called
+   * @param params - Parameters passed to the tool
    */
   printToolCall(toolName: string, params: Record<string, unknown>): void {
     console.log();
@@ -227,7 +278,11 @@ export class CLIInterface {
   }
 
   /**
-   * Print tool result
+   * Print the result of a tool execution.
+   * Shows success/failure status and optional output.
+   * @param success - Whether the tool executed successfully
+   * @param output - Output from successful execution
+   * @param error - Error message if execution failed
    */
   printToolResult(success: boolean, output?: string, error?: string): void {
     if (success) {
@@ -250,7 +305,8 @@ export class CLIInterface {
   }
 
   /**
-   * Print error message
+   * Print an error message in a styled box.
+   * @param message - The error message to display
    */
   printError(message: string): void {
     console.log();
@@ -263,28 +319,34 @@ export class CLIInterface {
   }
 
   /**
-   * Print info message
+   * Print an informational message.
+   * @param message - The info message to display
    */
   printInfo(message: string): void {
     console.log(chalk.hex('#4ECDC4')('  ℹ ') + chalk.gray(message));
   }
 
   /**
-   * Print success message
+   * Print a success message.
+   * @param message - The success message to display
    */
   printSuccess(message: string): void {
     console.log(chalk.green('  ✓ ') + chalk.white(message));
   }
 
   /**
-   * Print warning message
+   * Print a warning message.
+   * @param message - The warning message to display
    */
   printWarning(message: string): void {
     console.log(chalk.hex('#FFE66D')('  ⚠ ') + chalk.white(message));
   }
 
   /**
-   * Format a line with syntax highlighting for code
+   * Format a line with syntax highlighting for inline code.
+   * Highlights backtick-wrapped code in coral.
+   * @param line - The line to format
+   * @returns Formatted line with highlighted code
    */
   private formatLine(line: string): string {
     // Check for code block markers
@@ -298,7 +360,7 @@ export class CLIInterface {
   }
 
   /**
-   * Show help
+   * Show the help message with available commands and examples.
    */
   showHelp(): void {
     console.log();
@@ -321,7 +383,8 @@ export class CLIInterface {
   }
 
   /**
-   * Show available tools
+   * Show a list of available tools.
+   * @param tools - Array of tool info with name and description
    */
   showTools(tools: { name: string; description: string }[]): void {
     console.log();
@@ -337,7 +400,7 @@ export class CLIInterface {
   }
 
   /**
-   * Show goodbye message
+   * Show a goodbye message when exiting.
    */
   showGoodbye(): void {
     console.log();
@@ -346,7 +409,8 @@ export class CLIInterface {
   }
 
   /**
-   * Close the interface
+   * Close the readline interface.
+   * Should be called when the CLI is shutting down.
    */
   close(): void {
     this.rl.close();

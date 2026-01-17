@@ -1,3 +1,9 @@
+/**
+ * @fileoverview Analytics query page route component.
+ * Provides an interactive interface for querying aggregated click data.
+ * Supports time range selection, grouping options, and result visualization.
+ */
+
 import { createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
 import { getAggregateData } from '../services/api'
@@ -6,10 +12,19 @@ import { ClickChart } from '../components/ClickChart'
 import { StatCard } from '../components/StatCard'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 
+/**
+ * Route definition for the analytics page.
+ */
 export const Route = createFileRoute('/analytics')({
   component: Analytics,
 })
 
+/**
+ * Analytics query builder and results viewer.
+ * Allows configuring time range, granularity, and grouping dimensions.
+ *
+ * @returns Query form and results visualization
+ */
 function Analytics() {
   const [startTime, setStartTime] = useState(() => {
     const date = new Date()

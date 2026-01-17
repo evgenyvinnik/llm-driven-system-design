@@ -1,5 +1,17 @@
+/**
+ * Cooldown timer component showing when the user can place the next pixel.
+ *
+ * States:
+ * - Not authenticated: Shows sign-in prompt
+ * - Ready: Shows green "Ready to place!" indicator
+ * - Cooling down: Shows countdown timer in mm:ss or ss format
+ */
 import { useAppStore } from '../stores/appStore';
 
+/**
+ * Displays the current cooldown status with visual feedback.
+ * Updates every second when counting down.
+ */
 export function CooldownTimer() {
   const { cooldown, isAuthenticated } = useAppStore();
 

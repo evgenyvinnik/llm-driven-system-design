@@ -1,7 +1,17 @@
+/**
+ * Admin Dashboard Component
+ *
+ * Provides administrative controls for system management.
+ * Includes tabs for statistics, URL management, user management, and key pool.
+ */
 import React, { useEffect, useState } from 'react';
 import { SystemStats, GlobalAnalytics, KeyPoolStats, Url, User } from '../types';
 import { api } from '../services/api';
 
+/**
+ * Reusable statistic card component.
+ * Displays a metric with title and optional subtitle.
+ */
 function StatCard({ title, value, subtitle }: { title: string; value: number | string; subtitle?: string }) {
   return (
     <div className="card bg-gray-50">
@@ -12,6 +22,10 @@ function StatCard({ title, value, subtitle }: { title: string; value: number | s
   );
 }
 
+/**
+ * System statistics section.
+ * Shows overview metrics and top URLs by clicks.
+ */
 function StatsSection() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -75,6 +89,10 @@ function StatsSection() {
   );
 }
 
+/**
+ * Key pool management section.
+ * Displays key pool statistics and allows repopulating keys.
+ */
 function KeyPoolSection() {
   const [stats, setStats] = useState<KeyPoolStats | null>(null);
   const [loading, setLoading] = useState(false);
@@ -137,6 +155,10 @@ function KeyPoolSection() {
   );
 }
 
+/**
+ * URL management section.
+ * Allows searching, viewing, and toggling URL active status.
+ */
 function UrlsSection() {
   const [urls, setUrls] = useState<Url[]>([]);
   const [total, setTotal] = useState(0);
@@ -244,6 +266,10 @@ function UrlsSection() {
   );
 }
 
+/**
+ * User management section.
+ * Displays user list and allows role changes.
+ */
 function UsersSection() {
   const [users, setUsers] = useState<User[]>([]);
   const [total, setTotal] = useState(0);
@@ -330,6 +356,10 @@ function UsersSection() {
   );
 }
 
+/**
+ * Main admin dashboard component.
+ * Provides tabbed interface for system administration.
+ */
 export function AdminDashboard() {
   const [activeTab, setActiveTab] = useState<'stats' | 'urls' | 'users' | 'keys'>('stats');
 

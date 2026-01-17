@@ -1,21 +1,45 @@
+/**
+ * Real-time stock quote state management using Zustand.
+ * Manages WebSocket connection for live quote updates and
+ * provides quote data to components throughout the app.
+ */
+
 import { create } from 'zustand';
 import type { Quote } from '../types';
 import { wsService } from '../services/websocket';
 import { quotesApi } from '../services/api';
 
+/**
+ * Quote store state and actions.
+ */
 interface QuoteState {
+  /** Map of symbol to current quote data */
   quotes: Map<string, Quote>;
+  /** Whether WebSocket is currently connected */
   isConnected: boolean;
+  /** Whether a quote fetch is in progress */
   isLoading: boolean;
+  /** Error message from last failed operation */
   error: string | null;
+  /** Gets cached quote for a symbol */
   getQuote: (symbol: string) => Quote | undefined;
+  /** Subscribes to real-time updates for symbols */
   subscribe: (symbols: string[]) => void;
+  /** Unsubscribes from real-time updates for symbols */
   unsubscribe: (symbols: string[]) => void;
+  /** Fetches quote from API and caches it */
   fetchQuote: (symbol: string) => Promise<Quote | null>;
+  /** Initializes WebSocket connection */
   initializeConnection: () => void;
+  /** Disconnects WebSocket */
   disconnect: () => void;
 }
 
+/**
+ * Zustand store for real-time quote data.
+ * Connects to WebSocket on initialization and updates
+ * quotes map as new data arrives.
+ */
 export const useQuoteStore = create<QuoteState>((set, get) => {
   let initialized = false;
 

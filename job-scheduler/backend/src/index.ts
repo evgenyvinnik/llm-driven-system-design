@@ -1,11 +1,27 @@
-// Main entry point - runs all services together (for development)
+/**
+ * Main entry point for running job scheduler services.
+ * Supports running individual services or all services together.
+ * MODE environment variable controls which services start:
+ * - 'api': Only the REST API server
+ * - 'scheduler': Only the job scheduler
+ * - 'worker': Only the job worker
+ * - 'all' (default): All services together (for development)
+ * @module backend
+ */
+
 import dotenv from 'dotenv';
 dotenv.config();
 
 import { logger } from './utils/logger';
 
+/** Service mode from environment - 'api', 'scheduler', 'worker', or 'all' */
 const mode = process.env.MODE || 'all';
 
+/**
+ * Starts the job scheduler services based on the MODE environment variable.
+ * For production, run each service separately. For development, 'all' mode
+ * starts everything with staggered timing to avoid race conditions.
+ */
 async function start() {
   logger.info(`Starting job scheduler in mode: ${mode}`);
 

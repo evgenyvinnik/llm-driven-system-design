@@ -1,5 +1,24 @@
+/**
+ * API client for the LinkedIn clone frontend.
+ * Provides typed methods for all backend API endpoints.
+ * Handles request formatting, error handling, and credential management.
+ *
+ * @module services/api
+ */
+
+/** Base URL for API requests, proxied by Vite in development */
 const API_BASE = '/api';
 
+/**
+ * Generic fetch wrapper with JSON handling and error management.
+ * Automatically includes credentials and Content-Type header.
+ *
+ * @template T - Expected response type
+ * @param path - API endpoint path (will be prefixed with /api)
+ * @param options - Fetch options (method, body, headers)
+ * @returns Parsed JSON response
+ * @throws Error with message from API response or "Request failed"
+ */
 async function request<T>(
   path: string,
   options: RequestInit = {}
@@ -21,7 +40,10 @@ async function request<T>(
   return response.json();
 }
 
-// Auth
+/**
+ * Authentication API endpoints.
+ * Handles login, registration, logout, and session verification.
+ */
 export const authApi = {
   login: (email: string, password: string) =>
     request<{ user: import('../types').User }>('/auth/login', {
@@ -42,7 +64,10 @@ export const authApi = {
     request<{ user: import('../types').User }>('/auth/me'),
 };
 
-// Users
+/**
+ * User profile API endpoints.
+ * Handles profile viewing, editing, search, and profile section management.
+ */
 export const usersApi = {
   getProfile: (id: number) =>
     request<{
@@ -92,7 +117,10 @@ export const usersApi = {
     request<{ message: string }>(`/users/${userId}/skills/${skillId}/endorse`, { method: 'POST' }),
 };
 
-// Connections
+/**
+ * Connection API endpoints.
+ * Manages the professional network graph and PYMK recommendations.
+ */
 export const connectionsApi = {
   getConnections: (offset = 0, limit = 20) =>
     request<{ connections: import('../types').User[] }>(`/connections?offset=${offset}&limit=${limit}`),
@@ -128,7 +156,10 @@ export const connectionsApi = {
     request<{ people: import('../types').PYMKCandidate[] }>(`/connections/pymk?limit=${limit}`),
 };
 
-// Feed
+/**
+ * Feed API endpoints.
+ * Handles posts, likes, comments, and feed generation.
+ */
 export const feedApi = {
   getFeed: (offset = 0, limit = 20) =>
     request<{ posts: import('../types').Post[] }>(`/feed?offset=${offset}&limit=${limit}`),
@@ -164,7 +195,10 @@ export const feedApi = {
     request<{ posts: import('../types').Post[] }>(`/feed/user/${userId}?offset=${offset}&limit=${limit}`),
 };
 
-// Jobs
+/**
+ * Jobs API endpoints.
+ * Handles job search, listings, applications, and recommendations.
+ */
 export const jobsApi = {
   getJobs: (params?: {
     q?: string;
