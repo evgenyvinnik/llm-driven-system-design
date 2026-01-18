@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { usePhotoStore } from '../stores/photoStore';
 import { PhotoToolbar, PhotoGrid, PhotoViewer, CreateAlbumModal } from './photos';
 
@@ -6,8 +6,8 @@ import { PhotoToolbar, PhotoGrid, PhotoViewer, CreateAlbumModal } from './photos
  * Main photo gallery component for iCloud Photos.
  *
  * Provides a complete photo browsing experience including:
- * - Responsive thumbnail grid with lazy loading
- * - Infinite scroll pagination
+ * - Virtualized thumbnail grid for efficient rendering of large collections
+ * - Infinite scroll pagination (handled by PhotoGrid)
  * - Filter toggle between all photos and favorites
  * - Multi-select for batch operations
  * - Photo upload with automatic thumbnail generation
@@ -46,7 +46,6 @@ export const PhotoGallery: React.FC = () => {
   const [viewingPhotoIndex, setViewingPhotoIndex] = useState<number | null>(null);
   const [showCreateAlbum, setShowCreateAlbum] = useState(false);
   const [albumName, setAlbumName] = useState('');
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   /**
    * Load photos and albums on component mount.
@@ -55,26 +54,6 @@ export const PhotoGallery: React.FC = () => {
     loadPhotos();
     loadAlbums();
   }, [loadPhotos, loadAlbums]);
-
-  /**
-   * Set up infinite scroll handler.
-   * Loads more photos when user scrolls near the bottom.
-   */
-  useEffect(() => {
-    const container = scrollContainerRef.current;
-    if (!container) return;
-
-    const handleScroll = () => {
-      const nearBottom =
-        container.scrollHeight - container.scrollTop <= container.clientHeight + 200;
-      if (nearBottom && hasMore && !isLoading) {
-        loadMore();
-      }
-    };
-
-    container.addEventListener('scroll', handleScroll);
-    return () => container.removeEventListener('scroll', handleScroll);
-  }, [hasMore, isLoading, loadMore]);
 
   /**
    * Handles file upload from the toolbar.
@@ -116,11 +95,13 @@ export const PhotoGallery: React.FC = () => {
 
       <ErrorMessage error={error} onDismiss={clearError} />
 
-      <div ref={scrollContainerRef} className="flex-1 overflow-auto p-4">
+      <div className="flex-1 overflow-hidden p-4">
         <PhotoGrid
           photos={photos}
           selectedPhotos={selectedPhotos}
           isLoading={isLoading}
+          hasMore={hasMore}
+          onLoadMore={loadMore}
           onToggleSelection={toggleSelection}
           onViewPhoto={setViewingPhotoIndex}
         />

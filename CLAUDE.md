@@ -193,6 +193,30 @@ Use these unless there's a compelling reason to deviate (document justification 
 
 ## Frontend Best Practices
 
+### List Virtualization
+
+For feeds and large lists, use `@tanstack/react-virtual` for efficient rendering. This only renders items visible in the viewport, critical for performance with hundreds/thousands of items.
+
+**Projects using virtualization:**
+- **TikTok** - Full-screen video feed (`routes/index.tsx`)
+- **Instagram** - Post feed with dynamic heights (`routes/index.tsx`)
+- **FB News Feed** - Post feed with infinite scroll (`routes/index.tsx`)
+- **Twitter** - Tweet timeline (`components/Timeline.tsx`)
+- **iCloud** - Photo grid with row-based virtualization (`components/photos/PhotoGrid.tsx`)
+
+**Standard pattern:**
+```tsx
+import { useVirtualizer } from '@tanstack/react-virtual';
+
+const virtualizer = useVirtualizer({
+  count: items.length,
+  getScrollElement: () => parentRef.current,
+  estimateSize: () => 400, // Estimated item height
+  overscan: 3, // Extra items to render above/below viewport
+  measureElement: (el) => el.getBoundingClientRect().height, // Dynamic heights
+});
+```
+
 ### TanStack Router File-Based Routing
 
 Projects using TanStack Router follow this file structure:
@@ -256,12 +280,11 @@ The `npm run db:migrate` command runs `migrate.ts` which executes `init.sql` aga
 
 ### Database Seed Files
 
-Seed files populate the database with sample data for development and testing. They are stored as `seed.sql` alongside `init.sql`:
+Seed files populate the database with sample data for development and testing. They are stored in a dedicated folder:
 
 | Location | Purpose |
 |----------|---------|
-| `backend/src/db/seed.sql` | Sample data (users, posts, etc.) |
-| `backend/db/seed.sql` | Alternative location in some projects |
+| `backend/db-seed/seed.sql` | Sample data (users, posts, etc.) |
 
 The screenshot automation script (`scripts/screenshots.mjs --start`) automatically runs `seed.sql` after `init.sql` when setting up the database for capturing screenshots.
 

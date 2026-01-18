@@ -1,4 +1,5 @@
-import amqplib, { Connection, Channel, ConsumeMessage } from 'amqplib';
+import amqplib from 'amqplib';
+import type { ChannelModel, Channel, ConsumeMessage } from 'amqplib';
 import logger from './logger.js';
 
 /**
@@ -28,7 +29,7 @@ export interface ClickEventMessage {
  * RabbitMQ connection state.
  * Manages a single connection and channel for the application.
  */
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 let isConnecting = false;
 
@@ -51,15 +52,16 @@ export async function connectQueue(): Promise<boolean> {
 
   try {
     logger.info({ url: QUEUE_CONFIG.url.replace(/:[^:@]+@/, ':***@') }, 'Connecting to RabbitMQ');
-    connection = await amqplib.connect(QUEUE_CONFIG.url);
+    const conn = await amqplib.connect(QUEUE_CONFIG.url);
+    connection = conn;
 
-    connection.on('error', (err) => {
+    conn.on('error', (err) => {
       logger.error({ err }, 'RabbitMQ connection error');
       channel = null;
       connection = null;
     });
 
-    connection.on('close', () => {
+    conn.on('close', () => {
       logger.warn('RabbitMQ connection closed, will reconnect');
       channel = null;
       connection = null;
@@ -72,10 +74,11 @@ export async function connectQueue(): Promise<boolean> {
       }, QUEUE_CONFIG.reconnectDelay);
     });
 
-    channel = await connection.createChannel();
+    const ch = await conn.createChannel();
+    channel = ch;
 
     // Assert the click-events queue exists
-    await channel.assertQueue(QUEUE_CONFIG.clickEventsQueue, {
+    await ch.assertQueue(QUEUE_CONFIG.clickEventsQueue, {
       durable: true, // Queue survives broker restart
       arguments: {
         'x-message-ttl': 86400000, // Messages expire after 24 hours
@@ -151,10 +154,12 @@ export async function consumeClickEvents(handler: ClickEventHandler): Promise<vo
     throw new Error('Queue not connected. Call connectQueue() first.');
   }
 
-  // Set prefetch to limit concurrent processing
-  await channel.prefetch(QUEUE_CONFIG.prefetchCount);
+  const ch = channel;
 
-  await channel.consume(
+  // Set prefetch to limit concurrent processing
+  await ch.prefetch(QUEUE_CONFIG.prefetchCount);
+
+  await ch.consume(
     QUEUE_CONFIG.clickEventsQueue,
     async (msg: ConsumeMessage | null) => {
       if (!msg) return;
@@ -167,7 +172,7 @@ export async function consumeClickEvents(handler: ClickEventHandler): Promise<vo
         await handler(event);
 
         // Acknowledge message after successful processing
-        channel!.ack(msg);
+        ch.ack(msg);
 
         logger.debug({ short_code: event.short_code }, 'Click event processed and acknowledged');
       } catch (error) {
@@ -175,7 +180,7 @@ export async function consumeClickEvents(handler: ClickEventHandler): Promise<vo
 
         // Reject message and requeue it for retry
         // In production, consider using dead-letter queue after N retries
-        channel!.nack(msg, false, true);
+        ch.nack(msg, false, true);
       }
     },
     { noAck: false } // Manual acknowledgment
@@ -190,12 +195,20 @@ export async function consumeClickEvents(handler: ClickEventHandler): Promise<vo
  */
 export async function closeQueue(): Promise<void> {
   if (channel) {
-    await channel.close();
+    try {
+      await channel.close();
+    } catch {
+      // Ignore close errors
+    }
     channel = null;
   }
 
   if (connection) {
-    await connection.close();
+    try {
+      await connection.close();
+    } catch {
+      // Ignore close errors
+    }
     connection = null;
   }
 

@@ -15,6 +15,7 @@ import {
   timeAsync,
 } from '../shared/metrics.js';
 import { getVideoRetentionPolicy, archiveDeletedVideo } from '../shared/retention.js';
+import { generateVideoEmbedding } from '../services/embeddings.js';
 
 const router = express.Router();
 const logger = createLogger('videos');
@@ -129,6 +130,11 @@ async function handleUpload(req, res, next) {
 
     const video = result.rows[0];
 
+    // Generate video embedding asynchronously (don't block response)
+    generateVideoEmbedding(video.id, description, hashtagArray).catch(err => {
+      logger.error({ error: err.message, videoId: video.id }, 'Failed to generate video embedding');
+    });
+
     // Metrics and logging
     videoUploadsCounter.labels('success').inc();
     auditLog('video_uploaded', req.session.userId, {
@@ -181,6 +187,11 @@ router.get('/:id', optionalAuth, async (req, res) => {
 
     const video = result.rows[0];
 
+    // Generate video embedding asynchronously (don't block response)
+    generateVideoEmbedding(video.id, description, hashtagArray).catch(err => {
+      logger.error({ error: err.message, videoId: video.id }, 'Failed to generate video embedding');
+    });
+
     // Check if user liked this video
     let likedVideoIds = [];
     if (req.session?.userId) {
@@ -209,6 +220,11 @@ router.get('/:id/retention', requireAuth, async (req, res) => {
     }
 
     const video = result.rows[0];
+
+    // Generate video embedding asynchronously (don't block response)
+    generateVideoEmbedding(video.id, description, hashtagArray).catch(err => {
+      logger.error({ error: err.message, videoId: video.id }, 'Failed to generate video embedding');
+    });
 
     // Only owner, moderators, or admins can view retention policy
     if (video.creator_id !== req.session.userId &&

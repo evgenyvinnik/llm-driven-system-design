@@ -1,3 +1,5 @@
+import { useRef, useEffect, useCallback } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Tweet } from './Tweet';
 import { Tweet as TweetType } from '../types';
 
@@ -18,6 +20,37 @@ export function Timeline({
   hasMore,
   emptyMessage = 'No tweets yet',
 }: TimelineProps) {
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  // Virtual list for tweets with dynamic height measurement
+  const virtualizer = useVirtualizer({
+    count: tweets.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 150, // Estimate tweet height
+    overscan: 5, // Render 5 extra items above/below
+    measureElement: (element) => {
+      return element.getBoundingClientRect().height;
+    },
+  });
+
+  // Infinite scroll: load more when near bottom
+  const handleScroll = useCallback(() => {
+    if (!parentRef.current || isLoading || !hasMore || !onLoadMore) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = parentRef.current;
+    if (scrollHeight - scrollTop - clientHeight < 500) {
+      onLoadMore();
+    }
+  }, [isLoading, hasMore, onLoadMore]);
+
+  useEffect(() => {
+    const parent = parentRef.current;
+    if (parent) {
+      parent.addEventListener('scroll', handleScroll);
+      return () => parent.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
+
   if (error) {
     return (
       <div className="p-8 text-center">
@@ -49,21 +82,47 @@ export function Timeline({
     );
   }
 
-  return (
-    <div>
-      {tweets.map((tweet) => (
-        <Tweet key={tweet.id} tweet={tweet} />
-      ))}
+  const virtualItems = virtualizer.getVirtualItems();
 
-      {hasMore && onLoadMore && (
-        <div className="p-4 text-center border-b border-twitter-border">
-          <button
-            onClick={onLoadMore}
-            disabled={isLoading}
-            className="px-6 py-2 text-twitter-blue hover:bg-twitter-blue/10 rounded-full transition-colors disabled:opacity-50 font-medium text-[15px]"
-          >
-            {isLoading ? 'Loading...' : 'Show more'}
-          </button>
+  return (
+    <div
+      ref={parentRef}
+      className="h-[calc(100vh-120px)] overflow-auto"
+    >
+      <div
+        style={{
+          height: `${virtualizer.getTotalSize()}px`,
+          width: '100%',
+          position: 'relative',
+        }}
+      >
+        {virtualItems.map((virtualItem) => {
+          const tweet = tweets[virtualItem.index];
+          if (!tweet) return null;
+
+          return (
+            <div
+              key={tweet.id}
+              data-index={virtualItem.index}
+              ref={virtualizer.measureElement}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                transform: `translateY(${virtualItem.start}px)`,
+              }}
+            >
+              <Tweet tweet={tweet} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Loading indicator */}
+      {isLoading && tweets.length > 0 && (
+        <div className="p-4 text-center">
+          <div className="inline-block w-6 h-6 border-3 border-twitter-blue border-t-transparent rounded-full animate-spin"></div>
         </div>
       )}
     </div>

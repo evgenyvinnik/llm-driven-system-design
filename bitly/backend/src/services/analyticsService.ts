@@ -1,5 +1,7 @@
 import { query } from '../utils/database.js';
 import { ClickEvent, ClickEventInput, UrlAnalytics } from '../models/types.js';
+import { ClickEventMessage } from '../utils/queue.js';
+import { incrementClickCount } from './urlService.js';
 
 /**
  * Parses a User-Agent string to determine device type.
@@ -27,6 +29,7 @@ function parseDeviceType(userAgent: string | undefined): string {
 /**
  * Records a click event in the database.
  * Called asynchronously during redirects to capture analytics data.
+ * @deprecated Use queue-based recording with publishClickEvent() instead.
  * @param input - Click event data including short code and request metadata
  */
 export async function recordClick(input: ClickEventInput): Promise<void> {
@@ -43,6 +46,29 @@ export async function recordClick(input: ClickEventInput): Promise<void> {
       deviceType,
     ]
   );
+}
+
+/**
+ * Records a click event synchronously (fallback when queue is unavailable).
+ * Also increments the URL click count.
+ * @param event - Click event message data
+ */
+export async function recordClickSync(event: ClickEventMessage): Promise<void> {
+  await query(
+    `INSERT INTO click_events (short_code, referrer, user_agent, ip_address, device_type, clicked_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      event.short_code,
+      event.referrer || null,
+      event.user_agent || null,
+      event.ip_address || null,
+      event.device_type,
+      new Date(event.timestamp),
+    ]
+  );
+
+  // Also increment click count
+  await incrementClickCount(event.short_code);
 }
 
 /**

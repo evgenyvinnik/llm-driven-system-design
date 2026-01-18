@@ -75,3 +75,12 @@ export {
   getPresignedDownloadUrl,
   getPublicUrl,
 } from './resilientStorage.js';
+
+// RabbitMQ queue
+export {
+  connectQueue,
+  publishTranscodeJob,
+  consumeTranscodeJobs,
+  closeQueue,
+  getQueueStats,
+} from './queue.js';

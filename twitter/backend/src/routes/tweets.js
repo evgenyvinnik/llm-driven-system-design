@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { fanoutTweet } from '../services/fanout.js';
 import logger from '../shared/logger.js';
 import { tweetIdempotencyMiddleware } from '../shared/idempotency.js';
+import { publishTweet, publishLike } from '../shared/kafka.js';
 import {
   tweetCounter,
   tweetCreationDuration,
@@ -101,8 +102,14 @@ router.post('/', requireAuth, tweetIdempotency, async (req, res, next) => {
       await redis.expire(`trend:${hashtag}:${bucket}`, 3600); // 1 hour expiry
     }
 
-    // Fanout tweet to followers' timelines (async, non-blocking)
-    // We don't await this to avoid blocking the response
+    // Publish tweet to Kafka for async fanout and trending processing
+    // This enables async fanout to followers' timelines via workers
+    publishTweet(tweet).catch((err) => {
+      tweetLog.error({ error: err.message, tweetId: tweet.id }, 'Kafka publish error (non-blocking)');
+    });
+
+    // Fanout tweet to followers' timelines (sync fallback, non-blocking)
+    // This runs in parallel with Kafka - workers will also process for redundancy
     fanoutTweet(tweet.id, authorId).catch((err) => {
       tweetLog.error({ error: err.message, tweetId: tweet.id }, 'Fanout error (non-blocking)');
     });
@@ -342,6 +349,11 @@ router.post('/:id/like', requireAuth, async (req, res, next) => {
       [userId, tweetId],
     );
 
+    // Publish like event to Kafka for trending processing
+    publishLike({ userId, tweetId }).catch((err) => {
+      logger.error({ error: err.message, tweetId, userId }, 'Kafka like publish error (non-blocking)');
+    });
+
     // Get updated like count
     const countResult = await pool.query(
       'SELECT like_count FROM tweets WHERE id = $1',
@@ -432,6 +444,11 @@ router.post('/:id/retweet', requireAuth, async (req, res, next) => {
     const retweet = retweetResult.rows[0];
 
     retweetLog.info({ retweetId: retweet.id }, 'Retweet created');
+
+    // Publish retweet to Kafka for async fanout
+    publishTweet(retweet).catch((err) => {
+      retweetLog.error({ error: err.message }, 'Kafka retweet publish error (non-blocking)');
+    });
 
     // Fanout retweet to followers (async, non-blocking)
     fanoutTweet(retweet.id, userId).catch((err) => {

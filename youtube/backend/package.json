@@ -9,7 +9,11 @@
     "dev:server1": "PORT=3001 node --watch src/index.js",
     "dev:server2": "PORT=3002 node --watch src/index.js",
     "dev:server3": "PORT=3003 node --watch src/index.js",
+    "dev:worker": "node --watch src/workers/transcode-worker.js",
+    "dev:worker1": "WORKER_ID=1 node --watch src/workers/transcode-worker.js",
+    "dev:worker2": "WORKER_ID=2 node --watch src/workers/transcode-worker.js",
     "start": "node src/index.js",
+    "start:worker": "node src/workers/transcode-worker.js",
     "migrate": "node migrations/run.js"
   },
   "dependencies": {

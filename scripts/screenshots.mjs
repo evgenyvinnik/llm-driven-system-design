@@ -321,7 +321,7 @@ async function setupDatabase(projectDir, projectName, config) {
   }
 
   const backendDir = path.join(projectDir, 'backend');
-  const seedSqlPath = path.join(backendDir, 'seed.sql');
+  const seedSqlPath = path.join(backendDir, 'db-seed', 'seed.sql');
 
   if (!fs.existsSync(seedSqlPath)) {
     return true; // No seeding needed
@@ -357,7 +357,7 @@ async function setupDatabase(projectDir, projectName, config) {
   // Retry seeding a few times (in case database just became ready)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/seed.sql`, {
+      execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/db-seed/seed.sql`, {
         cwd: projectDir,
         stdio: 'pipe',
       });

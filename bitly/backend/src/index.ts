@@ -14,6 +14,7 @@ import pinoHttp from 'pino-http';
 import { SERVER_CONFIG, RATE_LIMIT_CONFIG } from './config.js';
 import { testConnection, closePool, isDatabaseConnected, getCircuitBreakerStatus } from './utils/database.js';
 import { closeRedis, isRedisConnected } from './utils/cache.js';
+import { connectQueue, closeQueue, isQueueConnected } from './utils/queue.js';
 import { initKeyService, getLocalCacheCount, getKeyPoolStats } from './services/keyService.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import logger from './utils/logger.js';
@@ -154,13 +155,15 @@ app.get('/health', (req: Request, res: Response) => {
 
 /**
  * Detailed health check endpoint.
- * Returns status of all dependencies (database, cache, circuit breakers).
+ * Returns status of all dependencies (database, cache, queue, circuit breakers).
  */
 app.get('/health/detailed', async (req: Request, res: Response) => {
   const dbHealthy = await isDatabaseConnected();
   const redisHealthy = isRedisConnected();
+  const queueHealthy = isQueueConnected();
   const circuitBreaker = getCircuitBreakerStatus();
 
+  // Queue is optional - system is healthy even if queue is down (uses sync fallback)
   const status = dbHealthy && redisHealthy ? 'healthy' : 'degraded';
   const statusCode = status === 'healthy' ? 200 : 503;
 
@@ -176,6 +179,10 @@ app.get('/health/detailed', async (req: Request, res: Response) => {
       },
       redis: {
         status: redisHealthy ? 'connected' : 'disconnected',
+      },
+      rabbitmq: {
+        status: queueHealthy ? 'connected' : 'disconnected',
+        note: queueHealthy ? 'async analytics enabled' : 'using sync fallback',
       },
     },
     key_pool: {
@@ -223,13 +230,14 @@ app.use(errorHandler);
 
 /**
  * Handles graceful shutdown of the server.
- * Closes database and Redis connections before exiting.
+ * Closes database, Redis, and RabbitMQ connections before exiting.
  * @param signal - The signal that triggered the shutdown (SIGTERM or SIGINT)
  */
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Shutdown signal received, starting graceful shutdown');
 
   try {
+    await closeQueue();
     await closePool();
     await closeRedis();
     logger.info('Cleanup complete. Exiting.');
@@ -245,7 +253,7 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 /**
  * Initializes and starts the HTTP server.
- * Tests database connection and initializes the key service before listening.
+ * Tests database connection, initializes the key service, and connects to RabbitMQ.
  */
 async function start(): Promise<void> {
   try {
@@ -259,6 +267,12 @@ async function start(): Promise<void> {
     // Initialize key service
     await initKeyService();
 
+    // Connect to RabbitMQ (optional - will use sync fallback if unavailable)
+    const queueConnected = await connectQueue();
+    if (!queueConnected) {
+      logger.warn('RabbitMQ not available. Click events will be recorded synchronously.');
+    }
+
     // Start listening
     app.listen(SERVER_CONFIG.port, SERVER_CONFIG.host, () => {
       logger.info(
@@ -267,6 +281,7 @@ async function start(): Promise<void> {
           host: SERVER_CONFIG.host,
           base_url: SERVER_CONFIG.baseUrl,
           cors_origin: SERVER_CONFIG.corsOrigin,
+          queue_enabled: queueConnected,
         },
         'Server started'
       );
