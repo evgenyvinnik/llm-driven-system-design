@@ -16,11 +16,6 @@
     "start": "node src/index.js",
     "start:fanout-worker": "node src/workers/fanout-worker.js",
     "start:trending-worker": "node src/workers/trending-worker.js",
-    "db:migrate": "node src/db/migrateRunner.js up",
-    "db:migrate:status": "node src/db/migrateRunner.js status",
-    "db:migrate:create": "node src/db/migrateRunner.js create",
-    "db:migrate:verify": "node src/db/migrateRunner.js verify",
-    "db:migrate:legacy": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js"
   },
   "dependencies": {

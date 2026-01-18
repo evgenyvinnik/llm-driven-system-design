@@ -12,7 +12,6 @@
     "dev:worker": "NODE_ENV=development node --watch src/workers/image-worker.js",
     "start": "NODE_ENV=production node src/index.js",
     "start:worker": "NODE_ENV=production node src/workers/image-worker.js",
-    "db:migrate": "node db/migrate.js",
     "db:seed": "node db/seed.js"
   },
   "dependencies": {

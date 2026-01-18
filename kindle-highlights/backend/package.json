@@ -12,7 +12,6 @@
     "dev:worker": "node --watch --experimental-strip-types src/aggregation/worker.ts",
     "build": "tsc",
     "start": "node dist/highlight/index.js",
-    "db:migrate": "node --experimental-strip-types src/db/migrate.ts",
     "db:seed": "node --experimental-strip-types src/db/seed.ts",
     "test": "vitest run",
     "test:watch": "vitest"

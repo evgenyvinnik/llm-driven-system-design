@@ -10,7 +10,6 @@
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
     "start": "NODE_ENV=production node src/index.js",
-    "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js"
   },
   "dependencies": {

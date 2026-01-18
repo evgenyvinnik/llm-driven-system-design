@@ -7,7 +7,6 @@
     "dev:api": "tsx watch src/api/index.ts",
     "build": "tsc",
     "start": "node dist/api/index.js",
-    "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest",
     "test:watch": "vitest --watch"

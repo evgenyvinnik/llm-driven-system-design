@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 import { redis } from '../db/index.js';
 import { rateLimitConfig } from './config.js';
@@ -28,8 +28,8 @@ export const apiRateLimiter = rateLimit({
     });
   },
   keyGenerator: (req: Request) => {
-    // Use session userId if available, otherwise use IP
-    return req.session?.userId || req.ip || 'unknown';
+    // Use session userId if available, otherwise use IP (properly handled for IPv6)
+    return req.session?.userId || ipKeyGenerator(req);
   },
 });
 
@@ -51,7 +51,8 @@ export const messageRateLimiter = rateLimit({
     });
   },
   keyGenerator: (req: Request) => {
-    return req.session?.userId || req.ip || 'unknown';
+    // Use session userId if available, otherwise use IP (properly handled for IPv6)
+    return req.session?.userId || ipKeyGenerator(req);
   },
 });
 

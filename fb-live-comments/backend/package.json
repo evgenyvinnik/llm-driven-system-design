@@ -11,8 +11,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
-    "format": "prettier --write 'src/**/*.ts'",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "format": "prettier --write 'src/**/*.ts'"
   },
   "dependencies": {
     "cors": "^2.8.5",

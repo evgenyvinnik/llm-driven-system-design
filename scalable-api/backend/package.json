@@ -13,9 +13,6 @@
     "start:gateway": "node gateway/src/index.js",
     "start:lb": "node load-balancer/src/index.js",
     "start:server": "node api-server/src/index.js",
-    "db:migrate": "node src/db/migrate.js up",
-    "db:migrate:down": "node src/db/migrate.js down",
-    "db:migrate:status": "node src/db/migrate.js status",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

@@ -9,10 +9,7 @@
     "dev": "node --watch src/index.js",
     "dev:server1": "PORT=3001 node --watch src/index.js",
     "dev:server2": "PORT=3002 node --watch src/index.js",
-    "dev:server3": "PORT=3003 node --watch src/index.js",
-    "db:migrate": "node src/db/migrate.js up",
-    "db:migrate:down": "node src/db/migrate.js down",
-    "db:migrate:status": "node src/db/migrate.js status"
+    "dev:server3": "PORT=3003 node --watch src/index.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

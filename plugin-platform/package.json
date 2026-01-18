@@ -23,7 +23,6 @@
     "type-check": "npm run type-check --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "clean": "rm -rf node_modules packages/*/node_modules plugins/*/node_modules frontend/node_modules backend/node_modules packages/*/dist plugins/*/dist frontend/dist backend/dist",
-    "db:migrate": "npm run db:migrate -w backend",
     "db:seed": "npm run db:seed -w backend",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",

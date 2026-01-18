@@ -17,8 +17,7 @@
     "start:fraud-worker": "node dist/workers/fraud-worker.js",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src/**/*.ts",
-    "type-check": "tsc --noEmit",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "amqplib": "^0.10.9",

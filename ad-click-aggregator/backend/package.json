@@ -11,11 +11,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit",
-    "db:migrate": "tsx src/db/migrate.ts migrate",
-    "db:migrate:dry-run": "tsx src/db/migrate.ts migrate --dry-run",
-    "db:migrate:status": "tsx src/db/migrate.ts status",
-    "db:migrate:rollback": "tsx src/db/migrate.ts rollback"
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "@clickhouse/client": "^1.8.1",

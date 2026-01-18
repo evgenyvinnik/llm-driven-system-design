@@ -11,7 +11,6 @@
     "dev:server1": "PORT=3001 npm run dev:collection",
     "dev:server2": "PORT=3002 npm run dev:admin",
     "dev:server3": "PORT=3003 npm run dev:inference",
-    "db:migrate": "tsx src/db/migrate.ts",
     "db:seed-admin": "tsx src/db/seed-admin.ts",
     "build": "tsc",
     "test": "vitest run",

@@ -12,10 +12,6 @@
     "dev:worker": "nodemon src/workers/voteAggregator.js",
     "dev:ranking": "nodemon src/workers/rankingCalculator.js",
     "start": "node src/index.js",
-    "db:migrate": "node src/db/migrate.js",
-    "db:migrate:dry-run": "node src/db/migrate.js dry-run",
-    "db:migrate:status": "node src/db/migrate.js status",
-    "db:migrate:rollback": "node src/db/migrate.js rollback",
     "db:seed": "node src/db/seed.js"
   },
   "dependencies": {

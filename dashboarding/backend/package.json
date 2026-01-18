@@ -10,7 +10,6 @@
     "dev:server3": "PORT=3003 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit"
