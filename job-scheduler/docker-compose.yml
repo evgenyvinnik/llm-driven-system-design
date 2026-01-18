@@ -20,7 +20,7 @@ services:
 
   # Redis for queues and distributed locking
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:7-alpine
     container_name: job-scheduler-redis
     ports:
       - "6379:6379"

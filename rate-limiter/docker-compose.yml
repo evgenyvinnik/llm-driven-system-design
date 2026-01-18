@@ -1,7 +1,7 @@
 services:
   # Redis for distributed rate limit state
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:7-alpine
     container_name: rate-limiter-redis
     ports:
       - "6379:6379"

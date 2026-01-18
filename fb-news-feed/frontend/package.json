@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@tanstack/react-router": "^1.92.1",
+    "@tanstack/react-virtual": "^3.13.18",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "zustand": "^5.0.3"

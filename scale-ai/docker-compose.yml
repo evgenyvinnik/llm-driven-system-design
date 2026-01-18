@@ -19,7 +19,7 @@ services:
 
   # Redis for session storage and caching
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:7-alpine
     container_name: scale-ai-redis
     ports:
       - "6379:6379"

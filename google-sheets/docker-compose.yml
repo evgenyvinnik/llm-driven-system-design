@@ -20,7 +20,7 @@ services:
 
   # Redis for pub/sub and sessions
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:7-alpine
     container_name: sheets-redis
     ports:
       - "6379:6379"
