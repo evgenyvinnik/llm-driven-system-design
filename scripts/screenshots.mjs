@@ -20,7 +20,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
-import { chromium } from 'playwright';
+import { webkit } from 'playwright';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -301,7 +301,7 @@ async function startFrontend(projectDir, config) {
     return null;
   }
 
-  const depsInstalled = await installFrontendDeps(frontendDir);
+  const depsInstalled = await installDeps(frontendDir, 'frontend');
   if (!depsInstalled) {
     return null;
   }
@@ -378,23 +378,16 @@ process.on('exit', () => {
 async function captureWithPlaywright(config, outputDir) {
   const baseUrl = `http://localhost:${config.frontendPort}`;
 
-  logStep('BROWSER', 'Launching Chrome...');
+  logStep('BROWSER', 'Launching WebKit...');
 
   let browser;
   try {
-    // Use installed Chrome via channel option (more stable on macOS)
-    browser = await chromium.launch({
+    browser = await webkit.launch({
       headless: true,
-      channel: 'chrome',
-      args: [
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
-      ],
     });
   } catch (error) {
     logError(`Failed to launch browser: ${error.message}`);
-    logWarning('Make sure Google Chrome is installed');
+    logWarning('Run: npx playwright install webkit');
     return { success: false, captured: 0, failed: config.screens.length };
   }
 
@@ -530,10 +523,21 @@ async function processProject(config) {
   }
 
   let frontendProcess = null;
+  let backendProcess = null;
+  let dockerStarted = false;
 
   // Auto-start mode
   if (shouldStart) {
-    await startDockerCompose(projectDir, config.name);
+    // Start Docker infrastructure
+    dockerStarted = await startDockerCompose(projectDir, config.name);
+
+    // Start backend if required
+    if (config.backendRequired) {
+      backendProcess = await startBackend(projectDir, config);
+      if (!backendProcess) {
+        logWarning('Backend failed to start, screenshots may fail for authenticated pages');
+      }
+    }
 
     const alreadyRunning = await isUrlReachable(`http://localhost:${config.frontendPort}`);
     if (alreadyRunning) {
@@ -541,6 +545,10 @@ async function processProject(config) {
     } else {
       frontendProcess = await startFrontend(projectDir, config);
       if (!frontendProcess) {
+        // Cleanup before returning
+        if (dockerStarted) {
+          stopDockerCompose(projectDir, config.name);
+        }
         return { project: config.name, success: false, reason: 'Failed to start frontend' };
       }
     }
@@ -563,6 +571,10 @@ async function processProject(config) {
     config.screens.forEach(screen => {
       log(`  • ${screen.name} (${screen.path})`, 'dim');
     });
+    // Cleanup
+    if (dockerStarted) {
+      stopDockerCompose(projectDir, config.name);
+    }
     return { project: config.name, success: true, captured: 0, failed: 0 };
   }
 
@@ -581,6 +593,25 @@ async function processProject(config) {
       const idx = spawnedProcesses.findIndex(p => p.process === frontendProcess);
       if (idx >= 0) spawnedProcesses.splice(idx, 1);
     } catch {}
+  }
+
+  // Stop backend if we started it
+  if (backendProcess && !backendProcess.killed) {
+    logStep('STOP', `Stopping ${config.name} backend...`);
+    try {
+      if (process.platform !== 'win32') {
+        process.kill(-backendProcess.pid, 'SIGTERM');
+      } else {
+        backendProcess.kill('SIGTERM');
+      }
+      const idx = spawnedProcesses.findIndex(p => p.process === backendProcess);
+      if (idx >= 0) spawnedProcesses.splice(idx, 1);
+    } catch {}
+  }
+
+  // Stop Docker if we started it
+  if (dockerStarted) {
+    stopDockerCompose(projectDir, config.name);
   }
 
   if (result.success) {
