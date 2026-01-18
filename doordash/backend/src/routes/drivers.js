@@ -16,6 +16,7 @@ import {
   etaAccuracy,
 } from '../shared/metrics.js';
 import { auditOrderStatusChange, ACTOR_TYPES } from '../shared/audit.js';
+import { publishOrderEvent, publishLocationUpdate } from '../shared/kafka.js';
 
 const router = Router();
 
@@ -60,12 +61,17 @@ router.post('/location', requireAuth, async (req, res) => {
     // Record metric
     driverLocationUpdates.inc();
 
-    // Broadcast location to subscribers (customers tracking their orders)
+    // Publish location update to Kafka (for analytics and tracking)
     const activeOrders = await query(
       `SELECT id, customer_id FROM orders WHERE driver_id = $1 AND status IN ('CONFIRMED', 'PREPARING', 'READY_FOR_PICKUP', 'PICKED_UP')`,
       [driver.id]
     );
 
+    // If driver has active orders, include the order ID in the Kafka event
+    const activeOrderId = activeOrders.rows.length > 0 ? activeOrders.rows[0].id.toString() : null;
+    publishLocationUpdate(driver.id.toString(), lat, lon, activeOrderId);
+
+    // Broadcast location to subscribers (customers tracking their orders)
     for (const order of activeOrders.rows) {
       broadcast(`order:${order.id}`, {
         type: 'driver_location',
@@ -221,6 +227,12 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
 
     logger.info({ orderId, driverId: driver.id }, 'Order picked up');
 
+    // Publish order event to Kafka
+    publishOrderEvent(orderId.toString(), 'picked_up', {
+      driverId: driver.id,
+      estimatedDelivery: eta.eta,
+    });
+
     // Broadcast update
     broadcastToChannels(
       [`order:${orderId}`, `customer:${order.customer_id}:orders`, `restaurant:${order.restaurant_id}:orders`],
@@ -309,6 +321,14 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
         ? Math.round((Date.now() - new Date(order.placed_at).getTime()) / 60000)
         : null,
     }, 'Order delivered');
+
+    // Publish order event to Kafka
+    publishOrderEvent(orderId.toString(), 'delivered', {
+      driverId: driver.id,
+      deliveryTimeMinutes: order.placed_at
+        ? Math.round((Date.now() - new Date(order.placed_at).getTime()) / 60000)
+        : null,
+    });
 
     // Broadcast update
     broadcastToChannels(

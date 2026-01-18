@@ -27,6 +27,7 @@ CREATE TABLE posts (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     caption TEXT,
     location VARCHAR(255),
+    status VARCHAR(20) DEFAULT 'processing' CHECK (status IN ('processing', 'published', 'failed')),
     like_count INTEGER DEFAULT 0,
     comment_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -38,12 +39,14 @@ CREATE TABLE post_media (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
     media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
-    media_url VARCHAR(500) NOT NULL,
+    media_url VARCHAR(500),
     thumbnail_url VARCHAR(500),
+    original_key VARCHAR(500),
     filter_applied VARCHAR(50),
     width INTEGER,
     height INTEGER,
     order_index INTEGER DEFAULT 0,
+    processed_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

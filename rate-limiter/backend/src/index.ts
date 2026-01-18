@@ -17,7 +17,7 @@ import {
   createAlgorithmInfoRoutes,
 } from './routes/index.js';
 import { createRateLimitMiddleware } from './middleware/rate-limit.js';
-import { logger, prometheusMetrics, getMetricsText, getMetricsContentType } from './shared/index.js';
+import { logger, prometheusMetrics, getMetricsText, getMetricsContentType, initializeQueue, closeQueue } from './shared/index.js';
 
 /**
  * HTTP request logging and metrics middleware.
@@ -111,6 +111,14 @@ async function main() {
     { connected: redisStatus.connected, circuitBreaker: redisStatus.circuitBreakerState },
     'Redis status at startup'
   );
+
+  // Initialize RabbitMQ for async event publishing (non-blocking)
+  try {
+    await initializeQueue();
+    logger.info('RabbitMQ queue initialized');
+  } catch (error) {
+    logger.warn({ error: (error as Error).message }, 'RabbitMQ initialization failed, events will not be published');
+  }
 
   // Initialize rate limiter factory with all algorithm implementations
   const factory = new RateLimiterFactory(redis, config.redis.keyPrefix);
@@ -219,6 +227,9 @@ async function main() {
 
     // Close Redis connection
     await closeRedisClient();
+
+    // Close RabbitMQ connection
+    await closeQueue();
 
     logger.info('Shutdown complete');
     process.exit(0);

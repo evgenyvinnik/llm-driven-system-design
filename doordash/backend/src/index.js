@@ -14,6 +14,7 @@ import driverRoutes from './routes/drivers.js';
 // Shared modules
 import logger, { requestLogger } from './shared/logger.js';
 import { metricsMiddleware, getMetrics, getContentType } from './shared/metrics.js';
+import { initializeKafka, closeKafka, isKafkaReady } from './shared/kafka.js';
 import pool from './db.js';
 import redisClient from './redis.js';
 
@@ -86,6 +87,12 @@ app.get('/health', async (req, res) => {
     health.status = 'degraded';
   }
 
+  // Check Kafka
+  health.checks.kafka = {
+    status: isKafkaReady() ? 'healthy' : 'unavailable',
+    note: 'Event streaming',
+  };
+
   // Memory usage
   const memUsage = process.memoryUsage();
   health.memory = {
@@ -134,6 +141,11 @@ setupWebSocket(server);
 
 const PORT = process.env.PORT || 3000;
 
+// Initialize Kafka (non-blocking)
+initializeKafka().catch((error) => {
+  logger.warn({ error: error.message }, 'Kafka initialization failed - events will not be published');
+});
+
 server.listen(PORT, () => {
   logger.info({ port: PORT }, 'Server started');
   logger.info({ wsPath: `/ws` }, 'WebSocket available');
@@ -158,6 +170,13 @@ process.on('SIGTERM', async () => {
       logger.info('Redis connection closed');
     } catch (error) {
       logger.error({ error: error.message }, 'Error closing Redis');
+    }
+
+    try {
+      await closeKafka();
+      logger.info('Kafka connection closed');
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error closing Kafka');
     }
 
     process.exit(0);

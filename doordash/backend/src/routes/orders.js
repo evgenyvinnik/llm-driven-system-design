@@ -20,6 +20,7 @@ import {
 import { auditOrderCreated, auditOrderStatusChange, auditDriverAssigned, ACTOR_TYPES } from '../shared/audit.js';
 import { idempotencyMiddleware, IDEMPOTENCY_KEYS, clearIdempotencyKey } from '../shared/idempotency.js';
 import { getDriverMatchCircuitBreaker } from '../shared/circuit-breaker.js';
+import { publishOrderEvent, publishDispatchEvent } from '../shared/kafka.js';
 
 const router = Router();
 
@@ -166,6 +167,15 @@ router.post('/', requireAuth, idempotencyMiddleware(IDEMPOTENCY_KEYS.ORDER_CREAT
       total: order.total,
       itemCount: orderItems.length,
     }, 'Order placed');
+
+    // Publish order created event to Kafka
+    publishOrderEvent(order.id.toString(), 'created', {
+      customerId: req.user.id,
+      restaurantId,
+      total: order.total,
+      itemCount: orderItems.length,
+      deliveryAddress,
+    });
 
     // Notify restaurant via WebSocket
     broadcast(`restaurant:${restaurantId}:orders`, {
@@ -363,6 +373,14 @@ router.patch('/:id/status', requireAuth, async (req, res) => {
       actorType,
       actorId: req.user.id,
     }, 'Order status updated');
+
+    // Publish order status event to Kafka
+    publishOrderEvent(id.toString(), status.toLowerCase(), {
+      previousStatus,
+      actorType,
+      actorId: req.user.id,
+      cancelReason: status === 'CANCELLED' ? cancelReason : undefined,
+    });
 
     // Get updated order
     const updatedOrder = await getOrderWithDetails(id);
@@ -571,6 +589,13 @@ async function matchDriverToOrder(orderId) {
         score: bestMatch.score,
         distance: bestMatch.distance,
       }, 'Driver assigned to order');
+
+      // Publish dispatch event to Kafka
+      publishDispatchEvent(orderId.toString(), bestMatch.driver.id.toString(), 'assigned', {
+        score: bestMatch.score,
+        distance: bestMatch.distance,
+        estimatedDelivery: eta.eta,
+      });
 
       return { matched: true, driverId: bestMatch.driver.id };
     });

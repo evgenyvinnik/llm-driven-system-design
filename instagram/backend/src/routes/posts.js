@@ -1,64 +1,32 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { query, getClient } from '../services/db.js';
-import { processAndUploadImage, FILTERS } from '../services/storage.js';
+import { storeOriginalImage, FILTERS } from '../services/storage.js';
+import { publishImageProcessingJob, isQueueReady } from '../services/queue.js';
 import { timelineAdd, timelineRemove, cacheGet, cacheSet, cacheDel } from '../services/redis.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { postRateLimiter, likeRateLimiter } from '../services/rateLimiter.js';
-import { createCircuitBreaker, fallbackWithError } from '../services/circuitBreaker.js';
 import logger from '../services/logger.js';
 import {
   postsCreatedTotal,
   postsDeletedTotal,
   likesTotal,
   likesDuplicateTotal,
-  imageProcessingDuration,
-  imageProcessingErrors,
 } from '../services/metrics.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 /**
- * Circuit breaker for image processing
+ * Create post with async image processing.
  *
- * WHY: Image processing is CPU-intensive and can fail due to:
- * - Invalid/corrupted images
- * - Memory exhaustion
- * - Storage service issues
- *
- * The circuit breaker prevents cascading failures by:
- * - Failing fast when image processing is consistently failing
- * - Allowing time for the system to recover
- * - Automatically testing recovery after timeout
+ * Flow:
+ * 1. Store original images in MinIO
+ * 2. Create post with status 'processing'
+ * 3. Publish job to RabbitMQ
+ * 4. Return 202 Accepted immediately
+ * 5. Worker processes images and updates status to 'published'
  */
-const imageProcessingBreaker = createCircuitBreaker(
-  'image_processing',
-  async (fileBuffer, originalName, filterName) => {
-    const startTime = Date.now();
-    try {
-      const result = await processAndUploadImage(fileBuffer, originalName, filterName);
-      imageProcessingDuration.labels('all').observe((Date.now() - startTime) / 1000);
-      return result;
-    } catch (error) {
-      imageProcessingErrors.labels(error.name || 'unknown').inc();
-      throw error;
-    }
-  },
-  {
-    timeout: 30000, // 30 seconds for image processing
-    errorThresholdPercentage: 50,
-    resetTimeout: 60000, // 1 minute before testing recovery
-    volumeThreshold: 3,
-  }
-);
-
-// Add fallback for image processing failure
-imageProcessingBreaker.fallback(
-  fallbackWithError('Image processing is temporarily unavailable. Please try again later.')
-);
-
-// Create post
 router.post('/', requireAuth, postRateLimiter, upload.array('media', 10), async (req, res) => {
   const client = await getClient();
 
@@ -71,17 +39,6 @@ router.post('/', requireAuth, postRateLimiter, upload.array('media', 10), async 
       return res.status(400).json({ error: 'At least one image is required' });
     }
 
-    await client.query('BEGIN');
-
-    // Create post
-    const postResult = await client.query(
-      `INSERT INTO posts (user_id, caption, location)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [userId, caption || '', location || null]
-    );
-    const post = postResult.rows[0];
-
     // Parse filters (JSON array or default to 'none' for all)
     let filterArray = [];
     try {
@@ -90,25 +47,53 @@ router.post('/', requireAuth, postRateLimiter, upload.array('media', 10), async 
       filterArray = [];
     }
 
-    // Process and upload each media file using circuit breaker
+    await client.query('BEGIN');
+
+    // Create post with 'processing' status
+    const postResult = await client.query(
+      `INSERT INTO posts (user_id, caption, location, status)
+       VALUES ($1, $2, $3, 'processing')
+       RETURNING *`,
+      [userId, caption || '', location || null]
+    );
+    const post = postResult.rows[0];
+
+    // Store original images and create media records
     const mediaItems = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const filterName = filterArray[i] || 'none';
 
-      // Use circuit breaker for image processing
-      const mediaResult = await imageProcessingBreaker.fire(file.buffer, file.originalname, filterName);
+      // Store original in MinIO
+      const { key: originalKey } = await storeOriginalImage(file.buffer, file.originalname);
 
+      // Create media record with original_key (no processed URLs yet)
       const mediaInsert = await client.query(
-        `INSERT INTO post_media (post_id, media_type, media_url, thumbnail_url, filter_applied, width, height, order_index)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO post_media (post_id, media_type, original_key, filter_applied, order_index)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [post.id, 'image', mediaResult.mediaUrl, mediaResult.thumbnailUrl, filterName, mediaResult.width, mediaResult.height, i]
+        [post.id, 'image', originalKey, filterName, i]
       );
-      mediaItems.push(mediaInsert.rows[0]);
+
+      mediaItems.push({
+        originalKey,
+        filterName,
+        orderIndex: i,
+      });
     }
 
     await client.query('COMMIT');
+
+    // Publish job to queue for async processing
+    const jobPublished = await publishImageProcessingJob({
+      postId: post.id,
+      userId,
+      mediaItems,
+    });
+
+    if (!jobPublished) {
+      logger.warn({ postId: post.id }, 'Failed to publish job, post will remain in processing state');
+    }
 
     // Increment metrics
     postsCreatedTotal.inc();
@@ -118,49 +103,30 @@ router.post('/', requireAuth, postRateLimiter, upload.array('media', 10), async 
       postId: post.id,
       userId,
       mediaCount: files.length,
-    }, `Post created: ${post.id}`);
+      status: 'processing',
+    }, `Post created (processing): ${post.id}`);
 
-    // Fan out to followers' timelines
-    const followers = await query(
-      'SELECT follower_id FROM follows WHERE following_id = $1',
-      [userId]
-    );
-
-    const timestamp = new Date(post.created_at).getTime();
-    for (const follower of followers.rows) {
-      await timelineAdd(follower.follower_id, post.id, timestamp);
-    }
-    // Add to own timeline too
-    await timelineAdd(userId, post.id, timestamp);
-
-    res.status(201).json({
+    // Return 202 Accepted for async processing
+    res.status(202).json({
       post: {
         id: post.id,
         userId: post.user_id,
         caption: post.caption,
         location: post.location,
+        status: 'processing',
         likeCount: post.like_count,
         commentCount: post.comment_count,
         createdAt: post.created_at,
-        media: mediaItems.map((m) => ({
-          id: m.id,
-          mediaType: m.media_type,
-          mediaUrl: m.media_url,
-          thumbnailUrl: m.thumbnail_url,
-          filterApplied: m.filter_applied,
-          width: m.width,
-          height: m.height,
-          orderIndex: m.order_index,
+        media: mediaItems.map((m, i) => ({
+          orderIndex: i,
+          filterApplied: m.filterName,
+          status: 'processing',
         })),
       },
+      message: 'Post is being processed. Images will be available shortly.',
     });
   } catch (error) {
     await client.query('ROLLBACK');
-
-    // Handle circuit breaker errors
-    if (error.code === 'SERVICE_UNAVAILABLE') {
-      return res.status(503).json({ error: error.message });
-    }
 
     logger.error({
       type: 'post_create_error',

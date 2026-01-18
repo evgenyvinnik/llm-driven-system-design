@@ -143,4 +143,33 @@ export const deleteObject = async (key) => {
   }
 };
 
+// Store original image for async processing
+export const storeOriginalImage = async (fileBuffer, originalName) => {
+  const fileId = uuidv4();
+  const ext = originalName.split('.').pop() || 'jpg';
+  const key = `originals/${fileId}.${ext}`;
+
+  await minioClient.putObject(BUCKET_NAME, key, fileBuffer, {
+    'Content-Type': 'image/jpeg',
+  });
+
+  return { key, fileId };
+};
+
+// Fetch original image from MinIO (for worker)
+export const fetchOriginalImage = async (key) => {
+  const stream = await minioClient.getObject(BUCKET_NAME, key);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+};
+
+// Process image from stored original (for worker)
+export const processStoredImage = async (originalKey, filterName = 'none') => {
+  const fileBuffer = await fetchOriginalImage(originalKey);
+  return processAndUploadImage(fileBuffer, originalKey, filterName);
+};
+
 export default minioClient;

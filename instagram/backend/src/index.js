@@ -12,6 +12,7 @@ import { attachUserContext } from './middleware/auth.js';
 import { generalRateLimiter } from './services/rateLimiter.js';
 import pool from './services/db.js';
 import { initCassandra, closeCassandra, isCassandraConnected } from './services/cassandra.js';
+import { initializeQueue, closeQueue, isQueueReady } from './services/queue.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -180,6 +181,12 @@ app.get('/api/health/detailed', async (req, res) => {
     note: 'Direct messaging service',
   };
 
+  // Check RabbitMQ (for async image processing)
+  health.components.rabbitmq = {
+    status: isQueueReady() ? 'ok' : 'unavailable',
+    note: 'Async image processing',
+  };
+
   // Memory usage
   const memUsage = process.memoryUsage();
   health.memory = {
@@ -270,6 +277,11 @@ const startServer = async () => {
       logger.warn({ error: err.message }, 'Cassandra initialization failed - DMs will be unavailable');
     });
 
+    // Initialize RabbitMQ for async image processing (non-blocking)
+    initializeQueue().catch((err) => {
+      logger.warn({ error: err.message }, 'RabbitMQ initialization failed - posts will not process');
+    });
+
     // Start the server
     app.listen(config.port, () => {
       logger.info({
@@ -310,6 +322,14 @@ const gracefulShutdown = async (signal) => {
     logger.info('Cassandra connection closed');
   } catch (err) {
     logError(err, { context: 'shutdown', component: 'cassandra' });
+  }
+
+  // Close RabbitMQ connection
+  try {
+    await closeQueue();
+    logger.info('RabbitMQ connection closed');
+  } catch (err) {
+    logError(err, { context: 'shutdown', component: 'rabbitmq' });
   }
 
   process.exit(0);

@@ -9,11 +9,14 @@
     "dev:server1": "PORT=3001 npm run dev",
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
+    "dev:worker": "NODE_ENV=development node --watch src/workers/image-worker.js",
     "start": "NODE_ENV=production node src/index.js",
+    "start:worker": "NODE_ENV=production node src/workers/image-worker.js",
     "db:migrate": "node db/migrate.js",
     "db:seed": "node db/seed.js"
   },
   "dependencies": {
+    "amqplib": "^0.10.9",
     "bcryptjs": "^3.0.2",
     "cassandra-driver": "^4.7.2",
     "connect-redis": "^8.0.1",

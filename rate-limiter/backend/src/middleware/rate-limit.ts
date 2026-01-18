@@ -11,7 +11,7 @@ import { Request, Response, NextFunction } from 'express';
 import { RateLimiterFactory } from '../algorithms/index.js';
 import { Algorithm, RateLimitResult } from '../types/index.js';
 import { recordMetric } from '../utils/redis.js';
-import { logger, prometheusMetrics } from '../shared/index.js';
+import { logger, prometheusMetrics, publishRateLimitEvent } from '../shared/index.js';
 import { config } from '../config/index.js';
 import Redis from 'ioredis';
 
@@ -102,6 +102,9 @@ export function createRateLimitMiddleware(
 
       const latencyMs = Date.now() - startTime;
       await recordMetric(redis, result.allowed ? 'allowed' : 'denied', latencyMs, algorithm);
+
+      // Publish rate limit event to queue (non-blocking)
+      publishRateLimitEvent(id, req.path, result.allowed, result.remaining, algorithm);
 
       // Set standard rate limit headers (compatible with RFC 6585)
       res.set({
