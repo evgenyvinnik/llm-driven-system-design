@@ -14,7 +14,6 @@
     "format": "prettier --write src/"
   },
   "dependencies": {
-    "@elastic/elasticsearch": "^8.19.1",
     "amqplib": "^0.10.9",
     "bcrypt": "^5.1.1",
     "cookie-parser": "^1.4.6",

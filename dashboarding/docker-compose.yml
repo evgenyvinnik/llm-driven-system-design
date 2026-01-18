@@ -1,7 +1,7 @@
 services:
-  timescaledb:
+  postgres:
     image: timescale/timescaledb:latest-pg16
-    container_name: dashboarding-timescaledb
+    container_name: dashboarding-postgres
     ports:
       - "5432:5432"
     environment:
@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: metrics123
       POSTGRES_DB: metricsdb
     volumes:
-      - timescaledb_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U metrics -d metricsdb"]
@@ -55,5 +55,5 @@ services:
       - kafka
 
 volumes:
-  timescaledb_data:
+  postgres_data:
   redis_data:
