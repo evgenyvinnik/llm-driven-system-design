@@ -1,6 +1,7 @@
 import { pool, redis, testDatabaseConnection, testRedisConnection } from '../db/index.js';
 import { logger } from './logger.js';
 import { ALERT_THRESHOLDS } from './config.js';
+import { queueService, QUEUES } from './queue.js';
 
 /**
  * Health check status levels.
@@ -28,6 +29,7 @@ export interface HealthCheckResponse {
   components: {
     database: ComponentHealth;
     redis: ComponentHealth;
+    rabbitmq: ComponentHealth;
     memory: ComponentHealth;
   };
 }
@@ -45,6 +47,11 @@ export interface DetailedHealthCheckResponse extends HealthCheckResponse {
     redis: ComponentHealth & {
       memoryUsed?: number;
       connectedClients?: number;
+    };
+    rabbitmq: ComponentHealth & {
+      queues?: {
+        [key: string]: number | null;
+      };
     };
     memory: ComponentHealth & {
       heapUsed?: number;
@@ -193,6 +200,92 @@ async function checkRedisHealth(): Promise<ComponentHealth & {
 }
 
 /**
+ * Checks RabbitMQ health.
+ * Verifies connection status and queue depths.
+ */
+async function checkRabbitMQHealth(): Promise<ComponentHealth & {
+  queues?: { [key: string]: number | null };
+}> {
+  const start = Date.now();
+
+  try {
+    const isHealthy = queueService.isHealthy();
+    const latencyMs = Date.now() - start;
+
+    if (!isHealthy) {
+      return {
+        status: 'unhealthy',
+        message: 'RabbitMQ connection not established',
+        latencyMs,
+      };
+    }
+
+    // Get queue depths
+    const [notificationsDepth, remindersDepth, dlqDepth] = await Promise.all([
+      queueService.getQueueDepth(QUEUES.BOOKING_NOTIFICATIONS),
+      queueService.getQueueDepth(QUEUES.REMINDERS),
+      queueService.getQueueDepth(QUEUES.DLQ),
+    ]);
+
+    const queues = {
+      [QUEUES.BOOKING_NOTIFICATIONS]: notificationsDepth,
+      [QUEUES.REMINDERS]: remindersDepth,
+      [QUEUES.DLQ]: dlqDepth,
+    };
+
+    // Check queue depth thresholds
+    if (dlqDepth !== null && dlqDepth > ALERT_THRESHOLDS.QUEUE.DLQ_CRITICAL) {
+      return {
+        status: 'unhealthy',
+        message: 'Dead letter queue depth critical',
+        latencyMs,
+        queues,
+      };
+    }
+
+    if (notificationsDepth !== null && notificationsDepth > ALERT_THRESHOLDS.QUEUE.NOTIFICATION_QUEUE_CRITICAL) {
+      return {
+        status: 'unhealthy',
+        message: 'Notification queue depth critical',
+        latencyMs,
+        queues,
+      };
+    }
+
+    if (dlqDepth !== null && dlqDepth > ALERT_THRESHOLDS.QUEUE.DLQ_WARNING) {
+      return {
+        status: 'degraded',
+        message: 'Dead letter queue depth elevated',
+        latencyMs,
+        queues,
+      };
+    }
+
+    if (notificationsDepth !== null && notificationsDepth > ALERT_THRESHOLDS.QUEUE.NOTIFICATION_QUEUE_WARNING) {
+      return {
+        status: 'degraded',
+        message: 'Notification queue depth elevated',
+        latencyMs,
+        queues,
+      };
+    }
+
+    return {
+      status: 'healthy',
+      latencyMs,
+      queues,
+    };
+  } catch (error) {
+    logger.error({ error }, 'RabbitMQ health check failed');
+    return {
+      status: 'degraded',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      latencyMs: Date.now() - start,
+    };
+  }
+}
+
+/**
  * Checks Node.js process memory health.
  * Monitors heap usage for potential memory leaks.
  */
@@ -236,23 +329,31 @@ function checkMemoryHealth(): ComponentHealth & {
 
 /**
  * Determines overall health status from component statuses.
+ * RabbitMQ is considered optional - degraded status if unavailable.
  */
 function determineOverallStatus(components: {
   database: ComponentHealth;
   redis: ComponentHealth;
+  rabbitmq: ComponentHealth;
   memory: ComponentHealth;
 }): HealthStatus {
-  const statuses = [
+  // Database and Redis are critical
+  const criticalStatuses = [
     components.database.status,
     components.redis.status,
     components.memory.status,
   ];
 
-  if (statuses.includes('unhealthy')) {
+  if (criticalStatuses.includes('unhealthy')) {
     return 'unhealthy';
   }
 
-  if (statuses.includes('degraded')) {
+  // RabbitMQ unhealthy only degrades overall status (async processing can retry)
+  if (components.rabbitmq.status === 'unhealthy') {
+    return 'degraded';
+  }
+
+  if (criticalStatuses.includes('degraded') || components.rabbitmq.status === 'degraded') {
     return 'degraded';
   }
 
@@ -264,9 +365,10 @@ function determineOverallStatus(components: {
  * Returns minimal information suitable for load balancers.
  */
 export async function performHealthCheck(): Promise<HealthCheckResponse> {
-  const [database, redisHealth] = await Promise.all([
+  const [database, redisHealth, rabbitmqHealth] = await Promise.all([
     checkDatabaseHealth(),
     checkRedisHealth(),
+    checkRabbitMQHealth(),
   ]);
 
   const memory = checkMemoryHealth();
@@ -281,6 +383,11 @@ export async function performHealthCheck(): Promise<HealthCheckResponse> {
       status: redisHealth.status,
       message: redisHealth.message,
       latencyMs: redisHealth.latencyMs,
+    },
+    rabbitmq: {
+      status: rabbitmqHealth.status,
+      message: rabbitmqHealth.message,
+      latencyMs: rabbitmqHealth.latencyMs,
     },
     memory: {
       status: memory.status,
@@ -302,14 +409,15 @@ export async function performHealthCheck(): Promise<HealthCheckResponse> {
  * Returns comprehensive information for debugging and monitoring.
  */
 export async function performDetailedHealthCheck(): Promise<DetailedHealthCheckResponse> {
-  const [database, redisHealth] = await Promise.all([
+  const [database, redisHealth, rabbitmqHealth] = await Promise.all([
     checkDatabaseHealth(),
     checkRedisHealth(),
+    checkRabbitMQHealth(),
   ]);
 
   const memory = checkMemoryHealth();
 
-  const components = { database, redis: redisHealth, memory };
+  const components = { database, redis: redisHealth, rabbitmq: rabbitmqHealth, memory };
 
   return {
     status: determineOverallStatus(components),

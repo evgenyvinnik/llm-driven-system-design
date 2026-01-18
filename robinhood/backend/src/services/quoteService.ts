@@ -2,6 +2,7 @@ import { redis } from '../redis.js';
 import type { Quote } from '../types/index.js';
 import { logger } from '../shared/logger.js';
 import { createCircuitBreaker, CircuitBreakerState, getCircuitBreakerState } from '../shared/circuitBreaker.js';
+import { publishQuotes, isProducerConnected } from '../shared/kafka.js';
 import CircuitBreaker from 'opossum';
 
 /**
@@ -133,6 +134,7 @@ async function publishQuotesToRedis(quotes: Quote[]): Promise<void> {
  * Enhanced with:
  * - Circuit breaker for external market data calls
  * - Circuit breaker for Redis publishing
+ * - Kafka publishing for distributed quote streaming
  * - Fallback to last known good quotes
  * - Structured logging
  *
@@ -200,7 +202,7 @@ export class QuoteService {
 
   /**
    * Starts the quote simulation with periodic price updates.
-   * Updates are stored in Redis and published to all subscribers.
+   * Updates are stored in Redis, published to Kafka, and sent to all subscribers.
    * @param intervalMs - Update interval in milliseconds (default: 1000)
    */
   start(intervalMs: number = 1000): void {
@@ -219,7 +221,7 @@ export class QuoteService {
         }
       }
 
-      // Notify all subscribers (in-process, always works)
+      // Notify all in-process subscribers (WebSocket handlers, etc.)
       this.notifySubscribers(updatedQuotes);
 
       // Publish to Redis with circuit breaker protection
@@ -227,6 +229,15 @@ export class QuoteService {
         await this.redisBreaker.fire(updatedQuotes);
       } catch (error) {
         // Circuit breaker fallback handles this
+      }
+
+      // Publish to Kafka for distributed consumers
+      if (isProducerConnected()) {
+        try {
+          await publishQuotes(updatedQuotes);
+        } catch (error) {
+          logger.error({ error }, 'Failed to publish quotes to Kafka');
+        }
       }
     }, intervalMs);
 

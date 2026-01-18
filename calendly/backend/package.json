@@ -18,7 +18,10 @@
     "db:migrate:rollback": "tsx src/db/migrate.ts rollback",
     "db:archive-bookings": "tsx -e \"import { archivalService } from './src/services/archivalService.js'; archivalService.archiveOldBookings().then(console.log).catch(console.error).finally(() => process.exit())\"",
     "db:maintenance": "tsx -e \"import { archivalService } from './src/services/archivalService.js'; archivalService.runAllMaintenance().then(console.log).catch(console.error).finally(() => process.exit())\"",
-    "db:storage-stats": "tsx -e \"import { archivalService } from './src/services/archivalService.js'; archivalService.getStorageStats().then(s => console.log(JSON.stringify(s, null, 2))).catch(console.error).finally(() => process.exit())\""
+    "db:storage-stats": "tsx -e \"import { archivalService } from './src/services/archivalService.js'; archivalService.getStorageStats().then(s => console.log(JSON.stringify(s, null, 2))).catch(console.error).finally(() => process.exit())\"",
+    "dev:worker": "tsx watch src/workers/notification-worker.ts",
+    "dev:worker1": "WORKER_ID=1 tsx watch src/workers/notification-worker.ts",
+    "dev:worker2": "WORKER_ID=2 tsx watch src/workers/notification-worker.ts"
   },
   "dependencies": {
     "amqplib": "^0.10.9",

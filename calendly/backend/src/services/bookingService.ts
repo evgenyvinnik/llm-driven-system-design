@@ -18,6 +18,7 @@ import {
 } from '../shared/metrics.js';
 import { idempotencyService, IdempotencyService } from '../shared/idempotency.js';
 import { IDEMPOTENCY_CONFIG } from '../shared/config.js';
+import { queueService } from '../shared/queue.js';
 import { v4 as uuidv4 } from 'uuid';
 import { parseISO, addMinutes, startOfWeek, endOfWeek, startOfMonth, endOfMonth } from 'date-fns';
 
@@ -28,6 +29,8 @@ import { parseISO, addMinutes, startOfWeek, endOfWeek, startOfMonth, endOfMonth 
  * optimistic concurrency control via version fields.
  *
  * Also implements idempotency to prevent duplicate bookings from network retries.
+ * 
+ * Notifications are published to RabbitMQ for async processing by workers.
  */
 export class BookingService {
   /**
@@ -200,7 +203,17 @@ export class BookingService {
       // Update active bookings gauge
       await this.updateActiveBookingsGauge();
 
-      // Send confirmation emails (async, don't block)
+      // Publish notification to RabbitMQ for async processing
+      this.publishBookingConfirmation(booking, meetingType).catch((error) => {
+        bookingLogger.error({ error }, 'Failed to publish booking notification to queue');
+      });
+
+      // Schedule reminders (24h and 1h before meeting)
+      this.scheduleReminders(booking).catch((error) => {
+        bookingLogger.error({ error }, 'Failed to schedule reminders');
+      });
+
+      // Also send confirmation emails directly (fallback/legacy path)
       this.sendConfirmationEmails(booking, meetingType).catch((error) => {
         bookingLogger.error({ error }, 'Failed to send confirmation emails');
         emailNotificationsTotal.inc({ type: 'confirmation', status: 'failure' });
@@ -222,6 +235,70 @@ export class BookingService {
       client.release();
       // Release idempotency lock
       await idempotencyService.releaseLock(effectiveIdempotencyKey);
+    }
+  }
+
+  /**
+   * Publishes booking confirmation notification to RabbitMQ.
+   * @param booking - The newly created booking
+   * @param meetingType - Meeting type details including host info
+   */
+  private async publishBookingConfirmation(
+    booking: Booking,
+    meetingType: { name: string; user_name: string; user_email: string; id: string }
+  ): Promise<void> {
+    try {
+      await queueService.publishNotification('booking_confirmed', {
+        bookingId: booking.id,
+        hostUserId: booking.host_user_id,
+        inviteeEmail: booking.invitee_email,
+        inviteeName: booking.invitee_name,
+        meetingTypeName: meetingType.name,
+        meetingTypeId: meetingType.id,
+        hostName: meetingType.user_name,
+        hostEmail: meetingType.user_email,
+        startTime: booking.start_time.toString(),
+        endTime: booking.end_time.toString(),
+        inviteeTimezone: booking.invitee_timezone,
+        notes: booking.notes || undefined,
+      });
+    } catch (error) {
+      logger.error({ error, bookingId: booking.id }, 'Failed to publish booking confirmation');
+      throw error;
+    }
+  }
+
+  /**
+   * Schedules reminder notifications for a booking.
+   * Schedules reminders for 24 hours and 1 hour before the meeting.
+   * @param booking - The booking to schedule reminders for
+   */
+  private async scheduleReminders(booking: Booking): Promise<void> {
+    const startTime = new Date(booking.start_time);
+    const now = new Date();
+
+    // Schedule 24-hour reminder
+    const reminder24h = new Date(startTime.getTime() - 24 * 60 * 60 * 1000);
+    if (reminder24h > now) {
+      await queueService.scheduleReminder(booking.id, reminder24h.toISOString(), {
+        hoursUntil: 24,
+        inviteeEmail: booking.invitee_email,
+        inviteeName: booking.invitee_name,
+        startTime: booking.start_time.toString(),
+        inviteeTimezone: booking.invitee_timezone,
+      });
+    }
+
+    // Schedule 1-hour reminder
+    const reminder1h = new Date(startTime.getTime() - 60 * 60 * 1000);
+    if (reminder1h > now) {
+      await queueService.scheduleReminder(booking.id, reminder1h.toISOString(), {
+        hoursUntil: 1,
+        inviteeEmail: booking.invitee_email,
+        inviteeName: booking.invitee_name,
+        startTime: booking.start_time.toString(),
+        inviteeTimezone: booking.invitee_timezone,
+      });
     }
   }
 
@@ -354,9 +431,12 @@ export class BookingService {
 
       // Get the existing booking with locking
       const existingResult = await client.query(
-        `SELECT b.*, mt.duration_minutes, mt.buffer_before_minutes, mt.buffer_after_minutes
+        `SELECT b.*, mt.duration_minutes, mt.buffer_before_minutes, mt.buffer_after_minutes,
+                mt.name as meeting_type_name, mt.id as meeting_type_id,
+                u.name as host_name, u.email as host_email
          FROM bookings b
          JOIN meeting_types mt ON b.meeting_type_id = mt.id
+         JOIN users u ON b.host_user_id = u.id
          WHERE b.id = $1
          FOR UPDATE`,
         [id]
@@ -421,7 +501,12 @@ export class BookingService {
       // Invalidate cache
       await this.invalidateAvailabilityCache(existing.host_user_id, existing.meeting_type_id);
 
-      // Send reschedule notification
+      // Publish reschedule notification to RabbitMQ
+      this.publishRescheduleNotification(booking, existing).catch((error) => {
+        rescheduleLogger.error({ error }, 'Failed to publish reschedule notification');
+      });
+
+      // Send reschedule notification (legacy path)
       emailService.sendRescheduleNotification(booking).catch((error) => {
         rescheduleLogger.error({ error }, 'Failed to send reschedule notification');
         emailNotificationsTotal.inc({ type: 'reschedule', status: 'failure' });
@@ -437,6 +522,33 @@ export class BookingService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Publishes reschedule notification to RabbitMQ.
+   */
+  private async publishRescheduleNotification(
+    booking: Booking,
+    meetingDetails: {
+      meeting_type_name: string;
+      meeting_type_id: string;
+      host_name: string;
+      host_email: string;
+    }
+  ): Promise<void> {
+    await queueService.publishNotification('booking_rescheduled', {
+      bookingId: booking.id,
+      hostUserId: booking.host_user_id,
+      inviteeEmail: booking.invitee_email,
+      inviteeName: booking.invitee_name,
+      meetingTypeName: meetingDetails.meeting_type_name,
+      meetingTypeId: meetingDetails.meeting_type_id,
+      hostName: meetingDetails.host_name,
+      hostEmail: meetingDetails.host_email,
+      startTime: booking.start_time.toString(),
+      endTime: booking.end_time.toString(),
+      inviteeTimezone: booking.invitee_timezone,
+    });
   }
 
   /**
@@ -456,9 +568,15 @@ export class BookingService {
     try {
       await client.query('BEGIN');
 
-      // Get booking with lock
+      // Get booking with lock and meeting type/host details
       const existingResult = await client.query(
-        `SELECT * FROM bookings WHERE id = $1 FOR UPDATE`,
+        `SELECT b.*, mt.name as meeting_type_name, mt.id as meeting_type_id,
+                u.name as host_name, u.email as host_email
+         FROM bookings b
+         JOIN meeting_types mt ON b.meeting_type_id = mt.id
+         JOIN users u ON b.host_user_id = u.id
+         WHERE b.id = $1
+         FOR UPDATE`,
         [id]
       );
 
@@ -499,7 +617,12 @@ export class BookingService {
       // Update active bookings gauge
       await this.updateActiveBookingsGauge();
 
-      // Send cancellation notification
+      // Publish cancellation notification to RabbitMQ
+      this.publishCancellationNotification(booking, existing, reason).catch((error) => {
+        cancelLogger.error({ error }, 'Failed to publish cancellation notification');
+      });
+
+      // Send cancellation notification (legacy path)
       emailService.sendCancellationNotification(booking, reason).catch((error) => {
         cancelLogger.error({ error }, 'Failed to send cancellation notification');
         emailNotificationsTotal.inc({ type: 'cancellation', status: 'failure' });
@@ -515,6 +638,35 @@ export class BookingService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Publishes cancellation notification to RabbitMQ.
+   */
+  private async publishCancellationNotification(
+    booking: Booking,
+    meetingDetails: {
+      meeting_type_name: string;
+      meeting_type_id: string;
+      host_name: string;
+      host_email: string;
+    },
+    reason?: string
+  ): Promise<void> {
+    await queueService.publishNotification('booking_cancelled', {
+      bookingId: booking.id,
+      hostUserId: booking.host_user_id,
+      inviteeEmail: booking.invitee_email,
+      inviteeName: booking.invitee_name,
+      meetingTypeName: meetingDetails.meeting_type_name,
+      meetingTypeId: meetingDetails.meeting_type_id,
+      hostName: meetingDetails.host_name,
+      hostEmail: meetingDetails.host_email,
+      startTime: booking.start_time.toString(),
+      endTime: booking.end_time.toString(),
+      inviteeTimezone: booking.invitee_timezone,
+      cancellationReason: reason,
+    });
   }
 
   /**

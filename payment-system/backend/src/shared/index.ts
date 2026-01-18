@@ -7,6 +7,7 @@
  * - Circuit Breaker: Resilience for external service calls
  * - Idempotency: Duplicate request prevention
  * - Audit: Compliance logging for financial operations
+ * - Queue: RabbitMQ integration for async processing
  */
 
 // Logging
@@ -71,3 +72,24 @@ export {
   type AuditAction,
   type AuditLogEntry,
 } from './audit.js';
+
+// Queue (RabbitMQ)
+export {
+  connectQueue,
+  closeQueue,
+  publishWebhook,
+  publishFraudCheck,
+  publishSettlement,
+  consumeWebhooks,
+  consumeFraudChecks,
+  consumeSettlements,
+  requeueWebhook,
+  QUEUES,
+  queueMessagesPublished,
+  queueMessagesConsumed,
+  queueProcessingDuration,
+  type WebhookMessage,
+  type FraudCheckMessage,
+  type SettlementMessage,
+  type MessageHandler,
+} from './queue.js';

@@ -1,4 +1,5 @@
-import amqp, { Channel, Connection, ConsumeMessage } from 'amqplib';
+import amqp from 'amqplib';
+import type { Channel, ChannelModel, ConsumeMessage } from 'amqplib';
 import { logger } from './logger.js';
 
 /**
@@ -67,7 +68,7 @@ export type ReminderHandler = (payload: ReminderPayload) => Promise<void>;
  * Handles connection lifecycle, queue setup, and message publishing/consuming.
  */
 class QueueService {
-  private connection: Connection | null = null;
+  private connection: ChannelModel | null = null;
   private channel: Channel | null = null;
   private connectionUrl: string;
   private isConnecting: boolean = false;
@@ -80,7 +81,7 @@ class QueueService {
     const port = process.env.RABBITMQ_PORT || '5672';
     const user = process.env.RABBITMQ_USER || 'guest';
     const password = process.env.RABBITMQ_PASSWORD || 'guest';
-    this.connectionUrl = `amqp://${user}:${password}@${host}:${port}`;
+    this.connectionUrl = 'amqp://' + user + ':' + password + '@' + host + ':' + port;
   }
 
   /**
@@ -100,7 +101,7 @@ class QueueService {
       this.channel = await this.connection.createChannel();
 
       // Set up error handlers for connection recovery
-      this.connection.on('error', (err) => {
+      this.connection.on('error', (err: Error) => {
         logger.error({ error: err }, 'RabbitMQ connection error');
         this.handleDisconnection();
       });
@@ -253,7 +254,7 @@ class QueueService {
       // In production, consider using RabbitMQ delayed message plugin
       if (delayMs > 0) {
         // Create a temporary delay queue
-        const delayQueue = `reminders-delay-${delayMs}`;
+        const delayQueue = 'reminders-delay-' + delayMs;
         await this.channel!.assertQueue(delayQueue, {
           durable: true,
           arguments: {

@@ -10,6 +10,7 @@ import { migrate } from './models/migrate.js';
 // Shared modules
 import logger, { requestLogger } from './shared/logger.js';
 import { metricsMiddleware, metricsHandler, dbPoolConnections } from './shared/metrics.js';
+import { initProducer, disconnectProducer } from './shared/kafka.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -45,6 +46,14 @@ async function startServer() {
 
     // Run migrations
     await migrate();
+
+    // Initialize Kafka producer for playback events
+    try {
+      await initProducer();
+      logger.info('Kafka producer initialized');
+    } catch (error) {
+      logger.warn({ error: error.message }, 'Kafka producer initialization failed - playback events will not be published');
+    }
 
     // Session store with Redis
     const redisStore = new RedisStore({
@@ -167,30 +176,21 @@ async function startServer() {
 }
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully');
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Shutdown signal received, closing connections gracefully');
   try {
+    await disconnectProducer();
     await redisClient.quit();
     await pool.end();
-    logger.info('Connections closed');
+    logger.info('All connections closed');
     process.exit(0);
   } catch (error) {
     logger.error({ error }, 'Error during shutdown');
     process.exit(1);
   }
-});
+}
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  try {
-    await redisClient.quit();
-    await pool.end();
-    logger.info('Connections closed');
-    process.exit(0);
-  } catch (error) {
-    logger.error({ error }, 'Error during shutdown');
-    process.exit(1);
-  }
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 startServer();

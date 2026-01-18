@@ -1,4 +1,4 @@
-import amqplib, { Channel, Connection, ConsumeMessage } from 'amqplib';
+import amqplib, { Connection, Channel, ConsumeMessage } from 'amqplib';
 import { createComponentLogger } from './logger.js';
 import { Counter, Histogram } from 'prom-client';
 import { metricsRegistry } from './metrics.js';
@@ -83,21 +83,23 @@ export async function getChannel(): Promise<Channel> {
   try {
     log.info({ url: RABBITMQ_URL.replace(/\/\/.*@/, '//***@') }, 'Connecting to RabbitMQ');
 
-    connection = await amqplib.connect(RABBITMQ_URL);
-    channel = await connection.createChannel();
+    const conn = await amqplib.connect(RABBITMQ_URL);
+    connection = conn as unknown as Connection;
+    const ch = await conn.createChannel();
+    channel = ch;
 
     // Set prefetch for fair dispatch among workers
-    await channel.prefetch(10);
+    await ch.prefetch(10);
 
     // Declare queues with durability
-    await channel.assertQueue(QUEUES.LOCATION_REPORTS, {
+    await ch.assertQueue(QUEUES.LOCATION_REPORTS, {
       durable: true,
       arguments: {
         'x-message-ttl': 86400000, // 24 hour TTL
       },
     });
 
-    await channel.assertQueue(QUEUES.NOTIFICATIONS, {
+    await ch.assertQueue(QUEUES.NOTIFICATIONS, {
       durable: true,
       arguments: {
         'x-message-ttl': 3600000, // 1 hour TTL
@@ -107,19 +109,19 @@ export async function getChannel(): Promise<Channel> {
     log.info('Connected to RabbitMQ, queues declared');
 
     // Handle connection errors
-    connection.on('error', (err) => {
+    conn.on('error', (err: Error) => {
       log.error({ error: err }, 'RabbitMQ connection error');
       channel = null;
       connection = null;
     });
 
-    connection.on('close', () => {
+    conn.on('close', () => {
       log.warn('RabbitMQ connection closed');
       channel = null;
       connection = null;
     });
 
-    return channel;
+    return ch;
   } catch (error) {
     log.error({ error }, 'Failed to connect to RabbitMQ');
     throw error;
@@ -139,7 +141,7 @@ export async function closeConnection(): Promise<void> {
       channel = null;
     }
     if (connection) {
-      await connection.close();
+      await (connection as unknown as { close(): Promise<void> }).close();
       connection = null;
     }
     log.info('RabbitMQ connection closed');
