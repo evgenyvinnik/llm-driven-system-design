@@ -2,24 +2,24 @@
 
 ## Opening Statement (1 minute)
 
-"I'll design a web-based plugin platform that enables developers to build, publish, and distribute extensions that extend core application functionality. The core challenge is running untrusted third-party code safely in the browser while providing a rich, versioned API that balances capability with security.
+"I'll design a web-based plugin platform that enables developers to build, publish, and distribute extensions that extend core application functionality. The core challenge is designing a flexible plugin architecture that balances capability with maintainability.
 
-This involves three key technical challenges: designing a secure sandboxing system using Web Workers for isolation, building a versioned extension API with a permission model that protects user data, and implementing a marketplace that scales to thousands of extensions with millions of users."
+This involves three key technical challenges: designing a slot-based contribution system where plugins register UI components to named regions, building a versioned extension API with event bus and shared state for plugin communication, and implementing a marketplace that scales to thousands of extensions with millions of users."
 
 ## Requirements Clarification (3 minutes)
 
 ### Functional Requirements
 - **Install**: Users can add extensions from a marketplace
-- **Run**: Execute extensions in isolated sandboxed environment
+- **Run**: Execute extensions with access to plugin APIs
 - **Publish**: Developers can submit extensions for review
 - **Manage**: Enable, disable, update, configure extensions
 - **Discover**: Browse, search, and review extensions
 
 ### Non-Functional Requirements
-- **Security**: Extensions cannot access arbitrary user data
+- **Composability**: Plugins work independently and together
 - **Performance**: < 500ms extension activation
 - **Scale**: 10,000+ extensions, 1M+ users
-- **Reliability**: Platform works even if extension crashes
+- **Developer Experience**: Easy to build and debug plugins
 
 ### Scale Estimates
 - **Extensions**: 10,000+
@@ -38,20 +38,20 @@ This involves three key technical challenges: designing a secure sandboxing syst
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Web Application                              │
 │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
-│  │  Core App     │  │  Extension    │  │  Extension    │       │
-│  │  (Main Thread)│  │  Host         │  │  Manager      │       │
+│  │  Core App     │  │  Plugin Host  │  │  Extension    │       │
+│  │  (Main Thread)│  │               │  │  Manager      │       │
 │  │               │  │               │  │               │       │
-│  │ - UI          │  │ - API Proxy   │  │ - Install     │       │
-│  │ - Commands    │  │ - Messaging   │  │ - Lifecycle   │       │
+│  │ - UI Slots    │  │ - Event Bus   │  │ - Install     │       │
+│  │ - Commands    │  │ - State Mgr   │  │ - Lifecycle   │       │
 │  └───────────────┘  └───────────────┘  └───────────────┘       │
 └─────────────────────────────────────────────────────────────────┘
            │                    │
-           │               Web Workers (Sandboxed)
+           │          Plugins (In-Process, Main Thread)
            │          ┌────────┴────────┐
            │          ▼                 ▼
            │   ┌───────────────┐ ┌───────────────┐
-           │   │ Extension A   │ │ Extension B   │
-           │   │ (Isolated)    │ │ (Isolated)    │
+           │   │ Plugin A      │ │ Plugin B      │
+           │   │ (Bundled)     │ │ (Bundled)     │
            │   └───────────────┘ └───────────────┘
            │
            ▼
@@ -70,331 +70,279 @@ This involves three key technical challenges: designing a secure sandboxing syst
 
 ### Core Components
 
-1. **Extension Host**: Manages Web Worker lifecycle and message passing
-2. **Extension Manager**: Handles installation, updates, enable/disable
-3. **Extension Registry**: Stores metadata, versions, bundle URLs
-4. **Marketplace Service**: Search, rankings, reviews
-5. **Security Scanner**: Analyzes extensions before publication
+1. **Plugin Host**: Manages plugin lifecycle and provides context APIs
+2. **Slot System**: Named regions where plugins contribute UI components
+3. **Event Bus**: Publish/subscribe communication between plugins
+4. **State Manager**: Reactive shared state with subscriptions
+5. **Marketplace Service**: Search, rankings, reviews
 
-## Deep Dive: Web Worker Sandboxing (8 minutes)
+## Deep Dive: In-Process Plugin Architecture (8 minutes)
 
-The key security mechanism is running each extension in an isolated Web Worker with a controlled API surface.
+The architecture uses in-process plugins running in the main thread. This design choice prioritizes developer experience and simplicity for a marketplace with vetted plugins.
 
-### Extension Host Implementation
+### Why In-Process (Not Web Workers)?
 
-```javascript
-class ExtensionHost {
-  constructor() {
-    this.workers = new Map();    // extensionId -> Worker
-    this.pendingRequests = new Map();
-    this.platformAPI = this.createPlatformAPI();
-  }
+| Aspect | In-Process | Web Workers |
+|--------|------------|-------------|
+| DOM Access | Direct | None (requires message passing) |
+| React Components | Native rendering | Cannot run directly |
+| Debugging | Standard DevTools | Complex, separate context |
+| Development Speed | Fast iteration | Slower, more boilerplate |
+| Best For | Bundled/vetted plugins | Untrusted third-party code |
 
-  async loadExtension(extension) {
-    // Create isolated Web Worker for extension
-    const worker = new Worker('/extension-worker.js', {
-      type: 'module',
-      name: extension.id
-    });
+**Design Decision**: Plugins run in the main thread because:
+- Plugins need direct DOM access for UI rendering
+- React components cannot easily run in workers
+- Bundled plugins from marketplace are vetted
+- Simpler development and debugging experience
 
-    // Set up message channel
-    worker.onmessage = (e) => this.handleMessage(extension.id, e.data);
-    worker.onerror = (e) => this.handleError(extension.id, e);
+### Plugin Host Implementation
 
-    // Initialize extension with limited API
-    worker.postMessage({
-      type: 'init',
-      extensionId: extension.id,
-      manifest: extension.manifest,
-      permissions: extension.permissions,
-      code: extension.bundleUrl
-    });
+```typescript
+class PluginHost {
+  private eventBus: EventBus;
+  private stateManager: StateManager;
+  private loadedPlugins: Map<string, LoadedPlugin>;
 
-    this.workers.set(extension.id, {
-      worker,
-      permissions: extension.permissions,
-      state: 'initializing'
-    });
+  async loadPlugin(manifest: PluginManifest, module: PluginModule) {
+    // Create plugin context with available APIs
+    const context: PluginContext = {
+      pluginId: manifest.id,
 
-    // Timeout for unresponsive extensions
-    setTimeout(() => {
-      const ext = this.workers.get(extension.id);
-      if (ext && ext.state === 'initializing') {
-        console.warn(`Extension ${extension.id} failed to initialize`);
-        this.unloadExtension(extension.id);
-      }
-    }, 5000);
-  }
-
-  async handleMessage(extensionId, message) {
-    if (message.type === 'api-response') {
-      // Extension responding to our call
-      const pending = this.pendingRequests.get(message.requestId);
-      if (pending) {
-        this.pendingRequests.delete(message.requestId);
-        if (message.error) {
-          pending.reject(new Error(message.error));
-        } else {
-          pending.resolve(message.result);
-        }
-      }
-    } else if (message.type === 'platform-api') {
-      // Extension calling platform API
-      await this.handlePlatformAPICall(extensionId, message);
-    } else if (message.type === 'initialized') {
-      const ext = this.workers.get(extensionId);
-      if (ext) ext.state = 'active';
-    }
-  }
-
-  async handlePlatformAPICall(extensionId, message) {
-    const { requestId, api, method, args } = message;
-    const ext = this.workers.get(extensionId);
-
-    try {
-      // Check permissions before allowing API call
-      const hasPermission = this.checkPermission(ext.permissions, api, method);
-      if (!hasPermission) {
-        throw new Error(`Permission denied: ${api}.${method}`);
-      }
-
-      // Execute the API call
-      const result = await this.platformAPI[api][method](extensionId, ...args);
-
-      ext.worker.postMessage({
-        type: 'platform-api-response',
-        requestId,
-        result
-      });
-    } catch (error) {
-      ext.worker.postMessage({
-        type: 'platform-api-response',
-        requestId,
-        error: error.message
-      });
-    }
-  }
-
-  checkPermission(permissions, api, method) {
-    // Define which permissions are required for each API
-    const permissionMap = {
-      'storage': { required: 'storage' },
-      'network': { required: 'network' },
-      'clipboard': { required: 'clipboard' },
-      'ui': { required: null },  // Always allowed
-    };
-
-    const requirement = permissionMap[api];
-    if (!requirement) return false;
-    if (requirement.required === null) return true;
-
-    return permissions.includes(requirement.required);
-  }
-}
-```
-
-### Extension Runtime (Inside Web Worker)
-
-```javascript
-// extension-worker.js - Runs inside Web Worker
-class ExtensionRuntime {
-  constructor() {
-    this.extensionId = null;
-    this.permissions = [];
-    this.pendingRequests = new Map();
-  }
-
-  init(config) {
-    this.extensionId = config.extensionId;
-    this.permissions = config.permissions;
-
-    // Dynamically import extension code
-    import(config.code).then(module => {
-      if (module.activate) {
-        module.activate(this.createAPI());
-      }
-      self.postMessage({ type: 'initialized' });
-    }).catch(error => {
-      self.postMessage({ type: 'error', error: error.message });
-    });
-  }
-
-  createAPI() {
-    return {
-      // UI API (always allowed)
-      ui: {
-        showMessage: (message, type) =>
-          this.callPlatformAPI('ui', 'showMessage', [message, type]),
-        createPanel: (options) =>
-          this.callPlatformAPI('ui', 'createPanel', [options]),
-        registerCommand: (id, callback) =>
-          this.registerCommand(id, callback)
-      },
-
-      // Storage API (requires 'storage' permission)
-      storage: {
-        get: (key) =>
-          this.callPlatformAPI('storage', 'get', [key]),
-        set: (key, value) =>
-          this.callPlatformAPI('storage', 'set', [key, value]),
-        delete: (key) =>
-          this.callPlatformAPI('storage', 'delete', [key])
-      },
-
-      // Network API (requires 'network' permission)
-      network: {
-        fetch: async (url, options) => {
-          if (!this.permissions.includes('network')) {
-            throw new Error('Network permission required');
-          }
-          return this.callPlatformAPI('network', 'fetch', [url, options]);
-        }
-      },
-
-      // Events API
       events: {
-        on: (event, handler) => this.registerEventHandler(event, handler),
-        off: (event, handler) => this.unregisterEventHandler(event, handler)
-      }
+        emit: (event, data) => this.eventBus.emit(event, data),
+        on: (event, handler) => this.eventBus.on(event, handler),
+      },
+
+      state: {
+        get: (key) => this.stateManager.get(key),
+        set: (key, value) => this.stateManager.set(key, value),
+        subscribe: (key, handler) => this.stateManager.subscribe(key, handler),
+      },
+
+      storage: {
+        get: (key) => this.getStorage(manifest.id, key),
+        set: (key, value) => this.setStorage(manifest.id, key, value),
+      },
+
+      commands: {
+        register: (id, handler) => this.registerCommand(manifest.id, id, handler),
+        execute: (id) => this.executeCommand(id),
+      },
     };
-  }
 
-  async callPlatformAPI(api, method, args) {
-    const requestId = crypto.randomUUID();
+    // Activate plugin
+    if (module.activate) {
+      await module.activate(context);
+    }
 
-    return new Promise((resolve, reject) => {
-      this.pendingRequests.set(requestId, { resolve, reject });
+    // Collect slot contributions
+    const contributions = this.collectContributions(manifest, module);
 
-      self.postMessage({
-        type: 'platform-api',
-        requestId,
-        api,
-        method,
-        args
-      });
-
-      // Timeout
-      setTimeout(() => {
-        if (this.pendingRequests.has(requestId)) {
-          this.pendingRequests.delete(requestId);
-          reject(new Error('API call timeout'));
-        }
-      }, 10000);
+    this.loadedPlugins.set(manifest.id, {
+      manifest,
+      context,
+      contributions,
     });
   }
-}
 
-// Initialize runtime
-const runtime = new ExtensionRuntime();
-self.onmessage = (e) => {
-  if (e.data.type === 'init') {
-    runtime.init(e.data);
-  } else if (e.data.type === 'platform-api-response') {
-    const pending = runtime.pendingRequests.get(e.data.requestId);
-    if (pending) {
-      runtime.pendingRequests.delete(e.data.requestId);
-      if (e.data.error) {
-        pending.reject(new Error(e.data.error));
-      } else {
-        pending.resolve(e.data.result);
+  private collectContributions(manifest: PluginManifest, module: PluginModule) {
+    const contributions: SlotContribution[] = [];
+
+    for (const slot of manifest.contributes?.slots || []) {
+      const component = module[slot.component];
+      if (component) {
+        contributions.push({
+          slot: slot.slot,
+          component,
+          order: slot.order || 0,
+        });
+      }
+    }
+
+    return contributions;
+  }
+}
+```
+
+### Event Bus for Plugin Communication
+
+```typescript
+class EventBus {
+  private handlers: Map<string, Set<EventHandler>>;
+
+  emit(event: string, data?: unknown): void {
+    const eventHandlers = this.handlers.get(event);
+    if (eventHandlers) {
+      for (const handler of eventHandlers) {
+        try {
+          handler(data);
+        } catch (error) {
+          console.error(`Event handler error for ${event}:`, error);
+          // Error in one handler doesn't break others
+        }
       }
     }
   }
-};
-```
 
-### Why Web Workers?
-
-| Isolation Method | Security | DOM Access | Performance |
-|------------------|----------|------------|-------------|
-| Web Workers | Strong | None (good!) | Separate thread |
-| iframes | Medium | Own DOM | Main thread |
-| Same-thread | None | Full | Main thread |
-
-Web Workers provide the strongest isolation because they have no DOM access by default and run on a separate thread, preventing a misbehaving extension from freezing the UI.
-
-## Deep Dive: Extension API Design (6 minutes)
-
-### Versioned API with Deprecation
-
-```javascript
-// API versioning strategy
-const API_VERSIONS = {
-  'v1': {
-    storage: {
-      get: (extensionId, key) => getStorageV1(extensionId, key),
-      set: (extensionId, key, value) => setStorageV1(extensionId, key, value)
+  on(event: string, handler: EventHandler): () => void {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, new Set());
     }
-  },
-  'v2': {
-    storage: {
-      get: async (extensionId, key) => {
-        // V2 supports multiple keys
-        if (Array.isArray(key)) {
-          return getMultipleV2(extensionId, key);
-        }
-        return getStorageV1(extensionId, key);
-      },
-      set: (extensionId, key, value) => setStorageV1(extensionId, key, value),
-      // New in v2
-      getAll: (extensionId) => getAllStorageV2(extensionId)
-    }
+    this.handlers.get(event)!.add(handler);
+
+    // Return unsubscribe function
+    return () => {
+      this.handlers.get(event)?.delete(handler);
+    };
   }
-};
-
-function getPlatformAPI(apiVersion) {
-  const version = API_VERSIONS[apiVersion] || API_VERSIONS['v1'];
-  return version;
 }
 ```
 
-### Permission Model
+### State Manager with Reactive Subscriptions
 
-```javascript
-// Extension manifest.json
-{
-  "id": "my-extension",
-  "name": "My Extension",
-  "version": "1.0.0",
-  "minPlatformVersion": "2.0",
-  "permissions": [
-    "storage",           // Local storage for extension data
-    "network",           // Make HTTP requests
-    "clipboard",         // Read/write clipboard
-    "notifications"      // Show system notifications
-  ],
-  "optionalPermissions": [
-    "webcam",            // Access webcam (requires runtime prompt)
-    "microphone"         // Access microphone
-  ]
+```typescript
+class StateManager {
+  private state: Map<string, unknown>;
+  private subscribers: Map<string, Set<StateHandler>>;
+
+  get<T>(key: string): T | undefined {
+    return this.state.get(key) as T;
+  }
+
+  set(key: string, value: unknown): void {
+    const oldValue = this.state.get(key);
+    this.state.set(key, value);
+
+    // Notify subscribers
+    const keySubscribers = this.subscribers.get(key);
+    if (keySubscribers) {
+      for (const handler of keySubscribers) {
+        handler(value, oldValue);
+      }
+    }
+  }
+
+  subscribe(key: string, handler: StateHandler): () => void {
+    if (!this.subscribers.has(key)) {
+      this.subscribers.set(key, new Set());
+    }
+    this.subscribers.get(key)!.add(handler);
+
+    return () => {
+      this.subscribers.get(key)?.delete(handler);
+    };
+  }
 }
 ```
 
-### Permission Request Flow
+### Plugin Communication Examples
 
-```javascript
-async function requestPermission(extensionId, permission) {
-  // Check if already granted
-  const granted = await db.query(`
-    SELECT 1 FROM extension_permissions
-    WHERE extension_id = $1 AND permission = $2
-  `, [extensionId, permission]);
+**Font Plugin to Editor Plugin:**
+```
+Font Selector                    Text Editor
+    │                                │
+    ├── state.set('format.font')────▶│
+    │                                │ subscribe('format.font')
+    │                                │     └── Update textarea style
+```
 
-  if (granted.rows.length > 0) {
-    return true;
-  }
+**Editor Plugin to Word Count Plugin:**
+```
+Text Editor                      Word Count
+    │                                │
+    ├── state.set('editor.content')─▶│
+    │                                │ subscribe('editor.content')
+    │                                │     └── Recalculate counts
+```
 
-  // Prompt user
-  const approved = await showPermissionDialog(extensionId, permission);
+## Deep Dive: Slot System (6 minutes)
 
-  if (approved) {
-    await db.query(`
-      INSERT INTO extension_permissions (extension_id, permission, granted_at)
-      VALUES ($1, $2, NOW())
-    `, [extensionId, permission]);
-  }
+### Named Slot Regions
 
-  return approved;
+Slots are named regions where plugins contribute UI components:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        [toolbar slot]                            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐           ┌──────────┐ │
+│  │ Font     │ │ Size     │ │ Paper    │           │ Theme    │ │
+│  │ Selector │ │ Selector │ │ Selector │           │ Toggle   │ │
+│  └──────────┘ └──────────┘ └──────────┘           └──────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                      [canvas slot]                               │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ ░ Paper Background (z-index: 0)                         ░│  │
+│  │  ┌─────────────────────────────────────────────────────┐ │  │
+│  │  │ Text Editor (z-index: 1)                            │ │  │
+│  │  └─────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                      [statusbar slot]                            │
+│  Words: 9  |  Characters: 44  |  Lines: 1                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Slot | Layout | Purpose |
+|------|--------|---------|
+| `toolbar` | Horizontal | Controls, selectors, buttons |
+| `canvas` | Stacked (z-index) | Paper background, text editor |
+| `sidebar` | Vertical | Settings, info panels |
+| `statusbar` | Horizontal | Stats, status info |
+| `modal` | Single | Dialog overlays |
+
+### Slot Renderer Component
+
+```typescript
+function SlotRenderer({ slotName }: { slotName: string }) {
+  const { pluginHost } = usePluginHost();
+
+  // Collect all contributions for this slot
+  const contributions = useMemo(() => {
+    const allContributions: SlotContribution[] = [];
+
+    for (const plugin of pluginHost.loadedPlugins.values()) {
+      const matching = plugin.contributions.filter(c => c.slot === slotName);
+      allContributions.push(...matching);
+    }
+
+    // Sort by order
+    return allContributions.sort((a, b) => a.order - b.order);
+  }, [pluginHost, slotName]);
+
+  return (
+    <div className={`slot slot-${slotName}`}>
+      {contributions.map((contribution, index) => {
+        const Component = contribution.component;
+        const context = pluginHost.getContext(contribution.pluginId);
+        return <Component key={index} context={context} />;
+      })}
+    </div>
+  );
+}
+```
+
+### Plugin Manifest
+
+```typescript
+interface PluginManifest {
+  id: string;                    // Unique identifier
+  name: string;                  // Display name
+  version: string;               // Semver version
+  description: string;
+
+  contributes: {
+    slots?: SlotContribution[];  // UI components to slots
+    commands?: Command[];        // Executable commands
+    settings?: Setting[];        // Configurable options
+  };
+
+  requires?: {
+    events?: string[];           // Events it subscribes to
+    state?: string[];            // State keys it reads
+  };
 }
 ```
 
@@ -402,16 +350,16 @@ async function requestPermission(extensionId, permission) {
 
 ### Extension Publishing Flow
 
-```javascript
+```typescript
 class MarketplaceService {
-  async publishExtension(authorId, manifest, bundle) {
+  async publishExtension(authorId: string, manifest: PluginManifest, bundle: Buffer) {
     // 1. Validate manifest
     this.validateManifest(manifest);
 
-    // 2. Security scan
-    const scanResult = await this.securityScanner.scan(bundle);
-    if (scanResult.hasIssues) {
-      throw new Error(`Security issues: ${scanResult.issues.join(', ')}`);
+    // 2. Basic code review (for bundled plugins)
+    const reviewResult = await this.codeReview.analyze(bundle);
+    if (reviewResult.hasIssues) {
+      throw new Error(`Review issues: ${reviewResult.issues.join(', ')}`);
     }
 
     // 3. Upload bundle to CDN
@@ -433,10 +381,10 @@ class MarketplaceService {
     // 5. Add version
     await db.query(`
       INSERT INTO extension_versions
-        (extension_id, version, bundle_url, changelog, min_platform_version, permissions)
-      VALUES ($1, $2, $3, $4, $5, $6)
+        (extension_id, version, bundle_url, changelog, min_platform_version)
+      VALUES ($1, $2, $3, $4, $5)
     `, [manifest.id, manifest.version, bundleUrl, manifest.changelog,
-        manifest.minPlatformVersion, manifest.permissions]);
+        manifest.minPlatformVersion]);
 
     // 6. Update search index
     await this.updateSearchIndex(extension.rows[0]);
@@ -444,7 +392,7 @@ class MarketplaceService {
     return extension.rows[0];
   }
 
-  async searchExtensions(query, options = {}) {
+  async searchExtensions(query: string, options = {}) {
     const { category, sortBy = 'popularity', limit = 20 } = options;
 
     // Elasticsearch query
@@ -484,60 +432,64 @@ class MarketplaceService {
 }
 ```
 
-### Security Scanner
+## Trade-offs and Alternatives (5 minutes)
+
+### 1. In-Process vs. Web Worker Sandboxing
+
+**Chose: In-Process Plugins**
+- Pro: Direct DOM access for UI rendering
+- Pro: React components work naturally
+- Pro: Simple debugging with standard DevTools
+- Pro: Faster development iteration
+- Con: Less isolation between plugins
+- Trade-off: Acceptable for vetted marketplace plugins
+
+**Production Alternative: Web Worker Sandboxing**
+
+For platforms running untrusted third-party code, Web Workers provide stronger isolation:
 
 ```javascript
-class SecurityScanner {
-  async scan(bundle) {
-    const issues = [];
+// Web Worker approach (alternative for enhanced security)
+class SandboxedPluginHost {
+  async loadPlugin(extension) {
+    const worker = new Worker('/extension-worker.js', { type: 'module' });
 
-    // Check for dangerous patterns
-    const dangerousPatterns = [
-      /eval\s*\(/g,                  // eval()
-      /new\s+Function\s*\(/g,        // new Function()
-      /document\./g,                 // DOM access (shouldn't be possible in worker)
-      /window\./g,                   // Global access
-      /localStorage/g,               // Direct storage access
-      /XMLHttpRequest/g,             // Direct network (should use API)
-    ];
+    worker.onmessage = (e) => this.handleMessage(extension.id, e.data);
 
-    for (const pattern of dangerousPatterns) {
-      if (pattern.test(bundle)) {
-        issues.push(`Detected pattern: ${pattern.source}`);
-      }
+    worker.postMessage({
+      type: 'init',
+      extensionId: extension.id,
+      code: extension.bundleUrl
+    });
+  }
+
+  async handlePlatformAPICall(extensionId, message) {
+    const { api, method, args } = message;
+
+    // Check permissions before allowing API call
+    const hasPermission = this.checkPermission(extensionId, api, method);
+    if (!hasPermission) {
+      throw new Error(`Permission denied: ${api}.${method}`);
     }
 
-    // Check bundle size
-    if (bundle.length > 5 * 1024 * 1024) { // 5MB
-      issues.push('Bundle exceeds size limit');
-    }
-
-    return {
-      hasIssues: issues.length > 0,
-      issues
-    };
+    // Execute through controlled API
+    return this.platformAPI[api][method](extensionId, ...args);
   }
 }
 ```
 
-## Trade-offs and Alternatives (5 minutes)
+Web Workers are better when:
+- Running untrusted third-party code
+- Plugins don't need direct DOM access
+- Maximum isolation is required
 
-### 1. Web Workers vs. iframes
+### 2. Event Bus + State vs. Single Mechanism
 
-**Chose: Web Workers**
-- Pro: No DOM access (stronger isolation)
-- Pro: Separate thread (can't block UI)
-- Pro: Clean message-passing API
-- Con: Can't render UI directly
-- Trade-off: Extensions use API to request UI, platform renders it
-
-### 2. postMessage vs. Shared Memory
-
-**Chose: postMessage**
-- Pro: Clear security boundary
-- Pro: Easy to audit all communication
-- Con: Serialization overhead
-- Alternative: SharedArrayBuffer (faster, harder to audit)
+**Chose: Both mechanisms**
+- State: For persistent values (font, theme, content)
+- Events: For transient notifications (content changed)
+- Pro: Plugins choose the appropriate mechanism
+- Con: Two APIs to learn
 
 ### 3. CDN-Hosted vs. Platform-Stored Bundles
 
@@ -588,7 +540,6 @@ CREATE TABLE extension_versions (
   bundle_url VARCHAR(500) NOT NULL,
   changelog TEXT,
   min_platform_version VARCHAR(20),
-  permissions TEXT[],
   published_at TIMESTAMP DEFAULT NOW(),
   UNIQUE (extension_id, version)
 );
@@ -616,12 +567,12 @@ CREATE TABLE extension_reviews (
 
 ## Closing Summary (1 minute)
 
-"The plugin platform is built around three security-first principles:
+"The plugin platform is built around three core principles:
 
-1. **Web Worker sandboxing** - Each extension runs in an isolated Web Worker with no direct DOM access. All capabilities are exposed through a controlled API with permission checking on every call.
+1. **Slot-based contribution system** - Plugins register React components to named slots (toolbar, canvas, statusbar). The platform renders all contributions in order, creating a composable UI where plugins don't need to know about each other.
 
-2. **Message-based API with permissions** - Extensions communicate with the platform via postMessage, which creates an auditable security boundary. Permissions are declared in the manifest and checked at runtime.
+2. **Event bus + shared state** - Plugins communicate through two complementary mechanisms: an event bus for transient notifications and a state manager for persistent values with reactive subscriptions. This enables loose coupling between plugins.
 
-3. **CDN-hosted immutable bundles** - Extension code is scanned for security issues, then hosted on CDN with version-specific URLs, ensuring users always get the exact code that was reviewed.
+3. **In-process execution with vetted plugins** - Plugins run in the main thread for direct DOM access and simpler development. This works because marketplace plugins go through a review process before publication.
 
-The main trade-off is capability vs. security. We chose strict sandboxing and permission requirements because user trust is essential for platform adoption. Future improvements would include an extension signing system, runtime behavioral analysis, and a more sophisticated review process using automated code analysis."
+The main trade-off is isolation vs. developer experience. We chose in-process execution because plugins need direct DOM access for React component rendering, and vetted marketplace plugins don't require Web Worker isolation. For platforms running truly untrusted code, Web Worker sandboxing would provide stronger isolation at the cost of complexity and limited DOM access."

@@ -1,0 +1,127 @@
+-- Venmo Seed Data
+-- Password hash for 'password123': $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
+-- PIN hash for '1234': $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
+
+-- Sample users
+INSERT INTO users (id, username, email, phone, name, avatar_url, password_hash, pin_hash, role)
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '555-0101', 'Alice Johnson', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'user'),
+  ('22222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '555-0102', 'Bob Smith', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'user'),
+  ('33333333-3333-3333-3333-333333333333', 'charlie', 'charlie@example.com', '555-0103', 'Charlie Brown', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'user'),
+  ('44444444-4444-4444-4444-444444444444', 'diana', 'diana@example.com', '555-0104', 'Diana Prince', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'user'),
+  ('55555555-5555-5555-5555-555555555555', 'eddie', 'eddie@example.com', '555-0105', 'Eddie Murphy', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'user'),
+  ('99999999-9999-9999-9999-999999999999', 'admin', 'admin@example.com', '555-0100', 'Admin User', 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=200', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'admin')
+ON CONFLICT (username) DO NOTHING;
+
+-- Wallets with initial balances (in cents)
+INSERT INTO wallets (user_id, balance, pending_balance)
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 50000, 0),    -- $500.00
+  ('22222222-2222-2222-2222-222222222222', 25000, 0),    -- $250.00
+  ('33333333-3333-3333-3333-333333333333', 10000, 0),    -- $100.00
+  ('44444444-4444-4444-4444-444444444444', 15000, 0),    -- $150.00
+  ('55555555-5555-5555-5555-555555555555', 8500, 0),     -- $85.00
+  ('99999999-9999-9999-9999-999999999999', 100000, 0)    -- $1000.00 (admin)
+ON CONFLICT (user_id) DO NOTHING;
+
+-- Payment methods (bank accounts)
+INSERT INTO payment_methods (id, user_id, type, is_default, name, last4, bank_name, routing_number, account_number_encrypted, verified)
+VALUES
+  ('pm-11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 'bank', true, 'Alice Checking', '4567', 'Chase Bank', '021000021', 'encrypted_account_alice', true),
+  ('pm-22222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 'bank', true, 'Bob Checking', '8901', 'Bank of America', '026009593', 'encrypted_account_bob', true),
+  ('pm-33333333-3333-3333-3333-333333333333', '33333333-3333-3333-3333-333333333333', 'bank', true, 'Charlie Savings', '2345', 'Wells Fargo', '121000248', 'encrypted_account_charlie', true),
+  ('pm-44444444-4444-4444-4444-444444444444', '44444444-4444-4444-4444-444444444444', 'bank', true, 'Diana Checking', '6789', 'Citibank', '021000089', 'encrypted_account_diana', true),
+  ('pm-55555555-5555-5555-5555-555555555555', '55555555-5555-5555-5555-555555555555', 'bank', true, 'Eddie Checking', '3456', 'US Bank', '091000019', 'encrypted_account_eddie', true),
+  -- Debit cards
+  ('pm-11111111-aaaa-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 'debit_card', false, 'Alice Debit', '4242', NULL, NULL, 'tok_visa_debit_alice', true),
+  ('pm-22222222-aaaa-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 'debit_card', false, 'Bob Debit', '5555', NULL, NULL, 'tok_mastercard_debit_bob', true)
+ON CONFLICT DO NOTHING;
+
+-- Friendships (bidirectional - both entries for accepted friendships)
+INSERT INTO friendships (user_id, friend_id, status)
+VALUES
+  ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'accepted'),
+  ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 'accepted'),
+  ('11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'accepted'),
+  ('33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'accepted'),
+  ('11111111-1111-1111-1111-111111111111', '44444444-4444-4444-4444-444444444444', 'accepted'),
+  ('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111', 'accepted'),
+  ('22222222-2222-2222-2222-222222222222', '33333333-3333-3333-3333-333333333333', 'accepted'),
+  ('33333333-3333-3333-3333-333333333333', '22222222-2222-2222-2222-222222222222', 'accepted'),
+  ('22222222-2222-2222-2222-222222222222', '44444444-4444-4444-4444-444444444444', 'accepted'),
+  ('44444444-4444-4444-4444-444444444444', '22222222-2222-2222-2222-222222222222', 'accepted'),
+  ('33333333-3333-3333-3333-333333333333', '44444444-4444-4444-4444-444444444444', 'accepted'),
+  ('44444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', 'accepted'),
+  ('44444444-4444-4444-4444-444444444444', '55555555-5555-5555-5555-555555555555', 'accepted'),
+  ('55555555-5555-5555-5555-555555555555', '44444444-4444-4444-4444-444444444444', 'accepted'),
+  -- Pending friend request
+  ('55555555-5555-5555-5555-555555555555', '11111111-1111-1111-1111-111111111111', 'pending')
+ON CONFLICT DO NOTHING;
+
+-- Sample transfers (completed payments)
+INSERT INTO transfers (id, sender_id, receiver_id, amount, note, visibility, status, funding_source, created_at)
+VALUES
+  ('tr-11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 2500, 'Lunch yesterday - tacos were amazing!', 'public', 'completed', 'balance', NOW() - INTERVAL '5 days'),
+  ('tr-22222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', '33333333-3333-3333-3333-333333333333', 1500, 'Coffee run', 'public', 'completed', 'balance', NOW() - INTERVAL '4 days'),
+  ('tr-33333333-3333-3333-3333-333333333333', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 5000, 'Concert tickets - thanks for getting them!', 'friends', 'completed', 'bank', NOW() - INTERVAL '3 days'),
+  ('tr-44444444-4444-4444-4444-444444444444', '44444444-4444-4444-4444-444444444444', '22222222-2222-2222-2222-222222222222', 3500, 'Uber split from Saturday', 'public', 'completed', 'balance', NOW() - INTERVAL '2 days'),
+  ('tr-55555555-5555-5555-5555-555555555555', '11111111-1111-1111-1111-111111111111', '44444444-4444-4444-4444-444444444444', 4200, 'Brunch - my treat next time!', 'public', 'completed', 'balance', NOW() - INTERVAL '1 day'),
+  ('tr-66666666-6666-6666-6666-666666666666', '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 1800, 'Movie tickets', 'friends', 'completed', 'debit_card', NOW() - INTERVAL '12 hours'),
+  ('tr-77777777-7777-7777-7777-777777777777', '33333333-3333-3333-3333-333333333333', '44444444-4444-4444-4444-444444444444', 2750, 'Birthday gift contribution', 'private', 'completed', 'balance', NOW() - INTERVAL '6 hours'),
+  ('tr-88888888-8888-8888-8888-888888888888', '55555555-5555-5555-5555-555555555555', '44444444-4444-4444-4444-444444444444', 1200, 'Gym membership split', 'public', 'completed', 'balance', NOW() - INTERVAL '2 hours')
+ON CONFLICT DO NOTHING;
+
+-- Feed items (fan-out on write pattern)
+INSERT INTO feed_items (id, user_id, transfer_id, created_at)
+VALUES
+  -- Feed for transfer 1 (Alice -> Bob, public)
+  ('fi-01-alice', '11111111-1111-1111-1111-111111111111', 'tr-11111111-1111-1111-1111-111111111111', NOW() - INTERVAL '5 days'),
+  ('fi-01-bob', '22222222-2222-2222-2222-222222222222', 'tr-11111111-1111-1111-1111-111111111111', NOW() - INTERVAL '5 days'),
+  ('fi-01-charlie', '33333333-3333-3333-3333-333333333333', 'tr-11111111-1111-1111-1111-111111111111', NOW() - INTERVAL '5 days'),
+  ('fi-01-diana', '44444444-4444-4444-4444-444444444444', 'tr-11111111-1111-1111-1111-111111111111', NOW() - INTERVAL '5 days'),
+  -- Feed for transfer 2 (Bob -> Charlie, public)
+  ('fi-02-bob', '22222222-2222-2222-2222-222222222222', 'tr-22222222-2222-2222-2222-222222222222', NOW() - INTERVAL '4 days'),
+  ('fi-02-charlie', '33333333-3333-3333-3333-333333333333', 'tr-22222222-2222-2222-2222-222222222222', NOW() - INTERVAL '4 days'),
+  ('fi-02-alice', '11111111-1111-1111-1111-111111111111', 'tr-22222222-2222-2222-2222-222222222222', NOW() - INTERVAL '4 days'),
+  ('fi-02-diana', '44444444-4444-4444-4444-444444444444', 'tr-22222222-2222-2222-2222-222222222222', NOW() - INTERVAL '4 days'),
+  -- Feed for transfer 5 (Alice -> Diana, public)
+  ('fi-05-alice', '11111111-1111-1111-1111-111111111111', 'tr-55555555-5555-5555-5555-555555555555', NOW() - INTERVAL '1 day'),
+  ('fi-05-diana', '44444444-4444-4444-4444-444444444444', 'tr-55555555-5555-5555-5555-555555555555', NOW() - INTERVAL '1 day'),
+  ('fi-05-bob', '22222222-2222-2222-2222-222222222222', 'tr-55555555-5555-5555-5555-555555555555', NOW() - INTERVAL '1 day'),
+  ('fi-05-charlie', '33333333-3333-3333-3333-333333333333', 'tr-55555555-5555-5555-5555-555555555555', NOW() - INTERVAL '1 day')
+ON CONFLICT DO NOTHING;
+
+-- Payment requests (pending)
+INSERT INTO payment_requests (id, requester_id, requestee_id, amount, note, status, created_at)
+VALUES
+  ('pr-11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 2000, 'Movie tickets from last week', 'pending', NOW() - INTERVAL '2 days'),
+  ('pr-22222222-2222-2222-2222-222222222222', '44444444-4444-4444-4444-444444444444', '22222222-2222-2222-2222-222222222222', 1500, 'Pizza night', 'pending', NOW() - INTERVAL '1 day'),
+  ('pr-33333333-3333-3333-3333-333333333333', '22222222-2222-2222-2222-222222222222', '55555555-5555-5555-5555-555555555555', 3000, 'Group gift contribution', 'pending', NOW() - INTERVAL '6 hours')
+ON CONFLICT DO NOTHING;
+
+-- Transfer likes
+INSERT INTO transfer_likes (user_id, transfer_id)
+VALUES
+  ('33333333-3333-3333-3333-333333333333', 'tr-11111111-1111-1111-1111-111111111111'),
+  ('44444444-4444-4444-4444-444444444444', 'tr-11111111-1111-1111-1111-111111111111'),
+  ('11111111-1111-1111-1111-111111111111', 'tr-22222222-2222-2222-2222-222222222222'),
+  ('44444444-4444-4444-4444-444444444444', 'tr-22222222-2222-2222-2222-222222222222'),
+  ('22222222-2222-2222-2222-222222222222', 'tr-55555555-5555-5555-5555-555555555555'),
+  ('33333333-3333-3333-3333-333333333333', 'tr-55555555-5555-5555-5555-555555555555')
+ON CONFLICT DO NOTHING;
+
+-- Transfer comments
+INSERT INTO transfer_comments (id, user_id, transfer_id, content, created_at)
+VALUES
+  ('tc-11111111-aaaa-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 'tr-11111111-1111-1111-1111-111111111111', 'Those tacos looked incredible!', NOW() - INTERVAL '5 days'),
+  ('tc-22222222-aaaa-2222-2222-222222222222', '44444444-4444-4444-4444-444444444444', 'tr-11111111-1111-1111-1111-111111111111', 'Which taco place? I need to try it!', NOW() - INTERVAL '5 days'),
+  ('tc-33333333-aaaa-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'tr-22222222-2222-2222-2222-222222222222', 'Coffee is always a good idea', NOW() - INTERVAL '4 days'),
+  ('tc-44444444-aaaa-4444-4444-444444444444', '22222222-2222-2222-2222-222222222222', 'tr-55555555-5555-5555-5555-555555555555', 'Brunch crew!', NOW() - INTERVAL '1 day')
+ON CONFLICT DO NOTHING;
+
+-- Cashouts (one completed, one processing)
+INSERT INTO cashouts (id, user_id, amount, fee, speed, status, payment_method_id, estimated_arrival, completed_at, created_at)
+VALUES
+  ('co-11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 10000, 0, 'standard', 'completed', 'pm-11111111-1111-1111-1111-111111111111', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '3 days'),
+  ('co-22222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 5000, 25, 'instant', 'completed', 'pm-22222222-aaaa-2222-2222-222222222222', NOW(), NOW(), NOW() - INTERVAL '30 minutes')
+ON CONFLICT DO NOTHING;

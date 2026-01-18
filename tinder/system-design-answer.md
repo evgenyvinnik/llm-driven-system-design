@@ -76,13 +76,13 @@
 │                    │                                                         │
 │  ┌─────────────────▼─────────────────┐                              ┌────────▼────────┐
 │  │          PostgreSQL               │                              │     Redis       │
-│  │  (Users, Matches, Preferences)    │                              │  (Cache, Swipes)│
+│  │  (Users, Matches, Messages)       │                              │  (Cache, Swipes)│
 │  └───────────────────────────────────┘                              └─────────────────┘
 │                                                                                        │
-│  ┌──────────────────────┐  ┌──────────────────┐  ┌───────────────────────────────────┐│
-│  │    Elasticsearch     │  │     MongoDB      │  │    S3 / Object Storage            ││
-│  │   (Geo + Search)     │  │   (Messages)     │  │        (Photos)                   ││
-│  └──────────────────────┘  └──────────────────┘  └───────────────────────────────────┘│
+│  ┌──────────────────────┐                       ┌───────────────────────────────────┐ │
+│  │    Elasticsearch     │                       │    S3 / Object Storage            │ │
+│  │   (Geo + Search)     │                       │        (Photos)                   │ │
+│  └──────────────────────┘                       └───────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 
                      ┌─────────────────┐
@@ -162,7 +162,19 @@ CREATE TABLE matches (
     last_message_at TIMESTAMP,
     UNIQUE(user1_id, user2_id)
 );
+
+-- Messages (stored in PostgreSQL for simplicity)
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY,
+    match_id        UUID NOT NULL REFERENCES matches(id),
+    sender_id       UUID NOT NULL REFERENCES users(id),
+    content         TEXT NOT NULL,
+    sent_at         TIMESTAMP DEFAULT NOW(),
+    read_at         TIMESTAMP
+);
 ```
+
+> **Implementation Note:** This simplified implementation uses PostgreSQL for message storage. In a production system at scale, you might consider a dedicated message store like Cassandra or ScyllaDB for better write throughput and time-series access patterns, or a document database like MongoDB for flexible schema evolution.
 
 ### Geospatial Index
 
@@ -439,28 +451,27 @@ class SwipeStore:
 
 ## 7. Messaging System (4 minutes)
 
-### Message Storage (MongoDB)
+> **Implementation Note:** This implementation uses PostgreSQL for message storage, which is suitable for moderate scale and simplifies the infrastructure. For high-volume messaging at scale, consider dedicated solutions like Cassandra (for time-series access patterns) or a purpose-built chat infrastructure.
 
-```javascript
-// Conversations collection
-{
-  _id: ObjectId,
-  match_id: UUID,
-  participants: [user1_id, user2_id],
-  created_at: ISODate,
-  last_message_at: ISODate,
-  last_message_preview: "Hey, how are you?"
-}
+### Message Storage (PostgreSQL)
 
-// Messages collection
-{
-  _id: ObjectId,
-  conversation_id: ObjectId,
-  sender_id: UUID,
-  content: "Hey, how are you?",
-  sent_at: ISODate,
-  read_at: ISODate
-}
+```sql
+-- Messages table
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    match_id        UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    sender_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content         TEXT NOT NULL,
+    sent_at         TIMESTAMP DEFAULT NOW(),
+    read_at         TIMESTAMP  -- NULL until recipient reads the message
+);
+
+-- Index for fetching conversation messages
+CREATE INDEX idx_messages_match ON messages(match_id);
+CREATE INDEX idx_messages_sent ON messages(sent_at);
+
+-- Denormalized last_message_at in matches table for sorting
+UPDATE matches SET last_message_at = NOW() WHERE id = :match_id;
 ```
 
 ### Real-Time Messaging
@@ -475,22 +486,19 @@ class MessageService:
 
         recipient_id = match.user1_id if sender_id == match.user2_id else match.user2_id
 
-        # Store message
-        message = await mongodb.messages.insert_one({
-            'conversation_id': match_id,
-            'sender_id': sender_id,
-            'content': content,
-            'sent_at': datetime.now()
-        })
+        # Store message in PostgreSQL
+        message = await db.query("""
+            INSERT INTO messages (match_id, sender_id, content, sent_at)
+            VALUES (:match_id, :sender_id, :content, NOW())
+            RETURNING id, match_id, sender_id, content, sent_at
+        """, match_id=match_id, sender_id=sender_id, content=content)
 
-        # Update conversation
-        await mongodb.conversations.update_one(
-            {'match_id': match_id},
-            {'$set': {
-                'last_message_at': datetime.now(),
-                'last_message_preview': content[:50]
-            }}
-        )
+        # Update match with last message timestamp
+        await db.query("""
+            UPDATE matches
+            SET last_message_at = NOW()
+            WHERE id = :match_id
+        """, match_id=match_id)
 
         # Send via WebSocket
         await websocket_gateway.send(recipient_id, {
@@ -500,6 +508,19 @@ class MessageService:
         })
 
         return message
+
+    async def get_conversation(self, match_id, limit=50, before=None):
+        """Fetch messages for a conversation with pagination."""
+        query = """
+            SELECT id, match_id, sender_id, content, sent_at, read_at
+            FROM messages
+            WHERE match_id = :match_id
+        """
+        if before:
+            query += " AND sent_at < :before"
+        query += " ORDER BY sent_at DESC LIMIT :limit"
+
+        return await db.query(query, match_id=match_id, before=before, limit=limit)
 ```
 
 ### WebSocket Connection Management
@@ -593,6 +614,12 @@ async def get_display_distance(user1, user2):
 **Trade-off**: Real-time matching requires more lookups
 **Alternative**: Batch process matches periodically (delayed notifications)
 
+### Trade-off 4: Message Storage
+
+**Chose**: PostgreSQL for simplified implementation
+**Trade-off**: Limited write throughput compared to dedicated message stores
+**Alternative**: Use Cassandra/ScyllaDB for time-series optimized storage, or MongoDB for flexible document storage at higher scale
+
 ---
 
 ## 10. Scalability Considerations (2 minutes)
@@ -650,3 +677,6 @@ A: The discovery query filters by the intersection of: what the viewing user wan
 
 **Q: How do you handle fake profiles and catfishing?**
 A: Photo verification (take a selfie matching a pose), ML-based fake photo detection, reporting system with manual review, and account age/behavior scoring.
+
+**Q: Why PostgreSQL instead of a dedicated message store?**
+A: For this implementation, PostgreSQL simplifies the infrastructure while providing sufficient performance for moderate scale. The ACID guarantees and familiar SQL interface make development easier. At higher scale, we would consider Cassandra for write-heavy time-series data or a dedicated chat infrastructure.

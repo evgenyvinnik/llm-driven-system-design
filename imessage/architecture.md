@@ -12,6 +12,40 @@ iMessage is an encrypted messaging platform with multi-device sync. Core challen
 
 ---
 
+## Implementation Status
+
+> **Note:** This architecture document describes the full production-ready iMessage system. The current implementation is a phased approach starting with basic messaging.
+
+### Current Implementation: Phase 1 - Basic Messaging
+- [x] Real-time direct messaging via WebSocket
+- [x] Message persistence in PostgreSQL
+- [x] Delivery receipts and read receipts
+- [x] Typing indicators
+- [x] User presence (online/offline)
+- [x] Basic conversation management
+
+### Future: Phase 2 - Multi-Device Sync
+- [ ] Device registration and management
+- [ ] Cross-device message synchronization
+- [ ] Read state sync across devices
+- [ ] Sync cursors and conflict resolution
+
+### Future: Phase 3 - End-to-End Encryption
+- [ ] Signal Protocol implementation (X3DH + Double Ratchet)
+- [ ] Per-device encryption keys
+- [ ] Prekey management and rotation
+- [ ] Forward secrecy
+
+### Future: Phase 4 - Group Messaging
+- [ ] Group creation and management
+- [ ] Sender keys for efficient group encryption
+- [ ] Member add/remove with key rotation
+- [ ] Admin controls
+
+**Architecture sections marked with "(Future)" describe production-level features not yet implemented.**
+
+---
+
 ## Requirements
 
 ### Functional Requirements
@@ -64,7 +98,7 @@ iMessage is an encrypted messaging platform with multi-device sync. Core challen
 
 ## Core Components
 
-### 1. Key Management
+### 1. Key Management (Future: Phase 3)
 
 **Multi-Device Key Architecture:**
 ```javascript
@@ -140,7 +174,7 @@ class KeyManager {
 }
 ```
 
-### 2. Message Encryption
+### 2. Message Encryption (Future: Phase 3)
 
 **Per-Device Encryption:**
 ```javascript
@@ -241,7 +275,7 @@ class MessageEncryptor {
 }
 ```
 
-### 3. Message Sync
+### 3. Message Sync (Future: Phase 2)
 
 **Cross-Device Synchronization:**
 ```javascript
@@ -317,7 +351,7 @@ class MessageSyncService {
 }
 ```
 
-### 4. Group Messaging
+### 4. Group Messaging (Future: Phase 4)
 
 **Sender Keys for Groups:**
 ```javascript

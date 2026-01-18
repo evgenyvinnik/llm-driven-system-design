@@ -58,10 +58,10 @@ Venmo is a peer-to-peer payment platform with social features. Core challenges i
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Data Layer                                 │
 ├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │    Cassandra      │      Redis                │
-│   - Wallets     │    - Feed items   │      - Balance cache      │
-│   - Transfers   │    - Activity     │      - Sessions           │
-│   - Users       │    - Social graph │      - Rate limits        │
+│          PostgreSQL           │      Redis                │
+│  - Wallets, Transfers, Users  │      - Balance cache      │
+│  - Feed items, Social graph   │      - Sessions           │
+│  - Activity history           │      - Rate limits        │
 └─────────────────┴───────────────────┴───────────────────────────┘
 ```
 
@@ -197,9 +197,9 @@ async function publishToFeed(transfer) {
 }
 
 async function addToFeed(userId, transfer) {
-  await cassandra.execute(`
-    INSERT INTO feed_items (user_id, timestamp, transfer_id, sender_id, receiver_id, amount, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+  await db.query(`
+    INSERT INTO feed_items (user_id, created_at, transfer_id, sender_id, receiver_id, amount, note)
+    VALUES ($1, NOW(), $2, $3, $4, $5, $6)
   `, [userId, Date.now(), transfer.id, transfer.sender_id, transfer.receiver_id,
       transfer.amount, transfer.note])
 }
@@ -208,19 +208,19 @@ async function addToFeed(userId, transfer) {
 async function getFeed(userId, limit = 20, before = null) {
   let query = `
     SELECT * FROM feed_items
-    WHERE user_id = ?
+    WHERE user_id = $1
   `
   const params = [userId]
 
   if (before) {
-    query += ` AND timestamp < ?`
+    query += ` AND created_at < $2`
     params.push(before)
   }
 
-  query += ` ORDER BY timestamp DESC LIMIT ?`
+  query += ` ORDER BY created_at DESC LIMIT $3`
   params.push(limit)
 
-  const result = await cassandra.execute(query, params)
+  const result = await db.query(query, params)
 
   // Hydrate with user info
   return hydrateWithUsers(result.rows)
@@ -623,7 +623,7 @@ Key metrics to expose via Prometheus (or similar) for a payment platform:
 **Infrastructure Metrics:**
 - `venmo_postgres_connections_active` - Connection pool usage
 - `venmo_redis_memory_used_bytes` - Cache memory consumption
-- `venmo_cassandra_read_latency_seconds` - Feed read performance
+- `venmo_feed_read_latency_seconds` - Feed query performance
 - `venmo_queue_depth{queue_name}` - Pending jobs in RabbitMQ
 
 ### Logging Strategy
@@ -709,7 +709,7 @@ jaeger:
 |-----|--------|-----------------|
 | PostgreSQL connection pool usage | < 80% | > 90% for 5 min |
 | Redis memory usage | < 75% | > 85% for 10 min |
-| Cassandra read latency p99 | < 50ms | > 100ms for 5 min |
+| Feed query latency p99 | < 50ms | > 100ms for 5 min |
 
 ### Audit Logging
 
@@ -990,15 +990,11 @@ For local development, Redis data is ephemeral (cache only). On restart:
 2. Cache warms up organically with traffic
 3. No explicit backup needed for cache data
 
-**Cassandra Backup (Feed Data):**
+**Feed Items (stored in PostgreSQL):
 
 ```bash
-# Snapshot all keyspaces
-nodetool snapshot venmo_feeds
-
-# Snapshots stored in data_directory/keyspace/table/snapshots/
-# Copy to backup location
-cp -r /var/lib/cassandra/data/venmo_feeds/*/snapshots/latest /backups/cassandra/
+# Feed items are backed up as part of PostgreSQL backup
+# They use the same pg_dump command shown above
 ```
 
 ### Disaster Recovery (Local Dev Simulation)
@@ -1041,16 +1037,14 @@ async function maybeDelay() {
 - Estimated size: ~500 bytes per transfer, ~200 bytes per user
 - For 1M users with 50 transfers each: ~25 GB
 
-**Cassandra (Warm Data):**
+**Feed Items (also in PostgreSQL):
 - Feed items (last 30 days by default)
 - Older items can use shorter TTL or move to cheaper storage
-- TTL of 30 days: items auto-expire
+- For production scale, consider archiving older items
 
-```cql
--- Feed items with automatic expiration
-INSERT INTO feed_items (user_id, timestamp, transfer_id, ...)
-VALUES (?, ?, ?, ...)
-USING TTL 2592000;  -- 30 days in seconds
+```sql
+-- Periodic cleanup for old feed items
+DELETE FROM feed_items WHERE created_at < NOW() - INTERVAL '30 days';
 ```
 
 **Archive Strategy (Cold Data):**
@@ -1156,11 +1150,6 @@ services:
       resources:
         limits:
           memory: 64M
-  cassandra:
-    deploy:
-      resources:
-        limits:
-          memory: 1G  # Cassandra is memory-hungry
   rabbitmq:
     deploy:
       resources:
@@ -1168,7 +1157,7 @@ services:
           memory: 256M
 ```
 
-**Total local dev footprint: ~2 GB RAM** - reasonable for development laptops.
+**Total local dev footprint: ~600 MB RAM** - reasonable for development laptops.
 
 ---
 
