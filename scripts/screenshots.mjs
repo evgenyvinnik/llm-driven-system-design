@@ -161,16 +161,23 @@ async function aggressiveCleanup() {
       // Get all running container IDs
       const containers = execSync('docker ps -q', { encoding: 'utf-8' }).trim();
       if (containers) {
-        execSync(`docker stop ${containers.split('\n').join(' ')}`, { stdio: 'pipe' });
+        execSync(`docker stop ${containers.split('\n').join(' ')}`, { stdio: 'pipe', timeout: 30000 });
         logSuccess('Stopped all running Docker containers');
       }
     } catch {
       // Ignore errors
     }
 
-    // Also try to remove stopped containers to free up names
+    // Force remove all containers (including stopped ones)
     try {
-      execSync('docker container prune -f', { stdio: 'pipe' });
+      execSync('docker rm -f $(docker ps -aq) 2>/dev/null || true', { stdio: 'pipe', shell: true });
+    } catch {
+      // Ignore errors
+    }
+
+    // Prune networks to avoid conflicts
+    try {
+      execSync('docker network prune -f', { stdio: 'pipe' });
     } catch {
       // Ignore errors
     }
@@ -195,7 +202,7 @@ async function aggressiveCleanup() {
   }
 
   // Wait a moment for ports to be released
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 3000));
 
   logSuccess('Aggressive cleanup complete');
 }
@@ -286,8 +293,71 @@ async function startDockerCompose(projectDir, projectName) {
       stdio: 'pipe',
     });
     logSuccess('Docker services started');
-    // Wait longer for PostgreSQL to be ready
-    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // Wait for PostgreSQL to be ready by checking if port 5432 is accepting connections
+    logStep('DOCKER', 'Waiting for database services to be ready...');
+    let dbReady = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        // Try to connect to PostgreSQL port
+        const nc = process.platform === 'darwin' ? 'nc -z localhost 5432' : 'nc -z localhost 5432 || timeout 1 bash -c "cat < /dev/null > /dev/tcp/localhost/5432"';
+        execSync(nc, { stdio: 'pipe', timeout: 2000 });
+        dbReady = true;
+        break;
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    if (dbReady) {
+      logSuccess('Database port 5432 is accessible');
+      // Wait for PostgreSQL to be fully ready (including init scripts)
+      logStep('DOCKER', 'Waiting for PostgreSQL to be fully initialized...');
+      let pgInitialized = false;
+      for (let i = 0; i < 30; i++) {
+        try {
+          // Check if postgres container's healthcheck passes
+          const health = execSync('docker inspect --format="{{.State.Health.Status}}" $(docker-compose ps -q postgres 2>/dev/null || echo "none") 2>/dev/null || echo "none"', {
+            cwd: projectDir,
+            encoding: 'utf-8',
+            shell: true,
+            timeout: 5000,
+          }).trim();
+          if (health === 'healthy') {
+            pgInitialized = true;
+            break;
+          }
+        } catch {
+          // Ignore errors
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      if (pgInitialized) {
+        logSuccess('PostgreSQL is fully initialized');
+      } else {
+        logWarning('PostgreSQL healthcheck did not pass, but continuing...');
+      }
+      // Extra wait for init scripts to complete
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    } else {
+      logWarning('Database may not be ready (continuing anyway)');
+    }
+
+    // Wait for Redis to be ready
+    try {
+      for (let i = 0; i < 10; i++) {
+        try {
+          execSync('nc -z localhost 6379', { stdio: 'pipe', timeout: 2000 });
+          logSuccess('Redis port 6379 is accessible');
+          break;
+        } catch {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+    } catch {
+      // Ignore - Redis might not be used by all projects
+    }
+
     return true;
   } catch (error) {
     logWarning(`Docker-compose failed: ${error.message}`);
@@ -296,7 +366,7 @@ async function startDockerCompose(projectDir, projectName) {
 }
 
 /**
- * Setup database (run seed.sql if it exists)
+ * Setup database (run seed.sql or npm run seed if available)
  * Note: init.sql is automatically run by PostgreSQL on first startup via docker-entrypoint-initdb.d
  */
 async function setupDatabase(projectDir, projectName, config) {
@@ -306,8 +376,22 @@ async function setupDatabase(projectDir, projectName, config) {
 
   const backendDir = path.join(projectDir, 'backend');
   const seedSqlPath = path.join(backendDir, 'seed.sql');
+  const packageJsonPath = path.join(backendDir, 'package.json');
 
-  if (!fs.existsSync(seedSqlPath)) {
+  // Check if there's a seed.sql or a seed script in package.json
+  const hasSeedSql = fs.existsSync(seedSqlPath);
+  let hasNpmSeed = false;
+
+  if (fs.existsSync(packageJsonPath)) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      hasNpmSeed = packageJson.scripts && packageJson.scripts.seed;
+    } catch {
+      // Ignore parse errors
+    }
+  }
+
+  if (!hasSeedSql && !hasNpmSeed) {
     return true; // No seeding needed
   }
 
@@ -315,44 +399,41 @@ async function setupDatabase(projectDir, projectName, config) {
   const dbName = config.dbName || projectName.replace(/-/g, '_');
   const dbUser = config.dbUser || projectName.replace(/-/g, '_');
 
-  // Wait for PostgreSQL to be ready with retries
-  logStep('DATABASE', 'Waiting for database to be ready...');
-  let dbReady = false;
-  for (let i = 0; i < 15; i++) {
-    try {
-      execSync(`docker-compose exec -T postgres pg_isready -U ${dbUser}`, {
-        cwd: projectDir,
-        stdio: 'pipe',
-      });
-      dbReady = true;
-      break;
-    } catch {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+  logStep('DATABASE', 'Seeding database...');
+
+  // Option 1: Run seed.sql via docker-compose exec
+  if (hasSeedSql) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/seed.sql`, {
+          cwd: projectDir,
+          stdio: 'pipe',
+        });
+        logSuccess('Database seeded (SQL)');
+        return true;
+      } catch (error) {
+        if (attempt === 3) {
+          logWarning(`SQL seeding failed after ${attempt} attempts: ${error.message}`);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
     }
   }
 
-  if (!dbReady) {
-    logWarning('Database not ready after 15 seconds');
-    return false;
-  }
-
-  logStep('DATABASE', 'Seeding database...');
-
-  // Retry seeding a few times (in case database just became ready)
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // Option 2: Run npm run seed
+  if (hasNpmSeed) {
     try {
-      execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/seed.sql`, {
-        cwd: projectDir,
+      execSync('npm run seed', {
+        cwd: backendDir,
         stdio: 'pipe',
+        timeout: 30000,
       });
-      logSuccess('Database seeded');
+      logSuccess('Database seeded (npm run seed)');
       return true;
     } catch (error) {
-      if (attempt === 3) {
-        logWarning(`Database seeding failed after ${attempt} attempts: ${error.message}`);
-        return false;
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      logWarning(`npm run seed failed: ${error.message}`);
+      return false;
     }
   }
 
@@ -724,15 +805,8 @@ async function processProject(config) {
 
   // Auto-start mode
   if (shouldStart) {
-    // Step 1: Kill any processes on frontend/backend ports (clean slate)
-    logStep('CLEANUP', 'Killing processes on ports...');
-    killProcessOnPort(config.frontendPort);
-    if (config.backendRequired && config.backendPort) {
-      killProcessOnPort(config.backendPort);
-    }
-
-    // Step 2: Stop any existing docker containers (clean slate)
-    await stopDockerCompose(projectDir, config.name);
+    // Step 1: Aggressive cleanup - stop all Docker and kill all common ports
+    await aggressiveCleanup();
 
     // Step 3: Start docker-compose services
     await startDockerCompose(projectDir, config.name);
@@ -883,12 +957,6 @@ async function main() {
   const results = [];
 
   for (const config of projectsToProcess) {
-    // When processing multiple projects, do aggressive cleanup first
-    // This ensures no port conflicts between projects
-    if (shouldStart && projectsToProcess.length > 1) {
-      await aggressiveCleanup();
-    }
-
     const result = await processProject(config);
     results.push(result);
   }

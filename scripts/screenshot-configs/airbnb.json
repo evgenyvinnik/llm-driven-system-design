@@ -1,12 +1,15 @@
 {
   "name": "airbnb",
   "frontendPort": 5173,
+  "backendPort": 3000,
   "backendRequired": true,
+  "dbName": "airbnb",
+  "dbUser": "airbnb",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
+      "email": "guest1@example.com",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
