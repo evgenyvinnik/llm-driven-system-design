@@ -1,6 +1,7 @@
 {
   "name": "bitly",
   "frontendPort": 5173,
+  "backendPort": 3000,
   "backendRequired": true,
   "auth": {
     "enabled": true,
@@ -16,29 +17,30 @@
   },
   "screens": [
     {
-      "name": "01-login",
+      "name": "01-login-page",
       "path": "/login",
       "waitFor": "form",
       "skipAuth": true,
       "delay": 500
     },
     {
-      "name": "02-home",
+      "name": "02-home-page",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1000
+      "waitFor": "h1",
+      "skipAuth": true,
+      "delay": 800
     },
     {
-      "name": "03-dashboard",
+      "name": "03-dashboard-with-urls",
       "path": "/dashboard",
-      "waitFor": "main",
-      "delay": 500
+      "waitFor": "table, .space-y-2",
+      "delay": 1500
     },
     {
-      "name": "04-admin",
+      "name": "04-admin-overview",
       "path": "/admin",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1000
     }
   ],
   "viewport": {
