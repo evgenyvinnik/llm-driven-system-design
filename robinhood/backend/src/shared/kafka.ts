@@ -10,7 +10,7 @@
  * for resilience against broker failures.
  */
 
-import { Kafka, Producer, Consumer, Partitioners, logLevel, CompressionTypes } from 'kafkajs';
+import { Kafka, Producer, Consumer, Partitioners, logLevel, CompressionTypes, EachBatchPayload, EachMessagePayload } from 'kafkajs';
 import { logger } from './logger.js';
 import type { Quote, Order, Execution } from '../types/index.js';
 
@@ -62,11 +62,11 @@ export async function initKafkaProducer(): Promise<void> {
     await admin.connect();
     
     const existingTopics = await admin.listTopics();
-    const topicsToCreate = Object.values(TOPICS).filter(t => !existingTopics.includes(t));
+    const topicsToCreate = Object.values(TOPICS).filter((t: string) => !existingTopics.includes(t));
     
     if (topicsToCreate.length > 0) {
       await admin.createTopics({
-        topics: topicsToCreate.map(topic => ({
+        topics: topicsToCreate.map((topic: string) => ({
           topic,
           numPartitions: 3,
           replicationFactor: 1,
@@ -152,7 +152,7 @@ export async function publishQuotes(quotes: Quote[]): Promise<void> {
     await producer.send({
       topic: TOPICS.QUOTES,
       compression: CompressionTypes.Snappy,
-      messages: quotes.map(quote => ({
+      messages: quotes.map((quote: Quote) => ({
         key: quote.symbol,
         value: JSON.stringify(quote),
         headers: {
@@ -320,8 +320,8 @@ export async function consumeQuotes(
   await consumer.subscribe({ topic: TOPICS.QUOTES, fromBeginning: false });
 
   await consumer.run({
-    eachBatch: async ({ batch }) => {
-      const quotes: Quote[] = batch.messages.map(msg => {
+    eachBatch: async ({ batch }: EachBatchPayload) => {
+      const quotes: Quote[] = batch.messages.map((msg) => {
         const value = msg.value?.toString();
         return value ? JSON.parse(value) : null;
       }).filter((q): q is Quote => q !== null);
@@ -358,7 +358,7 @@ export async function consumeOrders(
   await consumer.subscribe({ topic: TOPICS.ORDERS, fromBeginning: false });
 
   await consumer.run({
-    eachMessage: async ({ message }) => {
+    eachMessage: async ({ message }: EachMessagePayload) => {
       const value = message.value?.toString();
       if (value) {
         const event: OrderEvent = JSON.parse(value);
@@ -393,7 +393,7 @@ export async function consumeTrades(
   await consumer.subscribe({ topic: TOPICS.TRADES, fromBeginning: false });
 
   await consumer.run({
-    eachMessage: async ({ message }) => {
+    eachMessage: async ({ message }: EachMessagePayload) => {
       const value = message.value?.toString();
       if (value) {
         const event: TradeEvent = JSON.parse(value);
