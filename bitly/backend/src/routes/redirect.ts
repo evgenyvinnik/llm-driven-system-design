@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { asyncHandler } from '../middleware/errorHandler.js';
-import { getUrlByShortCode, incrementClickCount } from '../services/urlService.js';
-import { recordClick } from '../services/analyticsService.js';
+import { getUrlByShortCode } from '../services/urlService.js';
+import { publishClickEvent, isQueueConnected, ClickEventMessage } from '../utils/queue.js';
+import { recordClickSync } from '../services/analyticsService.js';
 import logger from '../utils/logger.js';
 import { urlRedirectsTotal, clickEventsTotal } from '../utils/metrics.js';
 
@@ -15,7 +16,7 @@ const router = Router();
 /**
  * GET /:shortCode - Redirect to the original long URL
  * Uses 302 (temporary) redirect to ensure analytics are captured.
- * Records click events asynchronously to avoid blocking the redirect.
+ * Records click events asynchronously via RabbitMQ to avoid blocking the redirect.
  */
 router.get(
   '/:shortCode',
@@ -38,21 +39,32 @@ router.get(
     // Increment redirect metric
     urlRedirectsTotal.inc({ cached: cacheHit ? 'hit' : 'miss', status: 'success' });
 
-    // Record click asynchronously (don't block redirect)
+    // Parse device type for metrics and analytics
+    const userAgent = req.get('User-Agent');
+    const deviceType = parseDeviceType(userAgent);
+
+    // Build click event data
+    const clickEvent: ClickEventMessage = {
+      short_code: shortCode,
+      referrer: req.get('Referer'),
+      user_agent: userAgent,
+      ip_address: req.ip,
+      device_type: deviceType,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Record click asynchronously via queue (non-blocking)
+    // If queue is unavailable, fall back to direct database insert
     setImmediate(async () => {
       try {
-        const userAgent = req.get('User-Agent');
-        const deviceType = parseDeviceType(userAgent);
-
-        await Promise.all([
-          incrementClickCount(shortCode),
-          recordClick({
-            short_code: shortCode,
-            referrer: req.get('Referer'),
-            user_agent: userAgent,
-            ip_address: req.ip,
-          }),
-        ]);
+        if (isQueueConnected()) {
+          // Publish to queue for async processing by worker
+          await publishClickEvent(clickEvent);
+        } else {
+          // Fallback: sync insert if queue unavailable
+          logger.warn({ short_code: shortCode }, 'Queue unavailable, using sync recording');
+          await recordClickSync(clickEvent);
+        }
 
         // Track click event by device type
         clickEventsTotal.inc({ device_type: deviceType });
@@ -63,8 +75,9 @@ router.get(
             device_type: deviceType,
             referrer: req.get('Referer'),
             duration_ms: Date.now() - startTime,
+            queue_available: isQueueConnected(),
           },
-          'Click recorded'
+          'Click event recorded'
         );
       } catch (error) {
         logger.error({ err: error, short_code: shortCode }, 'Failed to record click');

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
   video_count INTEGER DEFAULT 0,
   like_count INTEGER DEFAULT 0,
   role VARCHAR(20) DEFAULT 'user',
+  interest_embedding vector(384), -- User interest embedding for recommendations
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS videos (
   like_count INTEGER DEFAULT 0,
   comment_count INTEGER DEFAULT 0,
   share_count INTEGER DEFAULT 0,
+  embedding vector(384), -- Video content embedding for similarity search
   status VARCHAR(20) DEFAULT 'active',
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
@@ -97,6 +99,14 @@ CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id);
 CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
 CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
 CREATE INDEX IF NOT EXISTS idx_watch_history_user ON watch_history(user_id, created_at DESC);
+
+-- Vector similarity indexes for embeddings
+-- IVFFlat index for approximate nearest neighbor search on video embeddings
+-- Lists = 100 is suitable for datasets with thousands of videos
+CREATE INDEX IF NOT EXISTS idx_videos_embedding ON videos USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- IVFFlat index for user interest embeddings
+CREATE INDEX IF NOT EXISTS idx_users_interest_embedding ON users USING ivfflat (interest_embedding vector_cosine_ops) WITH (lists = 100);
 
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()

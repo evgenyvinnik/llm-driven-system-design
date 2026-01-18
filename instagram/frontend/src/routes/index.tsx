@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { createFileRoute, Navigate } from '@tanstack/react-router';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAuthStore } from '../stores/authStore';
 import { feedApi, storiesApi } from '../services/api';
 import type { Post, StoryUser } from '../types';
@@ -16,6 +17,7 @@ function HomePage() {
   const [storyUsers, setStoryUsers] = useState<StoryUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const parentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -58,6 +60,36 @@ function HomePage() {
     );
   };
 
+  // Virtual list for feed posts with dynamic height measurement
+  const virtualizer = useVirtualizer({
+    count: posts.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 600, // Estimate: header(60) + image(400) + actions(60) + caption(80)
+    overscan: 3, // Render 3 extra items above/below for smoother scrolling
+    measureElement: (element) => {
+      // Measure actual element height for accurate positioning
+      return element.getBoundingClientRect().height;
+    },
+  });
+
+  // Infinite scroll: load more when near bottom
+  const handleScroll = useCallback(() => {
+    if (!parentRef.current || loading || !nextCursor) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = parentRef.current;
+    if (scrollHeight - scrollTop - clientHeight < 500) {
+      loadFeed(nextCursor);
+    }
+  }, [loading, nextCursor]);
+
+  useEffect(() => {
+    const parent = parentRef.current;
+    if (parent) {
+      parent.addEventListener('scroll', handleScroll);
+      return () => parent.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">
@@ -70,14 +102,19 @@ function HomePage() {
     return <Navigate to="/login" />;
   }
 
+  const virtualItems = virtualizer.getVirtualItems();
+
   return (
-    <div className="max-w-lg mx-auto">
-      {/* Story Tray */}
+    <div
+      ref={parentRef}
+      className="max-w-lg mx-auto h-[calc(100vh-60px)] overflow-auto"
+    >
+      {/* Story Tray - Fixed at top, not virtualized */}
       {storyUsers.length > 0 && (
         <StoryTray users={storyUsers} onStoryViewed={handleStoryViewed} />
       )}
 
-      {/* Feed */}
+      {/* Feed - Virtualized */}
       {loading && posts.length === 0 ? (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
@@ -117,20 +154,42 @@ function HomePage() {
           </p>
         </div>
       ) : (
-        <>
-          {posts.map((post) => (
-            <PostCard key={post.id} post={post} />
-          ))}
-          {nextCursor && (
-            <button
-              onClick={() => loadFeed(nextCursor)}
-              disabled={loading}
-              className="w-full py-3 text-primary hover:text-primary-hover font-semibold disabled:opacity-50 transition-colors"
-            >
-              {loading ? 'Loading...' : 'Load more'}
-            </button>
-          )}
-        </>
+        <div
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            width: '100%',
+            position: 'relative',
+          }}
+        >
+          {virtualItems.map((virtualItem) => {
+            const post = posts[virtualItem.index];
+            if (!post) return null;
+
+            return (
+              <div
+                key={post.id}
+                data-index={virtualItem.index}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  transform: `translateY(${virtualItem.start}px)`,
+                }}
+              >
+                <PostCard post={post} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Loading indicator at bottom */}
+      {loading && posts.length > 0 && (
+        <div className="py-4 text-center">
+          <div className="animate-spin inline-block rounded-full h-6 w-6 border-t-2 border-primary" />
+        </div>
       )}
     </div>
   );

@@ -25,6 +25,13 @@ const config = {
     },
   },
 
+  rabbitmq: {
+    url: process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672',
+    queues: {
+      transcode: 'transcode-jobs',
+    },
+  },
+
   cors: {
     origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
     credentials: true,

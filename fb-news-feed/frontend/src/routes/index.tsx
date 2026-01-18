@@ -1,5 +1,6 @@
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useEffect, useCallback, useRef } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { PostComposer } from '@/components/PostComposer';
 import { PostCard } from '@/components/PostCard';
 import { useFeedStore } from '@/stores/feedStore';
@@ -19,8 +20,7 @@ export const Route = createFileRoute('/')({
 function HomePage() {
   const { posts, isLoading, hasMore, error, fetchFeed, removePost } = useFeedStore();
   const { isAuthenticated } = useAuthStore();
-  const observerRef = useRef<IntersectionObserver | null>(null);
-  const loadMoreRef = useRef<HTMLDivElement>(null);
+  const parentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -28,32 +28,34 @@ function HomePage() {
     }
   }, [isAuthenticated, fetchFeed]);
 
-  const handleObserver = useCallback(
-    (entries: IntersectionObserverEntry[]) => {
-      const [entry] = entries;
-      if (entry.isIntersecting && hasMore && !isLoading) {
-        fetchFeed();
-      }
+  // Virtual list for feed posts with dynamic height measurement
+  const virtualizer = useVirtualizer({
+    count: posts.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 400, // Estimate: header + content + actions + comments
+    overscan: 3, // Render 3 extra items above/below for smoother scrolling
+    measureElement: (element) => {
+      return element.getBoundingClientRect().height;
     },
-    [hasMore, isLoading, fetchFeed]
-  );
+  });
+
+  // Infinite scroll: load more when near bottom
+  const handleScroll = useCallback(() => {
+    if (!parentRef.current || isLoading || !hasMore) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = parentRef.current;
+    if (scrollHeight - scrollTop - clientHeight < 500) {
+      fetchFeed();
+    }
+  }, [isLoading, hasMore, fetchFeed]);
 
   useEffect(() => {
-    const element = loadMoreRef.current;
-    if (!element) return;
-
-    observerRef.current = new IntersectionObserver(handleObserver, {
-      threshold: 0.1,
-    });
-
-    observerRef.current.observe(element);
-
-    return () => {
-      if (observerRef.current) {
-        observerRef.current.disconnect();
-      }
-    };
-  }, [handleObserver]);
+    const parent = parentRef.current;
+    if (parent) {
+      parent.addEventListener('scroll', handleScroll);
+      return () => parent.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
 
   const handleDeletePost = async (postId: string) => {
     if (!confirm('Are you sure you want to delete this post?')) return;
@@ -65,68 +67,96 @@ function HomePage() {
     }
   };
 
+  const virtualItems = virtualizer.getVirtualItems();
+
   return (
-    <div className="max-w-2xl mx-auto py-6 px-4">
-      {/* Post Composer */}
+    <div
+      ref={parentRef}
+      className="max-w-2xl mx-auto py-6 px-4 h-screen overflow-auto"
+    >
+      {/* Post Composer - Fixed, not virtualized */}
       <div className="mb-4">
         <PostComposer />
       </div>
 
-      {/* Feed */}
-      <div className="space-y-4">
-        {posts.map((post) => (
-          <PostCard
-            key={post.id}
-            post={post}
-            onDelete={() => handleDeletePost(post.id)}
-          />
-        ))}
+      {/* Feed - Virtualized */}
+      {posts.length > 0 ? (
+        <div
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            width: '100%',
+            position: 'relative',
+          }}
+        >
+          {virtualItems.map((virtualItem) => {
+            const post = posts[virtualItem.index];
+            if (!post) return null;
 
-        {/* Loading indicator */}
-        {isLoading && (
-          <div className="flex justify-center py-8">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-facebook-blue" />
+            return (
+              <div
+                key={post.id}
+                data-index={virtualItem.index}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  transform: `translateY(${virtualItem.start}px)`,
+                }}
+                className="pb-4"
+              >
+                <PostCard
+                  post={post}
+                  onDelete={() => handleDeletePost(post.id)}
+                />
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+
+      {/* Loading indicator */}
+      {isLoading && (
+        <div className="flex justify-center py-8">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-facebook-blue" />
+        </div>
+      )}
+
+      {/* Error message */}
+      {error && (
+        <div className="text-center py-8 text-red-500">
+          <p>{error}</p>
+          <button
+            onClick={() => fetchFeed(true)}
+            className="mt-2 text-facebook-blue hover:underline"
+          >
+            Try again
+          </button>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!isLoading && posts.length === 0 && !error && (
+        <div className="text-center py-12">
+          <div className="w-16 h-16 bg-gray-200 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg className="w-8 h-8 text-facebook-darkGray" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 20H5a2 2 0 01-2-2V6a2 2 0 012-2h10a2 2 0 012 2v1m2 13a2 2 0 01-2-2V7m2 13a2 2 0 002-2V9a2 2 0 00-2-2h-2m-4-3H9M7 16h6M7 8h6v4H7V8z" />
+            </svg>
           </div>
-        )}
+          <h3 className="text-lg font-semibold text-facebook-text">No posts yet</h3>
+          <p className="text-facebook-darkGray mt-1">
+            Follow people to see their posts in your feed, or create your first post!
+          </p>
+        </div>
+      )}
 
-        {/* Error message */}
-        {error && (
-          <div className="text-center py-8 text-red-500">
-            <p>{error}</p>
-            <button
-              onClick={() => fetchFeed(true)}
-              className="mt-2 text-facebook-blue hover:underline"
-            >
-              Try again
-            </button>
-          </div>
-        )}
-
-        {/* Empty state */}
-        {!isLoading && posts.length === 0 && !error && (
-          <div className="text-center py-12">
-            <div className="w-16 h-16 bg-gray-200 rounded-full flex items-center justify-center mx-auto mb-4">
-              <svg className="w-8 h-8 text-facebook-darkGray" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 20H5a2 2 0 01-2-2V6a2 2 0 012-2h10a2 2 0 012 2v1m2 13a2 2 0 01-2-2V7m2 13a2 2 0 002-2V9a2 2 0 00-2-2h-2m-4-3H9M7 16h6M7 8h6v4H7V8z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-semibold text-facebook-text">No posts yet</h3>
-            <p className="text-facebook-darkGray mt-1">
-              Follow people to see their posts in your feed, or create your first post!
-            </p>
-          </div>
-        )}
-
-        {/* Infinite scroll trigger */}
-        <div ref={loadMoreRef} className="h-10" />
-
-        {/* End of feed */}
-        {!hasMore && posts.length > 0 && (
-          <div className="text-center py-8 text-facebook-darkGray">
-            <p>You've seen all posts!</p>
-          </div>
-        )}
-      </div>
+      {/* End of feed */}
+      {!hasMore && posts.length > 0 && (
+        <div className="text-center py-8 text-facebook-darkGray">
+          <p>You've seen all posts!</p>
+        </div>
+      )}
     </div>
   );
 }

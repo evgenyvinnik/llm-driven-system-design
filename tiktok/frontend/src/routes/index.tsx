@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useFeedStore } from '@/stores/feedStore';
 import VideoPlayer from '@/components/VideoPlayer';
 import VideoActions from '@/components/VideoActions';
@@ -11,6 +12,19 @@ export const Route = createFileRoute('/')({
 function HomePage() {
   const { videos, currentIndex, isLoading, feedType, setFeedType, loadMore, setCurrentIndex } = useFeedStore();
   const containerRef = useRef<HTMLDivElement>(null);
+  const [containerHeight, setContainerHeight] = useState(0);
+
+  // Measure container height for full-screen video items
+  useEffect(() => {
+    const updateHeight = () => {
+      if (containerRef.current) {
+        setContainerHeight(containerRef.current.clientHeight);
+      }
+    };
+    updateHeight();
+    window.addEventListener('resize', updateHeight);
+    return () => window.removeEventListener('resize', updateHeight);
+  }, []);
 
   useEffect(() => {
     if (videos.length === 0) {
@@ -18,18 +32,33 @@ function HomePage() {
     }
   }, [videos.length, loadMore]);
 
+  // Virtual list for full-screen video scrolling
+  const virtualizer = useVirtualizer({
+    count: videos.length,
+    getScrollElement: () => containerRef.current,
+    estimateSize: () => containerHeight || window.innerHeight,
+    overscan: 1, // Only render 1 extra video above/below for smooth transitions
+  });
+
+  // Handle scroll to update current video index
   const handleScroll = useCallback(() => {
     const container = containerRef.current;
-    if (!container) return;
+    if (!container || containerHeight === 0) return;
 
     const scrollTop = container.scrollTop;
-    const itemHeight = container.clientHeight;
-    const newIndex = Math.round(scrollTop / itemHeight);
+    const newIndex = Math.round(scrollTop / containerHeight);
 
     if (newIndex !== currentIndex && newIndex >= 0 && newIndex < videos.length) {
       setCurrentIndex(newIndex);
     }
-  }, [currentIndex, videos.length, setCurrentIndex]);
+
+    // Load more when approaching the end
+    if (newIndex >= videos.length - 3 && !isLoading) {
+      loadMore();
+    }
+  }, [currentIndex, videos.length, containerHeight, setCurrentIndex, isLoading, loadMore]);
+
+  const virtualItems = virtualizer.getVirtualItems();
 
   return (
     <div className="flex-1 relative pb-14">
@@ -54,7 +83,7 @@ function HomePage() {
         </button>
       </div>
 
-      {/* Video Feed */}
+      {/* Video Feed - Virtualized */}
       <div
         ref={containerRef}
         className="video-scroll hide-scrollbar h-full"
@@ -67,18 +96,42 @@ function HomePage() {
               <p className="text-sm">Be the first to upload!</p>
             </div>
           </div>
-        ) : (
-          videos.map((video, index) => (
-            <div key={video.id} className="video-item h-full relative">
-              <VideoPlayer
-                video={video}
-                isActive={index === currentIndex}
-              />
-              <VideoActions video={video} />
-              <VideoInfo video={video} />
-            </div>
-          ))
-        )}
+        ) : containerHeight > 0 ? (
+          <div
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              width: '100%',
+              position: 'relative',
+            }}
+          >
+            {virtualItems.map((virtualItem) => {
+              const video = videos[virtualItem.index];
+              if (!video) return null;
+
+              return (
+                <div
+                  key={video.id}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    height: `${containerHeight}px`,
+                    transform: `translateY(${virtualItem.start}px)`,
+                  }}
+                  className="video-item relative"
+                >
+                  <VideoPlayer
+                    video={video}
+                    isActive={virtualItem.index === currentIndex}
+                  />
+                  <VideoActions video={video} />
+                  <VideoInfo video={video} />
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
 
         {isLoading && (
           <div className="h-full flex items-center justify-center">
