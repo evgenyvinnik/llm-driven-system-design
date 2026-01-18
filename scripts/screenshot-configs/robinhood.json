@@ -2,6 +2,8 @@
   "name": "robinhood",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "robinhood",
+  "dbUser": "robinhood",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

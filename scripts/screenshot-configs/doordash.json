@@ -2,6 +2,8 @@
   "name": "doordash",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "doordash",
+  "dbUser": "doordash",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

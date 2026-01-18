@@ -2,6 +2,8 @@
   "name": "instagram",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "instagram",
+  "dbUser": "instagram",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "apns",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "apns",
+  "dbUser": "apns",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

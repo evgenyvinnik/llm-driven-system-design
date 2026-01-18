@@ -2,6 +2,8 @@
   "name": "calendly",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "calendly",
+  "dbUser": "calendly",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

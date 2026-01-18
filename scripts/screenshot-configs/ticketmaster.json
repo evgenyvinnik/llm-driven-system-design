@@ -2,6 +2,8 @@
   "name": "ticketmaster",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "ticketmaster",
+  "dbUser": "ticketmaster",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

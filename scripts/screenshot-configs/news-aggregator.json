@@ -2,6 +2,8 @@
   "name": "news-aggregator",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "news_aggregator",
+  "dbUser": "newsagg",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

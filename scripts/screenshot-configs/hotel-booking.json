@@ -2,6 +2,8 @@
   "name": "hotel-booking",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "hotel_booking",
+  "dbUser": "hotel_user",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

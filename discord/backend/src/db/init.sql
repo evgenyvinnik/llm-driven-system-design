@@ -42,12 +42,6 @@ CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname);
 -- Index for room name lookup
 CREATE INDEX IF NOT EXISTS idx_rooms_name ON rooms(name);
 
--- Create a default "general" room
-INSERT INTO users (nickname) VALUES ('system') ON CONFLICT (nickname) DO NOTHING;
-INSERT INTO rooms (name, created_by)
-SELECT 'general', id FROM users WHERE nickname = 'system'
-ON CONFLICT (name) DO NOTHING;
-
 -- Function to cleanup old messages (keep only last 10 per room)
 CREATE OR REPLACE FUNCTION cleanup_old_messages() RETURNS void AS $$
 BEGIN
@@ -61,3 +55,5 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+
+-- Seed data is in seed.sql

@@ -2,6 +2,8 @@
   "name": "etsy",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "etsy_db",
+  "dbUser": "etsy",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

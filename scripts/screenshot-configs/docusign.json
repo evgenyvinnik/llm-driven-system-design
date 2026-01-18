@@ -2,6 +2,8 @@
   "name": "docusign",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "docusign",
+  "dbUser": "docusign",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "notification-system",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "notification_db",
+  "dbUser": "notification_user",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

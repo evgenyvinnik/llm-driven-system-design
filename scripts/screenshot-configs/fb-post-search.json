@@ -2,6 +2,8 @@
   "name": "fb-post-search",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "fb_post_search",
+  "dbUser": "fb_search",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

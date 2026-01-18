@@ -3,6 +3,44 @@
 -- bcrypt hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
 
 -- ============================================================================
+-- CATEGORIES (must be inserted first as other tables reference them)
+-- ============================================================================
+INSERT INTO categories (name, slug, icon) VALUES
+    ('Restaurants', 'restaurants', 'utensils'),
+    ('Coffee & Tea', 'coffee-tea', 'coffee'),
+    ('Bars', 'bars', 'beer'),
+    ('Shopping', 'shopping', 'shopping-bag'),
+    ('Beauty & Spas', 'beauty-spas', 'spa'),
+    ('Automotive', 'automotive', 'car'),
+    ('Home Services', 'home-services', 'home'),
+    ('Health & Medical', 'health-medical', 'heart'),
+    ('Nightlife', 'nightlife', 'moon'),
+    ('Active Life', 'active-life', 'dumbbell'),
+    ('Hotels & Travel', 'hotels-travel', 'plane'),
+    ('Arts & Entertainment', 'arts-entertainment', 'palette'),
+    ('Pets', 'pets', 'paw'),
+    ('Professional Services', 'professional-services', 'briefcase'),
+    ('Education', 'education', 'book')
+ON CONFLICT (slug) DO NOTHING;
+
+-- Insert subcategories for restaurants
+INSERT INTO categories (name, slug, parent_id, icon)
+SELECT name, slug, (SELECT id FROM categories WHERE slug = 'restaurants'), icon
+FROM (VALUES
+    ('Italian', 'italian', 'pizza'),
+    ('Mexican', 'mexican', 'taco'),
+    ('Chinese', 'chinese', 'bowl'),
+    ('Japanese', 'japanese', 'sushi'),
+    ('Indian', 'indian', 'curry'),
+    ('Thai', 'thai', 'noodles'),
+    ('American', 'american', 'burger'),
+    ('Pizza', 'pizza', 'pizza'),
+    ('Seafood', 'seafood', 'fish'),
+    ('Vegetarian', 'vegetarian', 'leaf')
+) AS t(name, slug, icon)
+ON CONFLICT (slug) DO NOTHING;
+
+-- ============================================================================
 -- USERS
 -- ============================================================================
 INSERT INTO users (id, email, password_hash, name, avatar_url, role, review_count) VALUES

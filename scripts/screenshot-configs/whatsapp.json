@@ -2,6 +2,8 @@
   "name": "whatsapp",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "whatsapp",
+  "dbUser": "whatsapp",
   "auth": {
     "enabled": false
   },

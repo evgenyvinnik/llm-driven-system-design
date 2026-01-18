@@ -2,6 +2,8 @@
   "name": "dropbox",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "dropbox",
+  "dbUser": "dropbox",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -111,8 +111,4 @@ $$ LANGUAGE plpgsql;
 -- Populate initial key pool with 10,000 keys
 SELECT populate_key_pool(10000);
 
--- Create default admin user (password: admin123)
--- Password hash generated with bcrypt, 10 rounds
-INSERT INTO users (email, password_hash, role)
-VALUES ('admin@bitly.local', '$2b$10$rQZ5pZGKGy8sMC.8c2G5..kC6lQwH9vSQCWz8D1Y8Aq.9lYz9.9.i', 'admin')
-ON CONFLICT (email) DO NOTHING;
+-- Seed data is in db-seed/seed.sql

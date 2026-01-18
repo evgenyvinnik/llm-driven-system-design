@@ -1,6 +1,12 @@
 -- Seed script for Bitly URL Shortener
 -- Creates sample users, URLs, and click analytics data
 
+-- Create default admin user (password: admin123)
+-- Password hash generated with bcrypt, 10 rounds
+INSERT INTO users (email, password_hash, role)
+VALUES ('admin@bitly.local', '$2b$10$rQZ5pZGKGy8sMC.8c2G5..kC6lQwH9vSQCWz8D1Y8Aq.9lYz9.9.i', 'admin')
+ON CONFLICT (email) DO NOTHING;
+
 -- Create alice user (password: password123)
 -- Password hash generated with bcrypt, 10 rounds
 INSERT INTO users (email, password_hash, role)

@@ -2,6 +2,8 @@
   "name": "discord",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "babydiscord",
+  "dbUser": "discord",
   "auth": {
     "enabled": true,
     "loginUrl": "/",

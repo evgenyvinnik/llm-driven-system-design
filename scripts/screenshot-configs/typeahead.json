@@ -2,6 +2,8 @@
   "name": "typeahead",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "typeahead",
+  "dbUser": "typeahead",
   "auth": {
     "enabled": false
   },

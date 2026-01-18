@@ -2,6 +2,8 @@
   "name": "netflix",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "netflix",
+  "dbUser": "netflix",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

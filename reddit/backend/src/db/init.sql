@@ -179,3 +179,6 @@ INSERT INTO schema_migrations (version) VALUES
   ('002_audit_logs'),
   ('003_archival_support')
 ON CONFLICT (version) DO NOTHING;
+
+-- Seed data is in seed.sql
+

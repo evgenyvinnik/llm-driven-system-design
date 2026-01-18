@@ -2,6 +2,8 @@
   "name": "notion",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "notion_db",
+  "dbUser": "notion",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "twitter",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "twitter_db",
+  "dbUser": "twitter",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "linkedin",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "linkedin",
+  "dbUser": "linkedin",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

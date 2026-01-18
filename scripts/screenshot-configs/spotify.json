@@ -2,6 +2,8 @@
   "name": "spotify",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "spotify",
+  "dbUser": "spotify",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "jira",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "jira",
+  "dbUser": "jira",
   "auth": {
     "enabled": false
   },

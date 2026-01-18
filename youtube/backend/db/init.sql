@@ -314,17 +314,4 @@ CREATE TRIGGER trigger_update_subscriber_count
     FOR EACH ROW
     EXECUTE FUNCTION update_subscriber_count();
 
--- =============================================================================
--- SEED DATA
--- =============================================================================
-
--- Insert sample admin user (password should be properly hashed in production)
-INSERT INTO users (username, email, password_hash, channel_name, channel_description, role)
-VALUES (
-    'admin',
-    'admin@youtube.local',
-    '$2b$10$example', -- Replace with actual bcrypt hash in production
-    'Admin Channel',
-    'Platform administration channel',
-    'admin'
-);
+-- Seed data is in db-seed/seed.sql

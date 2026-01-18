@@ -124,6 +124,4 @@ CREATE TRIGGER update_auctions_updated_at BEFORE UPDATE ON auctions
 CREATE TRIGGER update_auto_bids_updated_at BEFORE UPDATE ON auto_bids
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Insert sample admin user (password: admin123)
-INSERT INTO users (username, email, password_hash, role) VALUES
-('admin', 'admin@auction.com', '$2b$10$6L.nRCCOMK/vMYXwrZtJ8e0VW.rWJw7XgUfwPwJQyQP6fLH5P8xnm', 'admin');
+-- Seed data is in seed.sql

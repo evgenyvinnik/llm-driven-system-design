@@ -2,6 +2,8 @@
   "name": "stripe",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "stripe_db",
+  "dbUser": "stripe",
   "auth": {
     "enabled": false
   },

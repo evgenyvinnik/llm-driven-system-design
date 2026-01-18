@@ -2,6 +2,8 @@
   "name": "github",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "github",
+  "dbUser": "github",
   "auth": {
     "enabled": false
   },

@@ -2,6 +2,8 @@
   "name": "imessage",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "imessage",
+  "dbUser": "imessage",
   "auth": {
     "enabled": false
   },

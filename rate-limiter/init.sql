@@ -24,14 +24,6 @@ CREATE INDEX IF NOT EXISTS idx_rules_lookup ON rate_limit_rules(enabled, priorit
 CREATE INDEX IF NOT EXISTS idx_rules_endpoint ON rate_limit_rules(endpoint_pattern);
 CREATE INDEX IF NOT EXISTS idx_rules_tier ON rate_limit_rules(user_tier);
 
--- Insert default rules
-INSERT INTO rate_limit_rules (name, endpoint_pattern, identifier_type, user_tier, algorithm, limit_value, window_seconds, priority, enabled)
-VALUES
-    ('Free tier global', NULL, 'api_key', 'free', 'sliding_window', 100, 60, 0, true),
-    ('Pro tier global', NULL, 'api_key', 'pro', 'sliding_window', 1000, 60, 0, true),
-    ('Enterprise global', NULL, 'api_key', 'enterprise', 'token_bucket', 10000, 60, 0, true)
-ON CONFLICT DO NOTHING;
-
 -- Rate limit metrics table (for historical analysis)
 CREATE TABLE IF NOT EXISTS rate_limit_metrics (
     id              SERIAL PRIMARY KEY,
@@ -53,3 +45,5 @@ BEGIN
     DELETE FROM rate_limit_metrics WHERE timestamp < NOW() - INTERVAL '7 days';
 END;
 $$ LANGUAGE plpgsql;
+
+-- Seed data is in seed.sql

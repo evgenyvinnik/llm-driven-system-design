@@ -2,6 +2,8 @@
   "name": "price-tracking",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "pricetracker",
+  "dbUser": "pricetracker",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

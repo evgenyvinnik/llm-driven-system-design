@@ -2,6 +2,8 @@
   "name": "icloud",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "icloud_sync",
+  "dbUser": "icloud",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "job-scheduler",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "job_scheduler",
+  "dbUser": "scheduler",
   "auth": {
     "enabled": false
   },

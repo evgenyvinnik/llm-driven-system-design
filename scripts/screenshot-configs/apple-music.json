@@ -2,6 +2,8 @@
   "name": "apple-music",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "apple_music",
+  "dbUser": "apple_music",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

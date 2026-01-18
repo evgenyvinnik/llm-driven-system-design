@@ -2,6 +2,8 @@
   "name": "uber",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "uber_db",
+  "dbUser": "uber",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "slack",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "slack",
+  "dbUser": "slack",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

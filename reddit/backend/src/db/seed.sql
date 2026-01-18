@@ -1,0 +1,5 @@
+-- Seed data for development/testing
+-- Note: reddit/backend/src/db/init.sql contains no seed data to extract.
+-- The schema_migrations table inserts are for tracking which migrations have been applied,
+-- not development/testing seed data.
+-- Add sample users, subreddits, posts, and comments here for development.

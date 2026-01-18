@@ -2,6 +2,8 @@
   "name": "fb-news-feed",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "newsfeed",
+  "dbUser": "postgres",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

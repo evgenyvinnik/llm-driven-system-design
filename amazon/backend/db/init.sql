@@ -162,51 +162,6 @@ CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories(slug);
 -- Full-text search index for products
 CREATE INDEX IF NOT EXISTS idx_products_search ON products USING gin(to_tsvector('english', title || ' ' || COALESCE(description, '')));
 
--- Insert default warehouse
-INSERT INTO warehouses (name, address) VALUES
-  ('Main Warehouse', '{"street": "123 Warehouse Lane", "city": "Seattle", "state": "WA", "zip": "98101", "country": "USA"}')
-ON CONFLICT DO NOTHING;
-
--- Insert default admin user (password: admin123)
-INSERT INTO users (email, password_hash, name, role) VALUES
-  ('admin@amazon.local', '$2b$10$rPqO8.mLVk3vQzGvXtE8UOqHoS3wHJYZxL/5GZXS0vCaC3B5Q4LlW', 'Admin User', 'admin')
-ON CONFLICT (email) DO NOTHING;
-
--- Insert sample categories
-INSERT INTO categories (name, slug, description) VALUES
-  ('Electronics', 'electronics', 'Electronic devices and accessories'),
-  ('Computers', 'computers', 'Laptops, desktops, and accessories'),
-  ('Books', 'books', 'Physical and digital books'),
-  ('Clothing', 'clothing', 'Men and women apparel'),
-  ('Home & Kitchen', 'home-kitchen', 'Home goods and kitchen appliances')
-ON CONFLICT (slug) DO NOTHING;
-
--- Insert subcategories
-INSERT INTO categories (name, slug, parent_id, description)
-SELECT 'Smartphones', 'smartphones', id, 'Mobile phones and accessories'
-FROM categories WHERE slug = 'electronics'
-ON CONFLICT (slug) DO NOTHING;
-
-INSERT INTO categories (name, slug, parent_id, description)
-SELECT 'Laptops', 'laptops', id, 'Laptop computers'
-FROM categories WHERE slug = 'computers'
-ON CONFLICT (slug) DO NOTHING;
-
-INSERT INTO categories (name, slug, parent_id, description)
-SELECT 'Fiction', 'fiction', id, 'Fiction books'
-FROM categories WHERE slug = 'books'
-ON CONFLICT (slug) DO NOTHING;
-
--- Create a default seller
-INSERT INTO users (email, password_hash, name, role) VALUES
-  ('seller@amazon.local', '$2b$10$rPqO8.mLVk3vQzGvXtE8UOqHoS3wHJYZxL/5GZXS0vCaC3B5Q4LlW', 'Demo Seller', 'seller')
-ON CONFLICT (email) DO NOTHING;
-
-INSERT INTO sellers (user_id, business_name, description)
-SELECT id, 'TechStore', 'Quality electronics and gadgets'
-FROM users WHERE email = 'seller@amazon.local'
-ON CONFLICT DO NOTHING;
-
 -- ============================================================
 -- Observability and Resilience Tables (Added for production readiness)
 -- ============================================================
@@ -287,3 +242,5 @@ CREATE TABLE IF NOT EXISTS search_logs (
 
 CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_search_logs_user ON search_logs(user_id);
+
+-- Seed data is in db-seed/seed.sql

@@ -75,10 +75,4 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 CREATE TRIGGER update_conversations_updated_at BEFORE UPDATE ON conversations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Insert some demo users
-INSERT INTO users (id, username, display_name, password_hash) VALUES
-    ('11111111-1111-1111-1111-111111111111', 'alice', 'Alice Smith', '$2b$10$rNCLQxB7h2cR1VJ4kB1lk.w8R7HNXF8TG8f6b7YwFhW1fJLBj0Ky6'),
-    ('22222222-2222-2222-2222-222222222222', 'bob', 'Bob Johnson', '$2b$10$rNCLQxB7h2cR1VJ4kB1lk.w8R7HNXF8TG8f6b7YwFhW1fJLBj0Ky6'),
-    ('33333333-3333-3333-3333-333333333333', 'charlie', 'Charlie Brown', '$2b$10$rNCLQxB7h2cR1VJ4kB1lk.w8R7HNXF8TG8f6b7YwFhW1fJLBj0Ky6')
-ON CONFLICT (username) DO NOTHING;
--- Password for all users is 'password123'
+-- Seed data is in db-seed/seed.sql

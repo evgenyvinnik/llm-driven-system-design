@@ -2,6 +2,8 @@
   "name": "venmo",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "venmo",
+  "dbUser": "venmo",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

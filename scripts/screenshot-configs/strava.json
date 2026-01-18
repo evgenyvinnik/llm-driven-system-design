@@ -2,6 +2,8 @@
   "name": "strava",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "strava",
+  "dbUser": "strava",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

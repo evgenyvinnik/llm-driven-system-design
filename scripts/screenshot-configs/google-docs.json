@@ -2,6 +2,8 @@
   "name": "google-docs",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "googledocs",
+  "dbUser": "googledocs",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

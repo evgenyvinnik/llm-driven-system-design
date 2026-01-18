@@ -2,6 +2,8 @@
   "name": "local-delivery",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "delivery",
+  "dbUser": "delivery",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

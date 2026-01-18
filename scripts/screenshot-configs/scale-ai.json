@@ -2,6 +2,8 @@
   "name": "scale-ai",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "scaleai",
+  "dbUser": "scaleai",
   "auth": {
     "enabled": false
   },

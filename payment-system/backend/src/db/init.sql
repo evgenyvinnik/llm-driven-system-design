@@ -140,8 +140,4 @@ CREATE INDEX idx_webhook_deliveries_next_retry_at ON webhook_deliveries(next_ret
 
 CREATE INDEX idx_idempotency_keys_expires_at ON idempotency_keys(expires_at);
 
--- Insert system accounts
-INSERT INTO accounts (id, name, account_type, currency) VALUES
-    ('00000000-0000-0000-0000-000000000001', 'accounts_receivable', 'asset', 'USD'),
-    ('00000000-0000-0000-0000-000000000002', 'platform_revenue', 'revenue', 'USD'),
-    ('00000000-0000-0000-0000-000000000003', 'pending_settlements', 'liability', 'USD');
+-- Seed data is in seed.sql

@@ -2,6 +2,8 @@
   "name": "health-data-pipeline",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "health_data",
+  "dbUser": "health_user",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

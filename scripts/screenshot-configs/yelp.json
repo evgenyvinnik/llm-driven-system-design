@@ -2,6 +2,8 @@
   "name": "yelp",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "yelp_db",
+  "dbUser": "yelp",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -2,6 +2,8 @@
   "name": "youtube-top-k",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "youtube_topk",
+  "dbUser": "postgres",
   "auth": {
     "enabled": false
   },

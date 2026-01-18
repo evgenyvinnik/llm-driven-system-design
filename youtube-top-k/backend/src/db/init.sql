@@ -100,3 +100,5 @@ CREATE INDEX IF NOT EXISTS idx_trending_snapshots_window
 -- Mark both migrations as applied so migrate.ts won't re-run them
 INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT DO NOTHING;
 INSERT INTO schema_migrations (version) VALUES (2) ON CONFLICT DO NOTHING;
+
+-- Seed data is in db-seed/seed.sql
