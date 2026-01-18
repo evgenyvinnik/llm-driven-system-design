@@ -29,19 +29,26 @@
       "delay": 1500
     },
     {
-      "name": "03-matches",
+      "name": "03-portraits-gallery",
+      "path": "/portraits",
+      "waitFor": "main",
+      "skipAuth": true,
+      "delay": 1000
+    },
+    {
+      "name": "04-matches",
       "path": "/matches",
       "waitFor": "main",
       "delay": 500
     },
     {
-      "name": "04-profile",
+      "name": "05-profile",
       "path": "/profile",
       "waitFor": "main",
       "delay": 500
     },
     {
-      "name": "05-preferences",
+      "name": "06-preferences",
       "path": "/preferences",
       "waitFor": "main",
       "delay": 500
