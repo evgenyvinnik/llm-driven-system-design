@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Screenshot automation script for frontend projects.
- * Uses Playwright to capture screenshots of key screens.
+ * Uses Puppeteer to capture screenshots of key screens.
  *
  * Usage:
  *   node scripts/screenshots.mjs <project>                  # Screenshot (frontend must be running)
@@ -9,10 +9,9 @@
  *   node scripts/screenshots.mjs --start --all              # Auto-screenshot all projects
  *   node scripts/screenshots.mjs --dry-run <project>        # Show what would be captured
  *   node scripts/screenshots.mjs --list                     # List available configs
- *   node scripts/screenshots.mjs --browser=chromium <proj>  # Use specific browser (chromium, firefox, webkit)
  *
  * Requirements:
- *   - Playwright browsers installed: npx playwright install
+ *   - Puppeteer installed: npm install puppeteer
  *   - Frontend dev server must be running (or use --start flag)
  */
 
@@ -20,7 +19,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
-import { chromium, firefox, webkit } from 'playwright';
+import puppeteer from 'puppeteer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,8 +32,6 @@ const isDryRun = args.includes('--dry-run');
 const isAll = args.includes('--all');
 const isList = args.includes('--list');
 const shouldStart = args.includes('--start');
-const browserArg = args.find(arg => arg.startsWith('--browser='));
-const browserType = browserArg ? browserArg.split('=')[1] : 'chromium';
 const projectArgs = args.filter(arg => !arg.startsWith('--'));
 
 // Track spawned processes for cleanup
@@ -278,42 +275,55 @@ process.on('exit', () => {
 });
 
 /**
- * Capture screenshots using Playwright
+ * Capture screenshots using Puppeteer
  */
-async function captureWithPlaywright(config, outputDir) {
-  const browsers = { chromium, firefox, webkit };
-  const browserLauncher = browsers[browserType] || chromium;
+async function captureWithPuppeteer(config, outputDir) {
   const baseUrl = `http://localhost:${config.frontendPort}`;
 
-  logStep('BROWSER', `Launching ${browserType}...`);
+  logStep('BROWSER', 'Launching Chrome...');
 
   let browser;
+  let tempUserDataDir = null;
   try {
-    // Try using installed Chrome first (more stable on macOS)
-    browser = await browserLauncher.launch({
+    // Create temp user data directory to avoid profile issues
+    tempUserDataDir = fs.mkdtempSync(path.join('/tmp', 'puppeteer-'));
+
+    // Use Puppeteer's ARM Chrome for Testing
+    const armChromePath = '/Users/evgenyvinnik/.cache/puppeteer/chrome/mac_arm-143.0.7499.192/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+
+    browser = await puppeteer.launch({
       headless: true,
-      executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      executablePath: fs.existsSync(armChromePath) ? armChromePath : undefined,
+      userDataDir: tempUserDataDir,
+      pipe: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--no-first-run',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--mute-audio',
+      ],
     });
   } catch (error) {
-    // Fall back to Playwright-bundled browser
-    try {
-      browser = await browserLauncher.launch({ headless: true });
-    } catch (error2) {
-      logError(`Failed to launch browser: ${error2.message}`);
-      logWarning('Run: npx playwright install');
-      return { success: false, captured: 0, failed: config.screens.length };
+    logError(`Failed to launch browser: ${error.message}`);
+    if (tempUserDataDir) {
+      fs.rmSync(tempUserDataDir, { recursive: true, force: true });
     }
+    return { success: false, captured: 0, failed: config.screens.length };
   }
 
-  const context = await browser.newContext({
-    viewport: {
-      width: config.viewport?.width || 1280,
-      height: config.viewport?.height || 720,
-    },
+  const page = await browser.newPage();
+  await page.setViewport({
+    width: config.viewport?.width || 1280,
+    height: config.viewport?.height || 720,
     deviceScaleFactor: 2,
   });
-
-  const page = await context.newPage();
 
   let successCount = 0;
   let failCount = 0;
@@ -327,16 +337,16 @@ async function captureWithPlaywright(config, outputDir) {
     logStep('AUTH', 'Logging in...');
 
     try {
-      await page.goto(`${baseUrl}${auth.loginUrl}`, { waitUntil: 'networkidle', timeout: 30000 });
+      await page.goto(`${baseUrl}${auth.loginUrl}`, { waitUntil: 'networkidle0', timeout: 30000 });
 
       // Wait for and fill username/email field
       const usernameSelector = auth.usernameSelector || 'input[name="username"], input[name="email"], input[type="email"], input[type="text"]';
       await page.waitForSelector(usernameSelector, { timeout: 10000 });
-      await page.fill(usernameSelector, auth.credentials.username || auth.credentials.email);
+      await page.type(usernameSelector, auth.credentials.username || auth.credentials.email);
 
       // Fill password field
       const passwordSelector = auth.passwordSelector || 'input[name="password"], input[type="password"]';
-      await page.fill(passwordSelector, auth.credentials.password);
+      await page.type(passwordSelector, auth.credentials.password);
 
       // Click submit
       const submitSelector = auth.submitSelector || 'button[type="submit"]';
@@ -346,7 +356,7 @@ async function captureWithPlaywright(config, outputDir) {
       if (auth.successIndicator) {
         await page.waitForSelector(auth.successIndicator, { timeout: 10000 });
       } else {
-        await page.waitForLoadState('networkidle');
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {});
       }
 
       logSuccess('Login successful');
@@ -367,7 +377,7 @@ async function captureWithPlaywright(config, outputDir) {
 
       logStep('CAPTURE', `${screen.name} (${screen.path})`);
 
-      await page.goto(`${baseUrl}${screen.path}`, { waitUntil: 'networkidle', timeout: 30000 });
+      await page.goto(`${baseUrl}${screen.path}`, { waitUntil: 'networkidle0', timeout: 30000 });
 
       // Wait for specific selector if specified
       if (screen.waitFor) {
@@ -394,7 +404,7 @@ async function captureWithPlaywright(config, outputDir) {
 
       // Additional delay if specified
       if (screen.delay) {
-        await page.waitForTimeout(screen.delay);
+        await new Promise(resolve => setTimeout(resolve, screen.delay));
       }
 
       // Take screenshot
@@ -413,6 +423,11 @@ async function captureWithPlaywright(config, outputDir) {
   }
 
   await browser.close();
+
+  // Clean up temp user data directory
+  if (tempUserDataDir) {
+    fs.rmSync(tempUserDataDir, { recursive: true, force: true });
+  }
 
   log(`Results: ${successCount} captured, ${failCount} failed`, 'cyan');
 
@@ -473,8 +488,8 @@ async function processProject(config) {
     return { project: config.name, success: true, captured: 0, failed: 0 };
   }
 
-  // Capture screenshots using Playwright
-  const result = await captureWithPlaywright(config, outputDir);
+  // Capture screenshots using Puppeteer
+  const result = await captureWithPuppeteer(config, outputDir);
 
   // Stop frontend if we started it
   if (frontendProcess && !frontendProcess.killed) {
@@ -545,9 +560,7 @@ async function main() {
     log('  node scripts/screenshots.mjs --start --all         # Auto-screenshot all projects');
     log('  node scripts/screenshots.mjs --list                # List available configs');
     log('  node scripts/screenshots.mjs --dry-run <project>   # Show what would be captured');
-    log('  node scripts/screenshots.mjs --browser=chromium    # Use specific browser');
-    log('\nBrowsers: chromium (default), firefox, webkit', 'dim');
-    log('Available projects: ' + configs.map(c => c.name).join(', '), 'dim');
+    log('\nAvailable projects: ' + configs.map(c => c.name).join(', '), 'dim');
     return;
   }
 

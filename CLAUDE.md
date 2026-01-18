@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **system design learning repository** where each subdirectory represents an independent system design challenge. Most projects have both design documentation and working implementations.
 
+**Node.js Requirement:** >=20.0.0
+
 ## Quick Start for Any Project
 
 1. Read the project's `architecture.md` first to understand the design
@@ -24,6 +26,7 @@ Each project folder typically contains:
 ├── claude.md                  # LLM collaboration notes and iteration history
 ├── frontend/                  # React + TypeScript frontend (when applicable)
 ├── backend/                   # Node.js + Express backend (when applicable)
+├── training/                  # ML training code (Python, when applicable)
 └── docker-compose.yml         # Infrastructure services (PostgreSQL, Redis, etc.)
 ```
 
@@ -70,12 +73,14 @@ docker-compose down -v   # Stop and remove volumes
 
 ## Repository Scripts
 
+Scripts run from the repository root:
+
 ```bash
 # Count SLOC for entire repository
-node scripts/sloc.mjs
+npm run sloc
 
 # Count SLOC for specific project
-node scripts/sloc.mjs scale-ai
+npm run sloc scale-ai
 
 # Output as JSON
 node scripts/sloc.mjs scale-ai --json
@@ -84,7 +89,7 @@ node scripts/sloc.mjs scale-ai --json
 node scripts/sloc.mjs scale-ai --summary
 
 # Update all project READMEs with SLOC stats
-node scripts/update-readme-sloc.mjs
+npm run sloc:update
 
 # Add Codex opinion comments to architecture files
 node scripts/add-codex-opinion.mjs
@@ -92,7 +97,7 @@ node scripts/add-codex-opinion.mjs
 
 ### Screenshot Automation
 
-Capture screenshots of frontend projects for documentation using Puppeteer in Docker.
+Capture screenshots of frontend projects for documentation using Puppeteer in Docker (Playwright also available).
 
 **Prerequisites:**
 - Docker Desktop must be running
@@ -108,7 +113,7 @@ npm run screenshots instagram
 node scripts/screenshots.mjs --start instagram
 
 # Auto-screenshot all configured projects
-node scripts/screenshots.mjs --start --all
+npm run screenshots:all
 
 # Dry run (show what would be captured)
 npm run screenshots:dry instagram
@@ -179,6 +184,17 @@ Use these unless there's a compelling reason to deviate (document justification 
 
 ## Frontend Best Practices
 
+### TanStack Router File-Based Routing
+
+Projects using TanStack Router follow this file structure:
+```
+frontend/src/routes/
+├── __root.tsx      # Root layout with outlet
+├── index.tsx       # / route
+├── admin.tsx       # /admin route
+└── $dynamicParam.tsx  # Dynamic route segment
+```
+
 ### SVG Icon Organization
 
 Never inline SVG code directly into components. Create separate icon components in `frontend/src/components/icons/` with a barrel export (`index.ts`). Each icon should accept `className` and variant props.
@@ -229,7 +245,9 @@ For projects using multiple databases:
 
 The `npm run db:migrate` command runs `migrate.ts` which executes `init.sql` against the database.
 
-Tests use vitest with mocked shared modules. Test files are co-located with source files (`app.test.ts` next to `app.ts`). Mock shared modules before importing the app:
+### Testing
+
+Tests use vitest with mocked shared modules. Each backend has a `vitest.config.ts` at its root. Test files are co-located with source files (`app.test.ts` next to `app.ts`). Mock shared modules before importing the app:
 
 ```typescript
 // Mock shared modules before import

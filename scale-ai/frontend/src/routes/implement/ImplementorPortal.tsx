@@ -6,7 +6,7 @@
  * @module routes/implement/ImplementorPortal
  */
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { PostItCanvas } from '../../components/PostItCanvas'
 import { GenerateMode } from './GenerateMode'
 import { classifyDrawing, getModelInfo, type ClassificationResult, type ModelInfo } from '../../services/api'
@@ -28,23 +28,33 @@ const TABS: { id: PortalMode; label: string; description: string }[] = [
 export function ImplementorPortal() {
   const [activeMode, setActiveMode] = useState<PortalMode>('classify')
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
+  const [modelLoading, setModelLoading] = useState(true)
   const [result, setResult] = useState<ClassificationResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   /**
    * Loads model info from the inference service.
-   * Called on first drawing interaction.
    */
   const loadModelInfo = useCallback(async () => {
     try {
+      setModelLoading(true)
       const info = await getModelInfo()
       setModelInfo(info)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load model')
+    } finally {
+      setModelLoading(false)
     }
   }, [])
+
+  /**
+   * Load model info on mount.
+   */
+  useEffect(() => {
+    loadModelInfo()
+  }, [loadModelInfo])
 
   /**
    * Handles drawing completion and runs classification.
@@ -97,11 +107,23 @@ export function ImplementorPortal() {
       <header className="portal-header">
         <h1>Model Tester</h1>
         <p>{TABS.find((t) => t.id === activeMode)?.description}</p>
-        {modelInfo && (
-          <div className="model-badge">
-            Model: {modelInfo.version} ({(modelInfo.accuracy * 100).toFixed(1)}% accuracy)
-          </div>
-        )}
+        <div className="model-status">
+          {modelLoading && (
+            <div className="model-badge loading">
+              Loading model...
+            </div>
+          )}
+          {!modelLoading && modelInfo && (
+            <div className="model-badge active">
+              Active Model: <strong>{modelInfo.version}</strong> ({(modelInfo.accuracy * 100).toFixed(1)}% accuracy)
+            </div>
+          )}
+          {!modelLoading && !modelInfo && error && (
+            <div className="model-badge error">
+              No active model - train and activate a model first
+            </div>
+          )}
+        </div>
       </header>
 
       {/* Tab Navigation */}
@@ -122,7 +144,7 @@ export function ImplementorPortal() {
         <div className="portal-content">
           <div className="canvas-section">
             <PostItCanvas
-              shape="circle" // Placeholder, not used for prompt in this mode
+              shape="freeform"
               onComplete={handleComplete}
               onClear={handleClear}
             />

@@ -31,8 +31,8 @@ interface Stroke {
  * Props for the PostItCanvas component.
  */
 interface PostItCanvasProps {
-  /** The shape the user should draw */
-  shape: 'line' | 'heart' | 'circle' | 'square' | 'triangle'
+  /** The shape the user should draw (use 'freeform' for classify mode) */
+  shape: 'line' | 'heart' | 'circle' | 'square' | 'triangle' | 'freeform'
   /** Called when user clicks "Done!" with the stroke data */
   onComplete?: (strokeData: { strokes: Stroke[]; duration_ms: number }) => void
   /** Called when user clicks "Start Over" */
@@ -46,6 +46,7 @@ const SHAPE_PROMPTS: Record<string, string> = {
   circle: 'Draw a circle',
   square: 'Draw a square',
   triangle: 'Draw a triangle',
+  freeform: 'Draw any shape',
 }
 
 /** Unicode symbols as visual hints for each shape */
@@ -55,6 +56,7 @@ const SHAPE_HINTS: Record<string, string> = {
   circle: '○',
   square: '□',
   triangle: '△',
+  freeform: '✏️',
 }
 
 /**
