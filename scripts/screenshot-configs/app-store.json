@@ -6,8 +6,8 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
-      "password": "password123"
+      "email": "admin@appstore.dev",
+      "password": "admin123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
     "passwordSelector": "input[name='password'], input[type='password']",

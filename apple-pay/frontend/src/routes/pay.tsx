@@ -261,7 +261,7 @@ function PayPage() {
             <ul className="space-y-1 text-xs">
               <li>Amount $666.66 - Insufficient funds</li>
               <li>Amount $999.99 - Card declined</li>
-              <li>Amount > $10,000 - Limit exceeded</li>
+              <li>Amount over $10,000 - Limit exceeded</li>
             </ul>
           </div>
         </>
