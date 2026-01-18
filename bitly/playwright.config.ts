@@ -14,8 +14,8 @@ export default defineConfig({
   },
   projects: [
     {
-      name: 'webkit',
-      use: { ...devices['Desktop Safari'] },
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
     },
   ],
   // webServer: {

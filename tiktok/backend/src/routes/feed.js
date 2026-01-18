@@ -10,6 +10,7 @@ import {
   timeAsync,
 } from '../shared/metrics.js';
 import { createCircuitBreaker, withCircuitBreaker } from '../shared/circuitBreaker.js';
+import { getEmbeddingBasedRecommendations, generateUserEmbedding } from '../services/embeddings.js';
 
 const router = express.Router();
 const logger = createLogger('feed');
@@ -348,8 +349,8 @@ async function getPersonalizedFeedInternal(userId, limit, offset) {
 async function generateCandidates(userId, count) {
   const candidateMap = new Map();
 
-  // Source 1: Videos from followed creators (40%)
-  const followedCount = Math.floor(count * 0.4);
+  // Source 1: Videos from followed creators (30%)
+  const followedCount = Math.floor(count * 0.3);
   const followedResult = await query(
     `SELECT v.*, u.username as creator_username, u.display_name as creator_display_name,
             u.avatar_url as creator_avatar_url
@@ -365,8 +366,8 @@ async function generateCandidates(userId, count) {
     candidateMap.set(video.id, { ...video, source: 'followed' });
   }
 
-  // Source 2: Videos with hashtags user has engaged with (30%)
-  const hashtagCount = Math.floor(count * 0.3);
+  // Source 2: Videos with hashtags user has engaged with (20%)
+  const hashtagCount = Math.floor(count * 0.2);
   const prefResult = await query(
     'SELECT hashtag_preferences FROM user_embeddings WHERE user_id = $1',
     [userId]
