@@ -6,7 +6,7 @@ import { RadioStation, Track } from '../../types';
 import { TrackRow } from '../../components/MusicCards';
 import { usePlayerStore } from '../../stores/playerStore';
 
-export const Route = createFileRoute('/radio/$id')({
+export const Route = createFileRoute('/radio_/$id')({
   component: RadioStationPage,
 });
 
