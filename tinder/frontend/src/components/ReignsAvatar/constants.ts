@@ -47,6 +47,8 @@ export const HAIR_COLORS: HairColorPalette[] = [
   { base: '#2B1E16', highlight: '#3D2D23' }, // Espresso
   { base: '#503626', highlight: '#6B4A35' }, // Chestnut
   { base: '#7A5A3B', highlight: '#8E6A4A' }, // Hazel
+  { base: '#6A4A3A', highlight: '#7D5B4A' }, // Mocha
+  { base: '#A07A5A', highlight: '#B08D6C' }, // Soft auburn
   { base: '#1F1F1F', highlight: '#353535' }, // Charcoal
   { base: '#C2B8A3', highlight: '#D6CDBC' }, // Ash
 ];
@@ -61,6 +63,8 @@ export const EYE_COLORS: string[] = [
   '#6C7A89', // Slate
   '#4F6A8C', // Dusty blue
   '#7A6350', // Hazel
+  '#2F2E2B', // Charcoal
+  '#7B6A58', // Taupe
 ];
 
 /**
@@ -96,4 +100,5 @@ export const ACCESSORY_COLORS: string[] = [
   '#C7B48A', // Soft gold
   '#AFA79A', // Brushed silver
   '#8F7C5E', // Antique bronze
+  '#B18C3E', // Dark gold
 ];
