@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as RegisterRouteImport } from './routes/register'
 import { Route as ProfileRouteImport } from './routes/profile'
 import { Route as PreferencesRouteImport } from './routes/preferences'
+import { Route as PortraitsRouteImport } from './routes/portraits'
 import { Route as MatchesRouteImport } from './routes/matches'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AdminRouteImport } from './routes/admin'
@@ -32,6 +33,11 @@ const ProfileRoute = ProfileRouteImport.update({
 const PreferencesRoute = PreferencesRouteImport.update({
   id: '/preferences',
   path: '/preferences',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PortraitsRoute = PortraitsRouteImport.update({
+  id: '/portraits',
+  path: '/portraits',
   getParentRoute: () => rootRouteImport,
 } as any)
 const MatchesRoute = MatchesRouteImport.update({
@@ -70,6 +76,7 @@ export interface FileRoutesByFullPath {
   '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
+  '/portraits': typeof PortraitsRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
@@ -81,6 +88,7 @@ export interface FileRoutesByTo {
   '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
+  '/portraits': typeof PortraitsRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
@@ -93,6 +101,7 @@ export interface FileRoutesById {
   '/admin': typeof AdminRouteWithChildren
   '/login': typeof LoginRoute
   '/matches': typeof MatchesRoute
+  '/portraits': typeof PortraitsRoute
   '/preferences': typeof PreferencesRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
@@ -106,6 +115,7 @@ export interface FileRouteTypes {
     | '/admin'
     | '/login'
     | '/matches'
+    | '/portraits'
     | '/preferences'
     | '/profile'
     | '/register'
@@ -117,6 +127,7 @@ export interface FileRouteTypes {
     | '/admin'
     | '/login'
     | '/matches'
+    | '/portraits'
     | '/preferences'
     | '/profile'
     | '/register'
@@ -128,6 +139,7 @@ export interface FileRouteTypes {
     | '/admin'
     | '/login'
     | '/matches'
+    | '/portraits'
     | '/preferences'
     | '/profile'
     | '/register'
@@ -140,6 +152,7 @@ export interface RootRouteChildren {
   AdminRoute: typeof AdminRouteWithChildren
   LoginRoute: typeof LoginRoute
   MatchesRoute: typeof MatchesRoute
+  PortraitsRoute: typeof PortraitsRoute
   PreferencesRoute: typeof PreferencesRoute
   ProfileRoute: typeof ProfileRoute
   RegisterRoute: typeof RegisterRoute
@@ -167,6 +180,13 @@ declare module '@tanstack/react-router' {
       path: '/preferences'
       fullPath: '/preferences'
       preLoaderRoute: typeof PreferencesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/portraits': {
+      id: '/portraits'
+      path: '/portraits'
+      fullPath: '/portraits'
+      preLoaderRoute: typeof PortraitsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/matches': {
@@ -229,6 +249,7 @@ const rootRouteChildren: RootRouteChildren = {
   AdminRoute: AdminRouteWithChildren,
   LoginRoute: LoginRoute,
   MatchesRoute: MatchesRoute,
+  PortraitsRoute: PortraitsRoute,
   PreferencesRoute: PreferencesRoute,
   ProfileRoute: ProfileRoute,
   RegisterRoute: RegisterRoute,
