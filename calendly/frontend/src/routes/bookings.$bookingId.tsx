@@ -1,4 +1,4 @@
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
+import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { bookingsApi } from '../services/api';
 import type { Booking } from '../types';
@@ -11,7 +11,6 @@ export const Route = createFileRoute('/bookings/$bookingId')({
 
 function BookingDetailPage() {
   const { bookingId } = Route.useParams();
-  const navigate = useNavigate();
   const [booking, setBooking] = useState<Booking | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');

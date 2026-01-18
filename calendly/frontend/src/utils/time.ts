@@ -1,5 +1,5 @@
-import { format, parseISO, addMinutes } from 'date-fns';
-import { toZonedTime, formatInTimeZone } from 'date-fns-tz';
+import { parseISO } from 'date-fns';
+import { formatInTimeZone } from 'date-fns-tz';
 
 /**
  * Get the user's local timezone

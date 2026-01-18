@@ -1,0 +1,22 @@
+{
+  "name": "collaborative-editor",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "collaborative_editor",
+  "dbUser": "collab",
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-document-list",
+      "path": "/",
+      "waitFor": "main, .documents, button",
+      "delay": 1500
+    }
+  ],
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  }
+}

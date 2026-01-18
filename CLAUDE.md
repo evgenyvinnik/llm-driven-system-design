@@ -15,6 +15,17 @@ This is a **system design learning repository** where each subdirectory represen
 3. Look at `README.md` for setup instructions
 4. Check `package.json` to find available scripts
 
+## Project-Specific CLAUDE.md Files
+
+Each project has its own `CLAUDE.md` documenting:
+- **Project Context** - What system is being built and why
+- **Key Learning Goals** - Specific concepts being explored
+- **Key Challenges Explored** - Implementation decisions with rationale
+- **Architecture Decisions** - Database choices, caching strategies, etc.
+- **Iteration History** - How the design evolved
+
+These files capture the "why" behind implementation choices and serve as the primary context when working on that specific project.
+
 ## Project Structure
 
 Each project folder typically contains:
@@ -101,6 +112,31 @@ npm run generate-tests bitly        # Generate for specific project
 # Run smoke tests (automated UI tests)
 npm run test:smoke instagram        # Run smoke tests for specific project
 npm run test:smoke:all              # Run smoke tests for all projects
+```
+
+### Full Development Workflow
+
+To run a complete project with frontend and backend:
+
+```bash
+# Terminal 1: Start infrastructure
+cd <project>
+docker-compose up -d
+
+# Terminal 2: Run database migrations and start backend
+cd <project>/backend
+npm run db:migrate
+npm run dev
+
+# Terminal 3: Start frontend
+cd <project>/frontend
+npm run dev
+```
+
+For projects requiring seed data (screenshots, demos):
+```bash
+# After migration, seed the database
+PGPASSWORD=password psql -h localhost -U user -d dbname -f backend/db-seed/seed.sql
 ```
 
 ### Screenshot Automation
@@ -423,8 +459,9 @@ This ensures projects are accessible to developers who prefer not to use Docker.
 
 ## ESM Import Convention
 
-Backend projects use ES modules (`"type": "module"` in package.json). Always use `.js` extension in imports, even for TypeScript files:
+Backend projects use ES modules (`"type": "module"` in package.json). Import handling differs by language:
 
+**TypeScript projects** - Always use `.js` extension in imports (TypeScript compiles to JS):
 ```typescript
 // Correct - use .js extension
 import { pool } from '../shared/db.js'
@@ -433,4 +470,10 @@ import { cacheGet } from '../shared/cache.js'
 // Wrong - TypeScript extension won't work at runtime
 import { pool } from '../shared/db.ts'  // ❌
 import { pool } from '../shared/db'     // ❌
+```
+
+**JavaScript projects** - Use `.js` extension consistently:
+```javascript
+import { pool } from '../shared/db.js'
+import express from 'express'
 ```

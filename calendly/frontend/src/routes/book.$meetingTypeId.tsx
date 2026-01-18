@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { meetingTypesApi, availabilityApi, bookingsApi } from '../services/api';
 import type { MeetingType, TimeSlot } from '../types';
@@ -16,7 +16,6 @@ type BookingStep = 'select-time' | 'enter-details' | 'confirmed';
 
 function BookingPage() {
   const { meetingTypeId } = Route.useParams();
-  const navigate = useNavigate();
 
   const [meetingType, setMeetingType] = useState<MeetingType | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -35,7 +34,7 @@ function BookingPage() {
   const [email, setEmail] = useState('');
   const [notes, setNotes] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [bookingId, setBookingId] = useState<string | null>(null);
+  const [_bookingId, setBookingId] = useState<string | null>(null);
 
   useEffect(() => {
     loadMeetingType();

@@ -6,7 +6,7 @@ import { LoadingSpinner } from '../components/LoadingSpinner';
 
 export const Route = createFileRoute('/admin')({
   beforeLoad: async () => {
-    const { isAuthenticated, checkAuth, user } = useAuthStore.getState();
+    const { isAuthenticated, checkAuth } = useAuthStore.getState();
     if (!isAuthenticated) {
       await checkAuth();
     }
