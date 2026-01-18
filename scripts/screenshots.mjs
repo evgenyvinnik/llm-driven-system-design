@@ -245,31 +245,6 @@ async function startDockerCompose(projectDir, projectName) {
 }
 
 /**
- * Stop docker-compose services
- */
-function stopDockerCompose(projectDir, projectName) {
-  if (!hasDockerCompose(projectDir)) {
-    return;
-  }
-
-  if (!isDockerRunning()) {
-    return;
-  }
-
-  logStep('DOCKER', `Stopping infrastructure for ${projectName}...`);
-
-  try {
-    execSync('docker-compose down', {
-      cwd: projectDir,
-      stdio: 'pipe',
-    });
-    logSuccess('Docker services stopped');
-  } catch (error) {
-    logWarning(`Docker-compose stop failed: ${error.message}`);
-  }
-}
-
-/**
  * Setup database (run seed.sql if it exists)
  * Note: init.sql is automatically run by PostgreSQL on first startup via docker-entrypoint-initdb.d
  */
@@ -331,89 +306,6 @@ async function setupDatabase(projectDir, projectName, config) {
   }
 
   return false;
-}
-
-/**
- * Install backend dependencies if needed
- */
-async function installBackendDeps(backendDir) {
-  const nodeModulesPath = path.join(backendDir, 'node_modules');
-
-  if (fs.existsSync(nodeModulesPath)) {
-    return true;
-  }
-
-  logStep('NPM', 'Installing backend dependencies...');
-
-  try {
-    execSync('npm install', {
-      cwd: backendDir,
-      stdio: 'pipe',
-    });
-    logSuccess('Backend dependencies installed');
-    return true;
-  } catch (error) {
-    logError(`Backend npm install failed: ${error.message}`);
-    return false;
-  }
-}
-
-/**
- * Start the backend dev server
- */
-async function startBackend(projectDir, config) {
-  if (!config.backendRequired) {
-    return null;
-  }
-
-  const backendDir = path.join(projectDir, 'backend');
-
-  if (!fs.existsSync(backendDir)) {
-    logWarning('Backend required but directory not found');
-    return null;
-  }
-
-  const depsInstalled = await installBackendDeps(backendDir);
-  if (!depsInstalled) {
-    return null;
-  }
-
-  logStep('START', 'Starting backend server...');
-
-  const child = spawn('npm', ['run', 'dev'], {
-    cwd: backendDir,
-    stdio: 'pipe',
-    detached: false,
-    env: { ...process.env, FORCE_COLOR: '0' },
-  });
-
-  spawnedProcesses.push({ process: child, name: `${config.name} backend` });
-
-  child.stderr.on('data', (data) => {
-    const msg = data.toString().trim();
-    if (msg && !msg.includes('ExperimentalWarning') && msg.toLowerCase().includes('error')) {
-      logWarning(`Backend stderr: ${msg}`);
-    }
-  });
-
-  // Wait for backend to be ready (typically on port 3000)
-  const backendPort = config.backendPort || 3000;
-  let backendReady = false;
-  for (let i = 0; i < 30; i++) {
-    if (await isUrlReachable(`http://localhost:${backendPort}`)) {
-      backendReady = true;
-      break;
-    }
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-
-  if (backendReady) {
-    logSuccess('Backend server ready');
-    return child;
-  } else {
-    logWarning('Backend may not be ready (continuing anyway)');
-    return child;
-  }
 }
 
 /**
@@ -763,6 +655,7 @@ async function processProject(config) {
 
   let frontendProcess = null;
   let backendProcess = null;
+  let dockerStarted = false;
 
   // Auto-start mode
   if (shouldStart) {
@@ -777,7 +670,7 @@ async function processProject(config) {
     await stopDockerCompose(projectDir, config.name);
 
     // Step 3: Start docker-compose services
-    await startDockerCompose(projectDir, config.name);
+    dockerStarted = await startDockerCompose(projectDir, config.name);
 
     // Step 4: Setup database (seed.sql)
     const dbSetup = await setupDatabase(projectDir, config.name, config);
@@ -859,27 +752,10 @@ async function processProject(config) {
       } catch {}
     }
 
-    // Stop docker-compose
-    await stopDockerCompose(projectDir, config.name);
-  }
-
-  // Stop backend if we started it
-  if (backendProcess && !backendProcess.killed) {
-    logStep('STOP', `Stopping ${config.name} backend...`);
-    try {
-      if (process.platform !== 'win32') {
-        process.kill(-backendProcess.pid, 'SIGTERM');
-      } else {
-        backendProcess.kill('SIGTERM');
-      }
-      const idx = spawnedProcesses.findIndex(p => p.process === backendProcess);
-      if (idx >= 0) spawnedProcesses.splice(idx, 1);
-    } catch {}
-  }
-
-  // Stop Docker if we started it
-  if (dockerStarted) {
-    stopDockerCompose(projectDir, config.name);
+    // Stop docker-compose if we started it
+    if (dockerStarted) {
+      await stopDockerCompose(projectDir, config.name);
+    }
   }
 
   if (result.success) {
