@@ -87,6 +87,8 @@ function createLimiter(options) {
     standardHeaders: true, // Return rate limit info in headers
     legacyHeaders: false,
     store: new RedisRateLimitStore(prefix, windowMs),
+    // Disable IPv6 validation since we use custom keyGenerator with user ID fallback
+    validate: { ipKeyGenerator: false },
     keyGenerator: keyGenerator || ((req) => {
       // Use user ID if authenticated, otherwise IP
       return req.user?.id || req.ip || req.connection?.remoteAddress || 'unknown';

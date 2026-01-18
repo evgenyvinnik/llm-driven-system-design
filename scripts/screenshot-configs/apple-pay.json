@@ -2,6 +2,8 @@
   "name": "apple-pay",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbUser": "applepay",
+  "dbName": "applepay",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

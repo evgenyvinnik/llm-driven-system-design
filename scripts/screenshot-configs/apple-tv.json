@@ -2,6 +2,8 @@
   "name": "apple-tv",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "appletv",
+  "dbUser": "appletv",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

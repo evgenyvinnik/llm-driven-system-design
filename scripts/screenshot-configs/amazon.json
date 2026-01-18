@@ -2,6 +2,8 @@
   "name": "amazon",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "amazon_ecommerce",
+  "dbUser": "amazon",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",

@@ -7,7 +7,7 @@
     "loginUrl": "/login",
     "credentials": {
       "username": "admin",
-      "password": "admin123"
+      "password": "password123"
     },
     "usernameSelector": "input[name='username']",
     "passwordSelector": "input[name='password'], input[type='password']",

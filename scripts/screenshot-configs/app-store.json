@@ -2,6 +2,8 @@
   "name": "app-store",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "appstore",
+  "dbUser": "appstore",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",
