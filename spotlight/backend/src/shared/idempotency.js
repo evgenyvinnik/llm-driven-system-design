@@ -1,38 +1,26 @@
 import crypto from 'crypto';
+import { redis, cacheGet, cacheSet, cacheDel } from './redis.js';
 import { idempotencyCacheHitsTotal } from './metrics.js';
 import { indexLogger } from './logger.js';
 
 /**
- * In-memory idempotency store
- * In production, this should use Redis/Valkey for distributed deployments
+ * Redis-backed idempotency store
+ * Provides distributed idempotency checking across multiple server instances
  */
 class IdempotencyStore {
   constructor() {
-    // Map of idempotencyKey -> { result, timestamp, status }
-    this.cache = new Map();
-    // Default TTL: 24 hours
-    this.ttl = 24 * 60 * 60 * 1000;
-    // Clean up expired entries every hour
-    this.cleanupInterval = setInterval(() => this.cleanup(), 60 * 60 * 1000);
+    // Default TTL: 24 hours (in seconds for Redis)
+    this.ttlSeconds = 24 * 60 * 60;
+    this.keyPrefix = 'idempotency:';
   }
 
   /**
    * Get a cached result for an idempotency key
    * @param {string} key - Idempotency key
-   * @returns {Object|null} - Cached result or null
+   * @returns {Promise<Object|null>} - Cached result or null
    */
-  get(key) {
-    const entry = this.cache.get(key);
-    if (!entry) {
-      return null;
-    }
-
-    // Check if expired
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
-
+  async get(key) {
+    const entry = await cacheGet(this.keyPrefix + key);
     return entry;
   }
 
@@ -42,68 +30,59 @@ class IdempotencyStore {
    * @param {Object} result - Result to cache
    * @param {string} status - Status of the operation
    */
-  set(key, result, status = 'completed') {
-    this.cache.set(key, {
-      result,
-      status,
-      timestamp: Date.now()
-    });
+  async set(key, result, status = 'completed') {
+    await cacheSet(
+      this.keyPrefix + key,
+      { result, status, timestamp: Date.now() },
+      this.ttlSeconds
+    );
   }
 
   /**
    * Mark an operation as in-progress
+   * Uses Redis SETNX for atomic check-and-set
    * @param {string} key - Idempotency key
-   * @returns {boolean} - True if successfully marked, false if already in progress
+   * @returns {Promise<boolean>} - True if successfully marked, false if already in progress
    */
-  markInProgress(key) {
-    const existing = this.get(key);
-    if (existing) {
-      return false; // Already exists
-    }
-
-    this.cache.set(key, {
+  async markInProgress(key) {
+    const redisKey = this.keyPrefix + key;
+    // Use SETNX (SET if Not eXists) for atomic operation
+    const result = await redis.setnx(redisKey, JSON.stringify({
       result: null,
       status: 'in_progress',
       timestamp: Date.now()
-    });
-    return true;
+    }));
+
+    if (result === 1) {
+      // Successfully set, add expiry
+      await redis.expire(redisKey, this.ttlSeconds);
+      return true;
+    }
+    return false;
   }
 
   /**
    * Remove an idempotency key (for failed operations that should be retried)
    * @param {string} key - Idempotency key
    */
-  remove(key) {
-    this.cache.delete(key);
+  async remove(key) {
+    await cacheDel(this.keyPrefix + key);
   }
 
   /**
-   * Clean up expired entries
+   * Get the approximate number of cached entries (for monitoring)
+   * @returns {Promise<number>} - Number of entries
    */
-  cleanup() {
-    const now = Date.now();
-    for (const [key, entry] of this.cache) {
-      if (now - entry.timestamp > this.ttl) {
-        this.cache.delete(key);
-      }
-    }
+  async size() {
+    const keys = await redis.keys(this.keyPrefix + '*');
+    return keys.length;
   }
 
   /**
-   * Get the number of cached entries
-   * @returns {number} - Number of entries
-   */
-  size() {
-    return this.cache.size;
-  }
-
-  /**
-   * Stop the cleanup interval (for graceful shutdown)
+   * Stop the store (no-op for Redis, kept for API compatibility)
    */
   stop() {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-    }
+    // Redis handles its own connection management
   }
 }
 
@@ -138,7 +117,7 @@ export function idempotencyMiddleware(operationType = 'unknown') {
     }
 
     // Check for cached result
-    const cached = store.get(idempotencyKey);
+    const cached = await store.get(idempotencyKey);
 
     if (cached) {
       if (cached.status === 'in_progress') {
@@ -164,7 +143,8 @@ export function idempotencyMiddleware(operationType = 'unknown') {
     }
 
     // Mark operation as in progress
-    if (!store.markInProgress(idempotencyKey)) {
+    const marked = await store.markInProgress(idempotencyKey);
+    if (!marked) {
       // Race condition: another request just started
       return res.status(409).json({
         error: 'Request with this idempotency key is being processed',
@@ -185,11 +165,11 @@ export function idempotencyMiddleware(operationType = 'unknown') {
     };
 
     // Handle response finish to cache result
-    res.on('finish', () => {
+    res.on('finish', async () => {
       if (responseBody !== null) {
         if (res.statusCode >= 200 && res.statusCode < 300) {
           // Only cache successful responses
-          store.set(idempotencyKey, {
+          await store.set(idempotencyKey, {
             statusCode: responseStatus,
             body: responseBody
           });
@@ -201,11 +181,11 @@ export function idempotencyMiddleware(operationType = 'unknown') {
           }, 'Idempotency result cached');
         } else {
           // Remove failed operations so they can be retried
-          store.remove(idempotencyKey);
+          await store.remove(idempotencyKey);
         }
       } else {
         // No response body, remove from cache
-        store.remove(idempotencyKey);
+        await store.remove(idempotencyKey);
       }
     });
 
@@ -230,7 +210,7 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
   }
 
   // Check for cached result
-  const cached = store.get(idempotencyKey);
+  const cached = await store.get(idempotencyKey);
 
   if (cached) {
     if (cached.status === 'in_progress') {
@@ -248,7 +228,8 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
   }
 
   // Mark as in progress
-  if (!store.markInProgress(idempotencyKey)) {
+  const marked = await store.markInProgress(idempotencyKey);
+  if (!marked) {
     throw new Error('Operation with this idempotency key is being processed');
   }
 
@@ -256,7 +237,7 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
     const result = await operation();
 
     // Cache the result
-    store.set(idempotencyKey, result);
+    await store.set(idempotencyKey, result);
 
     indexLogger.info({
       idempotencyKey,
@@ -267,7 +248,7 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
     return result;
   } catch (error) {
     // Remove from cache on failure so operation can be retried
-    store.remove(idempotencyKey);
+    await store.remove(idempotencyKey);
     throw error;
   }
 }
@@ -283,8 +264,11 @@ export function getIdempotencyStore() {
 /**
  * Clear the idempotency store (for testing)
  */
-export function clearIdempotencyStore() {
-  store.cache.clear();
+export async function clearIdempotencyStore() {
+  const keys = await redis.keys('idempotency:*');
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
 }
 
 export default {

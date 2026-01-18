@@ -44,7 +44,7 @@ test.describe('bitly Smoke Tests', () => {
     await page.waitForTimeout(2000);
 
     // Verify page content loads
-    await expect(page.locator('.space-y-3')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('h1:has-text(\'Dashboard\')')).toBeVisible({ timeout: 10000 });
 
     // Verify no React error boundary
     await expect(page.locator('text=Something went wrong')).not.toBeVisible();

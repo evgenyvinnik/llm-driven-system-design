@@ -25,6 +25,7 @@ import searchRoutes from './routes/search.js';
 import categoryRoutes from './routes/categories.js';
 import userRoutes from './routes/users.js';
 import adminRoutes from './routes/admin.js';
+import photosRoutes from './routes/photos.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -214,6 +215,7 @@ app.use('/api/search', searchRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/photos', photosRoutes);
 
 // ============================================================================
 // Error handling middleware

@@ -14,6 +14,7 @@
     "sync-elasticsearch": "node src/utils/syncElasticsearch.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.971.0",
     "@elastic/elasticsearch": "^8.11.0",
     "amqplib": "^0.10.9",
     "bcrypt": "^5.1.1",

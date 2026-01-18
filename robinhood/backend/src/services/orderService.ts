@@ -5,6 +5,7 @@ import type { Position, Order, Execution } from '../types/index.js';
 import { logger } from '../shared/logger.js';
 import { auditLogger } from '../shared/audit.js';
 import { idempotencyService } from '../shared/idempotency.js';
+import { publishOrder, publishTrade, isProducerConnected } from '../shared/kafka.js';
 import {
   ordersPlacedTotal,
   ordersFilledTotal,
@@ -64,6 +65,7 @@ export interface OrderContext {
  * - Idempotency to prevent duplicate trades
  * - Audit logging for SEC compliance
  * - Prometheus metrics for monitoring
+ * - Kafka event publishing for distributed processing
  */
 export class OrderService {
   private executionInterval: NodeJS.Timeout | null = null;
@@ -189,6 +191,14 @@ export class OrderService {
         userAgent: context.userAgent,
         idempotencyKey: context.idempotencyKey,
       });
+
+      // Publish order event to Kafka
+      if (isProducerConnected()) {
+        await publishOrder(order, 'placed', {
+          requestId: context.requestId,
+          idempotencyKey: context.idempotencyKey,
+        });
+      }
 
       orderLogger.info({ orderId: order.id }, 'Order placed successfully');
 
@@ -379,6 +389,8 @@ export class OrderService {
       const newTotal = oldTotal + quantity * price;
       const newAvgPrice = newTotal / newFilledQty;
 
+      const newStatus = isFullyFilled ? 'filled' : 'partial';
+
       await client.query(
         `UPDATE orders
          SET filled_quantity = $1, avg_fill_price = $2, status = $3,
@@ -386,7 +398,7 @@ export class OrderService {
              submitted_at = COALESCE(submitted_at, NOW()),
              updated_at = NOW()
          WHERE id = $4`,
-        [newFilledQty, newAvgPrice, isFullyFilled ? 'filled' : 'partial', order.id]
+        [newFilledQty, newAvgPrice, newStatus, order.id]
       );
 
       // Update position
@@ -440,7 +452,8 @@ export class OrderService {
         avgFillPrice: newAvgPrice,
       }, { requestId: context.requestId });
 
-      fillLogger.info({ executionId: execution.id }, `Order ${isFullyFilled ? 'filled' : 'partially filled'}`);
+      const fillStatusMsg = isFullyFilled ? 'filled' : 'partially filled';
+      fillLogger.info({ executionId: execution.id }, `Order ${fillStatusMsg}`);
 
       // Fetch updated order
       const updatedOrderResult = await pool.query<Order>(
@@ -448,10 +461,30 @@ export class OrderService {
         [order.id]
       );
 
+      const updatedOrder = updatedOrderResult.rows[0];
+
+      // Publish order fill event to Kafka
+      if (isProducerConnected()) {
+        const orderEventType = isFullyFilled ? 'filled' : 'partial';
+        await publishOrder(updatedOrder, orderEventType, {
+          executionId: execution.id,
+          price,
+          quantity,
+          requestId: context.requestId,
+        });
+
+        // Publish trade event for portfolio updates
+        await publishTrade(execution, updatedOrder, {
+          isFullyFilled,
+          avgFillPrice: newAvgPrice,
+          requestId: context.requestId,
+        });
+      }
+
       return {
-        order: updatedOrderResult.rows[0],
+        order: updatedOrder,
         execution,
-        message: `Order ${isFullyFilled ? 'filled' : 'partially filled'} at $${price.toFixed(2)}`,
+        message: `Order ${fillStatusMsg} at $${price.toFixed(2)}`,
       };
     } catch (error) {
       await client.query('ROLLBACK');
@@ -632,7 +665,17 @@ export class OrderService {
         [orderId]
       );
 
-      return updatedResult.rows[0];
+      const cancelledOrder = updatedResult.rows[0];
+
+      // Publish order cancelled event to Kafka
+      if (isProducerConnected()) {
+        await publishOrder(cancelledOrder, 'cancelled', {
+          remainingQuantity: remainingQty,
+          requestId: context.requestId,
+        });
+      }
+
+      return cancelledOrder;
     } catch (error) {
       await client.query('ROLLBACK');
       cancelLogger.error({ error }, 'Order cancellation failed');

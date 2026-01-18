@@ -8,6 +8,7 @@
  * - Prometheus metrics endpoint
  * - Structured logging with pino
  * - Audit logging for compliance
+ * - Kafka producer for event streaming
  *
  * The server provides a complete trading platform with:
  * - User authentication (session-based)
@@ -15,6 +16,7 @@
  * - Order placement and execution with idempotency
  * - Portfolio tracking with P&L calculations
  * - Watchlists and price alerts
+ * - Event streaming via Kafka
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -30,6 +32,7 @@ import { priceAlertService } from './services/watchlistService.js';
 import { WebSocketHandler } from './websocket.js';
 import { logger } from './shared/logger.js';
 import { auditLogger } from './shared/audit.js';
+import { initKafkaProducer, disconnectKafkaProducer, isProducerConnected } from './shared/kafka.js';
 import {
   registry,
   httpRequestsTotal,
@@ -100,11 +103,13 @@ app.use((req: Request, res: Response, next: NextFunction) => {
  * - status: 'healthy' or 'unhealthy'
  * - database: connection status
  * - redis: connection status
+ * - kafka: producer connection status
  * - services: status of background services
  */
 app.get('/health', async (_req: Request, res: Response) => {
   const dbHealthy = await testDatabaseConnection();
   const redisHealthy = await testRedisConnection();
+  const kafkaConnected = isProducerConnected();
 
   const status = dbHealthy && redisHealthy ? 'healthy' : 'unhealthy';
 
@@ -118,6 +123,9 @@ app.get('/health', async (_req: Request, res: Response) => {
       },
       redis: {
         status: redisHealthy ? 'connected' : 'disconnected',
+      },
+      kafka: {
+        status: kafkaConnected ? 'connected' : 'disconnected',
       },
       services: {
         quoteService: 'running',
@@ -234,6 +242,17 @@ async function startServer(): Promise<void> {
     logger.error('Run: docker-compose up -d');
   }
 
+  // Initialize Kafka producer
+  let kafkaConnected = false;
+  try {
+    await initKafkaProducer();
+    kafkaConnected = true;
+    logger.info('Kafka producer initialized');
+  } catch (error) {
+    logger.warn({ error }, 'Failed to connect to Kafka - event streaming disabled');
+    logger.warn('Run: docker-compose up -d kafka zookeeper');
+  }
+
   // Initialize audit logger
   try {
     await auditLogger.initialize();
@@ -262,37 +281,40 @@ async function startServer(): Promise<void> {
       port: config.port,
       database: dbConnected ? 'connected' : 'disconnected',
       redis: redisConnected ? 'connected' : 'disconnected',
+      kafka: kafkaConnected ? 'connected' : 'disconnected',
     }, 'Server started');
 
-    console.log(`
-╔════════════════════════════════════════════════════════════════╗
-║                  Robinhood Trading Platform                     ║
-╠════════════════════════════════════════════════════════════════╣
-║  HTTP Server:     http://localhost:${config.port}                      ║
-║  WebSocket:       ws://localhost:${config.port}/ws                     ║
-║  Metrics:         http://localhost:${config.port}/metrics              ║
-║  Health:          http://localhost:${config.port}/health               ║
-║  Database:        ${dbConnected ? 'Connected' : 'Disconnected'}                                     ║
-║  Redis:           ${redisConnected ? 'Connected' : 'Disconnected'}                                     ║
-╠════════════════════════════════════════════════════════════════╣
-║  Demo Credentials:                                              ║
-║    Email:    demo@example.com                                   ║
-║    Password: password                                           ║
-╠════════════════════════════════════════════════════════════════╣
-║  Features:                                                      ║
-║    - Idempotent order placement (X-Idempotency-Key header)     ║
-║    - Audit logging for compliance                               ║
-║    - Prometheus metrics                                         ║
-║    - Structured JSON logging                                    ║
-╚════════════════════════════════════════════════════════════════╝
-    `);
+    console.log('\n' +
+      '================================================================\n' +
+      '                  Robinhood Trading Platform                     \n' +
+      '================================================================\n' +
+      '  HTTP Server:     http://localhost:' + config.port + '\n' +
+      '  WebSocket:       ws://localhost:' + config.port + '/ws\n' +
+      '  Metrics:         http://localhost:' + config.port + '/metrics\n' +
+      '  Health:          http://localhost:' + config.port + '/health\n' +
+      '  Database:        ' + (dbConnected ? 'Connected' : 'Disconnected') + '\n' +
+      '  Redis:           ' + (redisConnected ? 'Connected' : 'Disconnected') + '\n' +
+      '  Kafka:           ' + (kafkaConnected ? 'Connected' : 'Disconnected') + '\n' +
+      '----------------------------------------------------------------\n' +
+      '  Demo Credentials:\n' +
+      '    Email:    demo@example.com\n' +
+      '    Password: password\n' +
+      '----------------------------------------------------------------\n' +
+      '  Features:\n' +
+      '    - Idempotent order placement (X-Idempotency-Key header)\n' +
+      '    - Audit logging for compliance\n' +
+      '    - Prometheus metrics\n' +
+      '    - Structured JSON logging\n' +
+      '    - Kafka event streaming (quotes, orders, trades)\n' +
+      '================================================================\n'
+    );
   });
 }
 
 // Handle graceful shutdown
 function gracefulShutdown(signal: string): void {
   logger.info({ signal }, 'Shutdown signal received');
-  console.log(`${signal} received. Shutting down gracefully...`);
+  console.log(signal + ' received. Shutting down gracefully...');
 
   quoteService.stop();
   orderService.stopLimitOrderMatcher();
@@ -301,13 +323,16 @@ function gracefulShutdown(signal: string): void {
   server.close(() => {
     logger.info('HTTP server closed');
 
-    // Close database and redis connections
-    pool.end().then(() => {
-      logger.info('Database pool closed');
-      redis.quit().then(() => {
-        logger.info('Redis connection closed');
-        process.exit(0);
-      });
+    // Close database, redis, and kafka connections
+    Promise.all([
+      pool.end().then(() => logger.info('Database pool closed')),
+      redis.quit().then(() => logger.info('Redis connection closed')),
+      disconnectKafkaProducer().then(() => logger.info('Kafka producer disconnected')),
+    ]).then(() => {
+      process.exit(0);
+    }).catch((error) => {
+      logger.error({ error }, 'Error during shutdown');
+      process.exit(1);
     });
   });
 

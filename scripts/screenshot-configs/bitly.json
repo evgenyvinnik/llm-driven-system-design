@@ -35,7 +35,7 @@
     {
       "name": "03-dashboard-with-urls",
       "path": "/dashboard",
-      "waitFor": ".space-y-3, h2",
+      "waitFor": "h1:has-text('Dashboard')",
       "delay": 2000
     },
     {

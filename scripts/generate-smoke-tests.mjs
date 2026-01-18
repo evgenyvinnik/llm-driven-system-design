@@ -140,7 +140,7 @@ function generateSmokeTests(config) {
   for (const screen of config.screens || []) {
     const testName = screen.name.replace(/-/g, ' ');
     const needsAuth = config.auth?.enabled && !screen.skipAuth;
-    const waitForSelector = screen.waitFor?.split(',')[0]?.trim() || 'main';
+    const waitForSelector = (screen.waitFor?.split(',')[0]?.trim() || 'main').replace(/'/g, "\\'");
 
     lines.push('');
     lines.push(`  test('${testName} loads correctly', async ({ page }) => {`);
