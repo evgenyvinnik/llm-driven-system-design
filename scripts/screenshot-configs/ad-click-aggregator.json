@@ -2,6 +2,8 @@
   "name": "ad-click-aggregator",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbUser": "adclick",
+  "dbName": "adclick_aggregator",
   "auth": {
     "enabled": false
   },
