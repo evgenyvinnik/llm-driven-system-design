@@ -149,6 +149,43 @@ function isDockerRunning() {
 }
 
 /**
+ * Kill any process using a specific port
+ */
+function killProcessOnPort(port) {
+  try {
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      // Find process ID using the port
+      const result = execSync(`lsof -ti:${port}`, { encoding: 'utf-8' }).trim();
+      if (result) {
+        const pids = result.split('\n');
+        pids.forEach(pid => {
+          try {
+            execSync(`kill -9 ${pid}`, { stdio: 'pipe' });
+          } catch {}
+        });
+        logSuccess(`Killed process on port ${port}`);
+      }
+    } else if (process.platform === 'win32') {
+      const result = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf-8' });
+      const lines = result.split('\n');
+      const pids = new Set();
+      lines.forEach(line => {
+        const match = line.match(/\s+(\d+)\s*$/);
+        if (match) pids.add(match[1]);
+      });
+      pids.forEach(pid => {
+        try {
+          execSync(`taskkill /F /PID ${pid}`, { stdio: 'pipe' });
+        } catch {}
+      });
+      logSuccess(`Killed process on port ${port}`);
+    }
+  } catch (error) {
+    // No process found on port, which is fine
+  }
+}
+
+/**
  * Stop docker-compose services
  */
 async function stopDockerCompose(projectDir, projectName) {
@@ -206,7 +243,8 @@ async function startDockerCompose(projectDir, projectName) {
 }
 
 /**
- * Setup database (run init.sql and seed.sql if they exist)
+ * Setup database (run seed.sql if it exists)
+ * Note: init.sql is automatically run by PostgreSQL on first startup via docker-entrypoint-initdb.d
  */
 async function setupDatabase(projectDir, projectName, config) {
   if (!config.backendRequired) {
@@ -214,42 +252,58 @@ async function setupDatabase(projectDir, projectName, config) {
   }
 
   const backendDir = path.join(projectDir, 'backend');
-  const initSqlPath = path.join(backendDir, 'init.sql');
   const seedSqlPath = path.join(backendDir, 'seed.sql');
 
-  if (!fs.existsSync(initSqlPath)) {
-    return true; // No database setup needed
+  if (!fs.existsSync(seedSqlPath)) {
+    return true; // No seeding needed
   }
 
-  logStep('DATABASE', 'Initializing database...');
+  // Get database name from config or use project name
+  const dbName = config.dbName || projectName.replace(/-/g, '_');
+  const dbUser = config.dbUser || projectName.replace(/-/g, '_');
 
-  try {
-    // Get database connection details from docker-compose.yml or use defaults
-    const dbName = 'bitly_db';
-    const dbUser = 'bitly';
+  // Wait for PostgreSQL to be ready with retries
+  logStep('DATABASE', 'Waiting for database to be ready...');
+  let dbReady = false;
+  for (let i = 0; i < 15; i++) {
+    try {
+      execSync(`docker-compose exec -T postgres pg_isready -U ${dbUser}`, {
+        cwd: projectDir,
+        stdio: 'pipe',
+      });
+      dbReady = true;
+      break;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
 
-    // Run init.sql
-    execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/init.sql`, {
-      cwd: projectDir,
-      stdio: 'pipe',
-    });
-    logSuccess('Database initialized');
+  if (!dbReady) {
+    logWarning('Database not ready after 15 seconds');
+    return false;
+  }
 
-    // Run seed.sql if exists
-    if (fs.existsSync(seedSqlPath)) {
-      logStep('DATABASE', 'Seeding database...');
+  logStep('DATABASE', 'Seeding database...');
+
+  // Retry seeding a few times (in case database just became ready)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
       execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/seed.sql`, {
         cwd: projectDir,
         stdio: 'pipe',
       });
       logSuccess('Database seeded');
+      return true;
+    } catch (error) {
+      if (attempt === 3) {
+        logWarning(`Database seeding failed after ${attempt} attempts: ${error.message}`);
+        return false;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-
-    return true;
-  } catch (error) {
-    logWarning(`Database setup failed: ${error.message}`);
-    return false;
   }
+
+  return false;
 }
 
 /**
@@ -599,19 +653,26 @@ async function processProject(config) {
 
   // Auto-start mode
   if (shouldStart) {
-    // Step 1: Stop any existing docker containers (clean slate)
+    // Step 1: Kill any processes on frontend/backend ports (clean slate)
+    logStep('CLEANUP', 'Killing processes on ports...');
+    killProcessOnPort(config.frontendPort);
+    if (config.backendRequired && config.backendPort) {
+      killProcessOnPort(config.backendPort);
+    }
+
+    // Step 2: Stop any existing docker containers (clean slate)
     await stopDockerCompose(projectDir, config.name);
 
-    // Step 2: Start docker-compose services
+    // Step 3: Start docker-compose services
     await startDockerCompose(projectDir, config.name);
 
-    // Step 3: Setup database (init.sql + seed.sql)
+    // Step 4: Setup database (seed.sql)
     const dbSetup = await setupDatabase(projectDir, config.name, config);
     if (!dbSetup && config.backendRequired) {
       logWarning('Database setup failed, continuing anyway...');
     }
 
-    // Step 4: Start backend if required
+    // Step 5: Start backend if required
     if (config.backendRequired) {
       backendProcess = await startBackend(projectDir, config);
       if (!backendProcess) {
@@ -620,7 +681,7 @@ async function processProject(config) {
       }
     }
 
-    // Step 5: Start frontend
+    // Step 6: Start frontend
     frontendProcess = await startFrontend(projectDir, config);
     if (!frontendProcess) {
       await stopDockerCompose(projectDir, config.name);

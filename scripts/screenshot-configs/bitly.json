@@ -3,6 +3,8 @@
   "frontendPort": 5173,
   "backendPort": 3000,
   "backendRequired": true,
+  "dbName": "bitly",
+  "dbUser": "bitly",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",
@@ -33,8 +35,8 @@
     {
       "name": "03-dashboard-with-urls",
       "path": "/dashboard",
-      "waitFor": "table, .space-y-2",
-      "delay": 1500
+      "waitFor": ".space-y-3, h2",
+      "delay": 2000
     },
     {
       "name": "04-admin-overview",
