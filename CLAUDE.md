@@ -11,11 +11,9 @@ This is a **system design learning repository** where each subdirectory represen
 ## Quick Start for Any Project
 
 1. Read the project's `architecture.md` first to understand the design
-2. Check `claude.md` (lowercase) for iteration history and key decisions (this is the primary source of truth for project-specific guidance)
+2. Check `CLAUDE.md` for iteration history and key decisions (this is the primary source of truth for project-specific guidance)
 3. Look at `README.md` for setup instructions
 4. Check `package.json` to find available scripts
-
-**Note:** Project-level files use lowercase `claude.md` to distinguish from the repository-wide `CLAUDE.md`.
 
 ## Project Structure
 
@@ -25,7 +23,7 @@ Each project folder typically contains:
 ├── README.md                  # Setup instructions and implementation guide
 ├── architecture.md            # System design documentation and trade-offs
 ├── system-design-answer.md    # Interview-style answer (45-minute format)
-├── claude.md                  # LLM collaboration notes and iteration history
+├── CLAUDE.md                  # LLM collaboration notes and iteration history
 ├── frontend/                  # React + TypeScript frontend (when applicable)
 ├── backend/                   # Node.js + Express backend (when applicable)
 ├── training/                  # ML training code (Python, when applicable)
