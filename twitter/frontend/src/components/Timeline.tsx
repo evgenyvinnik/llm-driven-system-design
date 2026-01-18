@@ -1,17 +1,46 @@
+/**
+ * Timeline component for displaying tweets with infinite scroll.
+ * Uses TanStack Virtual for efficient rendering of large tweet lists,
+ * only rendering items visible in the viewport.
+ *
+ * Features:
+ * - Virtualized list for performance with thousands of tweets
+ * - Dynamic height measurement for variable tweet sizes
+ * - Infinite scroll with automatic load-more triggering
+ * - Loading, error, and empty state handling
+ *
+ * @module components/Timeline
+ */
 import { useRef, useEffect, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Tweet } from './Tweet';
 import { Tweet as TweetType } from '../types';
 
+/**
+ * Props for the Timeline component.
+ */
 interface TimelineProps {
+  /** Array of tweet objects to display */
   tweets: TweetType[];
+  /** Whether tweets are currently being fetched */
   isLoading: boolean;
+  /** Error message if tweet fetch failed, null if no error */
   error: string | null;
+  /** Callback to fetch more tweets when scrolling near bottom */
   onLoadMore?: () => void;
+  /** Whether more tweets are available to load */
   hasMore?: boolean;
+  /** Message to display when no tweets match the filter */
   emptyMessage?: string;
 }
 
+/**
+ * Virtualized timeline component for efficient tweet rendering.
+ * Automatically loads more tweets when the user scrolls near the bottom.
+ *
+ * @param props - TimelineProps with tweets data and handlers
+ * @returns Scrollable virtualized tweet timeline
+ */
 export function Timeline({
   tweets,
   isLoading,

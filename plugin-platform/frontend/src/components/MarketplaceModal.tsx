@@ -1,12 +1,37 @@
+/**
+ * MarketplaceModal component - Plugin marketplace browser and installer.
+ * Provides a searchable, filterable interface for discovering and managing plugins.
+ *
+ * Features:
+ * - Category-based filtering
+ * - Search with debounced queries
+ * - Plugin detail view with version history
+ * - Install/uninstall actions
+ *
+ * @module components/MarketplaceModal
+ */
 import React, { useState, useEffect } from 'react';
 import { pluginsApi, type Plugin, type PluginDetails } from '../services/api';
 import { useAuthStore } from '../stores/auth';
 
+/**
+ * Props for the MarketplaceModal component.
+ */
 interface MarketplaceModalProps {
+  /** Whether the modal is currently open */
   isOpen: boolean;
+  /** Callback to close the modal */
   onClose: () => void;
 }
 
+/**
+ * Main marketplace modal component.
+ * Displays a browsable list of available plugins with search and filtering.
+ * Allows viewing plugin details and installing/uninstalling plugins.
+ *
+ * @param props - MarketplaceModalProps with modal state and close handler
+ * @returns Modal dialog or null when closed
+ */
 export function MarketplaceModal({ isOpen, onClose }: MarketplaceModalProps): React.ReactElement | null {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [selectedPlugin, setSelectedPlugin] = useState<PluginDetails | null>(null);
@@ -223,19 +248,37 @@ export function MarketplaceModal({ isOpen, onClose }: MarketplaceModalProps): Re
   );
 }
 
+/**
+ * Props for the PluginCard component.
+ */
+interface PluginCardProps {
+  /** Plugin data to display */
+  plugin: Plugin;
+  /** Whether this plugin is currently installed */
+  isInstalled: boolean;
+  /** Click handler to view plugin details */
+  onClick: () => void;
+  /** Install button click handler */
+  onInstall: (e: React.MouseEvent) => void;
+  /** Uninstall button click handler */
+  onUninstall: (e: React.MouseEvent) => void;
+}
+
+/**
+ * Card component displaying a plugin in the marketplace list.
+ * Shows plugin name, description, author, install count, and rating.
+ * Includes install/uninstall button based on current state.
+ *
+ * @param props - PluginCardProps with plugin data and handlers
+ * @returns Plugin card element
+ */
 function PluginCard({
   plugin,
   isInstalled,
   onClick,
   onInstall,
   onUninstall,
-}: {
-  plugin: Plugin;
-  isInstalled: boolean;
-  onClick: () => void;
-  onInstall: (e: React.MouseEvent) => void;
-  onUninstall: (e: React.MouseEvent) => void;
-}): React.ReactElement {
+}: PluginCardProps): React.ReactElement {
   return (
     <div
       onClick={onClick}
@@ -283,19 +326,37 @@ function PluginCard({
   );
 }
 
+/**
+ * Props for the PluginDetailView component.
+ */
+interface PluginDetailViewProps {
+  /** Detailed plugin information */
+  plugin: PluginDetails;
+  /** Whether this plugin is currently installed */
+  isInstalled: boolean;
+  /** Install handler */
+  onInstall: () => void;
+  /** Uninstall handler */
+  onUninstall: () => void;
+  /** Whether an action is in progress */
+  isLoading: boolean;
+}
+
+/**
+ * Detailed view of a single plugin.
+ * Shows full plugin information including version history,
+ * install count, rating, license, and author details.
+ *
+ * @param props - PluginDetailViewProps with plugin data and handlers
+ * @returns Plugin detail view element
+ */
 function PluginDetailView({
   plugin,
   isInstalled,
   onInstall,
   onUninstall,
   isLoading,
-}: {
-  plugin: PluginDetails;
-  isInstalled: boolean;
-  onInstall: () => void;
-  onUninstall: () => void;
-  isLoading: boolean;
-}): React.ReactElement {
+}: PluginDetailViewProps): React.ReactElement {
   return (
     <div className="flex-1 p-6 overflow-y-auto">
       <div className="flex items-start justify-between mb-6">
@@ -395,7 +456,14 @@ function PluginDetailView({
   );
 }
 
-// Icons
+// ============================================================================
+// Icon Components
+// ============================================================================
+
+/**
+ * Close (X) icon for modal dismiss button.
+ * @returns SVG close icon element
+ */
 function CloseIcon(): React.ReactElement {
   return (
     <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -404,6 +472,10 @@ function CloseIcon(): React.ReactElement {
   );
 }
 
+/**
+ * Chevron left icon for back navigation.
+ * @returns SVG chevron left icon element
+ */
 function ChevronLeftIcon(): React.ReactElement {
   return (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -412,6 +484,10 @@ function ChevronLeftIcon(): React.ReactElement {
   );
 }
 
+/**
+ * Star icon for displaying plugin ratings.
+ * @returns SVG star icon element with yellow fill
+ */
 function StarIcon(): React.ReactElement {
   return (
     <svg className="w-4 h-4 text-yellow-400" fill="currentColor" viewBox="0 0 20 20">

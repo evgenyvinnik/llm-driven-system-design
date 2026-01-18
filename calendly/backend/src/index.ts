@@ -31,7 +31,7 @@ import RedisStore from 'connect-redis';
  */
 const app = express();
 
-/** Server port from environment or default to 3001 */
+/** Server port from environment or default to 3000 */
 const PORT = APP_CONFIG.PORT;
 
 // ============================================================================

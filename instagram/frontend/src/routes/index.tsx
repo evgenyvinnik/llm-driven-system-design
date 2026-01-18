@@ -1,3 +1,17 @@
+/**
+ * Home page component - Instagram feed with stories and posts.
+ * Uses TanStack Virtual for efficient rendering of the post feed,
+ * only rendering items visible in the viewport.
+ *
+ * Features:
+ * - Story tray at top with user stories
+ * - Virtualized feed for performance with large post counts
+ * - Dynamic height measurement for variable post sizes (images, captions)
+ * - Infinite scroll with automatic load-more triggering
+ * - Loading skeleton states
+ *
+ * @module routes/index
+ */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createFileRoute, Navigate } from '@tanstack/react-router';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -11,6 +25,12 @@ export const Route = createFileRoute('/')({
   component: HomePage,
 });
 
+/**
+ * Main home page component displaying the Instagram feed.
+ * Shows stories tray and virtualized post feed with infinite scroll.
+ *
+ * @returns Home page with stories and feed
+ */
 function HomePage() {
   const { isAuthenticated, isLoading } = useAuthStore();
   const [posts, setPosts] = useState<Post[]>([]);

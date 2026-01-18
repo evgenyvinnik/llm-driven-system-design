@@ -218,7 +218,7 @@ export const IDEMPOTENCY_CONFIG = {
  * General application configuration.
  */
 export const APP_CONFIG = {
-  PORT: parseInt(process.env.PORT || '3001'),
+  PORT: parseInt(process.env.PORT || '3000'),
   NODE_ENV: process.env.NODE_ENV || 'development',
   FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:5173',
   SESSION_SECRET: process.env.SESSION_SECRET || 'calendly-secret-key-change-in-production',
