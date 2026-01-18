@@ -2,6 +2,8 @@
   "name": "tinder",
   "frontendPort": 5173,
   "backendRequired": true,
+  "dbName": "tinder_db",
+  "dbUser": "tinder",
   "auth": {
     "enabled": true,
     "loginUrl": "/login",
