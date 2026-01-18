@@ -141,15 +141,16 @@ function isDockerRunning() {
 
 /**
  * Start docker-compose services
+ * @returns {boolean} true if docker was started by this function
  */
 async function startDockerCompose(projectDir, projectName) {
   if (!hasDockerCompose(projectDir)) {
-    return true;
+    return false;
   }
 
   if (!isDockerRunning()) {
     logWarning('Docker is not running, skipping docker-compose');
-    return true;
+    return false;
   }
 
   logStep('DOCKER', `Starting infrastructure for ${projectName}...`);
@@ -160,37 +161,133 @@ async function startDockerCompose(projectDir, projectName) {
       stdio: 'pipe',
     });
     logSuccess('Docker services started');
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Wait for services to be healthy
+    await new Promise(resolve => setTimeout(resolve, 5000));
     return true;
   } catch (error) {
     logWarning(`Docker-compose failed: ${error.message}`);
-    return true;
+    return false;
+  }
+}
+
+/**
+ * Stop docker-compose services
+ */
+function stopDockerCompose(projectDir, projectName) {
+  if (!hasDockerCompose(projectDir)) {
+    return;
+  }
+
+  if (!isDockerRunning()) {
+    return;
+  }
+
+  logStep('DOCKER', `Stopping infrastructure for ${projectName}...`);
+
+  try {
+    execSync('docker-compose down', {
+      cwd: projectDir,
+      stdio: 'pipe',
+    });
+    logSuccess('Docker services stopped');
+  } catch (error) {
+    logWarning(`Docker-compose stop failed: ${error.message}`);
   }
 }
 
 /**
  * Install frontend dependencies if needed
  */
-async function installFrontendDeps(frontendDir) {
-  const nodeModulesPath = path.join(frontendDir, 'node_modules');
+async function installDeps(dir, name = 'frontend') {
+  const nodeModulesPath = path.join(dir, 'node_modules');
 
   if (fs.existsSync(nodeModulesPath)) {
     return true;
   }
 
-  logStep('NPM', 'Installing frontend dependencies...');
+  logStep('NPM', `Installing ${name} dependencies...`);
 
   try {
     execSync('npm install', {
-      cwd: frontendDir,
+      cwd: dir,
       stdio: 'pipe',
     });
-    logSuccess('Dependencies installed');
+    logSuccess(`${name} dependencies installed`);
     return true;
   } catch (error) {
-    logError(`npm install failed: ${error.message}`);
+    logError(`npm install failed for ${name}: ${error.message}`);
     return false;
   }
+}
+
+/**
+ * Start the backend dev server
+ */
+async function startBackend(projectDir, config) {
+  const backendDir = path.join(projectDir, 'backend');
+
+  if (!fs.existsSync(backendDir)) {
+    logWarning(`Backend directory not found: ${backendDir}`);
+    return null;
+  }
+
+  const depsInstalled = await installDeps(backendDir, 'backend');
+  if (!depsInstalled) {
+    return null;
+  }
+
+  // Run migrations if db:migrate script exists
+  const pkgJsonPath = path.join(backendDir, 'package.json');
+  if (fs.existsSync(pkgJsonPath)) {
+    const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+    if (pkgJson.scripts?.['db:migrate']) {
+      logStep('DB', 'Running database migrations...');
+      try {
+        execSync('npm run db:migrate', {
+          cwd: backendDir,
+          stdio: 'pipe',
+        });
+        logSuccess('Migrations complete');
+      } catch (error) {
+        logWarning(`Migration failed: ${error.message}`);
+      }
+    }
+  }
+
+  logStep('START', 'Starting backend...');
+
+  const child = spawn('npm', ['run', 'dev'], {
+    cwd: backendDir,
+    stdio: 'pipe',
+    detached: false,
+    env: { ...process.env, FORCE_COLOR: '0' },
+  });
+
+  spawnedProcesses.push({ process: child, name: `${config.name} backend` });
+
+  child.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg && !msg.includes('ExperimentalWarning') && msg.toLowerCase().includes('error')) {
+      logWarning(`Backend stderr: ${msg}`);
+    }
+  });
+
+  // Wait for backend to be ready (check port 3000)
+  const backendPort = config.backendPort || 3000;
+  const backendUrl = `http://localhost:${backendPort}`;
+  const startTime = Date.now();
+  const maxWait = 30000;
+
+  while (Date.now() - startTime < maxWait) {
+    if (await isUrlReachable(backendUrl)) {
+      logSuccess(`Backend ready on port ${backendPort}`);
+      return child;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  logWarning('Backend may not be fully ready, continuing anyway...');
+  return child;
 }
 
 /**
@@ -289,6 +386,11 @@ async function captureWithPlaywright(config, outputDir) {
     browser = await chromium.launch({
       headless: true,
       channel: 'chrome',
+      args: [
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+      ],
     });
   } catch (error) {
     logError(`Failed to launch browser: ${error.message}`);
