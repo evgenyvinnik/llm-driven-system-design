@@ -2,14 +2,23 @@ import queue, { QUEUES } from './shared/services/queue.js';
 import db from './shared/services/database.js';
 import config from './shared/config/index.js';
 
-const workerId = process.env.WORKER_ID || 'audit-1';
+interface AuditEvent {
+  id: string;
+  action: string;
+  userId?: string | number;
+  details: Record<string, unknown>;
+  timestamp: string;
+  instanceId?: string;
+}
+
+const workerId = process.env['WORKER_ID'] || 'audit-1';
 
 console.log(`Audit Worker [${workerId}] starting...`);
 
 /**
  * Store audit event in database
  */
-async function storeAuditEvent(event) {
+async function storeAuditEvent(event: AuditEvent) {
   const { id, action, userId, details, timestamp, instanceId } = event;
 
   await db.query(
@@ -22,7 +31,7 @@ async function storeAuditEvent(event) {
 /**
  * Handle incoming audit event
  */
-async function handleAuditEvent(event) {
+async function handleAuditEvent(event: AuditEvent) {
   const { id, action, userId, details } = event;
 
   console.log(`[${workerId}] Processing audit event: ${action} (user: ${userId || 'system'})`);
@@ -41,7 +50,7 @@ async function handleAuditEvent(event) {
     // Additional processing based on action type
     await processSecurityAlerts(event);
   } catch (error) {
-    console.error(`[${workerId}] Failed to process audit event ${id}:`, error.message);
+    console.error(`[${workerId}] Failed to process audit event ${id}:`, (error as Error).message);
     throw error; // Will trigger requeue
   }
 }
@@ -49,7 +58,7 @@ async function handleAuditEvent(event) {
 /**
  * Process security-related audit events for alerting
  */
-async function processSecurityAlerts(event) {
+async function processSecurityAlerts(event: AuditEvent) {
   const { action, userId, details } = event;
 
   // Security-critical events that might need alerting
@@ -82,7 +91,7 @@ async function processSecurityAlerts(event) {
 /**
  * Track failed logins for security monitoring
  */
-async function trackFailedLogin(ip, _attemptedUser) {
+async function trackFailedLogin(ip: string, _attemptedUser: string | number | undefined) {
   try {
     // Count recent failed attempts from this IP
     const result = await db.query(
@@ -101,7 +110,7 @@ async function trackFailedLogin(ip, _attemptedUser) {
     }
   } catch (error) {
     // Don't fail the main audit logging if this check fails
-    console.warn(`[${workerId}] Failed to track login attempt:`, error.message);
+    console.warn(`[${workerId}] Failed to track login attempt:`, (error as Error).message);
   }
 }
 
@@ -127,7 +136,7 @@ async function start() {
     console.log(`Audit Worker [${workerId}] is now consuming from ${QUEUES.AUDIT_LOG}`);
     console.log(`Environment: ${config.env}`);
   } catch (error) {
-    console.error(`[${workerId}] Failed to start:`, error.message);
+    console.error(`[${workerId}] Failed to start:`, (error as Error).message);
     process.exit(1);
   }
 }

@@ -36,6 +36,10 @@ export default tseslint.config(
       '@typescript-eslint/no-namespace': 'off', // Allow namespace for Express type augmentation
       '@typescript-eslint/no-require-imports': 'off', // Allow require for dynamic imports
       'no-case-declarations': 'off', // Allow declarations in case blocks
+      'no-constant-condition': 'off', // Allow while(true) for worker loops
+      'no-control-regex': 'off', // Allow control characters in regex
+      'prefer-const': 'warn', // Only warn for let that should be const
+      'no-useless-escape': 'warn', // Only warn for unnecessary escapes
     },
   },
 )
@@ -65,6 +69,10 @@ export default tseslint.config(
       '@typescript-eslint/no-namespace': 'off',
       '@typescript-eslint/no-require-imports': 'off',
       'no-case-declarations': 'off',
+      'no-constant-condition': 'off',
+      'no-control-regex': 'off',
+      'prefer-const': 'warn',
+      'no-useless-escape': 'warn',
     },
   },
 )

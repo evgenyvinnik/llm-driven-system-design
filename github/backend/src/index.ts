@@ -53,7 +53,7 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // Request logging and metrics
-app.use(requestLoggerMiddleware);
+app.use(requestLoggerMiddleware as unknown as (req: Request, res: Response, next: NextFunction) => void);
 app.use(metricsMiddleware);
 app.use(authMiddleware);
 
@@ -142,9 +142,10 @@ app.get('/api/admin/circuit-breakers', requireAuth, requireAdmin, (_req: Request
 });
 
 app.post('/api/admin/circuit-breakers/:name/reset', requireAuth, requireAdmin, (req: Request, res: Response): void => {
-  const success = resetCircuitBreaker(req.params.name);
+  const name = req.params.name as string;
+  const success = resetCircuitBreaker(name);
   if (success) {
-    res.json({ success: true, message: `Circuit breaker ${req.params.name} reset` });
+    res.json({ success: true, message: `Circuit breaker ${name} reset` });
   } else {
     res.status(404).json({ error: 'Circuit breaker not found' });
   }

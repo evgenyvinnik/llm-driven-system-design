@@ -1,4 +1,4 @@
-import express, { Request, Response, _NextFunction } from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import config from '../../shared/config/index.js';
@@ -15,7 +15,7 @@ import { metricsService } from '../../shared/services/metrics.js';
 import { circuitBreakerRegistry } from '../../shared/services/circuit-breaker.js';
 import { CacheService } from '../../shared/services/cache.js';
 import db from '../../shared/services/database.js';
-import type { AuthenticatedRequest, _RateLimitResult } from '../../shared/types.js';
+import type { AuthenticatedRequest } from '../../shared/types.js';
 
 const app = express();
 const rateLimiter = new RateLimiter();
