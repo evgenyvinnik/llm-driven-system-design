@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { query, transaction } from '../db.js';
 import { authenticate, requireHost, optionalAuth } from '../middleware/auth.js';
 import { getCachedListing, invalidateListingCache, getCachedAvailability, invalidateAvailabilityCache, CACHE_TTL } from '../shared/cache.js';
@@ -12,6 +12,30 @@ import fs from 'fs';
 
 const router = Router();
 const log = createModuleLogger('listings');
+
+// Type definitions
+interface ListingRow {
+  id: number;
+  host_id: number;
+  title: string;
+  description?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  property_type?: string;
+  room_type?: string;
+  max_guests: number;
+  bedrooms: number;
+  beds: number;
+  bathrooms: number;
+  amenities: string[];
+  price_per_night: number;
+  cleaning_fee: number;
+  instant_book: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -85,7 +109,7 @@ router.post('/', authenticate, requireHost, async (req, res) => {
         $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
       ) RETURNING *`,
       [
-        req.user.id, title, description, longitude, latitude, address_line1,
+        req.user!.id, title, description, longitude, latitude, address_line1,
         address_line2, city, state, country, postal_code, property_type,
         room_type, max_guests, bedrooms, beds, bathrooms, amenities || [],
         house_rules, price_per_night, cleaning_fee || 0, instant_book || false,
@@ -93,12 +117,12 @@ router.post('/', authenticate, requireHost, async (req, res) => {
       ]
     );
 
-    const listing = result.rows[0];
+    const listing = result.rows[0] as ListingRow;
 
     // Audit log
     await auditListing(AUDIT_EVENTS.LISTING_CREATED, listing, req);
 
-    log.info({ listingId: listing.id, hostId: req.user.id }, 'Listing created');
+    log.info({ listingId: listing.id, hostId: req.user!.id }, 'Listing created');
 
     res.status(201).json({ listing });
   } catch (error) {
@@ -129,7 +153,7 @@ router.get('/', optionalAuth, async (req, res) => {
       sql += ` AND l.host_id = $${params.length}`;
     }
 
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(parseInt(String(limit)), parseInt(String(offset)));
     sql += ` ORDER BY l.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
     const result = await query(sql, params);

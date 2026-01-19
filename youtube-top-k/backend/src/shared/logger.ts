@@ -80,10 +80,11 @@ export function requestLogger(
   );
 
   // Override res.end to log response
-  const originalEnd = res.end.bind(res);
-  res.end = function (
-    this: Response,
-    ...args: Parameters<Response['end']>
+  const originalEnd = res.end.bind(res) as typeof res.end;
+  (res.end as unknown) = function (
+    chunk?: unknown,
+    encodingOrCallback?: BufferEncoding | (() => void),
+    callback?: () => void
   ): Response {
     const duration = Date.now() - startTime;
 
@@ -98,7 +99,10 @@ export function requestLogger(
       `${req.method} ${req.path} ${res.statusCode} ${duration}ms`
     );
 
-    return originalEnd(...args);
+    if (typeof encodingOrCallback === 'function') {
+      return originalEnd(chunk, encodingOrCallback);
+    }
+    return originalEnd(chunk, encodingOrCallback, callback);
   };
 
   next();

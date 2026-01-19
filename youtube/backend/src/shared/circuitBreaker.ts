@@ -22,43 +22,28 @@ const STATE = {
   CLOSED: 0,
   OPEN: 1,
   HALF_OPEN: 2,
-} as const;
+};
 
 // Default circuit breaker options
-const DEFAULT_OPTIONS: CircuitBreaker.Options = {
-  timeout: 10000, // 10s - time to wait for response
+const DEFAULT_OPTIONS = {
+  timeout: 10000,           // 10s - time to wait for response
   errorThresholdPercentage: 50, // Open circuit if 50% of requests fail
-  resetTimeout: 30000, // 30s - time before trying again
-  volumeThreshold: 5, // Minimum requests before tripping
+  resetTimeout: 30000,      // 30s - time before trying again
+  volumeThreshold: 5,       // Minimum requests before tripping
 };
 
 // Store all circuit breakers for health checks
-const circuitBreakers = new Map<string, CircuitBreaker>();
-
-export interface CircuitBreakerHealth {
-  state: 'open' | 'half-open' | 'closed';
-  stats: {
-    successes: number;
-    failures: number;
-    timeouts: number;
-    rejects: number;
-    fallbacks: number;
-  };
-}
+const circuitBreakers = new Map();
 
 /**
  * Create a circuit breaker for a service
  *
- * @param name - Service name (e.g., 'storage', 'transcoding')
- * @param fn - Async function to wrap
- * @param options - Circuit breaker options
- * @returns Configured circuit breaker
+ * @param {string} name - Service name (e.g., 'storage', 'transcoding')
+ * @param {Function} fn - Async function to wrap
+ * @param {object} options - Circuit breaker options
+ * @returns {CircuitBreaker} Configured circuit breaker
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
-  name: string,
-  fn: T,
-  options: Partial<CircuitBreaker.Options> = {}
-): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> {
+export function createCircuitBreaker(name, fn, options = {}) {
   const breaker = new CircuitBreaker(fn, {
     ...DEFAULT_OPTIONS,
     ...options,
@@ -66,36 +51,27 @@ export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<u
   });
 
   // Event handlers for monitoring
-  breaker.on('success', (result: unknown, latencyMs: number) => {
-    logger.debug(
-      {
-        event: 'circuit_breaker_success',
-        service: name,
-        latencyMs,
-      },
-      `Circuit breaker ${name}: success`
-    );
+  breaker.on('success', (result, latencyMs) => {
+    logger.debug({
+      event: 'circuit_breaker_success',
+      service: name,
+      latencyMs,
+    }, `Circuit breaker ${name}: success`);
   });
 
   breaker.on('timeout', () => {
-    logger.warn(
-      {
-        event: 'circuit_breaker_timeout',
-        service: name,
-      },
-      `Circuit breaker ${name}: timeout`
-    );
+    logger.warn({
+      event: 'circuit_breaker_timeout',
+      service: name,
+    }, `Circuit breaker ${name}: timeout`);
     circuitBreakerFailuresTotal.inc({ service: name });
   });
 
   breaker.on('reject', () => {
-    logger.warn(
-      {
-        event: 'circuit_breaker_reject',
-        service: name,
-      },
-      `Circuit breaker ${name}: rejected (circuit open)`
-    );
+    logger.warn({
+      event: 'circuit_breaker_reject',
+      service: name,
+    }, `Circuit breaker ${name}: rejected (circuit open)`);
   });
 
   breaker.on('open', () => {
@@ -107,13 +83,10 @@ export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<u
   });
 
   breaker.on('halfOpen', () => {
-    logger.info(
-      {
-        event: 'circuit_breaker_half_open',
-        service: name,
-      },
-      `Circuit breaker ${name}: half-open (testing)`
-    );
+    logger.info({
+      event: 'circuit_breaker_half_open',
+      service: name,
+    }, `Circuit breaker ${name}: half-open (testing)`);
     circuitBreakerState.set({ service: name }, STATE.HALF_OPEN);
   });
 
@@ -122,26 +95,20 @@ export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<u
     circuitBreakerState.set({ service: name }, STATE.CLOSED);
   });
 
-  breaker.on('failure', (error: Error) => {
-    logger.warn(
-      {
-        event: 'circuit_breaker_failure',
-        service: name,
-        error: error.message,
-      },
-      `Circuit breaker ${name}: failure`
-    );
+  breaker.on('failure', (error) => {
+    logger.warn({
+      event: 'circuit_breaker_failure',
+      service: name,
+      error: error.message,
+    }, `Circuit breaker ${name}: failure`);
     circuitBreakerFailuresTotal.inc({ service: name });
   });
 
-  breaker.on('fallback', (result: unknown) => {
-    logger.info(
-      {
-        event: 'circuit_breaker_fallback',
-        service: name,
-      },
-      `Circuit breaker ${name}: using fallback`
-    );
+  breaker.on('fallback', (result) => {
+    logger.info({
+      event: 'circuit_breaker_fallback',
+      service: name,
+    }, `Circuit breaker ${name}: using fallback`);
   });
 
   // Initialize metrics
@@ -153,39 +120,29 @@ export function createCircuitBreaker<T extends (...args: unknown[]) => Promise<u
   return breaker;
 }
 
-export interface CircuitOpenError extends Error {
-  code: 'CIRCUIT_OPEN';
-  service: string;
-}
-
 /**
  * Create circuit-protected wrapper function
  *
- * @param name - Service name
- * @param fn - Function to wrap
- * @param fallback - Optional fallback function
- * @param options - Circuit breaker options
- * @returns Wrapped function
+ * @param {string} name - Service name
+ * @param {Function} fn - Function to wrap
+ * @param {Function} fallback - Optional fallback function
+ * @param {object} options - Circuit breaker options
+ * @returns {Function} Wrapped function
  */
-export function withCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
-  name: string,
-  fn: T,
-  fallback: ((...args: Parameters<T>) => ReturnType<T>) | null = null,
-  options: Partial<CircuitBreaker.Options> = {}
-): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
+export function withCircuitBreaker(name, fn, fallback = null, options = {}) {
   const breaker = createCircuitBreaker(name, fn, options);
 
   if (fallback) {
-    breaker.fallback(fallback as (...args: unknown[]) => unknown);
+    breaker.fallback(fallback);
   }
 
-  return async (...args: Parameters<T>): Promise<Awaited<ReturnType<T>>> => {
+  return async (...args) => {
     try {
-      return (await breaker.fire(...args)) as Awaited<ReturnType<T>>;
+      return await breaker.fire(...args);
     } catch (error) {
       // Re-throw if no fallback and circuit is open
       if (breaker.opened) {
-        const circuitError = new Error(`Service ${name} is unavailable (circuit open)`) as CircuitOpenError;
+        const circuitError = new Error(`Service ${name} is unavailable (circuit open)`);
         circuitError.code = 'CIRCUIT_OPEN';
         circuitError.service = name;
         throw circuitError;
@@ -197,10 +154,10 @@ export function withCircuitBreaker<T extends (...args: unknown[]) => Promise<unk
 
 /**
  * Get health status of all circuit breakers
- * @returns Health status
+ * @returns {object} Health status
  */
-export function getCircuitBreakerHealth(): Record<string, CircuitBreakerHealth> {
-  const health: Record<string, CircuitBreakerHealth> = {};
+export function getCircuitBreakerHealth() {
+  const health = {};
 
   for (const [name, breaker] of circuitBreakers) {
     health[name] = {
@@ -220,9 +177,9 @@ export function getCircuitBreakerHealth(): Record<string, CircuitBreakerHealth> 
 
 /**
  * Check if any circuit breaker is open
- * @returns True if any circuit is open
+ * @returns {boolean} True if any circuit is open
  */
-export function hasOpenCircuit(): boolean {
+export function hasOpenCircuit() {
   for (const [, breaker] of circuitBreakers) {
     if (breaker.opened) {
       return true;
@@ -233,10 +190,10 @@ export function hasOpenCircuit(): boolean {
 
 /**
  * Get a specific circuit breaker
- * @param name - Circuit breaker name
- * @returns CircuitBreaker or undefined
+ * @param {string} name - Circuit breaker name
+ * @returns {CircuitBreaker|undefined}
  */
-export function getCircuitBreaker(name: string): CircuitBreaker | undefined {
+export function getCircuitBreaker(name) {
   return circuitBreakers.get(name);
 }
 

@@ -1,5 +1,4 @@
-import client, { Registry, Counter, Histogram, Gauge } from 'prom-client';
-import { Request, Response, NextFunction } from 'express';
+import client from 'prom-client';
 
 /**
  * Prometheus metrics module
@@ -16,7 +15,7 @@ import { Request, Response, NextFunction } from 'express';
  */
 
 // Create a registry
-const register = new Registry();
+const register = new client.Registry();
 
 // Add default labels
 register.setDefaultLabels({
@@ -28,17 +27,17 @@ client.collectDefaultMetrics({ register });
 
 // ============ HTTP Request Metrics ============
 
-export const httpRequestsTotal: Counter<'method' | 'endpoint' | 'status_code'> = new Counter({
+export const httpRequestsTotal = new client.Counter({
   name: 'http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'endpoint', 'status_code'] as const,
+  labelNames: ['method', 'endpoint', 'status_code'],
   registers: [register],
 });
 
-export const httpRequestDuration: Histogram<'method' | 'endpoint' | 'status_code'> = new Histogram({
+export const httpRequestDuration = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'endpoint', 'status_code'] as const,
+  labelNames: ['method', 'endpoint', 'status_code'],
   buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [register],
 });
@@ -46,33 +45,33 @@ export const httpRequestDuration: Histogram<'method' | 'endpoint' | 'status_code
 // ============ Business Metrics ============
 
 // Video metrics
-export const videoViewsTotal: Counter<'video_id' | 'channel_id'> = new Counter({
+export const videoViewsTotal = new client.Counter({
   name: 'video_views_total',
   help: 'Total number of video views',
-  labelNames: ['video_id', 'channel_id'] as const,
+  labelNames: ['video_id', 'channel_id'],
   registers: [register],
 });
 
-export const videoWatchDuration: Histogram<'video_id'> = new Histogram({
+export const videoWatchDuration = new client.Histogram({
   name: 'video_watch_duration_seconds',
   help: 'Video watch duration in seconds',
-  labelNames: ['video_id'] as const,
+  labelNames: ['video_id'],
   buckets: [10, 30, 60, 120, 300, 600, 1800, 3600],
   registers: [register],
 });
 
-export const videoUploadsTotal: Counter<'status'> = new Counter({
+export const videoUploadsTotal = new client.Counter({
   name: 'video_uploads_total',
   help: 'Total number of video uploads',
-  labelNames: ['status'] as const, // success, failed
+  labelNames: ['status'], // success, failed
   registers: [register],
 });
 
-export const videoUploadSize: Histogram<string> = new Histogram({
+export const videoUploadSize = new client.Histogram({
   name: 'video_upload_size_bytes',
   help: 'Size of uploaded videos in bytes',
   buckets: [
-    1024 * 1024, // 1MB
+    1024 * 1024,      // 1MB
     10 * 1024 * 1024, // 10MB
     50 * 1024 * 1024, // 50MB
     100 * 1024 * 1024, // 100MB
@@ -83,118 +82,118 @@ export const videoUploadSize: Histogram<string> = new Histogram({
 });
 
 // Transcoding metrics
-export const transcodeQueueDepth: Gauge<string> = new Gauge({
+export const transcodeQueueDepth = new client.Gauge({
   name: 'transcode_queue_depth',
   help: 'Current number of videos in the transcoding queue',
   registers: [register],
 });
 
-export const transcodeJobDuration: Histogram<'resolution' | 'status'> = new Histogram({
+export const transcodeJobDuration = new client.Histogram({
   name: 'transcode_job_duration_seconds',
   help: 'Duration of transcoding jobs in seconds',
-  labelNames: ['resolution', 'status'] as const,
+  labelNames: ['resolution', 'status'],
   buckets: [10, 30, 60, 120, 300, 600, 1800, 3600],
   registers: [register],
 });
 
-export const transcodedVideosTotal: Counter<'status' | 'resolution'> = new Counter({
+export const transcodedVideosTotal = new client.Counter({
   name: 'transcoded_videos_total',
   help: 'Total number of transcoded videos',
-  labelNames: ['status', 'resolution'] as const,
+  labelNames: ['status', 'resolution'],
   registers: [register],
 });
 
 // Engagement metrics
-export const commentsTotal: Counter<'action'> = new Counter({
+export const commentsTotal = new client.Counter({
   name: 'comments_total',
   help: 'Total number of comments created',
-  labelNames: ['action'] as const, // created, deleted
+  labelNames: ['action'], // created, deleted
   registers: [register],
 });
 
-export const reactionsTotal: Counter<'type' | 'target'> = new Counter({
+export const reactionsTotal = new client.Counter({
   name: 'reactions_total',
   help: 'Total number of reactions',
-  labelNames: ['type', 'target'] as const, // like/dislike, video/comment
+  labelNames: ['type', 'target'], // like/dislike, video/comment
   registers: [register],
 });
 
-export const subscriptionsTotal: Counter<'action'> = new Counter({
+export const subscriptionsTotal = new client.Counter({
   name: 'subscriptions_total',
   help: 'Total number of subscription events',
-  labelNames: ['action'] as const, // subscribe, unsubscribe
+  labelNames: ['action'], // subscribe, unsubscribe
   registers: [register],
 });
 
 // ============ System Health Metrics ============
 
 // Database metrics
-export const dbQueryDuration: Histogram<'query_type'> = new Histogram({
+export const dbQueryDuration = new client.Histogram({
   name: 'db_query_duration_seconds',
   help: 'Duration of database queries in seconds',
-  labelNames: ['query_type'] as const, // select, insert, update, delete
+  labelNames: ['query_type'], // select, insert, update, delete
   buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
   registers: [register],
 });
 
-export const dbConnectionPoolSize: Gauge<'state'> = new Gauge({
+export const dbConnectionPoolSize = new client.Gauge({
   name: 'db_connection_pool_size',
   help: 'Current size of the database connection pool',
-  labelNames: ['state'] as const, // idle, active, waiting
+  labelNames: ['state'], // idle, active, waiting
   registers: [register],
 });
 
 // Cache metrics
-export const cacheHitRatio: Gauge<'cache'> = new Gauge({
+export const cacheHitRatio = new client.Gauge({
   name: 'cache_hit_ratio',
   help: 'Cache hit ratio (hits / total requests)',
-  labelNames: ['cache'] as const, // session, video, channel
+  labelNames: ['cache'], // session, video, channel
   registers: [register],
 });
 
-export const cacheOperationsTotal: Counter<'cache' | 'operation' | 'result'> = new Counter({
+export const cacheOperationsTotal = new client.Counter({
   name: 'cache_operations_total',
   help: 'Total cache operations',
-  labelNames: ['cache', 'operation', 'result'] as const, // cache name, get/set/delete, hit/miss
+  labelNames: ['cache', 'operation', 'result'], // cache name, get/set/delete, hit/miss
   registers: [register],
 });
 
 // Storage metrics
-export const storageOperationsTotal: Counter<'operation' | 'bucket' | 'status'> = new Counter({
+export const storageOperationsTotal = new client.Counter({
   name: 'storage_operations_total',
   help: 'Total storage operations',
-  labelNames: ['operation', 'bucket', 'status'] as const, // put/get/delete, bucket name, success/failure
+  labelNames: ['operation', 'bucket', 'status'], // put/get/delete, bucket name, success/failure
   registers: [register],
 });
 
-export const storageOperationDuration: Histogram<'operation' | 'bucket'> = new Histogram({
+export const storageOperationDuration = new client.Histogram({
   name: 'storage_operation_duration_seconds',
   help: 'Duration of storage operations in seconds',
-  labelNames: ['operation', 'bucket'] as const,
+  labelNames: ['operation', 'bucket'],
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
   registers: [register],
 });
 
 // Circuit breaker metrics
-export const circuitBreakerState: Gauge<'service'> = new Gauge({
+export const circuitBreakerState = new client.Gauge({
   name: 'circuit_breaker_state',
   help: 'Circuit breaker state (0=closed, 1=open, 2=half-open)',
-  labelNames: ['service'] as const,
+  labelNames: ['service'],
   registers: [register],
 });
 
-export const circuitBreakerFailuresTotal: Counter<'service'> = new Counter({
+export const circuitBreakerFailuresTotal = new client.Counter({
   name: 'circuit_breaker_failures_total',
   help: 'Total circuit breaker failures',
-  labelNames: ['service'] as const,
+  labelNames: ['service'],
   registers: [register],
 });
 
 // Rate limiting metrics
-export const rateLimitHitsTotal: Counter<'endpoint' | 'type'> = new Counter({
+export const rateLimitHitsTotal = new client.Counter({
   name: 'rate_limit_hits_total',
   help: 'Total number of rate limit hits',
-  labelNames: ['endpoint', 'type'] as const, // endpoint, ip/user
+  labelNames: ['endpoint', 'type'], // endpoint, ip/user
   registers: [register],
 });
 
@@ -203,7 +202,7 @@ export const rateLimitHitsTotal: Counter<'endpoint' | 'type'> = new Counter({
 /**
  * Express middleware to track HTTP request metrics
  */
-export const metricsMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+export const metricsMiddleware = (req, res, next) => {
   const startTime = Date.now();
 
   res.on('finish', () => {
@@ -213,14 +212,14 @@ export const metricsMiddleware = (req: Request, res: Response, next: NextFunctio
     httpRequestsTotal.inc({
       method: req.method,
       endpoint,
-      status_code: res.statusCode.toString(),
+      status_code: res.statusCode,
     });
 
     httpRequestDuration.observe(
       {
         method: req.method,
         endpoint,
-        status_code: res.statusCode.toString(),
+        status_code: res.statusCode,
       },
       duration
     );
@@ -232,10 +231,10 @@ export const metricsMiddleware = (req: Request, res: Response, next: NextFunctio
 /**
  * Normalize endpoint path for metrics (remove IDs)
  */
-function normalizeEndpoint(path: string): string {
+function normalizeEndpoint(path) {
   return path
-    .replace(/\/[a-f0-9-]{36}/gi, '/:id') // UUID
-    .replace(/\/\d+/g, '/:id') // Numeric ID
+    .replace(/\/[a-f0-9-]{36}/gi, '/:id')  // UUID
+    .replace(/\/\d+/g, '/:id')              // Numeric ID
     .replace(/\/[A-Za-z0-9_-]{11}/g, '/:id'); // YouTube-style ID
 }
 
@@ -244,12 +243,12 @@ function normalizeEndpoint(path: string): string {
 /**
  * Handler for /metrics endpoint
  */
-export const metricsHandler = async (req: Request, res: Response): Promise<void> => {
+export const metricsHandler = async (req, res) => {
   try {
     res.set('Content-Type', register.contentType);
     res.end(await register.metrics());
   } catch (error) {
-    res.status(500).end((error as Error).message);
+    res.status(500).end(error.message);
   }
 };
 

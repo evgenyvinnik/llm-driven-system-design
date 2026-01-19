@@ -1,11 +1,24 @@
-const authService = require('../services/authService');
+import { Request, Response, NextFunction } from 'express';
+import authService, { User } from '../services/authService.js';
+import { query } from '../models/db.js';
+
+// Extend Express Request to include user and token properties
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+      token?: string;
+    }
+  }
+}
 
 // Authentication middleware
-async function authenticate(req, res, next) {
+export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Authentication required' });
+    res.status(401).json({ error: 'Authentication required' });
+    return;
   }
 
   const token = authHeader.substring(7);
@@ -14,7 +27,8 @@ async function authenticate(req, res, next) {
     const user = await authService.validateSession(token);
 
     if (!user) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
     req.user = user;
@@ -27,11 +41,12 @@ async function authenticate(req, res, next) {
 }
 
 // Optional authentication middleware
-async function optionalAuth(req, res, next) {
+export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return next();
+    next();
+    return;
   }
 
   const token = authHeader.substring(7);
@@ -50,14 +65,18 @@ async function optionalAuth(req, res, next) {
 }
 
 // Role-based authorization middleware
-function requireRole(...roles) {
-  return (req, res, next) => {
+export function requireRole(
+  ...roles: string[]
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
+      res.status(403).json({ error: 'Insufficient permissions' });
+      return;
     }
 
     next();
@@ -65,44 +84,50 @@ function requireRole(...roles) {
 }
 
 // Hotel admin middleware (must own the hotel or be admin)
-function requireHotelOwner(hotelIdParam = 'hotelId') {
-  return async (req, res, next) => {
+export function requireHotelOwner(
+  hotelIdParam: string = 'hotelId'
+): (req: Request, res: Response, next: NextFunction) => Promise<void> {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     // System admin can access all hotels
     if (req.user.role === 'admin') {
-      return next();
+      next();
+      return;
     }
 
     // Hotel admin must own the hotel
     if (req.user.role !== 'hotel_admin') {
-      return res.status(403).json({ error: 'Hotel admin access required' });
+      res.status(403).json({ error: 'Hotel admin access required' });
+      return;
     }
 
     // hotelIdParam can be in params or body
-    const hotelId = req.params[hotelIdParam] || req.body.hotelId;
+    const hotelId = req.params[hotelIdParam] || (req.body as Record<string, unknown>).hotelId;
 
     if (!hotelId) {
-      return res.status(400).json({ error: 'Hotel ID required' });
+      res.status(400).json({ error: 'Hotel ID required' });
+      return;
     }
 
-    const db = require('../models/db');
-    const result = await db.query(
+    const result = await query<{ id: string }>(
       'SELECT id FROM hotels WHERE id = $1 AND owner_id = $2',
       [hotelId, req.user.id]
     );
 
     if (result.rows.length === 0) {
-      return res.status(403).json({ error: 'Access denied to this hotel' });
+      res.status(403).json({ error: 'Access denied to this hotel' });
+      return;
     }
 
     next();
   };
 }
 
-module.exports = {
+export default {
   authenticate,
   optionalAuth,
   requireRole,

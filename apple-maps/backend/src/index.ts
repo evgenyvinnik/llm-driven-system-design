@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import type { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
 import pool from './db.js';
 import redis from './redis.js';
 
@@ -50,7 +51,7 @@ app.get('/metrics', metricsHandler);
 app.use('/health', healthRouter);
 
 // Legacy health endpoint (for backward compatibility)
-app.get('/ping', (req, res) => {
+app.get('/ping', (_req: Request, res: Response) => {
   res.json({ pong: true, timestamp: new Date().toISOString() });
 });
 
@@ -64,16 +65,26 @@ app.use('/api/search', searchLimiter, searchRouter);
 // ============================================================
 // Map data endpoints with rate limiting
 // ============================================================
-app.get('/api/map/nodes', mapDataLimiter, async (req, res) => {
+
+interface BoundingBoxQuery {
+  minLat?: string;
+  minLng?: string;
+  maxLat?: string;
+  maxLng?: string;
+  category?: string;
+  limit?: string;
+}
+
+app.get('/api/map/nodes', mapDataLimiter, async (req: Request<object, unknown, unknown, BoundingBoxQuery>, res: Response) => {
   try {
     const { minLat, minLng, maxLat, maxLng } = req.query;
 
     let query = 'SELECT id, lat, lng, is_intersection FROM road_nodes';
-    let params = [];
+    const params: number[] = [];
 
     if (minLat && minLng && maxLat && maxLng) {
       query += ` WHERE lat BETWEEN $1 AND $3 AND lng BETWEEN $2 AND $4`;
-      params = [parseFloat(minLat), parseFloat(minLng), parseFloat(maxLat), parseFloat(maxLng)];
+      params.push(parseFloat(minLat), parseFloat(minLng), parseFloat(maxLat), parseFloat(maxLng));
     }
 
     query += ' LIMIT 5000';
@@ -90,7 +101,7 @@ app.get('/api/map/nodes', mapDataLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/map/segments', mapDataLimiter, async (req, res) => {
+app.get('/api/map/segments', mapDataLimiter, async (req: Request<object, unknown, unknown, BoundingBoxQuery>, res: Response) => {
   try {
     const { minLat, minLng, maxLat, maxLng } = req.query;
 
@@ -104,7 +115,7 @@ app.get('/api/map/segments', mapDataLimiter, async (req, res) => {
       JOIN road_nodes n1 ON s.start_node_id = n1.id
       JOIN road_nodes n2 ON s.end_node_id = n2.id
     `;
-    let params = [];
+    const params: number[] = [];
 
     if (minLat && minLng && maxLat && maxLng) {
       query += `
@@ -113,7 +124,7 @@ app.get('/api/map/segments', mapDataLimiter, async (req, res) => {
           OR (n2.lat BETWEEN $1 AND $3 AND n2.lng BETWEEN $2 AND $4)
         )
       `;
-      params = [parseFloat(minLat), parseFloat(minLng), parseFloat(maxLat), parseFloat(maxLng)];
+      params.push(parseFloat(minLat), parseFloat(minLng), parseFloat(maxLat), parseFloat(maxLng));
     }
 
     query += ' LIMIT 5000';
@@ -130,12 +141,12 @@ app.get('/api/map/segments', mapDataLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/map/pois', mapDataLimiter, async (req, res) => {
+app.get('/api/map/pois', mapDataLimiter, async (req: Request<object, unknown, unknown, BoundingBoxQuery>, res: Response) => {
   try {
-    const { minLat, minLng, maxLat, maxLng, category, limit = 100 } = req.query;
+    const { minLat, minLng, maxLat, maxLng, category, limit = '100' } = req.query;
 
     let query = 'SELECT id, name, category, lat, lng, address, rating FROM pois WHERE 1=1';
-    let params = [];
+    const params: (number | string)[] = [];
     let paramIndex = 1;
 
     if (minLat && minLng && maxLat && maxLng) {
@@ -168,7 +179,7 @@ app.get('/api/map/pois', mapDataLimiter, async (req, res) => {
 // ============================================================
 // Error handler
 // ============================================================
-app.use((err, req, res, next) => {
+const errorHandler: ErrorRequestHandler = (err: Error, req: Request, res: Response, _next: NextFunction) => {
   logger.error({
     error: err.message,
     stack: err.stack,
@@ -179,7 +190,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({
     error: 'Internal server error',
   });
-});
+};
+
+app.use(errorHandler);
 
 // ============================================================
 // Start server
@@ -200,7 +213,7 @@ app.listen(PORT, () => {
 // ============================================================
 // Graceful shutdown
 // ============================================================
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
 
   trafficService.stopSimulation();
@@ -227,7 +240,7 @@ async function gracefulShutdown(signal) {
   }
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
 
 export default app;

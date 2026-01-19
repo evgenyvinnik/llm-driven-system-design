@@ -1,22 +1,76 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
 
+interface UpdateUserBody {
+  role?: string;
+  subscriptionTier?: string;
+}
+
+interface CreateArtistBody {
+  name: string;
+  bio?: string;
+  imageUrl?: string;
+  genres?: string[];
+  verified?: boolean;
+}
+
+interface UpdateArtistBody {
+  name?: string;
+  bio?: string;
+  imageUrl?: string;
+  genres?: string[];
+  verified?: boolean;
+}
+
+interface CreateAlbumBody {
+  title: string;
+  artistId: string;
+  releaseDate?: string;
+  albumType?: string;
+  genres?: string[];
+  artworkUrl?: string;
+  explicit?: boolean;
+}
+
+interface CreateTrackBody {
+  title: string;
+  artistId: string;
+  albumId: string;
+  durationMs?: number;
+  trackNumber?: number;
+  discNumber?: number;
+  explicit?: boolean;
+  audioFeatures?: Record<string, unknown>;
+  genres?: string[];
+}
+
+interface CreateRadioStationBody {
+  name: string;
+  description?: string;
+  type?: string;
+  seedArtistId?: string;
+  seedGenre?: string;
+  artworkUrl?: string;
+  trackIds?: string[];
+}
+
 // All admin routes require authentication and admin role
 router.use(authenticate);
 router.use(requireAdmin);
 
 // Dashboard stats
-router.get('/stats', async (req, res) => {
+router.get('/stats', async (_req: Request, res: Response) => {
   try {
     const cacheKey = 'admin:stats';
     const cached = await redis.get(cacheKey);
 
     if (cached) {
-      return res.json(JSON.parse(cached));
+      res.json(JSON.parse(cached));
+      return;
     }
 
     const [users, tracks, albums, artists, playlists, plays] = await Promise.all([
@@ -79,9 +133,9 @@ router.get('/stats', async (req, res) => {
 });
 
 // Get all users
-router.get('/users', async (req, res) => {
+router.get('/users', async (req: Request<object, unknown, unknown, { limit?: string; offset?: string }>, res: Response) => {
   try {
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = '50', offset = '0' } = req.query;
 
     const result = await pool.query(
       `SELECT id, email, username, display_name, role, subscription_tier,
@@ -107,13 +161,13 @@ router.get('/users', async (req, res) => {
 });
 
 // Update user
-router.patch('/users/:id', async (req, res) => {
+router.patch('/users/:id', async (req: Request<{ id: string }, unknown, UpdateUserBody>, res: Response) => {
   try {
     const { id } = req.params;
     const { role, subscriptionTier } = req.body;
 
-    const updates = [];
-    const values = [];
+    const updates: string[] = [];
+    const values: (string | undefined)[] = [];
     let paramCount = 1;
 
     if (role) {
@@ -126,7 +180,8 @@ router.patch('/users/:id', async (req, res) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No updates provided' });
+      res.status(400).json({ error: 'No updates provided' });
+      return;
     }
 
     updates.push('updated_at = NOW()');
@@ -140,7 +195,8 @@ router.patch('/users/:id', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     res.json(result.rows[0]);
@@ -151,12 +207,13 @@ router.patch('/users/:id', async (req, res) => {
 });
 
 // Add new artist
-router.post('/artists', async (req, res) => {
+router.post('/artists', async (req: Request<object, unknown, CreateArtistBody>, res: Response) => {
   try {
     const { name, bio, imageUrl, genres, verified } = req.body;
 
     if (!name) {
-      return res.status(400).json({ error: 'Artist name required' });
+      res.status(400).json({ error: 'Artist name required' });
+      return;
     }
 
     const result = await pool.query(
@@ -177,13 +234,13 @@ router.post('/artists', async (req, res) => {
 });
 
 // Update artist
-router.patch('/artists/:id', async (req, res) => {
+router.patch('/artists/:id', async (req: Request<{ id: string }, unknown, UpdateArtistBody>, res: Response) => {
   try {
     const { id } = req.params;
     const { name, bio, imageUrl, genres, verified } = req.body;
 
-    const updates = [];
-    const values = [];
+    const updates: string[] = [];
+    const values: (string | string[] | boolean | undefined)[] = [];
     let paramCount = 1;
 
     if (name) {
@@ -208,7 +265,8 @@ router.patch('/artists/:id', async (req, res) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No updates provided' });
+      res.status(400).json({ error: 'No updates provided' });
+      return;
     }
 
     values.push(id);
@@ -221,7 +279,8 @@ router.patch('/artists/:id', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Artist not found' });
+      res.status(404).json({ error: 'Artist not found' });
+      return;
     }
 
     res.json(result.rows[0]);
@@ -232,12 +291,13 @@ router.patch('/artists/:id', async (req, res) => {
 });
 
 // Add new album
-router.post('/albums', async (req, res) => {
+router.post('/albums', async (req: Request<object, unknown, CreateAlbumBody>, res: Response) => {
   try {
     const { title, artistId, releaseDate, albumType, genres, artworkUrl, explicit } = req.body;
 
     if (!title || !artistId) {
-      return res.status(400).json({ error: 'Title and artist ID required' });
+      res.status(400).json({ error: 'Title and artist ID required' });
+      return;
     }
 
     const result = await pool.query(
@@ -255,12 +315,13 @@ router.post('/albums', async (req, res) => {
 });
 
 // Add new track
-router.post('/tracks', async (req, res) => {
+router.post('/tracks', async (req: Request<object, unknown, CreateTrackBody>, res: Response) => {
   try {
     const { title, artistId, albumId, durationMs, trackNumber, discNumber, explicit, audioFeatures, genres } = req.body;
 
     if (!title || !artistId || !albumId) {
-      return res.status(400).json({ error: 'Title, artist ID, and album ID required' });
+      res.status(400).json({ error: 'Title, artist ID, and album ID required' });
+      return;
     }
 
     const result = await pool.query(
@@ -290,12 +351,13 @@ router.post('/tracks', async (req, res) => {
 });
 
 // Create radio station
-router.post('/radio-stations', async (req, res) => {
+router.post('/radio-stations', async (req: Request<object, unknown, CreateRadioStationBody>, res: Response) => {
   try {
     const { name, description, type, seedArtistId, seedGenre, artworkUrl, trackIds } = req.body;
 
     if (!name) {
-      return res.status(400).json({ error: 'Station name required' });
+      res.status(400).json({ error: 'Station name required' });
+      return;
     }
 
     const result = await pool.query(
@@ -328,7 +390,7 @@ router.post('/radio-stations', async (req, res) => {
 });
 
 // Clear cache
-router.post('/cache/clear', async (req, res) => {
+router.post('/cache/clear', async (req: Request<object, unknown, { pattern?: string }>, res: Response) => {
   try {
     const { pattern } = req.body;
 

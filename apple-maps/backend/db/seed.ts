@@ -1,5 +1,4 @@
 import pg from 'pg';
-import { v4 as uuid } from 'uuid';
 
 const { Pool } = pg;
 
@@ -11,10 +10,17 @@ const pool = new Pool({
   database: process.env.DB_NAME || 'apple_maps',
 });
 
+interface PoiData {
+  name: string;
+  category: string;
+  rating: number;
+  reviews: number;
+}
+
 /**
  * Generate a grid-based road network centered on San Francisco
  */
-async function seedDatabase() {
+async function seedDatabase(): Promise<void> {
   console.log('Seeding database...');
 
   // San Francisco coordinates as center
@@ -36,7 +42,7 @@ async function seedDatabase() {
   const ewStreets = [
     'Market St', 'Mission St', 'Howard St', 'Folsom St', 'Harrison St',
     'Bryant St', 'Brannan St', 'Townsend St', 'King St', 'Berry St',
-    'Bush St', 'Sutter St', 'Post St', 'Geary St', 'O\'Farrell St',
+    'Bush St', 'Sutter St', 'Post St', 'Geary St', "O'Farrell St",
     'Ellis St', 'Eddy St', 'Turk St', 'Golden Gate Ave', 'McAllister St'
   ];
 
@@ -51,10 +57,10 @@ async function seedDatabase() {
 
   // Create nodes
   console.log('Creating road nodes...');
-  const nodeIds = [];
+  const nodeIds: string[][] = [];
 
   for (let row = 0; row < gridSize; row++) {
-    const rowIds = [];
+    const rowIds: string[] = [];
     for (let col = 0; col < gridSize; col++) {
       const lat = centerLat - (gridSize / 2 - row) * spacing;
       const lng = centerLng - (gridSize / 2 - col) * spacing;
@@ -84,8 +90,9 @@ async function seedDatabase() {
     const speed = roadClass === 'arterial' ? 50 : 35;
 
     for (let col = 0; col < gridSize - 1; col++) {
-      const startNodeId = nodeIds[row][col];
-      const endNodeId = nodeIds[row][col + 1];
+      const startNodeId = nodeIds[row]?.[col];
+      const endNodeId = nodeIds[row]?.[col + 1];
+      if (!startNodeId || !endNodeId) continue;
 
       const startLat = centerLat - (gridSize / 2 - row) * spacing;
       const startLng = centerLng - (gridSize / 2 - col) * spacing;
@@ -121,8 +128,9 @@ async function seedDatabase() {
     const speed = roadClass === 'arterial' ? 50 : 35;
 
     for (let row = 0; row < gridSize - 1; row++) {
-      const startNodeId = nodeIds[row][col];
-      const endNodeId = nodeIds[row + 1][col];
+      const startNodeId = nodeIds[row]?.[col];
+      const endNodeId = nodeIds[row + 1]?.[col];
+      if (!startNodeId || !endNodeId) continue;
 
       const startLat = centerLat - (gridSize / 2 - row) * spacing;
       const startLng = centerLng - (gridSize / 2 - col) * spacing;
@@ -156,7 +164,7 @@ async function seedDatabase() {
   // Create POIs
   console.log('Creating points of interest...');
 
-  const poiData = [
+  const poiData: PoiData[] = [
     // Restaurants
     { name: 'The Grill House', category: 'restaurant', rating: 4.5, reviews: 245 },
     { name: 'Sushi Palace', category: 'restaurant', rating: 4.7, reviews: 189 },
@@ -187,7 +195,7 @@ async function seedDatabase() {
 
     // Attractions
     { name: 'Golden Gate Park', category: 'park', rating: 4.9, reviews: 5678 },
-    { name: 'Fisherman\'s Wharf', category: 'attraction', rating: 4.2, reviews: 4321 },
+    { name: "Fisherman's Wharf", category: 'attraction', rating: 4.2, reviews: 4321 },
     { name: 'Alcatraz Island', category: 'attraction', rating: 4.7, reviews: 3456 },
     { name: 'Cable Car Museum', category: 'museum', rating: 4.5, reviews: 876 },
     { name: 'SFMOMA', category: 'museum', rating: 4.6, reviews: 2345 },
@@ -236,7 +244,7 @@ async function seedDatabase() {
 
   const segments = await pool.query('SELECT id, free_flow_speed_kph FROM road_segments');
 
-  for (const segment of segments.rows) {
+  for (const segment of segments.rows as { id: string; free_flow_speed_kph: number }[]) {
     const variation = 0.7 + Math.random() * 0.3; // 70-100% of free flow
     const speed = segment.free_flow_speed_kph * variation;
 

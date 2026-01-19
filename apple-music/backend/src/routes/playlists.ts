@@ -1,12 +1,38 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../db/index.js';
-import { authenticate, optionalAuth, requirePermission } from '../middleware/auth.js';
-import { idempotentMiddleware, getIdempotentResponse, setIdempotentResponse } from '../shared/idempotency.js';
+import { authenticate, optionalAuth } from '../middleware/auth.js';
+import { idempotentMiddleware } from '../shared/idempotency.js';
 import { playlistOperations, libraryOperations } from '../shared/metrics.js';
 import { logger, auditLog } from '../shared/logger.js';
 import { playlistCreateLimiter } from '../shared/rateLimit.js';
 
 const router = Router();
+
+interface PlaylistQuery {
+  limit?: string;
+  offset?: string;
+}
+
+interface CreatePlaylistBody {
+  name: string;
+  description?: string;
+  isPublic?: boolean;
+  type?: string;
+}
+
+interface UpdatePlaylistBody {
+  name?: string;
+  description?: string;
+  isPublic?: boolean;
+}
+
+interface AddTrackBody {
+  trackId: string;
+}
+
+interface ReorderBody {
+  trackIds: string[];
+}
 
 /**
  * Playlist routes with idempotency and metrics.
@@ -20,10 +46,10 @@ const router = Router();
  */
 
 // Get user's playlists
-router.get('/', authenticate, async (req, res) => {
+router.get('/', authenticate, async (req: Request<object, unknown, unknown, PlaylistQuery>, res: Response) => {
   try {
-    const { limit = 50, offset = 0 } = req.query;
-    const userId = req.user.id;
+    const { limit = '50', offset = '0' } = req.query;
+    const userId = req.user!.id;
 
     const result = await pool.query(
       `SELECT * FROM playlists
@@ -51,9 +77,9 @@ router.get('/', authenticate, async (req, res) => {
 });
 
 // Get public playlists
-router.get('/public', optionalAuth, async (req, res) => {
+router.get('/public', optionalAuth, async (req: Request<object, unknown, unknown, PlaylistQuery>, res: Response) => {
   try {
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = '50', offset = '0' } = req.query;
 
     const result = await pool.query(
       `SELECT p.*, u.username as owner_username, u.display_name as owner_name
@@ -73,7 +99,7 @@ router.get('/public', optionalAuth, async (req, res) => {
 });
 
 // Get single playlist with tracks
-router.get('/:id', optionalAuth, async (req, res) => {
+router.get('/:id', optionalAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -86,14 +112,16 @@ router.get('/:id', optionalAuth, async (req, res) => {
     );
 
     if (playlistResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Playlist not found' });
+      res.status(404).json({ error: 'Playlist not found' });
+      return;
     }
 
     const playlist = playlistResult.rows[0];
 
     // Check access
     if (!playlist.is_public && (!req.user || req.user.id !== playlist.user_id)) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     const tracksResult = await pool.query(
@@ -127,14 +155,15 @@ router.post('/',
   authenticate,
   playlistCreateLimiter,
   idempotentMiddleware,
-  async (req, res) => {
+  async (req: Request<object, unknown, CreatePlaylistBody>, res: Response) => {
     try {
       const { name, description, isPublic, type } = req.body;
-      const userId = req.user.id;
-      const idempotencyKey = req.headers['x-idempotency-key'];
+      const userId = req.user!.id;
+      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
       if (!name) {
-        return res.status(400).json({ error: 'Playlist name required' });
+        res.status(400).json({ error: 'Playlist name required' });
+        return;
       }
 
       // Track metrics
@@ -178,11 +207,11 @@ router.post('/',
 );
 
 // Update playlist
-router.patch('/:id', authenticate, async (req, res) => {
+router.patch('/:id', authenticate, async (req: Request<{ id: string }, unknown, UpdatePlaylistBody>, res: Response) => {
   try {
     const { id } = req.params;
     const { name, description, isPublic } = req.body;
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     // Check ownership
     const checkResult = await pool.query(
@@ -191,15 +220,17 @@ router.patch('/:id', authenticate, async (req, res) => {
     );
 
     if (checkResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Playlist not found' });
+      res.status(404).json({ error: 'Playlist not found' });
+      return;
     }
 
     if (checkResult.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
-    const updates = [];
-    const values = [];
+    const updates: string[] = [];
+    const values: (string | boolean | undefined)[] = [];
     let paramCount = 1;
 
     if (name !== undefined) {
@@ -216,7 +247,8 @@ router.patch('/:id', authenticate, async (req, res) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No updates provided' });
+      res.status(400).json({ error: 'No updates provided' });
+      return;
     }
 
     updates.push(`updated_at = NOW()`);
@@ -244,10 +276,10 @@ router.patch('/:id', authenticate, async (req, res) => {
 router.delete('/:id',
   authenticate,
   auditLog('playlist.delete'),
-  async (req, res) => {
+  async (req: Request<{ id: string }>, res: Response) => {
     try {
       const { id } = req.params;
-      const userId = req.user.id;
+      const userId = req.user!.id;
 
       const result = await pool.query(
         'DELETE FROM playlists WHERE id = $1 AND user_id = $2 RETURNING id',
@@ -255,7 +287,8 @@ router.delete('/:id',
       );
 
       if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Playlist not found or access denied' });
+        res.status(404).json({ error: 'Playlist not found or access denied' });
+        return;
       }
 
       // Remove from library
@@ -286,12 +319,12 @@ router.delete('/:id',
 router.post('/:id/tracks',
   authenticate,
   idempotentMiddleware,
-  async (req, res) => {
+  async (req: Request<{ id: string }, unknown, AddTrackBody>, res: Response) => {
     try {
       const { id } = req.params;
       const { trackId } = req.body;
-      const userId = req.user.id;
-      const idempotencyKey = req.headers['x-idempotency-key'];
+      const userId = req.user!.id;
+      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
       // Check ownership
       const checkResult = await pool.query(
@@ -300,11 +333,13 @@ router.post('/:id/tracks',
       );
 
       if (checkResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Playlist not found' });
+        res.status(404).json({ error: 'Playlist not found' });
+        return;
       }
 
       if (checkResult.rows[0].user_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
+        res.status(403).json({ error: 'Access denied' });
+        return;
       }
 
       // Get next position
@@ -345,10 +380,10 @@ router.post('/:id/tracks',
 );
 
 // Remove track from playlist
-router.delete('/:id/tracks/:trackId', authenticate, async (req, res) => {
+router.delete('/:id/tracks/:trackId', authenticate, async (req: Request<{ id: string; trackId: string }>, res: Response) => {
   try {
     const { id, trackId } = req.params;
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     // Check ownership
     const checkResult = await pool.query(
@@ -357,11 +392,13 @@ router.delete('/:id/tracks/:trackId', authenticate, async (req, res) => {
     );
 
     if (checkResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Playlist not found' });
+      res.status(404).json({ error: 'Playlist not found' });
+      return;
     }
 
     if (checkResult.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     await pool.query(
@@ -398,11 +435,11 @@ router.delete('/:id/tracks/:trackId', authenticate, async (req, res) => {
 });
 
 // Reorder playlist tracks
-router.put('/:id/tracks/reorder', authenticate, async (req, res) => {
+router.put('/:id/tracks/reorder', authenticate, async (req: Request<{ id: string }, unknown, ReorderBody>, res: Response) => {
   try {
     const { id } = req.params;
     const { trackIds } = req.body;
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     // Check ownership
     const checkResult = await pool.query(
@@ -411,11 +448,13 @@ router.put('/:id/tracks/reorder', authenticate, async (req, res) => {
     );
 
     if (checkResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Playlist not found' });
+      res.status(404).json({ error: 'Playlist not found' });
+      return;
     }
 
     if (checkResult.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     // Update positions in a transaction

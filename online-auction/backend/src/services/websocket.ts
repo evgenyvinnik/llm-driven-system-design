@@ -1,26 +1,34 @@
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { subscriber } from '../redis.js';
 import { getSession } from '../redis.js';
 import { query } from '../db.js';
+import type { Server } from 'http';
+import type { ConnectionStats, WebSocketMessage } from '../types.js';
+
+// Extended WebSocket with custom properties
+interface AuctionWebSocket extends WebSocket {
+  userId?: string;
+  username?: string;
+}
 
 // Map of auction IDs to connected clients
-const auctionSubscribers = new Map();
+const auctionSubscribers = new Map<string, Set<AuctionWebSocket>>();
 
 // Map of client connections to their subscribed auctions
-const clientSubscriptions = new Map();
+const clientSubscriptions = new Map<AuctionWebSocket, Set<string>>();
 
-export const setupWebSocket = (server) => {
+export const setupWebSocket = (server: Server): WebSocketServer => {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   console.log('WebSocket server initialized');
 
-  wss.on('connection', async (ws, req) => {
+  wss.on('connection', async (ws: AuctionWebSocket, req) => {
     console.log('New WebSocket connection');
 
-    let userId = null;
+    let userId: string | null = null;
 
     // Try to authenticate via query param
-    const url = new URL(req.url, 'http://localhost');
+    const url = new URL(req.url || '', 'http://localhost');
     const token = url.searchParams.get('token');
 
     if (token) {
@@ -39,15 +47,19 @@ export const setupWebSocket = (server) => {
 
     ws.on('message', async (data) => {
       try {
-        const message = JSON.parse(data.toString());
+        const message: WebSocketMessage = JSON.parse(data.toString());
 
         switch (message.type) {
           case 'subscribe':
-            handleSubscribe(ws, message.auction_id);
+            if (message.auction_id) {
+              handleSubscribe(ws, message.auction_id);
+            }
             break;
 
           case 'unsubscribe':
-            handleUnsubscribe(ws, message.auction_id);
+            if (message.auction_id) {
+              handleUnsubscribe(ws, message.auction_id);
+            }
             break;
 
           case 'ping':
@@ -84,7 +96,7 @@ export const setupWebSocket = (server) => {
   });
 
   // Subscribe to Redis pub/sub for bid updates
-  subscriber.on('message', (channel, message) => {
+  subscriber.on('message', (channel: string, message: string) => {
     if (channel.startsWith('auction:')) {
       const auctionId = channel.replace('auction:', '');
       broadcastToAuction(auctionId, message);
@@ -97,17 +109,17 @@ export const setupWebSocket = (server) => {
   return wss;
 };
 
-const handleSubscribe = (ws, auctionId) => {
+const handleSubscribe = (ws: AuctionWebSocket, auctionId: string): void => {
   if (!auctionId) return;
 
   // Add to auction subscribers
   if (!auctionSubscribers.has(auctionId)) {
     auctionSubscribers.set(auctionId, new Set());
   }
-  auctionSubscribers.get(auctionId).add(ws);
+  auctionSubscribers.get(auctionId)!.add(ws);
 
   // Track client's subscriptions
-  clientSubscriptions.get(ws).add(auctionId);
+  clientSubscriptions.get(ws)?.add(auctionId);
 
   ws.send(
     JSON.stringify({
@@ -120,7 +132,7 @@ const handleSubscribe = (ws, auctionId) => {
   console.log(`Client subscribed to auction ${auctionId}`);
 };
 
-const handleUnsubscribe = (ws, auctionId) => {
+const handleUnsubscribe = (ws: AuctionWebSocket, auctionId: string): void => {
   if (!auctionId) return;
 
   // Remove from auction subscribers
@@ -147,7 +159,7 @@ const handleUnsubscribe = (ws, auctionId) => {
   );
 };
 
-const cleanupClient = (ws) => {
+const cleanupClient = (ws: AuctionWebSocket): void => {
   const subscriptions = clientSubscriptions.get(ws);
 
   if (subscriptions) {
@@ -165,7 +177,7 @@ const cleanupClient = (ws) => {
   clientSubscriptions.delete(ws);
 };
 
-const broadcastToAuction = (auctionId, message) => {
+const broadcastToAuction = (auctionId: string, message: string): void => {
   const subscribers = auctionSubscribers.get(auctionId);
 
   if (!subscribers || subscribers.size === 0) {
@@ -175,16 +187,15 @@ const broadcastToAuction = (auctionId, message) => {
   console.log(`Broadcasting to ${subscribers.size} clients for auction ${auctionId}`);
 
   for (const ws of subscribers) {
-    if (ws.readyState === 1) {
-      // WebSocket.OPEN
+    if (ws.readyState === WebSocket.OPEN) {
       ws.send(message);
     }
   }
 };
 
 // Get stats about connected clients
-export const getConnectionStats = () => {
-  let totalClients = clientSubscriptions.size;
+export const getConnectionStats = (): ConnectionStats => {
+  const totalClients = clientSubscriptions.size;
   let totalSubscriptions = 0;
 
   for (const subs of clientSubscriptions.values()) {

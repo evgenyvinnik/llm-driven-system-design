@@ -2,22 +2,42 @@
  * AggregationService processes query logs and updates the trie.
  * Implements buffered writes and periodic flushing for efficiency.
  */
+import type Redis from 'ioredis';
+import type { Pool } from 'pg';
+import type { Trie } from '../data-structures/trie.js';
+
+interface BufferEntry {
+  count: number;
+  firstSeen: number;
+  lastSeen?: number;
+}
+
+interface AggregationStats {
+  bufferSize: number;
+  isRunning: boolean;
+  flushInterval: number;
+}
+
 export class AggregationService {
-  constructor(redis, pgPool, trie) {
+  private redis: Redis;
+  private pgPool: Pool;
+  private trie: Trie;
+  private buffer: Map<string, BufferEntry> = new Map();
+  private flushInterval: number = 30000; // 30 seconds
+  private flushTimer: NodeJS.Timeout | null = null;
+  private trendingDecayTimer: NodeJS.Timeout | null = null;
+  private isRunning: boolean = false;
+
+  constructor(redis: Redis, pgPool: Pool, trie: Trie) {
     this.redis = redis;
     this.pgPool = pgPool;
     this.trie = trie;
-    this.buffer = new Map(); // phrase -> { count, timestamps }
-    this.flushInterval = 30000; // 30 seconds
-    this.flushTimer = null;
-    this.trendingDecayTimer = null;
-    this.isRunning = false;
   }
 
   /**
    * Start the aggregation service.
    */
-  start() {
+  start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
 
@@ -25,10 +45,7 @@ export class AggregationService {
     this.flushTimer = setInterval(() => this.flush(), this.flushInterval);
 
     // Periodic trending decay (every hour)
-    this.trendingDecayTimer = setInterval(
-      () => this.decayTrending(),
-      60 * 60 * 1000
-    );
+    this.trendingDecayTimer = setInterval(() => this.decayTrending(), 60 * 60 * 1000);
 
     console.log('Aggregation service started');
   }
@@ -36,7 +53,7 @@ export class AggregationService {
   /**
    * Stop the aggregation service.
    */
-  stop() {
+  stop(): void {
     this.isRunning = false;
 
     if (this.flushTimer) {
@@ -56,11 +73,12 @@ export class AggregationService {
 
   /**
    * Process a search query.
-   * @param {string} query - The search query
-   * @param {string} userId - Optional user ID
-   * @param {string} sessionId - Optional session ID
    */
-  async processQuery(query, userId = null, sessionId = null) {
+  async processQuery(
+    query: string,
+    userId: string | null = null,
+    sessionId: string | null = null
+  ): Promise<void> {
     if (!query || typeof query !== 'string') return;
 
     const normalizedQuery = query.toLowerCase().trim();
@@ -79,7 +97,7 @@ export class AggregationService {
     if (!this.buffer.has(normalizedQuery)) {
       this.buffer.set(normalizedQuery, { count: 0, firstSeen: Date.now() });
     }
-    const entry = this.buffer.get(normalizedQuery);
+    const entry = this.buffer.get(normalizedQuery)!;
     entry.count++;
     entry.lastSeen = Date.now();
 
@@ -87,7 +105,7 @@ export class AggregationService {
     await this.updateTrending(normalizedQuery);
 
     // Log to PostgreSQL (async, non-blocking)
-    this.logQuery(normalizedQuery, userId, sessionId).catch(err => {
+    this.logQuery(normalizedQuery, userId, sessionId).catch((err: Error) => {
       console.error('Error logging query:', err.message);
     });
   }
@@ -95,7 +113,7 @@ export class AggregationService {
   /**
    * Check if a query is low quality.
    */
-  isLowQuality(query) {
+  isLowQuality(query: string): boolean {
     // Too short
     if (query.length < 2) return true;
 
@@ -117,7 +135,7 @@ export class AggregationService {
   /**
    * Check if a query contains inappropriate content.
    */
-  async isInappropriate(query) {
+  async isInappropriate(query: string): Promise<boolean> {
     try {
       // Check against filtered phrases in database
       const result = await this.pgPool.query(
@@ -135,7 +153,7 @@ export class AggregationService {
         return true;
       }
     } catch (error) {
-      console.error('Error checking inappropriate:', error.message);
+      console.error('Error checking inappropriate:', (error as Error).message);
     }
 
     return false;
@@ -144,7 +162,7 @@ export class AggregationService {
   /**
    * Update trending scores for real-time trending.
    */
-  async updateTrending(query) {
+  async updateTrending(query: string): Promise<void> {
     try {
       // Use sliding window counters
       const now = Date.now();
@@ -155,14 +173,18 @@ export class AggregationService {
 
       // Aggregate recent windows periodically (done in flush)
     } catch (error) {
-      console.error('Error updating trending:', error.message);
+      console.error('Error updating trending:', (error as Error).message);
     }
   }
 
   /**
    * Log query to PostgreSQL for analytics.
    */
-  async logQuery(query, userId, sessionId) {
+  async logQuery(
+    query: string,
+    userId: string | null,
+    sessionId: string | null
+  ): Promise<void> {
     try {
       await this.pgPool.query(
         `INSERT INTO query_logs (query, user_id, session_id, timestamp)
@@ -170,14 +192,14 @@ export class AggregationService {
         [query, userId, sessionId]
       );
     } catch (error) {
-      console.error('Error logging query:', error.message);
+      console.error('Error logging query:', (error as Error).message);
     }
   }
 
   /**
    * Flush buffer to database and update trie.
    */
-  async flush() {
+  async flush(): Promise<void> {
     if (this.buffer.size === 0) return;
 
     const updates = Array.from(this.buffer.entries());
@@ -199,7 +221,7 @@ export class AggregationService {
         // Update trie
         this.trie.incrementCount(phrase, count);
       } catch (error) {
-        console.error(`Error flushing phrase "${phrase}":`, error.message);
+        console.error(`Error flushing phrase "${phrase}":`, (error as Error).message);
       }
     }
 
@@ -212,10 +234,10 @@ export class AggregationService {
   /**
    * Aggregate recent trending windows into main trending set.
    */
-  async aggregateTrendingWindows() {
+  async aggregateTrendingWindows(): Promise<void> {
     try {
       const now = Date.now();
-      const recentWindows = [];
+      const recentWindows: string[] = [];
 
       // Get last 12 windows (1 hour of 5-minute windows)
       for (let i = 0; i < 12; i++) {
@@ -224,7 +246,7 @@ export class AggregationService {
       }
 
       // Check which windows exist
-      const existingWindows = [];
+      const existingWindows: string[] = [];
       for (const key of recentWindows) {
         const exists = await this.redis.exists(key);
         if (exists) {
@@ -243,14 +265,14 @@ export class AggregationService {
         );
       }
     } catch (error) {
-      console.error('Error aggregating trending:', error.message);
+      console.error('Error aggregating trending:', (error as Error).message);
     }
   }
 
   /**
    * Decay trending scores over time.
    */
-  async decayTrending() {
+  async decayTrending(): Promise<void> {
     try {
       const trending = await this.redis.zrange('trending_queries', 0, -1, 'WITHSCORES');
 
@@ -271,14 +293,14 @@ export class AggregationService {
       await pipeline.exec();
       console.log('Trending decay complete');
     } catch (error) {
-      console.error('Error decaying trending:', error.message);
+      console.error('Error decaying trending:', (error as Error).message);
     }
   }
 
   /**
    * Rebuild the entire trie from database.
    */
-  async rebuildTrie() {
+  async rebuildTrie(): Promise<void> {
     console.log('Rebuilding trie from database...');
 
     try {
@@ -290,7 +312,7 @@ export class AggregationService {
       );
 
       // Clear and rebuild
-      this.trie.root = { children: new Map(), suggestions: [] };
+      this.trie.root = { children: new Map(), suggestions: [], isEndOfWord: false, count: 0, lastUpdated: Date.now() } as typeof this.trie.root;
       this.trie.size = 0;
       this.trie.phraseMap.clear();
 
@@ -306,7 +328,7 @@ export class AggregationService {
         await this.redis.del(...keys);
       }
     } catch (error) {
-      console.error('Error rebuilding trie:', error.message);
+      console.error('Error rebuilding trie:', (error as Error).message);
       throw error;
     }
   }
@@ -314,7 +336,7 @@ export class AggregationService {
   /**
    * Get aggregation stats.
    */
-  getStats() {
+  getStats(): AggregationStats {
     return {
       bufferSize: this.buffer.size,
       isRunning: this.isRunning,

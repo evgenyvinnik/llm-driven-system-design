@@ -3,9 +3,38 @@ import { Client } from '@elastic/elasticsearch';
 
 const { Pool } = pg;
 
+interface SampleApp {
+  bundle_id: string;
+  name: string;
+  path: string;
+  category: string;
+}
+
+interface SampleContact {
+  name: string;
+  email: string;
+  phone: string;
+  company: string;
+}
+
+interface SampleFile {
+  path: string;
+  name: string;
+  type: string;
+  content: string;
+  size: number;
+  modified_at: Date;
+}
+
+interface SampleWebItem {
+  url: string;
+  title: string;
+  description: string;
+}
+
 const pool = new Pool({
   host: process.env.PG_HOST || 'localhost',
-  port: process.env.PG_PORT || 5432,
+  port: parseInt(process.env.PG_PORT || '5432'),
   database: process.env.PG_DATABASE || 'spotlight',
   user: process.env.PG_USER || 'spotlight',
   password: process.env.PG_PASSWORD || 'spotlight_password',
@@ -16,7 +45,7 @@ const esClient = new Client({
 });
 
 // Sample data
-const sampleApps = [
+const sampleApps: SampleApp[] = [
   { bundle_id: 'com.apple.Safari', name: 'Safari', path: '/Applications/Safari.app', category: 'browser' },
   { bundle_id: 'com.apple.mail', name: 'Mail', path: '/Applications/Mail.app', category: 'productivity' },
   { bundle_id: 'com.apple.finder', name: 'Finder', path: '/System/Library/CoreServices/Finder.app', category: 'system' },
@@ -34,7 +63,7 @@ const sampleApps = [
   { bundle_id: 'com.figma.Desktop', name: 'Figma', path: '/Applications/Figma.app', category: 'design' }
 ];
 
-const sampleContacts = [
+const sampleContacts: SampleContact[] = [
   { name: 'Alice Johnson', email: 'alice@example.com', phone: '+1-555-0101', company: 'Tech Corp' },
   { name: 'Bob Smith', email: 'bob@example.com', phone: '+1-555-0102', company: 'Design Studio' },
   { name: 'Carol Williams', email: 'carol@example.com', phone: '+1-555-0103', company: 'Marketing Inc' },
@@ -45,7 +74,7 @@ const sampleContacts = [
   { name: 'Henry Wilson', email: 'henry@example.com', phone: '+1-555-0108', company: 'Consulting Group' }
 ];
 
-const sampleFiles = [
+const sampleFiles: SampleFile[] = [
   { path: '/Users/demo/Documents/project-proposal.pdf', name: 'Project Proposal', type: 'document', content: 'project proposal budget timeline objectives', size: 245000, modified_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) },
   { path: '/Users/demo/Documents/meeting-notes.txt', name: 'Meeting Notes', type: 'document', content: 'meeting notes discussion action items follow up', size: 12000, modified_at: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000) },
   { path: '/Users/demo/Documents/budget-2024.xlsx', name: 'Budget 2024', type: 'spreadsheet', content: 'budget expenses revenue forecast', size: 89000, modified_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000) },
@@ -58,7 +87,7 @@ const sampleFiles = [
   { path: '/Users/demo/Music/playlist.m3u', name: 'Favorite Playlist', type: 'music', content: 'playlist music songs favorites', size: 2500, modified_at: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
 ];
 
-const sampleWebItems = [
+const sampleWebItems: SampleWebItem[] = [
   { url: 'https://github.com', title: 'GitHub', description: 'Where the world builds software' },
   { url: 'https://stackoverflow.com', title: 'Stack Overflow', description: 'Where developers learn, share, and build careers' },
   { url: 'https://developer.mozilla.org', title: 'MDN Web Docs', description: 'Resources for developers, by developers' },
@@ -69,7 +98,7 @@ const sampleWebItems = [
   { url: 'https://www.notion.so', title: 'Notion', description: 'All-in-one workspace' }
 ];
 
-async function seed() {
+async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   try {
@@ -148,7 +177,7 @@ async function seed() {
     // Seed web items
     console.log('Seeding web items...');
     for (const web of sampleWebItems) {
-      const result = await pool.query(`
+      await pool.query(`
         INSERT INTO web_items (url, title, description)
         VALUES ($1, $2, $3)
         ON CONFLICT (url) DO UPDATE SET title = $2, description = $3

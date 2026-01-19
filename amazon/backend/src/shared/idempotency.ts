@@ -9,41 +9,62 @@
  * Uses Redis for fast lookups with TTL, with PostgreSQL fallback for durability.
  */
 import crypto from 'crypto';
+import { Request, Response, NextFunction } from 'express';
 import { getRedis } from '../services/redis.js';
 import { query } from '../services/database.js';
 import logger, { LogEvents } from './logger.js';
 import { idempotencyHitsTotal } from './metrics.js';
 
+// Extend Request to include idempotencyKey
+interface ExtendedRequest extends Request {
+  idempotencyKey?: string;
+}
+
 // Idempotency key TTL (24 hours by default)
-const IDEMPOTENCY_TTL_SECONDS = parseInt(process.env.IDEMPOTENCY_TTL_SECONDS) || 86400;
+const IDEMPOTENCY_TTL_SECONDS = parseInt(process.env.IDEMPOTENCY_TTL_SECONDS || '86400');
 
 // Redis key prefix
 const REDIS_PREFIX = 'idempotency:';
 
 /**
  * Idempotency record structure
- * @typedef {Object} IdempotencyRecord
- * @property {string} key - The idempotency key
- * @property {string} status - 'processing' | 'completed' | 'failed'
- * @property {Object} response - Cached response for completed requests
- * @property {number} createdAt - Timestamp when record was created
- * @property {number} completedAt - Timestamp when request completed
  */
+interface IdempotencyRecord {
+  key: string;
+  status: 'processing' | 'completed' | 'failed';
+  response: unknown;
+  requestData?: unknown;
+  createdAt: number;
+  completedAt: number | null;
+}
+
+interface IdempotencyResult {
+  isDuplicate: boolean;
+  isProcessing?: boolean;
+  response?: unknown;
+}
+
+interface IdempotencyDBRow {
+  key: string;
+  status: string;
+  response: unknown;
+  request_data: unknown;
+  created_at: Date;
+  completed_at: Date | null;
+}
 
 /**
  * Generate an idempotency key for a request
  * Client should generate this, but we provide a fallback
- * @param {Object} req - Express request object
- * @returns {string} Idempotency key
  */
-export function generateIdempotencyKey(req) {
+export function generateIdempotencyKey(req: ExtendedRequest): string {
   // Client-provided key takes precedence
   if (req.headers['idempotency-key']) {
-    return req.headers['idempotency-key'];
+    return req.headers['idempotency-key'] as string;
   }
 
   if (req.headers['x-idempotency-key']) {
-    return req.headers['x-idempotency-key'];
+    return req.headers['x-idempotency-key'] as string;
   }
 
   // Fallback: Generate from user ID + timestamp + random
@@ -54,10 +75,8 @@ export function generateIdempotencyKey(req) {
 
 /**
  * Check if an idempotency key exists and return cached response if available
- * @param {string} key - Idempotency key
- * @returns {Promise<IdempotencyRecord|null>} Cached record or null
  */
-export async function getIdempotencyRecord(key) {
+export async function getIdempotencyRecord(key: string): Promise<IdempotencyRecord | null> {
   try {
     const redis = getRedis();
     const redisKey = `${REDIS_PREFIX}${key}`;
@@ -65,25 +84,25 @@ export async function getIdempotencyRecord(key) {
     // Try Redis first (fast)
     const cached = await redis.get(redisKey);
     if (cached) {
-      const record = JSON.parse(cached);
+      const record: IdempotencyRecord = JSON.parse(cached);
       logger.debug({ key, status: record.status }, 'Idempotency key found in Redis');
       return record;
     }
 
     // Fallback to PostgreSQL for durability
-    const result = await query(
+    const result = await query<IdempotencyDBRow>(
       'SELECT * FROM idempotency_keys WHERE key = $1',
       [key]
     );
 
     if (result.rows.length > 0) {
       const dbRecord = result.rows[0];
-      const record = {
+      const record: IdempotencyRecord = {
         key: dbRecord.key,
-        status: dbRecord.status,
+        status: dbRecord.status as IdempotencyRecord['status'],
         response: dbRecord.response,
-        createdAt: dbRecord.created_at,
-        completedAt: dbRecord.completed_at
+        createdAt: new Date(dbRecord.created_at).getTime(),
+        completedAt: dbRecord.completed_at ? new Date(dbRecord.completed_at).getTime() : null
       };
 
       // Cache in Redis for faster subsequent lookups
@@ -95,7 +114,8 @@ export async function getIdempotencyRecord(key) {
 
     return null;
   } catch (error) {
-    logger.error({ key, error: error.message }, 'Error checking idempotency key');
+    const err = error as Error;
+    logger.error({ key, error: err.message }, 'Error checking idempotency key');
     // On error, return null to allow the request to proceed
     // This is a trade-off: better to risk duplicate than block all requests
     return null;
@@ -105,16 +125,16 @@ export async function getIdempotencyRecord(key) {
 /**
  * Create a new idempotency record in 'processing' state
  * Uses Redis SETNX for atomic check-and-set
- * @param {string} key - Idempotency key
- * @param {Object} requestData - Original request data for debugging
- * @returns {Promise<boolean>} True if record was created, false if key already exists
  */
-export async function createIdempotencyRecord(key, requestData = {}) {
+export async function createIdempotencyRecord(
+  key: string,
+  requestData: unknown = {}
+): Promise<boolean> {
   try {
     const redis = getRedis();
     const redisKey = `${REDIS_PREFIX}${key}`;
 
-    const record = {
+    const record: IdempotencyRecord = {
       key,
       status: 'processing',
       response: null,
@@ -144,15 +164,17 @@ export async function createIdempotencyRecord(key, requestData = {}) {
         [key, 'processing', JSON.stringify(requestData)]
       );
     } catch (dbError) {
+      const err = dbError as Error;
       // PostgreSQL insert failed, but Redis succeeded
       // Log warning but continue - Redis is primary
-      logger.warn({ key, error: dbError.message }, 'Failed to store idempotency key in PostgreSQL');
+      logger.warn({ key, error: err.message }, 'Failed to store idempotency key in PostgreSQL');
     }
 
     logger.debug({ key }, 'Created idempotency record');
     return true;
   } catch (error) {
-    logger.error({ key, error: error.message }, 'Error creating idempotency record');
+    const err = error as Error;
+    logger.error({ key, error: err.message }, 'Error creating idempotency record');
     // On error, return true to allow request to proceed
     return true;
   }
@@ -160,17 +182,17 @@ export async function createIdempotencyRecord(key, requestData = {}) {
 
 /**
  * Complete an idempotency record with response
- * @param {string} key - Idempotency key
- * @param {string} status - 'completed' | 'failed'
- * @param {Object} response - Response to cache
- * @returns {Promise<void>}
  */
-export async function completeIdempotencyRecord(key, status, response) {
+export async function completeIdempotencyRecord(
+  key: string,
+  status: 'completed' | 'failed',
+  response: unknown
+): Promise<void> {
   try {
     const redis = getRedis();
     const redisKey = `${REDIS_PREFIX}${key}`;
 
-    const record = {
+    const record: IdempotencyRecord = {
       key,
       status,
       response,
@@ -191,7 +213,8 @@ export async function completeIdempotencyRecord(key, status, response) {
 
     logger.debug({ key, status }, 'Completed idempotency record');
   } catch (error) {
-    logger.error({ key, error: error.message }, 'Error completing idempotency record');
+    const err = error as Error;
+    logger.error({ key, error: err.message }, 'Error completing idempotency record');
   }
 }
 
@@ -199,14 +222,19 @@ export async function completeIdempotencyRecord(key, status, response) {
  * Middleware for idempotency handling
  * Attaches idempotency functions to request object
  */
-export function idempotencyMiddleware(req, res, next) {
+export function idempotencyMiddleware(
+  req: ExtendedRequest,
+  res: Response,
+  next: NextFunction
+): void {
   // Only apply to POST/PUT/PATCH requests
   if (!['POST', 'PUT', 'PATCH'].includes(req.method)) {
-    return next();
+    next();
+    return;
   }
 
   // Extract idempotency key from headers
-  const idempotencyKey = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+  const idempotencyKey = (req.headers['idempotency-key'] as string) || (req.headers['x-idempotency-key'] as string);
 
   if (idempotencyKey) {
     req.idempotencyKey = idempotencyKey;
@@ -218,10 +246,8 @@ export function idempotencyMiddleware(req, res, next) {
 /**
  * Handle idempotent order placement
  * Returns cached response if duplicate, otherwise allows request
- * @param {Object} req - Express request object
- * @returns {Promise<{isDuplicate: boolean, response?: Object}>}
  */
-export async function handleIdempotentOrder(req) {
+export async function handleIdempotentOrder(req: ExtendedRequest): Promise<IdempotencyResult> {
   const key = req.idempotencyKey || generateIdempotencyKey(req);
 
   // Check for existing record
@@ -290,11 +316,8 @@ export async function handleIdempotentOrder(req) {
 
 /**
  * Complete order with idempotency record update
- * @param {Object} req - Express request object
- * @param {Object} order - Created order
- * @returns {Promise<void>}
  */
-export async function completeIdempotentOrder(req, order) {
+export async function completeIdempotentOrder(req: ExtendedRequest, order: unknown): Promise<void> {
   if (req.idempotencyKey) {
     await completeIdempotencyRecord(req.idempotencyKey, 'completed', { order });
   }
@@ -302,15 +325,12 @@ export async function completeIdempotentOrder(req, order) {
 
 /**
  * Mark order creation as failed
- * @param {Object} req - Express request object
- * @param {Object} error - Error that occurred
- * @returns {Promise<void>}
  */
-export async function failIdempotentOrder(req, error) {
+export async function failIdempotentOrder(req: ExtendedRequest, error: Error): Promise<void> {
   if (req.idempotencyKey) {
     await completeIdempotencyRecord(req.idempotencyKey, 'failed', {
       error: error.message,
-      code: error.code
+      code: (error as Error & { code?: string }).code
     });
   }
 }
@@ -319,7 +339,7 @@ export async function failIdempotentOrder(req, error) {
  * Cleanup expired idempotency keys from PostgreSQL
  * Run as a scheduled job
  */
-export async function cleanupExpiredIdempotencyKeys() {
+export async function cleanupExpiredIdempotencyKeys(): Promise<number> {
   try {
     const cutoffDate = new Date(Date.now() - IDEMPOTENCY_TTL_SECONDS * 1000);
 
@@ -329,9 +349,10 @@ export async function cleanupExpiredIdempotencyKeys() {
     );
 
     logger.info({ deleted: result.rowCount }, 'Cleaned up expired idempotency keys');
-    return result.rowCount;
+    return result.rowCount || 0;
   } catch (error) {
-    logger.error({ error: error.message }, 'Error cleaning up idempotency keys');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Error cleaning up idempotency keys');
     throw error;
   }
 }

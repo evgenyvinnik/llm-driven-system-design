@@ -84,9 +84,3 @@ export {
   closeQueue,
   getQueueStats,
 } from './queue.js';
-
-// Types
-export type { TranscodeJob, QueueStats } from './queue.js';
-export type { CircuitBreakerHealth, CircuitOpenError } from './circuitBreaker.js';
-export type { RetryOptions } from './retry.js';
-export type { RateLimitStatus } from './rateLimiter.js';

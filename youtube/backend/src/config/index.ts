@@ -1,57 +1,9 @@
-export interface Config {
-  port: number;
-  postgres: {
-    host: string;
-    port: number;
-    database: string;
-    user: string;
-    password: string;
-  };
-  redis: {
-    host: string;
-    port: number;
-  };
-  minio: {
-    endpoint: string;
-    accessKey: string;
-    secretKey: string;
-    buckets: {
-      raw: string;
-      processed: string;
-      thumbnails: string;
-    };
-  };
-  rabbitmq: {
-    url: string;
-    queues: {
-      transcode: string;
-    };
-  };
-  cors: {
-    origin: string;
-    credentials: boolean;
-  };
-  session: {
-    secret: string;
-    maxAge: number;
-  };
-  upload: {
-    maxFileSize: number;
-    chunkSize: number;
-    allowedMimeTypes: string[];
-  };
-  transcoding: {
-    resolutions: string[];
-    simulatedDuration: number;
-  };
-}
-
-const config: Config = {
-  port: parseInt(process.env.PORT || '3000', 10),
+const config = {
+  port: process.env.PORT || 3000,
 
   postgres: {
     host: process.env.POSTGRES_HOST || 'localhost',
-    port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
+    port: parseInt(process.env.POSTGRES_PORT || '5432'),
     database: process.env.POSTGRES_DB || 'youtube',
     user: process.env.POSTGRES_USER || 'youtube',
     password: process.env.POSTGRES_PASSWORD || 'youtube_secret',
@@ -59,7 +11,7 @@ const config: Config = {
 
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    port: parseInt(process.env.REDIS_PORT || '6379'),
   },
 
   minio: {

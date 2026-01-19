@@ -1,6 +1,5 @@
-import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { sessionGet, sessionSet, sessionDelete, SessionData } from '../utils/redis.js';
+import { sessionGet, sessionSet, sessionDelete } from '../utils/redis.js';
 import { query } from '../utils/db.js';
 import logger, { logEvent } from '../shared/logger.js';
 
@@ -19,12 +18,10 @@ export const ROLES = {
   VIEWER: 'viewer',
   CREATOR: 'creator',
   ADMIN: 'admin',
-} as const;
-
-export type Role = (typeof ROLES)[keyof typeof ROLES];
+};
 
 // Role hierarchy for permission checks
-const ROLE_HIERARCHY: Record<Role, number> = {
+const ROLE_HIERARCHY = {
   [ROLES.VIEWER]: 1,
   [ROLES.CREATOR]: 2,
   [ROLES.ADMIN]: 3,
@@ -56,12 +53,10 @@ export const PERMISSIONS = {
   // Admin permissions
   ADMIN_DASHBOARD: 'admin:dashboard',
   ADMIN_TRANSCODE: 'admin:transcode',
-} as const;
-
-export type Permission = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
+};
 
 // Role to permissions mapping
-const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
+const ROLE_PERMISSIONS = {
   [ROLES.VIEWER]: [
     PERMISSIONS.VIDEO_VIEW,
     PERMISSIONS.CHANNEL_VIEW,
@@ -70,23 +65,36 @@ const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     PERMISSIONS.USER_SUBSCRIBE,
   ],
   [ROLES.CREATOR]: [
-    PERMISSIONS.VIDEO_VIEW,
-    PERMISSIONS.CHANNEL_VIEW,
-    PERMISSIONS.COMMENT_CREATE,
-    PERMISSIONS.COMMENT_DELETE_OWN,
-    PERMISSIONS.USER_SUBSCRIBE,
+    // Inherits viewer permissions
+    ...ROLE_PERMISSIONS?.[ROLES.VIEWER] || [],
     PERMISSIONS.VIDEO_UPLOAD,
     PERMISSIONS.VIDEO_EDIT_OWN,
     PERMISSIONS.VIDEO_DELETE_OWN,
     PERMISSIONS.CHANNEL_EDIT_OWN,
   ],
-  [ROLES.ADMIN]: Object.values(PERMISSIONS) as Permission[],
+  [ROLES.ADMIN]: [
+    // All permissions
+    ...Object.values(PERMISSIONS),
+  ],
 };
+
+// Fix circular reference for creator permissions
+ROLE_PERMISSIONS[ROLES.CREATOR] = [
+  PERMISSIONS.VIDEO_VIEW,
+  PERMISSIONS.CHANNEL_VIEW,
+  PERMISSIONS.COMMENT_CREATE,
+  PERMISSIONS.COMMENT_DELETE_OWN,
+  PERMISSIONS.USER_SUBSCRIBE,
+  PERMISSIONS.VIDEO_UPLOAD,
+  PERMISSIONS.VIDEO_EDIT_OWN,
+  PERMISSIONS.VIDEO_DELETE_OWN,
+  PERMISSIONS.CHANNEL_EDIT_OWN,
+];
 
 /**
  * Check if a role has a specific permission
  */
-export function hasPermission(role: Role, permission: Permission): boolean {
+export function hasPermission(role, permission) {
   const permissions = ROLE_PERMISSIONS[role] || [];
   return permissions.includes(permission);
 }
@@ -94,20 +102,10 @@ export function hasPermission(role: Role, permission: Permission): boolean {
 /**
  * Check if role1 is at least as high as role2 in hierarchy
  */
-export function isRoleAtLeast(userRole: Role, requiredRole: Role): boolean {
+export function isRoleAtLeast(userRole, requiredRole) {
   const userLevel = ROLE_HIERARCHY[userRole] || 0;
   const requiredLevel = ROLE_HIERARCHY[requiredRole] || 0;
   return userLevel >= requiredLevel;
-}
-
-// Extend Express Request to include user
-declare global {
-  namespace Express {
-    interface Request {
-      user?: SessionData;
-      sessionId?: string;
-    }
-  }
 }
 
 // ============ Auth Middleware ============
@@ -115,21 +113,19 @@ declare global {
 /**
  * Authentication middleware - checks for valid session
  */
-export const authenticate = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const authenticate = async (req, res, next) => {
   try {
-    const sessionId = req.cookies?.sessionId as string | undefined;
+    const sessionId = req.cookies?.sessionId;
 
     if (!sessionId) {
-      res.status(401).json({ error: 'Not authenticated' });
-      return;
+      return res.status(401).json({ error: 'Not authenticated' });
     }
 
     const session = await sessionGet(sessionId);
 
     if (!session) {
       res.clearCookie('sessionId');
-      res.status(401).json({ error: 'Session expired' });
-      return;
+      return res.status(401).json({ error: 'Session expired' });
     }
 
     // Attach user to request
@@ -143,7 +139,7 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
 
     next();
   } catch (error) {
-    (req.log || logger).error({ error: (error as Error).message }, 'Auth middleware error');
+    (req.log || logger).error({ error: error.message }, 'Auth middleware error');
     res.status(500).json({ error: 'Authentication error' });
   }
 };
@@ -151,9 +147,9 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
 /**
  * Optional auth - attaches user if logged in, but doesn't require it
  */
-export const optionalAuth = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const optionalAuth = async (req, res, next) => {
   try {
-    const sessionId = req.cookies?.sessionId as string | undefined;
+    const sessionId = req.cookies?.sessionId;
 
     if (sessionId) {
       const session = await sessionGet(sessionId);
@@ -180,25 +176,22 @@ export const optionalAuth = async (req: Request, res: Response, next: NextFuncti
 /**
  * Require specific role(s)
  *
- * @param roles - Required role(s)
- * @returns Express middleware
+ * @param {string|string[]} roles - Required role(s)
+ * @returns {Function} Express middleware
  *
  * @example
  * router.post('/videos', authenticate, requireRole('creator'), createVideo);
  * router.delete('/admin/users/:id', authenticate, requireRole(['admin']), deleteUser);
  */
-export const requireRole = (
-  roles: Role | Role[]
-): ((req: Request, res: Response, next: NextFunction) => void) => {
+export const requireRole = (roles) => {
   const allowedRoles = Array.isArray(roles) ? roles : [roles];
 
-  return (req: Request, res: Response, next: NextFunction): void => {
+  return (req, res, next) => {
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const userRole = (req.user.role as Role) || ROLES.VIEWER;
+    const userRole = req.user.role || ROLES.VIEWER;
 
     // Check if user's role is in the allowed list
     if (!allowedRoles.includes(userRole)) {
@@ -206,20 +199,16 @@ export const requireRole = (
       const hasHigherRole = allowedRoles.some((role) => isRoleAtLeast(userRole, role));
 
       if (!hasHigherRole) {
-        (req.log || logger).warn(
-          {
-            event: 'authorization_denied',
-            userRole,
-            requiredRoles: allowedRoles,
-          },
-          'Access denied: insufficient role'
-        );
+        (req.log || logger).warn({
+          event: 'authorization_denied',
+          userRole,
+          requiredRoles: allowedRoles,
+        }, 'Access denied: insufficient role');
 
-        res.status(403).json({
+        return res.status(403).json({
           error: 'Access denied',
           message: `Required role: ${allowedRoles.join(' or ')}`,
         });
-        return;
       }
     }
 
@@ -230,35 +219,28 @@ export const requireRole = (
 /**
  * Require specific permission
  *
- * @param permission - Required permission
- * @returns Express middleware
+ * @param {string} permission - Required permission
+ * @returns {Function} Express middleware
  */
-export const requirePermission = (
-  permission: Permission
-): ((req: Request, res: Response, next: NextFunction) => void) => {
-  return (req: Request, res: Response, next: NextFunction): void => {
+export const requirePermission = (permission) => {
+  return (req, res, next) => {
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const userRole = (req.user.role as Role) || ROLES.VIEWER;
+    const userRole = req.user.role || ROLES.VIEWER;
 
     if (!hasPermission(userRole, permission)) {
-      (req.log || logger).warn(
-        {
-          event: 'authorization_denied',
-          userRole,
-          requiredPermission: permission,
-        },
-        'Access denied: insufficient permission'
-      );
+      (req.log || logger).warn({
+        event: 'authorization_denied',
+        userRole,
+        requiredPermission: permission,
+      }, 'Access denied: insufficient permission');
 
-      res.status(403).json({
+      return res.status(403).json({
         error: 'Access denied',
         message: `Required permission: ${permission}`,
       });
-      return;
     }
 
     next();
@@ -275,35 +257,27 @@ export const requireAdmin = requireRole(ROLES.ADMIN);
  */
 export const requireCreator = requireRole([ROLES.CREATOR, ROLES.ADMIN]);
 
-type ResourceType = 'video' | 'comment' | 'channel';
-
 /**
  * Check resource ownership
  *
- * @param resourceType - Type of resource ('video', 'comment', 'channel')
- * @returns Express middleware
+ * @param {string} resourceType - Type of resource ('video', 'comment', 'channel')
+ * @returns {Function} Express middleware
  */
-export const requireOwnership = (
-  resourceType: ResourceType
-): ((req: Request, res: Response, next: NextFunction) => Promise<void>) => {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const requireOwnership = (resourceType) => {
+  return async (req, res, next) => {
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ error: 'Authentication required' });
     }
 
     // Admins bypass ownership check
     if (req.user.role === ROLES.ADMIN) {
-      next();
-      return;
+      return next();
     }
 
-    const resourceId =
-      req.params.videoId || req.params.channelId || req.params.commentId || req.params.id;
+    const resourceId = req.params.videoId || req.params.channelId || req.params.commentId || req.params.id;
 
     if (!resourceId) {
-      res.status(400).json({ error: 'Resource ID required' });
-      return;
+      return res.status(400).json({ error: 'Resource ID required' });
     }
 
     try {
@@ -311,7 +285,10 @@ export const requireOwnership = (
 
       switch (resourceType) {
         case 'video': {
-          const result = await query('SELECT channel_id FROM videos WHERE id = $1', [resourceId]);
+          const result = await query(
+            'SELECT channel_id FROM videos WHERE id = $1',
+            [resourceId]
+          );
           if (result.rows.length > 0) {
             isOwner = result.rows[0].channel_id === req.user.id;
           }
@@ -319,7 +296,10 @@ export const requireOwnership = (
         }
 
         case 'comment': {
-          const result = await query('SELECT user_id FROM comments WHERE id = $1', [resourceId]);
+          const result = await query(
+            'SELECT user_id FROM comments WHERE id = $1',
+            [resourceId]
+          );
           if (result.rows.length > 0) {
             isOwner = result.rows[0].user_id === req.user.id;
           }
@@ -327,40 +307,35 @@ export const requireOwnership = (
         }
 
         case 'channel': {
-          const result = await query('SELECT id FROM channels WHERE id = $1 AND user_id = $2', [
-            resourceId,
-            req.user.id,
-          ]);
+          const result = await query(
+            'SELECT id FROM channels WHERE id = $1 AND user_id = $2',
+            [resourceId, req.user.id]
+          );
           isOwner = result.rows.length > 0;
           break;
         }
 
         default:
-          res.status(400).json({ error: 'Invalid resource type' });
-          return;
+          return res.status(400).json({ error: 'Invalid resource type' });
       }
 
       if (!isOwner) {
-        (req.log || logger).warn(
-          {
-            event: 'ownership_denied',
-            resourceType,
-            resourceId,
-            userId: req.user.id,
-          },
-          'Access denied: not resource owner'
-        );
+        (req.log || logger).warn({
+          event: 'ownership_denied',
+          resourceType,
+          resourceId,
+          userId: req.user.id,
+        }, 'Access denied: not resource owner');
 
-        res.status(403).json({
+        return res.status(403).json({
           error: 'Access denied',
           message: 'You do not own this resource',
         });
-        return;
       }
 
       next();
     } catch (error) {
-      (req.log || logger).error({ error: (error as Error).message }, 'Ownership check error');
+      (req.log || logger).error({ error: error.message }, 'Ownership check error');
       res.status(500).json({ error: 'Authorization error' });
     }
   };
@@ -368,21 +343,12 @@ export const requireOwnership = (
 
 // ============ Session Management ============
 
-interface User {
-  id: string;
-  username: string;
-  email: string;
-  channel_name: string;
-  role?: string;
-  avatar_url: string | null;
-}
-
 /**
  * Create session for user
  */
-export const createSession = async (user: User): Promise<string> => {
+export const createSession = async (user) => {
   const sessionId = uuidv4();
-  const sessionData: SessionData = {
+  const sessionData = {
     id: user.id,
     username: user.username,
     email: user.email,
@@ -399,7 +365,7 @@ export const createSession = async (user: User): Promise<string> => {
 /**
  * Destroy session
  */
-export const destroySession = async (sessionId: string): Promise<void> => {
+export const destroySession = async (sessionId) => {
   await sessionDelete(sessionId);
 };
 
@@ -408,23 +374,24 @@ export const destroySession = async (sessionId: string): Promise<void> => {
 /**
  * Login handler
  */
-export const login = async (req: Request, res: Response): Promise<void> => {
+export const login = async (req, res) => {
   try {
     const { username, password } = req.body;
 
     if (!username || !password) {
-      res.status(400).json({ error: 'Username and password are required' });
-      return;
+      return res.status(400).json({ error: 'Username and password are required' });
     }
 
-    const result = await query('SELECT * FROM users WHERE username = $1', [username]);
+    const result = await query(
+      'SELECT * FROM users WHERE username = $1',
+      [username]
+    );
 
     if (result.rows.length === 0) {
-      res.status(401).json({ error: 'Invalid credentials' });
-      return;
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const user = result.rows[0] as User;
+    const user = result.rows[0];
 
     // Simple password verification (in production, use bcrypt.compare)
     // For demo, any password works for existing users
@@ -454,7 +421,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       },
     });
   } catch (error) {
-    (req.log || logger).error({ error: (error as Error).message }, 'Login error');
+    (req.log || logger).error({ error: error.message }, 'Login error');
     res.status(500).json({ error: 'Login failed' });
   }
 };
@@ -462,28 +429,26 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 /**
  * Register handler
  */
-export const register = async (req: Request, res: Response): Promise<void> => {
+export const register = async (req, res) => {
   try {
     const { username, email, password, channelName, role } = req.body;
 
     if (!username || !email || !password) {
-      res.status(400).json({ error: 'Username, email, and password are required' });
-      return;
+      return res.status(400).json({ error: 'Username, email, and password are required' });
     }
 
     // Check if user exists
-    const existingUser = await query('SELECT id FROM users WHERE username = $1 OR email = $2', [
-      username,
-      email,
-    ]);
+    const existingUser = await query(
+      'SELECT id FROM users WHERE username = $1 OR email = $2',
+      [username, email]
+    );
 
     if (existingUser.rows.length > 0) {
-      res.status(409).json({ error: 'Username or email already exists' });
-      return;
+      return res.status(409).json({ error: 'Username or email already exists' });
     }
 
     // Determine role - default to viewer, allow creator, block admin
-    let userRole: Role = ROLES.VIEWER;
+    let userRole = ROLES.VIEWER;
     if (role === ROLES.CREATOR) {
       userRole = ROLES.CREATOR;
     }
@@ -497,7 +462,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       [username, email, 'demo_hash', channelName || username, userRole]
     );
 
-    const user = result.rows[0] as User;
+    const user = result.rows[0];
     const sessionId = await createSession(user);
 
     res.cookie('sessionId', sessionId, {
@@ -523,7 +488,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       },
     });
   } catch (error) {
-    (req.log || logger).error({ error: (error as Error).message }, 'Register error');
+    (req.log || logger).error({ error: error.message }, 'Register error');
     res.status(500).json({ error: 'Registration failed' });
   }
 };
@@ -531,9 +496,9 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 /**
  * Logout handler
  */
-export const logout = async (req: Request, res: Response): Promise<void> => {
+export const logout = async (req, res) => {
   try {
-    const sessionId = req.cookies?.sessionId as string | undefined;
+    const sessionId = req.cookies?.sessionId;
 
     if (sessionId) {
       await destroySession(sessionId);
@@ -542,7 +507,7 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
     res.clearCookie('sessionId');
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    (req.log || logger).error({ error: (error as Error).message }, 'Logout error');
+    (req.log || logger).error({ error: error.message }, 'Logout error');
     res.status(500).json({ error: 'Logout failed' });
   }
 };
@@ -550,21 +515,20 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
 /**
  * Get current user
  */
-export const getCurrentUser = async (req: Request, res: Response): Promise<void> => {
+export const getCurrentUser = async (req, res) => {
   res.json({ user: req.user });
 };
 
 /**
  * Update user role (admin only)
  */
-export const updateUserRole = async (req: Request, res: Response): Promise<void> => {
+export const updateUserRole = async (req, res) => {
   try {
     const { userId } = req.params;
     const { role } = req.body;
 
     if (!Object.values(ROLES).includes(role)) {
-      res.status(400).json({ error: 'Invalid role' });
-      return;
+      return res.status(400).json({ error: 'Invalid role' });
     }
 
     const result = await query(
@@ -573,23 +537,19 @@ export const updateUserRole = async (req: Request, res: Response): Promise<void>
     );
 
     if (result.rows.length === 0) {
-      res.status(404).json({ error: 'User not found' });
-      return;
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    (req.log || logger).info(
-      {
-        event: 'user_role_updated',
-        targetUserId: userId,
-        newRole: role,
-        adminId: req.user?.id,
-      },
-      `User role updated to ${role}`
-    );
+    (req.log || logger).info({
+      event: 'user_role_updated',
+      targetUserId: userId,
+      newRole: role,
+      adminId: req.user.id,
+    }, `User role updated to ${role}`);
 
     res.json({ user: result.rows[0] });
   } catch (error) {
-    (req.log || logger).error({ error: (error as Error).message }, 'Update role error');
+    (req.log || logger).error({ error: error.message }, 'Update role error');
     res.status(500).json({ error: 'Failed to update role' });
   }
 };

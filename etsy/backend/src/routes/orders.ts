@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
@@ -11,15 +11,87 @@ import {
   orderValue,
   checkoutDuration,
   ordersByShop,
-  cartOperations,
 } from '../shared/metrics.js';
 import { orderLogger as logger } from '../shared/logger.js';
-import { paymentCircuitBreaker, createCircuitBreaker } from '../shared/circuit-breaker.js';
+import { paymentCircuitBreaker } from '../shared/circuit-breaker.js';
 
 const router = Router();
 
+interface PaymentResult {
+  success: boolean;
+  transactionId?: string;
+  amount?: number;
+  timestamp?: string;
+  queued?: boolean;
+  message?: string;
+}
+
+interface CartItem {
+  id: number;
+  product_id: number;
+  title: string;
+  price: string;
+  quantity: number;
+  available: number;
+  images: string[];
+  shipping_price: string;
+  shop_id: number;
+  category_id: number | null;
+}
+
+interface ShopGroup {
+  shopId: number;
+  items: CartItem[];
+  subtotal: number;
+  shippingTotal: number;
+}
+
+interface OrderRow {
+  id: number;
+  buyer_id: number;
+  shop_id: number;
+  order_number: string;
+  subtotal: string;
+  shipping: string;
+  total: string;
+  shipping_address: object;
+  notes: string | null;
+  status: string;
+  tracking_number: string | null;
+  payment_transaction_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+  shop_name?: string;
+  shop_slug?: string;
+  shop_location?: string;
+  buyer_email?: string;
+  buyer_name?: string;
+  items?: OrderItemRow[];
+}
+
+interface OrderItemRow {
+  id: number;
+  order_id: number;
+  product_id: number;
+  title: string;
+  price: string;
+  quantity: number;
+  image_url: string | null;
+}
+
+interface CheckoutBody {
+  shippingAddress: object;
+  notes?: string;
+  paymentDetails?: object;
+}
+
+interface UpdateOrderStatusBody {
+  status: string;
+  trackingNumber?: string;
+}
+
 // Simulated payment processing function (would be replaced with real payment gateway)
-async function processPayment(orderId, amount, paymentDetails) {
+async function processPayment(_orderId: string, amount: number, _paymentDetails: object): Promise<PaymentResult> {
   // Simulate payment processing delay
   await new Promise((resolve) => setTimeout(resolve, 100));
 
@@ -38,12 +110,12 @@ async function processPayment(orderId, amount, paymentDetails) {
 
 // Initialize payment circuit breaker
 paymentCircuitBreaker.init(
-  async (orderId, amount, paymentDetails) => {
+  async (orderId: string, amount: number, paymentDetails: object) => {
     return await processPayment(orderId, amount, paymentDetails);
   },
-  async (orderId, amount, paymentDetails) => {
+  async (_orderId: string, amount: number, _paymentDetails: object) => {
     // Fallback: Queue payment for later processing
-    logger.warn({ orderId, amount }, 'Payment service unavailable, queueing for retry');
+    logger.warn({ orderId: _orderId, amount }, 'Payment service unavailable, queueing for retry');
     return {
       success: false,
       queued: true,
@@ -53,9 +125,9 @@ paymentCircuitBreaker.init(
 );
 
 // Get user's orders (as buyer)
-router.get('/', isAuthenticated, async (req, res) => {
+router.get('/', isAuthenticated, async (req: Request, res: Response) => {
   try {
-    const { status, limit = 20, offset = 0 } = req.query;
+    const { status, limit = '20', offset = '0' } = req.query as { status?: string; limit?: string; offset?: string };
 
     let query = `
       SELECT o.*, s.name as shop_name, s.slug as shop_slug
@@ -63,7 +135,7 @@ router.get('/', isAuthenticated, async (req, res) => {
       JOIN shops s ON o.shop_id = s.id
       WHERE o.buyer_id = $1
     `;
-    const params = [req.session.userId];
+    const params: (number | string)[] = [req.session.userId!];
 
     if (status) {
       query += ` AND o.status = $${params.length + 1}`;
@@ -73,11 +145,11 @@ router.get('/', isAuthenticated, async (req, res) => {
     query += ` ORDER BY o.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const result = await db.query(query, params);
+    const result = await db.query<OrderRow>(query, params);
 
     // Get order items for each order
     for (const order of result.rows) {
-      const itemsResult = await db.query(
+      const itemsResult = await db.query<OrderItemRow>(
         'SELECT * FROM order_items WHERE order_id = $1',
         [order.id]
       );
@@ -92,11 +164,11 @@ router.get('/', isAuthenticated, async (req, res) => {
 });
 
 // Get single order
-router.get('/:id', isAuthenticated, async (req, res) => {
+router.get('/:id', isAuthenticated, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
 
-    const result = await db.query(
+    const result = await db.query<OrderRow>(
       `SELECT o.*, s.name as shop_name, s.slug as shop_slug, s.location as shop_location,
               u.email as buyer_email, u.full_name as buyer_name
        FROM orders o
@@ -121,7 +193,7 @@ router.get('/:id', isAuthenticated, async (req, res) => {
     }
 
     // Get order items
-    const itemsResult = await db.query(
+    const itemsResult = await db.query<OrderItemRow>(
       'SELECT * FROM order_items WHERE order_id = $1',
       [order.id]
     );
@@ -139,7 +211,7 @@ router.post(
   '/checkout',
   isAuthenticated,
   idempotencyMiddleware({ required: false, methods: ['POST'] }),
-  async (req, res) => {
+  async (req: Request<object, object, CheckoutBody>, res: Response) => {
     const checkoutStart = Date.now();
 
     try {
@@ -150,7 +222,7 @@ router.post(
       }
 
       // Get cart items
-      const cartResult = await db.query(
+      const cartResult = await db.query<CartItem>(
         `SELECT ci.*, p.title, p.price, p.quantity as available, p.images, p.shipping_price, p.shop_id, p.category_id
          FROM cart_items ci
          JOIN products p ON ci.product_id = p.id
@@ -172,7 +244,7 @@ router.post(
       }
 
       // Group by shop
-      const byShop = cartResult.rows.reduce((acc, item) => {
+      const byShop = cartResult.rows.reduce<Record<number, ShopGroup>>((acc, item) => {
         if (!acc[item.shop_id]) {
           acc[item.shop_id] = {
             shopId: item.shop_id,
@@ -193,9 +265,9 @@ router.post(
       );
 
       // Process payment through circuit breaker
-      let paymentResult;
+      let paymentResult: PaymentResult;
       try {
-        paymentResult = await paymentCircuitBreaker.fire(
+        paymentResult = await paymentCircuitBreaker.fire<[string, number, object], PaymentResult>(
           `ORDER-${Date.now()}`,
           totalAmount,
           paymentDetails || {}
@@ -204,7 +276,7 @@ router.post(
         logger.error({ error, userId: req.session.userId }, 'Payment processing failed');
         return res.status(402).json({
           error: 'Payment processing failed. Please try again.',
-          details: error.message,
+          details: error instanceof Error ? error.message : 'Unknown error',
         });
       }
 
@@ -216,7 +288,7 @@ router.post(
       }
 
       const client = await db.getClient();
-      const createdOrders = [];
+      const createdOrders: OrderRow[] = [];
 
       try {
         await client.query('BEGIN');
@@ -228,7 +300,7 @@ router.post(
 
           const orderStatus = paymentResult.queued ? 'payment_pending' : 'pending';
 
-          const orderResult = await client.query(
+          const orderResult = await client.query<OrderRow>(
             `INSERT INTO orders (buyer_id, shop_id, order_number, subtotal, shipping, total, shipping_address, notes, status, payment_transaction_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *`,
@@ -336,7 +408,7 @@ router.post(
 );
 
 // Update order status (seller only)
-router.put('/:id/status', isAuthenticated, async (req, res) => {
+router.put('/:id/status', isAuthenticated, async (req: Request<{ id: string }, object, UpdateOrderStatusBody>, res: Response) => {
   try {
     const { id } = req.params;
     const { status, trackingNumber } = req.body;
@@ -347,7 +419,7 @@ router.put('/:id/status', isAuthenticated, async (req, res) => {
     }
 
     // Get order and check shop ownership
-    const orderResult = await db.query('SELECT shop_id, status as current_status FROM orders WHERE id = $1', [parseInt(id)]);
+    const orderResult = await db.query<{ shop_id: number; current_status: string }>('SELECT shop_id, status as current_status FROM orders WHERE id = $1', [parseInt(id)]);
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ error: 'Order not found' });
     }
@@ -359,7 +431,7 @@ router.put('/:id/status', isAuthenticated, async (req, res) => {
       return res.status(403).json({ error: 'You do not own this shop' });
     }
 
-    const result = await db.query(
+    const result = await db.query<OrderRow>(
       `UPDATE orders SET
         status = $1,
         tracking_number = COALESCE($2, tracking_number),
@@ -387,13 +459,13 @@ router.put('/:id/status', isAuthenticated, async (req, res) => {
 });
 
 // Cancel order (buyer only, if still pending)
-router.post('/:id/cancel', isAuthenticated, async (req, res) => {
+router.post('/:id/cancel', isAuthenticated, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
     const orderId = parseInt(id);
 
     // Get order
-    const orderResult = await db.query(
+    const orderResult = await db.query<OrderRow>(
       'SELECT * FROM orders WHERE id = $1',
       [orderId]
     );
@@ -428,7 +500,7 @@ router.post('/:id/cancel', isAuthenticated, async (req, res) => {
       );
 
       // Restore product quantities
-      const itemsResult = await client.query(
+      const itemsResult = await client.query<{ product_id: number; quantity: number }>(
         'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
         [orderId]
       );

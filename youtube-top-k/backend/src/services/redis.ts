@@ -178,7 +178,7 @@ export class WindowedViewCounter {
    */
   async getMultipleTotalViews(videoIds: string[]): Promise<Map<string, number>> {
     const redisClient = await getRedisClient();
-    const counts = await redisClient.hMGet('views:total', videoIds);
+    const counts = await redisClient.hmGet('views:total', videoIds);
     return new Map(videoIds.map((id, i) => [id, parseInt(counts[i] || '0', 10)]));
   }
 }

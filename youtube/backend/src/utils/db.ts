@@ -1,7 +1,9 @@
-import pg, { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+import pg from 'pg';
 import config from '../config/index.js';
 
-const pool: Pool = new pg.Pool({
+const { Pool } = pg;
+
+const pool = new Pool({
   host: config.postgres.host,
   port: config.postgres.port,
   database: config.postgres.database,
@@ -12,16 +14,13 @@ const pool: Pool = new pg.Pool({
   connectionTimeoutMillis: 2000,
 });
 
-pool.on('error', (err: Error) => {
+pool.on('error', (err) => {
   console.error('Unexpected database pool error:', err);
 });
 
-export const query = async <T extends QueryResultRow = QueryResultRow>(
-  text: string,
-  params?: unknown[]
-): Promise<QueryResult<T>> => {
+export const query = async (text, params) => {
   const start = Date.now();
-  const result = await pool.query<T>(text, params);
+  const result = await pool.query(text, params);
   const duration = Date.now() - start;
   if (duration > 100) {
     console.log('Slow query:', { text, duration, rows: result.rowCount });
@@ -29,14 +28,12 @@ export const query = async <T extends QueryResultRow = QueryResultRow>(
   return result;
 };
 
-export const getClient = async (): Promise<PoolClient> => {
+export const getClient = async () => {
   const client = await pool.connect();
   return client;
 };
 
-export const transaction = async <T>(
-  callback: (client: PoolClient) => Promise<T>
-): Promise<T> => {
+export const transaction = async (callback) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
