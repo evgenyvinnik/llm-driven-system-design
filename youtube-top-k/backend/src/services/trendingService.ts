@@ -3,7 +3,7 @@ import { WindowedViewCounter, getRedisClient, TopKResult } from './redis.js';
 import { query } from '../models/database.js';
 
 // Import shared modules
-import { WINDOW_CONFIG, TOP_K_CONFIG, CACHE_CONFIG, RETENTION_CONFIG } from '../shared/config.js';
+import { WINDOW_CONFIG, TOP_K_CONFIG, _CACHE_CONFIG, RETENTION_CONFIG } from '../shared/config.js';
 import logger, { logTrendingCalculation, logCacheAccess, logViewEvent, logError } from '../shared/logger.js';
 import {
   viewEventsTotal,

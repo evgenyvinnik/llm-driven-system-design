@@ -12,8 +12,8 @@ import { RateLimiter } from './base.js';
 import { FixedWindowLimiter } from './fixed-window.js';
 import { SlidingWindowLimiter } from './sliding-window.js';
 import { SlidingLogLimiter } from './sliding-log.js';
-import { TokenBucketLimiter, TokenBucketOptions } from './token-bucket.js';
-import { LeakyBucketLimiter, LeakyBucketOptions } from './leaky-bucket.js';
+import { TokenBucketLimiter, _TokenBucketOptions } from './token-bucket.js';
+import { LeakyBucketLimiter, _LeakyBucketOptions } from './leaky-bucket.js';
 
 // Re-export all algorithm classes for direct usage
 export { RateLimiter, RateLimiterOptions } from './base.js';

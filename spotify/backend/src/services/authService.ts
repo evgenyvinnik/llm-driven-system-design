@@ -1,6 +1,6 @@
 import { pool } from '../db.js';
 import bcrypt from 'bcrypt';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as _uuidv4 } from 'uuid';
 
 const SALT_ROUNDS = 10;
 
@@ -47,7 +47,7 @@ export async function login({ email, password }) {
   }
 
   // Return user without password
-  const { password_hash, ...safeUser } = user;
+  const { _password_hash, ...safeUser } = user;
   return safeUser;
 }
 

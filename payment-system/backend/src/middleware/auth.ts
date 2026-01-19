@@ -105,7 +105,7 @@ export async function optionalAuth(
     }
 
     next();
-  } catch (error) {
+  } catch (_error) {
     // Continue without auth on error
     next();
   }

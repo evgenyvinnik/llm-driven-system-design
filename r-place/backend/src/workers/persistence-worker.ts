@@ -142,7 +142,7 @@ async function start(): Promise<void> {
         const metrics = await getMetrics();
         res.set('Content-Type', getMetricsContentType());
         res.send(metrics);
-      } catch (error) {
+      } catch (_error) {
         res.status(500).send('Failed to collect metrics');
       }
     });

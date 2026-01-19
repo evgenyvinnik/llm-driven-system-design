@@ -174,7 +174,7 @@ async function seed() {
         index: 'users',
         body: { query: { match_all: {} } },
       });
-    } catch (e) {
+    } catch (_e) {
       // Index might not exist yet
     }
 

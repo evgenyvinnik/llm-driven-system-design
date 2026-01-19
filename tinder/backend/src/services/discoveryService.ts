@@ -1,5 +1,5 @@
 import { pool, redis, elasticsearch } from '../db/index.js';
-import type { DiscoveryCard, Photo } from '../types/index.js';
+import type { DiscoveryCard, _Photo } from '../types/index.js';
 import { UserService } from './userService.js';
 
 /**

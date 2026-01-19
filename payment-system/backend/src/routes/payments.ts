@@ -19,7 +19,7 @@ import { logger } from '../shared/index.js';
 const router = Router();
 const paymentService = new PaymentService();
 const refundService = new RefundService();
-const chargebackService = new ChargebackService();
+const _chargebackService = new ChargebackService();
 const ledgerService = new LedgerService();
 
 /**

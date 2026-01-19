@@ -89,7 +89,7 @@ export class RefundService {
     clientInfo?: { ipAddress?: string; userAgent?: string }
   ): Promise<Refund> {
     const startTime = Date.now();
-    const { amount, reason, idempotency_key } = request;
+    const { _amount, _reason, idempotency_key } = request;
 
     // Use shared idempotency wrapper for refund operations
     const { result, fromCache } = await withIdempotency<Refund>(
@@ -168,7 +168,7 @@ export class RefundService {
     const isFullRefund = totalRefunded + refundAmount === transaction.amount;
 
     // Process refund atomically
-    const refund = await withTransaction(async (client: PoolClient) => {
+    const _refund = await withTransaction(async (client: PoolClient) => {
       // Create refund record
       const refundResult = await client.query<Refund>(
         `INSERT INTO refunds (id, idempotency_key, original_tx_id, merchant_id, amount, reason, status)

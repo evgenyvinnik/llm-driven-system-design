@@ -33,7 +33,7 @@
 import { pool } from '../db/pool.js';
 import { logger } from './logger.js';
 import { auditEventsTotal } from './metrics.js';
-import type { Request } from 'express';
+import type { _Request } from 'express';
 
 // Audit action types
 export const AUDIT_ACTIONS = {

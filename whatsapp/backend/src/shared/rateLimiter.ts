@@ -115,7 +115,7 @@ export function createRateLimiter(options: {
       // Skip rate limiting for health checks
       return req.path === '/health' || req.path === '/metrics';
     },
-    handler: (req, res, next, optionsUsed) => {
+    handler: (req, res, _next, _optionsUsed) => {
       // Track rate limit hits
       rateLimitHits.inc({ endpoint: options.endpoint });
 

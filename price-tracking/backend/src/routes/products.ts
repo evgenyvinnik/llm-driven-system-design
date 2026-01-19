@@ -44,7 +44,7 @@ router.get('/', async (req: Request, res: Response) => {
   try {
     const products = await getUserProducts(req.user!.id);
     res.json({ products });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch products' });
   }
 });
@@ -99,7 +99,7 @@ router.get('/:productId', async (req: Request, res: Response) => {
     }
 
     res.json({ product });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch product' });
   }
 });
@@ -148,7 +148,7 @@ router.delete('/:productId', async (req: Request, res: Response) => {
     }
 
     res.json({ message: 'Product removed from tracking' });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to remove product' });
   }
 });
@@ -169,7 +169,7 @@ router.get('/:productId/history', async (req: Request, res: Response) => {
 
     const history = await getPriceHistory(productId, startDate);
     res.json({ history });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch price history' });
   }
 });
@@ -187,7 +187,7 @@ router.get('/:productId/daily', async (req: Request, res: Response) => {
 
     const daily = await getDailyPrices(productId, parseInt(days as string, 10));
     res.json({ daily });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch daily prices' });
   }
 });

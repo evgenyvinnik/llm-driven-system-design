@@ -1,4 +1,4 @@
-import { query, queryOne, execute } from '../utils/db.js';
+import { query, queryOne, _execute } from '../utils/db.js';
 import { updateDriverRating } from './driverService.js';
 import { updateMerchantRating } from './merchantService.js';
 import type { Rating, CreateRatingInput, Order } from '../types/index.js';

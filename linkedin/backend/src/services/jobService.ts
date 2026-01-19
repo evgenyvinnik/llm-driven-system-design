@@ -2,7 +2,7 @@ import { query, queryOne, execute } from '../utils/db.js';
 import { indexJob, searchJobs as esSearchJobs } from '../utils/elasticsearch.js';
 import { getFirstDegreeConnections } from './connectionService.js';
 import { getUserSkills, getUserExperiences } from './userService.js';
-import type { Job, JobApplication, Company, Skill, User } from '../types/index.js';
+import type { Job, JobApplication, Company, Skill, _User } from '../types/index.js';
 
 /**
  * Creates a new company in the system.
@@ -524,7 +524,7 @@ export async function getRecommendedJobs(userId: number, limit = 10): Promise<Jo
   ]);
 
   const skillIds = userSkills.map(s => s.skill_id);
-  const industries = [...new Set(userExperiences.map(e => e.company_name))];
+  const _industries = [...new Set(userExperiences.map(e => e.company_name))];
 
   // Get jobs that match user's skills
   const jobs = await query<Job & { match_score: number }>(

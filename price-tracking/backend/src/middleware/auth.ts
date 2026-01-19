@@ -88,7 +88,7 @@ export async function optionalAuthMiddleware(
     }
 
     next();
-  } catch (error) {
+  } catch (_error) {
     // Don't fail for optional auth
     next();
   }

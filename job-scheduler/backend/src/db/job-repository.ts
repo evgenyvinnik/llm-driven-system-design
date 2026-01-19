@@ -27,7 +27,7 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
     try {
       const interval = cronParser.parseExpression(input.schedule);
       nextRunTime = interval.next().toDate();
-    } catch (error) {
+    } catch (_error) {
       throw new Error(`Invalid cron expression: ${input.schedule}`);
     }
   } else if (input.scheduled_at) {
@@ -224,7 +224,7 @@ export async function updateJob(id: string, input: UpdateJobInput): Promise<Job 
       updates.push(`next_run_time = $${paramIndex}`);
       params.push(interval.next().toDate());
       paramIndex++;
-    } catch (error) {
+    } catch (_error) {
       throw new Error(`Invalid cron expression: ${input.schedule}`);
     }
   }

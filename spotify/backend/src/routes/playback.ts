@@ -3,7 +3,7 @@ import playbackService from '../services/playbackService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { rateLimiters } from '../shared/rateLimit.js';
 import { playbackEventsTotal, streamCountsTotal, activeStreams } from '../shared/metrics.js';
-import type { AuthenticatedRequest, PlaybackEventType, PlaybackState, isPlaybackEventType } from '../types.js';
+import type { AuthenticatedRequest, PlaybackEventType, PlaybackState, _isPlaybackEventType } from '../types.js';
 
 const router = Router();
 

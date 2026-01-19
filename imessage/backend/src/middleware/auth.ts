@@ -9,6 +9,7 @@ export interface User {
   email: string;
   display_name: string;
   avatar_url: string | null;
+  [key: string]: unknown;
 }
 
 export interface AuthenticatedRequest extends LoggedRequest {

@@ -1,5 +1,5 @@
 import { pool, redis, elasticsearch } from '../db/index.js';
-import type { User, UserPreferences, Photo, UserProfile, DiscoveryCard } from '../types/index.js';
+import type { User, UserPreferences, Photo, UserProfile, _DiscoveryCard } from '../types/index.js';
 
 /**
  * Service responsible for user account management and profile operations.
@@ -321,7 +321,7 @@ export class UserService {
           last_active: new Date().toISOString(),
         },
       });
-    } catch (error) {
+    } catch (_error) {
       // Ignore Elasticsearch errors for activity updates
     }
   }

@@ -12,7 +12,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole, loadMembership } from '../middleware/rbac.js';
 import { getCachedWorkspace, invalidateWorkspaceCache, invalidateChannelCache } from '../services/cache.js';
 import { logger } from '../services/logger.js';
-import type { Workspace, WorkspaceMember } from '../types/index.js';
+import type { Workspace, _WorkspaceMember } from '../types/index.js';
 
 const router = Router();
 

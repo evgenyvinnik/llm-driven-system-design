@@ -72,7 +72,7 @@ async function checkPostgres(): Promise<DependencyStatus> {
   const start = Date.now()
 
   try {
-    const result = await Promise.race([
+    const _result = await Promise.race([
       pool.query('SELECT 1 as health_check'),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Timeout')), CHECK_TIMEOUT_MS)

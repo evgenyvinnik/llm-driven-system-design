@@ -115,7 +115,7 @@ export function generateDashManifest(
   durationSeconds: number
 ): string {
   const segmentDuration = 4;
-  const segmentCount = Math.ceil(durationSeconds / segmentDuration);
+  const _segmentCount = Math.ceil(durationSeconds / segmentDuration);
 
   const representations = qualities
     .map(

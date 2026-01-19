@@ -1,6 +1,7 @@
-import Redis from 'ioredis';
+import RedisClient from 'ioredis';
 import config from '../config.js';
 
+const Redis = RedisClient.default || RedisClient;
 const redis = new Redis(config.redis.url);
 
 redis.on('error', (err: Error) => {

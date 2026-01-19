@@ -1,4 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
+// @ts-expect-error - no types available for polyline
 import polyline from 'polyline';
 
 const parser = new XMLParser({
@@ -207,8 +208,10 @@ export function calculateMetrics(points: GpsPoint[]): ActivityMetrics {
 
   // Calculate elapsed time from first to last point
   let elapsedTime = 0;
-  if (points[0].timestamp && points[points.length - 1].timestamp) {
-    elapsedTime = (points[points.length - 1].timestamp.getTime() - points[0].timestamp.getTime()) / 1000;
+  const firstTimestamp = points[0].timestamp;
+  const lastTimestamp = points[points.length - 1].timestamp;
+  if (firstTimestamp && lastTimestamp) {
+    elapsedTime = (lastTimestamp.getTime() - firstTimestamp.getTime()) / 1000;
   }
 
   // Calculate average speed (distance / moving time)

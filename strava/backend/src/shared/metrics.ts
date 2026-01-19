@@ -228,11 +228,11 @@ export function getContentType(): string {
   return register.contentType;
 }
 
-interface RouteRequest extends Request {
+type RouteRequest = Request & {
   route?: {
     path: string;
   };
-}
+};
 
 /**
  * Record HTTP request metrics middleware

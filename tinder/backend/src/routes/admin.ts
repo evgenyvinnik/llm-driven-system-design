@@ -122,7 +122,7 @@ router.get('/users/:userId', requireAuth, requireAdmin, async (req: Request, res
       return;
     }
 
-    const { password_hash, ...safeProfile } = profile;
+    const { _password_hash, ...safeProfile } = profile;
     res.json(safeProfile);
   } catch (error) {
     console.error('Get user error:', error);

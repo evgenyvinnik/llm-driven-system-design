@@ -5,7 +5,7 @@
  *
  * @module utils/audit
  */
-import { query, queryOne, execute } from './db.js';
+import { query, queryOne, _execute } from './db.js';
 import { logger } from './logger.js';
 
 /**

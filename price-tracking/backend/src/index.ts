@@ -20,7 +20,7 @@ import pool from './db/pool.js';
 import redis from './db/redis.js';
 import { getMetrics, getContentType, httpRequestsTotal, httpRequestDuration } from './shared/metrics.js';
 import { getCircuitBreakerStates } from './shared/resilience.js';
-import { getPriceHistoryStats, getRetentionConfig } from './shared/retention.js';
+import { _getPriceHistoryStats, getRetentionConfig } from './shared/retention.js';
 
 dotenv.config();
 

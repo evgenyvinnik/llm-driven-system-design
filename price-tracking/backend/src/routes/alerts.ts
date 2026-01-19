@@ -32,7 +32,7 @@ router.get('/', async (req: Request, res: Response) => {
       parseInt(limit as string, 10)
     );
     res.json({ alerts });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch alerts' });
   }
 });
@@ -45,7 +45,7 @@ router.get('/count', async (req: Request, res: Response) => {
   try {
     const count = await getUnreadAlertCount(req.user!.id);
     res.json({ count });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch alert count' });
   }
 });
@@ -64,7 +64,7 @@ router.patch('/:alertId/read', async (req: Request, res: Response) => {
     }
 
     res.json({ alert });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to mark alert as read' });
   }
 });
@@ -77,7 +77,7 @@ router.post('/read-all', async (req: Request, res: Response) => {
   try {
     const count = await markAllAlertsAsRead(req.user!.id);
     res.json({ message: `Marked ${count} alerts as read` });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to mark alerts as read' });
   }
 });
@@ -96,7 +96,7 @@ router.delete('/:alertId', async (req: Request, res: Response) => {
     }
 
     res.json({ message: 'Alert deleted' });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to delete alert' });
   }
 });

@@ -224,7 +224,7 @@ export async function getSecondDegreeConnections(userId: number): Promise<Connec
 
   const firstDegreeSet = new Set(firstDegree);
 
-  const placeholders = firstDegree.map((_, i) => `$${i + 2}`).join(',');
+  const _placeholders = firstDegree.map((_, i) => `$${i + 2}`).join(',');
 
   const secondDegree = await query<{ user_id: number; mutual_count: number }>(
     `SELECT
@@ -323,7 +323,7 @@ export async function getPeopleYouMayKnow(userId: number, limit = 20): Promise<P
   if (!user) return [];
 
   const firstDegree = await getFirstDegreeConnections(userId);
-  const firstDegreeSet = new Set(firstDegree);
+  const _firstDegreeSet = new Set(firstDegree);
 
   const secondDegree = await getSecondDegreeConnections(userId);
 

@@ -157,7 +157,7 @@ app.get('/health/detailed', async (req, res) => {
     const redisStart = Date.now();
     await redis.ping();
     health.services.redis = { status: 'connected', latencyMs: Date.now() - redisStart };
-  } catch (error) {
+  } catch (_error) {
     health.services.redis = { status: 'disconnected' };
     health.status = 'degraded';
   }
@@ -167,7 +167,7 @@ app.get('/health/detailed', async (req, res) => {
     const pgStart = Date.now();
     await pool.query('SELECT 1');
     health.services.postgres = { status: 'connected', latencyMs: Date.now() - pgStart };
-  } catch (error) {
+  } catch (_error) {
     health.services.postgres = { status: 'disconnected' };
     health.status = 'unhealthy';
   }
@@ -210,7 +210,7 @@ app.get('/ready', async (req, res) => {
       pool.query('SELECT 1'),
     ]);
     res.status(200).json({ ready: true });
-  } catch (error) {
+  } catch (_error) {
     res.status(503).json({ ready: false, reason: 'Critical service unavailable' });
   }
 });

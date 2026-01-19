@@ -165,7 +165,7 @@ class LocationService {
       // Update driver availability metrics
       await this.updateDriverMetrics();
 
-      const duration = (Date.now() - startTime) / 1000;
+      const _duration = (Date.now() - startTime) / 1000;
       metrics.geoOperationsTotal.inc({ operation: 'set_availability', success: 'true' });
 
       logger.info(

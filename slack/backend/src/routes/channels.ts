@@ -13,7 +13,7 @@ import { rateLimit } from '../middleware/rateLimit.js';
 import { requireRole, loadMembership } from '../middleware/rbac.js';
 import { getCachedChannel, invalidateChannelCache } from '../services/cache.js';
 import { logger } from '../services/logger.js';
-import type { Channel, ChannelMember } from '../types/index.js';
+import type { Channel, _ChannelMember } from '../types/index.js';
 
 const router = Router();
 

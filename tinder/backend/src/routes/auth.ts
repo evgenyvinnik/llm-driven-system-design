@@ -147,7 +147,7 @@ router.get('/me', requireAuth, async (req: Request, res: Response) => {
     }
 
     // Don't expose password hash
-    const { password_hash, ...safeProfile } = profile;
+    const { _password_hash, ...safeProfile } = profile;
     res.json(safeProfile);
   } catch (error) {
     console.error('Get profile error:', error);

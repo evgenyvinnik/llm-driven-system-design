@@ -1,4 +1,4 @@
-import { config } from '../config.js';
+import { _config } from '../config.js';
 import { redisPub, KEYS } from '../redis.js';
 import { createServiceLogger } from '../shared/logger.js';
 import { recordDeliveryDuration } from '../shared/metrics.js';
@@ -6,7 +6,7 @@ import { withRedisCircuit } from '../shared/circuitBreaker.js';
 import { recordDelivery, idempotentStatusUpdate } from '../shared/deliveryTracker.js';
 import { getConnection, sendToSocket } from './connection-manager.js';
 
-const wsLogger = createServiceLogger('websocket-redis');
+const _wsLogger = createServiceLogger('websocket-redis');
 
 /**
  * Redis Message Handler Module

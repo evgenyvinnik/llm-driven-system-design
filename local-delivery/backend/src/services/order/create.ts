@@ -4,7 +4,7 @@
  *
  * @module services/order/create
  */
-import { query, queryOne } from '../../utils/db.js';
+import { _query, queryOne } from '../../utils/db.js';
 import { haversineDistance, calculateDeliveryFee, calculateETA } from '../../utils/geo.js';
 import { getMerchantById, getMenuItemsByIds } from '../merchantService.js';
 import type {

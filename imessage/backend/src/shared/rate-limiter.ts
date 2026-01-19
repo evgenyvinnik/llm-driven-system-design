@@ -1,6 +1,5 @@
-import Redis from 'ioredis';
 import { Request, Response, NextFunction, RequestHandler } from 'express';
-import redis from '../redis.js';
+import redis, { RedisClient } from '../redis.js';
 import { createLogger } from './logger.js';
 import { rateLimitExceeded } from './metrics.js';
 
@@ -27,10 +26,10 @@ interface AuthenticatedRequest extends Request {
  * Rate limiter using Redis sliding window algorithm
  */
 export class RateLimiter {
-  private redis: Redis;
+  private redis: RedisClient;
   private keyPrefix: string;
 
-  constructor(redisClient: Redis) {
+  constructor(redisClient: RedisClient) {
     this.redis = redisClient;
     this.keyPrefix = 'ratelimit:';
   }

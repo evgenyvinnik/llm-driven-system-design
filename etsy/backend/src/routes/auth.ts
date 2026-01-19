@@ -63,7 +63,7 @@ router.post('/register', async (req: Request<object, object, RegisterBody>, res:
 
     // Get user's shops
     const shopsResult = await db.query<ShopRow>('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
-    const shopIds = shopsResult.rows.map((s) => s.id);
+    const shopIds = shopsResult.rows.map((s: ShopRow) => s.id);
 
     // Set session
     req.session.userId = user.id;
@@ -113,7 +113,7 @@ router.post('/login', async (req: Request<object, object, LoginBody>, res: Respo
 
     // Get user's shops
     const shopsResult = await db.query<ShopRow>('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
-    const shopIds = shopsResult.rows.map((s) => s.id);
+    const shopIds = shopsResult.rows.map((s: ShopRow) => s.id);
 
     // Set session
     req.session.userId = user.id;

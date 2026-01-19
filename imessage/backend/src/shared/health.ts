@@ -1,7 +1,6 @@
-import Redis from 'ioredis';
 import { Request, Response } from 'express';
 import { query } from '../db.js';
-import redis from '../redis.js';
+import redis, { RedisClient } from '../redis.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('health');
@@ -64,10 +63,10 @@ interface DeepHealthResult {
  * - Deep health check: Status of all dependencies
  */
 export class HealthCheckService {
-  private redis: Redis;
+  private redis: RedisClient;
   private startTime: number;
 
-  constructor(redisClient: Redis) {
+  constructor(redisClient: RedisClient) {
     this.redis = redisClient;
     this.startTime = Date.now();
   }

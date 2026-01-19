@@ -14,7 +14,7 @@ async function start(): Promise<void> {
   await initRedis()
 
   const server = http.createServer(app)
-  const wss = createSyncServer(server)
+  const _wss = createSyncServer(server)
 
   server.listen(PORT, () => {
     logger.info({ event: 'server_started', port: PORT })

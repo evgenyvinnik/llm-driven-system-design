@@ -1,4 +1,6 @@
-import Redis from 'ioredis';
+import Redis, { Redis as RedisClient } from 'ioredis';
+
+export type { RedisClient };
 
 export interface SessionData {
   userId: string;
@@ -18,7 +20,7 @@ export interface OfflineMessage {
   [key: string]: unknown;
 }
 
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+const redis: RedisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: 3,
   retryDelayOnFailover: 100,
   lazyConnect: true,
@@ -100,7 +102,7 @@ export async function getTypingUsers(conversationId: string): Promise<string[]> 
   const activeTypers: string[] = [];
 
   for (const [userId, timestamp] of Object.entries(typing)) {
-    if (now - parseInt(timestamp) < 5000) {
+    if (now - parseInt(timestamp as string) < 5000) {
       activeTypers.push(userId);
     }
   }
@@ -126,7 +128,7 @@ export async function getOfflineMessages(
   const key = `offline:${userId}:${deviceId}`;
   const messages = await redis.lrange(key, 0, -1);
   await redis.del(key);
-  return messages.map(msg => JSON.parse(msg));
+  return messages.map((msg: string) => JSON.parse(msg) as OfflineMessage);
 }
 
 // WebSocket connection tracking

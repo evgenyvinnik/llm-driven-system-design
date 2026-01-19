@@ -30,7 +30,7 @@ import conversationRoutes from './routes/conversations.js';
 import messageRoutes from './routes/messages.js';
 
 // Shared modules for observability and resilience
-import { logger, httpLogger, createServiceLogger } from './shared/logger.js';
+import { _logger, httpLogger, createServiceLogger } from './shared/logger.js';
 import { getMetrics, metricsMiddleware, websocketConnections } from './shared/metrics.js';
 import { loginRateLimiter, registerRateLimiter } from './shared/rateLimiter.js';
 import { getCircuitBreakerStatus } from './shared/circuitBreaker.js';

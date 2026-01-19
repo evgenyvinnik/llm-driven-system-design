@@ -108,8 +108,8 @@ router.get('/', isAuthenticated, async (req: Request, res: Response) => {
     }, {});
 
     const shops = Object.values(byShop);
-    const itemTotal = shops.reduce((sum, shop) => sum + shop.subtotal, 0);
-    const shippingTotal = shops.reduce((sum, shop) => sum + shop.shippingTotal, 0);
+    const itemTotal = shops.reduce((sum: number, shop: ShopGroup) => sum + shop.subtotal, 0);
+    const shippingTotal = shops.reduce((sum: number, shop: ShopGroup) => sum + shop.shippingTotal, 0);
     const grandTotal = itemTotal + shippingTotal;
 
     res.json({
@@ -118,7 +118,7 @@ router.get('/', isAuthenticated, async (req: Request, res: Response) => {
         itemTotal,
         shippingTotal,
         grandTotal,
-        itemCount: result.rows.reduce((sum, item) => sum + item.quantity, 0),
+        itemCount: result.rows.reduce((sum: number, item: CartItemRow) => sum + item.quantity, 0),
       },
     });
   } catch (error) {

@@ -58,7 +58,7 @@ router.get('/stats', async (req: Request, res: Response) => {
       productsByStatus,
       recentScrapesByDomain: scrapeStats,
     });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
@@ -77,7 +77,7 @@ router.get('/products', async (req: Request, res: Response) => {
       status as string | undefined
     );
     res.json(result);
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch products' });
   }
 });
@@ -92,7 +92,7 @@ router.get('/scrape-queue', async (req: Request, res: Response) => {
     const { limit = '50' } = req.query;
     const products = await getProductsToScrape(parseInt(limit as string, 10));
     res.json({ products, count: products.length });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch scrape queue' });
   }
 });
@@ -105,7 +105,7 @@ router.get('/scraper-configs', async (req: Request, res: Response) => {
   try {
     const configs = await getScraperConfigs();
     res.json({ configs });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch scraper configs' });
   }
 });
@@ -125,7 +125,7 @@ router.patch('/scraper-configs/:domain', async (req: Request, res: Response) => 
     }
 
     res.json({ config });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to update scraper config' });
   }
 });
@@ -142,7 +142,7 @@ router.post('/scraper-configs', async (req: Request, res: Response) => {
       return;
     }
     res.status(201).json({ config });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to create scraper config' });
   }
 });
@@ -188,7 +188,7 @@ router.get('/price-changes', async (req: Request, res: Response) => {
     );
 
     res.json({ changes });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to fetch price changes' });
   }
 });

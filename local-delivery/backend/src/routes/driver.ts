@@ -24,7 +24,7 @@ import {
   completeDelivery,
   getPendingOfferForDriver,
 } from '../services/order/index.js';
-import { publisher } from '../utils/redis.js';
+import { _publisher } from '../utils/redis.js';
 
 const router = Router();
 
@@ -126,7 +126,7 @@ router.post('/go-offline', authenticate, requireDriver, async (req: Request, res
 // Update location
 router.post('/location', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const { lat, lng, speed, heading } = req.body;
+    const { lat, lng, _speed, _heading } = req.body;
 
     if (!lat || !lng) {
       res.status(400).json({

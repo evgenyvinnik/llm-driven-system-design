@@ -6,7 +6,7 @@
  */
 
 import pino from 'pino'
-import { Request, Response, NextFunction } from 'express'
+import { _Request, _Response, _NextFunction } from 'express'
 
 /**
  * Log level from environment or default to 'info'.

@@ -62,7 +62,7 @@ export function createCircuitBreaker<T, R>(
   });
 
   // Set up event handlers for logging and metrics
-  breaker.on('success', (result) => {
+  breaker.on('success', (_result) => {
     logger.debug({ handler: handlerName }, 'Circuit breaker: success');
     circuitBreakerState.set({ handler: handlerName }, 0); // closed
   });

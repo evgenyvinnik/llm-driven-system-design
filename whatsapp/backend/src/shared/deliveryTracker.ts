@@ -17,17 +17,17 @@
  * - Metrics track delivery success rates and latency
  */
 
-import { redis, KEYS } from '../redis.js';
+import { redis, _KEYS } from '../redis.js';
 import { pool } from '../db.js';
 import { recordMessage, recordDeliveryDuration } from './metrics.js';
-import { logger, LogEvents, logEvent } from './logger.js';
+import { _logger, LogEvents, logEvent } from './logger.js';
 import { withRetry } from './retry.js';
 
 /**
  * Status progression order for idempotent updates.
  * Higher index = more progressed state.
  */
-const STATUS_ORDER: Record<string, number> = {
+const _STATUS_ORDER: Record<string, number> = {
   sent: 0,
   delivered: 1,
   read: 2,
@@ -247,7 +247,7 @@ export async function batchStatusUpdate(
       const updatedIds = result.rows.map((row: { message_id: string }) => row.message_id);
 
       // Record metrics for each updated message
-      for (const id of updatedIds) {
+      for (const _id of updatedIds) {
         if (newStatus === 'delivered') {
           recordMessage('delivered', 'text');
         } else if (newStatus === 'read') {

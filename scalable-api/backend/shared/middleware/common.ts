@@ -66,7 +66,7 @@ export function requestLoggerMiddleware(req, res, next) {
 /**
  * Error handler middleware
  */
-export function errorHandlerMiddleware(err, req, res, next) {
+export function errorHandlerMiddleware(err, req, res, _next) {
   const log = req.log || logger.child({ requestId: req.id });
 
   // Record error metrics

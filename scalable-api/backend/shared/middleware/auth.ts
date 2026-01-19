@@ -1,6 +1,6 @@
 import { query } from '../services/database.js';
 import { CacheService } from '../services/cache.js';
-import { UnauthorizedError, ForbiddenError, hashString } from '../utils/index.js';
+import { UnauthorizedError, _ForbiddenError, hashString } from '../utils/index.js';
 import config from '../config/index.js';
 
 const cache = new CacheService();

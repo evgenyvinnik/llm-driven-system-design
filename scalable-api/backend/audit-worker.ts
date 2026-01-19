@@ -82,7 +82,7 @@ async function processSecurityAlerts(event) {
 /**
  * Track failed logins for security monitoring
  */
-async function trackFailedLogin(ip, attemptedUser) {
+async function trackFailedLogin(ip, _attemptedUser) {
   try {
     // Count recent failed attempts from this IP
     const result = await db.query(

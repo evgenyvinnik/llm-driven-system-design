@@ -18,7 +18,7 @@ import pino from 'pino';
 import pinoHttpModule from 'pino-http';
 import { config } from '../config.js';
 import crypto from 'crypto';
-import { IncomingMessage, ServerResponse } from 'http';
+import { IncomingMessage, _ServerResponse } from 'http';
 
 // Handle both ESM and CJS module exports
 const pinoHttp = (pinoHttpModule as any).default || pinoHttpModule;

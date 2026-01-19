@@ -120,7 +120,7 @@ async function scrapeProduct(productId: string): Promise<void> {
       await publishPriceUpdate(productId, data.price, product.current_price);
 
       // Process alerts and track metrics
-      const alertResult = await processPriceChange({
+      const _alertResult = await processPriceChange({
         product_id: productId,
         old_price: product.current_price,
         new_price: data.price,

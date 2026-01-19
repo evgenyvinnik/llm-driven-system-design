@@ -244,7 +244,7 @@ router.post(
       }
 
       // Group by shop
-      const byShop = cartResult.rows.reduce<Record<number, ShopGroup>>((acc, item) => {
+      const byShop = cartResult.rows.reduce<Record<number, ShopGroup>>((acc: Record<number, ShopGroup>, item: CartItem) => {
         if (!acc[item.shop_id]) {
           acc[item.shop_id] = {
             shopId: item.shop_id,
@@ -260,7 +260,7 @@ router.post(
       }, {});
 
       const totalAmount = Object.values(byShop).reduce(
-        (sum, shop) => sum + shop.subtotal + shop.shippingTotal,
+        (sum: number, shop: ShopGroup) => sum + shop.subtotal + shop.shippingTotal,
         0
       );
 
@@ -294,7 +294,7 @@ router.post(
         await client.query('BEGIN');
 
         // Create one order per shop
-        for (const shopGroup of Object.values(byShop)) {
+        for (const shopGroup of Object.values(byShop) as ShopGroup[]) {
           const orderNumber = `ORD-${uuidv4().substring(0, 8).toUpperCase()}`;
           const total = shopGroup.subtotal + shopGroup.shippingTotal;
 

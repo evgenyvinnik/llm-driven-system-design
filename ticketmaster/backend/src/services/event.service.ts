@@ -164,7 +164,7 @@ export class EventService {
    * @returns The total number of seats generated
    */
   async generateEventSeats(eventId: string): Promise<number> {
-    const result = await query('SELECT generate_event_seats($1)', [eventId]);
+    const _result = await query('SELECT generate_event_seats($1)', [eventId]);
 
     // Update seat counts
     await query(`

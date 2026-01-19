@@ -98,7 +98,7 @@ router.post('/logout', authMiddleware, async (req: Request, res: Response) => {
 
     res.clearCookie('token');
     res.json({ message: 'Logged out successfully' });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Logout failed' });
   }
 });
@@ -126,7 +126,7 @@ router.patch('/me', authMiddleware, async (req: Request, res: Response) => {
     }
 
     res.json({ user });
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Update failed' });
   }
 });

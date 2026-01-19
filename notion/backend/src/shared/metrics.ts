@@ -285,7 +285,7 @@ export async function metricsHandler(_req: Request, res: Response): Promise<void
   try {
     res.set('Content-Type', registry.contentType);
     res.end(await registry.metrics());
-  } catch (error) {
+  } catch (_error) {
     res.status(500).end('Error collecting metrics');
   }
 }

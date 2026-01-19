@@ -64,7 +64,7 @@ export async function authenticateUser(email: string, password: string): Promise
   const valid = await bcrypt.compare(password, row.password_hash);
   if (!valid) return null;
 
-  const { password_hash, ...user } = row;
+  const { _password_hash, ...user } = row;
   return user;
 }
 

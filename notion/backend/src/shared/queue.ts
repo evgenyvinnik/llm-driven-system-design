@@ -181,7 +181,7 @@ class QueueManager {
       this.reconnectTimeout = null;
       try {
         await this.connect();
-      } catch (error) {
+      } catch (_error) {
         // Error already logged in connect
       }
     }, 5000);

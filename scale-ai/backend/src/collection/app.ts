@@ -23,7 +23,7 @@ import { cacheGet, cacheSet, cacheDelete, CacheKeys } from '../shared/cache.js'
 import { v4 as uuidv4 } from 'uuid'
 
 // New shared modules
-import { logger, createChildLogger, logError } from '../shared/logger.js'
+import { _logger, createChildLogger, logError } from '../shared/logger.js'
 import { idempotencyMiddleware } from '../shared/idempotency.js'
 import { minioCircuitBreaker, postgresCircuitBreaker, CircuitBreakerOpenError } from '../shared/circuitBreaker.js'
 import { withRetry, RetryPresets } from '../shared/retry.js'

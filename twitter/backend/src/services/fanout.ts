@@ -1,6 +1,6 @@
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
-import type { Pool } from 'pg';
+import type { _Pool } from 'pg';
 import type Redis from 'ioredis';
 import dotenv from 'dotenv';
 import logger from '../shared/logger.js';
@@ -16,7 +16,7 @@ import {
 
 dotenv.config();
 
-const CELEBRITY_THRESHOLD = parseInt(process.env.CELEBRITY_THRESHOLD || '') || 10000;
+const _CELEBRITY_THRESHOLD = parseInt(process.env.CELEBRITY_THRESHOLD || '') || 10000;
 const TIMELINE_CACHE_SIZE = parseInt(process.env.TIMELINE_CACHE_SIZE || '') || 800;
 const TIMELINE_TTL_SECONDS = parseInt(process.env.TIMELINE_CACHE_TTL_SECONDS || '') || 7 * 24 * 60 * 60;
 

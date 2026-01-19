@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction, Router } from 'express';
 import { query } from '../db.js';
-import { getRedis } from '../redis.js';
+import { _getRedis } from '../redis.js';
 import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { createLogger } from '../shared/logger.js';
 import { getRateLimiters } from '../index.js';
@@ -9,8 +9,8 @@ import {
   recommendationLatencyHistogram,
   timeAsync,
 } from '../shared/metrics.js';
-import { createCircuitBreaker, withCircuitBreaker } from '../shared/circuitBreaker.js';
-import { getEmbeddingBasedRecommendations, generateUserEmbedding } from '../services/embeddings.js';
+import { createCircuitBreaker, _withCircuitBreaker } from '../shared/circuitBreaker.js';
+import { getEmbeddingBasedRecommendations, _generateUserEmbedding } from '../services/embeddings.js';
 
 const router: Router = express.Router();
 const logger = createLogger('feed');

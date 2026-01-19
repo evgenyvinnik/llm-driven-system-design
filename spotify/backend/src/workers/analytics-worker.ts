@@ -16,7 +16,7 @@ import type { KafkaPlaybackMessage, PlaybackEventType } from '../types.js';
 
 // Cache TTLs
 const USER_STATS_TTL = 3600; // 1 hour
-const ARTIST_STATS_TTL = 1800; // 30 minutes
+const _ARTIST_STATS_TTL = 1800; // 30 minutes
 
 interface PlaybackEvent {
   userId: string;

@@ -7,7 +7,7 @@
  */
 import redis from '../db/redis.js';
 import { query } from '../db/pool.js';
-import logger, { businessLogger } from './logger.js';
+import logger, { _businessLogger } from './logger.js';
 import { idempotencyHits, idempotencyMisses } from './metrics.js';
 
 /** Time-to-live for idempotency keys in Redis (24 hours) */

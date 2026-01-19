@@ -227,7 +227,7 @@ export class QuoteService {
       // Publish to Redis with circuit breaker protection
       try {
         await this.redisBreaker.fire(updatedQuotes);
-      } catch (error) {
+      } catch (_error) {
         // Circuit breaker fallback handles this
       }
 
@@ -279,7 +279,7 @@ export class QuoteService {
         currentPrices.set(symbol.toUpperCase(), externalQuote);
         return externalQuote;
       }
-    } catch (error) {
+    } catch (_error) {
       // Circuit breaker fallback handles this
     }
 

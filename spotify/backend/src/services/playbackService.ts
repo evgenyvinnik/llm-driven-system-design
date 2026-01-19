@@ -5,7 +5,7 @@ import { publishPlaybackEvent } from '../shared/kafka.js';
 import { logger } from '../shared/logger.js';
 
 // Get stream URL for a track
-export async function getStreamUrl(trackId, userId) {
+export async function getStreamUrl(trackId, _userId) {
   // Get track info
   const trackResult = await pool.query(
     'SELECT audio_url, duration_ms FROM tracks WHERE id = $1',

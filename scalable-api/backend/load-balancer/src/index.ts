@@ -289,7 +289,7 @@ app.use('*', async (req, res) => {
     });
 
   } catch (error) {
-    const duration = Date.now() - startTime;
+    const _duration = Date.now() - startTime;
     serverPool.requestCompleted(server, false);
 
     console.error(`Proxy error to ${server.url}:`, error.message);

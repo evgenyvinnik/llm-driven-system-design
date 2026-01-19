@@ -391,9 +391,13 @@ export async function createSegmentFromActivity(
     );
 
     if (points[i].altitude && points[i - 1].altitude) {
-      const elevDiff = points[i].altitude - points[i - 1].altitude;
-      if (elevDiff > 0) {
-        elevationGain += elevDiff;
+      const currAltitude = points[i].altitude;
+      const prevAltitude = points[i - 1].altitude;
+      if (currAltitude !== null && prevAltitude !== null) {
+        const elevDiff = currAltitude - prevAltitude;
+        if (elevDiff > 0) {
+          elevationGain += elevDiff;
+        }
       }
     }
   }

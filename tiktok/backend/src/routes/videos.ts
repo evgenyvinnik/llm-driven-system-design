@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction, Router } from 'express';
 import multer, { FileFilterCallback } from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../db.js';
-import { uploadFile, getPublicUrl } from '../storage.js';
+import { uploadFile, _getPublicUrl } from '../storage.js';
 import { getRedis } from '../redis.js';
 import { requireAuth, requireCreator, optionalAuth, PERMISSIONS, hasPermission } from '../middleware/auth.js';
 import { createLogger, auditLog } from '../shared/logger.js';
@@ -14,7 +14,7 @@ import {
   storageOperationDurationHistogram,
   timeAsync,
 } from '../shared/metrics.js';
-import { getVideoRetentionPolicy, archiveDeletedVideo } from '../shared/retention.js';
+import { getVideoRetentionPolicy, _archiveDeletedVideo } from '../shared/retention.js';
 import { generateVideoEmbedding, findVideosLikeThis } from '../services/embeddings.js';
 
 const router: Router = express.Router();

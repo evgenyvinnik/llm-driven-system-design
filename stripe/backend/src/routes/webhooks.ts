@@ -79,7 +79,7 @@ router.post('/events/:id/retry', authenticateApiKey, async (req: AuthenticatedRe
     }
 
     const signature = req.headers['stripe-signature'];
-    const signatureStr = Array.isArray(signature) ? signature[0] : signature;
+    const _signatureStr = Array.isArray(signature) ? signature[0] : signature;
     const result = await retryWebhook(req.params.id as string);
     res.json(result);
   } catch (error) {

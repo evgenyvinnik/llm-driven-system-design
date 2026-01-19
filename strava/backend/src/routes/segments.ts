@@ -112,7 +112,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 // Get single segment with leaderboard
 router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
 
     const result = await query<SegmentRow>(
       `SELECT s.*, u.username as creator_name
@@ -166,7 +166,7 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
 // Get segment leaderboard
 router.get('/:id/leaderboard', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     const limit = parseInt(req.query.limit as string) || 20;
     const filter = (req.query.filter as string) || 'overall';
 

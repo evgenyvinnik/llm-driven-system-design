@@ -6,7 +6,7 @@ import {
   getDriverLocationFromRedis,
   getDriverOrderCount,
 } from '../utils/redis.js';
-import { haversineDistance, calculateETA } from '../utils/geo.js';
+import { _haversineDistance, _calculateETA } from '../utils/geo.js';
 import type {
   Driver,
   CreateDriverInput,
@@ -118,7 +118,7 @@ export async function updateDriverLocation(
   await updateDriverLocationRedis(id, lat, lng);
 
   // Log to history (sample every 10 seconds to reduce data volume)
-  const historyKey = `driver:${id}:last_history`;
+  const _historyKey = `driver:${id}:last_history`;
   const lastHistory = await getDriverLocationFromRedis(id);
   if (!lastHistory || Date.now() - lastHistory.updated_at > 10000) {
     await execute(

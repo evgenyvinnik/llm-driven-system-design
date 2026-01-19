@@ -11,7 +11,7 @@ import {
   recordBufferEvent,
   recordPlaybackError,
 } from '../services/metrics.js';
-import { STREAMING_CONFIG, MINIO_CONFIG } from '../config.js';
+import { STREAMING_CONFIG, _MINIO_CONFIG } from '../config.js';
 
 /**
  * Streaming router.

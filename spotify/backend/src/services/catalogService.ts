@@ -1,6 +1,6 @@
 import { pool } from '../db.js';
 import { redisClient } from '../db.js';
-import { getPublicUrl, COVERS_BUCKET } from '../storage.js';
+import { _getPublicUrl, _COVERS_BUCKET } from '../storage.js';
 
 const CACHE_TTL = 300; // 5 minutes
 

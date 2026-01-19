@@ -7,8 +7,8 @@ import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import { v4 as uuid } from 'uuid'
 import { query, transaction } from '../shared/db.js'
-import { authMiddleware, optionalAuthMiddleware } from '../shared/auth.js'
-import { cacheGet, cacheSet, cacheDel, hashIncr, redis } from '../shared/cache.js'
+import { authMiddleware, _optionalAuthMiddleware } from '../shared/auth.js'
+import { cacheGet, cacheSet, cacheDel, hashIncr, _redis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
 
 const logger = createLogger('highlight-service')

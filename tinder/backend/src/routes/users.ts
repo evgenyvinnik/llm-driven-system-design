@@ -62,7 +62,7 @@ router.get('/profile', requireAuth, async (req: Request, res: Response) => {
       return;
     }
 
-    const { password_hash, ...safeProfile } = profile;
+    const { _password_hash, ...safeProfile } = profile;
     res.json(safeProfile);
   } catch (error) {
     console.error('Get profile error:', error);
@@ -91,7 +91,7 @@ router.put('/profile', requireAuth, async (req: Request, res: Response) => {
       return;
     }
 
-    const { password_hash, ...safeUser } = updatedUser;
+    const { _password_hash, ...safeUser } = updatedUser;
     res.json(safeUser);
   } catch (error) {
     console.error('Update profile error:', error);

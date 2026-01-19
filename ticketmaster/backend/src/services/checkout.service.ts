@@ -19,7 +19,7 @@ import {
   generateCheckoutIdempotencyKey,
   validateIdempotencyKey,
 } from '../shared/idempotency.js';
-import { CircuitBreaker, CircuitState, createPaymentCircuitBreaker } from '../shared/circuit-breaker.js';
+import { CircuitBreaker, _CircuitState, createPaymentCircuitBreaker } from '../shared/circuit-breaker.js';
 import {
   seatsSoldTotal,
   checkoutCompletedTotal,
@@ -218,7 +218,7 @@ export class CheckoutService {
 
       return result;
     } catch (error) {
-      const durationMs = Date.now() - startTime;
+      const _durationMs = Date.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
       businessLogger.checkoutFailed({

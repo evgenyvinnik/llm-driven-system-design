@@ -1,5 +1,4 @@
-import Redis from 'ioredis';
-import redis from '../redis.js';
+import redis, { RedisClient } from '../redis.js';
 import { createLogger } from './logger.js';
 import { cacheHits, cacheMisses } from './metrics.js';
 
@@ -34,13 +33,13 @@ interface Conversation {
  * 4. Invalidate on any modification
  */
 export class ConversationCache {
-  private redis: Redis;
+  private redis: RedisClient;
   private conversationPrefix: string;
   private participantsPrefix: string;
   private userConversationsPrefix: string;
   private ttlSeconds: number;
 
-  constructor(redisClient: Redis) {
+  constructor(redisClient: RedisClient) {
     this.redis = redisClient;
     this.conversationPrefix = 'conv:';
     this.participantsPrefix = 'conv:participants:';

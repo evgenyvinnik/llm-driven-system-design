@@ -201,7 +201,7 @@ export class LedgerService {
     description: string
   ): Promise<LedgerEntry> {
     // Update account balance atomically
-    const balanceChange = entryType === 'debit' ? amount : -amount;
+    const _balanceChange = entryType === 'debit' ? amount : -amount;
 
     // For asset accounts, debits increase balance
     // For liability/revenue accounts, credits increase balance

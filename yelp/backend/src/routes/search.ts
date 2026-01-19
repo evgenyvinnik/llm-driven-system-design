@@ -356,7 +356,7 @@ router.get(
   '/popular',
   async (req: Request, res: Response): Promise<void | Response> => {
     try {
-      const { latitude, longitude } = req.query as {
+      const { _latitude, _longitude } = req.query as {
         latitude?: string;
         longitude?: string;
       };

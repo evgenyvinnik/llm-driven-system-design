@@ -39,7 +39,7 @@ export class WebSocketGateway {
    * Manages authentication, message handling, and cleanup on disconnect.
    */
   private setupConnectionHandler(): void {
-    this.wss.on('connection', (ws: ExtendedWebSocket, req) => {
+    this.wss.on('connection', (ws: ExtendedWebSocket, _req) => {
       ws.isAlive = true;
 
       ws.on('pong', () => {

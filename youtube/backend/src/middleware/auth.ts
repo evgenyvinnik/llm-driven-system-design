@@ -178,7 +178,7 @@ export const optionalAuth = async (req: AuthRequest, res: Response, next: NextFu
     }
 
     next();
-  } catch (error) {
+  } catch (_error) {
     // Continue without auth on error
     next();
   }

@@ -30,7 +30,7 @@ const channelHandlers = {
    * Email notification - simulate sending
    */
   async email(notification) {
-    const { userId, message, metadata } = notification;
+    const { userId, message, _metadata } = notification;
 
     // Get user email from database
     const result = await db.query('SELECT email FROM users WHERE id = $1', [userId]);
@@ -52,7 +52,7 @@ const channelHandlers = {
    * Push notification - simulate sending
    */
   async push(notification) {
-    const { userId, message, metadata } = notification;
+    const { userId, message, _metadata } = notification;
 
     // Simulate push notification
     console.log(`[${workerId}] Sending push notification to user ${userId}: ${message}`);
@@ -87,7 +87,7 @@ const channelHandlers = {
  * Handle incoming notification
  */
 async function handleNotification(notification) {
-  const { id, userId, message, channel, priority } = notification;
+  const { id, _userId, _message, channel, priority } = notification;
 
   console.log(
     `[${workerId}] Processing notification ${id} (channel: ${channel}, priority: ${priority})`

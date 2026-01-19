@@ -1,5 +1,5 @@
 import type { Request } from 'express';
-import type { WebSocket } from 'ws';
+import type { _WebSocket } from 'ws';
 import type { Logger } from 'pino';
 
 // User types

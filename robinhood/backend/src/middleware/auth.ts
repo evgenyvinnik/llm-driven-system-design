@@ -76,7 +76,7 @@ export async function authMiddleware(
           // Cache expired, delete it
           await redis.del(cacheKey);
         }
-      } catch (parseError) {
+      } catch (_parseError) {
         // Invalid cache data, delete it
         await redis.del(cacheKey);
       }

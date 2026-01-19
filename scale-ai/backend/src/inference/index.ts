@@ -15,7 +15,7 @@
 import express from 'express'
 import cors from 'cors'
 import { pool } from '../shared/db.js'
-import { getModel } from '../shared/storage.js'
+import { _getModel } from '../shared/storage.js'
 import {
   SHAPE_NAMES as PROTOTYPE_SHAPE_NAMES,
   denormalizeStrokes,

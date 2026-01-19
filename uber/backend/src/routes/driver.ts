@@ -3,7 +3,7 @@ import { authenticate, requireDriver } from '../middleware/auth.js';
 import locationService from '../services/locationService.js';
 import matchingService from '../services/matching/index.js';
 import { query } from '../utils/db.js';
-import type { AuthenticatedRequest, RideRow } from '../types/index.js';
+import type { AuthenticatedRequest, _RideRow } from '../types/index.js';
 
 const router = Router();
 

@@ -1,11 +1,11 @@
-import Redis from 'ioredis';
+import Redis, { Redis as RedisClient } from 'ioredis';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-let redisClient: Redis | null = null;
+let redisClient: RedisClient | null = null;
 
-export function createClient(): Redis {
+export function createClient(): RedisClient {
   if (redisClient) return redisClient;
 
   redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
@@ -21,7 +21,7 @@ export function createClient(): Redis {
   return redisClient;
 }
 
-export function getClient(): Redis {
+export function getClient(): RedisClient {
   if (!redisClient) {
     return createClient();
   }

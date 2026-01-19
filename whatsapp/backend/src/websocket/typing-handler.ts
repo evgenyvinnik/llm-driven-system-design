@@ -96,7 +96,7 @@ export async function handleReadReceipt(
     if (markedIds.length === 0) return;
 
     // Record read metrics
-    for (const id of markedIds) {
+    for (const _id of markedIds) {
       recordMessage('read', 'text');
     }
 

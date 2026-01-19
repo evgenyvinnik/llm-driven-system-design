@@ -1,6 +1,5 @@
-import Redis from 'ioredis';
 import { Request, Response, NextFunction } from 'express';
-import redis from '../redis.js';
+import redis, { RedisClient } from '../redis.js';
 import { query } from '../db.js';
 import { createLogger } from './logger.js';
 import { idempotentRequests } from './metrics.js';
@@ -46,11 +45,11 @@ interface AuthenticatedRequest extends Request {
  * will recognize it as a duplicate and return the existing message.
  */
 export class IdempotencyService {
-  private redis: Redis;
+  private redis: RedisClient;
   private keyPrefix: string;
   private ttlSeconds: number;
 
-  constructor(redisClient: Redis) {
+  constructor(redisClient: RedisClient) {
     this.redis = redisClient;
     this.keyPrefix = 'idempotency:';
     this.ttlSeconds = 24 * 60 * 60; // 24 hours
