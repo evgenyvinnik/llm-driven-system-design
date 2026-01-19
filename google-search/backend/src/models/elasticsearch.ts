@@ -369,12 +369,12 @@ export const addSearchSuggestion = async (queryText: string): Promise<void> => {
       ? exists.hits.total
       : exists.hits.total?.value || 0;
 
-    if (total > 0) {
+    if (total > 0 && exists.hits.hits[0]._id) {
       // Update existing
       const id = exists.hits.hits[0]._id;
       await esClient.update({
         index: config.elasticsearch.autocompleteIndex,
-        id,
+        id: id,
         script: {
           source: 'ctx._source.frequency++; ctx._source.last_used = params.now',
           params: { now: new Date() },

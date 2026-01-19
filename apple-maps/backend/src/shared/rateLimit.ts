@@ -1,4 +1,5 @@
 import rateLimit from 'express-rate-limit';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import logger from './logger.js';
 import { rateLimitHits } from './metrics.js';
 
@@ -18,11 +19,19 @@ import { rateLimitHits } from './metrics.js';
  * - Per-IP rate limiting (can be extended to per-user)
  */
 
+interface RateLimiterOptions {
+  windowMs?: number;
+  max?: number;
+  message?: string;
+  routeName?: string;
+  skipSuccessfulRequests?: boolean;
+  skipFailedRequests?: boolean;
+}
+
 /**
  * Create a rate limiter with custom options
- * @param {Object} options - Rate limiter configuration
  */
-function createRateLimiter(options = {}) {
+function createRateLimiter(options: RateLimiterOptions = {}): RequestHandler {
   const {
     windowMs = 60000, // 1 minute
     max = 100, // 100 requests per window
@@ -40,15 +49,18 @@ function createRateLimiter(options = {}) {
     legacyHeaders: false, // Disable X-RateLimit-* headers
 
     // Use IP as key (can be extended for authenticated users)
-    keyGenerator: (req) => {
+    keyGenerator: (req: Request): string => {
       // Use X-Forwarded-For if behind a proxy
       const forwarded = req.headers['x-forwarded-for'];
-      const ip = forwarded ? forwarded.split(',')[0].trim() : req.ip;
+      const forwardedIp = Array.isArray(forwarded)
+        ? forwarded[0]?.split(',')[0]?.trim()
+        : forwarded?.split(',')[0]?.trim();
+      const ip = forwardedIp || req.ip || 'unknown';
       return ip;
     },
 
     // Log and track when rate limit is hit
-    handler: (req, res, next, options) => {
+    handler: (req: Request, res: Response, _next: NextFunction): void => {
       const ip = req.ip;
       logger.warn(
         { ip: ip?.replace(/\d+$/, 'xxx'), route: routeName, limit: max },
@@ -182,3 +194,4 @@ export {
   mapDataLimiter,
   strictLimiter,
 };
+export type { RateLimiterOptions };

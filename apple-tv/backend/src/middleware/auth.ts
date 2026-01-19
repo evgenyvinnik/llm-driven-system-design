@@ -1,29 +1,55 @@
-const isAuthenticated = (req, res, next) => {
+import { Request, Response, NextFunction } from 'express';
+
+// Extend express-session types
+declare module 'express-session' {
+  interface SessionData {
+    userId: string;
+    email: string;
+    name: string;
+    role: string;
+    subscriptionTier: string;
+    subscriptionExpiresAt: Date | string;
+    profileId?: string;
+    profileName?: string;
+    isKids?: boolean;
+  }
+}
+
+export const isAuthenticated = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
   if (req.session && req.session.userId) {
-    return next();
+    next();
+    return;
   }
-  return res.status(401).json({ error: 'Unauthorized' });
+  res.status(401).json({ error: 'Unauthorized' });
 };
 
-const isAdmin = (req, res, next) => {
+export const isAdmin = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
   if (req.session && req.session.role === 'admin') {
-    return next();
+    next();
+    return;
   }
-  return res.status(403).json({ error: 'Forbidden' });
+  res.status(403).json({ error: 'Forbidden' });
 };
 
-const hasSubscription = (req, res, next) => {
+export const hasSubscription = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
   if (req.session && req.session.subscriptionTier && req.session.subscriptionTier !== 'free') {
-    const expiresAt = new Date(req.session.subscriptionExpiresAt);
+    const expiresAt = new Date(req.session.subscriptionExpiresAt as string);
     if (expiresAt > new Date()) {
-      return next();
+      next();
+      return;
     }
   }
-  return res.status(403).json({ error: 'Subscription required' });
-};
-
-module.exports = {
-  isAuthenticated,
-  isAdmin,
-  hasSubscription
+  res.status(403).json({ error: 'Subscription required' });
 };

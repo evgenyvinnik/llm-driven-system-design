@@ -1,4 +1,5 @@
 import client from 'prom-client';
+import type { Request, Response, NextFunction } from 'express';
 
 /**
  * Prometheus metrics for Reddit clone.
@@ -26,7 +27,7 @@ client.collectDefaultMetrics({
 export const httpRequestDuration = new client.Histogram({
   name: 'reddit_http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status_code'],
+  labelNames: ['method', 'route', 'status_code'] as const,
   buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5],
   registers: [register],
 });
@@ -34,7 +35,7 @@ export const httpRequestDuration = new client.Histogram({
 export const httpRequestTotal = new client.Counter({
   name: 'reddit_http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
+  labelNames: ['method', 'route', 'status_code'] as const,
   registers: [register],
 });
 
@@ -45,7 +46,7 @@ export const httpRequestTotal = new client.Counter({
 export const voteTotal = new client.Counter({
   name: 'reddit_votes_total',
   help: 'Total votes cast',
-  labelNames: ['direction', 'target_type'],
+  labelNames: ['direction', 'target_type'] as const,
   registers: [register],
 });
 
@@ -69,14 +70,14 @@ export const voteAggregationDuration = new client.Histogram({
 export const postCreatedTotal = new client.Counter({
   name: 'reddit_posts_created_total',
   help: 'Total posts created',
-  labelNames: ['subreddit'],
+  labelNames: ['subreddit'] as const,
   registers: [register],
 });
 
 export const commentCreatedTotal = new client.Counter({
   name: 'reddit_comments_created_total',
   help: 'Total comments created',
-  labelNames: ['depth_bucket'],
+  labelNames: ['depth_bucket'] as const,
   registers: [register],
 });
 
@@ -122,14 +123,14 @@ export const hotScorePostsProcessed = new client.Gauge({
 export const dbPoolSize = new client.Gauge({
   name: 'reddit_db_pool_size',
   help: 'Current database connection pool size',
-  labelNames: ['state'],
+  labelNames: ['state'] as const,
   registers: [register],
 });
 
 export const dbQueryDuration = new client.Histogram({
   name: 'reddit_db_query_duration_seconds',
   help: 'Database query duration in seconds',
-  labelNames: ['operation'],
+  labelNames: ['operation'] as const,
   buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1],
   registers: [register],
 });
@@ -141,14 +142,14 @@ export const dbQueryDuration = new client.Histogram({
 export const cacheHits = new client.Counter({
   name: 'reddit_cache_hits_total',
   help: 'Total cache hits',
-  labelNames: ['cache_type'],
+  labelNames: ['cache_type'] as const,
   registers: [register],
 });
 
 export const cacheMisses = new client.Counter({
   name: 'reddit_cache_misses_total',
   help: 'Total cache misses',
-  labelNames: ['cache_type'],
+  labelNames: ['cache_type'] as const,
   registers: [register],
 });
 
@@ -159,9 +160,16 @@ export const cacheMisses = new client.Counter({
 export const auditEventsTotal = new client.Counter({
   name: 'reddit_audit_events_total',
   help: 'Total audit events logged',
-  labelNames: ['action', 'target_type'],
+  labelNames: ['action', 'target_type'] as const,
   registers: [register],
 });
+
+// Extended request interface for metrics middleware
+interface MetricsRequest extends Request {
+  route?: {
+    path: string;
+  };
+}
 
 // ============================================================================
 // Express Middleware for Request Metrics
@@ -171,7 +179,7 @@ export const auditEventsTotal = new client.Counter({
  * Middleware to collect HTTP metrics for each request.
  * Normalizes route patterns to avoid high cardinality label explosion.
  */
-export const metricsMiddleware = (req, res, next) => {
+export const metricsMiddleware = (req: MetricsRequest, res: Response, next: NextFunction): void => {
   const start = process.hrtime.bigint();
 
   res.on('finish', () => {
@@ -198,7 +206,7 @@ export const metricsMiddleware = (req, res, next) => {
  * Normalize routes to prevent cardinality explosion.
  * Replace dynamic segments with placeholders.
  */
-function normalizeRoute(path) {
+function normalizeRoute(path: string): string {
   return path
     .replace(/\/\d+/g, '/:id')
     .replace(/\/[a-f0-9-]{36}/g, '/:uuid')

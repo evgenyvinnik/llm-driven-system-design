@@ -3,9 +3,25 @@ import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import redis from '../db/redis.js';
 
-export const createUser = async (username, email, password) => {
+export interface User {
+  id: number;
+  username: string;
+  email: string;
+  password_hash?: string;
+  karma_post: number;
+  karma_comment: number;
+  role: string;
+  created_at: Date;
+}
+
+export interface Session {
+  userId: number;
+  expiresAt: Date | string;
+}
+
+export const createUser = async (username: string, email: string, password: string): Promise<User> => {
   const passwordHash = await bcrypt.hash(password, 10);
-  const result = await query(
+  const result = await query<User>(
     `INSERT INTO users (username, email, password_hash)
      VALUES ($1, $2, $3)
      RETURNING id, username, email, karma_post, karma_comment, role, created_at`,
@@ -14,8 +30,8 @@ export const createUser = async (username, email, password) => {
   return result.rows[0];
 };
 
-export const findUserByUsername = async (username) => {
-  const result = await query(
+export const findUserByUsername = async (username: string): Promise<User | undefined> => {
+  const result = await query<User>(
     `SELECT id, username, email, password_hash, karma_post, karma_comment, role, created_at
      FROM users WHERE username = $1`,
     [username]
@@ -23,8 +39,8 @@ export const findUserByUsername = async (username) => {
   return result.rows[0];
 };
 
-export const findUserById = async (id) => {
-  const result = await query(
+export const findUserById = async (id: number): Promise<User | undefined> => {
+  const result = await query<User>(
     `SELECT id, username, email, karma_post, karma_comment, role, created_at
      FROM users WHERE id = $1`,
     [id]
@@ -32,11 +48,11 @@ export const findUserById = async (id) => {
   return result.rows[0];
 };
 
-export const verifyPassword = async (password, passwordHash) => {
+export const verifyPassword = async (password: string, passwordHash: string): Promise<boolean> => {
   return bcrypt.compare(password, passwordHash);
 };
 
-export const createSession = async (userId) => {
+export const createSession = async (userId: number): Promise<string> => {
   const sessionId = uuidv4();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
 
@@ -52,24 +68,24 @@ export const createSession = async (userId) => {
   return sessionId;
 };
 
-export const getSession = async (sessionId) => {
+export const getSession = async (sessionId: string): Promise<Session | null> => {
   // Try Redis first
   const cached = await redis.get(`session:${sessionId}`);
   if (cached) {
-    const session = JSON.parse(cached);
+    const session = JSON.parse(cached) as Session;
     if (new Date(session.expiresAt) > new Date()) {
       return session;
     }
   }
 
   // Fallback to database
-  const result = await query(
+  const result = await query<{ user_id: number; expires_at: Date }>(
     `SELECT user_id, expires_at FROM sessions WHERE id = $1 AND expires_at > NOW()`,
     [sessionId]
   );
 
   if (result.rows[0]) {
-    const session = {
+    const session: Session = {
       userId: result.rows[0].user_id,
       expiresAt: result.rows[0].expires_at,
     };
@@ -81,12 +97,12 @@ export const getSession = async (sessionId) => {
   return null;
 };
 
-export const deleteSession = async (sessionId) => {
+export const deleteSession = async (sessionId: string): Promise<void> => {
   await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
   await redis.del(`session:${sessionId}`);
 };
 
-export const updateUserKarma = async (userId) => {
+export const updateUserKarma = async (userId: number): Promise<void> => {
   await query(`
     UPDATE users u
     SET

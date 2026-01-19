@@ -4,7 +4,8 @@
  */
 
 import { Registry, Counter, Histogram, Gauge, collectDefaultMetrics } from 'prom-client';
-import { ALERT_THRESHOLDS, CACHE_CONFIG } from './config.js';
+import type { Request, Response, NextFunction } from 'express';
+import { ALERT_THRESHOLDS } from './config.js';
 
 // Create a custom registry
 export const registry = new Registry();
@@ -27,7 +28,7 @@ collectDefaultMetrics({ register: registry });
 export const viewEventsTotal = new Counter({
   name: 'youtube_topk_view_events_total',
   help: 'Total number of view events received',
-  labelNames: ['category', 'status'],
+  labelNames: ['category', 'status'] as const,
   registers: [registry],
 });
 
@@ -37,7 +38,7 @@ export const viewEventsTotal = new Counter({
 export const duplicateViewEvents = new Counter({
   name: 'youtube_topk_duplicate_views_total',
   help: 'Total number of duplicate view events prevented by idempotency',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   registers: [registry],
 });
 
@@ -47,7 +48,7 @@ export const duplicateViewEvents = new Counter({
 export const viewEventLatency = new Histogram({
   name: 'youtube_topk_view_event_duration_seconds',
   help: 'Time taken to process a view event',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
   registers: [registry],
 });
@@ -62,7 +63,7 @@ export const viewEventLatency = new Histogram({
 export const trendingCalculationsTotal = new Counter({
   name: 'youtube_topk_trending_calculations_total',
   help: 'Total number of trending calculations performed',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   registers: [registry],
 });
 
@@ -72,7 +73,7 @@ export const trendingCalculationsTotal = new Counter({
 export const trendingCalculationLatency = new Histogram({
   name: 'youtube_topk_trending_calculation_duration_seconds',
   help: 'Time taken to calculate trending videos',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
   registers: [registry],
 });
@@ -83,7 +84,7 @@ export const trendingCalculationLatency = new Histogram({
 export const trendingVideosCount = new Gauge({
   name: 'youtube_topk_trending_videos_count',
   help: 'Current number of trending videos by category',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   registers: [registry],
 });
 
@@ -93,7 +94,7 @@ export const trendingVideosCount = new Gauge({
 export const lastTrendingUpdate = new Gauge({
   name: 'youtube_topk_last_trending_update_timestamp_seconds',
   help: 'Timestamp of the last trending update',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   registers: [registry],
 });
 
@@ -107,7 +108,7 @@ export const lastTrendingUpdate = new Gauge({
 export const heapOperationsTotal = new Counter({
   name: 'youtube_topk_heap_operations_total',
   help: 'Total number of heap operations',
-  labelNames: ['operation'], // push, pop, update, rebuild
+  labelNames: ['operation'] as const, // push, pop, update, rebuild
   registers: [registry],
 });
 
@@ -117,7 +118,7 @@ export const heapOperationsTotal = new Counter({
 export const heapOperationLatency = new Histogram({
   name: 'youtube_topk_heap_operation_duration_seconds',
   help: 'Time taken for heap operations',
-  labelNames: ['operation'],
+  labelNames: ['operation'] as const,
   buckets: [0.000001, 0.00001, 0.0001, 0.001, 0.01], // 1us to 10ms
   registers: [registry],
 });
@@ -128,7 +129,7 @@ export const heapOperationLatency = new Histogram({
 export const heapSize = new Gauge({
   name: 'youtube_topk_heap_size',
   help: 'Current size of the min-heap',
-  labelNames: ['type'], // main, category-specific
+  labelNames: ['type'] as const, // main, category-specific
   registers: [registry],
 });
 
@@ -142,7 +143,7 @@ export const heapSize = new Gauge({
 export const cacheAccesses = new Counter({
   name: 'youtube_topk_cache_accesses_total',
   help: 'Total number of cache accesses',
-  labelNames: ['cache_type', 'result'], // result: hit, miss
+  labelNames: ['cache_type', 'result'] as const, // result: hit, miss
   registers: [registry],
 });
 
@@ -152,22 +153,25 @@ export const cacheAccesses = new Counter({
 export const cacheHitRate = new Gauge({
   name: 'youtube_topk_cache_hit_rate',
   help: 'Current cache hit rate (0-1)',
-  labelNames: ['cache_type'],
+  labelNames: ['cache_type'] as const,
   registers: [registry],
 });
 
 // Track hits and misses for rate calculation
-const cacheStats = {
+interface CacheStats {
+  hits: number;
+  total: number;
+}
+
+const cacheStats: Record<string, CacheStats> = {
   trending: { hits: 0, total: 0 },
   metadata: { hits: 0, total: 0 },
 };
 
 /**
  * Record a cache access and update hit rate
- * @param {string} cacheType - Type of cache
- * @param {boolean} hit - Whether it was a hit
  */
-export function recordCacheAccess(cacheType, hit) {
+export function recordCacheAccess(cacheType: string, hit: boolean): void {
   const result = hit ? 'hit' : 'miss';
   cacheAccesses.inc({ cache_type: cacheType, result });
 
@@ -200,7 +204,7 @@ export const sseClientsConnected = new Gauge({
 export const sseConnectionsTotal = new Counter({
   name: 'youtube_topk_sse_connections_total',
   help: 'Total number of SSE connection attempts',
-  labelNames: ['status'], // connected, disconnected, error
+  labelNames: ['status'] as const, // connected, disconnected, error
   registers: [registry],
 });
 
@@ -223,7 +227,7 @@ export const redisMemoryUsage = new Gauge({
 export const redisBucketKeyCount = new Gauge({
   name: 'youtube_topk_redis_bucket_keys',
   help: 'Number of Redis bucket keys',
-  labelNames: ['category'],
+  labelNames: ['category'] as const,
   registers: [registry],
 });
 
@@ -233,7 +237,7 @@ export const redisBucketKeyCount = new Gauge({
 export const redisOperationsTotal = new Counter({
   name: 'youtube_topk_redis_operations_total',
   help: 'Total number of Redis operations',
-  labelNames: ['operation', 'status'], // status: success, error
+  labelNames: ['operation', 'status'] as const, // status: success, error
   registers: [registry],
 });
 
@@ -256,7 +260,7 @@ export const pgActiveConnections = new Gauge({
 export const pgQueryLatency = new Histogram({
   name: 'youtube_topk_pg_query_duration_seconds',
   help: 'PostgreSQL query execution time',
-  labelNames: ['query_type'], // select, insert, update
+  labelNames: ['query_type'] as const, // select, insert, update
   buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
   registers: [registry],
 });
@@ -267,7 +271,7 @@ export const pgQueryLatency = new Histogram({
 export const tableRowCount = new Gauge({
   name: 'youtube_topk_table_row_count',
   help: 'Number of rows in database tables',
-  labelNames: ['table'],
+  labelNames: ['table'] as const,
   registers: [registry],
 });
 
@@ -281,18 +285,19 @@ export const tableRowCount = new Gauge({
 export const alertStatus = new Gauge({
   name: 'youtube_topk_alert_status',
   help: 'Current alert status (0=ok, 1=warning, 2=critical)',
-  labelNames: ['metric'],
+  labelNames: ['metric'] as const,
   registers: [registry],
 });
 
 /**
  * Update alert status based on current value and thresholds
- * @param {string} metric - Metric name
- * @param {number} value - Current value
- * @param {number} warningThreshold - Warning threshold
- * @param {number} criticalThreshold - Critical threshold
  */
-export function updateAlertStatus(metric, value, warningThreshold, criticalThreshold) {
+export function updateAlertStatus(
+  metric: string,
+  value: number,
+  warningThreshold: number,
+  criticalThreshold: number
+): void {
   let status = 0; // OK
   if (value >= criticalThreshold) {
     status = 2; // Critical
@@ -312,7 +317,7 @@ export function updateAlertStatus(metric, value, warningThreshold, criticalThres
 export const httpRequestsTotal = new Counter({
   name: 'youtube_topk_http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'path', 'status_code'],
+  labelNames: ['method', 'path', 'status_code'] as const,
   registers: [registry],
 });
 
@@ -322,7 +327,7 @@ export const httpRequestsTotal = new Counter({
 export const httpRequestLatency = new Histogram({
   name: 'youtube_topk_http_request_duration_seconds',
   help: 'HTTP request latency',
-  labelNames: ['method', 'path'],
+  labelNames: ['method', 'path'] as const,
   buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
   registers: [registry],
 });
@@ -330,7 +335,7 @@ export const httpRequestLatency = new Histogram({
 /**
  * Express middleware for HTTP metrics
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const start = process.hrtime.bigint();
 
   res.on('finish', () => {
@@ -357,10 +362,8 @@ export function metricsMiddleware(req, res, next) {
 
 /**
  * Normalize path for metrics (replace UUIDs with :id)
- * @param {string} path - Request path
- * @returns {string} Normalized path
  */
-function normalizePath(path) {
+function normalizePath(path: string): string {
   // Replace UUIDs with :id
   return path.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id');
 }
@@ -369,14 +372,23 @@ function normalizePath(path) {
 // Health Check Helpers
 // ============================================
 
+export interface ThresholdCheck {
+  status: 'ok' | 'warning' | 'critical';
+  value: number;
+  warning: number;
+  critical: number;
+}
+
+interface ThresholdDef {
+  warning: number;
+  critical: number;
+}
+
 /**
  * Check if a metric exceeds alert thresholds
- * @param {string} metricName - Name of the metric
- * @param {number} value - Current value
- * @returns {{status: string, value: number, warning: number, critical: number}}
  */
-export function checkThreshold(metricName, value) {
-  const thresholdMap = {
+export function checkThreshold(metricName: string, value: number): ThresholdCheck {
+  const thresholdMap: Record<string, ThresholdDef> = {
     redis_memory: {
       warning: ALERT_THRESHOLDS.redisMemoryWarningBytes,
       critical: ALERT_THRESHOLDS.redisMemoryCriticalBytes,
@@ -405,7 +417,7 @@ export function checkThreshold(metricName, value) {
 
   const thresholds = thresholdMap[metricName] || { warning: Infinity, critical: Infinity };
 
-  let status = 'ok';
+  let status: 'ok' | 'warning' | 'critical' = 'ok';
   if (value >= thresholds.critical) {
     status = 'critical';
   } else if (value >= thresholds.warning) {
@@ -422,17 +434,15 @@ export function checkThreshold(metricName, value) {
 
 /**
  * Get all metrics as string for /metrics endpoint
- * @returns {Promise<string>} Prometheus-formatted metrics
  */
-export async function getMetrics() {
+export async function getMetrics(): Promise<string> {
   return registry.metrics();
 }
 
 /**
  * Get content type for metrics response
- * @returns {string} Content type
  */
-export function getContentType() {
+export function getContentType(): string {
   return registry.contentType;
 }
 

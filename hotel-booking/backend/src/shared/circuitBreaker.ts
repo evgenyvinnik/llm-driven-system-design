@@ -8,12 +8,12 @@
  * - Protecting against thundering herd on recovery
  */
 
-const CircuitBreaker = require('opossum');
-const { logger } = require('./logger');
-const metrics = require('./metrics');
+import CircuitBreaker from 'opossum';
+import { logger } from './logger.js';
+import * as metrics from './metrics.js';
 
 // Default circuit breaker options
-const DEFAULT_OPTIONS = {
+export const DEFAULT_OPTIONS: CircuitBreaker.Options = {
   timeout: 5000, // 5 seconds
   errorThresholdPercentage: 50, // Open circuit after 50% failures
   resetTimeout: 30000, // Try again after 30 seconds
@@ -21,22 +21,46 @@ const DEFAULT_OPTIONS = {
 };
 
 // Circuit breaker state mapping for metrics
-const STATE_MAP = {
+const STATE_MAP: Record<string, number> = {
   closed: 0,
   halfOpen: 1,
   open: 2,
 };
 
+export interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+}
+
+export interface PaymentFallbackResult {
+  success: boolean;
+  queued: boolean;
+  message: string;
+}
+
+export interface AvailabilityFallbackResult {
+  available: boolean;
+  fallback: boolean;
+  message: string;
+}
+
 /**
  * Create a circuit breaker for a service
- * @param {string} name - Service name for logging and metrics
- * @param {Function} fn - The function to wrap
- * @param {Object} options - Circuit breaker options
- * @param {Function} fallback - Optional fallback function
- * @returns {CircuitBreaker}
+ * @param name - Service name for logging and metrics
+ * @param fn - The function to wrap
+ * @param options - Circuit breaker options
+ * @param fallback - Optional fallback function
+ * @returns CircuitBreaker instance
  */
-function createCircuitBreaker(name, fn, options = {}, fallback = null) {
-  const breaker = new CircuitBreaker(fn, {
+export function createCircuitBreaker<T extends (...args: unknown[]) => unknown>(
+  name: string,
+  fn: T,
+  options: CircuitBreakerOptions = {},
+  fallback: ((...args: Parameters<T>) => ReturnType<T>) | null = null
+): CircuitBreaker<Parameters<T>, ReturnType<T>> {
+  const breaker = new CircuitBreaker<Parameters<T>, ReturnType<T>>(fn, {
     ...DEFAULT_OPTIONS,
     ...options,
     name,
@@ -59,17 +83,17 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
 
   breaker.on('open', () => {
     logger.error({ service: name }, 'Circuit breaker opened');
-    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.open);
+    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.open ?? 2);
   });
 
   breaker.on('halfOpen', () => {
     logger.info({ service: name }, 'Circuit breaker half-opened');
-    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.halfOpen);
+    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.halfOpen ?? 1);
   });
 
   breaker.on('close', () => {
     logger.info({ service: name }, 'Circuit breaker closed');
-    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.closed);
+    metrics.circuitBreakerState.set({ service: name }, STATE_MAP.closed ?? 0);
   });
 
   breaker.on('fallback', () => {
@@ -77,11 +101,11 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
   });
 
   // Initialize state metric
-  metrics.circuitBreakerState.set({ service: name }, STATE_MAP.closed);
+  metrics.circuitBreakerState.set({ service: name }, STATE_MAP.closed ?? 0);
 
   // Set fallback if provided
   if (fallback) {
-    breaker.fallback(fallback);
+    breaker.fallback(fallback as (...args: unknown[]) => unknown);
   }
 
   return breaker;
@@ -89,16 +113,20 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
 
 /**
  * Wrap an async function with circuit breaker
- * @param {string} name - Service name
- * @param {Function} fn - Async function to wrap
- * @param {Object} options - Options
- * @returns {Function} Wrapped function
+ * @param name - Service name
+ * @param fn - Async function to wrap
+ * @param options - Options
+ * @returns Wrapped function
  */
-function withCircuitBreaker(name, fn, options = {}) {
+export function withCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+  name: string,
+  fn: T,
+  options: CircuitBreakerOptions = {}
+): (...args: Parameters<T>) => Promise<ReturnType<T>> {
   const breaker = createCircuitBreaker(name, fn, options);
 
-  return async (...args) => {
-    return breaker.fire(...args);
+  return async (...args: Parameters<T>): Promise<ReturnType<T>> => {
+    return breaker.fire(...args) as ReturnType<T>;
   };
 }
 
@@ -110,23 +138,27 @@ function withCircuitBreaker(name, fn, options = {}) {
  * Payment service circuit breaker
  * More conservative settings due to financial impact
  */
-const paymentCircuitBreakerOptions = {
+const paymentCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 10000, // 10 seconds - payments can be slow
   errorThresholdPercentage: 30, // Open at 30% failures
   resetTimeout: 60000, // Wait 60 seconds before retry
   volumeThreshold: 3, // Trip after 3 failed requests
 };
 
+type PaymentFunction = (bookingId: string, amount: number) => Promise<unknown>;
+
 /**
  * Create a payment service circuit breaker
  */
-function createPaymentCircuitBreaker(paymentFn) {
+export function createPaymentCircuitBreaker(
+  paymentFn: PaymentFunction
+): CircuitBreaker<[string, number], unknown> {
   return createCircuitBreaker(
     'payment-service',
     paymentFn,
     paymentCircuitBreakerOptions,
     // Fallback: queue payment for later processing
-    async (bookingId, amount) => {
+    async (bookingId: string, amount: number): Promise<PaymentFallbackResult> => {
       logger.warn(
         { bookingId, amount },
         'Payment service unavailable, queueing for later'
@@ -144,23 +176,37 @@ function createPaymentCircuitBreaker(paymentFn) {
  * Availability service circuit breaker
  * Used for external availability APIs if integrated
  */
-const availabilityCircuitBreakerOptions = {
+const availabilityCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 3000, // 3 seconds
   errorThresholdPercentage: 50,
   resetTimeout: 30000,
   volumeThreshold: 5,
 };
 
+type AvailabilityFunction = (
+  hotelId: string,
+  roomTypeId: string,
+  checkIn: string,
+  checkOut: string
+) => Promise<unknown>;
+
 /**
  * Create an availability check circuit breaker
  */
-function createAvailabilityCircuitBreaker(availabilityFn) {
+export function createAvailabilityCircuitBreaker(
+  availabilityFn: AvailabilityFunction
+): CircuitBreaker<[string, string, string, string], unknown> {
   return createCircuitBreaker(
     'availability-service',
     availabilityFn,
     availabilityCircuitBreakerOptions,
     // Fallback: return cached or pessimistic response
-    async (hotelId, roomTypeId, checkIn, checkOut) => {
+    async (
+      hotelId: string,
+      roomTypeId: string,
+      checkIn: string,
+      checkOut: string
+    ): Promise<AvailabilityFallbackResult> => {
       logger.warn(
         { hotelId, roomTypeId, checkIn, checkOut },
         'Availability service unavailable, returning unavailable'
@@ -177,17 +223,22 @@ function createAvailabilityCircuitBreaker(availabilityFn) {
 /**
  * Elasticsearch circuit breaker
  */
-const elasticsearchCircuitBreakerOptions = {
+const elasticsearchCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 5000,
   errorThresholdPercentage: 50,
   resetTimeout: 20000,
   volumeThreshold: 5,
 };
 
+type SearchFunction = (...args: unknown[]) => Promise<unknown>;
+
 /**
  * Create an Elasticsearch circuit breaker
  */
-function createElasticsearchCircuitBreaker(searchFn, fallbackFn = null) {
+export function createElasticsearchCircuitBreaker(
+  searchFn: SearchFunction,
+  fallbackFn: SearchFunction | null = null
+): CircuitBreaker<unknown[], unknown> {
   return createCircuitBreaker(
     'elasticsearch',
     searchFn,
@@ -196,7 +247,7 @@ function createElasticsearchCircuitBreaker(searchFn, fallbackFn = null) {
   );
 }
 
-module.exports = {
+export default {
   createCircuitBreaker,
   withCircuitBreaker,
   createPaymentCircuitBreaker,

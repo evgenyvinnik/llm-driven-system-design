@@ -1,9 +1,33 @@
+import Redis from 'ioredis';
+import { Request, Response, NextFunction } from 'express';
 import redis from '../redis.js';
 import { query } from '../db.js';
 import { createLogger } from './logger.js';
 import { idempotentRequests } from './metrics.js';
 
 const logger = createLogger('idempotency');
+
+interface IdempotencyCheckResult {
+  exists: boolean;
+  messageId?: string;
+  status?: string;
+}
+
+interface IdempotencyProcessResult<T> {
+  result: T;
+  isDuplicate: boolean;
+}
+
+interface ProcessOptions<T> {
+  idempotencyKey: string;
+  userId: string;
+  operation: () => Promise<T>;
+}
+
+interface AuthenticatedRequest extends Request {
+  user?: { id: string; [key: string]: unknown };
+  idempotencyKey?: string | null;
+}
 
 /**
  * Idempotency service for preventing duplicate message delivery
@@ -22,29 +46,27 @@ const logger = createLogger('idempotency');
  * will recognize it as a duplicate and return the existing message.
  */
 export class IdempotencyService {
-  constructor(redisClient, dbPool) {
+  private redis: Redis;
+  private keyPrefix: string;
+  private ttlSeconds: number;
+
+  constructor(redisClient: Redis) {
     this.redis = redisClient;
-    this.db = dbPool;
     this.keyPrefix = 'idempotency:';
     this.ttlSeconds = 24 * 60 * 60; // 24 hours
   }
 
   /**
    * Generate an idempotency key for a message
-   * @param {string} userId - Sender's user ID
-   * @param {string} conversationId - Conversation ID
-   * @param {string} clientMessageId - Client-generated message ID
    */
-  generateKey(userId, conversationId, clientMessageId) {
+  generateKey(userId: string, conversationId: string, clientMessageId: string): string {
     return `${userId}:${conversationId}:${clientMessageId}`;
   }
 
   /**
    * Check if a request with this idempotency key has already been processed
-   * @param {string} idempotencyKey - The idempotency key
-   * @returns {Promise<{exists: boolean, messageId?: string, status?: string}>}
    */
-  async checkExisting(idempotencyKey) {
+  async checkExisting(idempotencyKey: string): Promise<IdempotencyCheckResult> {
     const fullKey = `${this.keyPrefix}${idempotencyKey}`;
 
     try {
@@ -87,11 +109,8 @@ export class IdempotencyService {
 
   /**
    * Record a completed operation with its idempotency key
-   * @param {string} idempotencyKey - The idempotency key
-   * @param {string} messageId - The resulting message ID
-   * @param {string} userId - The user who made the request
    */
-  async recordCompletion(idempotencyKey, messageId, userId) {
+  async recordCompletion(idempotencyKey: string, messageId: string, userId: string): Promise<void> {
     const fullKey = `${this.keyPrefix}${idempotencyKey}`;
 
     try {
@@ -120,13 +139,12 @@ export class IdempotencyService {
 
   /**
    * Process a request with idempotency handling
-   * @param {Object} options - Processing options
-   * @param {string} options.idempotencyKey - The idempotency key
-   * @param {string} options.userId - The user making the request
-   * @param {Function} options.operation - The async operation to perform
-   * @returns {Promise<{result: any, isDuplicate: boolean}>}
    */
-  async processWithIdempotency({ idempotencyKey, userId, operation }) {
+  async processWithIdempotency<T extends { id: string }>(
+    options: ProcessOptions<T>
+  ): Promise<IdempotencyProcessResult<T | { id: string; status?: string }>> {
+    const { idempotencyKey, userId, operation } = options;
+
     // Check for existing
     const existing = await this.checkExisting(idempotencyKey);
 
@@ -135,7 +153,7 @@ export class IdempotencyService {
       logger.info({ idempotencyKey, messageId: existing.messageId }, 'Duplicate request detected');
 
       return {
-        result: { id: existing.messageId, status: existing.status },
+        result: { id: existing.messageId!, status: existing.status },
         isDuplicate: true,
       };
     }
@@ -156,31 +174,32 @@ export class IdempotencyService {
 }
 
 // Create singleton instance
-const idempotencyService = new IdempotencyService(redis, null);
+const idempotencyService = new IdempotencyService(redis);
 
 /**
  * Express middleware for idempotent message sending
  * Expects idempotencyKey in request body or X-Idempotency-Key header
  */
-export function idempotencyMiddleware(req, res, next) {
+export function idempotencyMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const authReq = req as AuthenticatedRequest;
   // Extract or generate idempotency key
   const clientMessageId = req.body.clientMessageId || req.headers['x-idempotency-key'];
 
   if (!clientMessageId) {
     // No idempotency key provided - generate a warning but allow
     logger.warn({
-      userId: req.user?.id,
+      userId: authReq.user?.id,
       method: req.method,
       url: req.url,
     }, 'Request without idempotency key');
   }
 
   // Attach to request for use in handlers
-  req.idempotencyKey = clientMessageId
+  authReq.idempotencyKey = clientMessageId
     ? idempotencyService.generateKey(
-        req.user?.id || 'anonymous',
+        authReq.user?.id || 'anonymous',
         req.params.conversationId || 'unknown',
-        clientMessageId
+        clientMessageId as string
       )
     : null;
 

@@ -1,6 +1,7 @@
 import { redis } from './redis.js';
 import { logger } from './logger.js';
 import { rateLimitedRequestsTotal } from './metrics.js';
+import type { Request, Response, NextFunction } from 'express';
 
 /**
  * Rate Limiting Module for Reviews
@@ -13,8 +14,44 @@ import { rateLimitedRequestsTotal } from './metrics.js';
  * Uses a sliding window counter algorithm in Redis for accuracy.
  */
 
+// Extended request interface
+interface RateLimitRequest extends Request {
+  user?: {
+    id: string;
+    [key: string]: unknown;
+  };
+}
+
+// Rate limit config interface
+interface RateLimitConfig {
+  points: number;
+  duration: number;
+  keyPrefix: string;
+}
+
+// Rate limit result interface
+interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+  limit: number;
+}
+
+// Rate limit check result interface
+interface RateLimitCheckResult {
+  allowed: boolean;
+  remaining: number;
+  limit: number;
+}
+
+// Can review result interface
+interface CanReviewResult {
+  allowed: boolean;
+  message?: string;
+}
+
 // Rate limit configurations
-const RATE_LIMITS = {
+const RATE_LIMITS: Record<string, RateLimitConfig> = {
   // Max 10 reviews per user per hour
   userReviews: {
     points: 10,
@@ -43,12 +80,11 @@ const RATE_LIMITS = {
 
 /**
  * Consume a rate limit point
- *
- * @param {string} key - Redis key for the rate limit
- * @param {object} config - Rate limit configuration
- * @returns {object} - { allowed: boolean, remaining: number, resetAt: number }
  */
-async function consumePoint(key, config) {
+async function consumePoint(
+  key: string,
+  config: RateLimitConfig
+): Promise<RateLimitResult> {
   const now = Date.now();
   const windowStart = now - config.duration * 1000;
 
@@ -69,12 +105,15 @@ async function consumePoint(key, config) {
     multi.expire(key, config.duration);
 
     const results = await multi.exec();
-    const currentCount = results[1][1]; // zcard result
+    const currentCount = (results?.[1]?.[1] as number) ?? 0; // zcard result
 
     if (currentCount >= config.points) {
       // Rate limit exceeded
       const oldestEntry = await redis.zrange(key, 0, 0, 'WITHSCORES');
-      const resetAt = oldestEntry.length > 1 ? parseInt(oldestEntry[1]) + config.duration * 1000 : now + config.duration * 1000;
+      const resetAt =
+        oldestEntry.length > 1
+          ? parseInt(oldestEntry[1], 10) + config.duration * 1000
+          : now + config.duration * 1000;
 
       return {
         allowed: false,
@@ -91,20 +130,27 @@ async function consumePoint(key, config) {
       limit: config.points,
     };
   } catch (error) {
-    logger.error({ component: 'ratelimit', key, error: error.message }, 'Rate limit check failed');
+    logger.error(
+      { component: 'ratelimit', key, error: (error as Error).message },
+      'Rate limit check failed'
+    );
     // Fail open - allow request if Redis fails
-    return { allowed: true, remaining: config.points, resetAt: now, limit: config.points };
+    return {
+      allowed: true,
+      remaining: config.points,
+      resetAt: now,
+      limit: config.points,
+    };
   }
 }
 
 /**
  * Check rate limit without consuming
- *
- * @param {string} key - Redis key
- * @param {object} config - Rate limit configuration
- * @returns {object} - Current rate limit status
  */
-async function checkLimit(key, config) {
+async function checkLimit(
+  key: string,
+  config: RateLimitConfig
+): Promise<RateLimitCheckResult> {
   const now = Date.now();
   const windowStart = now - config.duration * 1000;
 
@@ -117,7 +163,7 @@ async function checkLimit(key, config) {
       remaining: Math.max(0, config.points - count),
       limit: config.points,
     };
-  } catch (error) {
+  } catch {
     return { allowed: true, remaining: config.points, limit: config.points };
   }
 }
@@ -125,37 +171,56 @@ async function checkLimit(key, config) {
 /**
  * Rate limit middleware for review creation
  */
-export function reviewRateLimit(req, res, next) {
-  return rateLimitMiddleware('userReviews', (req) => req.user?.id)(req, res, next);
+export function reviewRateLimit(
+  req: RateLimitRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  rateLimitMiddleware('userReviews', (r: RateLimitRequest) => r.user?.id)(
+    req,
+    res,
+    next
+  );
 }
 
 /**
  * Rate limit middleware for review votes
  */
-export function voteRateLimit(req, res, next) {
-  return rateLimitMiddleware('userVotes', (req) => req.user?.id)(req, res, next);
+export function voteRateLimit(
+  req: RateLimitRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  rateLimitMiddleware('userVotes', (r: RateLimitRequest) => r.user?.id)(
+    req,
+    res,
+    next
+  );
 }
 
 /**
  * Generic rate limit middleware factory
- *
- * @param {string} limitType - One of the RATE_LIMITS keys
- * @param {Function} keyExtractor - Function to extract the rate limit key from request
- * @returns {Function} Express middleware
  */
-export function rateLimitMiddleware(limitType, keyExtractor) {
+export function rateLimitMiddleware(
+  limitType: string,
+  keyExtractor: (req: RateLimitRequest) => string | undefined
+): (req: RateLimitRequest, res: Response, next: NextFunction) => Promise<void | Response> {
   const config = RATE_LIMITS[limitType];
 
   if (!config) {
     throw new Error(`Unknown rate limit type: ${limitType}`);
   }
 
-  return async (req, res, next) => {
+  return async (
+    req: RateLimitRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void | Response> => {
     const identifier = keyExtractor(req);
 
     if (!identifier) {
       // Fall back to IP-based limiting
-      const ip = req.ip || req.connection?.remoteAddress;
+      const ip = req.ip || req.socket?.remoteAddress;
       const ipConfig = RATE_LIMITS.ipReviews;
       const ipKey = `${ipConfig.keyPrefix}${ip}`;
       const result = await consumePoint(ipKey, ipConfig);
@@ -167,10 +232,13 @@ export function rateLimitMiddleware(limitType, keyExtractor) {
           'IP rate limit exceeded'
         );
 
-        res.set('X-RateLimit-Limit', result.limit);
-        res.set('X-RateLimit-Remaining', 0);
-        res.set('X-RateLimit-Reset', Math.ceil(result.resetAt / 1000));
-        res.set('Retry-After', Math.ceil((result.resetAt - Date.now()) / 1000));
+        res.set('X-RateLimit-Limit', String(result.limit));
+        res.set('X-RateLimit-Remaining', '0');
+        res.set('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
+        res.set(
+          'Retry-After',
+          String(Math.ceil((result.resetAt - Date.now()) / 1000))
+        );
 
         return res.status(429).json({
           error: {
@@ -180,9 +248,9 @@ export function rateLimitMiddleware(limitType, keyExtractor) {
         });
       }
 
-      res.set('X-RateLimit-Limit', result.limit);
-      res.set('X-RateLimit-Remaining', result.remaining);
-      res.set('X-RateLimit-Reset', Math.ceil(result.resetAt / 1000));
+      res.set('X-RateLimit-Limit', String(result.limit));
+      res.set('X-RateLimit-Remaining', String(result.remaining));
+      res.set('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
 
       return next();
     }
@@ -191,28 +259,35 @@ export function rateLimitMiddleware(limitType, keyExtractor) {
     const result = await consumePoint(key, config);
 
     if (!result.allowed) {
-      rateLimitedRequestsTotal.inc({ endpoint: req.path, limit_type: limitType });
+      rateLimitedRequestsTotal.inc({
+        endpoint: req.path,
+        limit_type: limitType,
+      });
       logger.warn(
         { component: 'ratelimit', userId: identifier, limitType, path: req.path },
         'User rate limit exceeded'
       );
 
-      res.set('X-RateLimit-Limit', result.limit);
-      res.set('X-RateLimit-Remaining', 0);
-      res.set('X-RateLimit-Reset', Math.ceil(result.resetAt / 1000));
-      res.set('Retry-After', Math.ceil((result.resetAt - Date.now()) / 1000));
+      res.set('X-RateLimit-Limit', String(result.limit));
+      res.set('X-RateLimit-Remaining', '0');
+      res.set('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
+      res.set(
+        'Retry-After',
+        String(Math.ceil((result.resetAt - Date.now()) / 1000))
+      );
 
       return res.status(429).json({
         error: {
-          message: 'You have exceeded the rate limit for this action. Please try again later.',
+          message:
+            'You have exceeded the rate limit for this action. Please try again later.',
           retryAfter: Math.ceil((result.resetAt - Date.now()) / 1000),
         },
       });
     }
 
-    res.set('X-RateLimit-Limit', result.limit);
-    res.set('X-RateLimit-Remaining', result.remaining);
-    res.set('X-RateLimit-Reset', Math.ceil(result.resetAt / 1000));
+    res.set('X-RateLimit-Limit', String(result.limit));
+    res.set('X-RateLimit-Remaining', String(result.remaining));
+    res.set('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
 
     next();
   };
@@ -220,12 +295,11 @@ export function rateLimitMiddleware(limitType, keyExtractor) {
 
 /**
  * Check if user can review a specific business (prevents review bombing)
- *
- * @param {string} userId - User ID
- * @param {string} businessId - Business ID
- * @returns {object} - { allowed: boolean, message?: string }
  */
-export async function canReviewBusiness(userId, businessId) {
+export async function canReviewBusiness(
+  userId: string,
+  businessId: string
+): Promise<CanReviewResult> {
   const config = RATE_LIMITS.userBusinessReviews;
   const key = `${config.keyPrefix}${userId}:${businessId}`;
   const result = await checkLimit(key, config);
@@ -233,7 +307,8 @@ export async function canReviewBusiness(userId, businessId) {
   if (!result.allowed) {
     return {
       allowed: false,
-      message: 'You have reached the maximum number of reviews for this business today.',
+      message:
+        'You have reached the maximum number of reviews for this business today.',
     };
   }
 
@@ -242,11 +317,11 @@ export async function canReviewBusiness(userId, businessId) {
 
 /**
  * Record a review action for rate limiting
- *
- * @param {string} userId - User ID
- * @param {string} businessId - Business ID
  */
-export async function recordReviewAction(userId, businessId) {
+export async function recordReviewAction(
+  userId: string,
+  businessId: string
+): Promise<void> {
   const config = RATE_LIMITS.userBusinessReviews;
   const key = `${config.keyPrefix}${userId}:${businessId}`;
   await consumePoint(key, config);
@@ -254,11 +329,11 @@ export async function recordReviewAction(userId, businessId) {
 
 /**
  * Reset rate limit for a user (admin function)
- *
- * @param {string} limitType - Rate limit type
- * @param {string} identifier - User or IP identifier
  */
-export async function resetRateLimit(limitType, identifier) {
+export async function resetRateLimit(
+  limitType: string,
+  identifier: string
+): Promise<void> {
   const config = RATE_LIMITS[limitType];
   if (!config) return;
 

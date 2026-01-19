@@ -1,10 +1,10 @@
-import pino from 'pino';
+import pino, { Logger, LoggerOptions } from 'pino';
 
 // Create structured JSON logger with pino
-const logger = pino({
+const loggerOptions: LoggerOptions = {
   level: process.env.LOG_LEVEL || 'info',
   formatters: {
-    level: (label) => {
+    level: (label: string) => {
       return { level: label };
     }
   },
@@ -18,28 +18,32 @@ const logger = pino({
   transport: process.env.NODE_ENV !== 'production' && process.env.LOG_PRETTY === 'true'
     ? { target: 'pino-pretty', options: { colorize: true } }
     : undefined
-});
+};
+
+const logger: Logger = pino(loggerOptions);
 
 // Create child loggers for specific components
-export const searchLogger = logger.child({ component: 'search' });
-export const indexLogger = logger.child({ component: 'index' });
-export const suggestionsLogger = logger.child({ component: 'suggestions' });
-export const healthLogger = logger.child({ component: 'health' });
+export const searchLogger: Logger = logger.child({ component: 'search' });
+export const indexLogger: Logger = logger.child({ component: 'index' });
+export const suggestionsLogger: Logger = logger.child({ component: 'suggestions' });
+export const healthLogger: Logger = logger.child({ component: 'health' });
 
 // Audit logger for security-relevant events
-export const auditLogger = logger.child({ component: 'audit', audit: true });
+export const auditLogger: Logger = logger.child({ component: 'audit', audit: true });
+
+export interface SearchLogParams {
+  query: string;
+  userId?: string | null;
+  resultCount: number;
+  latencyMs: number;
+  sources: string[];
+  requestId?: string;
+}
 
 /**
  * Log search operation with standardized fields
- * @param {Object} params - Search parameters
- * @param {string} params.query - The search query
- * @param {string} params.userId - User ID (if authenticated)
- * @param {number} params.resultCount - Number of results returned
- * @param {number} params.latencyMs - Search latency in milliseconds
- * @param {string[]} params.sources - Sources queried (local, provider, cloud)
- * @param {string} params.requestId - Request tracking ID
  */
-export function logSearch({ query, userId, resultCount, latencyMs, sources, requestId }) {
+export function logSearch({ query, userId, resultCount, latencyMs, sources, requestId }: SearchLogParams): void {
   searchLogger.info({
     query,
     userId,
@@ -50,19 +54,21 @@ export function logSearch({ query, userId, resultCount, latencyMs, sources, requ
   }, 'Search completed');
 }
 
+export interface IndexLogParams {
+  operation: string;
+  documentType: string;
+  documentId: string;
+  latencyMs: number;
+  success: boolean;
+  error?: string;
+  idempotencyKey?: string;
+}
+
 /**
  * Log index operation with standardized fields
- * @param {Object} params - Index parameters
- * @param {string} params.operation - Operation type (add, update, delete, bulk)
- * @param {string} params.documentType - Type of document (file, app, contact, web)
- * @param {string} params.documentId - Document identifier
- * @param {number} params.latencyMs - Operation latency in milliseconds
- * @param {boolean} params.success - Whether operation succeeded
- * @param {string} params.error - Error message if failed
- * @param {string} params.idempotencyKey - Idempotency key if provided
  */
-export function logIndexOperation({ operation, documentType, documentId, latencyMs, success, error, idempotencyKey }) {
-  const logData = {
+export function logIndexOperation({ operation, documentType, documentId, latencyMs, success, error, idempotencyKey }: IndexLogParams): void {
+  const logData: Record<string, unknown> = {
     operation,
     documentType,
     documentId,
@@ -82,15 +88,17 @@ export function logIndexOperation({ operation, documentType, documentId, latency
   }
 }
 
+export interface AuditEventParams {
+  eventType: string;
+  userId: string | null;
+  ip: string | null;
+  details: Record<string, unknown>;
+}
+
 /**
  * Log audit event for security tracking
- * @param {Object} params - Audit parameters
- * @param {string} params.eventType - Type of event (login, logout, permission_denied, rate_limit_exceeded, etc.)
- * @param {string} params.userId - User ID
- * @param {string} params.ip - Client IP address
- * @param {Object} params.details - Additional event details
  */
-export function logAuditEvent({ eventType, userId, ip, details }) {
+export function logAuditEvent({ eventType, userId, ip, details }: AuditEventParams): void {
   auditLogger.info({
     eventType,
     userId,
@@ -99,14 +107,16 @@ export function logAuditEvent({ eventType, userId, ip, details }) {
   }, `Audit: ${eventType}`);
 }
 
+export interface CircuitBreakerStateParams {
+  name: string;
+  state: string;
+  failures: number;
+}
+
 /**
  * Log circuit breaker state change
- * @param {Object} params - Circuit breaker parameters
- * @param {string} params.name - Circuit breaker name
- * @param {string} params.state - New state (OPEN, HALF_OPEN, CLOSED)
- * @param {number} params.failures - Number of failures
  */
-export function logCircuitBreakerState({ name, state, failures }) {
+export function logCircuitBreakerState({ name, state, failures }: CircuitBreakerStateParams): void {
   const logLevel = state === 'OPEN' ? 'warn' : 'info';
   logger[logLevel]({
     component: 'circuit_breaker',

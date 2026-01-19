@@ -1,8 +1,32 @@
-const db = require('./index');
-const bcrypt = require('bcryptjs');
-const { v4: uuidv4 } = require('uuid');
+import * as db from './index.js';
+import bcrypt from 'bcryptjs';
+import { v4 as uuidv4 } from 'uuid';
 
-async function seed() {
+interface Episode {
+  seriesId: string;
+  season: number;
+  episode: number;
+  title: string;
+  description: string;
+  duration: number;
+}
+
+interface EncodedVariant {
+  resolution: number;
+  codec: string;
+  hdr: boolean;
+  bitrate: number;
+}
+
+interface Movie {
+  title: string;
+  description: string;
+  duration: number;
+  rating: string;
+  genres: string[];
+}
+
+async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   // Create admin user
@@ -26,8 +50,8 @@ async function seed() {
   `, [userId, 'user@appletv.local', userPasswordHash, 'Test User', 'user', 'monthly', new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)]);
 
   // Get actual user IDs
-  const adminResult = await db.query(`SELECT id FROM users WHERE email = 'admin@appletv.local'`);
-  const userResult = await db.query(`SELECT id FROM users WHERE email = 'user@appletv.local'`);
+  const adminResult = await db.query<{ id: string }>(`SELECT id FROM users WHERE email = 'admin@appletv.local'`);
+  const userResult = await db.query<{ id: string }>(`SELECT id FROM users WHERE email = 'user@appletv.local'`);
   const actualAdminId = adminResult.rows[0].id;
   const actualUserId = userResult.rows[0].id;
 
@@ -111,7 +135,7 @@ async function seed() {
   ]);
 
   // Episodes for Silicon Dreams (Season 1)
-  const episodes = [
+  const episodes: Episode[] = [
     { seriesId: series1Id, season: 1, episode: 1, title: 'Pilot', description: 'Two college friends start a company in their garage.', duration: 3540 },
     { seriesId: series1Id, season: 1, episode: 2, title: 'Funding Round', description: 'The team pitches to venture capitalists for Series A.', duration: 3420 },
     { seriesId: series1Id, season: 1, episode: 3, title: 'Product Launch', description: 'Launch day arrives with unexpected challenges.', duration: 3600 },
@@ -120,7 +144,7 @@ async function seed() {
   ];
 
   // Episodes for Beyond the Stars (Season 1)
-  const starEpisodes = [
+  const starEpisodes: Episode[] = [
     { seriesId: series2Id, season: 1, episode: 1, title: 'Launch', description: 'The Horizon spacecraft departs on humanity\'s greatest journey.', duration: 3900 },
     { seriesId: series2Id, season: 1, episode: 2, title: 'The Signal', description: 'A mysterious transmission is detected from deep space.', duration: 3720 },
     { seriesId: series2Id, season: 1, episode: 3, title: 'First Contact', description: 'The crew encounters evidence of intelligent life.', duration: 3840 },
@@ -128,13 +152,13 @@ async function seed() {
   ];
 
   // Episodes for The Last Secret (Season 1)
-  const secretEpisodes = [
+  const secretEpisodes: Episode[] = [
     { seriesId: series3Id, season: 1, episode: 1, title: 'Cold Trail', description: 'Sarah discovers old evidence in her grandmother\'s attic.', duration: 3300 },
     { seriesId: series3Id, season: 1, episode: 2, title: 'Connections', description: 'The case connects to a powerful political family.', duration: 3240 },
     { seriesId: series3Id, season: 1, episode: 3, title: 'Deep Cover', description: 'Sarah goes undercover to gather evidence.', duration: 3420 },
   ];
 
-  const allEpisodes = [...episodes, ...starEpisodes, ...secretEpisodes];
+  const allEpisodes: Episode[] = [...episodes, ...starEpisodes, ...secretEpisodes];
 
   for (const ep of allEpisodes) {
     const episodeId = uuidv4();
@@ -158,7 +182,7 @@ async function seed() {
     ]);
 
     // Add encoded variants for each episode
-    const variants = [
+    const variants: EncodedVariant[] = [
       { resolution: 2160, codec: 'hevc', hdr: true, bitrate: 15000 },
       { resolution: 1080, codec: 'h264', hdr: false, bitrate: 6000 },
       { resolution: 720, codec: 'h264', hdr: false, bitrate: 3000 },
@@ -197,7 +221,7 @@ async function seed() {
   }
 
   // Create standalone movies
-  const movies = [
+  const movies: Movie[] = [
     {
       title: 'The Algorithm',
       description: 'A brilliant programmer creates an AI that begins to question its own existence. As it grows more sentient, both creator and creation must confront fundamental questions about consciousness and humanity.',
@@ -250,7 +274,7 @@ async function seed() {
     ]);
 
     // Add encoded variants
-    const variants = [
+    const variants: EncodedVariant[] = [
       { resolution: 2160, codec: 'hevc', hdr: true, bitrate: 20000 },
       { resolution: 1080, codec: 'h264', hdr: false, bitrate: 8000 },
       { resolution: 720, codec: 'h264', hdr: false, bitrate: 4000 },
@@ -304,7 +328,7 @@ async function seed() {
   process.exit(0);
 }
 
-seed().catch((err) => {
+seed().catch((err: Error) => {
   console.error('Seeding failed:', err);
   process.exit(1);
 });

@@ -10,48 +10,49 @@
  * - Health Checks
  */
 
-const logger = require('./logger');
-const metrics = require('./metrics');
-const circuitBreaker = require('./circuitBreaker');
-const distributedLock = require('./distributedLock');
-const idempotency = require('./idempotency');
-const healthCheck = require('./healthCheck');
+import * as loggerModule from './logger.js';
+import * as metricsModule from './metrics.js';
+import * as circuitBreakerModule from './circuitBreaker.js';
+import * as distributedLockModule from './distributedLock.js';
+import * as idempotencyModule from './idempotency.js';
+import * as healthCheckModule from './healthCheck.js';
 
-module.exports = {
-  // Logger
-  logger: logger.logger,
-  createRequestLogger: logger.createRequestLogger,
-  getTraceId: logger.getTraceId,
-  requestLoggerMiddleware: logger.requestLoggerMiddleware,
+// Re-export everything from individual modules
+export * from './logger.js';
+export * from './metrics.js';
+export * from './circuitBreaker.js';
+export * from './distributedLock.js';
+export * from './idempotency.js';
+export * from './healthCheck.js';
 
-  // Metrics
-  metrics,
-  metricsMiddleware: metrics.metricsMiddleware,
-  getMetrics: metrics.getMetrics,
-  getContentType: metrics.getContentType,
+// Named exports for convenience
+export const logger = loggerModule.logger;
+export const createRequestLogger = loggerModule.createRequestLogger;
+export const getTraceId = loggerModule.getTraceId;
+export const requestLoggerMiddleware = loggerModule.requestLoggerMiddleware;
 
-  // Circuit Breaker
-  createCircuitBreaker: circuitBreaker.createCircuitBreaker,
-  withCircuitBreaker: circuitBreaker.withCircuitBreaker,
-  createPaymentCircuitBreaker: circuitBreaker.createPaymentCircuitBreaker,
-  createAvailabilityCircuitBreaker: circuitBreaker.createAvailabilityCircuitBreaker,
-  createElasticsearchCircuitBreaker: circuitBreaker.createElasticsearchCircuitBreaker,
+export const metrics = metricsModule;
+export const metricsMiddleware = metricsModule.metricsMiddleware;
+export const getMetrics = metricsModule.getMetrics;
+export const getContentType = metricsModule.getContentType;
 
-  // Distributed Lock
-  acquireLock: distributedLock.acquireLock,
-  releaseLock: distributedLock.releaseLock,
-  withLock: distributedLock.withLock,
-  createRoomLockResource: distributedLock.createRoomLockResource,
+export const createCircuitBreaker = circuitBreakerModule.createCircuitBreaker;
+export const withCircuitBreaker = circuitBreakerModule.withCircuitBreaker;
+export const createPaymentCircuitBreaker = circuitBreakerModule.createPaymentCircuitBreaker;
+export const createAvailabilityCircuitBreaker = circuitBreakerModule.createAvailabilityCircuitBreaker;
+export const createElasticsearchCircuitBreaker = circuitBreakerModule.createElasticsearchCircuitBreaker;
 
-  // Idempotency
-  generateIdempotencyKey: idempotency.generateIdempotencyKey,
-  checkIdempotency: idempotency.checkIdempotency,
-  cacheIdempotencyResult: idempotency.cacheIdempotencyResult,
-  idempotencyMiddleware: idempotency.idempotencyMiddleware,
+export const acquireLock = distributedLockModule.acquireLock;
+export const releaseLock = distributedLockModule.releaseLock;
+export const withLock = distributedLockModule.withLock;
+export const createRoomLockResource = distributedLockModule.createRoomLockResource;
 
-  // Health Checks
-  checkHealth: healthCheck.checkHealth,
-  livenessCheck: healthCheck.livenessCheck,
-  readinessCheck: healthCheck.readinessCheck,
-  createHealthRouter: healthCheck.createHealthRouter,
-};
+export const generateIdempotencyKey = idempotencyModule.generateIdempotencyKey;
+export const checkIdempotency = idempotencyModule.checkIdempotency;
+export const cacheIdempotencyResult = idempotencyModule.cacheIdempotencyResult;
+export const idempotencyMiddleware = idempotencyModule.idempotencyMiddleware;
+
+export const checkHealth = healthCheckModule.checkHealth;
+export const livenessCheck = healthCheckModule.livenessCheck;
+export const readinessCheck = healthCheckModule.readinessCheck;
+export const createHealthRouter = healthCheckModule.createHealthRouter;

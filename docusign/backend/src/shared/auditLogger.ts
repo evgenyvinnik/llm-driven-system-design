@@ -75,18 +75,121 @@ export const AUDIT_EVENTS = {
   ACCESS_DENIED: 'access_denied',
   SUSPICIOUS_ACTIVITY: 'suspicious_activity',
   IDEMPOTENCY_BLOCKED: 'idempotency_blocked',
-};
+} as const;
+
+export type AuditEventType = typeof AUDIT_EVENTS[keyof typeof AUDIT_EVENTS];
+
+export interface AuditContext {
+  ipAddress?: string;
+  ip?: string;
+  userAgent?: string;
+  sessionId?: string;
+  geoLocation?: string;
+  deviceInfo?: string;
+  userId?: string;
+}
+
+export interface AuditEventData {
+  recipientId?: string;
+  userId?: string;
+  timestamp?: string;
+  [key: string]: unknown;
+}
+
+export interface AuditEvent {
+  id: string;
+  envelopeId: string;
+  eventType: string;
+  data: AuditEventData & { timestamp: string };
+  timestamp: string;
+  actor: string;
+  context: {
+    ipAddress?: string;
+    userAgent?: string;
+    sessionId?: string;
+    geoLocation?: string;
+    deviceInfo?: string;
+  };
+  previousHash?: string;
+  hash?: string;
+}
+
+export interface AuditEventRow {
+  id: string;
+  envelope_id: string;
+  event_type: string;
+  data: string | Record<string, unknown>;
+  timestamp: string;
+  actor: string;
+  previous_hash: string;
+  hash: string;
+}
+
+export interface ChainVerificationResult {
+  valid: boolean;
+  eventCount: number;
+  issues: ChainIssue[];
+  verifiedAt: string;
+}
+
+export interface ChainIssue {
+  eventId: string;
+  type: 'chain_broken' | 'hash_mismatch';
+  expected: string;
+  found: string;
+}
+
+export interface SignatureCaptureParams {
+  envelopeId: string;
+  recipientId: string;
+  recipientEmail: string;
+  recipientName: string;
+  fieldId: string;
+  signatureId: string;
+  signatureType: string;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+export interface DuplicateSignatureParams {
+  envelopeId: string;
+  recipientId: string;
+  fieldId: string;
+  idempotencyKey: string;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+export interface AuthEventParams {
+  recipientId: string;
+  authMethod?: string;
+  reason?: string;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+export interface SecurityEventParams {
+  severity?: string;
+  ipAddress?: string;
+  userAgent?: string;
+  [key: string]: unknown;
+}
 
 /**
  * Log an audit event with full context for legal compliance.
  *
- * @param {string} envelopeId - ID of the envelope
- * @param {string} eventType - Type of event (from AUDIT_EVENTS)
- * @param {Object} data - Event-specific data
- * @param {Object} context - Request context (IP, user agent, etc.)
+ * @param envelopeId - ID of the envelope
+ * @param eventType - Type of event (from AUDIT_EVENTS)
+ * @param data - Event-specific data
+ * @param context - Request context (IP, user agent, etc.)
  */
-export async function logAuditEvent(envelopeId, eventType, data, context = {}) {
-  const event = {
+export async function logAuditEvent(
+  envelopeId: string,
+  eventType: string,
+  data: AuditEventData,
+  context: AuditContext = {}
+): Promise<AuditEvent | null> {
+  const event: AuditEvent = {
     id: uuid(),
     envelopeId,
     eventType,
@@ -147,8 +250,9 @@ export async function logAuditEvent(envelopeId, eventType, data, context = {}) {
   } catch (error) {
     // Audit failures are critical - log at error level but don't throw
     // The main operation should still proceed
+    const err = error as Error;
     logger.error({
-      error: error.message,
+      error: err.message,
       envelopeId,
       eventType,
     }, 'Failed to log audit event');
@@ -160,7 +264,7 @@ export async function logAuditEvent(envelopeId, eventType, data, context = {}) {
 /**
  * Calculate SHA-256 hash for event (tamper-evidence).
  */
-function calculateEventHash(event) {
+function calculateEventHash(event: AuditEvent): string {
   const payload = JSON.stringify({
     id: event.id,
     envelopeId: event.envelopeId,
@@ -177,8 +281,8 @@ function calculateEventHash(event) {
 /**
  * Get the last event for an envelope (for hash chain).
  */
-async function getLastEvent(envelopeId) {
-  const result = await query(
+async function getLastEvent(envelopeId: string): Promise<AuditEventRow | null> {
+  const result = await query<AuditEventRow>(
     `SELECT * FROM audit_events
      WHERE envelope_id = $1
      ORDER BY timestamp DESC
@@ -191,7 +295,7 @@ async function getLastEvent(envelopeId) {
 /**
  * Log a signature capture event with full legal context.
  */
-export async function logSignatureCapture(params) {
+export async function logSignatureCapture(params: SignatureCaptureParams): Promise<AuditEvent | null> {
   const {
     envelopeId,
     recipientId,
@@ -222,7 +326,7 @@ export async function logSignatureCapture(params) {
 /**
  * Log a duplicate signature attempt (blocked by idempotency).
  */
-export async function logDuplicateSignatureBlocked(params) {
+export async function logDuplicateSignatureBlocked(params: DuplicateSignatureParams): Promise<AuditEvent | null> {
   const {
     envelopeId,
     recipientId,
@@ -247,7 +351,11 @@ export async function logDuplicateSignatureBlocked(params) {
 /**
  * Log authentication event for signing session.
  */
-export async function logAuthEvent(envelopeId, success, params) {
+export async function logAuthEvent(
+  envelopeId: string,
+  success: boolean,
+  params: AuthEventParams
+): Promise<AuditEvent | null> {
   const eventType = success ? AUDIT_EVENTS.AUTH_SUCCEEDED : AUDIT_EVENTS.AUTH_FAILED;
 
   return logAuditEvent(envelopeId, eventType, {
@@ -264,7 +372,11 @@ export async function logAuthEvent(envelopeId, success, params) {
 /**
  * Log security-related events.
  */
-export async function logSecurityEvent(envelopeId, eventType, params) {
+export async function logSecurityEvent(
+  envelopeId: string,
+  eventType: string,
+  params: SecurityEventParams
+): Promise<AuditEvent | null> {
   return logAuditEvent(envelopeId, eventType, {
     ...params,
     detectedAt: new Date().toISOString(),
@@ -279,8 +391,8 @@ export async function logSecurityEvent(envelopeId, eventType, params) {
  * Verify the integrity of the audit chain for an envelope.
  * Used for compliance audits and legal proceedings.
  */
-export async function verifyAuditChain(envelopeId) {
-  const result = await query(
+export async function verifyAuditChain(envelopeId: string): Promise<ChainVerificationResult> {
+  const result = await query<AuditEventRow>(
     `SELECT * FROM audit_events
      WHERE envelope_id = $1
      ORDER BY timestamp ASC`,
@@ -289,7 +401,7 @@ export async function verifyAuditChain(envelopeId) {
 
   const events = result.rows;
   let previousHash = '0'.repeat(64);
-  const issues = [];
+  const issues: ChainIssue[] = [];
 
   for (const event of events) {
     // Verify chain link
@@ -303,14 +415,16 @@ export async function verifyAuditChain(envelopeId) {
     }
 
     // Verify event hash
+    const eventData = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
     const calculatedHash = calculateEventHash({
       id: event.id,
       envelopeId: event.envelope_id,
       eventType: event.event_type,
-      data: typeof event.data === 'string' ? JSON.parse(event.data) : event.data,
+      data: eventData,
       timestamp: event.timestamp,
       previousHash: event.previous_hash,
-      context: (typeof event.data === 'string' ? JSON.parse(event.data) : event.data).context || {},
+      context: eventData.context || {},
+      actor: event.actor,
     });
 
     if (calculatedHash !== event.hash) {

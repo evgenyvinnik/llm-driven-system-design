@@ -3,11 +3,39 @@ import { calculateHotScore } from '../utils/ranking.js';
 import logger from '../shared/logger.js';
 import { postCreatedTotal } from '../shared/metrics.js';
 
-export const createPost = async (subredditId, authorId, title, content, url) => {
+export interface Post {
+  id: number;
+  subreddit_id: number;
+  author_id: number;
+  title: string;
+  content: string | null;
+  url: string | null;
+  upvotes: number;
+  downvotes: number;
+  score: number;
+  hot_score: number;
+  comment_count: number;
+  is_archived: boolean | null;
+  archived_at: Date | null;
+  created_at: Date;
+  author_username?: string;
+  subreddit_name?: string;
+  userVote?: number;
+}
+
+export type SortOption = 'hot' | 'new' | 'top' | 'controversial';
+
+export const createPost = async (
+  subredditId: number,
+  authorId: number,
+  title: string,
+  content: string | null,
+  url: string | null
+): Promise<Post> => {
   const now = new Date();
   const hotScore = calculateHotScore(0, 0, now);
 
-  const result = await query(
+  const result = await query<Post>(
     `INSERT INTO posts (subreddit_id, author_id, title, content, url, hot_score)
      VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
@@ -17,7 +45,7 @@ export const createPost = async (subredditId, authorId, title, content, url) => 
   const post = result.rows[0];
 
   // Get subreddit name for metric label
-  const subredditResult = await query(
+  const subredditResult = await query<{ name: string }>(
     `SELECT name FROM subreddits WHERE id = $1`,
     [subredditId]
   );
@@ -35,8 +63,8 @@ export const createPost = async (subredditId, authorId, title, content, url) => 
   return post;
 };
 
-export const findPostById = async (id) => {
-  const result = await query(
+export const findPostById = async (id: number): Promise<Post | undefined> => {
+  const result = await query<Post>(
     `SELECT p.*, u.username as author_username, s.name as subreddit_name
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
@@ -47,8 +75,13 @@ export const findPostById = async (id) => {
   return result.rows[0];
 };
 
-export const listPostsBySubreddit = async (subredditId, sort = 'hot', limit = 25, offset = 0) => {
-  let orderBy;
+export const listPostsBySubreddit = async (
+  subredditId: number,
+  sort: SortOption = 'hot',
+  limit: number = 25,
+  offset: number = 0
+): Promise<Post[]> => {
+  let orderBy: string;
   switch (sort) {
     case 'new':
       orderBy = 'p.created_at DESC';
@@ -67,7 +100,7 @@ export const listPostsBySubreddit = async (subredditId, sort = 'hot', limit = 25
       break;
   }
 
-  const result = await query(
+  const result = await query<Post>(
     `SELECT p.*, u.username as author_username, s.name as subreddit_name
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
@@ -80,8 +113,12 @@ export const listPostsBySubreddit = async (subredditId, sort = 'hot', limit = 25
   return result.rows;
 };
 
-export const listAllPosts = async (sort = 'hot', limit = 25, offset = 0) => {
-  let orderBy;
+export const listAllPosts = async (
+  sort: SortOption = 'hot',
+  limit: number = 25,
+  offset: number = 0
+): Promise<Post[]> => {
+  let orderBy: string;
   switch (sort) {
     case 'new':
       orderBy = 'p.created_at DESC';
@@ -100,7 +137,7 @@ export const listAllPosts = async (sort = 'hot', limit = 25, offset = 0) => {
       break;
   }
 
-  const result = await query(
+  const result = await query<Post>(
     `SELECT p.*, u.username as author_username, s.name as subreddit_name
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
@@ -113,8 +150,8 @@ export const listAllPosts = async (sort = 'hot', limit = 25, offset = 0) => {
   return result.rows;
 };
 
-export const listPostsByUser = async (userId, limit = 25, offset = 0) => {
-  const result = await query(
+export const listPostsByUser = async (userId: number, limit: number = 25, offset: number = 0): Promise<Post[]> => {
+  const result = await query<Post>(
     `SELECT p.*, u.username as author_username, s.name as subreddit_name
      FROM posts p
      LEFT JOIN users u ON p.author_id = u.id
@@ -127,10 +164,10 @@ export const listPostsByUser = async (userId, limit = 25, offset = 0) => {
   return result.rows;
 };
 
-export const updatePostScore = async (postId, upvotes, downvotes) => {
+export const updatePostScore = async (postId: number, upvotes: number, downvotes: number): Promise<void> => {
   const score = upvotes - downvotes;
   const post = await findPostById(postId);
-  if (!post) return null;
+  if (!post) return;
 
   const hotScore = calculateHotScore(upvotes, downvotes, new Date(post.created_at));
 
@@ -140,7 +177,7 @@ export const updatePostScore = async (postId, upvotes, downvotes) => {
   );
 };
 
-export const deletePost = async (postId) => {
+export const deletePost = async (postId: number): Promise<void> => {
   await query(`DELETE FROM posts WHERE id = $1`, [postId]);
   logger.info({ postId }, 'Post deleted');
 };
@@ -149,8 +186,8 @@ export const deletePost = async (postId) => {
  * Archive old posts based on retention policy.
  * Called by archival worker.
  */
-export const archivePosts = async (cutoffDate) => {
-  const result = await query(
+export const archivePosts = async (cutoffDate: Date): Promise<number | null> => {
+  const result = await query<{ id: number }>(
     `UPDATE posts
      SET is_archived = TRUE, archived_at = NOW()
      WHERE created_at < $1
@@ -159,7 +196,7 @@ export const archivePosts = async (cutoffDate) => {
     [cutoffDate]
   );
 
-  if (result.rowCount > 0) {
+  if (result.rowCount && result.rowCount > 0) {
     logger.info({
       count: result.rowCount,
       cutoffDate,
@@ -172,8 +209,8 @@ export const archivePosts = async (cutoffDate) => {
 /**
  * Get posts to be archived for export.
  */
-export const getPostsForArchival = async (cutoffDate, limit = 1000) => {
-  const result = await query(
+export const getPostsForArchival = async (cutoffDate: Date, limit: number = 1000): Promise<Post[]> => {
+  const result = await query<Post>(
     `SELECT * FROM posts
      WHERE created_at < $1
        AND (is_archived IS NULL OR is_archived = FALSE)

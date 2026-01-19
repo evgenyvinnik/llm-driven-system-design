@@ -13,27 +13,73 @@ import {
 } from './cassandra.js';
 import { logger } from './logger.js';
 
+export interface UserInfo {
+  username: string;
+  profilePicture: string | null;
+}
+
+export interface Message {
+  messageId: string;
+  conversationId: string;
+  senderId: string;
+  content: string;
+  contentType: string;
+  mediaUrl: string | null;
+  replyToMessageId?: string | null;
+  createdAt: string;
+}
+
+export interface Conversation {
+  conversationId: string;
+  otherUserId: string | null;
+  otherUsername: string;
+  otherProfilePicture: string | null;
+  lastMessagePreview: string;
+  lastMessageSenderId: string | null;
+  lastMessageAt: string;
+  unreadCount: number;
+  isMuted: boolean;
+}
+
+export interface SendMessageParams {
+  conversationId: string;
+  senderId: string;
+  content: string;
+  contentType?: string;
+  mediaUrl?: string | null;
+  replyToMessageId?: string | null;
+}
+
+export interface GetMessagesOptions {
+  limit?: number;
+  beforeMessageId?: string;
+}
+
+export interface GetConversationsOptions {
+  limit?: number;
+}
+
 /**
  * Get or create a conversation between two users.
- * @param {string} userId1 - First user UUID
- * @param {string} userId2 - Second user UUID
- * @param {object} user1Info - First user info { username, profilePicture }
- * @param {object} user2Info - Second user info { username, profilePicture }
- * @returns {Promise<string>} Conversation UUID
  */
-export async function getOrCreateConversation(userId1, userId2, user1Info, user2Info) {
+export async function getOrCreateConversation(
+  userId1: string,
+  userId2: string,
+  user1Info: UserInfo,
+  user2Info: UserInfo
+): Promise<string> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
   const userPairKey = generateUserPairKey(userId1, userId2);
 
   // Check if conversation exists
   const lookupQuery = 'SELECT conversation_id FROM user_conversation_lookup WHERE user_id_pair = ?';
   const lookupResult = await client.execute(lookupQuery, [userPairKey], { prepare: true });
 
-  if (lookupResult.rowCount > 0) {
+  if (lookupResult.rowCount && lookupResult.rowCount > 0) {
     return lookupResult.rows[0].conversation_id.toString();
   }
 
@@ -76,9 +122,16 @@ export async function getOrCreateConversation(userId1, userId2, user1Info, user2
   await client.execute(
     insertConversation,
     [
-      toUuid(userId1), now, conversationId, toUuid(userId2),
-      user2Info.username, user2Info.profilePicture, '',
-      null, 0, false,
+      toUuid(userId1),
+      now,
+      conversationId,
+      toUuid(userId2),
+      user2Info.username,
+      user2Info.profilePicture,
+      '',
+      null,
+      0,
+      false,
     ],
     { prepare: true }
   );
@@ -86,9 +139,16 @@ export async function getOrCreateConversation(userId1, userId2, user1Info, user2
   await client.execute(
     insertConversation,
     [
-      toUuid(userId2), now, conversationId, toUuid(userId1),
-      user1Info.username, user1Info.profilePicture, '',
-      null, 0, false,
+      toUuid(userId2),
+      now,
+      conversationId,
+      toUuid(userId1),
+      user1Info.username,
+      user1Info.profilePicture,
+      '',
+      null,
+      0,
+      false,
     ],
     { prepare: true }
   );
@@ -99,14 +159,6 @@ export async function getOrCreateConversation(userId1, userId2, user1Info, user2
 
 /**
  * Send a message in a conversation.
- * @param {object} params - Message parameters
- * @param {string} params.conversationId - Conversation UUID
- * @param {string} params.senderId - Sender user UUID
- * @param {string} params.content - Message content
- * @param {string} [params.contentType='text'] - Content type
- * @param {string} [params.mediaUrl] - Media URL if applicable
- * @param {string} [params.replyToMessageId] - Reply-to message ID
- * @returns {Promise<object>} Created message
  */
 export async function sendMessage({
   conversationId,
@@ -115,12 +167,12 @@ export async function sendMessage({
   contentType = 'text',
   mediaUrl = null,
   replyToMessageId = null,
-}) {
+}: SendMessageParams): Promise<Message> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
   const messageId = generateTimeUuid();
   const now = new Date();
 
@@ -135,8 +187,12 @@ export async function sendMessage({
   await client.execute(
     insertMessage,
     [
-      toUuid(conversationId), messageId, toUuid(senderId),
-      content, contentType, mediaUrl,
+      toUuid(conversationId),
+      messageId,
+      toUuid(senderId),
+      content,
+      contentType,
+      mediaUrl,
       replyToMessageId ? types.TimeUuid.fromString(replyToMessageId) : null,
       now,
     ],
@@ -160,7 +216,7 @@ export async function sendMessage({
     `;
     const oldEntry = await client.execute(findOldQuery, [row.user_id, toUuid(conversationId)], { prepare: true });
 
-    if (oldEntry.rowCount > 0) {
+    if (oldEntry.rowCount && oldEntry.rowCount > 0) {
       const deleteOld = `
         DELETE FROM conversations_by_user
         WHERE user_id = ? AND last_message_at = ? AND conversation_id = ?
@@ -171,9 +227,7 @@ export async function sendMessage({
     }
 
     // Get other user info for this participant
-    const otherParticipant = participantsResult.rows.find(
-      (p) => p.user_id.toString() !== participantId
-    );
+    const otherParticipant = participantsResult.rows.find((p) => p.user_id.toString() !== participantId);
 
     // Insert updated entry with new timestamp
     const insertConv = `
@@ -189,10 +243,16 @@ export async function sendMessage({
     await client.execute(
       insertConv,
       [
-        row.user_id, now, toUuid(conversationId),
+        row.user_id,
+        now,
+        toUuid(conversationId),
         otherParticipant?.user_id || null,
-        '', '', // Username/profile will be fetched from participants table
-        preview, toUuid(senderId), unreadCount, false,
+        '',
+        '', // Username/profile will be fetched from participants table
+        preview,
+        toUuid(senderId),
+        unreadCount,
+        false,
       ],
       { prepare: true }
     );
@@ -213,22 +273,17 @@ export async function sendMessage({
 
 /**
  * Get messages in a conversation.
- * @param {string} conversationId - Conversation UUID
- * @param {object} [options] - Query options
- * @param {number} [options.limit=50] - Max messages to return
- * @param {string} [options.beforeMessageId] - Get messages before this ID
- * @returns {Promise<object[]>} Messages
  */
-export async function getMessages(conversationId, options = {}) {
+export async function getMessages(conversationId: string, options: GetMessagesOptions = {}): Promise<Message[]> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
   const { limit = 50, beforeMessageId } = options;
 
-  let query;
-  let params;
+  let query: string;
+  let params: unknown[];
 
   if (beforeMessageId) {
     query = `
@@ -262,17 +317,16 @@ export async function getMessages(conversationId, options = {}) {
 
 /**
  * Get user's conversations (inbox).
- * @param {string} userId - User UUID
- * @param {object} [options] - Query options
- * @param {number} [options.limit=20] - Max conversations to return
- * @returns {Promise<object[]>} Conversations
  */
-export async function getConversations(userId, options = {}) {
+export async function getConversations(
+  userId: string,
+  options: GetConversationsOptions = {}
+): Promise<Conversation[]> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
   const { limit = 20 } = options;
 
   const query = `
@@ -298,17 +352,17 @@ export async function getConversations(userId, options = {}) {
 
 /**
  * Mark conversation as read.
- * @param {string} conversationId - Conversation UUID
- * @param {string} userId - User UUID
- * @param {string} lastMessageId - Last read message TimeUUID
- * @returns {Promise<void>}
  */
-export async function markConversationRead(conversationId, userId, lastMessageId) {
+export async function markConversationRead(
+  conversationId: string,
+  userId: string,
+  lastMessageId: string
+): Promise<void> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
   const now = new Date();
 
   // Update read receipt
@@ -329,16 +383,13 @@ export async function markConversationRead(conversationId, userId, lastMessageId
 
 /**
  * Set typing indicator.
- * @param {string} conversationId - Conversation UUID
- * @param {string} userId - User UUID
- * @returns {Promise<void>}
  */
-export async function setTypingIndicator(conversationId, userId) {
+export async function setTypingIndicator(conversationId: string, userId: string): Promise<void> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
 
   const query = `
     INSERT INTO typing_indicators (conversation_id, user_id, started_at)
@@ -349,15 +400,13 @@ export async function setTypingIndicator(conversationId, userId) {
 
 /**
  * Get typing indicators for a conversation.
- * @param {string} conversationId - Conversation UUID
- * @returns {Promise<string[]>} User IDs currently typing
  */
-export async function getTypingIndicators(conversationId) {
+export async function getTypingIndicators(conversationId: string): Promise<string[]> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
 
   const query = 'SELECT user_id FROM typing_indicators WHERE conversation_id = ?';
   const result = await client.execute(query, [toUuid(conversationId)], { prepare: true });
@@ -367,18 +416,18 @@ export async function getTypingIndicators(conversationId) {
 
 /**
  * Add reaction to a message.
- * @param {string} conversationId - Conversation UUID
- * @param {string} messageId - Message TimeUUID
- * @param {string} userId - User UUID
- * @param {string} reaction - Reaction type
- * @returns {Promise<void>}
  */
-export async function addReaction(conversationId, messageId, userId, reaction) {
+export async function addReaction(
+  conversationId: string,
+  messageId: string,
+  userId: string,
+  reaction: string
+): Promise<void> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
 
   const query = `
     INSERT INTO message_reactions (conversation_id, message_id, user_id, reaction, created_at)
@@ -395,25 +444,19 @@ export async function addReaction(conversationId, messageId, userId, reaction) {
 
 /**
  * Remove reaction from a message.
- * @param {string} conversationId - Conversation UUID
- * @param {string} messageId - Message TimeUUID
- * @param {string} userId - User UUID
- * @returns {Promise<void>}
  */
-export async function removeReaction(conversationId, messageId, userId) {
+export async function removeReaction(conversationId: string, messageId: string, userId: string): Promise<void> {
   if (!isCassandraConnected()) {
     throw new Error('Cassandra not connected');
   }
 
-  const client = getCassandraClient();
+  const client = getCassandraClient()!;
 
   const query = `
     DELETE FROM message_reactions
     WHERE conversation_id = ? AND message_id = ? AND user_id = ?
   `;
-  await client.execute(
-    query,
-    [toUuid(conversationId), types.TimeUuid.fromString(messageId), toUuid(userId)],
-    { prepare: true }
-  );
+  await client.execute(query, [toUuid(conversationId), types.TimeUuid.fromString(messageId), toUuid(userId)], {
+    prepare: true,
+  });
 }

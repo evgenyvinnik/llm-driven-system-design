@@ -19,8 +19,23 @@ import {
  * - HALF_OPEN: Testing if service recovered, limited requests allowed
  */
 
+// Circuit breaker options interface
+interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+  name?: string;
+}
+
+// Circuit breaker status interface
+interface CircuitBreakerStatusEntry {
+  state: 'OPEN' | 'CLOSED' | 'HALF_OPEN';
+  stats: unknown;
+}
+
 // Default circuit breaker options
-const DEFAULT_OPTIONS = {
+const DEFAULT_OPTIONS: CircuitBreakerOptions = {
   timeout: 5000, // 5 second timeout
   errorThresholdPercentage: 50, // Open circuit if 50% of requests fail
   resetTimeout: 30000, // Try again after 30 seconds
@@ -28,17 +43,16 @@ const DEFAULT_OPTIONS = {
 };
 
 // Store all circuit breakers for health checks
-const circuitBreakers = new Map();
+const circuitBreakers: Map<string, CircuitBreaker> = new Map();
 
 /**
  * Create a circuit breaker for a given function
- *
- * @param {string} name - Name for the circuit breaker (used in logs/metrics)
- * @param {Function} fn - The function to wrap
- * @param {object} options - Circuit breaker options
- * @returns {CircuitBreaker}
  */
-export function createCircuitBreaker(name, fn, options = {}) {
+export function createCircuitBreaker<T extends (...args: unknown[]) => unknown>(
+  name: string,
+  fn: T,
+  options: CircuitBreakerOptions = {}
+): CircuitBreaker<T> {
   const breaker = new CircuitBreaker(fn, {
     ...DEFAULT_OPTIONS,
     ...options,
@@ -62,9 +76,12 @@ export function createCircuitBreaker(name, fn, options = {}) {
   });
 
   // Track failures and successes
-  breaker.on('failure', (error) => {
+  breaker.on('failure', (error: Error) => {
     circuitBreakerFailures.inc({ name });
-    logger.warn({ component: 'circuit_breaker', name, error: error.message }, 'Circuit breaker failure');
+    logger.warn(
+      { component: 'circuit_breaker', name, error: error.message },
+      'Circuit breaker failure'
+    );
   });
 
   breaker.on('success', () => {
@@ -73,12 +90,18 @@ export function createCircuitBreaker(name, fn, options = {}) {
 
   // Log when requests are rejected due to open circuit
   breaker.on('reject', () => {
-    logger.warn({ component: 'circuit_breaker', name }, 'Request rejected - circuit is open');
+    logger.warn(
+      { component: 'circuit_breaker', name },
+      'Request rejected - circuit is open'
+    );
   });
 
   // Log timeouts
   breaker.on('timeout', () => {
-    logger.warn({ component: 'circuit_breaker', name }, 'Request timed out');
+    logger.warn(
+      { component: 'circuit_breaker', name },
+      'Request timed out'
+    );
   });
 
   // Initialize state metric
@@ -87,18 +110,21 @@ export function createCircuitBreaker(name, fn, options = {}) {
   // Store for health checks
   circuitBreakers.set(name, breaker);
 
-  return breaker;
+  return breaker as CircuitBreaker<T>;
 }
 
 /**
  * Get all circuit breaker statuses for health check
- * @returns {object} Map of breaker names to their current status
  */
-export function getCircuitBreakerStatus() {
-  const status = {};
+export function getCircuitBreakerStatus(): Record<string, CircuitBreakerStatusEntry> {
+  const status: Record<string, CircuitBreakerStatusEntry> = {};
   for (const [name, breaker] of circuitBreakers) {
     status[name] = {
-      state: breaker.opened ? 'OPEN' : breaker.halfOpen ? 'HALF_OPEN' : 'CLOSED',
+      state: breaker.opened
+        ? 'OPEN'
+        : breaker.halfOpen
+          ? 'HALF_OPEN'
+          : 'CLOSED',
       stats: breaker.stats,
     };
   }
@@ -108,9 +134,11 @@ export function getCircuitBreakerStatus() {
 /**
  * Create Elasticsearch search circuit breaker
  */
-let esSearchBreaker = null;
+let esSearchBreaker: CircuitBreaker | null = null;
 
-export function getElasticsearchSearchBreaker(searchFn) {
+export function getElasticsearchSearchBreaker<T extends (...args: unknown[]) => unknown>(
+  searchFn: T
+): CircuitBreaker<T> {
   if (!esSearchBreaker) {
     esSearchBreaker = createCircuitBreaker('elasticsearch_search', searchFn, {
       timeout: 3000, // 3 second timeout for search
@@ -118,31 +146,39 @@ export function getElasticsearchSearchBreaker(searchFn) {
       resetTimeout: 30000,
     });
   }
-  return esSearchBreaker;
+  return esSearchBreaker as CircuitBreaker<T>;
 }
 
 /**
  * Create Elasticsearch autocomplete circuit breaker
  */
-let esAutocompleteBreaker = null;
+let esAutocompleteBreaker: CircuitBreaker | null = null;
 
-export function getElasticsearchAutocompleteBreaker(autocompleteFn) {
+export function getElasticsearchAutocompleteBreaker<T extends (...args: unknown[]) => unknown>(
+  autocompleteFn: T
+): CircuitBreaker<T> {
   if (!esAutocompleteBreaker) {
-    esAutocompleteBreaker = createCircuitBreaker('elasticsearch_autocomplete', autocompleteFn, {
-      timeout: 2000, // 2 second timeout for autocomplete
-      errorThresholdPercentage: 60,
-      resetTimeout: 20000,
-    });
+    esAutocompleteBreaker = createCircuitBreaker(
+      'elasticsearch_autocomplete',
+      autocompleteFn,
+      {
+        timeout: 2000, // 2 second timeout for autocomplete
+        errorThresholdPercentage: 60,
+        resetTimeout: 20000,
+      }
+    );
   }
-  return esAutocompleteBreaker;
+  return esAutocompleteBreaker as CircuitBreaker<T>;
 }
 
 /**
  * Create PostgreSQL geo query circuit breaker
  */
-let pgGeoBreaker = null;
+let pgGeoBreaker: CircuitBreaker | null = null;
 
-export function getPostgresGeoBreaker(geoQueryFn) {
+export function getPostgresGeoBreaker<T extends (...args: unknown[]) => unknown>(
+  geoQueryFn: T
+): CircuitBreaker<T> {
   if (!pgGeoBreaker) {
     pgGeoBreaker = createCircuitBreaker('postgres_geo', geoQueryFn, {
       timeout: 5000, // 5 second timeout for geo queries
@@ -150,25 +186,24 @@ export function getPostgresGeoBreaker(geoQueryFn) {
       resetTimeout: 30000,
     });
   }
-  return pgGeoBreaker;
+  return pgGeoBreaker as CircuitBreaker<T>;
 }
 
 /**
  * Wrap a function with circuit breaker protection
- *
- * @param {string} name - Circuit breaker name
- * @param {Function} fn - Function to wrap
- * @param {object} options - Options
- * @returns {Function} - Wrapped function that uses circuit breaker
  */
-export function withCircuitBreaker(name, fn, options = {}) {
+export function withCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
+  name: string,
+  fn: T,
+  options: CircuitBreakerOptions = {}
+): (...args: Parameters<T>) => Promise<ReturnType<T>> {
   const breaker = createCircuitBreaker(name, fn, options);
 
-  return async (...args) => {
+  return async (...args: Parameters<T>): Promise<ReturnType<T>> => {
     try {
-      return await breaker.fire(...args);
+      return (await breaker.fire(...args)) as ReturnType<T>;
     } catch (error) {
-      if (error.message === 'Breaker is open') {
+      if ((error as Error).message === 'Breaker is open') {
         // Circuit is open, provide fallback behavior
         throw new Error(`Service unavailable: ${name} circuit is open`);
       }
@@ -179,11 +214,11 @@ export function withCircuitBreaker(name, fn, options = {}) {
 
 /**
  * Create a fallback handler for circuit breaker
- *
- * @param {string} name - Circuit breaker name
- * @param {Function} fallbackFn - Fallback function to call when circuit is open
  */
-export function setFallback(breaker, fallbackFn) {
+export function setFallback<T>(
+  breaker: CircuitBreaker,
+  fallbackFn: (...args: unknown[]) => T | Promise<T>
+): void {
   breaker.fallback(fallbackFn);
 }
 

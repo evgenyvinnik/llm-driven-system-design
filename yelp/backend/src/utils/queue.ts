@@ -1,4 +1,4 @@
-import amqp from 'amqplib';
+import amqp, { Connection, Channel, ConsumeMessage } from 'amqplib';
 import { logger } from './logger.js';
 
 /**
@@ -10,16 +10,30 @@ import { logger } from './logger.js';
  * - Enabling retry logic for failed index operations
  */
 
-const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
+const RABBITMQ_URL: string =
+  process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 
 // Queue names
 export const QUEUES = {
   BUSINESS_INDEX: 'business_index',
-};
+} as const;
+
+// Message types
+interface QueueMessage {
+  type: string;
+  businessId?: string;
+  updates?: Record<string, unknown>;
+  timestamp: string;
+}
+
+// Consumer options interface
+interface ConsumeOptions {
+  prefetch?: number;
+}
 
 // Connection state
-let connection = null;
-let channel = null;
+let connection: Connection | null = null;
+let channel: Channel | null = null;
 let isShuttingDown = false;
 let hasEverConnected = false;
 
@@ -27,7 +41,7 @@ let hasEverConnected = false;
  * Connect to RabbitMQ and set up the channel.
  * Creates required queues if they don't exist.
  */
-export async function connectQueue() {
+export async function connectQueue(): Promise<Channel> {
   try {
     connection = await amqp.connect(RABBITMQ_URL);
     channel = await connection.createChannel();
@@ -37,7 +51,7 @@ export async function connectQueue() {
     await channel.assertQueue(QUEUES.BUSINESS_INDEX, { durable: true });
 
     // Handle connection errors
-    connection.on('error', (err) => {
+    connection.on('error', (err: Error) => {
       if (!isShuttingDown) {
         logger.error({ err, component: 'queue' }, 'RabbitMQ connection error');
       }
@@ -49,7 +63,10 @@ export async function connectQueue() {
       }
     });
 
-    logger.info({ component: 'queue', url: RABBITMQ_URL.replace(/:[^:@]+@/, ':****@') }, 'RabbitMQ connected');
+    logger.info(
+      { component: 'queue', url: RABBITMQ_URL.replace(/:[^:@]+@/, ':****@') },
+      'RabbitMQ connected'
+    );
     return channel;
   } catch (err) {
     logger.error({ err, component: 'queue' }, 'Failed to connect to RabbitMQ');
@@ -60,20 +77,23 @@ export async function connectQueue() {
 /**
  * Check if the queue connection is healthy.
  */
-export function isQueueConnected() {
+export function isQueueConnected(): boolean {
   return channel !== null && connection !== null;
 }
 
 /**
  * Publish a message to a queue.
  * Messages are persisted to disk (persistent: true) for durability.
- *
- * @param {string} queue - Queue name from QUEUES
- * @param {object} message - Message payload (will be JSON stringified)
  */
-export async function publishToQueue(queue, message) {
+export async function publishToQueue(
+  queue: string,
+  message: QueueMessage
+): Promise<boolean> {
   if (!channel) {
-    logger.warn({ component: 'queue', queue }, 'Queue not connected, message dropped');
+    logger.warn(
+      { component: 'queue', queue },
+      'Queue not connected, message dropped'
+    );
     return false;
   }
 
@@ -82,27 +102,35 @@ export async function publishToQueue(queue, message) {
     const sent = channel.sendToQueue(queue, content, { persistent: true });
 
     if (sent) {
-      logger.debug({ component: 'queue', queue, messageType: message.type }, 'Message published');
+      logger.debug(
+        { component: 'queue', queue, messageType: message.type },
+        'Message published'
+      );
     } else {
-      logger.warn({ component: 'queue', queue }, 'Message not published (queue full)');
+      logger.warn(
+        { component: 'queue', queue },
+        'Message not published (queue full)'
+      );
     }
 
     return sent;
   } catch (err) {
-    logger.error({ err, component: 'queue', queue }, 'Failed to publish message');
+    logger.error(
+      { err, component: 'queue', queue },
+      'Failed to publish message'
+    );
     return false;
   }
 }
 
 /**
  * Start consuming messages from a queue.
- *
- * @param {string} queue - Queue name from QUEUES
- * @param {function} handler - Async function to process each message
- * @param {object} options - Consumer options
- * @param {number} options.prefetch - Max unacknowledged messages (default: 10)
  */
-export async function consumeQueue(queue, handler, options = {}) {
+export async function consumeQueue(
+  queue: string,
+  handler: (message: QueueMessage) => Promise<void>,
+  options: ConsumeOptions = {}
+): Promise<void> {
   if (!channel) {
     throw new Error('Queue not connected');
   }
@@ -110,19 +138,25 @@ export async function consumeQueue(queue, handler, options = {}) {
   const { prefetch = 10 } = options;
   await channel.prefetch(prefetch);
 
-  await channel.consume(queue, async (msg) => {
+  await channel.consume(queue, async (msg: ConsumeMessage | null) => {
     if (!msg) return;
 
     try {
-      const content = JSON.parse(msg.content.toString());
+      const content = JSON.parse(msg.content.toString()) as QueueMessage;
       await handler(content);
-      channel.ack(msg);
-      logger.debug({ component: 'queue', queue, messageType: content.type }, 'Message processed');
+      channel!.ack(msg);
+      logger.debug(
+        { component: 'queue', queue, messageType: content.type },
+        'Message processed'
+      );
     } catch (err) {
-      logger.error({ err, component: 'queue', queue }, 'Failed to process message');
+      logger.error(
+        { err, component: 'queue', queue },
+        'Failed to process message'
+      );
       // Negative acknowledge - requeue the message for retry
       // In production, you might want dead-letter queues for failed messages
-      channel.nack(msg, false, true);
+      channel!.nack(msg, false, true);
     }
   });
 
@@ -132,13 +166,13 @@ export async function consumeQueue(queue, handler, options = {}) {
 /**
  * Close the RabbitMQ connection gracefully.
  */
-export async function closeQueue() {
+export async function closeQueue(): Promise<void> {
   isShuttingDown = true;
 
   if (channel) {
     try {
       await channel.close();
-    } catch (err) {
+    } catch {
       // Channel might already be closed
     }
     channel = null;
@@ -147,7 +181,7 @@ export async function closeQueue() {
   if (connection) {
     try {
       await connection.close();
-    } catch (err) {
+    } catch {
       // Connection might already be closed
     }
     connection = null;
@@ -159,11 +193,11 @@ export async function closeQueue() {
 /**
  * Publish a business index update event.
  * Used by routes to trigger async Elasticsearch updates.
- *
- * @param {string} businessId - Business ID to update
- * @param {object} updates - Fields to update in Elasticsearch
  */
-export async function publishBusinessIndexUpdate(businessId, updates) {
+export async function publishBusinessIndexUpdate(
+  businessId: string,
+  updates: Record<string, unknown>
+): Promise<boolean> {
   return publishToQueue(QUEUES.BUSINESS_INDEX, {
     type: 'update',
     businessId,
@@ -174,10 +208,10 @@ export async function publishBusinessIndexUpdate(businessId, updates) {
 
 /**
  * Publish a full business reindex event.
- *
- * @param {string} businessId - Business ID to reindex
  */
-export async function publishBusinessReindex(businessId) {
+export async function publishBusinessReindex(
+  businessId: string
+): Promise<boolean> {
   return publishToQueue(QUEUES.BUSINESS_INDEX, {
     type: 'reindex',
     businessId,
@@ -187,10 +221,10 @@ export async function publishBusinessReindex(businessId) {
 
 /**
  * Publish a business deletion event.
- *
- * @param {string} businessId - Business ID to remove from index
  */
-export async function publishBusinessDelete(businessId) {
+export async function publishBusinessDelete(
+  businessId: string
+): Promise<boolean> {
   return publishToQueue(QUEUES.BUSINESS_INDEX, {
     type: 'delete',
     businessId,

@@ -1,6 +1,7 @@
 import { query } from '../db/index.js';
 import logger from './logger.js';
 import { auditEventsTotal } from './metrics.js';
+import type { AuthenticatedRequest } from './logger.js';
 
 /**
  * Audit logging for moderation and security-relevant actions.
@@ -19,22 +20,27 @@ import { auditEventsTotal } from './metrics.js';
  * - vote.suspicious - Potential vote manipulation
  */
 
-/**
- * @typedef {Object} AuditEvent
- * @property {number|null} actorId - User who performed the action
- * @property {string} actorIp - IP address of the actor
- * @property {string} action - Action type (e.g., 'post.delete', 'user.ban')
- * @property {'post'|'comment'|'user'|'subreddit'|null} [targetType] - Type of entity affected
- * @property {number|null} [targetId] - ID of affected entity
- * @property {Object|null} [details] - Additional context (reason, before/after values)
- * @property {number|null} [subredditId] - Subreddit context if applicable
- */
+export type TargetType = 'post' | 'comment' | 'user' | 'subreddit';
+
+export interface AuditEvent {
+  actorId: number | null;
+  actorIp: string;
+  action: string;
+  targetType?: TargetType | null;
+  targetId?: number | null;
+  details?: Record<string, unknown> | null;
+  subredditId?: number | null;
+}
+
+export interface AuditContext {
+  actorId: number | null;
+  actorIp: string;
+}
 
 /**
  * Log an audit event to the database.
- * @param {AuditEvent} event - The audit event to log
  */
-export async function audit(event) {
+export async function audit(event: AuditEvent): Promise<void> {
   const {
     actorId,
     actorIp,
@@ -82,20 +88,21 @@ export async function audit(event) {
 /**
  * Helper to extract IP from request, handling proxies.
  */
-export function getClientIp(req) {
+export function getClientIp(req: AuthenticatedRequest): string {
   const forwarded = req.headers['x-forwarded-for'];
   if (forwarded) {
-    return forwarded.split(',')[0].trim();
+    const forwardedStr = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    return forwardedStr.split(',')[0].trim();
   }
-  return req.ip || req.connection?.remoteAddress || 'unknown';
+  return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 
 /**
  * Audit middleware helper - creates audit context for a request.
  */
-export function createAuditContext(req) {
+export function createAuditContext(req: AuthenticatedRequest): AuditContext {
   return {
-    actorId: req.user?.id || null,
+    actorId: req.user?.id ?? null,
     actorIp: getClientIp(req),
   };
 }
@@ -104,7 +111,7 @@ export function createAuditContext(req) {
 // Convenience functions for common audit events
 // ============================================================================
 
-export async function auditLogin(req, userId, success) {
+export async function auditLogin(req: AuthenticatedRequest, userId: number | null, success: boolean): Promise<void> {
   await audit({
     actorId: userId,
     actorIp: getClientIp(req),
@@ -118,8 +125,14 @@ export async function auditLogin(req, userId, success) {
   });
 }
 
-export async function auditPostDelete(req, postId, subredditId, reason = null) {
+export async function auditPostDelete(
+  req: AuthenticatedRequest,
+  postId: number,
+  subredditId: number,
+  reason: string | null = null
+): Promise<void> {
   const context = createAuditContext(req);
+  const body = req.body as { authorId?: number } | undefined;
   await audit({
     ...context,
     action: 'post.delete',
@@ -128,13 +141,20 @@ export async function auditPostDelete(req, postId, subredditId, reason = null) {
     subredditId,
     details: {
       reason,
-      deletedByAuthor: req.user?.id === req.body?.authorId,
+      deletedByAuthor: req.user?.id === body?.authorId,
     },
   });
 }
 
-export async function auditCommentDelete(req, commentId, postId, subredditId, reason = null) {
+export async function auditCommentDelete(
+  req: AuthenticatedRequest,
+  commentId: number,
+  postId: number,
+  subredditId: number,
+  reason: string | null = null
+): Promise<void> {
   const context = createAuditContext(req);
+  const body = req.body as { authorId?: number } | undefined;
   await audit({
     ...context,
     action: 'comment.delete',
@@ -144,12 +164,18 @@ export async function auditCommentDelete(req, commentId, postId, subredditId, re
     details: {
       postId,
       reason,
-      deletedByAuthor: req.user?.id === req.body?.authorId,
+      deletedByAuthor: req.user?.id === body?.authorId,
     },
   });
 }
 
-export async function auditUserBan(req, targetUserId, subredditId, duration, reason) {
+export async function auditUserBan(
+  req: AuthenticatedRequest,
+  targetUserId: number,
+  subredditId: number,
+  duration: number | null,
+  reason: string
+): Promise<void> {
   const context = createAuditContext(req);
   await audit({
     ...context,
@@ -164,7 +190,13 @@ export async function auditUserBan(req, targetUserId, subredditId, duration, rea
   });
 }
 
-export async function auditSuspiciousVoting(userId, ip, targetType, targetId, pattern) {
+export async function auditSuspiciousVoting(
+  userId: number,
+  ip: string,
+  targetType: TargetType,
+  targetId: number,
+  pattern: string
+): Promise<void> {
   await audit({
     actorId: userId,
     actorIp: ip,

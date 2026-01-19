@@ -1,3 +1,4 @@
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
 import { logger, auditLog } from '../shared/logger.js';
@@ -27,7 +28,7 @@ import { authAttempts, cacheHits } from '../shared/metrics.js';
  * RBAC permission definitions.
  * Maps roles to their allowed permissions.
  */
-const ROLE_PERMISSIONS = {
+export const ROLE_PERMISSIONS: Record<string, string[]> = {
   user: [
     'catalog:read',
     'library:own',
@@ -59,13 +60,14 @@ const ROLE_PERMISSIONS = {
  * Main authentication middleware.
  * Validates session and attaches user to request.
  */
-export async function authenticate(req, res, next) {
+export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const token = req.cookies.session_token || req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
       authAttempts.inc({ type: 'session', result: 'missing_token' });
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     // Check Redis cache first
@@ -75,9 +77,10 @@ export async function authenticate(req, res, next) {
     if (sessionData) {
       cacheHits.inc({ cache: 'session', result: 'hit' });
       req.user = JSON.parse(sessionData);
-      req.user.id = req.user.userId;
+      req.user!.id = req.user!.userId!;
       req.sessionToken = token;
-      return next();
+      next();
+      return;
     }
 
     cacheHits.inc({ cache: 'session', result: 'miss' });
@@ -94,7 +97,8 @@ export async function authenticate(req, res, next) {
 
     if (result.rows.length === 0) {
       authAttempts.inc({ type: 'session', result: 'invalid' });
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
     const session = result.rows[0];
@@ -130,7 +134,7 @@ export async function authenticate(req, res, next) {
  * Optional authentication middleware.
  * Attaches user if session exists, continues otherwise.
  */
-export async function optionalAuth(req, res, next) {
+export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const token = req.cookies.session_token || req.headers.authorization?.replace('Bearer ', '');
 
@@ -139,7 +143,7 @@ export async function optionalAuth(req, res, next) {
 
       if (sessionData) {
         req.user = JSON.parse(sessionData);
-        req.user.id = req.user.userId;
+        req.user!.id = req.user!.userId!;
         cacheHits.inc({ cache: 'session', result: 'hit' });
       } else {
         cacheHits.inc({ cache: 'session', result: 'miss' });
@@ -158,14 +162,15 @@ export async function optionalAuth(req, res, next) {
  * Admin role requirement middleware.
  * Must be used after authenticate middleware.
  */
-export async function requireAdmin(req, res, next) {
+export async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
   if (!req.user || req.user.role !== 'admin') {
     logger.warn({
       userId: req.user?.id,
       attemptedRole: 'admin',
       actualRole: req.user?.role
     }, 'Admin access denied');
-    return res.status(403).json({ error: 'Admin access required' });
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 }
@@ -177,10 +182,11 @@ export async function requireAdmin(req, res, next) {
  * Usage:
  * router.post('/playlists/public', authenticate, requirePermission('playlist:public'), handler);
  */
-export function requirePermission(permission) {
-  return (req, res, next) => {
+export function requirePermission(permission: string): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const role = req.user.role || 'user';
@@ -188,7 +194,8 @@ export function requirePermission(permission) {
 
     // Check for wildcard or specific permission
     if (permissions.includes('*') || permissions.includes(permission)) {
-      return next();
+      next();
+      return;
     }
 
     logger.warn({
@@ -205,11 +212,15 @@ export function requirePermission(permission) {
   };
 }
 
+interface UserLike {
+  role?: string;
+}
+
 /**
  * Check if user has a specific permission.
  * Utility function for conditional logic in handlers.
  */
-export function hasPermission(user, permission) {
+export function hasPermission(user: UserLike | undefined, permission: string): boolean {
   if (!user) return false;
 
   const role = user.role || 'user';
@@ -222,23 +233,25 @@ export function hasPermission(user, permission) {
  * Subscription tier check middleware.
  * Verifies user has required subscription level.
  */
-export function requireSubscription(minTier) {
+export function requireSubscription(minTier: string): RequestHandler {
   const tierOrder = ['free', 'student', 'individual', 'family'];
 
-  return (req, res, next) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userTierIndex = tierOrder.indexOf(req.user.subscriptionTier || 'free');
     const requiredTierIndex = tierOrder.indexOf(minTier);
 
     if (userTierIndex < requiredTierIndex) {
-      return res.status(403).json({
+      res.status(403).json({
         error: 'Subscription upgrade required',
         currentTier: req.user.subscriptionTier,
         requiredTier: minTier
       });
+      return;
     }
 
     next();
@@ -249,7 +262,7 @@ export function requireSubscription(minTier) {
  * Invalidate session in cache and database.
  * Used for logout and session revocation.
  */
-export async function invalidateSession(token) {
+export async function invalidateSession(token: string): Promise<boolean> {
   try {
     // Remove from Redis cache
     await redis.del(`session:${token}`);
@@ -272,7 +285,7 @@ export async function invalidateSession(token) {
  * Audit-logged authentication for sensitive operations.
  * Combines authenticate with audit logging.
  */
-export function authenticateWithAudit(action) {
+export function authenticateWithAudit(action: string): RequestHandler[] {
   return [authenticate, auditLog(action)];
 }
 

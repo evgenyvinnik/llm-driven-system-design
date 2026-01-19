@@ -1,16 +1,50 @@
 import { v4 as uuid } from 'uuid';
 import bcrypt from 'bcryptjs';
+import { PoolClient } from 'pg';
 import { query, transaction } from '../db.js';
-import { setSession, deleteSession } from '../redis.js';
+import { setSession, deleteSession, SessionData } from '../redis.js';
 
 const SESSION_EXPIRY_HOURS = parseInt(process.env.SESSION_EXPIRY_HOURS || '720');
 
-export async function register(username, email, password, displayName, deviceName, deviceType) {
+interface User {
+  id: string;
+  username: string;
+  email: string;
+  display_name: string;
+  avatar_url: string | null;
+  created_at?: Date;
+  password_hash?: string;
+}
+
+interface Device {
+  id: string;
+  device_name: string;
+  device_type: string;
+  is_active?: boolean;
+  last_active?: Date;
+  created_at?: Date;
+}
+
+interface AuthResult {
+  user: User;
+  device: Device;
+  token: string;
+  expiresAt: Date;
+}
+
+export async function register(
+  username: string,
+  email: string,
+  password: string,
+  displayName?: string,
+  deviceName?: string,
+  deviceType?: string
+): Promise<AuthResult> {
   const passwordHash = await bcrypt.hash(password, 12);
 
-  return await transaction(async (client) => {
+  return await transaction(async (client: PoolClient) => {
     // Create user
-    const userResult = await client.query(
+    const userResult = await client.query<User>(
       `INSERT INTO users (username, email, password_hash, display_name)
        VALUES ($1, $2, $3, $4)
        RETURNING id, username, email, display_name, avatar_url, created_at`,
@@ -20,7 +54,7 @@ export async function register(username, email, password, displayName, deviceNam
     const user = userResult.rows[0];
 
     // Create device
-    const deviceResult = await client.query(
+    const deviceResult = await client.query<Device>(
       `INSERT INTO devices (user_id, device_name, device_type)
        VALUES ($1, $2, $3)
        RETURNING id, device_name, device_type`,
@@ -40,11 +74,12 @@ export async function register(username, email, password, displayName, deviceNam
     );
 
     // Store session in Redis
-    await setSession(token, {
+    const sessionData: SessionData = {
       userId: user.id,
       deviceId: device.id,
       expiresAt: expiresAt.toISOString(),
-    }, SESSION_EXPIRY_HOURS * 60 * 60);
+    };
+    await setSession(token, sessionData, SESSION_EXPIRY_HOURS * 60 * 60);
 
     return {
       user,
@@ -55,9 +90,14 @@ export async function register(username, email, password, displayName, deviceNam
   });
 }
 
-export async function login(usernameOrEmail, password, deviceName, deviceType) {
+export async function login(
+  usernameOrEmail: string,
+  password: string,
+  deviceName?: string,
+  deviceType?: string
+): Promise<AuthResult> {
   // Find user
-  const userResult = await query(
+  const userResult = await query<User & { password_hash: string }>(
     `SELECT id, username, email, password_hash, display_name, avatar_url
      FROM users
      WHERE username = $1 OR email = $1`,
@@ -77,15 +117,15 @@ export async function login(usernameOrEmail, password, deviceName, deviceType) {
   }
 
   // Find or create device
-  let deviceResult = await query(
+  let deviceResult = await query<Device>(
     `SELECT id, device_name, device_type FROM devices
      WHERE user_id = $1 AND device_name = $2 AND is_active = true`,
     [user.id, deviceName || 'Web Browser']
   );
 
-  let device;
+  let device: Device;
   if (deviceResult.rows.length === 0) {
-    deviceResult = await query(
+    deviceResult = await query<Device>(
       `INSERT INTO devices (user_id, device_name, device_type)
        VALUES ($1, $2, $3)
        RETURNING id, device_name, device_type`,
@@ -111,30 +151,33 @@ export async function login(usernameOrEmail, password, deviceName, deviceType) {
   );
 
   // Store session in Redis
-  await setSession(token, {
+  const sessionData: SessionData = {
     userId: user.id,
     deviceId: device.id,
     expiresAt: expiresAt.toISOString(),
-  }, SESSION_EXPIRY_HOURS * 60 * 60);
+  };
+  await setSession(token, sessionData, SESSION_EXPIRY_HOURS * 60 * 60);
 
   // Remove password hash from response
-  delete user.password_hash;
+  const { password_hash, ...userWithoutPassword } = user;
 
   return {
-    user,
+    user: userWithoutPassword,
     device,
     token,
     expiresAt,
   };
 }
 
-export async function logout(token) {
-  await query('DELETE FROM sessions WHERE token = $1', [token]);
-  await deleteSession(token);
+export async function logout(token: string | undefined): Promise<void> {
+  if (token) {
+    await query('DELETE FROM sessions WHERE token = $1', [token]);
+    await deleteSession(token);
+  }
 }
 
-export async function getUserDevices(userId) {
-  const result = await query(
+export async function getUserDevices(userId: string): Promise<Device[]> {
+  const result = await query<Device>(
     `SELECT id, device_name, device_type, is_active, last_active, created_at
      FROM devices
      WHERE user_id = $1 AND is_active = true
@@ -144,7 +187,7 @@ export async function getUserDevices(userId) {
   return result.rows;
 }
 
-export async function deactivateDevice(userId, deviceId) {
+export async function deactivateDevice(userId: string, deviceId: string): Promise<void> {
   // Delete sessions for this device
   await query(
     'DELETE FROM sessions WHERE device_id = $1 AND user_id = $2',

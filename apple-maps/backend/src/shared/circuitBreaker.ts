@@ -21,8 +21,29 @@ import {
  * - HALF-OPEN: Testing if service recovered
  */
 
+interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+  name?: string;
+}
+
+interface CircuitBreakerStats {
+  successes: number;
+  failures: number;
+  timeouts: number;
+  rejects: number;
+  fallbacks: number;
+}
+
+interface CircuitBreakerHealth {
+  state: string;
+  stats: CircuitBreakerStats;
+}
+
 // Default circuit breaker options
-const DEFAULT_OPTIONS = {
+const DEFAULT_OPTIONS: CircuitBreakerOptions = {
   timeout: 5000, // 5 seconds timeout for wrapped function
   errorThresholdPercentage: 50, // Open if 50% of requests fail
   resetTimeout: 30000, // 30 seconds before trying again
@@ -30,19 +51,20 @@ const DEFAULT_OPTIONS = {
 };
 
 // Store all circuit breakers for health reporting
-const circuitBreakers = new Map();
+const circuitBreakers = new Map<string, CircuitBreaker>();
 
 /**
  * Create a circuit breaker for a function
- * @param {string} name - Unique name for the breaker
- * @param {Function} fn - Async function to wrap
- * @param {Object} options - Circuit breaker options
- * @param {Function} fallback - Optional fallback function
  */
-function createCircuitBreaker(name, fn, options = {}, fallback = null) {
+function createCircuitBreaker<T extends unknown[], R>(
+  name: string,
+  fn: (...args: T) => Promise<R>,
+  options: CircuitBreakerOptions = {},
+  fallback: ((...args: T) => Promise<R>) | null = null
+): CircuitBreaker<T, R> {
   const mergedOptions = { ...DEFAULT_OPTIONS, ...options, name };
 
-  const breaker = new CircuitBreaker(fn, mergedOptions);
+  const breaker = new CircuitBreaker<T, R>(fn, mergedOptions);
 
   // Set up event listeners for logging and metrics
   breaker.on('success', () => {
@@ -50,7 +72,7 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
     circuitBreakerState.set({ name }, 0); // CLOSED = 0
   });
 
-  breaker.on('failure', (error) => {
+  breaker.on('failure', (error: Error) => {
     circuitBreakerFailures.inc({ name });
     logger.warn({ circuit: name, error: error.message }, 'Circuit breaker recorded failure');
   });
@@ -84,7 +106,7 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
   }
 
   // Store for health reporting
-  circuitBreakers.set(name, breaker);
+  circuitBreakers.set(name, breaker as CircuitBreaker);
 
   // Initialize metric
   circuitBreakerState.set({ name }, 0);
@@ -95,8 +117,8 @@ function createCircuitBreaker(name, fn, options = {}, fallback = null) {
 /**
  * Get health status of all circuit breakers
  */
-function getCircuitBreakerHealth() {
-  const health = {};
+function getCircuitBreakerHealth(): Record<string, CircuitBreakerHealth> {
+  const health: Record<string, CircuitBreakerHealth> = {};
   for (const [name, breaker] of circuitBreakers) {
     const stats = breaker.stats;
     health[name] = {
@@ -118,7 +140,7 @@ function getCircuitBreakerHealth() {
  */
 
 // Routing service circuit breaker for graph loading
-const routingCircuitBreakerOptions = {
+const routingCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 10000, // 10 seconds for complex routes
   errorThresholdPercentage: 60,
   resetTimeout: 60000, // 1 minute cooldown
@@ -126,7 +148,7 @@ const routingCircuitBreakerOptions = {
 };
 
 // Geocoding service circuit breaker
-const geocodingCircuitBreakerOptions = {
+const geocodingCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 5000,
   errorThresholdPercentage: 50,
   resetTimeout: 30000,
@@ -134,7 +156,7 @@ const geocodingCircuitBreakerOptions = {
 };
 
 // External traffic provider circuit breaker (if using external APIs)
-const externalTrafficCircuitBreakerOptions = {
+const externalTrafficCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 3000, // Fast timeout for external calls
   errorThresholdPercentage: 40,
   resetTimeout: 60000,
@@ -142,7 +164,7 @@ const externalTrafficCircuitBreakerOptions = {
 };
 
 // Database circuit breaker options
-const databaseCircuitBreakerOptions = {
+const databaseCircuitBreakerOptions: CircuitBreakerOptions = {
   timeout: 5000,
   errorThresholdPercentage: 30, // Lower threshold for DB
   resetTimeout: 15000, // Faster recovery attempt
@@ -158,3 +180,4 @@ export {
   databaseCircuitBreakerOptions,
   circuitBreakers,
 };
+export type { CircuitBreakerOptions, CircuitBreakerHealth };

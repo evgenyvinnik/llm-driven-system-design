@@ -1,4 +1,5 @@
 import pg from 'pg';
+import type { PoolClient, QueryResult } from 'pg';
 import dotenv from 'dotenv';
 import logger from '../shared/logger.js';
 import { dbQueryDuration, dbPoolSize } from '../shared/metrics.js';
@@ -10,13 +11,13 @@ const { Pool } = pg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://reddit:reddit_password@localhost:5432/reddit',
   // Connection pool settings
-  max: parseInt(process.env.DB_POOL_MAX, 10) || 20,
-  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT, 10) || 30000,
-  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT, 10) || 2000,
+  max: parseInt(process.env.DB_POOL_MAX ?? '', 10) || 20,
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT ?? '', 10) || 30000,
+  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT ?? '', 10) || 2000,
 });
 
 // Log pool errors
-pool.on('error', (err) => {
+pool.on('error', (err: Error) => {
   logger.error({ err }, 'Unexpected error on idle database client');
 });
 
@@ -42,10 +43,13 @@ pool.on('release', () => {
 /**
  * Execute a query with timing and logging.
  */
-export const query = async (text, params) => {
+export const query = async <T extends pg.QueryResultRow = pg.QueryResultRow>(
+  text: string,
+  params?: unknown[]
+): Promise<QueryResult<T>> => {
   const start = Date.now();
   try {
-    const res = await pool.query(text, params);
+    const res = await pool.query<T>(text, params);
     const duration = Date.now() - start;
 
     // Record query duration in metrics
@@ -82,7 +86,7 @@ export const query = async (text, params) => {
 /**
  * Get a client from the pool for transactions.
  */
-export const getClient = async () => {
+export const getClient = async (): Promise<PoolClient> => {
   const client = await pool.connect();
   return client;
 };

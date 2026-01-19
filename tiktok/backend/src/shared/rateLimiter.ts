@@ -1,17 +1,50 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler } from 'express-rate-limit';
 import { RedisStore } from 'rate-limit-redis';
+import { Request, Response, NextFunction } from 'express';
+import { RedisClientType } from 'redis';
 import { createLogger } from './logger.js';
 import { rateLimitHitsCounter } from './metrics.js';
 
 const logger = createLogger('rate-limiter');
 
+// Rate limiter options interface
+interface RateLimiterOptions {
+  windowMs?: number;
+  max?: number;
+  message?: string;
+  prefix?: string;
+  keyGenerator?: ((req: Request) => string) | null;
+  skipFailedRequests?: boolean;
+  skipSuccessfulRequests?: boolean;
+  standardHeaders?: boolean;
+  legacyHeaders?: boolean;
+  endpointName?: string;
+}
+
+// Rate limiters collection interface
+interface RateLimiters {
+  upload: RateLimitRequestHandler;
+  comment: RateLimitRequestHandler;
+  like: RateLimitRequestHandler;
+  feed: RateLimitRequestHandler;
+  search: RateLimitRequestHandler;
+  login: RateLimitRequestHandler;
+  register: RateLimitRequestHandler;
+  follow: RateLimitRequestHandler;
+  admin: RateLimitRequestHandler;
+  general: RateLimitRequestHandler;
+}
+
 /**
  * Create a Redis-backed rate limiter
  */
-export const createRateLimiter = (redisClient, options = {}) => {
+export const createRateLimiter = (
+  redisClient: RedisClientType,
+  options: RateLimiterOptions = {}
+): RateLimitRequestHandler => {
   const {
-    windowMs = 60000,           // 1 minute default
-    max = 100,                   // 100 requests per window default
+    windowMs = 60000, // 1 minute default
+    max = 100, // 100 requests per window default
     message = 'Too many requests, please try again later',
     prefix = 'rl:',
     keyGenerator = null,
@@ -23,7 +56,7 @@ export const createRateLimiter = (redisClient, options = {}) => {
 
   return rateLimit({
     store: new RedisStore({
-      sendCommand: (...args) => redisClient.sendCommand(args),
+      sendCommand: (...args: string[]) => redisClient.sendCommand(args),
       prefix,
     }),
     windowMs,
@@ -33,25 +66,30 @@ export const createRateLimiter = (redisClient, options = {}) => {
     legacyHeaders,
     skipFailedRequests,
     skipSuccessfulRequests,
-    keyGenerator: keyGenerator || ((req) => {
-      // Use user ID if authenticated, otherwise use IP
-      return req.session?.userId
-        ? `user:${req.session.userId}`
-        : `ip:${req.ip || req.connection?.remoteAddress}`;
-    }),
-    handler: (req, res, next, optionsUsed) => {
+    keyGenerator:
+      keyGenerator ||
+      ((req: Request): string => {
+        // Use user ID if authenticated, otherwise use IP
+        return req.session?.userId
+          ? `user:${req.session.userId}`
+          : `ip:${req.ip || req.socket?.remoteAddress}`;
+      }),
+    handler: (req: Request, res: Response, _next: NextFunction, optionsUsed) => {
       // Log rate limit hit
       const userType = req.session?.userId ? 'authenticated' : 'anonymous';
       const endpoint = options.endpointName || req.path;
 
-      logger.warn({
-        endpoint,
-        userType,
-        userId: req.session?.userId,
-        ip: req.ip,
-        limit: optionsUsed.max,
-        windowMs: optionsUsed.windowMs,
-      }, 'Rate limit exceeded');
+      logger.warn(
+        {
+          endpoint,
+          userType,
+          userId: req.session?.userId,
+          ip: req.ip,
+          limit: optionsUsed.max,
+          windowMs: optionsUsed.windowMs,
+        },
+        'Rate limit exceeded'
+      );
 
       // Record metric
       rateLimitHitsCounter.labels(endpoint, userType).inc();
@@ -67,12 +105,12 @@ export const createRateLimiter = (redisClient, options = {}) => {
 /**
  * Pre-configured rate limiters for different endpoints
  */
-export const createRateLimiters = (redisClient) => {
+export const createRateLimiters = (redisClient: RedisClientType): RateLimiters => {
   return {
     // Video upload - strict limit (10/hour)
     // WHY: Video processing is CPU-intensive and uses expensive storage
     upload: createRateLimiter(redisClient, {
-      windowMs: 60 * 60 * 1000,     // 1 hour
+      windowMs: 60 * 60 * 1000, // 1 hour
       max: 10,
       message: 'Upload limit reached. You can upload up to 10 videos per hour.',
       prefix: 'rl:upload:',
@@ -82,7 +120,7 @@ export const createRateLimiters = (redisClient) => {
     // Comments - moderate limit (30/minute)
     // WHY: Prevent comment spam and flooding
     comment: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 30,
       message: 'Comment limit reached. Please slow down.',
       prefix: 'rl:comment:',
@@ -92,7 +130,7 @@ export const createRateLimiters = (redisClient) => {
     // Likes - moderate limit (100/minute)
     // WHY: Prevent like manipulation and bot activity
     like: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 100,
       message: 'Like limit reached. Please slow down.',
       prefix: 'rl:like:',
@@ -102,7 +140,7 @@ export const createRateLimiters = (redisClient) => {
     // Feed requests - generous limit (60/minute)
     // WHY: Normal scrolling behavior, but prevent scraping
     feed: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 60,
       message: 'Too many feed requests. Please slow down.',
       prefix: 'rl:feed:',
@@ -112,7 +150,7 @@ export const createRateLimiters = (redisClient) => {
     // Search - moderate limit (30/minute)
     // WHY: Prevent scraping and excessive search queries
     search: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 30,
       message: 'Search limit reached. Please slow down.',
       prefix: 'rl:search:',
@@ -122,29 +160,31 @@ export const createRateLimiters = (redisClient) => {
     // Login attempts - strict limit (5/15 minutes)
     // WHY: Brute-force protection
     login: createRateLimiter(redisClient, {
-      windowMs: 15 * 60 * 1000,      // 15 minutes
+      windowMs: 15 * 60 * 1000, // 15 minutes
       max: 5,
       message: 'Too many login attempts. Please try again in 15 minutes.',
       prefix: 'rl:login:',
-      keyGenerator: (req) => `ip:${req.ip || req.connection?.remoteAddress}`,
+      keyGenerator: (req: Request): string =>
+        `ip:${req.ip || req.socket?.remoteAddress}`,
       endpointName: 'login',
     }),
 
     // Registration - strict limit (3/hour per IP)
     // WHY: Prevent mass account creation
     register: createRateLimiter(redisClient, {
-      windowMs: 60 * 60 * 1000,      // 1 hour
+      windowMs: 60 * 60 * 1000, // 1 hour
       max: 3,
       message: 'Too many registration attempts. Please try again later.',
       prefix: 'rl:register:',
-      keyGenerator: (req) => `ip:${req.ip || req.connection?.remoteAddress}`,
+      keyGenerator: (req: Request): string =>
+        `ip:${req.ip || req.socket?.remoteAddress}`,
       endpointName: 'register',
     }),
 
     // Follow actions - moderate limit (50/minute)
     // WHY: Prevent follow/unfollow spam
     follow: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 50,
       message: 'Follow limit reached. Please slow down.',
       prefix: 'rl:follow:',
@@ -154,7 +194,7 @@ export const createRateLimiters = (redisClient) => {
     // Admin API - higher limit (100/minute)
     // WHY: Ops work needs higher limits but still protected
     admin: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 100,
       message: 'Admin API rate limit reached.',
       prefix: 'rl:admin:',
@@ -163,7 +203,7 @@ export const createRateLimiters = (redisClient) => {
 
     // General API - default catch-all (200/minute)
     general: createRateLimiter(redisClient, {
-      windowMs: 60 * 1000,           // 1 minute
+      windowMs: 60 * 1000, // 1 minute
       max: 200,
       message: 'Rate limit exceeded. Please slow down.',
       prefix: 'rl:general:',
@@ -176,12 +216,12 @@ export const createRateLimiters = (redisClient) => {
  * Role-based rate limit multipliers
  * Verified/premium users get higher limits
  */
-export const getRateLimitMultiplier = (role) => {
-  const multipliers = {
+export const getRateLimitMultiplier = (role: string): number => {
+  const multipliers: Record<string, number> = {
     user: 1.0,
-    creator: 1.5,      // Creators get 50% more capacity
-    moderator: 2.0,    // Moderators get 2x capacity
-    admin: 5.0,        // Admins get 5x capacity
+    creator: 1.5, // Creators get 50% more capacity
+    moderator: 2.0, // Moderators get 2x capacity
+    admin: 5.0, // Admins get 5x capacity
   };
   return multipliers[role] || 1.0;
 };
@@ -189,9 +229,12 @@ export const getRateLimitMultiplier = (role) => {
 /**
  * Dynamic rate limiter that adjusts limits based on user role
  */
-export const createDynamicRateLimiter = (redisClient, baseOptions = {}) => {
-  return (req, res, next) => {
-    const multiplier = getRateLimitMultiplier(req.session?.role);
+export const createDynamicRateLimiter = (
+  redisClient: RedisClientType,
+  baseOptions: RateLimiterOptions = {}
+): ((req: Request, res: Response, next: NextFunction) => void) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const multiplier = getRateLimitMultiplier(req.session?.role || 'user');
     const adjustedMax = Math.floor((baseOptions.max || 100) * multiplier);
 
     const limiter = createRateLimiter(redisClient, {
@@ -199,7 +242,7 @@ export const createDynamicRateLimiter = (redisClient, baseOptions = {}) => {
       max: adjustedMax,
     });
 
-    return limiter(req, res, next);
+    limiter(req, res, next);
   };
 };
 

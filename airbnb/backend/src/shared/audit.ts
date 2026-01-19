@@ -17,8 +17,106 @@
 
 import { query } from '../db.js';
 import logger, { createModuleLogger } from './logger.js';
+import type { Request } from 'express';
 
 const log = createModuleLogger('audit');
+
+// Type definitions
+interface AuditEventInput {
+  type: string;
+  userId?: number | null;
+  resourceType: string;
+  resourceId: number | string;
+  action: string;
+  outcome?: string;
+  metadata?: Record<string, unknown>;
+  before?: Record<string, unknown> | null;
+  after?: Record<string, unknown> | null;
+}
+
+interface AuditEntry {
+  event_type: string;
+  user_id: number | null;
+  resource_type: string;
+  resource_id: number | string;
+  action: string;
+  outcome: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  session_id: string | null;
+  request_id: string | null;
+  metadata: Record<string, unknown>;
+  before_state: Record<string, unknown> | null;
+  after_state: Record<string, unknown> | null;
+}
+
+interface AuditBookingOptions {
+  userId?: number;
+  outcome?: string;
+  metadata?: Record<string, unknown>;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+}
+
+interface AuditListingOptions {
+  outcome?: string;
+  metadata?: Record<string, unknown>;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+}
+
+interface AuditHistoryOptions {
+  limit?: number;
+  offset?: number;
+  eventType?: string;
+}
+
+interface UserAuditHistoryOptions {
+  limit?: number;
+  offset?: number;
+  resourceType?: string;
+}
+
+interface AuditBooking {
+  id: number;
+  listing_id: number;
+  check_in: string;
+  check_out: string;
+  total_price: number;
+  nights: number;
+  guests: number;
+}
+
+interface AuditListing {
+  id: number;
+  title: string;
+  price_per_night: number;
+}
+
+interface AuditError {
+  message: string;
+  code?: string;
+}
+
+interface AuditLogRow {
+  id: number;
+  event_type: string;
+  user_id: number | null;
+  resource_type: string;
+  resource_id: number;
+  action: string;
+  outcome: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  session_id: string | null;
+  request_id: string | null;
+  metadata: Record<string, unknown>;
+  before_state: Record<string, unknown> | null;
+  after_state: Record<string, unknown> | null;
+  created_at: Date;
+  user_name?: string;
+  user_email?: string;
+}
 
 // Audit event types
 export const AUDIT_EVENTS = {
@@ -68,27 +166,18 @@ export const OUTCOMES = {
 
 /**
  * Log an audit event
- * @param {object} event - Audit event details
- * @param {string} event.type - Event type from AUDIT_EVENTS
- * @param {number} event.userId - ID of the user performing the action
- * @param {string} event.resourceType - Type of resource (booking, listing, etc.)
- * @param {number} event.resourceId - ID of the resource
- * @param {string} event.action - Action performed
- * @param {string} event.outcome - Outcome (success, failure, denied)
- * @param {object} event.metadata - Additional context
- * @param {object} event.before - State before change (for updates)
- * @param {object} event.after - State after change (for updates)
- * @param {object} req - Express request object for IP and user agent
+ * @param event - Audit event details
+ * @param req - Express request object for IP and user agent
  */
-export async function logAuditEvent(event, req = null) {
-  const auditEntry = {
+export async function logAuditEvent(event: AuditEventInput, req: Request | null = null): Promise<AuditEntry> {
+  const auditEntry: AuditEntry = {
     event_type: event.type,
-    user_id: event.userId || null,
+    user_id: event.userId ?? null,
     resource_type: event.resourceType,
     resource_id: event.resourceId,
     action: event.action,
     outcome: event.outcome || OUTCOMES.SUCCESS,
-    ip_address: req?.ip || req?.connection?.remoteAddress || null,
+    ip_address: req?.ip || (req as unknown as { connection?: { remoteAddress?: string } })?.connection?.remoteAddress || null,
     user_agent: req?.headers?.['user-agent'] || null,
     session_id: req?.cookies?.session || null,
     request_id: req?.requestId || null,
@@ -139,7 +228,7 @@ export async function logAuditEvent(event, req = null) {
 /**
  * Log a booking audit event with full context
  */
-export async function auditBooking(eventType, booking, req, options = {}) {
+export async function auditBooking(eventType: string, booking: AuditBooking, req: Request | null, options: AuditBookingOptions = {}): Promise<AuditEntry> {
   return logAuditEvent({
     type: eventType,
     userId: options.userId || req?.user?.id,
@@ -164,7 +253,7 @@ export async function auditBooking(eventType, booking, req, options = {}) {
 /**
  * Log a listing audit event
  */
-export async function auditListing(eventType, listing, req, options = {}) {
+export async function auditListing(eventType: string, listing: AuditListing, req: Request | null, options: AuditListingOptions = {}): Promise<AuditEntry> {
   return logAuditEvent({
     type: eventType,
     userId: req?.user?.id,
@@ -185,7 +274,7 @@ export async function auditListing(eventType, listing, req, options = {}) {
 /**
  * Log a failed operation for audit trail
  */
-export async function auditFailure(eventType, resourceType, resourceId, error, req) {
+export async function auditFailure(eventType: string, resourceType: string, resourceId: number | string, error: AuditError, req: Request | null): Promise<AuditEntry> {
   return logAuditEvent({
     type: eventType,
     userId: req?.user?.id,
@@ -203,7 +292,7 @@ export async function auditFailure(eventType, resourceType, resourceId, error, r
 /**
  * Log a denied operation (authorization failure)
  */
-export async function auditDenied(eventType, resourceType, resourceId, reason, req) {
+export async function auditDenied(eventType: string, resourceType: string, resourceId: number | string, reason: string, req: Request | null): Promise<AuditEntry> {
   return logAuditEvent({
     type: eventType,
     userId: req?.user?.id,
@@ -219,11 +308,11 @@ export async function auditDenied(eventType, resourceType, resourceId, reason, r
 
 /**
  * Query audit logs for a specific resource
- * @param {string} resourceType - Resource type
- * @param {number} resourceId - Resource ID
- * @param {object} options - Query options
+ * @param resourceType - Resource type
+ * @param resourceId - Resource ID
+ * @param options - Query options
  */
-export async function getAuditHistory(resourceType, resourceId, options = {}) {
+export async function getAuditHistory(resourceType: string, resourceId: number | string, options: AuditHistoryOptions = {}): Promise<AuditLogRow[]> {
   const { limit = 50, offset = 0, eventType } = options;
 
   let sql = `
@@ -232,7 +321,7 @@ export async function getAuditHistory(resourceType, resourceId, options = {}) {
     LEFT JOIN users u ON a.user_id = u.id
     WHERE a.resource_type = $1 AND a.resource_id = $2
   `;
-  const params = [resourceType, resourceId];
+  const params: (string | number)[] = [resourceType, resourceId];
 
   if (eventType) {
     params.push(eventType);
@@ -242,21 +331,21 @@ export async function getAuditHistory(resourceType, resourceId, options = {}) {
   params.push(limit, offset);
   sql += ` ORDER BY a.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
-  const result = await query(sql, params);
+  const result = await query<AuditLogRow>(sql, params);
   return result.rows;
 }
 
 /**
  * Query audit logs for a specific user
  */
-export async function getUserAuditHistory(userId, options = {}) {
+export async function getUserAuditHistory(userId: number, options: UserAuditHistoryOptions = {}): Promise<AuditLogRow[]> {
   const { limit = 50, offset = 0, resourceType } = options;
 
   let sql = `
     SELECT * FROM audit_logs
     WHERE user_id = $1
   `;
-  const params = [userId];
+  const params: (string | number)[] = [userId];
 
   if (resourceType) {
     params.push(resourceType);
@@ -266,7 +355,7 @@ export async function getUserAuditHistory(userId, options = {}) {
   params.push(limit, offset);
   sql += ` ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
-  const result = await query(sql, params);
+  const result = await query<AuditLogRow>(sql, params);
   return result.rows;
 }
 

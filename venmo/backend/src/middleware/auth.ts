@@ -1,17 +1,42 @@
-const { getSession } = require('../db/redis');
-const { pool } = require('../db/pool');
+import type { Request, Response, NextFunction } from 'express';
+import { pool } from '../db/pool.js';
+import { getSession } from '../db/redis.js';
 
-const authMiddleware = async (req, res, next) => {
+export interface User {
+  id: string;
+  username: string;
+  email: string;
+  name: string | null;
+  avatar_url: string | null;
+  role: string;
+}
+
+export interface AuthenticatedRequest extends Request {
+  user: User;
+  sessionId: string;
+  requestId?: string;
+  idempotencyKey?: string;
+  idempotencyFailed?: boolean;
+  storeIdempotencyResult?: (status: string, response: unknown) => Promise<void>;
+}
+
+export const authMiddleware = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
   try {
-    const sessionId = req.headers['x-session-id'] || req.cookies?.sessionId;
+    const sessionId = req.headers['x-session-id'] as string | undefined;
 
     if (!sessionId) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userId = await getSession(sessionId);
     if (!userId) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
     // Get user details
@@ -21,11 +46,12 @@ const authMiddleware = async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'User not found' });
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
-    req.user = result.rows[0];
-    req.sessionId = sessionId;
+    (req as AuthenticatedRequest).user = result.rows[0];
+    (req as AuthenticatedRequest).sessionId = sessionId;
     next();
   } catch (error) {
     console.error('Auth middleware error:', error);
@@ -33,11 +59,14 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
-const adminMiddleware = (req, res, next) => {
-  if (req.user?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
+export const adminMiddleware = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
+  if ((req as AuthenticatedRequest).user?.role !== 'admin') {
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 };
-
-module.exports = { authMiddleware, adminMiddleware };

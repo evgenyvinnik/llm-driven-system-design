@@ -1,8 +1,13 @@
 import 'dotenv/config';
 import { pool } from './db.js';
-import { elasticsearch, initElasticsearch, indexBusiness } from './elasticsearch.js';
+import {
+  elasticsearch,
+  initElasticsearch,
+  indexBusiness,
+  BusinessInput,
+} from './elasticsearch.js';
 
-async function syncElasticsearch() {
+async function syncElasticsearch(): Promise<void> {
   console.log('Starting Elasticsearch sync...');
 
   try {
@@ -13,7 +18,7 @@ async function syncElasticsearch() {
     try {
       await elasticsearch.indices.delete({ index: 'businesses' });
       console.log('Deleted existing index');
-    } catch (e) {
+    } catch {
       // Index might not exist
     }
 
@@ -21,7 +26,7 @@ async function syncElasticsearch() {
     console.log('Created fresh index');
 
     // Get all businesses with their categories
-    const result = await pool.query(`
+    const result = await pool.query<BusinessInput>(`
       SELECT b.*,
              array_agg(DISTINCT c.slug) FILTER (WHERE c.slug IS NOT NULL) as categories,
              array_agg(DISTINCT c.name) FILTER (WHERE c.name IS NOT NULL) as category_names,
@@ -49,7 +54,6 @@ async function syncElasticsearch() {
     // Refresh index
     await elasticsearch.indices.refresh({ index: 'businesses' });
     console.log('Index refreshed');
-
   } catch (error) {
     console.error('Sync error:', error);
     process.exit(1);

@@ -4,7 +4,13 @@
  */
 
 // View count window configuration
-export const WINDOW_CONFIG = {
+export interface WindowConfig {
+  windowSizeMinutes: number;
+  bucketSizeMinutes: number;
+  expirationBufferMinutes: number;
+}
+
+export const WINDOW_CONFIG: WindowConfig = {
   // Default sliding window size in minutes for trending calculation
   windowSizeMinutes: parseInt(process.env.WINDOW_SIZE_MINUTES || '60', 10),
 
@@ -16,7 +22,13 @@ export const WINDOW_CONFIG = {
 };
 
 // Top-K configuration
-export const TOP_K_CONFIG = {
+export interface TopKConfig {
+  defaultK: number;
+  maxK: number;
+  updateIntervalSeconds: number;
+}
+
+export const TOP_K_CONFIG: TopKConfig = {
   // Default number of top videos to track
   defaultK: parseInt(process.env.TOP_K_SIZE || '10', 10),
 
@@ -28,7 +40,15 @@ export const TOP_K_CONFIG = {
 };
 
 // Data retention policies
-export const RETENTION_CONFIG = {
+export interface RetentionConfig {
+  viewEventsRetentionDays: number;
+  snapshotsRetentionDays: number;
+  enableViewEventLogging: boolean;
+  viewEventSampleRate: number;
+  enableSnapshots: boolean;
+}
+
+export const RETENTION_CONFIG: RetentionConfig = {
   // View events table retention in days
   viewEventsRetentionDays: parseInt(process.env.VIEW_EVENTS_RETENTION_DAYS || '7', 10),
 
@@ -46,7 +66,26 @@ export const RETENTION_CONFIG = {
 };
 
 // Alert thresholds for capacity monitoring
-export const ALERT_THRESHOLDS = {
+export interface AlertThresholds {
+  redisMemoryWarningBytes: number;
+  redisMemoryCriticalBytes: number;
+  pgConnectionWarningPercent: number;
+  pgConnectionCriticalPercent: number;
+  viewEventsWarningRows: number;
+  viewEventsCriticalRows: number;
+  snapshotsWarningRows: number;
+  snapshotsCriticalRows: number;
+  sseClientsWarning: number;
+  sseClientsCritical: number;
+  viewRecordingLatencyWarningMs: number;
+  viewRecordingLatencyCriticalMs: number;
+  trendingQueryLatencyWarningMs: number;
+  trendingQueryLatencyCriticalMs: number;
+  queueLagWarningMessages: number;
+  queueLagCriticalMessages: number;
+}
+
+export const ALERT_THRESHOLDS: AlertThresholds = {
   // Redis memory thresholds (in bytes)
   redisMemoryWarningBytes: parseInt(process.env.REDIS_MEMORY_WARNING || '419430400', 10), // 400MB
   redisMemoryCriticalBytes: parseInt(process.env.REDIS_MEMORY_CRITICAL || '471859200', 10), // 450MB
@@ -77,7 +116,13 @@ export const ALERT_THRESHOLDS = {
 };
 
 // Cache configuration
-export const CACHE_CONFIG = {
+export interface CacheConfig {
+  trendingCacheTtlSeconds: number;
+  trendingCacheHitRateTarget: number;
+  videoMetadataCacheTtlSeconds: number;
+}
+
+export const CACHE_CONFIG: CacheConfig = {
   // Trending cache TTL in seconds (how long before re-fetching from Redis)
   trendingCacheTtlSeconds: parseInt(process.env.TRENDING_CACHE_TTL_SECONDS || '5', 10),
 
@@ -89,7 +134,12 @@ export const CACHE_CONFIG = {
 };
 
 // Idempotency configuration
-export const IDEMPOTENCY_CONFIG = {
+export interface IdempotencyConfig {
+  keyTtlSeconds: number;
+  keyPrefix: string;
+}
+
+export const IDEMPOTENCY_CONFIG: IdempotencyConfig = {
   // TTL for idempotency keys in seconds (how long to remember processed events)
   keyTtlSeconds: parseInt(process.env.IDEMPOTENCY_KEY_TTL_SECONDS || '3600', 10),
 
@@ -98,14 +148,27 @@ export const IDEMPOTENCY_CONFIG = {
 };
 
 // Server configuration
-export const SERVER_CONFIG = {
+export interface ServerConfig {
+  port: number;
+  nodeEnv: string;
+  logLevel: string;
+}
+
+export const SERVER_CONFIG: ServerConfig = {
   port: parseInt(process.env.PORT || '3000', 10),
   nodeEnv: process.env.NODE_ENV || 'development',
   logLevel: process.env.LOG_LEVEL || 'info',
 };
 
 // Database configuration
-export const DB_CONFIG = {
+export interface DbConfig {
+  connectionString: string;
+  maxConnections: number;
+  idleTimeoutMs: number;
+  connectionTimeoutMs: number;
+}
+
+export const DB_CONFIG: DbConfig = {
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/youtube_topk',
   maxConnections: parseInt(process.env.PG_POOL_SIZE || '20', 10),
   idleTimeoutMs: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10),
@@ -113,12 +176,28 @@ export const DB_CONFIG = {
 };
 
 // Redis configuration
-export const REDIS_CONFIG = {
+export interface RedisConfig {
+  url: string;
+}
+
+export const REDIS_CONFIG: RedisConfig = {
   url: process.env.REDIS_URL || 'redis://localhost:6379',
 };
 
 // Export all configs as a single object for convenience
-export const config = {
+export interface Config {
+  window: WindowConfig;
+  topK: TopKConfig;
+  retention: RetentionConfig;
+  alerts: AlertThresholds;
+  cache: CacheConfig;
+  idempotency: IdempotencyConfig;
+  server: ServerConfig;
+  db: DbConfig;
+  redis: RedisConfig;
+}
+
+export const config: Config = {
   window: WINDOW_CONFIG,
   topK: TOP_K_CONFIG,
   retention: RETENTION_CONFIG,

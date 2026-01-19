@@ -3,7 +3,7 @@ import { cacheHits, cacheMisses, cacheInvalidations } from './metrics.js';
 import { cacheLogger as logger } from './logger.js';
 
 // Cache TTL configuration (in seconds)
-export const CACHE_TTL = {
+export const CACHE_TTL: Record<string, number> = {
   PRODUCT: 300,           // 5 minutes - products change rarely
   SHOP: 600,              // 10 minutes - shop info stable
   SHOP_PRODUCTS: 180,     // 3 minutes - product list for a shop
@@ -14,7 +14,7 @@ export const CACHE_TTL = {
 };
 
 // Cache key prefixes
-export const CACHE_KEYS = {
+export const CACHE_KEYS: Record<string, string> = {
   PRODUCT: 'product:',
   SHOP: 'shop:',
   SHOP_PRODUCTS: 'shop:products:',
@@ -23,21 +23,22 @@ export const CACHE_KEYS = {
   CATEGORY: 'category:',
   LOCK: 'lock:',
   IDEMPOTENCY: 'idempotency:',
+  CART: 'cart:',
 };
 
 /**
  * Get data from cache with metrics tracking
- * @param {string} key - Cache key
- * @param {string} cacheType - Type for metrics (product, shop, search)
- * @returns {Promise<any|null>} Parsed cached data or null
+ * @param key - Cache key
+ * @param cacheType - Type for metrics (product, shop, search)
+ * @returns Parsed cached data or null
  */
-export async function getFromCache(key, cacheType = 'generic') {
+export async function getFromCache<T>(key: string, cacheType: string = 'generic'): Promise<T | null> {
   try {
     const cached = await redis.get(key);
     if (cached) {
       cacheHits.labels(cacheType).inc();
       logger.debug({ key, cacheType }, 'Cache hit');
-      return JSON.parse(cached);
+      return JSON.parse(cached) as T;
     }
     cacheMisses.labels(cacheType).inc();
     logger.debug({ key, cacheType }, 'Cache miss');
@@ -51,12 +52,12 @@ export async function getFromCache(key, cacheType = 'generic') {
 
 /**
  * Set data in cache with TTL
- * @param {string} key - Cache key
- * @param {any} data - Data to cache (will be JSON stringified)
- * @param {number} ttl - TTL in seconds
- * @returns {Promise<boolean>} Success status
+ * @param key - Cache key
+ * @param data - Data to cache (will be JSON stringified)
+ * @param ttl - TTL in seconds
+ * @returns Success status
  */
-export async function setInCache(key, data, ttl) {
+export async function setInCache(key: string, data: unknown, ttl: number): Promise<boolean> {
   try {
     await redis.setex(key, ttl, JSON.stringify(data));
     logger.debug({ key, ttl }, 'Cache set');
@@ -69,15 +70,20 @@ export async function setInCache(key, data, ttl) {
 
 /**
  * Cache-aside pattern: Get from cache or fetch from source
- * @param {string} key - Cache key
- * @param {Function} fetchFn - Async function to fetch data on cache miss
- * @param {number} ttl - TTL in seconds
- * @param {string} cacheType - Type for metrics
- * @returns {Promise<any>} Data from cache or source
+ * @param key - Cache key
+ * @param fetchFn - Async function to fetch data on cache miss
+ * @param ttl - TTL in seconds
+ * @param cacheType - Type for metrics
+ * @returns Data from cache or source
  */
-export async function cacheAside(key, fetchFn, ttl, cacheType = 'generic') {
+export async function cacheAside<T>(
+  key: string,
+  fetchFn: () => Promise<T>,
+  ttl: number,
+  cacheType: string = 'generic'
+): Promise<T> {
   // Try cache first
-  const cached = await getFromCache(key, cacheType);
+  const cached = await getFromCache<T>(key, cacheType);
   if (cached !== null) {
     return cached;
   }
@@ -98,15 +104,20 @@ export async function cacheAside(key, fetchFn, ttl, cacheType = 'generic') {
 /**
  * Cache-aside with stampede prevention using locks
  * Prevents multiple concurrent requests from hitting the database
- * @param {string} key - Cache key
- * @param {Function} fetchFn - Async function to fetch data
- * @param {number} ttl - TTL in seconds
- * @param {string} cacheType - Type for metrics
- * @returns {Promise<any>} Data from cache or source
+ * @param key - Cache key
+ * @param fetchFn - Async function to fetch data
+ * @param ttl - TTL in seconds
+ * @param cacheType - Type for metrics
+ * @returns Data from cache or source
  */
-export async function cacheAsideWithLock(key, fetchFn, ttl, cacheType = 'generic') {
+export async function cacheAsideWithLock<T>(
+  key: string,
+  fetchFn: () => Promise<T>,
+  ttl: number,
+  cacheType: string = 'generic'
+): Promise<T> {
   // Try cache first
-  const cached = await getFromCache(key, cacheType);
+  const cached = await getFromCache<T>(key, cacheType);
   if (cached !== null) {
     return cached;
   }
@@ -125,7 +136,7 @@ export async function cacheAsideWithLock(key, fetchFn, ttl, cacheType = 'generic
 
   try {
     // Double-check cache (another process may have populated it)
-    const rechecked = await getFromCache(key, cacheType);
+    const rechecked = await getFromCache<T>(key, cacheType);
     if (rechecked !== null) {
       return rechecked;
     }
@@ -147,11 +158,11 @@ export async function cacheAsideWithLock(key, fetchFn, ttl, cacheType = 'generic
 
 /**
  * Invalidate a single cache key
- * @param {string} key - Cache key to invalidate
- * @param {string} cacheType - Type for metrics
- * @param {string} reason - Reason for invalidation
+ * @param key - Cache key to invalidate
+ * @param cacheType - Type for metrics
+ * @param reason - Reason for invalidation
  */
-export async function invalidateCache(key, cacheType = 'generic', reason = 'update') {
+export async function invalidateCache(key: string, cacheType: string = 'generic', reason: string = 'update'): Promise<void> {
   try {
     await redis.del(key);
     cacheInvalidations.labels(cacheType, reason).inc();
@@ -163,11 +174,11 @@ export async function invalidateCache(key, cacheType = 'generic', reason = 'upda
 
 /**
  * Invalidate multiple cache keys matching a pattern
- * @param {string} pattern - Pattern to match (e.g., "shop:123:*")
- * @param {string} cacheType - Type for metrics
- * @param {string} reason - Reason for invalidation
+ * @param pattern - Pattern to match (e.g., "shop:123:*")
+ * @param cacheType - Type for metrics
+ * @param reason - Reason for invalidation
  */
-export async function invalidateCachePattern(pattern, cacheType = 'generic', reason = 'update') {
+export async function invalidateCachePattern(pattern: string, cacheType: string = 'generic', reason: string = 'update'): Promise<void> {
   try {
     let cursor = '0';
     let keysDeleted = 0;
@@ -193,33 +204,33 @@ export async function invalidateCachePattern(pattern, cacheType = 'generic', rea
 
 /**
  * Get product from cache or database
- * @param {number} productId - Product ID
- * @param {Function} fetchFn - Function to fetch product from DB
- * @returns {Promise<any>} Product data
+ * @param productId - Product ID
+ * @param fetchFn - Function to fetch product from DB
+ * @returns Product data
  */
-export async function getCachedProduct(productId, fetchFn) {
+export async function getCachedProduct<T>(productId: number, fetchFn: () => Promise<T>): Promise<T> {
   const key = `${CACHE_KEYS.PRODUCT}${productId}`;
   return cacheAsideWithLock(key, fetchFn, CACHE_TTL.PRODUCT, 'product');
 }
 
 /**
  * Get shop from cache or database
- * @param {number|string} shopIdOrSlug - Shop ID or slug
- * @param {Function} fetchFn - Function to fetch shop from DB
- * @returns {Promise<any>} Shop data
+ * @param shopIdOrSlug - Shop ID or slug
+ * @param fetchFn - Function to fetch shop from DB
+ * @returns Shop data
  */
-export async function getCachedShop(shopIdOrSlug, fetchFn) {
+export async function getCachedShop<T>(shopIdOrSlug: number | string, fetchFn: () => Promise<T>): Promise<T> {
   const key = `${CACHE_KEYS.SHOP}${shopIdOrSlug}`;
   return cacheAsideWithLock(key, fetchFn, CACHE_TTL.SHOP, 'shop');
 }
 
 /**
  * Invalidate product cache and related caches
- * @param {number} productId - Product ID
- * @param {number} shopId - Shop ID (for invalidating shop product list)
- * @param {number} categoryId - Category ID (for invalidating category searches)
+ * @param productId - Product ID
+ * @param shopId - Shop ID (for invalidating shop product list)
+ * @param categoryId - Category ID (for invalidating category searches)
  */
-export async function invalidateProductCache(productId, shopId, categoryId) {
+export async function invalidateProductCache(productId: number, shopId: number, categoryId: number | null): Promise<void> {
   // Invalidate product cache
   await invalidateCache(`${CACHE_KEYS.PRODUCT}${productId}`, 'product', 'update');
 
@@ -239,10 +250,10 @@ export async function invalidateProductCache(productId, shopId, categoryId) {
 
 /**
  * Invalidate shop cache
- * @param {number} shopId - Shop ID
- * @param {string} slug - Shop slug (if available)
+ * @param shopId - Shop ID
+ * @param slug - Shop slug (if available)
  */
-export async function invalidateShopCache(shopId, slug) {
+export async function invalidateShopCache(shopId: number, slug?: string): Promise<void> {
   await invalidateCache(`${CACHE_KEYS.SHOP}${shopId}`, 'shop', 'update');
   if (slug) {
     await invalidateCache(`${CACHE_KEYS.SHOP}${slug}`, 'shop', 'update');
@@ -251,7 +262,7 @@ export async function invalidateShopCache(shopId, slug) {
 }
 
 // Helper function
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 

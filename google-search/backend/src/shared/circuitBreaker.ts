@@ -135,9 +135,9 @@ export const elasticsearchBreaker = {
    * Wrap an Elasticsearch operation with circuit breaker protection
    */
   wrap: <T>(operation: () => Promise<T>): CircuitBreaker => {
-    const breaker = createCircuitBreaker(
+    const breaker = createCircuitBreaker<T>(
       'elasticsearch',
-      operation,
+      operation as unknown as (...args: unknown[]) => Promise<T>,
       {
         timeout: 15000, // ES operations can be slow
         errorThresholdPercentage: 40,
@@ -157,7 +157,10 @@ export const elasticsearchBreaker = {
       // First call - create the breaker
       breaker = createCircuitBreaker(
         'elasticsearch',
-        async (fn: () => Promise<T>) => fn(),
+        async (...args: unknown[]) => {
+          const fn = args[0] as () => Promise<T>;
+          return fn();
+        },
         {
           timeout: 15000,
           errorThresholdPercentage: 40,
@@ -184,7 +187,10 @@ export const redisBreaker = {
     if (!breaker) {
       breaker = createCircuitBreaker(
         'redis',
-        async (fn: () => Promise<T>) => fn(),
+        async (...args: unknown[]) => {
+          const fn = args[0] as () => Promise<T>;
+          return fn();
+        },
         {
           timeout: 5000, // Redis should be fast
           errorThresholdPercentage: 50,
@@ -211,7 +217,10 @@ export const postgresBreaker = {
     if (!breaker) {
       breaker = createCircuitBreaker(
         'postgres',
-        async (fn: () => Promise<T>) => fn(),
+        async (...args: unknown[]) => {
+          const fn = args[0] as () => Promise<T>;
+          return fn();
+        },
         {
           timeout: 10000,
           errorThresholdPercentage: 50,

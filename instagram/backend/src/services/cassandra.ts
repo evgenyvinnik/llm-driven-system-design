@@ -8,21 +8,26 @@ import { logger } from './logger.js';
 
 const { Client, types } = cassandra;
 
+interface CassandraConfig {
+  contactPoints: string[];
+  localDataCenter: string;
+  keyspace: string;
+}
+
 // Cassandra configuration
-const CASSANDRA_CONFIG = {
+const CASSANDRA_CONFIG: CassandraConfig = {
   contactPoints: (process.env.CASSANDRA_HOSTS || 'localhost').split(','),
   localDataCenter: process.env.CASSANDRA_DC || 'datacenter1',
   keyspace: process.env.CASSANDRA_KEYSPACE || 'instagram_dm',
 };
 
-let client = null;
-let isConnected = false;
+let client: cassandra.Client | null = null;
+let isConnected: boolean = false;
 
 /**
  * Initialize Cassandra client connection.
- * @returns {Promise<void>}
  */
-export async function initCassandra() {
+export async function initCassandra(): Promise<void> {
   try {
     client = new Client({
       contactPoints: CASSANDRA_CONFIG.contactPoints,
@@ -40,7 +45,8 @@ export async function initCassandra() {
     isConnected = true;
     logger.info({ contactPoints: CASSANDRA_CONFIG.contactPoints }, 'Cassandra connected successfully');
   } catch (error) {
-    logger.error({ error: error.message }, 'Failed to connect to Cassandra');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Failed to connect to Cassandra');
     // Don't throw - DMs are not critical for core functionality
     isConnected = false;
   }
@@ -48,25 +54,22 @@ export async function initCassandra() {
 
 /**
  * Get Cassandra client instance.
- * @returns {cassandra.Client|null}
  */
-export function getCassandraClient() {
+export function getCassandraClient(): cassandra.Client | null {
   return client;
 }
 
 /**
  * Check if Cassandra is connected.
- * @returns {boolean}
  */
-export function isCassandraConnected() {
+export function isCassandraConnected(): boolean {
   return isConnected;
 }
 
 /**
  * Close Cassandra connection.
- * @returns {Promise<void>}
  */
-export async function closeCassandra() {
+export async function closeCassandra(): Promise<void> {
   if (client) {
     await client.shutdown();
     isConnected = false;
@@ -76,28 +79,22 @@ export async function closeCassandra() {
 
 /**
  * Generate a TimeUUID for message ordering.
- * @returns {cassandra.types.TimeUuid}
  */
-export function generateTimeUuid() {
+export function generateTimeUuid(): cassandra.types.TimeUuid {
   return types.TimeUuid.now();
 }
 
 /**
  * Convert a string UUID to Cassandra UUID type.
- * @param {string} uuid - UUID string
- * @returns {cassandra.types.Uuid}
  */
-export function toUuid(uuid) {
+export function toUuid(uuid: string): cassandra.types.Uuid {
   return types.Uuid.fromString(uuid);
 }
 
 /**
  * Generate a sorted user pair key for conversation lookup.
- * @param {string} userId1 - First user UUID
- * @param {string} userId2 - Second user UUID
- * @returns {string}
  */
-export function generateUserPairKey(userId1, userId2) {
+export function generateUserPairKey(userId1: string, userId2: string): string {
   return [userId1, userId2].sort().join(':');
 }
 

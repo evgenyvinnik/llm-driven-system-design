@@ -1,4 +1,5 @@
 import promClient from 'prom-client';
+import type { Request, Response, NextFunction } from 'express';
 
 // Create a Registry to register metrics
 const register = new promClient.Registry();
@@ -165,10 +166,16 @@ export const idempotencyHits = new promClient.Counter({
   registers: [register],
 });
 
+interface RouteRequest extends Request {
+  route?: {
+    path?: string;
+  };
+}
+
 /**
  * Express middleware for collecting HTTP metrics
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: RouteRequest, res: Response, next: NextFunction): void {
   const start = Date.now();
 
   res.on('finish', () => {
@@ -177,7 +184,7 @@ export function metricsMiddleware(req, res, next) {
     const labels = {
       method: req.method,
       route,
-      status_code: res.statusCode,
+      status_code: res.statusCode.toString(),
     };
 
     httpRequestDuration.observe(labels, duration);
@@ -190,14 +197,14 @@ export function metricsMiddleware(req, res, next) {
 /**
  * Get metrics in Prometheus format
  */
-export async function getMetrics() {
+export async function getMetrics(): Promise<string> {
   return register.metrics();
 }
 
 /**
  * Get content type for metrics
  */
-export function getContentType() {
+export function getContentType(): string {
   return register.contentType;
 }
 

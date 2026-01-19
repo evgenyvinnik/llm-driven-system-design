@@ -1,3 +1,4 @@
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { redis } from '../services/redis.js';
 import { idempotencyCache } from './metrics.js';
 import { logger } from './logger.js';
@@ -25,10 +26,16 @@ import { logger } from './logger.js';
 const IDEMPOTENCY_TTL = 24 * 60 * 60; // 24 hours in seconds
 const IDEMPOTENCY_PREFIX = 'idempotency';
 
+interface CachedResponse {
+  statusCode: number;
+  body: unknown;
+  cachedAt: string;
+}
+
 /**
  * Generates a Redis key for idempotency storage.
  */
-function getIdempotencyKey(userId, idempotencyKey) {
+function getIdempotencyKey(userId: string, idempotencyKey: string): string {
   return `${IDEMPOTENCY_PREFIX}:${userId}:${idempotencyKey}`;
 }
 
@@ -36,7 +43,7 @@ function getIdempotencyKey(userId, idempotencyKey) {
  * Checks if a cached response exists for the idempotency key.
  * Returns the cached response or null if not found.
  */
-export async function getIdempotentResponse(userId, idempotencyKey) {
+export async function getIdempotentResponse(userId: string, idempotencyKey: string): Promise<CachedResponse | null> {
   if (!idempotencyKey) return null;
 
   try {
@@ -46,7 +53,7 @@ export async function getIdempotentResponse(userId, idempotencyKey) {
     if (cached) {
       idempotencyCache.inc({ result: 'hit' });
       logger.debug({ userId, idempotencyKey }, 'Idempotency cache hit');
-      return JSON.parse(cached);
+      return JSON.parse(cached) as CachedResponse;
     }
 
     idempotencyCache.inc({ result: 'miss' });
@@ -61,7 +68,11 @@ export async function getIdempotentResponse(userId, idempotencyKey) {
  * Stores a response for the idempotency key.
  * TTL ensures cleanup after 24 hours.
  */
-export async function setIdempotentResponse(userId, idempotencyKey, response) {
+export async function setIdempotentResponse(
+  userId: string,
+  idempotencyKey: string,
+  response: CachedResponse
+): Promise<void> {
   if (!idempotencyKey) return;
 
   try {
@@ -86,17 +97,19 @@ export async function setIdempotentResponse(userId, idempotencyKey, response) {
  * Content-Type: application/json
  * { "name": "My Playlist" }
  */
-export function idempotentMiddleware(req, res, next) {
-  const idempotencyKey = req.headers['x-idempotency-key'];
+export function idempotentMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
   if (!idempotencyKey) {
     // No idempotency key - proceed normally
-    return next();
+    next();
+    return;
   }
 
   if (!req.user?.id) {
     // Require authentication for idempotent operations
-    return res.status(401).json({ error: 'Authentication required for idempotent operations' });
+    res.status(401).json({ error: 'Authentication required for idempotent operations' });
+    return;
   }
 
   // Store reference to original json method
@@ -108,22 +121,23 @@ export function idempotentMiddleware(req, res, next) {
       if (cached) {
         // Return cached response
         logger.info({
-          userId: req.user.id,
+          userId: req.user!.id,
           idempotencyKey,
           path: req.path
         }, 'Returning idempotent cached response');
 
         res.set('X-Idempotency-Replayed', 'true');
-        return res.status(cached.statusCode || 200).json(cached.body);
+        res.status(cached.statusCode || 200).json(cached.body);
+        return;
       }
 
       // Override res.json to capture and cache response
-      res.json = function(body) {
+      res.json = function(body: unknown) {
         const statusCode = res.statusCode;
 
         // Only cache successful responses (2xx)
         if (statusCode >= 200 && statusCode < 300) {
-          setIdempotentResponse(req.user.id, idempotencyKey, {
+          setIdempotentResponse(req.user!.id, idempotencyKey, {
             statusCode,
             body,
             cachedAt: new Date().toISOString()
@@ -141,6 +155,8 @@ export function idempotentMiddleware(req, res, next) {
     });
 }
 
+type AsyncHandler = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
+
 /**
  * Helper to wrap route handlers with idempotency support.
  * Provides more control over what gets cached.
@@ -151,16 +167,17 @@ export function idempotentMiddleware(req, res, next) {
  *   return { playlist: newPlaylist };
  * }));
  */
-export function withIdempotency(handler) {
-  return async (req, res, next) => {
-    const idempotencyKey = req.headers['x-idempotency-key'];
+export function withIdempotency(handler: AsyncHandler): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
     if (idempotencyKey && req.user?.id) {
       // Check cache first
       const cached = await getIdempotentResponse(req.user.id, idempotencyKey);
       if (cached) {
         res.set('X-Idempotency-Replayed', 'true');
-        return res.status(cached.statusCode || 200).json(cached.body);
+        res.status(cached.statusCode || 200).json(cached.body);
+        return;
       }
     }
 
@@ -191,7 +208,7 @@ export function withIdempotency(handler) {
 /**
  * Validates idempotency key format (should be UUID or similar).
  */
-export function validateIdempotencyKey(key) {
+export function validateIdempotencyKey(key: string | undefined): boolean {
   if (!key) return true; // Optional
 
   // Accept UUID format or any string 8-64 chars
@@ -206,13 +223,14 @@ export function validateIdempotencyKey(key) {
 /**
  * Middleware to validate idempotency key format.
  */
-export function validateIdempotencyKeyMiddleware(req, res, next) {
-  const key = req.headers['x-idempotency-key'];
+export function validateIdempotencyKeyMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const key = req.headers['x-idempotency-key'] as string | undefined;
 
   if (key && !validateIdempotencyKey(key)) {
-    return res.status(400).json({
+    res.status(400).json({
       error: 'Invalid X-Idempotency-Key format. Must be 8-64 alphanumeric characters.'
     });
+    return;
   }
 
   next();

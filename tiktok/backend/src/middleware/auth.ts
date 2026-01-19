@@ -1,6 +1,16 @@
+import { Request, Response, NextFunction } from 'express';
 import { createLogger, auditLog } from '../shared/logger.js';
 
 const logger = createLogger('auth');
+
+// Extend Express Session to include user properties
+declare module 'express-session' {
+  interface SessionData {
+    userId?: number;
+    username?: string;
+    role?: string;
+  }
+}
 
 /**
  * User roles with hierarchical permissions
@@ -17,10 +27,12 @@ export const ROLES = {
   CREATOR: 'creator',
   MODERATOR: 'moderator',
   ADMIN: 'admin',
-};
+} as const;
+
+export type Role = (typeof ROLES)[keyof typeof ROLES];
 
 // Role hierarchy (higher index = more permissions)
-const ROLE_HIERARCHY = [ROLES.USER, ROLES.CREATOR, ROLES.MODERATOR, ROLES.ADMIN];
+const ROLE_HIERARCHY: Role[] = [ROLES.USER, ROLES.CREATOR, ROLES.MODERATOR, ROLES.ADMIN];
 
 /**
  * Permission definitions
@@ -53,12 +65,14 @@ export const PERMISSIONS = {
   ADMIN_ACCESS: 'admin:access',
   ADMIN_CONFIG: 'admin:config',
   ADMIN_AUDIT: 'admin:audit',
-};
+} as const;
+
+export type Permission = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
 
 /**
  * Role-permission mapping
  */
-const ROLE_PERMISSIONS = {
+const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
   [ROLES.USER]: [
     PERMISSIONS.VIDEO_VIEW,
     PERMISSIONS.COMMENT_CREATE,
@@ -68,14 +82,17 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.USER_EDIT_OWN,
   ],
   [ROLES.CREATOR]: [
-    // Inherits all USER permissions
-    ...ROLE_PERMISSIONS?.[ROLES.USER] || [],
+    PERMISSIONS.VIDEO_VIEW,
+    PERMISSIONS.COMMENT_CREATE,
+    PERMISSIONS.COMMENT_DELETE_OWN,
+    PERMISSIONS.USER_FOLLOW,
+    PERMISSIONS.USER_VIEW_PROFILE,
+    PERMISSIONS.USER_EDIT_OWN,
     PERMISSIONS.VIDEO_UPLOAD,
     PERMISSIONS.VIDEO_DELETE_OWN,
     PERMISSIONS.ANALYTICS_VIEW_OWN,
   ],
   [ROLES.MODERATOR]: [
-    // Inherits all CREATOR permissions
     PERMISSIONS.VIDEO_VIEW,
     PERMISSIONS.COMMENT_CREATE,
     PERMISSIONS.COMMENT_DELETE_OWN,
@@ -92,49 +109,34 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.ANALYTICS_VIEW_ALL,
     PERMISSIONS.ADMIN_ACCESS,
   ],
-  [ROLES.ADMIN]: [
-    // All permissions
-    ...Object.values(PERMISSIONS),
-  ],
+  [ROLES.ADMIN]: Object.values(PERMISSIONS) as Permission[],
 };
-
-// Fix circular reference in ROLE_PERMISSIONS
-ROLE_PERMISSIONS[ROLES.CREATOR] = [
-  PERMISSIONS.VIDEO_VIEW,
-  PERMISSIONS.COMMENT_CREATE,
-  PERMISSIONS.COMMENT_DELETE_OWN,
-  PERMISSIONS.USER_FOLLOW,
-  PERMISSIONS.USER_VIEW_PROFILE,
-  PERMISSIONS.USER_EDIT_OWN,
-  PERMISSIONS.VIDEO_UPLOAD,
-  PERMISSIONS.VIDEO_DELETE_OWN,
-  PERMISSIONS.ANALYTICS_VIEW_OWN,
-];
 
 /**
  * Check if a role has a specific permission
  */
-export const hasPermission = (role, permission) => {
-  const permissions = ROLE_PERMISSIONS[role] || [];
-  return permissions.includes(permission);
+export const hasPermission = (role: string, permission: string): boolean => {
+  const permissions = ROLE_PERMISSIONS[role as Role] || [];
+  return permissions.includes(permission as Permission);
 };
 
 /**
  * Check if roleA is higher or equal to roleB in hierarchy
  */
-export const isRoleAtLeast = (userRole, requiredRole) => {
-  const userIndex = ROLE_HIERARCHY.indexOf(userRole);
-  const requiredIndex = ROLE_HIERARCHY.indexOf(requiredRole);
+export const isRoleAtLeast = (userRole: string, requiredRole: string): boolean => {
+  const userIndex = ROLE_HIERARCHY.indexOf(userRole as Role);
+  const requiredIndex = ROLE_HIERARCHY.indexOf(requiredRole as Role);
   return userIndex >= requiredIndex;
 };
 
 /**
  * Basic authentication middleware - requires any authenticated user
  */
-export const requireAuth = (req, res, next) => {
+export const requireAuth = (req: Request, res: Response, next: NextFunction): void => {
   if (!req.session?.userId) {
     logger.debug({ path: req.path }, 'Authentication required but no session');
-    return res.status(401).json({ error: 'Authentication required' });
+    res.status(401).json({ error: 'Authentication required' });
+    return;
   }
   next();
 };
@@ -142,7 +144,7 @@ export const requireAuth = (req, res, next) => {
 /**
  * Optional authentication - continues regardless of auth status
  */
-export const optionalAuth = (req, res, next) => {
+export const optionalAuth = (_req: Request, _res: Response, next: NextFunction): void => {
   // User might be authenticated or not - we continue either way
   next();
 };
@@ -151,24 +153,30 @@ export const optionalAuth = (req, res, next) => {
  * Role-based access control middleware
  * Requires user to have one of the specified roles
  *
- * @param {...string} roles - Allowed roles
+ * @param roles - Allowed roles
  */
-export const requireRole = (...roles) => {
-  return (req, res, next) => {
+export const requireRole = (
+  ...roles: string[]
+): ((req: Request, res: Response, next: NextFunction) => void) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.session?.userId) {
       logger.debug({ path: req.path }, 'Authentication required');
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userRole = req.session.role || ROLES.USER;
 
     if (!roles.includes(userRole)) {
-      logger.warn({
-        userId: req.session.userId,
-        userRole,
-        requiredRoles: roles,
-        path: req.path,
-      }, 'Insufficient role permissions');
+      logger.warn(
+        {
+          userId: req.session.userId,
+          userRole,
+          requiredRoles: roles,
+          path: req.path,
+        },
+        'Insufficient role permissions'
+      );
 
       auditLog('access_denied', req.session.userId, {
         reason: 'insufficient_role',
@@ -177,7 +185,8 @@ export const requireRole = (...roles) => {
         path: req.path,
       });
 
-      return res.status(403).json({ error: 'Insufficient permissions' });
+      res.status(403).json({ error: 'Insufficient permissions' });
+      return;
     }
 
     next();
@@ -187,23 +196,29 @@ export const requireRole = (...roles) => {
 /**
  * Require minimum role level (uses hierarchy)
  *
- * @param {string} minimumRole - Minimum required role
+ * @param minimumRole - Minimum required role
  */
-export const requireMinRole = (minimumRole) => {
-  return (req, res, next) => {
+export const requireMinRole = (
+  minimumRole: string
+): ((req: Request, res: Response, next: NextFunction) => void) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.session?.userId) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userRole = req.session.role || ROLES.USER;
 
     if (!isRoleAtLeast(userRole, minimumRole)) {
-      logger.warn({
-        userId: req.session.userId,
-        userRole,
-        minimumRole,
-        path: req.path,
-      }, 'Insufficient role level');
+      logger.warn(
+        {
+          userId: req.session.userId,
+          userRole,
+          minimumRole,
+          path: req.path,
+        },
+        'Insufficient role level'
+      );
 
       auditLog('access_denied', req.session.userId, {
         reason: 'insufficient_role_level',
@@ -212,7 +227,8 @@ export const requireMinRole = (minimumRole) => {
         path: req.path,
       });
 
-      return res.status(403).json({ error: 'Insufficient permissions' });
+      res.status(403).json({ error: 'Insufficient permissions' });
+      return;
     }
 
     next();
@@ -222,24 +238,30 @@ export const requireMinRole = (minimumRole) => {
 /**
  * Permission-based access control middleware
  *
- * @param {...string} permissions - Required permissions (user needs at least one)
+ * @param permissions - Required permissions (user needs at least one)
  */
-export const requirePermission = (...permissions) => {
-  return (req, res, next) => {
+export const requirePermission = (
+  ...permissions: string[]
+): ((req: Request, res: Response, next: NextFunction) => void) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.session?.userId) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userRole = req.session.role || ROLES.USER;
-    const hasAnyPermission = permissions.some(perm => hasPermission(userRole, perm));
+    const hasAnyPermission = permissions.some((perm) => hasPermission(userRole, perm));
 
     if (!hasAnyPermission) {
-      logger.warn({
-        userId: req.session.userId,
-        userRole,
-        requiredPermissions: permissions,
-        path: req.path,
-      }, 'Missing required permissions');
+      logger.warn(
+        {
+          userId: req.session.userId,
+          userRole,
+          requiredPermissions: permissions,
+          path: req.path,
+        },
+        'Missing required permissions'
+      );
 
       auditLog('access_denied', req.session.userId, {
         reason: 'missing_permission',
@@ -248,7 +270,8 @@ export const requirePermission = (...permissions) => {
         path: req.path,
       });
 
-      return res.status(403).json({ error: 'Insufficient permissions' });
+      res.status(403).json({ error: 'Insufficient permissions' });
+      return;
     }
 
     next();
@@ -258,24 +281,29 @@ export const requirePermission = (...permissions) => {
 /**
  * Require admin access
  */
-export const requireAdmin = (req, res, next) => {
+export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
   if (!req.session?.userId) {
-    return res.status(401).json({ error: 'Authentication required' });
+    res.status(401).json({ error: 'Authentication required' });
+    return;
   }
 
   if (req.session.role !== ROLES.ADMIN) {
-    logger.warn({
-      userId: req.session.userId,
-      userRole: req.session.role,
-      path: req.path,
-    }, 'Admin access required');
+    logger.warn(
+      {
+        userId: req.session.userId,
+        userRole: req.session.role,
+        path: req.path,
+      },
+      'Admin access required'
+    );
 
     auditLog('access_denied', req.session.userId, {
       reason: 'admin_required',
       path: req.path,
     });
 
-    return res.status(403).json({ error: 'Admin access required' });
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
 
   next();
@@ -295,39 +323,50 @@ export const requireCreator = requireMinRole(ROLES.CREATOR);
  * Resource ownership check middleware factory
  * Checks if user owns the resource or has override permission
  *
- * @param {Function} getOwnerId - Async function to get owner ID from request
- * @param {string} overridePermission - Permission that bypasses ownership check
+ * @param getOwnerId - Async function to get owner ID from request
+ * @param overridePermission - Permission that bypasses ownership check
  */
-export const requireOwnershipOr = (getOwnerId, overridePermission) => {
-  return async (req, res, next) => {
+export const requireOwnershipOr = (
+  getOwnerId: (req: Request) => Promise<number>,
+  overridePermission: string
+): ((req: Request, res: Response, next: NextFunction) => Promise<void>) => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     if (!req.session?.userId) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userRole = req.session.role || ROLES.USER;
 
     // Check if user has override permission
     if (hasPermission(userRole, overridePermission)) {
-      return next();
+      next();
+      return;
     }
 
     // Check ownership
     try {
       const ownerId = await getOwnerId(req);
       if (ownerId === req.session.userId) {
-        return next();
+        next();
+        return;
       }
 
-      logger.warn({
-        userId: req.session.userId,
-        ownerId,
-        path: req.path,
-      }, 'Resource ownership check failed');
+      logger.warn(
+        {
+          userId: req.session.userId,
+          ownerId,
+          path: req.path,
+        },
+        'Resource ownership check failed'
+      );
 
-      return res.status(403).json({ error: 'Not authorized to access this resource' });
+      res.status(403).json({ error: 'Not authorized to access this resource' });
+      return;
     } catch (error) {
-      logger.error({ error: error.message }, 'Error checking resource ownership');
-      return res.status(500).json({ error: 'Internal server error' });
+      logger.error({ error: (error as Error).message }, 'Error checking resource ownership');
+      res.status(500).json({ error: 'Internal server error' });
+      return;
     }
   };
 };
@@ -335,7 +374,11 @@ export const requireOwnershipOr = (getOwnerId, overridePermission) => {
 /**
  * Attach user role to session if missing (for legacy sessions)
  */
-export const ensureRole = async (req, res, next) => {
+export const ensureRole = async (
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): Promise<void> => {
   if (req.session?.userId && !req.session.role) {
     // Default to 'user' role if not set
     req.session.role = ROLES.USER;

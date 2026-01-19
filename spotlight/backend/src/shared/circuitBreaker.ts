@@ -7,15 +7,21 @@ const STATE_MAP = {
   'closed': 0,
   'halfOpen': 1,
   'open': 2
-};
+} as const;
+
+export interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+  rollingCountTimeout?: number;
+  rollingCountBuckets?: number;
+}
 
 /**
  * Default circuit breaker configuration for index operations
- * - Opens after 5 consecutive failures
- * - Waits 30 seconds before allowing test requests
- * - Requires 3 successful requests to close
  */
-const DEFAULT_INDEX_OPTIONS = {
+const DEFAULT_INDEX_OPTIONS: CircuitBreakerOptions = {
   timeout: 10000,           // 10 seconds timeout for index operations
   errorThresholdPercentage: 50,  // Open if 50% of requests fail
   resetTimeout: 30000,      // Wait 30 seconds before half-open
@@ -26,9 +32,8 @@ const DEFAULT_INDEX_OPTIONS = {
 
 /**
  * Circuit breaker configuration for Elasticsearch operations
- * More aggressive than default since ES failures affect search quality
  */
-const ES_OPTIONS = {
+const ES_OPTIONS: CircuitBreakerOptions = {
   timeout: 5000,            // 5 seconds timeout
   errorThresholdPercentage: 30,  // Open if 30% of requests fail
   resetTimeout: 60000,      // Wait 60 seconds before half-open
@@ -37,19 +42,32 @@ const ES_OPTIONS = {
   rollingCountBuckets: 10
 };
 
+// Type for the circuit breaker
+type CircuitBreakerInstance = CircuitBreaker<unknown[], unknown>;
+
 // Map to store circuit breakers by name
-const circuitBreakers = new Map();
+const circuitBreakers = new Map<string, CircuitBreakerInstance>();
+
+export interface CircuitBreakerState {
+  state: 'OPEN' | 'HALF_OPEN' | 'CLOSED';
+  stats: {
+    failures: number;
+    successes: number;
+    rejects: number;
+    timeouts: number;
+  };
+}
 
 /**
  * Create or get a circuit breaker for a specific operation
- * @param {string} name - Name of the circuit breaker
- * @param {Function} action - The async function to protect
- * @param {Object} options - Circuit breaker options
- * @returns {CircuitBreaker} - The circuit breaker instance
  */
-export function createCircuitBreaker(name, action, options = {}) {
+export function createCircuitBreaker<T>(
+  name: string,
+  action: (...args: unknown[]) => Promise<T>,
+  options: CircuitBreakerOptions = {}
+): CircuitBreakerInstance {
   if (circuitBreakers.has(name)) {
-    return circuitBreakers.get(name);
+    return circuitBreakers.get(name)!;
   }
 
   const mergedOptions = {
@@ -94,22 +112,22 @@ export function createCircuitBreaker(name, action, options = {}) {
 
 /**
  * Create a circuit breaker specifically for Elasticsearch index operations
- * @param {string} indexName - Name of the Elasticsearch index
- * @param {Function} action - The async function to protect
- * @returns {CircuitBreaker} - The circuit breaker instance
  */
-export function createIndexCircuitBreaker(indexName, action) {
+export function createIndexCircuitBreaker<T>(
+  indexName: string,
+  action: (...args: unknown[]) => Promise<T>
+): CircuitBreakerInstance {
   return createCircuitBreaker(`es_index_${indexName}`, action, ES_OPTIONS);
 }
 
 /**
  * Execute an operation with circuit breaker protection
- * @param {string} breakerName - Name of the circuit breaker
- * @param {Function} action - The async function to execute
- * @param {*} fallbackValue - Value to return if circuit is open
- * @returns {Promise<*>} - Result of the action or fallback
  */
-export async function withCircuitBreaker(breakerName, action, fallbackValue = null) {
+export async function withCircuitBreaker<T>(
+  breakerName: string,
+  action: () => Promise<T>,
+  fallbackValue: T | null = null
+): Promise<T | null> {
   let breaker = circuitBreakers.get(breakerName);
 
   if (!breaker) {
@@ -118,9 +136,10 @@ export async function withCircuitBreaker(breakerName, action, fallbackValue = nu
 
   try {
     // For dynamic actions, we need to fire with the action
-    return await breaker.fire();
+    return await breaker.fire() as T;
   } catch (error) {
-    if (error.code === 'EOPENBREAKER') {
+    const err = error as { code?: string };
+    if (err.code === 'EOPENBREAKER') {
       // Circuit is open, return fallback
       return fallbackValue;
     }
@@ -130,10 +149,9 @@ export async function withCircuitBreaker(breakerName, action, fallbackValue = nu
 
 /**
  * Get the current state of all circuit breakers
- * @returns {Object} - Map of circuit breaker names to their states
  */
-export function getAllCircuitBreakerStates() {
-  const states = {};
+export function getAllCircuitBreakerStates(): Record<string, CircuitBreakerState> {
+  const states: Record<string, CircuitBreakerState> = {};
   for (const [name, breaker] of circuitBreakers) {
     states[name] = {
       state: breaker.opened ? 'OPEN' : (breaker.halfOpen ? 'HALF_OPEN' : 'CLOSED'),
@@ -150,10 +168,8 @@ export function getAllCircuitBreakerStates() {
 
 /**
  * Get a specific circuit breaker by name
- * @param {string} name - Name of the circuit breaker
- * @returns {CircuitBreaker|undefined} - The circuit breaker or undefined
  */
-export function getCircuitBreaker(name) {
+export function getCircuitBreaker(name: string): CircuitBreakerInstance | undefined {
   return circuitBreakers.get(name);
 }
 
@@ -161,7 +177,11 @@ export function getCircuitBreaker(name) {
  * Wrapper class for index operations with built-in circuit breaker
  */
 export class ProtectedIndexOperation {
-  constructor(name, options = {}) {
+  private name: string;
+  private options: CircuitBreakerOptions;
+  private breaker: CircuitBreakerInstance | null;
+
+  constructor(name: string, options: CircuitBreakerOptions = {}) {
     this.name = name;
     this.options = { ...ES_OPTIONS, ...options };
     this.breaker = null;
@@ -169,30 +189,26 @@ export class ProtectedIndexOperation {
 
   /**
    * Execute an index operation with circuit breaker protection
-   * @param {Function} operation - The async function to execute
-   * @returns {Promise<*>} - Result of the operation
    */
-  async execute(operation) {
+  async execute<T>(operation: () => Promise<T>): Promise<T> {
     if (!this.breaker) {
       this.breaker = createCircuitBreaker(this.name, operation, this.options);
     }
 
-    return this.breaker.fire();
+    return this.breaker.fire() as Promise<T>;
   }
 
   /**
    * Check if the circuit is open
-   * @returns {boolean} - True if circuit is open
    */
-  isOpen() {
+  isOpen(): boolean {
     return this.breaker?.opened ?? false;
   }
 
   /**
    * Get the current state
-   * @returns {string} - Current state (OPEN, HALF_OPEN, CLOSED)
    */
-  getState() {
+  getState(): 'OPEN' | 'HALF_OPEN' | 'CLOSED' {
     if (!this.breaker) return 'CLOSED';
     if (this.breaker.opened) return 'OPEN';
     if (this.breaker.halfOpen) return 'HALF_OPEN';
@@ -201,7 +217,7 @@ export class ProtectedIndexOperation {
 }
 
 // Pre-configured circuit breakers for common operations
-export const indexOperationsBreaker = {
+export const indexOperationsBreaker: Record<string, CircuitBreakerInstance | null> = {
   files: null,
   apps: null,
   contacts: null,
@@ -210,13 +226,14 @@ export const indexOperationsBreaker = {
 
 /**
  * Initialize circuit breakers for all index types
- * @param {Function} indexFn - The index function to protect
  */
-export function initializeIndexBreakers(indexFn) {
+export function initializeIndexBreakers(
+  indexFn: (indexType: string, params: unknown) => Promise<unknown>
+): void {
   for (const indexType of Object.keys(indexOperationsBreaker)) {
     indexOperationsBreaker[indexType] = createCircuitBreaker(
       `index_${indexType}`,
-      async (params) => indexFn(indexType, params),
+      async (params: unknown) => indexFn(indexType, params),
       ES_OPTIONS
     );
   }

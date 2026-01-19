@@ -11,14 +11,14 @@ const productIndexSettings = {
     analysis: {
       analyzer: {
         etsy_analyzer: {
-          type: 'custom',
+          type: 'custom' as const,
           tokenizer: 'standard',
           filter: ['lowercase', 'synonym_filter', 'stemmer'],
         },
       },
       filter: {
         synonym_filter: {
-          type: 'synonym',
+          type: 'synonym' as const,
           synonyms: [
             'handmade, handcrafted, artisan, homemade, hand-made',
             'vintage, antique, retro, old, classic',
@@ -37,30 +37,74 @@ const productIndexSettings = {
   },
   mappings: {
     properties: {
-      id: { type: 'integer' },
-      shop_id: { type: 'integer' },
-      shop_name: { type: 'keyword' },
-      shop_rating: { type: 'float' },
-      shop_sales_count: { type: 'integer' },
-      title: { type: 'text', analyzer: 'etsy_analyzer' },
-      description: { type: 'text', analyzer: 'etsy_analyzer' },
-      price: { type: 'float' },
-      quantity: { type: 'integer' },
-      category_id: { type: 'integer' },
-      category_name: { type: 'keyword' },
-      tags: { type: 'keyword' },
-      images: { type: 'keyword' },
-      is_vintage: { type: 'boolean' },
-      is_handmade: { type: 'boolean' },
-      shipping_price: { type: 'float' },
-      view_count: { type: 'integer' },
-      favorite_count: { type: 'integer' },
-      created_at: { type: 'date' },
+      id: { type: 'integer' as const },
+      shop_id: { type: 'integer' as const },
+      shop_name: { type: 'keyword' as const },
+      shop_rating: { type: 'float' as const },
+      shop_sales_count: { type: 'integer' as const },
+      title: { type: 'text' as const, analyzer: 'etsy_analyzer' },
+      description: { type: 'text' as const, analyzer: 'etsy_analyzer' },
+      price: { type: 'float' as const },
+      quantity: { type: 'integer' as const },
+      category_id: { type: 'integer' as const },
+      category_name: { type: 'keyword' as const },
+      tags: { type: 'keyword' as const },
+      images: { type: 'keyword' as const },
+      is_vintage: { type: 'boolean' as const },
+      is_handmade: { type: 'boolean' as const },
+      shipping_price: { type: 'float' as const },
+      view_count: { type: 'integer' as const },
+      favorite_count: { type: 'integer' as const },
+      created_at: { type: 'date' as const },
     },
   },
 };
 
-export async function initializeIndex() {
+export interface Product {
+  id: number;
+  shop_id: number;
+  shop_name?: string;
+  shop_rating?: number;
+  shop_sales_count?: number;
+  title: string;
+  description?: string;
+  price: number | string;
+  quantity: number;
+  category_id?: number;
+  category_name?: string;
+  tags?: string[];
+  images?: string[];
+  is_vintage?: boolean;
+  is_handmade?: boolean;
+  shipping_price?: number | string;
+  view_count?: number;
+  favorite_count?: number;
+  created_at?: Date | string;
+}
+
+export interface SearchFilters {
+  categoryId?: string;
+  priceMin?: string;
+  priceMax?: string;
+  isVintage?: string;
+  isHandmade?: string;
+  freeShipping?: string;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface SearchResult {
+  products: Array<Product & { score?: number }>;
+  total: number;
+  aggregations?: {
+    categories?: { buckets: Array<{ key: string; doc_count: number }> };
+    price_ranges?: { buckets: Array<{ key: string; doc_count: number }> };
+  };
+  fallback?: boolean;
+}
+
+export async function initializeIndex(): Promise<void> {
   try {
     const indexExists = await esClient.indices.exists({ index: 'products' });
     if (!indexExists) {
@@ -75,7 +119,7 @@ export async function initializeIndex() {
   }
 }
 
-export async function indexProduct(product) {
+export async function indexProduct(product: Product): Promise<void> {
   try {
     await esClient.index({
       index: 'products',
@@ -88,7 +132,7 @@ export async function indexProduct(product) {
         shop_sales_count: product.shop_sales_count || 0,
         title: product.title,
         description: product.description,
-        price: parseFloat(product.price),
+        price: parseFloat(String(product.price)),
         quantity: product.quantity,
         category_id: product.category_id,
         category_name: product.category_name,
@@ -96,7 +140,7 @@ export async function indexProduct(product) {
         images: product.images,
         is_vintage: product.is_vintage,
         is_handmade: product.is_handmade,
-        shipping_price: parseFloat(product.shipping_price || 0),
+        shipping_price: parseFloat(String(product.shipping_price || 0)),
         view_count: product.view_count || 0,
         favorite_count: product.favorite_count || 0,
         created_at: product.created_at,
@@ -107,7 +151,7 @@ export async function indexProduct(product) {
   }
 }
 
-export async function deleteProductFromIndex(productId) {
+export async function deleteProductFromIndex(productId: number): Promise<void> {
   try {
     await esClient.delete({
       index: 'products',
@@ -118,9 +162,9 @@ export async function deleteProductFromIndex(productId) {
   }
 }
 
-export async function searchProducts(query, filters = {}) {
-  const must = [];
-  const filter = [];
+export async function searchProducts(query: string | undefined, filters: SearchFilters = {}): Promise<SearchResult> {
+  const must: object[] = [];
+  const filter: object[] = [];
 
   if (query) {
     must.push({
@@ -163,7 +207,13 @@ export async function searchProducts(query, filters = {}) {
   // Only show in-stock items
   filter.push({ range: { quantity: { gt: 0 } } });
 
-  const body = {
+  const body: {
+    query: object;
+    aggs: object;
+    from: number;
+    size: number;
+    sort?: object[];
+  } = {
     query: {
       function_score: {
         query: {
@@ -247,13 +297,16 @@ export async function searchProducts(query, filters = {}) {
       ...body,
     });
 
+    const hits = result.hits.hits as Array<{ _source: Product; _score: number }>;
+    const total = (result.hits.total as { value: number }).value;
+
     return {
-      products: result.hits.hits.map((hit) => ({
+      products: hits.map((hit) => ({
         ...hit._source,
         score: hit._score,
       })),
-      total: result.hits.total.value,
-      aggregations: result.aggregations,
+      total,
+      aggregations: result.aggregations as SearchResult['aggregations'],
     };
   } catch (error) {
     console.error('Elasticsearch search error:', error);
@@ -261,7 +314,7 @@ export async function searchProducts(query, filters = {}) {
   }
 }
 
-export async function getSimilarProducts(productId, limit = 6) {
+export async function getSimilarProducts(productId: number, limit: number = 6): Promise<Product[]> {
   try {
     const result = await esClient.search({
       index: 'products',
@@ -276,7 +329,8 @@ export async function getSimilarProducts(productId, limit = 6) {
       size: limit,
     });
 
-    return result.hits.hits.map((hit) => hit._source);
+    const hits = result.hits.hits as Array<{ _source: Product }>;
+    return hits.map((hit) => hit._source);
   } catch (error) {
     console.error('Error getting similar products:', error);
     return [];

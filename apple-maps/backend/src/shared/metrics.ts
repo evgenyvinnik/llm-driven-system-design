@@ -1,4 +1,5 @@
 import client from 'prom-client';
+import type { Request, Response, NextFunction } from 'express';
 
 /**
  * Prometheus Metrics Module
@@ -25,7 +26,7 @@ client.collectDefaultMetrics({ register });
 const httpRequestDuration = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status_code'],
+  labelNames: ['method', 'route', 'status_code'] as const,
   // Buckets optimized for API latency (50ms to 10s)
   buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
 });
@@ -35,7 +36,7 @@ register.registerMetric(httpRequestDuration);
 const httpRequestTotal = new client.Counter({
   name: 'http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
+  labelNames: ['method', 'route', 'status_code'] as const,
 });
 register.registerMetric(httpRequestTotal);
 
@@ -43,7 +44,7 @@ register.registerMetric(httpRequestTotal);
 const httpActiveRequests = new client.Gauge({
   name: 'http_active_requests',
   help: 'Number of active HTTP requests',
-  labelNames: ['method', 'route'],
+  labelNames: ['method', 'route'] as const,
 });
 register.registerMetric(httpActiveRequests);
 
@@ -54,7 +55,7 @@ register.registerMetric(httpActiveRequests);
 const routeCalculationDuration = new client.Histogram({
   name: 'routing_calculation_duration_seconds',
   help: 'Time to calculate a route',
-  labelNames: ['route_type', 'status'],
+  labelNames: ['route_type', 'status'] as const,
   buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5],
 });
 register.registerMetric(routeCalculationDuration);
@@ -76,7 +77,7 @@ register.registerMetric(routeDistanceMeters);
 const routeRequestsTotal = new client.Counter({
   name: 'routing_requests_total',
   help: 'Total routing requests',
-  labelNames: ['status'], // success, no_route, error
+  labelNames: ['status'] as const, // success, no_route, error
 });
 register.registerMetric(routeRequestsTotal);
 
@@ -87,7 +88,7 @@ register.registerMetric(routeRequestsTotal);
 const trafficProbesIngested = new client.Counter({
   name: 'traffic_probes_ingested_total',
   help: 'Total GPS probes ingested',
-  labelNames: ['status'], // processed, duplicate, error
+  labelNames: ['status'] as const, // processed, duplicate, error
 });
 register.registerMetric(trafficProbesIngested);
 
@@ -100,7 +101,7 @@ register.registerMetric(trafficSegmentUpdates);
 const trafficIncidentsDetected = new client.Counter({
   name: 'traffic_incidents_detected_total',
   help: 'Total incidents detected',
-  labelNames: ['type', 'severity'],
+  labelNames: ['type', 'severity'] as const,
 });
 register.registerMetric(trafficIncidentsDetected);
 
@@ -117,14 +118,14 @@ register.registerMetric(trafficSegmentStaleness);
 const cacheHits = new client.Counter({
   name: 'cache_hits_total',
   help: 'Cache hit count',
-  labelNames: ['cache_name'],
+  labelNames: ['cache_name'] as const,
 });
 register.registerMetric(cacheHits);
 
 const cacheMisses = new client.Counter({
   name: 'cache_misses_total',
   help: 'Cache miss count',
-  labelNames: ['cache_name'],
+  labelNames: ['cache_name'] as const,
 });
 register.registerMetric(cacheMisses);
 
@@ -135,21 +136,21 @@ register.registerMetric(cacheMisses);
 const circuitBreakerState = new client.Gauge({
   name: 'circuit_breaker_state',
   help: 'Circuit breaker state (0=closed, 1=open, 0.5=half-open)',
-  labelNames: ['name'],
+  labelNames: ['name'] as const,
 });
 register.registerMetric(circuitBreakerState);
 
 const circuitBreakerFailures = new client.Counter({
   name: 'circuit_breaker_failures_total',
   help: 'Circuit breaker failure count',
-  labelNames: ['name'],
+  labelNames: ['name'] as const,
 });
 register.registerMetric(circuitBreakerFailures);
 
 const circuitBreakerSuccesses = new client.Counter({
   name: 'circuit_breaker_successes_total',
   help: 'Circuit breaker success count',
-  labelNames: ['name'],
+  labelNames: ['name'] as const,
 });
 register.registerMetric(circuitBreakerSuccesses);
 
@@ -160,7 +161,7 @@ register.registerMetric(circuitBreakerSuccesses);
 const dbQueryDuration = new client.Histogram({
   name: 'db_query_duration_seconds',
   help: 'Database query duration',
-  labelNames: ['query_type', 'status'],
+  labelNames: ['query_type', 'status'] as const,
   buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 register.registerMetric(dbQueryDuration);
@@ -184,14 +185,14 @@ register.registerMetric(dbConnectionsIdle);
 const idempotencyHits = new client.Counter({
   name: 'idempotency_hits_total',
   help: 'Idempotent request replays (duplicate requests)',
-  labelNames: ['operation'],
+  labelNames: ['operation'] as const,
 });
 register.registerMetric(idempotencyHits);
 
 const idempotencyMisses = new client.Counter({
   name: 'idempotency_misses_total',
   help: 'New idempotent requests',
-  labelNames: ['operation'],
+  labelNames: ['operation'] as const,
 });
 register.registerMetric(idempotencyMisses);
 
@@ -202,7 +203,7 @@ register.registerMetric(idempotencyMisses);
 const rateLimitHits = new client.Counter({
   name: 'rate_limit_hits_total',
   help: 'Requests that were rate limited',
-  labelNames: ['route'],
+  labelNames: ['route'] as const,
 });
 register.registerMetric(rateLimitHits);
 
@@ -210,7 +211,7 @@ register.registerMetric(rateLimitHits);
 // Express Middleware
 // ============================================================
 
-function metricsMiddleware(req, res, next) {
+function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   // Normalize route for metrics (avoid high cardinality)
   const route = req.route?.path || req.path;
   const normalizedRoute = route.replace(/\/[0-9a-f-]{36}/gi, '/:id').replace(/\/\d+/g, '/:id');
@@ -225,7 +226,7 @@ function metricsMiddleware(req, res, next) {
 
   // On response finish
   res.on('finish', () => {
-    const finalLabels = { ...labels, status_code: res.statusCode };
+    const finalLabels = { ...labels, status_code: res.statusCode.toString() };
     end(finalLabels);
     httpRequestTotal.inc(finalLabels);
     httpActiveRequests.dec(labels);
@@ -238,7 +239,7 @@ function metricsMiddleware(req, res, next) {
 // Metrics Endpoint Handler
 // ============================================================
 
-async function metricsHandler(req, res) {
+async function metricsHandler(_req: Request, res: Response): Promise<void> {
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 }

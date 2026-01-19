@@ -2,10 +2,39 @@ import CircuitBreaker from 'opossum';
 import logger from './logger.js';
 import { circuitBreakerState, circuitBreakerFailures, circuitBreakerSuccesses } from './metrics.js';
 
+interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+}
+
+interface PaymentData {
+  amount: number;
+  orderId: string;
+  [key: string]: unknown;
+}
+
+interface PaymentResult {
+  success: boolean;
+  transactionId?: string;
+  queued?: boolean;
+  message?: string;
+}
+
+export interface DriverMatchResult {
+  matched: boolean;
+  driverId?: number;
+  queued?: boolean;
+  message?: string;
+  reason?: string;
+  error?: string;
+}
+
 /**
  * Circuit breaker configuration options
  */
-const defaultOptions = {
+const defaultOptions: CircuitBreakerOptions = {
   timeout: 3000, // 3 seconds
   errorThresholdPercentage: 50, // Open circuit if 50% of requests fail
   resetTimeout: 30000, // Try again after 30 seconds
@@ -15,7 +44,7 @@ const defaultOptions = {
 /**
  * Map of circuit state to numeric value for metrics
  */
-const stateToNumber = {
+const stateToNumber: Record<string, number> = {
   closed: 0,
   open: 1,
   halfOpen: 2,
@@ -23,11 +52,12 @@ const stateToNumber = {
 
 /**
  * Create a circuit breaker for a service
- * @param {string} name - Service name for identification
- * @param {Function} action - Async function to wrap with circuit breaker
- * @param {Object} options - Circuit breaker options
  */
-export function createCircuitBreaker(name, action, options = {}) {
+export function createCircuitBreaker<T, A extends unknown[]>(
+  name: string,
+  action: (...args: A) => Promise<T>,
+  options: CircuitBreakerOptions = {}
+): CircuitBreaker<A, T> {
   const breaker = new CircuitBreaker(action, {
     ...defaultOptions,
     ...options,
@@ -43,7 +73,7 @@ export function createCircuitBreaker(name, action, options = {}) {
     logger.debug({ service: name }, 'Circuit breaker success');
   });
 
-  breaker.on('failure', (error) => {
+  breaker.on('failure', (error: Error) => {
     circuitBreakerFailures.inc({ service: name });
     logger.warn({ service: name, error: error?.message }, 'Circuit breaker failure');
   });
@@ -72,7 +102,7 @@ export function createCircuitBreaker(name, action, options = {}) {
     logger.info({ service: name }, 'Circuit breaker CLOSED - service recovered');
   });
 
-  breaker.on('fallback', (result) => {
+  breaker.on('fallback', (result: unknown) => {
     logger.info({ service: name, result }, 'Circuit breaker fallback executed');
   });
 
@@ -84,13 +114,13 @@ export function createCircuitBreaker(name, action, options = {}) {
  */
 
 // Payment service circuit breaker
-let paymentBreaker = null;
+let paymentBreaker: CircuitBreaker<[PaymentData], PaymentResult> | null = null;
 
-export function getPaymentCircuitBreaker() {
+export function getPaymentCircuitBreaker(): CircuitBreaker<[PaymentData], PaymentResult> {
   if (!paymentBreaker) {
-    paymentBreaker = createCircuitBreaker(
+    paymentBreaker = createCircuitBreaker<PaymentResult, [PaymentData]>(
       'payment',
-      async (paymentData) => {
+      async (paymentData: PaymentData): Promise<PaymentResult> => {
         // Simulate payment processing
         // In production, this would call the payment gateway
         await simulatePaymentProcessing(paymentData);
@@ -104,7 +134,7 @@ export function getPaymentCircuitBreaker() {
     );
 
     // Fallback: Queue payment for later processing
-    paymentBreaker.fallback(async (paymentData) => {
+    paymentBreaker.fallback(async (paymentData: PaymentData): Promise<PaymentResult> => {
       logger.warn({ paymentData }, 'Payment queued for later processing');
       return {
         success: false,
@@ -117,13 +147,17 @@ export function getPaymentCircuitBreaker() {
 }
 
 // Driver matching service circuit breaker
-let driverMatchBreaker = null;
+let driverMatchBreaker: CircuitBreaker<[() => Promise<DriverMatchResult>], DriverMatchResult> | null =
+  null;
 
-export function getDriverMatchCircuitBreaker() {
+export function getDriverMatchCircuitBreaker(): CircuitBreaker<
+  [() => Promise<DriverMatchResult>],
+  DriverMatchResult
+> {
   if (!driverMatchBreaker) {
-    driverMatchBreaker = createCircuitBreaker(
+    driverMatchBreaker = createCircuitBreaker<DriverMatchResult, [() => Promise<DriverMatchResult>]>(
       'driver_match',
-      async (matchFn) => {
+      async (matchFn: () => Promise<DriverMatchResult>): Promise<DriverMatchResult> => {
         // Execute the provided matching function
         return await matchFn();
       },
@@ -135,7 +169,7 @@ export function getDriverMatchCircuitBreaker() {
     );
 
     // Fallback: Return empty result and queue for retry
-    driverMatchBreaker.fallback(async () => {
+    driverMatchBreaker.fallback(async (): Promise<DriverMatchResult> => {
       logger.warn({}, 'Driver matching queued for retry');
       return {
         matched: false,
@@ -150,7 +184,7 @@ export function getDriverMatchCircuitBreaker() {
 /**
  * Simulate payment processing (placeholder for real implementation)
  */
-async function simulatePaymentProcessing(paymentData) {
+async function simulatePaymentProcessing(_paymentData: PaymentData): Promise<{ processed: boolean }> {
   // Simulate network latency
   await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 200));
 
@@ -162,10 +196,16 @@ async function simulatePaymentProcessing(paymentData) {
   return { processed: true };
 }
 
+interface CircuitBreakerStats {
+  name: string;
+  state: string;
+  stats: unknown;
+}
+
 /**
  * Get circuit breaker stats for a given breaker
  */
-export function getCircuitBreakerStats(breaker) {
+export function getCircuitBreakerStats(breaker: CircuitBreaker): CircuitBreakerStats {
   return {
     name: breaker.name,
     state: breaker.opened ? 'open' : breaker.halfOpen ? 'halfOpen' : 'closed',

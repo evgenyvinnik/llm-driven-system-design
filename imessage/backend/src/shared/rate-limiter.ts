@@ -1,26 +1,44 @@
+import Redis from 'ioredis';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import redis from '../redis.js';
 import { createLogger } from './logger.js';
 import { rateLimitExceeded } from './metrics.js';
 
 const logger = createLogger('rate-limiter');
 
+interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  retryAfter?: number;
+}
+
+interface RateLimitOptions {
+  limit: number;
+  windowSeconds: number;
+  keyGenerator: (req: Request) => string;
+  endpoint?: string;
+}
+
+interface AuthenticatedRequest extends Request {
+  user?: { id: string; [key: string]: unknown };
+}
+
 /**
  * Rate limiter using Redis sliding window algorithm
  */
 export class RateLimiter {
-  constructor(redisClient) {
+  private redis: Redis;
+  private keyPrefix: string;
+
+  constructor(redisClient: Redis) {
     this.redis = redisClient;
     this.keyPrefix = 'ratelimit:';
   }
 
   /**
    * Check if a request is allowed under the rate limit
-   * @param {string} key - Unique identifier for the rate limit (e.g., user:messages:userId)
-   * @param {number} limit - Maximum number of requests allowed
-   * @param {number} windowSeconds - Time window in seconds
-   * @returns {Promise<{allowed: boolean, remaining: number, retryAfter?: number}>}
    */
-  async checkLimit(key, limit, windowSeconds) {
+  async checkLimit(key: string, limit: number, windowSeconds: number): Promise<RateLimitResult> {
     const fullKey = `${this.keyPrefix}${key}`;
     const now = Date.now();
     const windowStart = now - (windowSeconds * 1000);
@@ -39,7 +57,7 @@ export class RateLimiter {
       const results = await pipeline.exec();
 
       // Get the current count after removing old entries
-      const currentCount = results[1][1];
+      const currentCount = results?.[1]?.[1] as number ?? 0;
 
       if (currentCount >= limit) {
         // Get the oldest entry to calculate retry-after
@@ -80,16 +98,11 @@ export class RateLimiter {
 
   /**
    * Create Express middleware for rate limiting
-   * @param {Object} options - Rate limit options
-   * @param {number} options.limit - Maximum requests per window
-   * @param {number} options.windowSeconds - Time window in seconds
-   * @param {Function} options.keyGenerator - Function to generate key from request
-   * @param {string} options.endpoint - Endpoint name for metrics
    */
-  middleware(options) {
+  middleware(options: RateLimitOptions): RequestHandler {
     const { limit, windowSeconds, keyGenerator, endpoint = 'unknown' } = options;
 
-    return async (req, res, next) => {
+    return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
       const key = keyGenerator(req);
       const result = await this.checkLimit(key, limit, windowSeconds);
 
@@ -99,11 +112,12 @@ export class RateLimiter {
       res.setHeader('X-RateLimit-Window', windowSeconds);
 
       if (!result.allowed) {
-        res.setHeader('Retry-After', result.retryAfter);
-        res.setHeader('X-RateLimit-Reset', Date.now() + (result.retryAfter * 1000));
+        res.setHeader('Retry-After', result.retryAfter!);
+        res.setHeader('X-RateLimit-Reset', Date.now() + (result.retryAfter! * 1000));
 
         // Record metric
-        const userId = req.user?.id || 'anonymous';
+        const authReq = req as AuthenticatedRequest;
+        const userId = authReq.user?.id || 'anonymous';
         rateLimitExceeded.inc({ endpoint, user_id: userId });
 
         logger.warn({
@@ -113,11 +127,12 @@ export class RateLimiter {
           retryAfter: result.retryAfter,
         }, 'Rate limit exceeded');
 
-        return res.status(429).json({
+        res.status(429).json({
           error: 'Too Many Requests',
           message: 'Rate limit exceeded. Please try again later.',
           retryAfter: result.retryAfter,
         });
+        return;
       }
 
       next();
@@ -132,14 +147,14 @@ const rateLimiter = new RateLimiter(redis);
 export const messageRateLimiter = rateLimiter.middleware({
   limit: 60,
   windowSeconds: 60,
-  keyGenerator: (req) => `messages:${req.user.id}`,
+  keyGenerator: (req) => `messages:${(req as AuthenticatedRequest).user!.id}`,
   endpoint: 'messages',
 });
 
 export const messageAttachmentRateLimiter = rateLimiter.middleware({
   limit: 20,
   windowSeconds: 60,
-  keyGenerator: (req) => `attachments:${req.user.id}`,
+  keyGenerator: (req) => `attachments:${(req as AuthenticatedRequest).user!.id}`,
   endpoint: 'attachments',
 });
 
@@ -153,14 +168,14 @@ export const loginRateLimiter = rateLimiter.middleware({
 export const deviceRegistrationRateLimiter = rateLimiter.middleware({
   limit: 10,
   windowSeconds: 3600, // 1 hour
-  keyGenerator: (req) => `device:${req.user.id}`,
+  keyGenerator: (req) => `device:${(req as AuthenticatedRequest).user!.id}`,
   endpoint: 'device_registration',
 });
 
 export const keysRateLimiter = rateLimiter.middleware({
   limit: 100,
   windowSeconds: 60,
-  keyGenerator: (req) => `keys:${req.user.id}`,
+  keyGenerator: (req) => `keys:${(req as AuthenticatedRequest).user!.id}`,
   endpoint: 'keys',
 });
 

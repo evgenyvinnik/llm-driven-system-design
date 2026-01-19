@@ -4,33 +4,53 @@ import { circuitBreakerStateGauge } from './metrics.js';
 
 const logger = createLogger('circuit-breaker');
 
+// Circuit breaker options interface
+interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+  rollingCountTimeout?: number;
+  rollingCountBuckets?: number;
+}
+
+// Circuit breaker stats interface
+interface CircuitBreakerStats {
+  state: 'open' | 'half-open' | 'closed';
+  stats: unknown;
+}
+
 // Default circuit breaker options
-const defaultOptions = {
-  timeout: 30000,                    // 30 seconds timeout per request
-  errorThresholdPercentage: 50,      // Open circuit at 50% failure rate
-  resetTimeout: 30000,               // Try again after 30 seconds
-  volumeThreshold: 10,               // Minimum 10 requests before tripping
-  rollingCountTimeout: 10000,        // 10 second rolling window
-  rollingCountBuckets: 10,           // Number of buckets in rolling window
+const defaultOptions: CircuitBreakerOptions = {
+  timeout: 30000, // 30 seconds timeout per request
+  errorThresholdPercentage: 50, // Open circuit at 50% failure rate
+  resetTimeout: 30000, // Try again after 30 seconds
+  volumeThreshold: 10, // Minimum 10 requests before tripping
+  rollingCountTimeout: 10000, // 10 second rolling window
+  rollingCountBuckets: 10, // Number of buckets in rolling window
 };
 
 // Map to store all circuit breakers
-const breakers = new Map();
+const breakers: Map<string, CircuitBreaker> = new Map();
 
 // Circuit breaker states for metrics
 const STATES = {
   CLOSED: 0,
   HALF_OPEN: 1,
   OPEN: 2,
-};
+} as const;
 
 /**
  * Create a circuit breaker for a service
- * @param {string} name - Service name
- * @param {Function} fn - Async function to wrap
- * @param {Object} options - Circuit breaker options
+ * @param name - Service name
+ * @param fn - Async function to wrap
+ * @param options - Circuit breaker options
  */
-export const createCircuitBreaker = (name, fn, options = {}) => {
+export const createCircuitBreaker = <T extends (...args: unknown[]) => Promise<unknown>>(
+  name: string,
+  fn: T,
+  options: CircuitBreakerOptions = {}
+): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> => {
   const opts = { ...defaultOptions, ...options };
   const breaker = new CircuitBreaker(fn, opts);
 
@@ -76,18 +96,18 @@ export const createCircuitBreaker = (name, fn, options = {}) => {
 /**
  * Get a circuit breaker by name
  */
-export const getCircuitBreaker = (name) => {
+export const getCircuitBreaker = (name: string): CircuitBreaker | undefined => {
   return breakers.get(name);
 };
 
 /**
  * Get all circuit breaker stats
  */
-export const getAllCircuitBreakerStats = () => {
-  const stats = {};
+export const getAllCircuitBreakerStats = (): Record<string, CircuitBreakerStats> => {
+  const stats: Record<string, CircuitBreakerStats> = {};
   for (const [name, breaker] of breakers) {
     stats[name] = {
-      state: breaker.opened ? 'open' : (breaker.halfOpen ? 'half-open' : 'closed'),
+      state: breaker.opened ? 'open' : breaker.halfOpen ? 'half-open' : 'closed',
       stats: breaker.stats,
     };
   }
@@ -100,12 +120,14 @@ export const getAllCircuitBreakerStats = () => {
  * Video transcoding service circuit breaker
  * Longer timeout since transcoding is slow
  */
-export const createTranscodingBreaker = (transcodeFn) => {
+export const createTranscodingBreaker = <T extends (...args: unknown[]) => Promise<unknown>>(
+  transcodeFn: T
+): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> => {
   return createCircuitBreaker('transcoding', transcodeFn, {
-    timeout: 120000,                  // 2 minutes for video transcoding
-    errorThresholdPercentage: 30,     // More sensitive - open at 30% failures
-    resetTimeout: 60000,              // Wait 1 minute before retrying
-    volumeThreshold: 5,               // Lower threshold for expensive operations
+    timeout: 120000, // 2 minutes for video transcoding
+    errorThresholdPercentage: 30, // More sensitive - open at 30% failures
+    resetTimeout: 60000, // Wait 1 minute before retrying
+    volumeThreshold: 5, // Lower threshold for expensive operations
   });
 };
 
@@ -113,21 +135,26 @@ export const createTranscodingBreaker = (transcodeFn) => {
  * Recommendation service circuit breaker
  * Quick timeout since recommendations should be fast
  */
-export const createRecommendationBreaker = (recommendFn) => {
+export const createRecommendationBreaker = <T extends (...args: unknown[]) => Promise<unknown>>(
+  recommendFn: T
+): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> => {
   return createCircuitBreaker('recommendation', recommendFn, {
-    timeout: 5000,                    // 5 seconds max for recommendations
-    errorThresholdPercentage: 50,     // Standard threshold
-    resetTimeout: 15000,              // Quick retry for recommendations
-    volumeThreshold: 20,              // Higher threshold since called frequently
+    timeout: 5000, // 5 seconds max for recommendations
+    errorThresholdPercentage: 50, // Standard threshold
+    resetTimeout: 15000, // Quick retry for recommendations
+    volumeThreshold: 20, // Higher threshold since called frequently
   });
 };
 
 /**
  * External API circuit breaker (CDN, third-party services)
  */
-export const createExternalApiBreaker = (name, apiFn) => {
+export const createExternalApiBreaker = <T extends (...args: unknown[]) => Promise<unknown>>(
+  name: string,
+  apiFn: T
+): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> => {
   return createCircuitBreaker(`external-${name}`, apiFn, {
-    timeout: 10000,                   // 10 seconds for external calls
+    timeout: 10000, // 10 seconds for external calls
     errorThresholdPercentage: 40,
     resetTimeout: 30000,
     volumeThreshold: 10,
@@ -137,11 +164,13 @@ export const createExternalApiBreaker = (name, apiFn) => {
 /**
  * Database circuit breaker for non-critical reads
  */
-export const createDatabaseBreaker = (queryFn) => {
+export const createDatabaseBreaker = <T extends (...args: unknown[]) => Promise<unknown>>(
+  queryFn: T
+): CircuitBreaker<Parameters<T>, Awaited<ReturnType<T>>> => {
   return createCircuitBreaker('database', queryFn, {
-    timeout: 5000,                    // 5 seconds for DB queries
-    errorThresholdPercentage: 60,     // More tolerant for DB
-    resetTimeout: 10000,              // Quick recovery
+    timeout: 5000, // 5 seconds for DB queries
+    errorThresholdPercentage: 60, // More tolerant for DB
+    resetTimeout: 10000, // Quick recovery
     volumeThreshold: 20,
   });
 };
@@ -149,11 +178,14 @@ export const createDatabaseBreaker = (queryFn) => {
 /**
  * Wrapper to execute with circuit breaker and fallback
  */
-export const withCircuitBreaker = async (breaker, fallbackValue = null) => {
+export const withCircuitBreaker = async <T>(
+  breaker: CircuitBreaker,
+  fallbackValue: T | null = null
+): Promise<T | null> => {
   try {
-    return await breaker.fire();
+    return (await breaker.fire()) as T;
   } catch (error) {
-    if (error.message === 'Breaker is open') {
+    if ((error as Error).message === 'Breaker is open') {
       logger.warn({ breaker: breaker.name }, 'Circuit breaker is open, using fallback');
       return fallbackValue;
     }

@@ -1,4 +1,5 @@
 import client from 'prom-client';
+import { Request, Response, NextFunction } from 'express';
 
 // Create a Registry to register the metrics
 const register = new client.Registry();
@@ -22,7 +23,7 @@ client.collectDefaultMetrics({ register });
 export const httpRequestDuration = new client.Histogram({
   name: 'spotlight_http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status_code'],
+  labelNames: ['method', 'route', 'status_code'] as const,
   buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
 });
 register.registerMetric(httpRequestDuration);
@@ -34,7 +35,7 @@ register.registerMetric(httpRequestDuration);
 export const httpRequestsTotal = new client.Counter({
   name: 'spotlight_http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'route', 'status_code']
+  labelNames: ['method', 'route', 'status_code'] as const
 });
 register.registerMetric(httpRequestsTotal);
 
@@ -49,7 +50,7 @@ register.registerMetric(httpRequestsTotal);
 export const searchLatency = new client.Histogram({
   name: 'spotlight_search_latency_seconds',
   help: 'Search query latency in seconds',
-  labelNames: ['source'],
+  labelNames: ['source'] as const,
   buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1]
 });
 register.registerMetric(searchLatency);
@@ -71,7 +72,7 @@ register.registerMetric(searchResultCount);
 export const searchRequestsTotal = new client.Counter({
   name: 'spotlight_search_requests_total',
   help: 'Total number of search requests by query type',
-  labelNames: ['type']
+  labelNames: ['type'] as const
 });
 register.registerMetric(searchRequestsTotal);
 
@@ -86,7 +87,7 @@ register.registerMetric(searchRequestsTotal);
 export const indexOperationLatency = new client.Histogram({
   name: 'spotlight_index_operation_latency_seconds',
   help: 'Index operation latency in seconds',
-  labelNames: ['operation', 'document_type'],
+  labelNames: ['operation', 'document_type'] as const,
   buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
 });
 register.registerMetric(indexOperationLatency);
@@ -98,7 +99,7 @@ register.registerMetric(indexOperationLatency);
 export const indexOperationsTotal = new client.Counter({
   name: 'spotlight_index_operations_total',
   help: 'Total number of index operations',
-  labelNames: ['operation', 'document_type', 'status']
+  labelNames: ['operation', 'document_type', 'status'] as const
 });
 register.registerMetric(indexOperationsTotal);
 
@@ -117,7 +118,7 @@ register.registerMetric(indexingQueueSize);
 export const indexSizeBytes = new client.Gauge({
   name: 'spotlight_index_size_bytes',
   help: 'Size of the search index in bytes',
-  labelNames: ['index_name']
+  labelNames: ['index_name'] as const
 });
 register.registerMetric(indexSizeBytes);
 
@@ -133,7 +134,7 @@ register.registerMetric(indexSizeBytes);
 export const circuitBreakerState = new client.Gauge({
   name: 'spotlight_circuit_breaker_state',
   help: 'Circuit breaker state (0=CLOSED, 1=HALF_OPEN, 2=OPEN)',
-  labelNames: ['name']
+  labelNames: ['name'] as const
 });
 register.registerMetric(circuitBreakerState);
 
@@ -144,7 +145,7 @@ register.registerMetric(circuitBreakerState);
 export const circuitBreakerTripsTotal = new client.Counter({
   name: 'spotlight_circuit_breaker_trips_total',
   help: 'Total number of circuit breaker trips (opens)',
-  labelNames: ['name']
+  labelNames: ['name'] as const
 });
 register.registerMetric(circuitBreakerTripsTotal);
 
@@ -159,7 +160,7 @@ register.registerMetric(circuitBreakerTripsTotal);
 export const rateLimitHitsTotal = new client.Counter({
   name: 'spotlight_rate_limit_hits_total',
   help: 'Total number of rate limit hits (rejected requests)',
-  labelNames: ['route']
+  labelNames: ['route'] as const
 });
 register.registerMetric(rateLimitHitsTotal);
 
@@ -174,7 +175,7 @@ register.registerMetric(rateLimitHitsTotal);
 export const idempotencyCacheHitsTotal = new client.Counter({
   name: 'spotlight_idempotency_cache_hits_total',
   help: 'Total number of idempotency cache hits (duplicate requests)',
-  labelNames: ['operation']
+  labelNames: ['operation'] as const
 });
 register.registerMetric(idempotencyCacheHitsTotal);
 
@@ -190,7 +191,7 @@ register.registerMetric(idempotencyCacheHitsTotal);
 export const serviceHealth = new client.Gauge({
   name: 'spotlight_service_health',
   help: 'Health status of service dependencies (0=unhealthy, 1=healthy)',
-  labelNames: ['component']
+  labelNames: ['component'] as const
 });
 register.registerMetric(serviceHealth);
 
@@ -198,10 +199,17 @@ register.registerMetric(serviceHealth);
 // Middleware Functions
 // ============================================================================
 
+// Extended Express Request with route property
+interface RequestWithRoute extends Request {
+  route?: {
+    path: string;
+  };
+}
+
 /**
  * Express middleware to track HTTP request metrics
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: RequestWithRoute, res: Response, next: NextFunction): void {
   const start = process.hrtime.bigint();
 
   res.on('finish', () => {
@@ -221,7 +229,7 @@ export function metricsMiddleware(req, res, next) {
 /**
  * Normalize route path to avoid high cardinality in metrics
  */
-function normalizeRoute(path) {
+function normalizeRoute(path: string): string {
   // Replace dynamic segments with placeholders
   return path
     .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '/:uuid')
@@ -232,14 +240,14 @@ function normalizeRoute(path) {
 /**
  * Get metrics in Prometheus format
  */
-export async function getMetrics() {
+export async function getMetrics(): Promise<string> {
   return register.metrics();
 }
 
 /**
  * Get content type for Prometheus metrics
  */
-export function getContentType() {
+export function getContentType(): string {
   return register.contentType;
 }
 

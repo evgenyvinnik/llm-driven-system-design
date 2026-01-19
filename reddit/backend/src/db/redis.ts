@@ -7,14 +7,14 @@ dotenv.config();
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: 3,
-  retryStrategy(times) {
+  retryStrategy(times: number): number {
     const delay = Math.min(times * 50, 2000);
     return delay;
   },
   lazyConnect: false,
 });
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   logger.error({ err }, 'Redis connection error');
 });
 
@@ -37,7 +37,7 @@ redis.on('close', () => {
 /**
  * Get a value from cache with metrics tracking.
  */
-export const cacheGet = async (key, cacheType = 'default') => {
+export const cacheGet = async (key: string, cacheType: string = 'default'): Promise<string | null> => {
   const value = await redis.get(key);
   if (value !== null) {
     cacheHits.inc({ cache_type: cacheType });
@@ -50,7 +50,7 @@ export const cacheGet = async (key, cacheType = 'default') => {
 /**
  * Set a value in cache with TTL.
  */
-export const cacheSet = async (key, value, ttlSeconds) => {
+export const cacheSet = async (key: string, value: string, ttlSeconds?: number): Promise<void> => {
   if (ttlSeconds) {
     await redis.setex(key, ttlSeconds, value);
   } else {

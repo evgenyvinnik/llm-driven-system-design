@@ -1,6 +1,14 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
+import { Request, Response, NextFunction } from 'express';
 import { rateLimitHitsTotal } from './metrics.js';
 import { logAuditEvent } from './logger.js';
+
+// Extend Express Request to include session
+interface RequestWithSession extends Request {
+  session?: {
+    userId?: string;
+  };
+}
 
 /**
  * Rate limit configuration for different endpoints
@@ -13,7 +21,7 @@ import { logAuditEvent } from './logger.js';
  * - Prevents search endpoint abuse
  * - Returns 429 with retry-after header
  */
-export const searchRateLimiter = rateLimit({
+export const searchRateLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 10 * 1000,  // 10 second window
   max: 100,             // 100 requests per window
   standardHeaders: true, // Return rate limit info in headers
@@ -23,11 +31,11 @@ export const searchRateLimiter = rateLimit({
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfterSeconds: 10
   },
-  keyGenerator: (req) => {
+  keyGenerator: (req: RequestWithSession): string => {
     // Use user ID if authenticated, otherwise IP
-    return req.session?.userId || req.ip;
+    return req.session?.userId || req.ip || 'unknown';
   },
-  handler: (req, res, next, options) => {
+  handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     // Track rate limit hits in metrics
     rateLimitHitsTotal.labels('/api/search').inc();
 
@@ -35,17 +43,17 @@ export const searchRateLimiter = rateLimit({
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip,
+      ip: req.ip || null,
       details: {
         route: '/api/search',
         windowMs: options.windowMs,
-        max: options.max
+        max: options.limit
       }
     });
 
     res.status(429).json(options.message);
   },
-  skip: (req) => {
+  skip: (req: Request): boolean => {
     // Skip rate limiting for health checks
     return req.path === '/health' || req.path === '/metrics';
   }
@@ -56,7 +64,7 @@ export const searchRateLimiter = rateLimit({
  * - 30 requests per 10 seconds
  * - Lower limit since suggestions are called frequently during typing
  */
-export const suggestionsRateLimiter = rateLimit({
+export const suggestionsRateLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 10 * 1000,
   max: 30,
   standardHeaders: true,
@@ -66,19 +74,19 @@ export const suggestionsRateLimiter = rateLimit({
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfterSeconds: 10
   },
-  keyGenerator: (req) => {
-    return req.session?.userId || req.ip;
+  keyGenerator: (req: RequestWithSession): string => {
+    return req.session?.userId || req.ip || 'unknown';
   },
-  handler: (req, res, next, options) => {
+  handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/suggestions').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip,
+      ip: req.ip || null,
       details: {
         route: '/api/suggestions',
         windowMs: options.windowMs,
-        max: options.max
+        max: options.limit
       }
     });
     res.status(429).json(options.message);
@@ -90,7 +98,7 @@ export const suggestionsRateLimiter = rateLimit({
  * - 50 requests per minute
  * - Higher limit for indexing but with longer window
  */
-export const indexRateLimiter = rateLimit({
+export const indexRateLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 60 * 1000,  // 1 minute window
   max: 50,              // 50 requests per minute
   standardHeaders: true,
@@ -100,19 +108,19 @@ export const indexRateLimiter = rateLimit({
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfterSeconds: 60
   },
-  keyGenerator: (req) => {
-    return req.session?.userId || req.ip;
+  keyGenerator: (req: RequestWithSession): string => {
+    return req.session?.userId || req.ip || 'unknown';
   },
-  handler: (req, res, next, options) => {
+  handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/index').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip,
+      ip: req.ip || null,
       details: {
         route: '/api/index',
         windowMs: options.windowMs,
-        max: options.max
+        max: options.limit
       }
     });
     res.status(429).json(options.message);
@@ -124,7 +132,7 @@ export const indexRateLimiter = rateLimit({
  * - 5 requests per minute
  * - Very low limit since bulk operations are expensive
  */
-export const bulkRateLimiter = rateLimit({
+export const bulkRateLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
   standardHeaders: true,
@@ -134,19 +142,19 @@ export const bulkRateLimiter = rateLimit({
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfterSeconds: 60
   },
-  keyGenerator: (req) => {
-    return req.session?.userId || req.ip;
+  keyGenerator: (req: RequestWithSession): string => {
+    return req.session?.userId || req.ip || 'unknown';
   },
-  handler: (req, res, next, options) => {
+  handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/index/bulk').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip,
+      ip: req.ip || null,
       details: {
         route: '/api/index/bulk',
         windowMs: options.windowMs,
-        max: options.max
+        max: options.limit
       }
     });
     res.status(429).json(options.message);
@@ -158,7 +166,7 @@ export const bulkRateLimiter = rateLimit({
  * - 500 requests per minute
  * - Acts as a safety net
  */
-export const globalRateLimiter = rateLimit({
+export const globalRateLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 60 * 1000,
   max: 500,
   standardHeaders: true,
@@ -168,39 +176,40 @@ export const globalRateLimiter = rateLimit({
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfterSeconds: 60
   },
-  keyGenerator: (req) => {
-    return req.ip;
+  keyGenerator: (req: Request): string => {
+    return req.ip || 'unknown';
   },
-  handler: (req, res, next, options) => {
+  handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('global').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip,
+      ip: req.ip || null,
       details: {
         route: 'global',
         path: req.path,
         windowMs: options.windowMs,
-        max: options.max
+        max: options.limit
       }
     });
     res.status(429).json(options.message);
   },
-  skip: (req) => {
+  skip: (req: Request): boolean => {
     // Skip rate limiting for health checks and metrics
     return req.path === '/health' || req.path === '/metrics';
   }
 });
 
+export interface CreateRateLimiterOptions {
+  windowMs: number;
+  max: number;
+  routeName: string;
+}
+
 /**
  * Create a custom rate limiter with specified options
- * @param {Object} options - Rate limiter options
- * @param {number} options.windowMs - Time window in milliseconds
- * @param {number} options.max - Maximum requests per window
- * @param {string} options.routeName - Name for metrics tracking
- * @returns {Function} - Express middleware
  */
-export function createRateLimiter({ windowMs, max, routeName }) {
+export function createRateLimiter({ windowMs, max, routeName }: CreateRateLimiterOptions): RateLimitRequestHandler {
   return rateLimit({
     windowMs,
     max,
@@ -211,19 +220,19 @@ export function createRateLimiter({ windowMs, max, routeName }) {
       code: 'RATE_LIMIT_EXCEEDED',
       retryAfterSeconds: Math.ceil(windowMs / 1000)
     },
-    keyGenerator: (req) => {
-      return req.session?.userId || req.ip;
+    keyGenerator: (req: RequestWithSession): string => {
+      return req.session?.userId || req.ip || 'unknown';
     },
-    handler: (req, res, next, options) => {
+    handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
       rateLimitHitsTotal.labels(routeName).inc();
       logAuditEvent({
         eventType: 'RATE_LIMIT_EXCEEDED',
         userId: req.session?.userId || null,
-        ip: req.ip,
+        ip: req.ip || null,
         details: {
           route: routeName,
           windowMs: options.windowMs,
-          max: options.max
+          max: options.limit
         }
       });
       res.status(429).json(options.message);

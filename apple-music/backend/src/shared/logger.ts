@@ -1,5 +1,6 @@
-import pino from 'pino';
+import pino, { Logger } from 'pino';
 import crypto from 'crypto';
+import { Request, Response, NextFunction } from 'express';
 
 /**
  * Structured logger using pino for JSON-formatted logs.
@@ -11,11 +12,31 @@ import crypto from 'crypto';
  * - Separate audit logger for security-relevant events
  */
 
+// Extend Express Request to include user and log
+declare global {
+  namespace Express {
+    interface Request {
+      log: Logger;
+      user?: {
+        id: string;
+        email: string;
+        username: string;
+        displayName: string;
+        role: string;
+        subscriptionTier: string;
+        preferredQuality: string;
+        userId?: string;
+      };
+      sessionToken?: string;
+    }
+  }
+}
+
 // Main application logger
 export const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   formatters: {
-    level: (label) => ({ level: label })
+    level: (label: string) => ({ level: label })
   },
   base: {
     service: 'apple-music-api',
@@ -40,9 +61,9 @@ export const auditLogger = logger.child({
  * Request logging middleware - attaches logger to each request.
  * Logs request completion with duration, status, and user context.
  */
-export function requestLogger(req, res, next) {
+export function requestLogger(req: Request, res: Response, next: NextFunction): void {
   const start = Date.now();
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  const requestId = (req.headers['x-request-id'] as string) || crypto.randomUUID();
 
   // Attach child logger with request context
   req.log = logger.child({
@@ -78,16 +99,27 @@ export function requestLogger(req, res, next) {
   next();
 }
 
+interface AuditEntry {
+  action: string;
+  userId?: string;
+  ip: string | undefined;
+  userAgent: string | undefined;
+  timestamp: string;
+  statusCode?: number;
+  success?: boolean;
+  [key: string]: unknown;
+}
+
 /**
  * Audit log helper for security-relevant events.
  * Use for login, logout, permission changes, admin actions.
  */
-export function auditLog(action, details = {}) {
-  return (req, res, next) => {
-    const auditEntry = {
+export function auditLog(action: string, details: Record<string, unknown> = {}) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const auditEntry: AuditEntry = {
       action,
       userId: req.user?.id,
-      ip: req.ip || req.connection?.remoteAddress,
+      ip: req.ip || (req.connection as { remoteAddress?: string })?.remoteAddress,
       userAgent: req.headers['user-agent'],
       timestamp: new Date().toISOString(),
       ...details
@@ -111,7 +143,12 @@ export function auditLog(action, details = {}) {
 /**
  * Stream event logger - specialized for music streaming events.
  */
-export function logStreamEvent(eventType, userId, trackId, details = {}) {
+export function logStreamEvent(
+  eventType: string,
+  userId: string,
+  trackId: string,
+  details: Record<string, unknown> = {}
+): void {
   logger.info({
     event: eventType,
     userId,

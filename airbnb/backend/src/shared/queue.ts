@@ -12,7 +12,7 @@
  * - Idempotency: Consumers track processed message IDs to handle redelivery
  */
 
-import amqp, { Connection, Channel, ConsumeMessage } from 'amqplib';
+import amqp, { ChannelModel, Channel, ConsumeMessage } from 'amqplib';
 import { v4 as uuidv4 } from 'uuid';
 import logger, { createModuleLogger } from './logger.js';
 import { metrics } from './metrics.js';
@@ -202,7 +202,7 @@ export async function publishEvent(eventType: string, data: unknown, options: Pu
       },
     };
 
-    channel.publish(
+    channel!.publish(
       EXCHANGE_NAME,
       eventType,
       Buffer.from(JSON.stringify(message)),
@@ -236,19 +236,19 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
     }
 
     const prefetch = options.prefetch || 10;
-    await channel.prefetch(prefetch);
+    await channel!.prefetch(prefetch);
 
     log.info({ queueName, prefetch }, 'Starting consumer');
 
-    channel.consume(queueName, async (msg) => {
+    channel!.consume(queueName, async (msg: ConsumeMessage | null) => {
       if (!msg) return;
 
       const startTime = Date.now();
 
       try {
-        const event = JSON.parse(msg.content.toString());
+        const event = JSON.parse(msg.content.toString()) as QueueEvent;
         const eventId = event.eventId;
-        const retryCount = msg.properties.headers?.['x-retry-count'] || 0;
+        const retryCount = (msg.properties.headers?.['x-retry-count'] as number) || 0;
 
         log.info({ eventId, eventType: event.eventType, retryCount }, 'Processing message');
 
@@ -258,7 +258,7 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
 
         if (alreadyProcessed) {
           log.info({ eventId }, 'Message already processed, skipping');
-          channel.ack(msg);
+          channel!.ack(msg);
           return;
         }
 
@@ -268,7 +268,7 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
         // Mark as processed (TTL 7 days)
         await redisClient.setEx(processedKey, 604800, '1');
 
-        channel.ack(msg);
+        channel!.ack(msg);
 
         const latency = (Date.now() - startTime) / 1000;
         metrics.queueMessagesConsumed.inc({
@@ -280,7 +280,7 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
 
         log.info({ eventId, latencyMs: latency * 1000 }, 'Message processed successfully');
       } catch (error) {
-        const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+        const retryCount = ((msg.properties.headers?.['x-retry-count'] as number) || 0) + 1;
         const maxRetries = options.maxRetries || 3;
 
         log.error({ error, retryCount, maxRetries }, 'Failed to process message');
@@ -297,12 +297,12 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
           log.info({ retryCount, delayMs: delay }, 'Scheduling retry');
 
           setTimeout(() => {
-            channel.nack(msg, false, true); // Requeue
+            channel!.nack(msg, false, true); // Requeue
           }, delay);
         } else {
           // Max retries exceeded, send to DLQ
           log.warn({ retryCount }, 'Max retries exceeded, sending to DLQ');
-          channel.nack(msg, false, false); // Don't requeue, send to DLQ
+          channel!.nack(msg, false, false); // Don't requeue, send to DLQ
         }
       }
     });
@@ -315,12 +315,12 @@ export async function startConsumer(queueName: string, handler: MessageHandler, 
 /**
  * Get queue statistics for monitoring
  */
-export async function getQueueStats() {
+export async function getQueueStats(): Promise<QueueStats> {
   if (!channel) {
     return {};
   }
 
-  const stats = {};
+  const stats: QueueStats = {};
 
   for (const queueName of Object.values(QUEUES)) {
     try {
@@ -341,7 +341,7 @@ export async function getQueueStats() {
 /**
  * Close the RabbitMQ connection
  */
-export async function closeQueue() {
+export async function closeQueue(): Promise<void> {
   try {
     if (channel) {
       await channel.close();
@@ -362,7 +362,7 @@ export async function closeQueue() {
 /**
  * Publish booking created event
  */
-export async function publishBookingCreated(booking, listing) {
+export async function publishBookingCreated(booking: Booking, listing: Listing): Promise<string> {
   return publishEvent(EVENT_TYPES.BOOKING_CREATED, {
     booking,
     listing: {
@@ -376,21 +376,21 @@ export async function publishBookingCreated(booking, listing) {
 /**
  * Publish booking confirmed event
  */
-export async function publishBookingConfirmed(booking) {
+export async function publishBookingConfirmed(booking: Booking): Promise<string> {
   return publishEvent(EVENT_TYPES.BOOKING_CONFIRMED, { booking });
 }
 
 /**
  * Publish booking cancelled event
  */
-export async function publishBookingCancelled(booking, cancelledBy) {
+export async function publishBookingCancelled(booking: Booking, cancelledBy: string): Promise<string> {
   return publishEvent(EVENT_TYPES.BOOKING_CANCELLED, { booking, cancelledBy });
 }
 
 /**
  * Publish host alert
  */
-export async function publishHostAlert(hostId, alertType, data) {
+export async function publishHostAlert(hostId: number, alertType: string, data: Record<string, unknown>): Promise<string> {
   return publishEvent(EVENT_TYPES.HOST_ALERT, {
     hostId,
     alertType,
@@ -401,7 +401,7 @@ export async function publishHostAlert(hostId, alertType, data) {
 /**
  * Publish availability changed event
  */
-export async function publishAvailabilityChanged(listingId, changes) {
+export async function publishAvailabilityChanged(listingId: number | string, changes: Record<string, unknown>): Promise<string> {
   return publishEvent(EVENT_TYPES.AVAILABILITY_CHANGED, { listingId, changes });
 }
 

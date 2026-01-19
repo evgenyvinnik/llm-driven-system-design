@@ -2,66 +2,79 @@
  * Priority Queue implementation using a binary min-heap
  * Used for A* pathfinding algorithm
  */
+
+interface HeapItem {
+  node: string;
+  priority: number;
+}
+
 export class PriorityQueue {
+  private heap: HeapItem[];
+  private nodeIndices: Map<string, number>;
+
   constructor() {
     this.heap = [];
-    this.nodeIndices = new Map(); // Track node positions for efficient updates
+    this.nodeIndices = new Map();
   }
 
-  isEmpty() {
+  isEmpty(): boolean {
     return this.heap.length === 0;
   }
 
-  size() {
+  size(): number {
     return this.heap.length;
   }
 
-  enqueue(node, priority) {
+  enqueue(node: string, priority: number): void {
     const existingIndex = this.nodeIndices.get(node);
 
     if (existingIndex !== undefined) {
-      // Update existing node priority if lower
-      if (priority < this.heap[existingIndex].priority) {
-        this.heap[existingIndex].priority = priority;
+      const heapItem = this.heap[existingIndex];
+      if (heapItem && priority < heapItem.priority) {
+        heapItem.priority = priority;
         this._bubbleUp(existingIndex);
       }
       return;
     }
 
-    const item = { node, priority };
+    const item: HeapItem = { node, priority };
     this.heap.push(item);
     const index = this.heap.length - 1;
     this.nodeIndices.set(node, index);
     this._bubbleUp(index);
   }
 
-  dequeue() {
+  dequeue(): string | null {
     if (this.isEmpty()) return null;
 
     const min = this.heap[0];
     const last = this.heap.pop();
-    this.nodeIndices.delete(min.node);
+    if (min) {
+      this.nodeIndices.delete(min.node);
+    }
 
-    if (this.heap.length > 0) {
+    if (this.heap.length > 0 && last) {
       this.heap[0] = last;
       this.nodeIndices.set(last.node, 0);
       this._bubbleDown(0);
     }
 
-    return min.node;
+    return min?.node ?? null;
   }
 
-  _bubbleUp(index) {
+  private _bubbleUp(index: number): void {
     while (index > 0) {
       const parentIndex = Math.floor((index - 1) / 2);
-      if (this.heap[index].priority >= this.heap[parentIndex].priority) break;
+      const current = this.heap[index];
+      const parent = this.heap[parentIndex];
+      if (!current || !parent || current.priority >= parent.priority) break;
 
       this._swap(index, parentIndex);
       index = parentIndex;
     }
   }
 
-  _bubbleDown(index) {
+  private _bubbleDown(index: number): void {
     const length = this.heap.length;
 
     while (true) {
@@ -69,11 +82,16 @@ export class PriorityQueue {
       const rightChild = 2 * index + 2;
       let smallest = index;
 
-      if (leftChild < length && this.heap[leftChild].priority < this.heap[smallest].priority) {
+      const currentSmallest = this.heap[smallest];
+      const left = this.heap[leftChild];
+      const right = this.heap[rightChild];
+
+      if (leftChild < length && left && currentSmallest && left.priority < currentSmallest.priority) {
         smallest = leftChild;
       }
 
-      if (rightChild < length && this.heap[rightChild].priority < this.heap[smallest].priority) {
+      const newSmallest = this.heap[smallest];
+      if (rightChild < length && right && newSmallest && right.priority < newSmallest.priority) {
         smallest = rightChild;
       }
 
@@ -84,17 +102,25 @@ export class PriorityQueue {
     }
   }
 
-  _swap(i, j) {
-    [this.heap[i], this.heap[j]] = [this.heap[j], this.heap[i]];
-    this.nodeIndices.set(this.heap[i].node, i);
-    this.nodeIndices.set(this.heap[j].node, j);
+  private _swap(i: number, j: number): void {
+    const itemI = this.heap[i];
+    const itemJ = this.heap[j];
+    if (!itemI || !itemJ) return;
+
+    [this.heap[i], this.heap[j]] = [itemJ, itemI];
+    this.nodeIndices.set(itemI.node, j);
+    this.nodeIndices.set(itemJ.node, i);
   }
+}
+
+function toRad(deg: number): number {
+  return deg * Math.PI / 180;
 }
 
 /**
  * Calculate haversine distance between two points in meters
  */
-export function haversineDistance(lat1, lng1, lat2, lng2) {
+export function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371000; // Earth's radius in meters
   const dLat = toRad(lat2 - lat1);
   const dLng = toRad(lng2 - lng1);
@@ -108,28 +134,24 @@ export function haversineDistance(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
-function toRad(deg) {
-  return deg * Math.PI / 180;
-}
-
 /**
  * Calculate bearing between two points in degrees
  */
-export function calculateBearing(lat1, lng1, lat2, lng2) {
+export function calculateBearing(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const dLng = toRad(lng2 - lng1);
   const y = Math.sin(dLng) * Math.cos(toRad(lat2));
   const x =
     Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
     Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
 
-  let bearing = Math.atan2(y, x) * 180 / Math.PI;
+  const bearing = Math.atan2(y, x) * 180 / Math.PI;
   return (bearing + 360) % 360;
 }
 
 /**
  * Calculate turn angle between two segments
  */
-export function calculateTurnAngle(bearing1, bearing2) {
+export function calculateTurnAngle(bearing1: number, bearing2: number): number {
   let angle = bearing2 - bearing1;
 
   // Normalize to -180 to 180
@@ -142,7 +164,7 @@ export function calculateTurnAngle(bearing1, bearing2) {
 /**
  * Format distance for display
  */
-export function formatDistance(meters) {
+export function formatDistance(meters: number): string {
   if (meters < 1000) {
     return `${Math.round(meters)} m`;
   }
@@ -152,7 +174,7 @@ export function formatDistance(meters) {
 /**
  * Format duration for display
  */
-export function formatDuration(seconds) {
+export function formatDuration(seconds: number): string {
   if (seconds < 60) {
     return `${Math.round(seconds)} sec`;
   }

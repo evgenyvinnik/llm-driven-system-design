@@ -2,7 +2,36 @@ import { query, getClient } from '../db/index.js';
 import logger from '../shared/logger.js';
 import { commentCreatedTotal, commentTreeDepth } from '../shared/metrics.js';
 
-export const createComment = async (postId, authorId, content, parentId = null) => {
+export interface Comment {
+  id: number;
+  post_id: number;
+  author_id: number;
+  parent_id: number | null;
+  content: string;
+  path: string;
+  depth: number;
+  upvotes: number;
+  downvotes: number;
+  score: number;
+  is_archived: boolean | null;
+  archived_at: Date | null;
+  created_at: Date;
+  author_username?: string;
+  userVote?: number;
+}
+
+export interface CommentWithReplies extends Comment {
+  replies: CommentWithReplies[];
+}
+
+export type CommentSortOption = 'best' | 'new' | 'top' | 'controversial';
+
+export const createComment = async (
+  postId: number,
+  authorId: number,
+  content: string,
+  parentId: number | null = null
+): Promise<Comment> => {
   const client = await getClient();
 
   try {
@@ -13,7 +42,7 @@ export const createComment = async (postId, authorId, content, parentId = null) 
     let parentPath = '';
 
     if (parentId) {
-      const parentResult = await client.query(
+      const parentResult = await client.query<{ path: string; depth: number }>(
         `SELECT path, depth FROM comments WHERE id = $1`,
         [parentId]
       );
@@ -24,7 +53,7 @@ export const createComment = async (postId, authorId, content, parentId = null) 
     }
 
     // Insert comment with temporary path
-    const result = await client.query(
+    const result = await client.query<Comment>(
       `INSERT INTO comments (post_id, author_id, parent_id, content, path, depth)
        VALUES ($1, $2, $3, $4, '', $5)
        RETURNING *`,
@@ -69,8 +98,8 @@ export const createComment = async (postId, authorId, content, parentId = null) 
   }
 };
 
-export const findCommentById = async (id) => {
-  const result = await query(
+export const findCommentById = async (id: number): Promise<Comment | undefined> => {
+  const result = await query<Comment>(
     `SELECT c.*, u.username as author_username
      FROM comments c
      LEFT JOIN users u ON c.author_id = u.id
@@ -80,8 +109,8 @@ export const findCommentById = async (id) => {
   return result.rows[0];
 };
 
-export const listCommentsByPost = async (postId, sort = 'best') => {
-  let orderBy;
+export const listCommentsByPost = async (postId: number, sort: CommentSortOption = 'best'): Promise<CommentWithReplies[]> => {
+  let orderBy: string;
   switch (sort) {
     case 'new':
       orderBy = 'c.created_at DESC';
@@ -110,7 +139,7 @@ export const listCommentsByPost = async (postId, sort = 'best') => {
   }
 
   // Fetch all comments for the post, then organize into tree structure
-  const result = await query(
+  const result = await query<Comment>(
     `SELECT c.*, u.username as author_username
      FROM comments c
      LEFT JOIN users u ON c.author_id = u.id
@@ -122,9 +151,9 @@ export const listCommentsByPost = async (postId, sort = 'best') => {
   return buildCommentTree(result.rows);
 };
 
-const buildCommentTree = (comments) => {
-  const commentMap = new Map();
-  const rootComments = [];
+const buildCommentTree = (comments: Comment[]): CommentWithReplies[] => {
+  const commentMap = new Map<number, CommentWithReplies>();
+  const rootComments: CommentWithReplies[] = [];
 
   // First pass: create map of all comments
   for (const comment of comments) {
@@ -133,9 +162,9 @@ const buildCommentTree = (comments) => {
 
   // Second pass: build tree structure
   for (const comment of comments) {
-    const commentWithReplies = commentMap.get(comment.id);
+    const commentWithReplies = commentMap.get(comment.id)!;
     if (comment.parent_id && commentMap.has(comment.parent_id)) {
-      commentMap.get(comment.parent_id).replies.push(commentWithReplies);
+      commentMap.get(comment.parent_id)!.replies.push(commentWithReplies);
     } else {
       rootComments.push(commentWithReplies);
     }
@@ -144,11 +173,11 @@ const buildCommentTree = (comments) => {
   return rootComments;
 };
 
-export const getCommentSubtree = async (commentId) => {
+export const getCommentSubtree = async (commentId: number): Promise<CommentWithReplies[] | null> => {
   const comment = await findCommentById(commentId);
   if (!comment) return null;
 
-  const result = await query(
+  const result = await query<Comment>(
     `SELECT c.*, u.username as author_username
      FROM comments c
      LEFT JOIN users u ON c.author_id = u.id
@@ -160,7 +189,7 @@ export const getCommentSubtree = async (commentId) => {
   return buildCommentTree(result.rows);
 };
 
-export const updateCommentScore = async (commentId, upvotes, downvotes) => {
+export const updateCommentScore = async (commentId: number, upvotes: number, downvotes: number): Promise<void> => {
   const score = upvotes - downvotes;
   await query(
     `UPDATE comments SET upvotes = $1, downvotes = $2, score = $3 WHERE id = $4`,
@@ -168,7 +197,7 @@ export const updateCommentScore = async (commentId, upvotes, downvotes) => {
   );
 };
 
-export const deleteComment = async (commentId) => {
+export const deleteComment = async (commentId: number): Promise<void> => {
   const comment = await findCommentById(commentId);
   if (!comment) return;
 
@@ -186,8 +215,8 @@ export const deleteComment = async (commentId) => {
  * Archive old comments based on retention policy.
  * Called by archival worker.
  */
-export const archiveComments = async (cutoffDate) => {
-  const result = await query(
+export const archiveComments = async (cutoffDate: Date): Promise<number | null> => {
+  const result = await query<{ id: number }>(
     `UPDATE comments
      SET is_archived = TRUE, archived_at = NOW()
      WHERE created_at < $1
@@ -196,7 +225,7 @@ export const archiveComments = async (cutoffDate) => {
     [cutoffDate]
   );
 
-  if (result.rowCount > 0) {
+  if (result.rowCount && result.rowCount > 0) {
     logger.info({
       count: result.rowCount,
       cutoffDate,

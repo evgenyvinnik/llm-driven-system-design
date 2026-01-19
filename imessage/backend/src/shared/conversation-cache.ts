@@ -1,8 +1,19 @@
+import Redis from 'ioredis';
 import redis from '../redis.js';
 import { createLogger } from './logger.js';
 import { cacheHits, cacheMisses } from './metrics.js';
 
 const logger = createLogger('conversation-cache');
+
+interface Conversation {
+  id: string;
+  type: string;
+  name?: string;
+  avatar_url?: string;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
 
 /**
  * Conversation caching service using cache-aside pattern
@@ -23,7 +34,13 @@ const logger = createLogger('conversation-cache');
  * 4. Invalidate on any modification
  */
 export class ConversationCache {
-  constructor(redisClient) {
+  private redis: Redis;
+  private conversationPrefix: string;
+  private participantsPrefix: string;
+  private userConversationsPrefix: string;
+  private ttlSeconds: number;
+
+  constructor(redisClient: Redis) {
     this.redis = redisClient;
     this.conversationPrefix = 'conv:';
     this.participantsPrefix = 'conv:participants:';
@@ -33,10 +50,8 @@ export class ConversationCache {
 
   /**
    * Get conversation metadata from cache
-   * @param {string} conversationId
-   * @returns {Promise<Object|null>}
    */
-  async getConversation(conversationId) {
+  async getConversation(conversationId: string): Promise<Conversation | null> {
     const key = `${this.conversationPrefix}${conversationId}`;
 
     try {
@@ -58,10 +73,8 @@ export class ConversationCache {
 
   /**
    * Set conversation metadata in cache
-   * @param {string} conversationId
-   * @param {Object} conversation
    */
-  async setConversation(conversationId, conversation) {
+  async setConversation(conversationId: string, conversation: Conversation): Promise<void> {
     const key = `${this.conversationPrefix}${conversationId}`;
 
     try {
@@ -74,10 +87,8 @@ export class ConversationCache {
 
   /**
    * Get participant IDs for a conversation (fast path for permission checks)
-   * @param {string} conversationId
-   * @returns {Promise<string[]|null>}
    */
-  async getParticipantIds(conversationId) {
+  async getParticipantIds(conversationId: string): Promise<string[] | null> {
     const key = `${this.participantsPrefix}${conversationId}`;
 
     try {
@@ -97,10 +108,8 @@ export class ConversationCache {
 
   /**
    * Set participant IDs in cache
-   * @param {string} conversationId
-   * @param {string[]} participantIds
    */
-  async setParticipantIds(conversationId, participantIds) {
+  async setParticipantIds(conversationId: string, participantIds: string[]): Promise<void> {
     const key = `${this.participantsPrefix}${conversationId}`;
 
     try {
@@ -120,11 +129,8 @@ export class ConversationCache {
 
   /**
    * Check if user is a participant (uses cached participant set)
-   * @param {string} conversationId
-   * @param {string} userId
-   * @returns {Promise<boolean|null>} null if cache miss
    */
-  async isParticipantCached(conversationId, userId) {
+  async isParticipantCached(conversationId: string, userId: string): Promise<boolean | null> {
     const key = `${this.participantsPrefix}${conversationId}`;
 
     try {
@@ -146,10 +152,8 @@ export class ConversationCache {
 
   /**
    * Get user's conversation list from cache
-   * @param {string} userId
-   * @returns {Promise<Object[]|null>}
    */
-  async getUserConversations(userId) {
+  async getUserConversations(userId: string): Promise<Conversation[] | null> {
     const key = `${this.userConversationsPrefix}${userId}`;
 
     try {
@@ -169,10 +173,8 @@ export class ConversationCache {
 
   /**
    * Set user's conversation list in cache
-   * @param {string} userId
-   * @param {Object[]} conversations
    */
-  async setUserConversations(userId, conversations) {
+  async setUserConversations(userId: string, conversations: Conversation[]): Promise<void> {
     const key = `${this.userConversationsPrefix}${userId}`;
 
     try {
@@ -186,9 +188,8 @@ export class ConversationCache {
 
   /**
    * Invalidate all caches for a conversation
-   * @param {string} conversationId
    */
-  async invalidateConversation(conversationId) {
+  async invalidateConversation(conversationId: string): Promise<void> {
     try {
       await this.redis.del(
         `${this.conversationPrefix}${conversationId}`,
@@ -202,9 +203,8 @@ export class ConversationCache {
 
   /**
    * Invalidate user's conversation list cache
-   * @param {string} userId
    */
-  async invalidateUserConversations(userId) {
+  async invalidateUserConversations(userId: string): Promise<void> {
     try {
       await this.redis.del(`${this.userConversationsPrefix}${userId}`);
       logger.debug({ userId }, 'User conversations cache invalidated');
@@ -215,10 +215,8 @@ export class ConversationCache {
 
   /**
    * Invalidate caches for all participants of a conversation
-   * @param {string} conversationId
-   * @param {string[]} participantIds
    */
-  async invalidateForParticipants(conversationId, participantIds) {
+  async invalidateForParticipants(conversationId: string, participantIds: string[]): Promise<void> {
     try {
       // Invalidate conversation cache
       await this.invalidateConversation(conversationId);

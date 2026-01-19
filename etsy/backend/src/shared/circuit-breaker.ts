@@ -5,7 +5,14 @@ import { createLogger } from './logger.js';
 const logger = createLogger('circuit-breaker');
 
 // Circuit breaker configuration presets
-const CIRCUIT_CONFIGS = {
+interface CircuitBreakerConfig {
+  timeout: number;
+  errorThresholdPercentage: number;
+  resetTimeout: number;
+  volumeThreshold: number;
+}
+
+const CIRCUIT_CONFIGS: Record<string, CircuitBreakerConfig> = {
   // For payment services - very conservative, fail fast
   payment: {
     timeout: 5000,           // 5 second timeout
@@ -37,26 +44,44 @@ const CIRCUIT_CONFIGS = {
 };
 
 // Store all circuit breakers for monitoring
-const breakers = new Map();
+const breakers = new Map<string, CircuitBreaker>();
+
+interface CircuitBreakerStats {
+  successes: number;
+  failures: number;
+  timeouts: number;
+  rejects: number;
+  fallbacks: number;
+}
+
+interface CircuitBreakerStatus {
+  state: 'open' | 'half-open' | 'closed';
+  stats: CircuitBreakerStats;
+}
 
 /**
  * Create a circuit breaker for a service
- * @param {string} name - Service name (for metrics and logging)
- * @param {Function} action - The async function to protect
- * @param {string} configPreset - Configuration preset name
- * @param {Object} fallbackFn - Optional fallback function when circuit is open
- * @returns {CircuitBreaker} Configured circuit breaker
+ * @param name - Service name (for metrics and logging)
+ * @param action - The async function to protect
+ * @param configPreset - Configuration preset name
+ * @param fallbackFn - Optional fallback function when circuit is open
+ * @returns Configured circuit breaker
  */
-export function createCircuitBreaker(name, action, configPreset = 'default', fallbackFn = null) {
+export function createCircuitBreaker<T extends unknown[], R>(
+  name: string,
+  action: (...args: T) => Promise<R>,
+  configPreset: string = 'default',
+  fallbackFn: ((...args: T) => Promise<R>) | null = null
+): CircuitBreaker<T, R> {
   const config = CIRCUIT_CONFIGS[configPreset] || CIRCUIT_CONFIGS.default;
 
-  const breaker = new CircuitBreaker(action, {
+  const breaker = new CircuitBreaker<T, R>(action, {
     ...config,
     name,
   });
 
   // Set up event handlers for monitoring
-  breaker.on('success', (result) => {
+  breaker.on('success', () => {
     logger.debug({ service: name }, 'Circuit breaker success');
   });
 
@@ -84,11 +109,11 @@ export function createCircuitBreaker(name, action, configPreset = 'default', fal
     circuitBreakerState.labels(name).set(0); // 0 = closed
   });
 
-  breaker.on('fallback', (result) => {
+  breaker.on('fallback', () => {
     logger.info({ service: name }, 'Circuit breaker fallback executed');
   });
 
-  breaker.on('failure', (error) => {
+  breaker.on('failure', (error: Error) => {
     logger.error({ service: name, error: error.message }, 'Circuit breaker failure');
     circuitBreakerFailures.labels(name).inc();
   });
@@ -102,17 +127,17 @@ export function createCircuitBreaker(name, action, configPreset = 'default', fal
   circuitBreakerState.labels(name).set(0);
 
   // Store breaker for monitoring
-  breakers.set(name, breaker);
+  breakers.set(name, breaker as CircuitBreaker);
 
   return breaker;
 }
 
 /**
  * Get circuit breaker status for all services
- * @returns {Object} Status of all circuit breakers
+ * @returns Status of all circuit breakers
  */
-export function getCircuitBreakerStatus() {
-  const status = {};
+export function getCircuitBreakerStatus(): Record<string, CircuitBreakerStatus> {
+  const status: Record<string, CircuitBreakerStatus> = {};
   for (const [name, breaker] of breakers) {
     status[name] = {
       state: breaker.opened ? 'open' : breaker.halfOpen ? 'half-open' : 'closed',
@@ -130,9 +155,9 @@ export function getCircuitBreakerStatus() {
 
 /**
  * Force open a circuit breaker (for maintenance/testing)
- * @param {string} name - Service name
+ * @param name - Service name
  */
-export function forceOpen(name) {
+export function forceOpen(name: string): void {
   const breaker = breakers.get(name);
   if (breaker) {
     breaker.open();
@@ -142,9 +167,9 @@ export function forceOpen(name) {
 
 /**
  * Force close a circuit breaker (for recovery)
- * @param {string} name - Service name
+ * @param name - Service name
  */
-export function forceClose(name) {
+export function forceClose(name: string): void {
   const breaker = breakers.get(name);
   if (breaker) {
     breaker.close();
@@ -153,54 +178,78 @@ export function forceClose(name) {
 }
 
 // Pre-configured circuit breaker for search operations
-export const searchCircuitBreaker = {
+interface SearchCircuitBreaker {
+  breaker: CircuitBreaker | null;
+  init: <T extends unknown[], R>(
+    searchFn: (...args: T) => Promise<R>,
+    fallbackFn: (...args: T) => Promise<R>
+  ) => void;
+  fire: <T extends unknown[], R>(...args: T) => Promise<R>;
+}
+
+export const searchCircuitBreaker: SearchCircuitBreaker = {
   breaker: null,
 
   /**
    * Initialize the search circuit breaker
-   * @param {Function} searchFn - The search function to wrap
-   * @param {Function} fallbackFn - Fallback when circuit is open
+   * @param searchFn - The search function to wrap
+   * @param fallbackFn - Fallback when circuit is open
    */
-  init(searchFn, fallbackFn) {
-    this.breaker = createCircuitBreaker('elasticsearch', searchFn, 'search', fallbackFn);
+  init<T extends unknown[], R>(
+    searchFn: (...args: T) => Promise<R>,
+    fallbackFn: (...args: T) => Promise<R>
+  ): void {
+    this.breaker = createCircuitBreaker('elasticsearch', searchFn, 'search', fallbackFn) as CircuitBreaker;
   },
 
   /**
    * Execute a search through the circuit breaker
-   * @param {...any} args - Arguments to pass to search function
-   * @returns {Promise<any>} Search results or fallback
+   * @param args - Arguments to pass to search function
+   * @returns Search results or fallback
    */
-  async fire(...args) {
+  async fire<T extends unknown[], R>(...args: T): Promise<R> {
     if (!this.breaker) {
       throw new Error('Search circuit breaker not initialized');
     }
-    return this.breaker.fire(...args);
+    return this.breaker.fire(...args) as Promise<R>;
   },
 };
 
 // Pre-configured circuit breaker for payment operations
-export const paymentCircuitBreaker = {
+interface PaymentCircuitBreaker {
+  breaker: CircuitBreaker | null;
+  init: <T extends unknown[], R>(
+    paymentFn: (...args: T) => Promise<R>,
+    fallbackFn: (...args: T) => Promise<R>
+  ) => void;
+  fire: <T extends unknown[], R>(...args: T) => Promise<R>;
+}
+
+export const paymentCircuitBreaker: PaymentCircuitBreaker = {
   breaker: null,
 
   /**
    * Initialize the payment circuit breaker
-   * @param {Function} paymentFn - The payment processing function
-   * @param {Function} fallbackFn - Fallback when circuit is open
+   * @param paymentFn - The payment processing function
+   * @param fallbackFn - Fallback when circuit is open
    */
-  init(paymentFn, fallbackFn) {
-    this.breaker = createCircuitBreaker('payment', paymentFn, 'payment', fallbackFn);
+  init<T extends unknown[], R>(
+    paymentFn: (...args: T) => Promise<R>,
+    fallbackFn: (...args: T) => Promise<R>
+  ): void {
+    this.breaker = createCircuitBreaker('payment', paymentFn, 'payment', fallbackFn) as CircuitBreaker;
   },
 
   /**
    * Execute a payment through the circuit breaker
-   * @param {...any} args - Arguments to pass to payment function
-   * @returns {Promise<any>} Payment result or fallback
+   * @param args - Arguments to pass to payment function
+   * @returns Payment result or fallback
    */
-  async fire(...args) {
+  async fire<T extends unknown[], R>(...args: T): Promise<R> {
     if (!this.breaker) {
       throw new Error('Payment circuit breaker not initialized');
     }
-    return this.breaker.fire(...args);
+    return this.breaker.fire(...args) as Promise<R>;
   },
 };
 

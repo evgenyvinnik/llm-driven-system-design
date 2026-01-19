@@ -7,15 +7,35 @@
  * - Audit logging for security-relevant events
  * - Configurable log levels via environment
  */
-const pino = require('pino');
-const { v4: uuid } = require('uuid');
+import pino, { Logger, Bindings } from 'pino';
+import { v4 as uuid } from 'uuid';
+import { Request, Response, NextFunction } from 'express';
+
+// Extended request type with logger
+declare global {
+  namespace Express {
+    interface Request {
+      log?: Logger;
+    }
+  }
+}
+
+export interface AuditLogData {
+  userId?: string;
+  deviceId?: string;
+  contentId?: string;
+  profileId?: string;
+  ipAddress?: string;
+  userAgent?: string;
+  details?: Record<string, unknown>;
+}
 
 // Base logger configuration
-const logger = pino({
+export const logger: Logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   formatters: {
-    level: (label) => ({ level: label }),
-    bindings: (bindings) => ({
+    level: (label: string) => ({ level: label }),
+    bindings: (bindings: Bindings) => ({
       pid: bindings.pid,
       host: bindings.hostname,
       service: 'apple-tv-api'
@@ -36,10 +56,10 @@ const logger = pino({
 });
 
 // Audit logger for security-relevant events
-const auditLogger = pino({
+export const auditLogger: Logger = pino({
   level: 'info',
   formatters: {
-    level: (label) => ({ level: label, logType: 'audit' })
+    level: (label: string) => ({ level: label, logType: 'audit' })
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   // In production, write to separate audit log file
@@ -52,7 +72,7 @@ const auditLogger = pino({
 });
 
 // Audit event types
-const AuditEvents = {
+export const AuditEvents = {
   LICENSE_ISSUED: 'drm.license.issued',
   LICENSE_REVOKED: 'drm.license.revoked',
   DOWNLOAD_STARTED: 'download.started',
@@ -67,14 +87,16 @@ const AuditEvents = {
   LOGIN_SUCCESS: 'auth.login.success',
   LOGIN_FAILED: 'auth.login.failed',
   LOGOUT: 'auth.logout'
-};
+} as const;
+
+export type AuditEventType = typeof AuditEvents[keyof typeof AuditEvents];
 
 /**
  * Log an audit event
- * @param {string} event - Event type from AuditEvents
- * @param {Object} data - Event data including userId, deviceId, etc.
+ * @param event - Event type from AuditEvents
+ * @param data - Event data including userId, deviceId, etc.
  */
-function auditLog(event, data) {
+export function auditLog(event: AuditEventType, data: AuditLogData): void {
   auditLogger.info({
     event,
     userId: data.userId,
@@ -89,11 +111,11 @@ function auditLog(event, data) {
 
 /**
  * Create a child logger with request context
- * @param {Object} req - Express request object
- * @returns {Object} Child logger with request context
+ * @param req - Express request object
+ * @returns Child logger with request context
  */
-function createRequestLogger(req) {
-  const requestId = req.headers['x-request-id'] || uuid();
+export function createRequestLogger(req: Request): Logger {
+  const requestId = (req.headers['x-request-id'] as string) || uuid();
   return logger.child({
     requestId,
     userId: req.session?.userId,
@@ -107,7 +129,11 @@ function createRequestLogger(req) {
 /**
  * Express middleware to attach logger to request
  */
-function requestLoggerMiddleware(req, res, next) {
+export function requestLoggerMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
   req.log = createRequestLogger(req);
   const start = Date.now();
 
@@ -120,22 +146,13 @@ function requestLoggerMiddleware(req, res, next) {
     };
 
     if (res.statusCode >= 500) {
-      req.log.error(logData, 'request failed');
+      req.log?.error(logData, 'request failed');
     } else if (res.statusCode >= 400) {
-      req.log.warn(logData, 'request error');
+      req.log?.warn(logData, 'request error');
     } else {
-      req.log.info(logData, 'request completed');
+      req.log?.info(logData, 'request completed');
     }
   });
 
   next();
 }
-
-module.exports = {
-  logger,
-  auditLogger,
-  auditLog,
-  AuditEvents,
-  createRequestLogger,
-  requestLoggerMiddleware
-};

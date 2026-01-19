@@ -26,7 +26,7 @@ export const AUDIT_EVENTS = {
 
   // Restaurant events
   RESTAURANT_UPDATED: 'RESTAURANT_UPDATED',
-};
+} as const;
 
 /**
  * Actor types for audit logs
@@ -37,20 +37,60 @@ export const ACTOR_TYPES = {
   RESTAURANT: 'restaurant',
   ADMIN: 'admin',
   SYSTEM: 'system',
-};
+} as const;
+
+export type AuditEventType = (typeof AUDIT_EVENTS)[keyof typeof AUDIT_EVENTS];
+export type ActorType = (typeof ACTOR_TYPES)[keyof typeof ACTOR_TYPES];
+
+export interface AuditEvent {
+  eventType: AuditEventType | string;
+  entityType: string;
+  entityId: number | string;
+  actorType: ActorType | string;
+  actorId?: number | null;
+  changes?: {
+    before: Record<string, unknown> | null;
+    after: Record<string, unknown> | null;
+  } | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface Actor {
+  type: ActorType | string;
+  id: number | null;
+}
+
+export interface OrderForAudit {
+  id: number;
+  status?: string;
+  total?: number;
+  customer_id?: number;
+  restaurant_id?: number;
+  driver_id?: number | null;
+  items?: unknown[];
+}
+
+export interface AuditLogRow {
+  id: number;
+  event_type: string;
+  entity_type: string;
+  entity_id: number;
+  actor_type: string;
+  actor_id: number | null;
+  changes: string | null;
+  metadata: string;
+  created_at: Date;
+}
+
+interface GetAuditLogsOptions {
+  limit?: number;
+  offset?: number;
+}
 
 /**
  * Create an audit log entry
- * @param {Object} event - Audit event data
- * @param {string} event.eventType - Type of event (from AUDIT_EVENTS)
- * @param {string} event.entityType - Type of entity ('order', 'driver', etc.)
- * @param {number} event.entityId - ID of the entity
- * @param {string} event.actorType - Type of actor (from ACTOR_TYPES)
- * @param {number|null} event.actorId - ID of the actor (null for system)
- * @param {Object} event.changes - Before and after state
- * @param {Object} event.metadata - Additional context (IP, user agent, etc.)
  */
-export async function createAuditLog(event) {
+export async function createAuditLog(event: AuditEvent): Promise<void> {
   try {
     const {
       eventType,
@@ -78,31 +118,39 @@ export async function createAuditLog(event) {
       ]
     );
 
-    logger.debug({
-      eventType,
-      entityType,
-      entityId,
-      actorType,
-      actorId,
-    }, 'Audit log created');
+    logger.debug(
+      {
+        eventType,
+        entityType,
+        entityId,
+        actorType,
+        actorId,
+      },
+      'Audit log created'
+    );
   } catch (error) {
+    const err = error as Error;
     // Log error but don't throw - audit logging shouldn't break the main flow
-    logger.error({
-      error: error.message,
-      event,
-    }, 'Failed to create audit log');
+    logger.error(
+      {
+        error: err.message,
+        event,
+      },
+      'Failed to create audit log'
+    );
   }
 }
 
 /**
  * Audit log for order status change
- * @param {Object} order - Order data
- * @param {string} fromStatus - Previous status
- * @param {string} toStatus - New status
- * @param {Object} actor - Actor information
- * @param {Object} metadata - Additional metadata (IP, user agent)
  */
-export async function auditOrderStatusChange(order, fromStatus, toStatus, actor, metadata = {}) {
+export async function auditOrderStatusChange(
+  order: OrderForAudit,
+  fromStatus: string,
+  toStatus: string,
+  actor: Actor,
+  metadata: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     eventType: toStatus === 'CANCELLED' ? AUDIT_EVENTS.ORDER_CANCELLED : AUDIT_EVENTS.ORDER_STATUS_CHANGED,
     entityType: 'order',
@@ -125,11 +173,12 @@ export async function auditOrderStatusChange(order, fromStatus, toStatus, actor,
 
 /**
  * Audit log for order creation
- * @param {Object} order - Created order data
- * @param {Object} actor - Actor information
- * @param {Object} metadata - Additional metadata
  */
-export async function auditOrderCreated(order, actor, metadata = {}) {
+export async function auditOrderCreated(
+  order: OrderForAudit,
+  actor: Actor,
+  metadata: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     eventType: AUDIT_EVENTS.ORDER_CREATED,
     entityType: 'order',
@@ -153,11 +202,12 @@ export async function auditOrderCreated(order, actor, metadata = {}) {
 
 /**
  * Audit log for driver assignment
- * @param {number} orderId - Order ID
- * @param {number} driverId - Driver ID
- * @param {Object} metadata - Additional metadata
  */
-export async function auditDriverAssigned(orderId, driverId, metadata = {}) {
+export async function auditDriverAssigned(
+  orderId: number,
+  driverId: number,
+  metadata: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     eventType: AUDIT_EVENTS.DRIVER_ASSIGNED,
     entityType: 'order',
@@ -177,12 +227,12 @@ export async function auditDriverAssigned(orderId, driverId, metadata = {}) {
 
 /**
  * Query audit logs for an entity
- * @param {string} entityType - Type of entity
- * @param {number} entityId - Entity ID
- * @param {Object} options - Query options (limit, offset)
- * @returns {Array} Audit log entries
  */
-export async function getAuditLogs(entityType, entityId, options = {}) {
+export async function getAuditLogs(
+  entityType: string,
+  entityId: number | string,
+  options: GetAuditLogsOptions = {}
+): Promise<AuditLogRow[]> {
   const { limit = 50, offset = 0 } = options;
 
   const result = await query(
@@ -193,7 +243,7 @@ export async function getAuditLogs(entityType, entityId, options = {}) {
     [entityType, entityId, limit, offset]
   );
 
-  return result.rows;
+  return result.rows as AuditLogRow[];
 }
 
 export default {

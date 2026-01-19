@@ -1,8 +1,59 @@
+import Redis from 'ioredis';
+import { Request, Response } from 'express';
 import { query } from '../db.js';
 import redis from '../redis.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('health');
+
+interface LivenessResult {
+  status: string;
+  timestamp: string;
+}
+
+interface ComponentCheck {
+  status: string;
+  latencyMs: number;
+  serverTime?: Date;
+  uptimeSeconds?: number | null;
+  error?: string;
+}
+
+interface ReadinessResult {
+  status: string;
+  timestamp: string;
+  checks: {
+    database: ComponentCheck;
+    redis: ComponentCheck;
+  };
+}
+
+interface MemoryUsage {
+  heapUsed: string;
+  heapTotal: string;
+  rss: string;
+  external: string;
+}
+
+interface DeepHealthResult {
+  status: string;
+  timestamp: string;
+  uptime: {
+    ms: number;
+    formatted: string;
+  };
+  version: string;
+  environment: string;
+  components: {
+    database: ComponentCheck;
+    redis: ComponentCheck;
+  };
+  process: {
+    pid: number;
+    memoryUsage: MemoryUsage;
+    nodeVersion: string;
+  };
+}
 
 /**
  * Health check service for monitoring system components
@@ -13,7 +64,10 @@ const logger = createLogger('health');
  * - Deep health check: Status of all dependencies
  */
 export class HealthCheckService {
-  constructor(redisClient) {
+  private redis: Redis;
+  private startTime: number;
+
+  constructor(redisClient: Redis) {
     this.redis = redisClient;
     this.startTime = Date.now();
   }
@@ -21,7 +75,7 @@ export class HealthCheckService {
   /**
    * Simple liveness check - is the process alive?
    */
-  async liveness() {
+  async liveness(): Promise<LivenessResult> {
     return {
       status: 'ok',
       timestamp: new Date().toISOString(),
@@ -31,7 +85,7 @@ export class HealthCheckService {
   /**
    * Readiness check - can the service handle requests?
    */
-  async readiness() {
+  async readiness(): Promise<ReadinessResult> {
     const checks = await Promise.all([
       this.checkDatabase(),
       this.checkRedis(),
@@ -52,7 +106,7 @@ export class HealthCheckService {
   /**
    * Deep health check with detailed component status
    */
-  async deepHealth() {
+  async deepHealth(): Promise<DeepHealthResult> {
     const [dbCheck, redisCheck] = await Promise.all([
       this.checkDatabase(),
       this.checkRedis(),
@@ -85,7 +139,7 @@ export class HealthCheckService {
   /**
    * Check PostgreSQL database connectivity
    */
-  async checkDatabase() {
+  async checkDatabase(): Promise<ComponentCheck> {
     const start = Date.now();
 
     try {
@@ -102,7 +156,7 @@ export class HealthCheckService {
 
       return {
         status: 'error',
-        error: error.message,
+        error: (error as Error).message,
         latencyMs: Date.now() - start,
       };
     }
@@ -111,7 +165,7 @@ export class HealthCheckService {
   /**
    * Check Redis connectivity
    */
-  async checkRedis() {
+  async checkRedis(): Promise<ComponentCheck> {
     const start = Date.now();
 
     try {
@@ -137,7 +191,7 @@ export class HealthCheckService {
 
       return {
         status: 'error',
-        error: error.message,
+        error: (error as Error).message,
         latencyMs: Date.now() - start,
       };
     }
@@ -146,7 +200,7 @@ export class HealthCheckService {
   /**
    * Format uptime into human-readable string
    */
-  formatUptime(ms) {
+  formatUptime(ms: number): string {
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
@@ -161,8 +215,8 @@ export class HealthCheckService {
   /**
    * Format memory usage
    */
-  formatMemory(usage) {
-    const formatBytes = (bytes) => `${Math.round(bytes / 1024 / 1024)}MB`;
+  formatMemory(usage: NodeJS.MemoryUsage): MemoryUsage {
+    const formatBytes = (bytes: number): string => `${Math.round(bytes / 1024 / 1024)}MB`;
 
     return {
       heapUsed: formatBytes(usage.heapUsed),
@@ -177,19 +231,19 @@ export class HealthCheckService {
 const healthCheck = new HealthCheckService(redis);
 
 // Express route handlers
-export function livenessHandler(req, res) {
+export function livenessHandler(req: Request, res: Response): void {
   healthCheck.liveness().then(result => {
     res.json(result);
   });
 }
 
-export async function readinessHandler(req, res) {
+export async function readinessHandler(req: Request, res: Response): Promise<void> {
   const result = await healthCheck.readiness();
   const status = result.status === 'ok' ? 200 : 503;
   res.status(status).json(result);
 }
 
-export async function healthHandler(req, res) {
+export async function healthHandler(req: Request, res: Response): Promise<void> {
   const result = await healthCheck.deepHealth();
   const status = result.status === 'healthy' ? 200 : 503;
   res.status(status).json(result);

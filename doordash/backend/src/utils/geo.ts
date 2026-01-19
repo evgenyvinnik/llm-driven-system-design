@@ -1,5 +1,10 @@
 // Haversine formula to calculate distance between two coordinates in km
-export function haversineDistance(lat1, lon1, lat2, lon2) {
+export function haversineDistance(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
   const R = 6371; // Earth's radius in km
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
@@ -12,15 +17,17 @@ export function haversineDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-function toRad(deg) {
+function toRad(deg: number): number {
   return deg * (Math.PI / 180);
 }
 
+type VehicleType = 'car' | 'bike' | 'scooter' | 'walk';
+
 // Estimate drive time in minutes based on distance
 // Using average speed based on traffic conditions
-export function estimateDriveTime(distanceKm, vehicleType = 'car') {
+export function estimateDriveTime(distanceKm: number, vehicleType: VehicleType = 'car'): number {
   // Average speeds in km/h
-  const speeds = {
+  const speeds: Record<VehicleType, number> = {
     car: 25, // City driving with traffic
     bike: 15,
     scooter: 20,
@@ -33,7 +40,7 @@ export function estimateDriveTime(distanceKm, vehicleType = 'car') {
 }
 
 // Get traffic multiplier based on time of day
-export function getTrafficMultiplier(date = new Date()) {
+export function getTrafficMultiplier(date: Date = new Date()): number {
   const hour = date.getHours();
   const day = date.getDay();
 
@@ -57,14 +64,55 @@ export function getTrafficMultiplier(date = new Date()) {
 }
 
 // Calculate route time with traffic
-export function calculateRouteTime(distanceKm, vehicleType = 'car') {
+export function calculateRouteTime(distanceKm: number, vehicleType: VehicleType = 'car'): number {
   const baseTime = estimateDriveTime(distanceKm, vehicleType);
   const multiplier = getTrafficMultiplier();
   return baseTime * multiplier;
 }
 
+export interface DeliveryAddress {
+  lat: number;
+  lon: number;
+  address: string;
+}
+
+export interface OrderForETA {
+  status: string;
+  preparing_at?: string;
+  confirmed_at?: string;
+  placed_at?: string;
+  delivery_address: DeliveryAddress;
+}
+
+export interface DriverForETA {
+  current_lat: number;
+  current_lon: number;
+  vehicle_type?: VehicleType;
+}
+
+export interface RestaurantForETA {
+  lat: number;
+  lon: number;
+  prep_time_minutes?: number;
+}
+
+export interface ETAResult {
+  eta: Date;
+  breakdown: {
+    toRestaurantMinutes: number;
+    prepTimeMinutes: number;
+    deliveryMinutes: number;
+    bufferMinutes: number;
+    totalMinutes: number;
+  };
+}
+
 // Calculate ETA breakdown for an order
-export function calculateETA(order, driver, restaurant) {
+export function calculateETA(
+  order: OrderForETA,
+  driver: DriverForETA | null,
+  restaurant: RestaurantForETA
+): ETAResult {
   const now = Date.now();
 
   // Time for driver to reach restaurant
@@ -76,14 +124,15 @@ export function calculateETA(order, driver, restaurant) {
       restaurant.lat,
       restaurant.lon
     );
-    timeToRestaurant = calculateRouteTime(distanceToRestaurant, driver.vehicle_type) * 60 * 1000; // ms
+    timeToRestaurant =
+      calculateRouteTime(distanceToRestaurant, driver.vehicle_type || 'car') * 60 * 1000; // ms
   }
 
   // Remaining prep time
   let prepTime = 0;
   if (order.status === 'PREPARING' || order.status === 'CONFIRMED') {
     const prepStarted = order.preparing_at || order.confirmed_at || order.placed_at;
-    const elapsed = now - new Date(prepStarted).getTime();
+    const elapsed = prepStarted ? now - new Date(prepStarted).getTime() : 0;
     const totalPrepTime = (restaurant.prep_time_minutes || 20) * 60 * 1000;
     prepTime = Math.max(0, totalPrepTime - elapsed);
   }

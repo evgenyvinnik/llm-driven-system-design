@@ -1,4 +1,4 @@
-import amqp from 'amqplib';
+import amqp, { Connection, Channel, ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { v4 as uuid } from 'uuid';
 import logger from './logger.js';
 import { queueMessagesPublished, queueMessagesProcessed, queueMessagesRetried } from './metrics.js';
@@ -34,22 +34,86 @@ export const QUEUES = {
   WORKFLOW: 'docusign.workflow',
   REMINDERS: 'docusign.reminders',
   DEAD_LETTER: 'docusign.dlq',
-};
+} as const;
 
 // Exchange names
 const EXCHANGES = {
   DIRECT: 'docusign.direct',
   DLX: 'docusign.dlx',
-};
+} as const;
 
-let connection = null;
-let channel = null;
-let confirmChannel = null;
+export interface QueueMessage {
+  id: string;
+  type: string;
+  data: Record<string, unknown>;
+  timestamp: string;
+  idempotencyKey: string;
+}
+
+export interface NotificationMessage {
+  recipientId: string;
+  envelopeId: string;
+  type: string;
+  channels?: string[];
+}
+
+export interface EmailMessage {
+  recipientId: string;
+  recipientEmail: string;
+  subject: string;
+  body: string;
+  templateId?: string;
+  templateData?: Record<string, unknown>;
+}
+
+export interface WorkflowEvent {
+  eventType: string;
+  envelopeId: string;
+  recipientId?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface ReminderMessage {
+  envelopeId: string;
+  recipientId: string;
+  scheduledFor: string;
+}
+
+export interface PublishOptions {
+  idempotencyKey?: string;
+  persistent?: boolean;
+  messageId?: string;
+  headers?: Record<string, unknown>;
+}
+
+export interface ConsumerOptions {
+  concurrency?: number;
+}
+
+export interface QueueStatus {
+  messages: number;
+  consumers: number;
+}
+
+export interface QueueHealthStatus {
+  status: 'connected' | 'disconnected' | 'error';
+  queues?: {
+    notifications: QueueStatus | null;
+    email: QueueStatus | null;
+    workflow: QueueStatus | null;
+    deadLetter: QueueStatus | null;
+  };
+  error?: string;
+}
+
+let connection: Connection | null = null;
+let channel: Channel | null = null;
+let confirmChannel: ConfirmChannel | null = null;
 
 /**
  * Initialize RabbitMQ connection and setup queues.
  */
-export async function initializeQueue() {
+export async function initializeQueue(): Promise<boolean> {
   const url = process.env.RABBITMQ_URL || 'amqp://docusign:docusign123@localhost:5672';
 
   try {
@@ -58,7 +122,7 @@ export async function initializeQueue() {
     confirmChannel = await connection.createConfirmChannel();
 
     // Handle connection errors
-    connection.on('error', (err) => {
+    connection.on('error', (err: Error) => {
       logger.error({ error: err.message }, 'RabbitMQ connection error');
     });
 
@@ -103,7 +167,8 @@ export async function initializeQueue() {
     logger.info('RabbitMQ queues initialized');
     return true;
   } catch (error) {
-    logger.error({ error: error.message }, 'Failed to initialize RabbitMQ');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Failed to initialize RabbitMQ');
     return false;
   }
 }
@@ -111,35 +176,45 @@ export async function initializeQueue() {
 /**
  * Close RabbitMQ connection.
  */
-export async function closeQueue() {
+export async function closeQueue(): Promise<void> {
   try {
     if (channel) await channel.close();
     if (confirmChannel) await confirmChannel.close();
     if (connection) await connection.close();
     logger.info('RabbitMQ connection closed');
   } catch (error) {
-    logger.error({ error: error.message }, 'Error closing RabbitMQ connection');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Error closing RabbitMQ connection');
   }
 }
 
 /**
  * Publish a message with delivery confirmation.
  *
- * @param {string} routingKey - Routing key (e.g., 'notification', 'email')
- * @param {Object} message - Message payload
- * @param {Object} options - Additional options
+ * @param routingKey - Routing key (e.g., 'notification', 'email')
+ * @param message - Message payload
+ * @param options - Additional options
  */
-export async function publishMessage(routingKey, message, options = {}) {
+export async function publishMessage(
+  routingKey: string,
+  message: Record<string, unknown>,
+  options: PublishOptions = {}
+): Promise<string> {
   const messageId = uuid();
-  const payload = {
+  const payload: QueueMessage = {
     id: messageId,
-    type: message.type,
+    type: message.type as string,
     data: message,
     timestamp: new Date().toISOString(),
     idempotencyKey: options.idempotencyKey || `${routingKey}:${messageId}`,
   };
 
   return new Promise((resolve, reject) => {
+    if (!confirmChannel) {
+      reject(new Error('Queue not initialized'));
+      return;
+    }
+
     confirmChannel.publish(
       EXCHANGES.DIRECT,
       routingKey,
@@ -170,7 +245,7 @@ export async function publishMessage(routingKey, message, options = {}) {
 /**
  * Publish notification for async delivery.
  */
-export async function publishNotification(notification) {
+export async function publishNotification(notification: NotificationMessage): Promise<string> {
   return publishMessage('notification', {
     type: 'notification',
     recipientId: notification.recipientId,
@@ -183,7 +258,7 @@ export async function publishNotification(notification) {
 /**
  * Publish email for async sending.
  */
-export async function publishEmail(email) {
+export async function publishEmail(email: EmailMessage): Promise<string> {
   return publishMessage('email', {
     type: 'email',
     recipientId: email.recipientId,
@@ -198,7 +273,7 @@ export async function publishEmail(email) {
 /**
  * Publish workflow event for async processing.
  */
-export async function publishWorkflowEvent(event) {
+export async function publishWorkflowEvent(event: WorkflowEvent): Promise<string> {
   return publishMessage('workflow', {
     type: 'workflow',
     eventType: event.eventType,
@@ -213,7 +288,7 @@ export async function publishWorkflowEvent(event) {
 /**
  * Publish reminder for scheduled delivery.
  */
-export async function publishReminder(reminder) {
+export async function publishReminder(reminder: ReminderMessage): Promise<string> {
   return publishMessage('reminder', {
     type: 'reminder',
     envelopeId: reminder.envelopeId,
@@ -225,20 +300,28 @@ export async function publishReminder(reminder) {
 /**
  * Create a consumer for a queue.
  *
- * @param {string} queue - Queue name
- * @param {Function} handler - Message handler function
- * @param {Object} options - Consumer options
+ * @param queue - Queue name
+ * @param handler - Message handler function
+ * @param options - Consumer options
  */
-export async function createConsumer(queue, handler, options = {}) {
+export async function createConsumer(
+  queue: string,
+  handler: (message: QueueMessage) => Promise<void>,
+  options: ConsumerOptions = {}
+): Promise<void> {
   const { concurrency = 5 } = options;
+
+  if (!channel) {
+    throw new Error('Queue not initialized');
+  }
 
   await channel.prefetch(concurrency);
 
-  await channel.consume(queue, async (msg) => {
-    if (!msg) return;
+  await channel.consume(queue, async (msg: ConsumeMessage | null) => {
+    if (!msg || !channel) return;
 
-    const message = JSON.parse(msg.content.toString());
-    const retryCount = msg.properties.headers['x-retry-count'] || 0;
+    const message: QueueMessage = JSON.parse(msg.content.toString());
+    const retryCount = (msg.properties.headers?.['x-retry-count'] as number) || 0;
     const startTime = Date.now();
 
     try {
@@ -255,8 +338,9 @@ export async function createConsumer(queue, handler, options = {}) {
       }, 'Message processed');
 
     } catch (error) {
+      const err = error as Error;
       logger.error({
-        error: error.message,
+        error: err.message,
         messageId: message.id,
         queue,
         retryCount
@@ -270,6 +354,7 @@ export async function createConsumer(queue, handler, options = {}) {
         const delay = Math.min(1000 * Math.pow(2, retryCount + 1), 60000);
 
         setTimeout(async () => {
+          if (!channel) return;
           await channel.publish(
             EXCHANGES.DIRECT,
             queue === QUEUES.NOTIFICATIONS ? 'notification' :
@@ -300,14 +385,14 @@ export async function createConsumer(queue, handler, options = {}) {
 /**
  * Check if queue is connected and healthy.
  */
-export function isQueueHealthy() {
+export function isQueueHealthy(): boolean {
   return connection !== null && channel !== null;
 }
 
 /**
  * Get queue health status.
  */
-export async function getQueueHealth() {
+export async function getQueueHealth(): Promise<QueueHealthStatus> {
   if (!connection || !channel) {
     return { status: 'disconnected' };
   }
@@ -331,7 +416,8 @@ export async function getQueueHealth() {
       },
     };
   } catch (error) {
-    return { status: 'error', error: error.message };
+    const err = error as Error;
+    return { status: 'error', error: err.message };
   }
 }
 

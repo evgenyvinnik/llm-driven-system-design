@@ -28,8 +28,13 @@ export const getClient = async (): Promise<PoolClient> => {
   return await pool.connect();
 };
 
+export const end = async (): Promise<void> => {
+  await pool.end();
+};
+
 export const db = {
   query,
   getClient,
   pool,
+  end,
 };

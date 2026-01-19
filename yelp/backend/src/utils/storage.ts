@@ -1,13 +1,18 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 
-const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'http://localhost:9000';
-const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || 'minioadmin';
-const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY || 'minioadmin';
-const MINIO_BUCKET = process.env.MINIO_BUCKET || 'yelp-photos';
+const MINIO_ENDPOINT: string =
+  process.env.MINIO_ENDPOINT || 'http://localhost:9000';
+const MINIO_ACCESS_KEY: string = process.env.MINIO_ACCESS_KEY || 'minioadmin';
+const MINIO_SECRET_KEY: string = process.env.MINIO_SECRET_KEY || 'minioadmin';
+const MINIO_BUCKET: string = process.env.MINIO_BUCKET || 'yelp-photos';
 
-const s3Client = new S3Client({
+const s3Client: S3Client = new S3Client({
   endpoint: MINIO_ENDPOINT,
   region: 'us-east-1',
   credentials: {
@@ -19,13 +24,18 @@ const s3Client = new S3Client({
 
 /**
  * Upload a file to MinIO
- * @param {Buffer} fileBuffer - The file buffer
- * @param {string} originalName - Original filename
- * @param {string} mimeType - MIME type of the file
- * @param {string} folder - Folder prefix (e.g., 'business', 'review')
- * @returns {Promise<string>} - The public URL of the uploaded file
+ * @param fileBuffer - The file buffer
+ * @param originalName - Original filename
+ * @param mimeType - MIME type of the file
+ * @param folder - Folder prefix (e.g., 'business', 'review')
+ * @returns The public URL of the uploaded file
  */
-export async function uploadPhoto(fileBuffer, originalName, mimeType, folder = 'photos') {
+export async function uploadPhoto(
+  fileBuffer: Buffer,
+  originalName: string,
+  mimeType: string,
+  folder: string = 'photos'
+): Promise<string> {
   const ext = path.extname(originalName);
   const key = `${folder}/${uuidv4()}${ext}`;
 
@@ -44,10 +54,9 @@ export async function uploadPhoto(fileBuffer, originalName, mimeType, folder = '
 
 /**
  * Delete a file from MinIO
- * @param {string} url - The full URL of the file to delete
- * @returns {Promise<void>}
+ * @param url - The full URL of the file to delete
  */
-export async function deletePhoto(url) {
+export async function deletePhoto(url: string): Promise<void> {
   // Extract key from URL
   const urlObj = new URL(url);
   const key = urlObj.pathname.replace(`/${MINIO_BUCKET}/`, '');

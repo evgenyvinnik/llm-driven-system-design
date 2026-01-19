@@ -8,11 +8,23 @@
  * - Sensitive data redaction (emails, payment info)
  */
 
-const pino = require('pino');
-const config = require('../config');
+import pino, { Logger } from 'pino';
+import crypto from 'crypto';
+import { Request, Response, NextFunction } from 'express';
+import config from '../config/index.js';
+
+// Extend Express Request to include our custom properties
+declare global {
+  namespace Express {
+    interface Request {
+      traceId?: string;
+      log?: Logger;
+    }
+  }
+}
 
 // Redact sensitive fields
-const redactPaths = [
+const redactPaths: string[] = [
   'password',
   'passwordHash',
   'credit_card',
@@ -25,7 +37,7 @@ const redactPaths = [
   'req.headers.cookie',
 ];
 
-const logger = pino({
+export const logger: Logger = pino({
   level: config.nodeEnv === 'development' ? 'debug' : 'info',
   redact: redactPaths,
   base: {
@@ -34,7 +46,7 @@ const logger = pino({
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   formatters: {
-    level: (label) => ({ level: label }),
+    level: (label: string) => ({ level: label }),
   },
   transport:
     config.nodeEnv === 'development'
@@ -51,30 +63,30 @@ const logger = pino({
 
 /**
  * Create a child logger with request context
- * @param {Object} context - Request context (traceId, userId, etc.)
- * @returns {pino.Logger} Child logger with context
+ * @param context - Request context (traceId, userId, etc.)
+ * @returns Child logger with context
  */
-function createRequestLogger(context = {}) {
+export function createRequestLogger(context: Record<string, unknown> = {}): Logger {
   return logger.child(context);
 }
 
 /**
  * Extract trace ID from request or generate one
- * @param {Object} req - Express request object
- * @returns {string} Trace ID
+ * @param req - Express request object
+ * @returns Trace ID
  */
-function getTraceId(req) {
+export function getTraceId(req: Request): string {
   return (
-    req.headers['x-request-id'] ||
-    req.headers['x-trace-id'] ||
-    require('crypto').randomUUID()
+    (req.headers['x-request-id'] as string | undefined) ||
+    (req.headers['x-trace-id'] as string | undefined) ||
+    crypto.randomUUID()
   );
 }
 
 /**
  * Express middleware for request logging
  */
-function requestLoggerMiddleware(req, res, next) {
+export function requestLoggerMiddleware(req: Request, res: Response, next: NextFunction): void {
   const traceId = getTraceId(req);
   const startTime = Date.now();
 
@@ -100,11 +112,11 @@ function requestLoggerMiddleware(req, res, next) {
     };
 
     if (res.statusCode >= 500) {
-      req.log.error(logData, 'Request failed');
+      req.log?.error(logData, 'Request failed');
     } else if (res.statusCode >= 400) {
-      req.log.warn(logData, 'Request completed with client error');
+      req.log?.warn(logData, 'Request completed with client error');
     } else {
-      req.log.info(logData, 'Request completed');
+      req.log?.info(logData, 'Request completed');
     }
   });
 
@@ -114,7 +126,7 @@ function requestLoggerMiddleware(req, res, next) {
   next();
 }
 
-module.exports = {
+export default {
   logger,
   createRequestLogger,
   getTraceId,

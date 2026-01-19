@@ -9,24 +9,76 @@
  * Supports both simple liveness checks and detailed readiness checks
  */
 
-const db = require('../models/db');
-const redis = require('../models/redis');
-const elasticsearch = require('../models/elasticsearch');
-const { logger } = require('./logger');
-const metrics = require('./metrics');
+import { query, pool } from '../models/db.js';
+import redis from '../models/redis.js';
+import { getClient } from '../models/elasticsearch.js';
+import { logger } from './logger.js';
+import * as metrics from './metrics.js';
+import express, { Router, Request, Response } from 'express';
+
+export interface DatabaseHealthStatus {
+  status: 'healthy' | 'unhealthy';
+  latencyMs: number;
+  pool?: {
+    total: number;
+    idle: number;
+    waiting: number;
+  };
+  error?: string;
+}
+
+export interface RedisHealthStatus {
+  status: 'healthy' | 'unhealthy';
+  latencyMs: number;
+  error?: string;
+}
+
+export interface ElasticsearchHealthStatus {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  latencyMs: number;
+  clusterStatus?: string;
+  numberOfNodes?: number;
+  activeShards?: number;
+  error?: string;
+}
+
+export interface HealthStatus {
+  status: 'healthy' | 'unhealthy';
+  timestamp: string;
+  totalLatencyMs: number;
+  dependencies: {
+    database: DatabaseHealthStatus;
+    cache: RedisHealthStatus;
+    search: ElasticsearchHealthStatus;
+  };
+}
+
+export interface LivenessStatus {
+  status: 'alive';
+  timestamp: string;
+  uptime: number;
+  memory: NodeJS.MemoryUsage;
+}
+
+export interface ReadinessStatus extends HealthStatus {
+  ready: boolean;
+}
+
+interface HealthCheckRow {
+  health_check: number;
+}
 
 /**
  * Check PostgreSQL health
- * @returns {Object} Health status
+ * @returns Health status
  */
-async function checkDatabase() {
+export async function checkDatabase(): Promise<DatabaseHealthStatus> {
   const startTime = Date.now();
   try {
-    const result = await db.query('SELECT 1 as health_check');
+    const result = await query<HealthCheckRow>('SELECT 1 as health_check');
 
     if (result.rows[0]?.health_check === 1) {
       // Update pool metrics
-      const pool = db.pool;
       metrics.dbPoolActiveConnections.set(pool.totalCount - pool.idleCount);
       metrics.dbPoolIdleConnections.set(pool.idleCount);
 
@@ -43,10 +95,11 @@ async function checkDatabase() {
 
     throw new Error('Unexpected query result');
   } catch (error) {
+    const err = error as Error;
     logger.error({ error }, 'Database health check failed');
     return {
       status: 'unhealthy',
-      error: error.message,
+      error: err.message,
       latencyMs: Date.now() - startTime,
     };
   }
@@ -54,9 +107,9 @@ async function checkDatabase() {
 
 /**
  * Check Redis health
- * @returns {Object} Health status
+ * @returns Health status
  */
-async function checkRedis() {
+export async function checkRedis(): Promise<RedisHealthStatus> {
   const startTime = Date.now();
   try {
     const result = await redis.ping();
@@ -71,11 +124,12 @@ async function checkRedis() {
 
     throw new Error(`Unexpected ping response: ${result}`);
   } catch (error) {
+    const err = error as Error;
     logger.error({ error }, 'Redis health check failed');
     metrics.redisConnectionStatus.set(0);
     return {
       status: 'unhealthy',
-      error: error.message,
+      error: err.message,
       latencyMs: Date.now() - startTime,
     };
   }
@@ -83,12 +137,12 @@ async function checkRedis() {
 
 /**
  * Check Elasticsearch health
- * @returns {Object} Health status
+ * @returns Health status
  */
-async function checkElasticsearch() {
+export async function checkElasticsearch(): Promise<ElasticsearchHealthStatus> {
   const startTime = Date.now();
   try {
-    const client = elasticsearch.getClient();
+    const client = getClient();
     const health = await client.cluster.health();
 
     const isHealthy = health.status === 'green' || health.status === 'yellow';
@@ -102,11 +156,12 @@ async function checkElasticsearch() {
       latencyMs: Date.now() - startTime,
     };
   } catch (error) {
+    const err = error as Error;
     logger.error({ error }, 'Elasticsearch health check failed');
     metrics.elasticsearchConnectionStatus.set(0);
     return {
       status: 'unhealthy',
-      error: error.message,
+      error: err.message,
       latencyMs: Date.now() - startTime,
     };
   }
@@ -114,9 +169,9 @@ async function checkElasticsearch() {
 
 /**
  * Perform full health check on all dependencies
- * @returns {Object} Comprehensive health status
+ * @returns Comprehensive health status
  */
-async function checkHealth() {
+export async function checkHealth(): Promise<HealthStatus> {
   const startTime = Date.now();
 
   const [database, cache, search] = await Promise.all([
@@ -145,9 +200,9 @@ async function checkHealth() {
 /**
  * Simple liveness check
  * Used by Kubernetes/Docker to determine if process is alive
- * @returns {Object} Liveness status
+ * @returns Liveness status
  */
-function livenessCheck() {
+export function livenessCheck(): LivenessStatus {
   return {
     status: 'alive',
     timestamp: new Date().toISOString(),
@@ -159,9 +214,9 @@ function livenessCheck() {
 /**
  * Readiness check
  * Used by Kubernetes/Docker to determine if service can accept traffic
- * @returns {Object} Readiness status
+ * @returns Readiness status
  */
-async function readinessCheck() {
+export async function readinessCheck(): Promise<ReadinessStatus> {
   const health = await checkHealth();
 
   return {
@@ -173,38 +228,40 @@ async function readinessCheck() {
 /**
  * Express router for health endpoints
  */
-function createHealthRouter(express) {
-  const router = express.Router();
+export function createHealthRouter(_express: typeof express): Router {
+  const router = Router();
 
   // Simple liveness probe
-  router.get('/live', (req, res) => {
+  router.get('/live', (_req: Request, res: Response) => {
     res.json(livenessCheck());
   });
 
   // Readiness probe with dependency checks
-  router.get('/ready', async (req, res) => {
+  router.get('/ready', async (_req: Request, res: Response) => {
     try {
       const status = await readinessCheck();
       res.status(status.ready ? 200 : 503).json(status);
     } catch (error) {
+      const err = error as Error;
       logger.error({ error }, 'Readiness check error');
       res.status(503).json({
         ready: false,
-        error: error.message,
+        error: err.message,
       });
     }
   });
 
   // Detailed health check
-  router.get('/', async (req, res) => {
+  router.get('/', async (_req: Request, res: Response) => {
     try {
       const health = await checkHealth();
       res.status(health.status === 'healthy' ? 200 : 503).json(health);
     } catch (error) {
+      const err = error as Error;
       logger.error({ error }, 'Health check error');
       res.status(503).json({
         status: 'error',
-        error: error.message,
+        error: err.message,
       });
     }
   });
@@ -212,7 +269,7 @@ function createHealthRouter(express) {
   return router;
 }
 
-module.exports = {
+export default {
   checkDatabase,
   checkRedis,
   checkElasticsearch,

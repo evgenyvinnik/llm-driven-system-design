@@ -3,6 +3,7 @@ import { query, getClient } from '../utils/db.js';
 import { redisClient } from '../utils/redis.js';
 import logger, { auditLogger } from './logger.js';
 import { idempotencyHits, idempotencyMisses } from './metrics.js';
+import { Request, Response, NextFunction } from 'express';
 
 /**
  * Idempotency handling for legal document operations.
@@ -29,14 +30,23 @@ import { idempotencyHits, idempotencyMisses } from './metrics.js';
 // Idempotency key TTL (24 hours - enough for client retries)
 const IDEMPOTENCY_TTL_SECONDS = 86400;
 
+export interface IdempotencyResult<T> {
+  data: T;
+  cached: boolean;
+}
+
+interface IdempotencyKeyRow {
+  response: unknown;
+}
+
 /**
  * Check if an operation was already performed using idempotency key.
  * Uses Redis for fast lookups with PostgreSQL as persistent backup.
  *
- * @param {string} idempotencyKey - Unique key for the operation
- * @returns {Object|null} - Cached response if exists, null if new operation
+ * @param idempotencyKey - Unique key for the operation
+ * @returns Cached response if exists, null if new operation
  */
-export async function checkIdempotency(idempotencyKey) {
+export async function checkIdempotency<T>(idempotencyKey: string | undefined): Promise<T | null> {
   if (!idempotencyKey) {
     return null;
   }
@@ -49,11 +59,11 @@ export async function checkIdempotency(idempotencyKey) {
     if (cached) {
       logger.info({ idempotencyKey }, 'Idempotency hit (Redis cache)');
       idempotencyHits.inc({ operation: 'signature' });
-      return JSON.parse(cached);
+      return JSON.parse(cached) as T;
     }
 
     // Check PostgreSQL (slow path, for durability)
-    const result = await query(
+    const result = await query<IdempotencyKeyRow>(
       `SELECT response FROM idempotency_keys
        WHERE key = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
       [idempotencyKey]
@@ -65,14 +75,15 @@ export async function checkIdempotency(idempotencyKey) {
       await redisClient.setEx(cacheKey, IDEMPOTENCY_TTL_SECONDS, JSON.stringify(response));
       logger.info({ idempotencyKey }, 'Idempotency hit (PostgreSQL)');
       idempotencyHits.inc({ operation: 'signature' });
-      return response;
+      return response as T;
     }
 
     idempotencyMisses.inc({ operation: 'signature' });
     return null;
   } catch (error) {
     // Log but don't fail - idempotency is a safety feature
-    logger.error({ error: error.message, idempotencyKey }, 'Idempotency check failed');
+    const err = error as Error;
+    logger.error({ error: err.message, idempotencyKey }, 'Idempotency check failed');
     return null;
   }
 }
@@ -80,10 +91,10 @@ export async function checkIdempotency(idempotencyKey) {
 /**
  * Store idempotency key with response for future duplicate detection.
  *
- * @param {string} idempotencyKey - Unique key for the operation
- * @param {Object} response - Response to cache
+ * @param idempotencyKey - Unique key for the operation
+ * @param response - Response to cache
  */
-export async function storeIdempotency(idempotencyKey, response) {
+export async function storeIdempotency<T>(idempotencyKey: string | undefined, response: T): Promise<void> {
   if (!idempotencyKey) {
     return;
   }
@@ -105,7 +116,8 @@ export async function storeIdempotency(idempotencyKey, response) {
     logger.debug({ idempotencyKey }, 'Idempotency key stored');
   } catch (error) {
     // Log but don't fail the main operation
-    logger.error({ error: error.message, idempotencyKey }, 'Failed to store idempotency key');
+    const err = error as Error;
+    logger.error({ error: err.message, idempotencyKey }, 'Failed to store idempotency key');
   }
 }
 
@@ -116,7 +128,7 @@ export async function storeIdempotency(idempotencyKey, response) {
  * Using 1-hour time buckets to allow legitimate re-signs after failures
  * while catching rapid duplicates.
  */
-export function generateSignatureIdempotencyKey(fieldId, recipientId) {
+export function generateSignatureIdempotencyKey(fieldId: string, recipientId: string): string {
   const hourBucket = Math.floor(Date.now() / 3600000);
   return `sig:${fieldId}:${recipientId}:${hourBucket}`;
 }
@@ -124,7 +136,7 @@ export function generateSignatureIdempotencyKey(fieldId, recipientId) {
 /**
  * Generate an idempotency key for envelope send operations.
  */
-export function generateSendIdempotencyKey(envelopeId, userId) {
+export function generateSendIdempotencyKey(envelopeId: string, userId: string): string {
   const hourBucket = Math.floor(Date.now() / 3600000);
   return `send:${envelopeId}:${userId}:${hourBucket}`;
 }
@@ -132,7 +144,7 @@ export function generateSendIdempotencyKey(envelopeId, userId) {
 /**
  * Generate an idempotency key for recipient completion.
  */
-export function generateCompletionIdempotencyKey(recipientId) {
+export function generateCompletionIdempotencyKey(recipientId: string): string {
   const hourBucket = Math.floor(Date.now() / 3600000);
   return `complete:${recipientId}:${hourBucket}`;
 }
@@ -141,14 +153,18 @@ export function generateCompletionIdempotencyKey(recipientId) {
  * Execute an operation with idempotency protection.
  * This is the main function to use for critical operations.
  *
- * @param {string} idempotencyKey - Unique key for the operation
- * @param {Function} operation - Async function to execute
- * @param {string} operationType - Type for logging (e.g., 'signature', 'send')
- * @returns {Object} - Result with { data, cached: boolean }
+ * @param idempotencyKey - Unique key for the operation
+ * @param operation - Async function to execute
+ * @param operationType - Type for logging (e.g., 'signature', 'send')
+ * @returns Result with { data, cached: boolean }
  */
-export async function executeWithIdempotency(idempotencyKey, operation, operationType = 'unknown') {
+export async function executeWithIdempotency<T>(
+  idempotencyKey: string,
+  operation: () => Promise<T>,
+  operationType: string = 'unknown'
+): Promise<IdempotencyResult<T>> {
   // Check for existing result
-  const existing = await checkIdempotency(idempotencyKey);
+  const existing = await checkIdempotency<T>(idempotencyKey);
   if (existing) {
     auditLogger.info({
       idempotencyKey,
@@ -178,14 +194,15 @@ export async function executeWithIdempotency(idempotencyKey, operation, operatio
  * Middleware to extract or generate idempotency key from request.
  * Clients should send X-Idempotency-Key header for POST/PUT requests.
  */
-export function idempotencyMiddleware(req, res, next) {
+export function idempotencyMiddleware(req: Request, res: Response, next: NextFunction): void {
   // Only for mutating requests
   if (!['POST', 'PUT', 'PATCH'].includes(req.method)) {
-    return next();
+    next();
+    return;
   }
 
   // Get from header or generate based on request
-  let idempotencyKey = req.headers['x-idempotency-key'];
+  let idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
   if (!idempotencyKey) {
     // Generate a default key based on request body hash

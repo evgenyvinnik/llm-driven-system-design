@@ -13,7 +13,7 @@ redis.on('connect', () => {
   indexLogger.info('Connected to Redis');
 });
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   indexLogger.error({ error: err.message }, 'Redis connection error');
 });
 
@@ -23,56 +23,50 @@ redis.on('close', () => {
 
 /**
  * Get a value from Redis cache
- * @param {string} key - Cache key
- * @returns {Promise<any|null>} - Cached value or null
  */
-export async function cacheGet(key) {
+export async function cacheGet<T = unknown>(key: string): Promise<T | null> {
   try {
     const value = await redis.get(key);
-    return value ? JSON.parse(value) : null;
+    return value ? (JSON.parse(value) as T) : null;
   } catch (err) {
-    indexLogger.error({ key, error: err.message }, 'Cache get error');
+    const error = err as Error;
+    indexLogger.error({ key, error: error.message }, 'Cache get error');
     return null;
   }
 }
 
 /**
  * Set a value in Redis cache with optional TTL
- * @param {string} key - Cache key
- * @param {any} value - Value to cache
- * @param {number} ttlSeconds - TTL in seconds (default: 1 hour)
- * @returns {Promise<boolean>} - Success status
  */
-export async function cacheSet(key, value, ttlSeconds = 3600) {
+export async function cacheSet(key: string, value: unknown, ttlSeconds: number = 3600): Promise<boolean> {
   try {
     await redis.setex(key, ttlSeconds, JSON.stringify(value));
     return true;
   } catch (err) {
-    indexLogger.error({ key, error: err.message }, 'Cache set error');
+    const error = err as Error;
+    indexLogger.error({ key, error: error.message }, 'Cache set error');
     return false;
   }
 }
 
 /**
  * Delete a key from Redis cache
- * @param {string} key - Cache key
- * @returns {Promise<boolean>} - Success status
  */
-export async function cacheDel(key) {
+export async function cacheDel(key: string): Promise<boolean> {
   try {
     await redis.del(key);
     return true;
   } catch (err) {
-    indexLogger.error({ key, error: err.message }, 'Cache delete error');
+    const error = err as Error;
+    indexLogger.error({ key, error: error.message }, 'Cache delete error');
     return false;
   }
 }
 
 /**
  * Check if Redis is connected
- * @returns {Promise<boolean>} - Connection status
  */
-export async function isRedisConnected() {
+export async function isRedisConnected(): Promise<boolean> {
   try {
     await redis.ping();
     return true;
@@ -84,12 +78,13 @@ export async function isRedisConnected() {
 /**
  * Gracefully close Redis connection
  */
-export async function closeRedis() {
+export async function closeRedis(): Promise<void> {
   try {
     await redis.quit();
     indexLogger.info('Redis connection closed gracefully');
   } catch (err) {
-    indexLogger.error({ error: err.message }, 'Error closing Redis connection');
+    const error = err as Error;
+    indexLogger.error({ error: error.message }, 'Error closing Redis connection');
   }
 }
 

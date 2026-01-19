@@ -7,7 +7,7 @@ const redis = new Redis({
   maxRetriesPerRequest: 3,
 });
 
-redis.on('error', (err) => {
+redis.on('error', (err: Error) => {
   console.error('Redis connection error:', err);
 });
 

@@ -1,15 +1,47 @@
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { query, transaction } from '../services/database.js';
 import { requireAuth } from '../middleware/auth.js';
+import type { PoolClient } from 'pg';
 
 const router = Router();
 
-const RESERVATION_MINUTES = parseInt(process.env.CART_RESERVATION_MINUTES) || 30;
+const RESERVATION_MINUTES = parseInt(process.env.CART_RESERVATION_MINUTES || '30');
+
+interface CartItemRow {
+  id: number;
+  quantity: number;
+  reserved_until?: Date;
+  added_at?: Date;
+  product_id: number;
+  title?: string;
+  slug?: string;
+  price?: string;
+  images?: string[];
+  stock_quantity?: string;
+}
+
+interface InventoryRow {
+  available: string;
+}
+
+interface CartQuantityRow {
+  quantity: number;
+}
+
+interface CartResponse {
+  items: CartItemRow[];
+  subtotal: string;
+  itemCount: number;
+}
+
+interface AppError extends Error {
+  status?: number;
+}
 
 // Get cart
-router.get('/', requireAuth, async (req, res, next) => {
+router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const result = await query(
+    const result = await query<CartItemRow>(
       `SELECT ci.id, ci.quantity, ci.reserved_until, ci.added_at,
               p.id as product_id, p.title, p.slug, p.price, p.images,
               COALESCE(SUM(i.quantity - i.reserved), 0) as stock_quantity
@@ -19,11 +51,11 @@ router.get('/', requireAuth, async (req, res, next) => {
        WHERE ci.user_id = $1
        GROUP BY ci.id, p.id
        ORDER BY ci.added_at DESC`,
-      [req.user.id]
+      [req.user!.id]
     );
 
     const items = result.rows;
-    const subtotal = items.reduce((sum, item) => sum + (parseFloat(item.price) * item.quantity), 0);
+    const subtotal = items.reduce((sum, item) => sum + (parseFloat(item.price || '0') * item.quantity), 0);
 
     res.json({
       items,
@@ -36,32 +68,32 @@ router.get('/', requireAuth, async (req, res, next) => {
 });
 
 // Add to cart
-router.post('/', requireAuth, async (req, res, next) => {
+router.post('/', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { productId, quantity = 1 } = req.body;
 
-    await transaction(async (client) => {
+    await transaction(async (client: PoolClient) => {
       // Check available inventory
-      const inventoryResult = await client.query(
+      const inventoryResult = await client.query<InventoryRow>(
         `SELECT COALESCE(SUM(quantity - reserved), 0) as available
          FROM inventory
          WHERE product_id = $1`,
         [productId]
       );
 
-      const available = parseInt(inventoryResult.rows[0].available);
+      const available = parseInt(inventoryResult.rows[0]?.available || '0');
 
       // Check existing cart item
-      const existingResult = await client.query(
+      const existingResult = await client.query<CartQuantityRow>(
         'SELECT quantity FROM cart_items WHERE user_id = $1 AND product_id = $2',
-        [req.user.id, productId]
+        [req.user!.id, productId]
       );
 
       const existingQuantity = existingResult.rows[0]?.quantity || 0;
       const totalQuantity = existingQuantity + quantity;
 
       if (available < totalQuantity) {
-        const error = new Error(`Only ${available} items available`);
+        const error: AppError = new Error(`Only ${available} items available`);
         error.status = 400;
         throw error;
       }
@@ -83,12 +115,12 @@ router.post('/', requireAuth, async (req, res, next) => {
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, product_id)
          DO UPDATE SET quantity = cart_items.quantity + $3, reserved_until = $4`,
-        [req.user.id, productId, quantity, reservedUntil]
+        [req.user!.id, productId, quantity, reservedUntil]
       );
     });
 
     // Return updated cart
-    const cart = await getCart(req.user.id);
+    const cart = await getCart(req.user!.id);
     res.json(cart);
   } catch (error) {
     next(error);
@@ -96,24 +128,25 @@ router.post('/', requireAuth, async (req, res, next) => {
 });
 
 // Update cart item quantity
-router.put('/:productId', requireAuth, async (req, res, next) => {
+router.put('/:productId', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { productId } = req.params;
     const { quantity } = req.body;
 
     if (quantity < 1) {
-      return res.status(400).json({ error: 'Quantity must be at least 1' });
+      res.status(400).json({ error: 'Quantity must be at least 1' });
+      return;
     }
 
-    await transaction(async (client) => {
+    await transaction(async (client: PoolClient) => {
       // Get current cart item
-      const currentResult = await client.query(
+      const currentResult = await client.query<CartQuantityRow>(
         'SELECT quantity FROM cart_items WHERE user_id = $1 AND product_id = $2',
-        [req.user.id, productId]
+        [req.user!.id, productId]
       );
 
       if (currentResult.rows.length === 0) {
-        const error = new Error('Item not in cart');
+        const error: AppError = new Error('Item not in cart');
         error.status = 404;
         throw error;
       }
@@ -123,16 +156,16 @@ router.put('/:productId', requireAuth, async (req, res, next) => {
 
       if (quantityDiff > 0) {
         // Need more - check availability
-        const inventoryResult = await client.query(
+        const inventoryResult = await client.query<InventoryRow>(
           `SELECT COALESCE(SUM(quantity - reserved), 0) as available
            FROM inventory
            WHERE product_id = $1`,
           [productId]
         );
 
-        const available = parseInt(inventoryResult.rows[0].available);
+        const available = parseInt(inventoryResult.rows[0]?.available || '0');
         if (available < quantityDiff) {
-          const error = new Error(`Only ${available + currentQuantity} items available`);
+          const error: AppError = new Error(`Only ${available + currentQuantity} items available`);
           error.status = 400;
           throw error;
         }
@@ -152,11 +185,11 @@ router.put('/:productId', requireAuth, async (req, res, next) => {
         `UPDATE cart_items
          SET quantity = $1, reserved_until = $2
          WHERE user_id = $3 AND product_id = $4`,
-        [quantity, reservedUntil, req.user.id, productId]
+        [quantity, reservedUntil, req.user!.id, productId]
       );
     });
 
-    const cart = await getCart(req.user.id);
+    const cart = await getCart(req.user!.id);
     res.json(cart);
   } catch (error) {
     next(error);
@@ -164,15 +197,15 @@ router.put('/:productId', requireAuth, async (req, res, next) => {
 });
 
 // Remove from cart
-router.delete('/:productId', requireAuth, async (req, res, next) => {
+router.delete('/:productId', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { productId } = req.params;
 
-    await transaction(async (client) => {
+    await transaction(async (client: PoolClient) => {
       // Get cart item quantity
-      const cartResult = await client.query(
+      const cartResult = await client.query<CartQuantityRow>(
         'SELECT quantity FROM cart_items WHERE user_id = $1 AND product_id = $2',
-        [req.user.id, productId]
+        [req.user!.id, productId]
       );
 
       if (cartResult.rows.length === 0) {
@@ -192,11 +225,11 @@ router.delete('/:productId', requireAuth, async (req, res, next) => {
       // Remove cart item
       await client.query(
         'DELETE FROM cart_items WHERE user_id = $1 AND product_id = $2',
-        [req.user.id, productId]
+        [req.user!.id, productId]
       );
     });
 
-    const cart = await getCart(req.user.id);
+    const cart = await getCart(req.user!.id);
     res.json(cart);
   } catch (error) {
     next(error);
@@ -204,13 +237,13 @@ router.delete('/:productId', requireAuth, async (req, res, next) => {
 });
 
 // Clear cart
-router.delete('/', requireAuth, async (req, res, next) => {
+router.delete('/', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    await transaction(async (client) => {
+    await transaction(async (client: PoolClient) => {
       // Get all cart items
-      const cartResult = await client.query(
+      const cartResult = await client.query<{ product_id: number; quantity: number }>(
         'SELECT product_id, quantity FROM cart_items WHERE user_id = $1',
-        [req.user.id]
+        [req.user!.id]
       );
 
       // Release all reservations
@@ -224,7 +257,7 @@ router.delete('/', requireAuth, async (req, res, next) => {
       }
 
       // Clear cart
-      await client.query('DELETE FROM cart_items WHERE user_id = $1', [req.user.id]);
+      await client.query('DELETE FROM cart_items WHERE user_id = $1', [req.user!.id]);
     });
 
     res.json({ items: [], subtotal: '0.00', itemCount: 0 });
@@ -234,8 +267,8 @@ router.delete('/', requireAuth, async (req, res, next) => {
 });
 
 // Helper function to get cart
-async function getCart(userId) {
-  const result = await query(
+async function getCart(userId: number): Promise<CartResponse> {
+  const result = await query<CartItemRow>(
     `SELECT ci.id, ci.quantity, ci.reserved_until, ci.added_at,
             p.id as product_id, p.title, p.slug, p.price, p.images,
             COALESCE(SUM(i.quantity - i.reserved), 0) as stock_quantity
@@ -249,7 +282,7 @@ async function getCart(userId) {
   );
 
   const items = result.rows;
-  const subtotal = items.reduce((sum, item) => sum + (parseFloat(item.price) * item.quantity), 0);
+  const subtotal = items.reduce((sum, item) => sum + (parseFloat(item.price || '0') * item.quantity), 0);
 
   return {
     items,

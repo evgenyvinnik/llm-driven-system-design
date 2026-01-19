@@ -1,11 +1,40 @@
 import { redis } from './redis.js';
 import { createLogger } from './logger.js';
 import { idempotencyCacheHits } from './metrics.js';
+import { Logger } from 'pino';
 
-const log = createLogger('idempotency');
+const log: Logger = createLogger('idempotency');
 
 // Default TTL for idempotency keys: 24 hours
 const DEFAULT_TTL_SECONDS = 86400;
+
+export interface IdempotencyOptions {
+  ttlSeconds?: number;
+  keyPrefix?: string;
+}
+
+interface IdempotencyCheckResult {
+  found: boolean;
+  result: unknown;
+  status: string | null;
+}
+
+interface IdempotencyExecuteResult<T> {
+  result: T;
+  cached: boolean;
+}
+
+interface CachedEntry {
+  status: string;
+  result?: unknown;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+interface RetryableError extends Error {
+  retryable?: boolean;
+  code?: string;
+}
 
 /**
  * Idempotency service for ensuring exactly-once processing of notifications.
@@ -21,29 +50,26 @@ const DEFAULT_TTL_SECONDS = 86400;
  * - Load balancer routes same request to different instances
  */
 export class IdempotencyService {
-  constructor(options = {}) {
+  private ttlSeconds: number;
+  private keyPrefix: string;
+
+  constructor(options: IdempotencyOptions = {}) {
     this.ttlSeconds = options.ttlSeconds || DEFAULT_TTL_SECONDS;
     this.keyPrefix = options.keyPrefix || 'idempotency';
   }
 
   /**
    * Build the Redis key for an idempotency key
-   *
-   * @param {string} key - The idempotency key
-   * @returns {string}
    */
-  buildKey(key) {
+  buildKey(key: string): string {
     return `${this.keyPrefix}:${key}`;
   }
 
   /**
    * Check if a request with the given idempotency key was already processed.
    * If so, return the cached result. Otherwise, return null.
-   *
-   * @param {string} idempotencyKey - Unique key for this request
-   * @returns {Promise<{found: boolean, result: any|null, status: string|null}>}
    */
-  async check(idempotencyKey) {
+  async check(idempotencyKey: string | undefined): Promise<IdempotencyCheckResult> {
     if (!idempotencyKey) {
       return { found: false, result: null, status: null };
     }
@@ -54,7 +80,7 @@ export class IdempotencyService {
       const cached = await redis.get(redisKey);
 
       if (cached) {
-        const parsed = JSON.parse(cached);
+        const parsed = JSON.parse(cached) as CachedEntry;
 
         // Check if the request is still in progress
         if (parsed.status === 'processing') {
@@ -81,11 +107,8 @@ export class IdempotencyService {
    * Mark a request as in-progress. This is used to detect concurrent duplicate requests.
    *
    * Uses SET NX to ensure only one instance can claim the key.
-   *
-   * @param {string} idempotencyKey - Unique key for this request
-   * @returns {Promise<boolean>} - True if successfully claimed, false if already processing
    */
-  async markProcessing(idempotencyKey) {
+  async markProcessing(idempotencyKey: string | undefined): Promise<boolean> {
     if (!idempotencyKey) {
       return true; // No idempotency key means we always process
     }
@@ -119,12 +142,8 @@ export class IdempotencyService {
 
   /**
    * Store the result for an idempotency key after successful processing.
-   *
-   * @param {string} idempotencyKey - Unique key for this request
-   * @param {any} result - The result to cache
-   * @param {number} ttlSeconds - Optional TTL override
    */
-  async complete(idempotencyKey, result, ttlSeconds = null) {
+  async complete(idempotencyKey: string | undefined, result: unknown, ttlSeconds?: number): Promise<void> {
     if (!idempotencyKey) {
       return;
     }
@@ -150,10 +169,8 @@ export class IdempotencyService {
 
   /**
    * Remove the idempotency key (e.g., on processing failure that should be retried)
-   *
-   * @param {string} idempotencyKey - Unique key for this request
    */
-  async clear(idempotencyKey) {
+  async clear(idempotencyKey: string | undefined): Promise<void> {
     if (!idempotencyKey) {
       return;
     }
@@ -176,17 +193,16 @@ export class IdempotencyService {
    * 2. Mark as processing (with NX lock)
    * 3. Execute operation
    * 4. Store result on success, clear on retryable failure
-   *
-   * @param {string} idempotencyKey - Unique key for this request
-   * @param {Function} operation - Async operation to execute
-   * @returns {Promise<{result: any, cached: boolean}>}
    */
-  async executeWithIdempotency(idempotencyKey, operation) {
+  async executeWithIdempotency<T>(
+    idempotencyKey: string,
+    operation: () => Promise<T>
+  ): Promise<IdempotencyExecuteResult<T>> {
     // Step 1: Check for existing result
     const existing = await this.check(idempotencyKey);
 
     if (existing.found && existing.status === 'completed') {
-      return { result: existing.result, cached: true };
+      return { result: existing.result as T, cached: true };
     }
 
     if (existing.found && existing.status === 'processing') {
@@ -210,15 +226,16 @@ export class IdempotencyService {
 
       return { result, cached: false };
     } catch (error) {
+      const retryableError = error as RetryableError;
       // On retryable errors, clear the key so the request can be retried
-      if (error.retryable) {
+      if (retryableError.retryable) {
         await this.clear(idempotencyKey);
       } else {
         // For non-retryable errors, store the error as the result
         await this.complete(idempotencyKey, {
           error: true,
-          message: error.message,
-          code: error.code,
+          message: retryableError.message,
+          code: retryableError.code,
         });
       }
       throw error;
@@ -228,11 +245,8 @@ export class IdempotencyService {
   /**
    * Generate an idempotency key from request parameters.
    * Useful when clients don't provide their own idempotency key.
-   *
-   * @param {Object} params - Parameters to hash
-   * @returns {string}
    */
-  generateKey(params) {
+  generateKey(params: Record<string, unknown>): string {
     const data = JSON.stringify(params);
     // Simple hash for deduplication
     let hash = 0;
@@ -249,7 +263,11 @@ export class IdempotencyService {
  * Error thrown when a duplicate request is detected while processing
  */
 export class IdempotencyConflictError extends Error {
-  constructor(idempotencyKey) {
+  public idempotencyKey: string;
+  public statusCode: number;
+  public retryable: boolean;
+
+  constructor(idempotencyKey: string) {
     super(`Request with idempotency key ${idempotencyKey} is already being processed`);
     this.name = 'IdempotencyConflictError';
     this.idempotencyKey = idempotencyKey;

@@ -1,3 +1,4 @@
+import { Request, Response, NextFunction } from 'express';
 import redis from '../services/redis.js';
 import { idempotencyKeyHits } from './metrics.js';
 import { createLogger } from './logger.js';
@@ -11,18 +12,41 @@ const IDEMPOTENCY_KEY_TTL = 24 * 60 * 60;
 const IDEMPOTENCY_PREFIX = 'idempotency:';
 
 // Possible states for idempotency keys
-const IdempotencyState = {
+export const IdempotencyState = {
   PROCESSING: 'processing',
   COMPLETED: 'completed',
   FAILED: 'failed',
-};
+} as const;
+
+type IdempotencyStateType = typeof IdempotencyState[keyof typeof IdempotencyState];
+
+interface IdempotencyKeyResult {
+  exists: boolean;
+  state?: IdempotencyStateType;
+  result?: unknown;
+  statusCode?: number;
+}
+
+interface IdempotencyMiddlewareOptions {
+  required?: boolean;
+  methods?: string[];
+}
+
+// Extend Express Request to include idempotencyKey
+declare global {
+  namespace Express {
+    interface Request {
+      idempotencyKey?: string;
+    }
+  }
+}
 
 /**
  * Check if an idempotency key exists and get its result
- * @param {string} key - The idempotency key (usually from Idempotency-Key header)
- * @returns {Promise<{exists: boolean, state?: string, result?: any}>}
+ * @param key - The idempotency key (usually from Idempotency-Key header)
+ * @returns Object containing exists flag and optional state/result
  */
-export async function checkIdempotencyKey(key) {
+export async function checkIdempotencyKey(key: string): Promise<IdempotencyKeyResult> {
   try {
     const data = await redis.get(`${IDEMPOTENCY_PREFIX}${key}`);
     if (!data) {
@@ -48,11 +72,11 @@ export async function checkIdempotencyKey(key) {
 /**
  * Start processing for an idempotency key
  * Acquires a lock to prevent concurrent processing
- * @param {string} key - The idempotency key
- * @param {number} lockTtl - Lock TTL in seconds (default 60s)
- * @returns {Promise<boolean>} True if lock acquired, false if already processing
+ * @param key - The idempotency key
+ * @param lockTtl - Lock TTL in seconds (default 60s)
+ * @returns True if lock acquired, false if already processing
  */
-export async function startIdempotentOperation(key, lockTtl = 60) {
+export async function startIdempotentOperation(key: string, lockTtl: number = 60): Promise<boolean> {
   try {
     const fullKey = `${IDEMPOTENCY_PREFIX}${key}`;
 
@@ -80,12 +104,17 @@ export async function startIdempotentOperation(key, lockTtl = 60) {
 
 /**
  * Complete an idempotent operation with its result
- * @param {string} key - The idempotency key
- * @param {any} result - The result to store
- * @param {number} statusCode - HTTP status code of the response
- * @param {number} ttl - TTL for storing the result (default 24h)
+ * @param key - The idempotency key
+ * @param result - The result to store
+ * @param statusCode - HTTP status code of the response
+ * @param ttl - TTL for storing the result (default 24h)
  */
-export async function completeIdempotentOperation(key, result, statusCode = 200, ttl = IDEMPOTENCY_KEY_TTL) {
+export async function completeIdempotentOperation(
+  key: string,
+  result: unknown,
+  statusCode: number = 200,
+  ttl: number = IDEMPOTENCY_KEY_TTL
+): Promise<void> {
   try {
     const fullKey = `${IDEMPOTENCY_PREFIX}${key}`;
     const data = {
@@ -105,15 +134,15 @@ export async function completeIdempotentOperation(key, result, statusCode = 200,
 /**
  * Mark an idempotent operation as failed
  * Clears the key so it can be retried
- * @param {string} key - The idempotency key
- * @param {string} error - Error message
+ * @param key - The idempotency key
+ * @param errorMsg - Error message
  */
-export async function failIdempotentOperation(key, error) {
+export async function failIdempotentOperation(key: string, errorMsg: string): Promise<void> {
   try {
     const fullKey = `${IDEMPOTENCY_PREFIX}${key}`;
     // Delete the key to allow retry
     await redis.del(fullKey);
-    logger.warn({ key, error }, 'Idempotent operation failed, key cleared for retry');
+    logger.warn({ key, error: errorMsg }, 'Idempotent operation failed, key cleared for retry');
   } catch (err) {
     logger.error({ error: err, key }, 'Error failing idempotent operation');
   }
@@ -122,21 +151,19 @@ export async function failIdempotentOperation(key, error) {
 /**
  * Express middleware for idempotency
  * Requires Idempotency-Key header for POST/PUT/DELETE requests
- * @param {Object} options - Middleware options
- * @param {boolean} options.required - Whether idempotency key is required
- * @param {string[]} options.methods - HTTP methods to enforce (default: POST)
- * @returns {Function} Express middleware
+ * @param options - Middleware options
+ * @returns Express middleware
  */
-export function idempotencyMiddleware(options = {}) {
+export function idempotencyMiddleware(options: IdempotencyMiddlewareOptions = {}): (req: Request, res: Response, next: NextFunction) => Promise<void | Response> {
   const { required = false, methods = ['POST'] } = options;
 
-  return async (req, res, next) => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void | Response> => {
     // Only check specified methods
     if (!methods.includes(req.method)) {
       return next();
     }
 
-    const idempotencyKey = req.headers['idempotency-key'];
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
     // If no key provided
     if (!idempotencyKey) {
@@ -163,7 +190,7 @@ export function idempotencyMiddleware(options = {}) {
       if (existing.state === IdempotencyState.COMPLETED) {
         // Return cached result
         logger.info({ key: idempotencyKey }, 'Returning cached idempotent response');
-        return res.status(existing.statusCode).json(existing.result);
+        return res.status(existing.statusCode || 200).json(existing.result);
       }
     }
 
@@ -181,7 +208,7 @@ export function idempotencyMiddleware(options = {}) {
 
     // Wrap res.json to capture the response
     const originalJson = res.json.bind(res);
-    res.json = (data) => {
+    res.json = (data: unknown) => {
       // Store the result if successful
       if (res.statusCode >= 200 && res.statusCode < 300) {
         completeIdempotentOperation(idempotencyKey, data, res.statusCode).catch((err) => {
@@ -203,12 +230,12 @@ export function idempotencyMiddleware(options = {}) {
 /**
  * Generate an idempotency key for client-side use
  * Based on user ID and operation details
- * @param {number} userId - User ID
- * @param {string} operation - Operation type (e.g., 'checkout')
- * @param {string} details - Additional details (e.g., cart hash)
- * @returns {string} Generated idempotency key
+ * @param userId - User ID
+ * @param operation - Operation type (e.g., 'checkout')
+ * @param details - Additional details (e.g., cart hash)
+ * @returns Generated idempotency key
  */
-export function generateIdempotencyKey(userId, operation, details = '') {
+export function generateIdempotencyKey(userId: number, operation: string, details: string = ''): string {
   const timestamp = Math.floor(Date.now() / 60000); // 1-minute granularity
   return `${userId}:${operation}:${details}:${timestamp}`;
 }

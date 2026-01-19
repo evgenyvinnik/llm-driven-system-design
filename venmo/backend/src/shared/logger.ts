@@ -8,13 +8,13 @@
  * - Audit trail for financial transactions
  */
 
-const pino = require('pino');
+import pino from 'pino';
 
 // Determine log level based on environment
 const level = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
 
 // Create the base logger instance
-const logger = pino({
+export const logger = pino({
   level,
   // Use pretty printing in development for readability
   transport: process.env.NODE_ENV !== 'production' ? {
@@ -49,11 +49,16 @@ const logger = pino({
   },
 });
 
+export interface RequestContext {
+  requestId?: string;
+  userId?: string;
+  [key: string]: unknown;
+}
+
 /**
  * Create a child logger with request context
- * @param {Object} context - Request context (requestId, userId, etc.)
  */
-function createRequestLogger(context) {
+export function createRequestLogger(context: RequestContext): pino.Logger {
   return logger.child({
     requestId: context.requestId,
     userId: context.userId,
@@ -63,10 +68,8 @@ function createRequestLogger(context) {
 
 /**
  * Mask sensitive data for logging
- * @param {string} value - Value to mask
- * @param {number} visibleChars - Number of characters to show at the end
  */
-function maskSensitive(value, visibleChars = 4) {
+export function maskSensitive(value: string | null | undefined, visibleChars: number = 4): string {
   if (!value || typeof value !== 'string') return '****';
   if (value.length <= visibleChars) return '****';
   return '****' + value.slice(-visibleChars);
@@ -74,9 +77,8 @@ function maskSensitive(value, visibleChars = 4) {
 
 /**
  * Format amount in cents to readable string for logs
- * @param {number} amountCents - Amount in cents
  */
-function formatAmount(amountCents) {
+export function formatAmount(amountCents: number): string {
   return `$${(amountCents / 100).toFixed(2)}`;
 }
 
@@ -90,10 +92,3 @@ function formatAmount(amountCents) {
  * DEBUG (20): Detailed diagnostics - full request/response, timing
  * TRACE (10): Very detailed tracing - function entry/exit
  */
-
-module.exports = {
-  logger,
-  createRequestLogger,
-  maskSensitive,
-  formatAmount,
-};

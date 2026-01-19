@@ -1,4 +1,5 @@
 import promClient from 'prom-client';
+import { Request, Response, NextFunction } from 'express';
 
 /**
  * Prometheus metrics module for observability.
@@ -193,10 +194,22 @@ export const idempotencyCache = new promClient.Counter({
 // ============================================
 
 /**
+ * Normalize route paths to avoid high cardinality in metrics.
+ * Replaces dynamic segments with placeholders.
+ */
+function normalizeRoute(path: string): string {
+  // Replace UUIDs with :id
+  let normalized = path.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id');
+  // Replace numeric IDs with :id
+  normalized = normalized.replace(/\/\d+/g, '/:id');
+  return normalized;
+}
+
+/**
  * HTTP metrics middleware.
  * Records request duration and counts for all routes.
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const start = Date.now();
 
   res.on('finish', () => {
@@ -207,7 +220,7 @@ export function metricsMiddleware(req, res, next) {
     const labels = {
       method: req.method,
       route,
-      status_code: res.statusCode
+      status_code: res.statusCode.toString()
     };
 
     httpRequestDuration.observe(labels, duration);
@@ -218,27 +231,15 @@ export function metricsMiddleware(req, res, next) {
 }
 
 /**
- * Normalize route paths to avoid high cardinality in metrics.
- * Replaces dynamic segments with placeholders.
- */
-function normalizeRoute(path) {
-  // Replace UUIDs with :id
-  path = path.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id');
-  // Replace numeric IDs with :id
-  path = path.replace(/\/\d+/g, '/:id');
-  return path;
-}
-
-/**
  * Metrics endpoint handler.
  * Exposes metrics in Prometheus format at /metrics.
  */
-export async function metricsHandler(req, res) {
+export async function metricsHandler(_req: Request, res: Response): Promise<void> {
   try {
     res.set('Content-Type', register.contentType);
     res.end(await register.metrics());
   } catch (err) {
-    res.status(500).end(err.message);
+    res.status(500).end((err as Error).message);
   }
 }
 

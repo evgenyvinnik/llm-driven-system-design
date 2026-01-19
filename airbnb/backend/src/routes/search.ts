@@ -1,4 +1,5 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
+import type CircuitBreaker from 'opossum';
 import { query } from '../db.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { getCachedSearchResults, CACHE_TTL } from '../shared/cache.js';
@@ -9,18 +10,94 @@ import { createSearchCircuitBreaker } from '../shared/circuitBreaker.js';
 const router = Router();
 const log = createModuleLogger('search');
 
-// Create circuit breaker for search operations
-let searchCircuitBreaker = null;
+// Type definitions
+interface SearchParams {
+  latitude?: string;
+  longitude?: string;
+  radius?: string | number;
+  check_in?: string;
+  check_out?: string;
+  guests?: string | number;
+  min_price?: string | number;
+  max_price?: string | number;
+  property_type?: string;
+  room_type?: string;
+  amenities?: string | string[];
+  instant_book?: string;
+  bedrooms?: string | number;
+  beds?: string | number;
+  bathrooms?: string | number;
+  limit?: string | number;
+  offset?: string | number;
+  sort?: string;
+}
 
-const initSearchCircuitBreaker = () => {
+interface SearchResult {
+  listings: unknown[];
+  total: number;
+  limit: number;
+  offset: number;
+  fromFallback?: boolean;
+}
+
+interface ListingRow {
+  id: number;
+  title: string;
+  description: string;
+  city: string;
+  state: string;
+  country: string;
+  property_type: string;
+  room_type: string;
+  max_guests: number;
+  bedrooms: number;
+  beds: number;
+  bathrooms: number;
+  amenities: string[];
+  price_per_night: number;
+  cleaning_fee: number;
+  rating: number | null;
+  review_count: number;
+  instant_book: boolean;
+  longitude: number;
+  latitude: number;
+  distance?: number;
+  host_name: string;
+  host_avatar: string | null;
+  host_verified: boolean;
+  primary_photo: string | null;
+  photos: string[] | null;
+}
+
+interface SuggestionRow {
+  city: string;
+  state: string;
+  country: string;
+  longitude: number;
+  latitude: number;
+}
+
+interface DestinationRow {
+  city: string;
+  state: string;
+  country: string;
+  listing_count: string;
+  longitude: number;
+  latitude: number;
+}
+
+// Create circuit breaker for search operations
+let searchCircuitBreaker: CircuitBreaker<unknown[], SearchResult> | null = null;
+
+const initSearchCircuitBreaker = (): CircuitBreaker<unknown[], SearchResult> => {
   if (!searchCircuitBreaker) {
-    searchCircuitBreaker = createSearchCircuitBreaker(executeSearch);
+    searchCircuitBreaker = createSearchCircuitBreaker(executeSearch) as CircuitBreaker<unknown[], SearchResult>;
   }
   return searchCircuitBreaker;
 };
 
 // Core search execution logic (wrapped by circuit breaker)
-async function executeSearch(searchParams) {
+async function executeSearch(searchParams: SearchParams): Promise<SearchResult> {
   const {
     latitude,
     longitude,
@@ -42,27 +119,27 @@ async function executeSearch(searchParams) {
     sort = 'relevance',
   } = searchParams;
 
-  let params = [];
-  let conditions = ['l.is_active = TRUE'];
+  const params: (string | number | string[])[] = [];
+  const conditions: string[] = ['l.is_active = TRUE'];
   let orderBy = 'l.rating DESC NULLS LAST, l.review_count DESC';
 
   // Geographic filter
   if (latitude && longitude) {
-    params.push(parseFloat(longitude), parseFloat(latitude), parseInt(radius));
+    params.push(parseFloat(longitude), parseFloat(latitude), parseInt(String(radius)));
     conditions.push(`ST_DWithin(l.location, ST_MakePoint($${params.length - 2}, $${params.length - 1})::geography, $${params.length})`);
   }
 
   // Guest count
-  params.push(parseInt(guests));
+  params.push(parseInt(String(guests)));
   conditions.push(`l.max_guests >= $${params.length}`);
 
   // Price range
   if (min_price) {
-    params.push(parseFloat(min_price));
+    params.push(parseFloat(String(min_price)));
     conditions.push(`l.price_per_night >= $${params.length}`);
   }
   if (max_price) {
-    params.push(parseFloat(max_price));
+    params.push(parseFloat(String(max_price)));
     conditions.push(`l.price_per_night <= $${params.length}`);
   }
 
@@ -92,19 +169,19 @@ async function executeSearch(searchParams) {
 
   // Bedrooms
   if (bedrooms) {
-    params.push(parseInt(bedrooms));
+    params.push(parseInt(String(bedrooms)));
     conditions.push(`l.bedrooms >= $${params.length}`);
   }
 
   // Beds
   if (beds) {
-    params.push(parseInt(beds));
+    params.push(parseInt(String(beds)));
     conditions.push(`l.beds >= $${params.length}`);
   }
 
   // Bathrooms
   if (bathrooms) {
-    params.push(parseFloat(bathrooms));
+    params.push(parseFloat(String(bathrooms)));
     conditions.push(`l.bathrooms >= $${params.length}`);
   }
 

@@ -9,10 +9,11 @@
  * - Transcoding job tracking
  * - Circuit breaker states
  */
-const promClient = require('prom-client');
+import promClient, { Registry, Histogram, Counter, Gauge } from 'prom-client';
+import { Request, Response, NextFunction } from 'express';
 
 // Create a Registry to register metrics
-const register = new promClient.Registry();
+export const register: Registry = new promClient.Registry();
 
 // Add default metrics (CPU, memory, etc.)
 promClient.collectDefaultMetrics({ register });
@@ -21,7 +22,7 @@ promClient.collectDefaultMetrics({ register });
 // HTTP Request Metrics
 // ============================================
 
-const httpRequestDuration = new promClient.Histogram({
+export const httpRequestDuration: Histogram<string> = new promClient.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
   labelNames: ['method', 'route', 'status_code'],
@@ -29,7 +30,7 @@ const httpRequestDuration = new promClient.Histogram({
   registers: [register]
 });
 
-const httpRequestTotal = new promClient.Counter({
+export const httpRequestTotal: Counter<string> = new promClient.Counter({
   name: 'http_requests_total',
   help: 'Total number of HTTP requests',
   labelNames: ['method', 'route', 'status_code'],
@@ -40,7 +41,7 @@ const httpRequestTotal = new promClient.Counter({
 // Streaming Metrics
 // ============================================
 
-const playbackStartLatency = new promClient.Histogram({
+export const playbackStartLatency: Histogram<string> = new promClient.Histogram({
   name: 'playback_start_latency_seconds',
   help: 'Time from play request to first frame rendered',
   labelNames: ['device_type', 'quality'],
@@ -48,14 +49,14 @@ const playbackStartLatency = new promClient.Histogram({
   registers: [register]
 });
 
-const activeStreams = new promClient.Gauge({
+export const activeStreams: Gauge<string> = new promClient.Gauge({
   name: 'active_streams_total',
   help: 'Number of currently active video streams',
   labelNames: ['quality', 'device_type'],
   registers: [register]
 });
 
-const manifestGenerationDuration = new promClient.Histogram({
+export const manifestGenerationDuration: Histogram<string> = new promClient.Histogram({
   name: 'manifest_generation_duration_seconds',
   help: 'Duration of HLS manifest generation',
   labelNames: ['manifest_type'], // master, variant, audio, subtitle
@@ -63,14 +64,14 @@ const manifestGenerationDuration = new promClient.Histogram({
   registers: [register]
 });
 
-const segmentRequestsTotal = new promClient.Counter({
+export const segmentRequestsTotal: Counter<string> = new promClient.Counter({
   name: 'segment_requests_total',
   help: 'Total number of segment requests',
   labelNames: ['content_id', 'quality'],
   registers: [register]
 });
 
-const streamingErrors = new promClient.Counter({
+export const streamingErrors: Counter<string> = new promClient.Counter({
   name: 'streaming_errors_total',
   help: 'Total number of streaming errors',
   labelNames: ['error_type', 'content_id'],
@@ -81,14 +82,14 @@ const streamingErrors = new promClient.Counter({
 // CDN Metrics
 // ============================================
 
-const cdnCacheHits = new promClient.Counter({
+export const cdnCacheHits: Counter<string> = new promClient.Counter({
   name: 'cdn_cache_hits_total',
   help: 'CDN cache hit count',
   labelNames: ['edge_location', 'content_type'],
   registers: [register]
 });
 
-const cdnCacheMisses = new promClient.Counter({
+export const cdnCacheMisses: Counter<string> = new promClient.Counter({
   name: 'cdn_cache_misses_total',
   help: 'CDN cache miss count',
   labelNames: ['edge_location', 'content_type'],
@@ -99,14 +100,14 @@ const cdnCacheMisses = new promClient.Counter({
 // DRM Metrics
 // ============================================
 
-const drmLicenseRequests = new promClient.Counter({
+export const drmLicenseRequests: Counter<string> = new promClient.Counter({
   name: 'drm_license_requests_total',
   help: 'Total DRM license requests',
   labelNames: ['status', 'device_type'],
   registers: [register]
 });
 
-const drmLicenseLatency = new promClient.Histogram({
+export const drmLicenseLatency: Histogram<string> = new promClient.Histogram({
   name: 'drm_license_latency_seconds',
   help: 'DRM license issuance latency',
   labelNames: ['device_type'],
@@ -118,7 +119,7 @@ const drmLicenseLatency = new promClient.Histogram({
 // Transcoding Metrics
 // ============================================
 
-const transcodingJobDuration = new promClient.Histogram({
+export const transcodingJobDuration: Histogram<string> = new promClient.Histogram({
   name: 'transcoding_job_duration_seconds',
   help: 'Duration of transcoding jobs',
   labelNames: ['resolution', 'codec'],
@@ -126,7 +127,7 @@ const transcodingJobDuration = new promClient.Histogram({
   registers: [register]
 });
 
-const transcodingJobsTotal = new promClient.Counter({
+export const transcodingJobsTotal: Counter<string> = new promClient.Counter({
   name: 'transcoding_jobs_total',
   help: 'Total transcoding jobs',
   labelNames: ['resolution', 'codec', 'status'],
@@ -137,21 +138,21 @@ const transcodingJobsTotal = new promClient.Counter({
 // Circuit Breaker Metrics
 // ============================================
 
-const circuitBreakerState = new promClient.Gauge({
+export const circuitBreakerState: Gauge<string> = new promClient.Gauge({
   name: 'circuit_breaker_state',
   help: 'Circuit breaker state (0=closed, 1=half-open, 2=open)',
   labelNames: ['service'],
   registers: [register]
 });
 
-const circuitBreakerFailures = new promClient.Counter({
+export const circuitBreakerFailures: Counter<string> = new promClient.Counter({
   name: 'circuit_breaker_failures_total',
   help: 'Total circuit breaker failures',
   labelNames: ['service'],
   registers: [register]
 });
 
-const circuitBreakerSuccesses = new promClient.Counter({
+export const circuitBreakerSuccesses: Counter<string> = new promClient.Counter({
   name: 'circuit_breaker_successes_total',
   help: 'Total circuit breaker successes',
   labelNames: ['service'],
@@ -162,14 +163,14 @@ const circuitBreakerSuccesses = new promClient.Counter({
 // Watch Progress Metrics
 // ============================================
 
-const watchProgressUpdates = new promClient.Counter({
+export const watchProgressUpdates: Counter<string> = new promClient.Counter({
   name: 'watch_progress_updates_total',
   help: 'Total watch progress updates',
   labelNames: ['status'], // success, conflict, error
   registers: [register]
 });
 
-const idempotentRequestsTotal = new promClient.Counter({
+export const idempotentRequestsTotal: Counter<string> = new promClient.Counter({
   name: 'idempotent_requests_total',
   help: 'Total idempotent requests',
   labelNames: ['result'], // new, cached, in_progress
@@ -183,7 +184,11 @@ const idempotentRequestsTotal = new promClient.Counter({
 /**
  * Express middleware to track HTTP request metrics
  */
-function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
   const start = process.hrtime.bigint();
 
   res.on('finish', () => {
@@ -205,43 +210,11 @@ function metricsMiddleware(req, res, next) {
 /**
  * Get metrics endpoint handler
  */
-async function metricsHandler(req, res) {
+export async function metricsHandler(req: Request, res: Response): Promise<void> {
   try {
     res.set('Content-Type', register.contentType);
     res.end(await register.metrics());
   } catch (error) {
-    res.status(500).end(error.message);
+    res.status(500).end((error as Error).message);
   }
 }
-
-module.exports = {
-  register,
-  // HTTP
-  httpRequestDuration,
-  httpRequestTotal,
-  // Streaming
-  playbackStartLatency,
-  activeStreams,
-  manifestGenerationDuration,
-  segmentRequestsTotal,
-  streamingErrors,
-  // CDN
-  cdnCacheHits,
-  cdnCacheMisses,
-  // DRM
-  drmLicenseRequests,
-  drmLicenseLatency,
-  // Transcoding
-  transcodingJobDuration,
-  transcodingJobsTotal,
-  // Circuit Breaker
-  circuitBreakerState,
-  circuitBreakerFailures,
-  circuitBreakerSuccesses,
-  // Watch Progress
-  watchProgressUpdates,
-  idempotentRequestsTotal,
-  // Middleware
-  metricsMiddleware,
-  metricsHandler
-};

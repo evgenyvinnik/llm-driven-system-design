@@ -1,4 +1,5 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
+import { Request, Response } from 'express';
 import { redis } from '../services/redis.js';
 import { rateLimitHits } from './metrics.js';
 import { logger } from './logger.js';
@@ -18,17 +19,25 @@ import { logger } from './logger.js';
  * Chosen: Redis for production-grade distributed limiting
  */
 
+interface IncrementResult {
+  totalHits: number;
+  resetTime: Date;
+}
+
 /**
  * Custom Redis store for express-rate-limit.
  * Uses Redis INCR with EXPIRE for atomic sliding window.
  */
 class RedisRateLimitStore {
-  constructor(prefix, windowMs) {
+  prefix: string;
+  windowSeconds: number;
+
+  constructor(prefix: string, windowMs: number) {
     this.prefix = prefix;
     this.windowSeconds = Math.ceil(windowMs / 1000);
   }
 
-  async increment(key) {
+  async increment(key: string): Promise<IncrementResult> {
     const redisKey = `${this.prefix}:${key}`;
     try {
       const current = await redis.incr(redisKey);
@@ -48,7 +57,7 @@ class RedisRateLimitStore {
     }
   }
 
-  async decrement(key) {
+  async decrement(key: string): Promise<void> {
     const redisKey = `${this.prefix}:${key}`;
     try {
       await redis.decr(redisKey);
@@ -57,7 +66,7 @@ class RedisRateLimitStore {
     }
   }
 
-  async resetKey(key) {
+  async resetKey(key: string): Promise<void> {
     const redisKey = `${this.prefix}:${key}`;
     try {
       await redis.del(redisKey);
@@ -67,10 +76,19 @@ class RedisRateLimitStore {
   }
 }
 
+interface LimiterOptions {
+  prefix: string;
+  windowMs: number;
+  max: number;
+  category: string;
+  message?: string;
+  keyGenerator?: (req: Request) => string;
+}
+
 /**
  * Create a rate limiter with specified configuration.
  */
-function createLimiter(options) {
+function createLimiter(options: LimiterOptions): RateLimitRequestHandler {
   const {
     prefix,
     windowMs,
@@ -80,20 +98,20 @@ function createLimiter(options) {
     keyGenerator
   } = options;
 
-  return rateLimit({
+  const rateLimitOptions: Partial<Options> = {
     windowMs,
     max,
     message: { error: message || 'Too many requests, please slow down' },
     standardHeaders: true, // Return rate limit info in headers
     legacyHeaders: false,
-    store: new RedisRateLimitStore(prefix, windowMs),
+    store: new RedisRateLimitStore(prefix, windowMs) as unknown as Options['store'],
     // Disable IP-based validation warnings since we use custom keyGenerator with user ID fallback
     validate: { ip: false, keyGeneratorIpFallback: false },
-    keyGenerator: keyGenerator || ((req) => {
+    keyGenerator: keyGenerator || ((req: Request): string => {
       // Use user ID if authenticated, otherwise IP
-      return req.user?.id || req.ip || req.connection?.remoteAddress || 'unknown';
+      return req.user?.id || req.ip || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown';
     }),
-    handler: (req, res, next, options) => {
+    handler: (req: Request, res: Response, _next, opts): void => {
       // Track rate limit hits in metrics
       rateLimitHits.inc({ category });
       logger.warn({
@@ -102,11 +120,13 @@ function createLimiter(options) {
         path: req.path,
         category
       }, 'Rate limit exceeded');
-      res.status(429).json(options.message);
+      res.status(429).json(opts.message);
     },
     // Skip rate limiting for health checks
-    skip: (req) => req.path === '/health' || req.path === '/metrics'
-  });
+    skip: (req: Request): boolean => req.path === '/health' || req.path === '/metrics'
+  };
+
+  return rateLimit(rateLimitOptions);
 }
 
 /**
@@ -167,7 +187,7 @@ export const loginLimiter = createLimiter({
   max: 5,
   category: 'login',
   message: 'Too many login attempts, please try again later',
-  keyGenerator: (req) => req.ip || req.connection?.remoteAddress || 'unknown'
+  keyGenerator: (req: Request): string => req.ip || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown'
 });
 
 /**

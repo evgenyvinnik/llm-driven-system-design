@@ -1,13 +1,51 @@
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { query, transaction } from '../services/database.js';
 import { indexProduct, deleteProductFromIndex } from '../services/elasticsearch.js';
 import { getRecommendations, cacheGet, cacheSet } from '../services/redis.js';
 import { requireSeller, requireAdmin } from '../middleware/auth.js';
+import type { PoolClient } from 'pg';
 
 const router = Router();
 
+interface ProductRow {
+  id: number;
+  title: string;
+  slug: string;
+  description?: string;
+  price: string;
+  compare_at_price?: string;
+  images?: string[];
+  rating?: string;
+  review_count?: number;
+  attributes?: Record<string, unknown>;
+  category_name?: string;
+  category_slug?: string;
+  seller_name?: string;
+  seller_rating?: string;
+  stock_quantity?: string;
+  category_id?: number;
+  seller_id?: number;
+  is_active?: boolean;
+  created_at?: Date;
+}
+
+interface RecommendationRow {
+  id: number;
+  title: string;
+  slug: string;
+  price: string;
+  images?: string[];
+  rating?: string;
+  score?: number;
+  product_id?: number;
+}
+
+interface SellerRow {
+  id: number;
+}
+
 // List products
-router.get('/', async (req, res, next) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { category, page = 0, limit = 20, sort = 'newest' } = req.query;
 
@@ -27,17 +65,17 @@ router.get('/', async (req, res, next) => {
         break;
     }
 
-    const offset = parseInt(page) * parseInt(limit);
+    const offset = parseInt(String(page)) * parseInt(String(limit));
 
     let whereClause = 'WHERE p.is_active = true';
-    const params = [];
+    const params: unknown[] = [];
 
     if (category) {
       params.push(category);
       whereClause += ` AND c.slug = $${params.length}`;
     }
 
-    const result = await query(
+    const result = await query<ProductRow>(
       `SELECT p.id, p.title, p.slug, p.description, p.price, p.compare_at_price,
               p.images, p.rating, p.review_count, p.attributes,
               c.name as category_name, c.slug as category_slug,
@@ -51,11 +89,11 @@ router.get('/', async (req, res, next) => {
        GROUP BY p.id, c.name, c.slug, s.business_name
        ORDER BY ${orderBy}
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, parseInt(limit), offset]
+      [...params, parseInt(String(limit)), offset]
     );
 
     // Get total count
-    const countResult = await query(
+    const countResult = await query<{ total: string }>(
       `SELECT COUNT(DISTINCT p.id) as total
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
@@ -65,9 +103,9 @@ router.get('/', async (req, res, next) => {
 
     res.json({
       products: result.rows,
-      total: parseInt(countResult.rows[0].total),
-      page: parseInt(page),
-      limit: parseInt(limit)
+      total: parseInt(countResult.rows[0]?.total || '0'),
+      page: parseInt(String(page)),
+      limit: parseInt(String(limit))
     });
   } catch (error) {
     next(error);
@@ -75,16 +113,16 @@ router.get('/', async (req, res, next) => {
 });
 
 // Get single product
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
 
     // Try cache first
     const cacheKey = `product:${id}`;
-    let product = await cacheGet(cacheKey);
+    let product = await cacheGet<ProductRow>(cacheKey);
 
     if (!product) {
-      const result = await query(
+      const result = await query<ProductRow>(
         `SELECT p.*, c.name as category_name, c.slug as category_slug,
                 s.business_name as seller_name, s.rating as seller_rating,
                 COALESCE(SUM(i.quantity - i.reserved), 0) as stock_quantity
@@ -98,7 +136,8 @@ router.get('/:id', async (req, res, next) => {
       );
 
       if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Product not found' });
+        res.status(404).json({ error: 'Product not found' });
+        return;
       }
 
       product = result.rows[0];
@@ -112,7 +151,7 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // Get product recommendations
-router.get('/:id/recommendations', async (req, res, next) => {
+router.get('/:id/recommendations', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -121,7 +160,7 @@ router.get('/:id/recommendations', async (req, res, next) => {
 
     if (!recommendations) {
       // Fallback to database
-      const result = await query(
+      const result = await query<RecommendationRow>(
         `SELECT p.id, p.title, p.slug, p.price, p.images, p.rating, pr.score
          FROM product_recommendations pr
          JOIN products p ON pr.recommended_product_id = p.id
@@ -135,7 +174,7 @@ router.get('/:id/recommendations', async (req, res, next) => {
       // Get full product data for cached recommendations
       const productIds = recommendations.map(r => r.product_id);
       if (productIds.length > 0) {
-        const result = await query(
+        const result = await query<RecommendationRow>(
           `SELECT id, title, slug, price, images, rating
            FROM products
            WHERE id = ANY($1)`,
@@ -152,7 +191,7 @@ router.get('/:id/recommendations', async (req, res, next) => {
 });
 
 // Create product (seller/admin only)
-router.post('/', requireSeller, async (req, res, next) => {
+router.post('/', requireSeller, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const {
       title, description, categoryId, price, compareAtPrice,
@@ -165,23 +204,24 @@ router.post('/', requireSeller, async (req, res, next) => {
       .replace(/(^-|-$)/g, '') + '-' + Date.now();
 
     // Get seller id for this user
-    const sellerResult = await query(
+    const sellerResult = await query<SellerRow>(
       'SELECT id FROM sellers WHERE user_id = $1',
-      [req.user.id]
+      [req.user!.id]
     );
 
-    let sellerId = null;
+    let sellerId: number | null = null;
     if (sellerResult.rows.length > 0) {
       sellerId = sellerResult.rows[0].id;
-    } else if (req.user.role === 'admin') {
+    } else if (req.user!.role === 'admin') {
       // Admin can create without being a seller
       sellerId = null;
     } else {
-      return res.status(400).json({ error: 'User is not a registered seller' });
+      res.status(400).json({ error: 'User is not a registered seller' });
+      return;
     }
 
-    const result = await transaction(async (client) => {
-      const productResult = await client.query(
+    const result = await transaction(async (client: PoolClient) => {
+      const productResult = await client.query<ProductRow>(
         `INSERT INTO products (seller_id, title, slug, description, category_id, price, compare_at_price, images, attributes)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING *`,
@@ -205,6 +245,9 @@ router.post('/', requireSeller, async (req, res, next) => {
     // Index in Elasticsearch
     await indexProduct({
       ...result,
+      id: result.id,
+      title: result.title,
+      price: result.price,
       stock_quantity: initialStock || 0
     });
 
@@ -215,12 +258,12 @@ router.post('/', requireSeller, async (req, res, next) => {
 });
 
 // Update product
-router.put('/:id', requireSeller, async (req, res, next) => {
+router.put('/:id', requireSeller, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
     const { title, description, categoryId, price, compareAtPrice, images, attributes, isActive } = req.body;
 
-    const result = await query(
+    const result = await query<ProductRow>(
       `UPDATE products
        SET title = COALESCE($1, title),
            description = COALESCE($2, description),
@@ -237,12 +280,18 @@ router.put('/:id', requireSeller, async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
+      res.status(404).json({ error: 'Product not found' });
+      return;
     }
 
     // Update Elasticsearch index
     const product = result.rows[0];
-    await indexProduct(product);
+    await indexProduct({
+      ...product,
+      id: product.id,
+      title: product.title,
+      price: product.price
+    });
 
     res.json({ product });
   } catch (error) {
@@ -251,7 +300,7 @@ router.put('/:id', requireSeller, async (req, res, next) => {
 });
 
 // Delete product
-router.delete('/:id', requireAdmin, async (req, res, next) => {
+router.delete('/:id', requireAdmin, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -265,7 +314,7 @@ router.delete('/:id', requireAdmin, async (req, res, next) => {
 });
 
 // Update inventory
-router.put('/:id/inventory', requireSeller, async (req, res, next) => {
+router.put('/:id/inventory', requireSeller, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
     const { quantity, warehouseId = 1 } = req.body;

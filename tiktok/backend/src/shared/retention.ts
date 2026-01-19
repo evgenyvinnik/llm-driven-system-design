@@ -2,6 +2,49 @@ import { createLogger, auditLog } from './logger.js';
 
 const logger = createLogger('retention');
 
+// Video interface
+interface Video {
+  id: number;
+  creator_id: number;
+  video_url: string;
+  view_count: number;
+  like_count: number;
+  share_count: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  last_accessed_at?: string;
+  deletion_reason?: string;
+}
+
+// Record with timestamp
+interface TimestampedRecord {
+  created_at: string;
+}
+
+// Retention policy interface
+interface RetentionPolicy {
+  hotStorage: number;
+  archiveAfter: number | null;
+  deleteAfter: number | null;
+  reason?: string;
+}
+
+// Video retention policy result
+interface VideoRetentionPolicyResult {
+  status: string;
+  policy: RetentionPolicy & { preserveIndefinitely?: boolean };
+  retainUntil?: string;
+  reason?: string;
+  storageTier?: string;
+}
+
+// Archive result
+interface ArchiveResult {
+  success: boolean;
+  archiveKey: string;
+}
+
 /**
  * Data retention configuration for TikTok platform
  *
@@ -17,18 +60,18 @@ export const retentionConfig = {
   videos: {
     // Active videos - never auto-delete
     active: {
-      hotStorage: Infinity,          // Always in hot storage while active
-      archiveAfter: null,            // Don't archive active videos
-      deleteAfter: null,             // Never auto-delete active videos
-    },
+      hotStorage: Infinity, // Always in hot storage while active
+      archiveAfter: null, // Don't archive active videos
+      deleteAfter: null, // Never auto-delete active videos
+    } as RetentionPolicy,
 
     // User-deleted videos - keep for legal compliance
     deleted: {
-      hotStorage: 0,                 // Move immediately from hot storage
-      archiveAfter: 0,               // Archive immediately
+      hotStorage: 0, // Move immediately from hot storage
+      archiveAfter: 0, // Archive immediately
       deleteAfter: 30 * 24 * 60 * 60 * 1000, // Delete after 30 days
       reason: 'Legal hold for DMCA claims and user disputes',
-    },
+    } as RetentionPolicy,
 
     // Policy-violated videos - longer retention for appeals
     policyViolation: {
@@ -36,13 +79,13 @@ export const retentionConfig = {
       archiveAfter: 0,
       deleteAfter: 90 * 24 * 60 * 60 * 1000, // 90 days for appeals
       reason: 'Extended retention for policy violation appeals',
-    },
+    } as RetentionPolicy,
 
     // Viral thresholds for preservation
     viralThresholds: {
-      viewCount: 1000000,            // 1M views
-      likeCount: 100000,             // 100K likes
-      shareCount: 10000,             // 10K shares
+      viewCount: 1000000, // 1M views
+      likeCount: 100000, // 100K likes
+      shareCount: 10000, // 10K shares
     },
   },
 
@@ -50,19 +93,19 @@ export const retentionConfig = {
   users: {
     // Active accounts
     active: {
-      deleteAfter: null,             // Never auto-delete
+      deleteAfter: null, // Never auto-delete
     },
 
     // Deactivated accounts - GDPR/privacy compliance
     deactivated: {
-      anonymizeAfter: 30 * 24 * 60 * 60 * 1000,  // 30 days
-      deleteAfter: 90 * 24 * 60 * 60 * 1000,     // 90 days
+      anonymizeAfter: 30 * 24 * 60 * 60 * 1000, // 30 days
+      deleteAfter: 90 * 24 * 60 * 60 * 1000, // 90 days
     },
   },
 
   // Engagement data retention
   watchHistory: {
-    hotStorage: 90 * 24 * 60 * 60 * 1000,   // 90 days in PostgreSQL
+    hotStorage: 90 * 24 * 60 * 60 * 1000, // 90 days in PostgreSQL
     archiveAfter: 90 * 24 * 60 * 60 * 1000, // Archive after 90 days
     deleteAfter: 365 * 24 * 60 * 60 * 1000, // Delete after 1 year
     reason: 'Watch history value decreases over time for recommendations',
@@ -70,30 +113,30 @@ export const retentionConfig = {
 
   // Session and ephemeral data
   sessions: {
-    ttl: 7 * 24 * 60 * 60,          // 7 days (Redis TTL in seconds)
+    ttl: 7 * 24 * 60 * 60, // 7 days (Redis TTL in seconds)
   },
 
   rateLimitCounters: {
-    ttl: 60 * 60,                    // 1 hour max (Redis TTL in seconds)
+    ttl: 60 * 60, // 1 hour max (Redis TTL in seconds)
   },
 
   idempotencyKeys: {
-    ttl: 24 * 60 * 60,               // 24 hours (Redis TTL in seconds)
+    ttl: 24 * 60 * 60, // 24 hours (Redis TTL in seconds)
   },
 
   viewCountBuffer: {
-    ttl: 5 * 60,                     // 5 minutes (Redis TTL in seconds)
+    ttl: 5 * 60, // 5 minutes (Redis TTL in seconds)
   },
 
   // Analytics and audit data
   analytics: {
-    hotStorage: 90 * 24 * 60 * 60 * 1000,   // 90 days in hot storage
+    hotStorage: 90 * 24 * 60 * 60 * 1000, // 90 days in hot storage
     archiveAfter: 90 * 24 * 60 * 60 * 1000, // Archive to cold storage
     deleteAfter: 2 * 365 * 24 * 60 * 60 * 1000, // 2 years
   },
 
   auditLogs: {
-    hotStorage: 365 * 24 * 60 * 60 * 1000,  // 1 year in hot storage
+    hotStorage: 365 * 24 * 60 * 60 * 1000, // 1 year in hot storage
     archiveAfter: 365 * 24 * 60 * 60 * 1000,
     deleteAfter: 7 * 365 * 24 * 60 * 60 * 1000, // 7 years for compliance
   },
@@ -102,7 +145,7 @@ export const retentionConfig = {
   userEmbeddings: {
     // Continuously updated, never archived
     deleteAfter: null,
-    updateDecayFactor: 0.99,         // Decay old preferences by 1% each update
+    updateDecayFactor: 0.99, // Decay old preferences by 1% each update
   },
 };
 
@@ -113,7 +156,7 @@ export const storageTiers = {
   hot: {
     name: 'hot',
     description: 'Primary storage (MinIO/S3 Standard)',
-    costPerGBMonth: 0.023,           // Approximate S3 Standard pricing
+    costPerGBMonth: 0.023, // Approximate S3 Standard pricing
     accessLatency: '<100ms',
   },
   warm: {
@@ -134,12 +177,12 @@ export const storageTiers = {
     costPerGBMonth: 0.00099,
     accessLatency: '12-48 hours',
   },
-};
+} as const;
 
 /**
  * Check if a video is viral (should never be archived)
  */
-export const isViralVideo = (video) => {
+export const isViralVideo = (video: Video): boolean => {
   const thresholds = retentionConfig.videos.viralThresholds;
   return (
     video.view_count >= thresholds.viewCount ||
@@ -151,7 +194,7 @@ export const isViralVideo = (video) => {
 /**
  * Get the appropriate storage tier for a video
  */
-export const getVideoStorageTier = (video) => {
+export const getVideoStorageTier = (video: Video): string => {
   // Viral content always stays hot
   if (isViralVideo(video)) {
     return 'hot';
@@ -178,23 +221,27 @@ export const getVideoStorageTier = (video) => {
 /**
  * Determine if watch history should be archived
  */
-export const shouldArchiveWatchHistory = (record) => {
+export const shouldArchiveWatchHistory = (record: TimestampedRecord): boolean => {
   const age = Date.now() - new Date(record.created_at).getTime();
-  return age > retentionConfig.watchHistory.archiveAfter;
+  return age > (retentionConfig.watchHistory.archiveAfter as number);
 };
 
 /**
  * Determine if watch history should be deleted
  */
-export const shouldDeleteWatchHistory = (record) => {
+export const shouldDeleteWatchHistory = (record: TimestampedRecord): boolean => {
   const age = Date.now() - new Date(record.created_at).getTime();
-  return age > retentionConfig.watchHistory.deleteAfter;
+  return age > (retentionConfig.watchHistory.deleteAfter as number);
 };
 
 /**
  * Archive deleted video to cold storage
  */
-export const archiveDeletedVideo = async (video, storage, db) => {
+export const archiveDeletedVideo = async (
+  video: Video,
+  _storage: unknown,
+  _db: unknown
+): Promise<ArchiveResult> => {
   logger.info({ videoId: video.id }, 'Archiving deleted video');
 
   try {
@@ -207,7 +254,9 @@ export const archiveDeletedVideo = async (video, storage, db) => {
       ...video,
       archived_at: new Date().toISOString(),
       deletion_reason: video.deletion_reason || 'user_request',
-      retain_until: new Date(Date.now() + retentionConfig.videos.deleted.deleteAfter).toISOString(),
+      retain_until: new Date(
+        Date.now() + (retentionConfig.videos.deleted.deleteAfter as number)
+      ).toISOString(),
     };
 
     // 3. Log for audit
@@ -220,7 +269,7 @@ export const archiveDeletedVideo = async (video, storage, db) => {
     logger.info({ videoId: video.id, archiveKey }, 'Video archived successfully');
     return { success: true, archiveKey };
   } catch (error) {
-    logger.error({ videoId: video.id, error: error.message }, 'Failed to archive video');
+    logger.error({ videoId: video.id, error: (error as Error).message }, 'Failed to archive video');
     throw error;
   }
 };
@@ -228,7 +277,10 @@ export const archiveDeletedVideo = async (video, storage, db) => {
 /**
  * Cleanup job for expired archived videos
  */
-export const cleanupExpiredArchives = async (storage, db) => {
+export const cleanupExpiredArchives = async (
+  _storage: unknown,
+  _db: unknown
+): Promise<void> => {
   logger.info('Starting expired archive cleanup');
 
   // In real implementation:
@@ -246,13 +298,14 @@ export const cleanupExpiredArchives = async (storage, db) => {
 /**
  * Get retention policy summary for a video
  */
-export const getVideoRetentionPolicy = (video) => {
+export const getVideoRetentionPolicy = (video: Video): VideoRetentionPolicyResult => {
   if (video.status === 'deleted') {
     return {
       status: 'deleted',
       policy: retentionConfig.videos.deleted,
       retainUntil: new Date(
-        new Date(video.updated_at).getTime() + retentionConfig.videos.deleted.deleteAfter
+        new Date(video.updated_at).getTime() +
+          (retentionConfig.videos.deleted.deleteAfter as number)
       ).toISOString(),
     };
   }
@@ -262,7 +315,8 @@ export const getVideoRetentionPolicy = (video) => {
       status: 'policy_violation',
       policy: retentionConfig.videos.policyViolation,
       retainUntil: new Date(
-        new Date(video.updated_at).getTime() + retentionConfig.videos.policyViolation.deleteAfter
+        new Date(video.updated_at).getTime() +
+          (retentionConfig.videos.policyViolation.deleteAfter as number)
       ).toISOString(),
     };
   }

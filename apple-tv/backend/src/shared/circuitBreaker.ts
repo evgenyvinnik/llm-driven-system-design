@@ -12,23 +12,44 @@
  * - Provides fallback behavior for graceful degradation
  * - Auto-recovery with half-open state testing
  */
-const CircuitBreaker = require('opossum');
-const { logger } = require('./logger');
-const {
+import CircuitBreaker from 'opossum';
+import { logger } from './logger.js';
+import {
   circuitBreakerState,
   circuitBreakerFailures,
   circuitBreakerSuccesses
-} = require('./metrics');
+} from './metrics.js';
 
 // State values for metrics
 const STATE_CLOSED = 0;
 const STATE_HALF_OPEN = 1;
 const STATE_OPEN = 2;
 
+export interface ServiceConfig {
+  timeout: number;
+  errorThresholdPercentage: number;
+  resetTimeout: number;
+  volumeThreshold: number;
+  name: string;
+}
+
+export interface CircuitBreakerHealth {
+  state: string;
+  stats?: {
+    fires: number;
+    failures: number;
+    successes: number;
+    timeouts: number;
+    rejects: number;
+  };
+}
+
+export type ServiceName = 'cdn' | 'transcoding' | 'drm' | 'storage';
+
 /**
  * Default circuit breaker options
  */
-const defaultOptions = {
+const defaultOptions: Omit<ServiceConfig, 'name'> = {
   timeout: 10000, // 10 seconds
   errorThresholdPercentage: 50, // Open circuit after 50% failures
   resetTimeout: 30000, // Try again after 30 seconds
@@ -38,7 +59,7 @@ const defaultOptions = {
 /**
  * Service-specific configurations
  */
-const serviceConfigs = {
+export const serviceConfigs: Record<ServiceName, ServiceConfig> = {
   cdn: {
     timeout: 5000,
     errorThresholdPercentage: 30,
@@ -69,27 +90,33 @@ const serviceConfigs = {
   }
 };
 
+type AsyncFunction<T> = () => Promise<T>;
+
 /**
  * Create a circuit breaker for a service
- * @param {Function} action - The async function to wrap
- * @param {string} serviceName - Name of the service (cdn, transcoding, drm, storage)
- * @param {Function} fallback - Optional fallback function when circuit is open
- * @returns {CircuitBreaker} Configured circuit breaker
+ * @param action - The async function to wrap
+ * @param serviceName - Name of the service (cdn, transcoding, drm, storage)
+ * @param fallback - Optional fallback function when circuit is open
+ * @returns Configured circuit breaker
  */
-function createCircuitBreaker(action, serviceName, fallback = null) {
-  const config = serviceConfigs[serviceName] || { ...defaultOptions, name: serviceName };
+export function createCircuitBreaker<T>(
+  action: (fn: AsyncFunction<T>) => Promise<T>,
+  serviceName: string,
+  fallback: (() => Promise<T>) | null = null
+): CircuitBreaker<[AsyncFunction<T>], T> {
+  const config = serviceConfigs[serviceName as ServiceName] || { ...defaultOptions, name: serviceName };
 
-  const breaker = new CircuitBreaker(action, {
+  const breaker = new CircuitBreaker<[AsyncFunction<T>], T>(action, {
     ...config,
     name: config.name
   });
 
   // Set up event handlers for logging and metrics
-  breaker.on('success', (result) => {
+  breaker.on('success', () => {
     circuitBreakerSuccesses.inc({ service: serviceName });
   });
 
-  breaker.on('failure', (error) => {
+  breaker.on('failure', (error: Error) => {
     circuitBreakerFailures.inc({ service: serviceName });
     logger.warn({
       service: serviceName,
@@ -146,12 +173,12 @@ function createCircuitBreaker(action, serviceName, fallback = null) {
  * CDN Circuit Breaker wrapper
  * Used for fetching content from CDN origin
  */
-let cdnBreaker = null;
+let cdnBreaker: CircuitBreaker<[AsyncFunction<unknown>], unknown> | null = null;
 
-function getCdnBreaker() {
+export function getCdnBreaker(): CircuitBreaker<[AsyncFunction<unknown>], unknown> {
   if (!cdnBreaker) {
     cdnBreaker = createCircuitBreaker(
-      async (fetchFn) => fetchFn(),
+      async (fetchFn: AsyncFunction<unknown>) => fetchFn(),
       'cdn',
       async () => {
         logger.info('CDN circuit open - using cached content or alternative');
@@ -166,12 +193,12 @@ function getCdnBreaker() {
  * Transcoding Circuit Breaker wrapper
  * Used for submitting and monitoring transcoding jobs
  */
-let transcodingBreaker = null;
+let transcodingBreaker: CircuitBreaker<[AsyncFunction<unknown>], unknown> | null = null;
 
-function getTranscodingBreaker() {
+export function getTranscodingBreaker(): CircuitBreaker<[AsyncFunction<unknown>], unknown> {
   if (!transcodingBreaker) {
     transcodingBreaker = createCircuitBreaker(
-      async (jobFn) => jobFn(),
+      async (jobFn: AsyncFunction<unknown>) => jobFn(),
       'transcoding',
       async () => {
         logger.info('Transcoding circuit open - queuing job for later');
@@ -186,12 +213,12 @@ function getTranscodingBreaker() {
  * DRM Circuit Breaker wrapper
  * Used for license issuance
  */
-let drmBreaker = null;
+let drmBreaker: CircuitBreaker<[AsyncFunction<unknown>], unknown> | null = null;
 
-function getDrmBreaker() {
+export function getDrmBreaker(): CircuitBreaker<[AsyncFunction<unknown>], unknown> {
   if (!drmBreaker) {
     drmBreaker = createCircuitBreaker(
-      async (licenseFn) => licenseFn(),
+      async (licenseFn: AsyncFunction<unknown>) => licenseFn(),
       'drm',
       async () => {
         throw new Error('DRM service unavailable - cannot issue license');
@@ -205,12 +232,12 @@ function getDrmBreaker() {
  * Storage Circuit Breaker wrapper
  * Used for MinIO/S3 operations
  */
-let storageBreaker = null;
+let storageBreaker: CircuitBreaker<[AsyncFunction<unknown>], unknown> | null = null;
 
-function getStorageBreaker() {
+export function getStorageBreaker(): CircuitBreaker<[AsyncFunction<unknown>], unknown> {
   if (!storageBreaker) {
     storageBreaker = createCircuitBreaker(
-      async (storageFn) => storageFn(),
+      async (storageFn: AsyncFunction<unknown>) => storageFn(),
       'storage',
       async () => {
         logger.info('Storage circuit open - using cached data');
@@ -223,12 +250,15 @@ function getStorageBreaker() {
 
 /**
  * Execute a function with circuit breaker protection
- * @param {string} serviceName - Service name (cdn, transcoding, drm, storage)
- * @param {Function} fn - Async function to execute
- * @returns {Promise} Result of the function or fallback
+ * @param serviceName - Service name (cdn, transcoding, drm, storage)
+ * @param fn - Async function to execute
+ * @returns Result of the function or fallback
  */
-async function withCircuitBreaker(serviceName, fn) {
-  let breaker;
+export async function withCircuitBreaker<T>(
+  serviceName: string,
+  fn: AsyncFunction<T>
+): Promise<T> {
+  let breaker: CircuitBreaker<[AsyncFunction<unknown>], unknown>;
   switch (serviceName) {
     case 'cdn':
       breaker = getCdnBreaker();
@@ -247,22 +277,22 @@ async function withCircuitBreaker(serviceName, fn) {
       return fn();
   }
 
-  return breaker.fire(fn);
+  return breaker.fire(fn as AsyncFunction<unknown>) as Promise<T>;
 }
 
 /**
  * Get circuit breaker health status for all services
- * @returns {Object} Health status of all circuit breakers
+ * @returns Health status of all circuit breakers
  */
-function getCircuitBreakerHealth() {
-  const breakers = {
+export function getCircuitBreakerHealth(): Record<string, CircuitBreakerHealth> {
+  const breakers: Record<string, CircuitBreaker<[AsyncFunction<unknown>], unknown> | null> = {
     cdn: cdnBreaker,
     transcoding: transcodingBreaker,
     drm: drmBreaker,
     storage: storageBreaker
   };
 
-  const health = {};
+  const health: Record<string, CircuitBreakerHealth> = {};
   for (const [name, breaker] of Object.entries(breakers)) {
     if (breaker) {
       health[name] = {
@@ -282,14 +312,3 @@ function getCircuitBreakerHealth() {
 
   return health;
 }
-
-module.exports = {
-  createCircuitBreaker,
-  getCdnBreaker,
-  getTranscodingBreaker,
-  getDrmBreaker,
-  getStorageBreaker,
-  withCircuitBreaker,
-  getCircuitBreakerHealth,
-  serviceConfigs
-};

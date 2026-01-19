@@ -1,5 +1,6 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
+import type { Request, Response, NextFunction } from 'express';
 import redis from './redis.js';
 import logger from './logger.js';
 import { rateLimitHits, followsRateLimited } from './metrics.js';
@@ -17,12 +18,29 @@ import { rateLimitHits, followsRateLimited } from './metrics.js';
  * - API abuse and scraping
  */
 
+interface ExtendedRequest extends Request {
+  session?: {
+    userId?: string;
+    username?: string;
+    role?: string;
+    isVerified?: boolean;
+  } & Request['session'];
+}
+
+interface RateLimiterOptions {
+  keyPrefix: string;
+  max: number;
+  windowMs: number;
+  message?: string;
+  skipSuccessfulRequests?: boolean;
+  skipFailedRequests?: boolean;
+  actionName?: string;
+}
+
 /**
  * Create a rate limiter with Redis backend
- * @param {Object} options - Rate limiter configuration
- * @returns {Function} Express middleware
  */
-const createRateLimiter = (options) => {
+const createRateLimiter = (options: RateLimiterOptions): RateLimitRequestHandler => {
   const {
     keyPrefix,
     max,
@@ -36,7 +54,7 @@ const createRateLimiter = (options) => {
   return rateLimit({
     store: new RedisStore({
       // Use the existing ioredis client
-      sendCommand: (...args) => redis.call(...args),
+      sendCommand: (...args: string[]) => redis.call(...args),
       prefix: `ratelimit:${keyPrefix}:`,
     }),
     max,
@@ -46,24 +64,36 @@ const createRateLimiter = (options) => {
     legacyHeaders: false,
     skipSuccessfulRequests,
     skipFailedRequests,
-    keyGenerator: (req) => {
+    keyGenerator: (req: ExtendedRequest): string => {
       // Use user ID if authenticated, otherwise IP
-      return req.session?.userId || req.ip;
+      return req.session?.userId || req.ip || 'unknown';
     },
-    handler: (req, res, next, options) => {
+    handler: (
+      req: ExtendedRequest,
+      res: Response,
+      _next: NextFunction,
+      opts: Options
+    ): void => {
       // Log and track rate limit hits
       const key = req.session?.userId || req.ip;
-      logger.warn({
-        type: 'rate_limit',
-        action: actionName,
-        key: key,
-        limit: max,
-        windowMs,
-      }, `Rate limit exceeded for ${actionName}: ${key}`);
+      logger.warn(
+        {
+          type: 'rate_limit',
+          action: actionName,
+          key: key,
+          limit: max,
+          windowMs,
+        },
+        `Rate limit exceeded for ${actionName}: ${key}`
+      );
 
       rateLimitHits.labels(actionName).inc();
 
-      res.status(options.statusCode).json({ error: options.message.error });
+      const errorMessage =
+        typeof opts.message === 'object' && opts.message !== null && 'error' in opts.message
+          ? (opts.message as { error: string }).error
+          : message;
+      res.status(opts.statusCode || 429).json({ error: errorMessage });
     },
   });
 };
@@ -72,7 +102,7 @@ const createRateLimiter = (options) => {
  * Rate limiter for post creation
  * Prevents content spam - 10 posts per hour
  */
-export const postRateLimiter = createRateLimiter({
+export const postRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'posts',
   max: 10,
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -88,7 +118,7 @@ export const postRateLimiter = createRateLimiter({
  * users rapidly follow/unfollow accounts to gain attention. Rate limiting
  * prevents this while allowing normal social interaction patterns.
  */
-export const followRateLimiter = createRateLimiter({
+export const followRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'follows',
   max: 30,
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -97,8 +127,8 @@ export const followRateLimiter = createRateLimiter({
 });
 
 // Track follow rate limits separately for metrics
-export const followRateLimitMiddleware = (req, res, next) => {
-  followRateLimiter(req, res, (err) => {
+export const followRateLimitMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+  followRateLimiter(req, res, (err?: unknown) => {
     if (res.headersSent) {
       followsRateLimited.inc();
     }
@@ -110,7 +140,7 @@ export const followRateLimitMiddleware = (req, res, next) => {
  * Rate limiter for login attempts
  * Prevents brute force attacks - 5 attempts per minute
  */
-export const loginRateLimiter = createRateLimiter({
+export const loginRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'login',
   max: 5,
   windowMs: 60 * 1000, // 1 minute
@@ -123,7 +153,7 @@ export const loginRateLimiter = createRateLimiter({
  * Rate limiter for likes
  * Prevents like spam - 100 likes per hour
  */
-export const likeRateLimiter = createRateLimiter({
+export const likeRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'likes',
   max: 100,
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -135,7 +165,7 @@ export const likeRateLimiter = createRateLimiter({
  * Rate limiter for comments
  * Prevents comment spam - 50 comments per hour
  */
-export const commentRateLimiter = createRateLimiter({
+export const commentRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'comments',
   max: 50,
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -147,7 +177,7 @@ export const commentRateLimiter = createRateLimiter({
  * Rate limiter for story creation
  * Prevents story spam - 20 stories per hour
  */
-export const storyRateLimiter = createRateLimiter({
+export const storyRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'stories',
   max: 20,
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -159,7 +189,7 @@ export const storyRateLimiter = createRateLimiter({
  * Rate limiter for feed requests
  * Prevents API scraping - 60 requests per minute
  */
-export const feedRateLimiter = createRateLimiter({
+export const feedRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'feed',
   max: 60,
   windowMs: 60 * 1000, // 1 minute
@@ -171,7 +201,7 @@ export const feedRateLimiter = createRateLimiter({
  * General API rate limiter
  * Applies to all endpoints as a catch-all - 1000 requests per minute
  */
-export const generalRateLimiter = createRateLimiter({
+export const generalRateLimiter: RateLimitRequestHandler = createRateLimiter({
   keyPrefix: 'general',
   max: 1000,
   windowMs: 60 * 1000, // 1 minute
@@ -182,14 +212,13 @@ export const generalRateLimiter = createRateLimiter({
 /**
  * Custom rate limit check using Redis directly
  * For more flexible rate limiting scenarios
- *
- * @param {string} userId - User ID
- * @param {string} action - Action name
- * @param {number} limit - Max requests
- * @param {number} windowSeconds - Window in seconds
- * @returns {Promise<boolean>} True if allowed, false if rate limited
  */
-export const checkRateLimit = async (userId, action, limit, windowSeconds) => {
+export const checkRateLimit = async (
+  userId: string,
+  action: string,
+  limit: number,
+  windowSeconds: number
+): Promise<boolean> => {
   const key = `ratelimit:custom:${action}:${userId}`;
   const current = await redis.incr(key);
 
@@ -198,13 +227,16 @@ export const checkRateLimit = async (userId, action, limit, windowSeconds) => {
   }
 
   if (current > limit) {
-    logger.warn({
-      type: 'rate_limit',
-      action,
-      userId,
-      current,
-      limit,
-    }, `Custom rate limit exceeded for ${action}: ${userId}`);
+    logger.warn(
+      {
+        type: 'rate_limit',
+        action,
+        userId,
+        current,
+        limit,
+      },
+      `Custom rate limit exceeded for ${action}: ${userId}`
+    );
     rateLimitHits.labels(action).inc();
     return false;
   }

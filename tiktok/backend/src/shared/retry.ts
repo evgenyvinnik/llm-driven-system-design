@@ -1,14 +1,37 @@
+import { RedisClientType } from 'redis';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('retry');
 
+// Retry configuration interface
+interface RetryConfig {
+  maxRetries: number;
+  initialDelay: number;
+  maxDelay: number;
+  backoffMultiplier: number;
+  jitterFactor: number;
+  retryableErrors: string[];
+  retryableStatusCodes: number[];
+  operationName?: string;
+  prefix?: string;
+  idempotencyTtl?: number;
+}
+
+// Error with additional properties
+interface RetryableError extends Error {
+  code?: string;
+  statusCode?: number;
+  response?: { status: number };
+  isRetryable?: boolean;
+}
+
 // Default retry configuration
-const defaultConfig = {
+const defaultConfig: RetryConfig = {
   maxRetries: 3,
-  initialDelay: 1000,       // 1 second
-  maxDelay: 30000,          // 30 seconds
-  backoffMultiplier: 2,     // Exponential backoff
-  jitterFactor: 0.1,        // 10% jitter to prevent thundering herd
+  initialDelay: 1000, // 1 second
+  maxDelay: 30000, // 30 seconds
+  backoffMultiplier: 2, // Exponential backoff
+  jitterFactor: 0.1, // 10% jitter to prevent thundering herd
   retryableErrors: [
     'ECONNRESET',
     'ETIMEDOUT',
@@ -24,12 +47,13 @@ const defaultConfig = {
 /**
  * Sleep for a specified duration
  */
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Calculate delay with exponential backoff and jitter
  */
-const calculateDelay = (attempt, config) => {
+const calculateDelay = (attempt: number, config: RetryConfig): number => {
   const exponentialDelay = config.initialDelay * Math.pow(config.backoffMultiplier, attempt);
   const clampedDelay = Math.min(exponentialDelay, config.maxDelay);
 
@@ -42,7 +66,7 @@ const calculateDelay = (attempt, config) => {
 /**
  * Check if an error is retryable
  */
-const isRetryableError = (error, config) => {
+const isRetryableError = (error: RetryableError, config: RetryConfig): boolean => {
   // Check error code
   if (error.code && config.retryableErrors.includes(error.code)) {
     return true;
@@ -69,50 +93,62 @@ const isRetryableError = (error, config) => {
 /**
  * Retry an async operation with exponential backoff
  *
- * @param {Function} fn - Async function to retry
- * @param {Object} options - Retry configuration
- * @returns {Promise} - Result of the function
+ * @param fn - Async function to retry
+ * @param options - Retry configuration
+ * @returns Result of the function
  */
-export const withRetry = async (fn, options = {}) => {
+export const withRetry = async <T>(
+  fn: () => Promise<T>,
+  options: Partial<RetryConfig> = {}
+): Promise<T> => {
   const config = { ...defaultConfig, ...options };
-  let lastError;
+  let lastError: RetryableError | undefined;
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
       const result = await fn();
       if (attempt > 0) {
-        logger.info({
-          attempt,
-          operation: config.operationName || 'unknown',
-        }, 'Operation succeeded after retry');
+        logger.info(
+          {
+            attempt,
+            operation: config.operationName || 'unknown',
+          },
+          'Operation succeeded after retry'
+        );
       }
       return result;
     } catch (error) {
-      lastError = error;
+      lastError = error as RetryableError;
 
       // Check if we should retry
-      if (attempt === config.maxRetries || !isRetryableError(error, config)) {
-        logger.error({
-          attempt,
-          maxRetries: config.maxRetries,
-          operation: config.operationName || 'unknown',
-          error: error.message,
-          code: error.code,
-          isRetryable: isRetryableError(error, config),
-        }, 'Operation failed after all retries or non-retryable error');
+      if (attempt === config.maxRetries || !isRetryableError(lastError, config)) {
+        logger.error(
+          {
+            attempt,
+            maxRetries: config.maxRetries,
+            operation: config.operationName || 'unknown',
+            error: lastError.message,
+            code: lastError.code,
+            isRetryable: isRetryableError(lastError, config),
+          },
+          'Operation failed after all retries or non-retryable error'
+        );
         throw error;
       }
 
       // Calculate delay and wait
       const delay = calculateDelay(attempt, config);
-      logger.warn({
-        attempt,
-        nextAttempt: attempt + 1,
-        maxRetries: config.maxRetries,
-        delayMs: delay,
-        operation: config.operationName || 'unknown',
-        error: error.message,
-      }, 'Operation failed, retrying');
+      logger.warn(
+        {
+          attempt,
+          nextAttempt: attempt + 1,
+          maxRetries: config.maxRetries,
+          delayMs: delay,
+          operation: config.operationName || 'unknown',
+          error: lastError.message,
+        },
+        'Operation failed, retrying'
+      );
 
       await sleep(delay);
     }
@@ -124,15 +160,23 @@ export const withRetry = async (fn, options = {}) => {
 /**
  * Create a retryable function wrapper
  */
-export const createRetryable = (fn, options = {}) => {
-  return (...args) => withRetry(() => fn(...args), options);
+export const createRetryable = <T extends unknown[], R>(
+  fn: (...args: T) => Promise<R>,
+  options: Partial<RetryConfig> = {}
+): ((...args: T) => Promise<R>) => {
+  return (...args: T) => withRetry(() => fn(...args), options);
 };
 
 /**
  * Retry with idempotency key support
  * Stores results in Redis to ensure idempotency
  */
-export const withIdempotentRetry = async (fn, idempotencyKey, redis, options = {}) => {
+export const withIdempotentRetry = async <T>(
+  fn: () => Promise<T>,
+  idempotencyKey: string,
+  redis: RedisClientType,
+  options: Partial<RetryConfig> = {}
+): Promise<T> => {
   const config = { ...defaultConfig, ...options };
   const cacheKey = `idem:${options.prefix || 'op'}:${idempotencyKey}`;
   const ttl = options.idempotencyTtl || 86400; // 24 hours default
@@ -141,18 +185,24 @@ export const withIdempotentRetry = async (fn, idempotencyKey, redis, options = {
   try {
     const cached = await redis.get(cacheKey);
     if (cached) {
-      const result = JSON.parse(cached);
-      logger.debug({
-        idempotencyKey,
-        operation: config.operationName || 'unknown',
-      }, 'Returning cached idempotent result');
+      const result = JSON.parse(cached) as T;
+      logger.debug(
+        {
+          idempotencyKey,
+          operation: config.operationName || 'unknown',
+        },
+        'Returning cached idempotent result'
+      );
       return result;
     }
   } catch (error) {
-    logger.warn({
-      idempotencyKey,
-      error: error.message,
-    }, 'Failed to check idempotency cache, proceeding with operation');
+    logger.warn(
+      {
+        idempotencyKey,
+        error: (error as Error).message,
+      },
+      'Failed to check idempotency cache, proceeding with operation'
+    );
   }
 
   // Execute with retry
@@ -162,10 +212,13 @@ export const withIdempotentRetry = async (fn, idempotencyKey, redis, options = {
   try {
     await redis.setEx(cacheKey, ttl, JSON.stringify(result));
   } catch (error) {
-    logger.warn({
-      idempotencyKey,
-      error: error.message,
-    }, 'Failed to store idempotency result');
+    logger.warn(
+      {
+        idempotencyKey,
+        error: (error as Error).message,
+      },
+      'Failed to store idempotency result'
+    );
   }
 
   return result;
@@ -174,7 +227,7 @@ export const withIdempotentRetry = async (fn, idempotencyKey, redis, options = {
 /**
  * Retry configuration presets for common operations
  */
-export const retryPresets = {
+export const retryPresets: Record<string, Partial<RetryConfig>> = {
   // For database operations - quick retries
   database: {
     maxRetries: 3,

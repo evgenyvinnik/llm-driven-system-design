@@ -1,3 +1,4 @@
+import { Request, Response, Application } from 'express';
 import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
 import { logger } from './logger.js';
@@ -15,10 +16,16 @@ import { logger } from './logger.js';
  * - Prevents traffic to unhealthy instances
  */
 
+interface ComponentHealth {
+  status: 'healthy' | 'unhealthy';
+  latencyMs: number;
+  error?: string;
+}
+
 /**
  * Check PostgreSQL connectivity.
  */
-async function checkPostgres() {
+async function checkPostgres(): Promise<ComponentHealth> {
   const start = Date.now();
   try {
     await pool.query('SELECT 1');
@@ -30,7 +37,7 @@ async function checkPostgres() {
     logger.error({ err }, 'PostgreSQL health check failed');
     return {
       status: 'unhealthy',
-      error: err.message,
+      error: (err as Error).message,
       latencyMs: Date.now() - start
     };
   }
@@ -39,7 +46,7 @@ async function checkPostgres() {
 /**
  * Check Redis connectivity.
  */
-async function checkRedis() {
+async function checkRedis(): Promise<ComponentHealth> {
   const start = Date.now();
   try {
     await redis.ping();
@@ -51,7 +58,7 @@ async function checkRedis() {
     logger.error({ err }, 'Redis health check failed');
     return {
       status: 'unhealthy',
-      error: err.message,
+      error: (err as Error).message,
       latencyMs: Date.now() - start
     };
   }
@@ -62,7 +69,7 @@ async function checkRedis() {
  * Returns 200 if the service is running.
  * Used by load balancers for basic health verification.
  */
-export async function livenessCheck(req, res) {
+export async function livenessCheck(_req: Request, res: Response): Promise<void> {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -75,7 +82,7 @@ export async function livenessCheck(req, res) {
  * Checks all dependencies and returns component-level status.
  * Returns 503 if any critical component is unhealthy.
  */
-export async function readinessCheck(req, res) {
+export async function readinessCheck(_req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
 
   // Check all components in parallel
@@ -111,7 +118,7 @@ export async function readinessCheck(req, res) {
 /**
  * Register health check routes on an Express app.
  */
-export function registerHealthRoutes(app) {
+export function registerHealthRoutes(app: Application): void {
   // Simple liveness probe
   app.get('/health', livenessCheck);
 

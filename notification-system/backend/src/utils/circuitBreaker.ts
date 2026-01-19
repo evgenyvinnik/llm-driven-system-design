@@ -1,18 +1,30 @@
-import { CircuitBreakerPolicy, ConsecutiveBreaker, handleAll } from 'cockatiel';
+import { CircuitBreakerPolicy, ConsecutiveBreaker } from 'cockatiel';
 import { createLogger } from './logger.js';
 import { circuitBreakerState, circuitBreakerStateChanges } from './metrics.js';
+import { Logger } from 'pino';
 
-const log = createLogger('circuit-breaker');
+const log: Logger = createLogger('circuit-breaker');
 
 // Circuit breaker states as numbers for Prometheus
-const STATES = {
+const STATES: Record<string, number> = {
   closed: 0,
   open: 1,
   halfOpen: 2,
 };
 
+export interface CircuitBreakerOptions {
+  consecutiveFailures?: number;
+  halfOpenAfter?: number;
+}
+
+interface CircuitBreakerEntry {
+  policy: CircuitBreakerPolicy;
+  lastState: string;
+  options: CircuitBreakerOptions;
+}
+
 // Store circuit breakers for each channel provider
-const circuitBreakers = new Map();
+const circuitBreakers: Map<string, CircuitBreakerEntry> = new Map();
 
 /**
  * Create a circuit breaker for a delivery channel
@@ -21,12 +33,11 @@ const circuitBreakers = new Map();
  * - consecutiveFailures: 5 - Opens after 5 consecutive failures to prevent cascading issues
  * - halfOpenAfter: 30s - Wait 30 seconds before testing if service has recovered
  * - Half-open allows 3 test requests before fully closing
- *
- * @param {string} channel - Channel name (push, email, sms)
- * @param {Object} options - Configuration options
- * @returns {CircuitBreakerPolicy}
  */
-export function createCircuitBreaker(channel, options = {}) {
+export function createCircuitBreaker(
+  channel: string,
+  options: CircuitBreakerOptions = {}
+): CircuitBreakerPolicy {
   const {
     consecutiveFailures = 5,
     halfOpenAfter = 30000, // 30 seconds
@@ -44,7 +55,7 @@ export function createCircuitBreaker(channel, options = {}) {
   circuitBreakerState.labels(channel).set(STATES.closed);
 
   // Listen to state changes for logging and metrics
-  policy.onStateChange((state) => {
+  policy.onStateChange((state: string) => {
     const previousState = circuitBreakers.get(channel)?.lastState || 'closed';
     const newState = state;
 
@@ -60,8 +71,9 @@ export function createCircuitBreaker(channel, options = {}) {
     circuitBreakerStateChanges.labels(channel, previousState, newState).inc();
 
     // Store last known state
-    if (circuitBreakers.has(channel)) {
-      circuitBreakers.get(channel).lastState = newState;
+    const entry = circuitBreakers.get(channel);
+    if (entry) {
+      entry.lastState = newState;
     }
   });
 
@@ -69,7 +81,7 @@ export function createCircuitBreaker(channel, options = {}) {
   policy.onBreak((result) => {
     log.error({
       channel,
-      error: result.reason?.message || 'Unknown error',
+      error: (result.reason as Error)?.message || 'Unknown error',
     }, `Circuit breaker opened for channel: ${channel}`);
   });
 
@@ -99,25 +111,21 @@ export function createCircuitBreaker(channel, options = {}) {
 
 /**
  * Get or create a circuit breaker for a channel
- *
- * @param {string} channel - Channel name
- * @returns {CircuitBreakerPolicy}
  */
-export function getCircuitBreaker(channel) {
+export function getCircuitBreaker(channel: string): CircuitBreakerPolicy {
   if (!circuitBreakers.has(channel)) {
     return createCircuitBreaker(channel);
   }
-  return circuitBreakers.get(channel).policy;
+  return circuitBreakers.get(channel)!.policy;
 }
 
 /**
  * Execute an operation with circuit breaker protection
- *
- * @param {string} channel - Channel name
- * @param {Function} operation - Async operation to execute
- * @returns {Promise<any>}
  */
-export async function withCircuitBreaker(channel, operation) {
+export async function withCircuitBreaker<T>(
+  channel: string,
+  operation: () => Promise<T>
+): Promise<T> {
   const policy = getCircuitBreaker(channel);
 
   try {
@@ -126,7 +134,7 @@ export async function withCircuitBreaker(channel, operation) {
     });
   } catch (error) {
     // Check if it's a circuit breaker rejection
-    if (error.name === 'BrokenCircuitError') {
+    if ((error as Error).name === 'BrokenCircuitError') {
       log.warn({
         channel,
       }, `Request rejected by circuit breaker for channel: ${channel}`);
@@ -139,24 +147,19 @@ export async function withCircuitBreaker(channel, operation) {
 
 /**
  * Get the current state of a circuit breaker
- *
- * @param {string} channel - Channel name
- * @returns {string} - State: 'closed', 'open', or 'halfOpen'
  */
-export function getCircuitBreakerState(channel) {
+export function getCircuitBreakerState(channel: string): string {
   if (!circuitBreakers.has(channel)) {
     return 'closed';
   }
-  return circuitBreakers.get(channel).lastState;
+  return circuitBreakers.get(channel)!.lastState;
 }
 
 /**
  * Get all circuit breaker states
- *
- * @returns {Object} - Map of channel to state
  */
-export function getAllCircuitBreakerStates() {
-  const states = {};
+export function getAllCircuitBreakerStates(): Record<string, string> {
+  const states: Record<string, string> = {};
   for (const [channel, cb] of circuitBreakers) {
     states[channel] = cb.lastState;
   }
@@ -167,7 +170,10 @@ export function getAllCircuitBreakerStates() {
  * Custom error for circuit breaker open state
  */
 export class CircuitBreakerOpenError extends Error {
-  constructor(channel) {
+  public channel: string;
+  public retryable: boolean;
+
+  constructor(channel: string) {
     super(`Circuit breaker is open for channel: ${channel}`);
     this.name = 'CircuitBreakerOpenError';
     this.channel = channel;
@@ -176,9 +182,9 @@ export class CircuitBreakerOpenError extends Error {
 }
 
 // Initialize circuit breakers for standard channels
-export function initializeCircuitBreakers() {
+export function initializeCircuitBreakers(): void {
   const channels = ['push', 'email', 'sms'];
-  const configs = {
+  const configs: Record<string, CircuitBreakerOptions> = {
     push: { consecutiveFailures: 5, halfOpenAfter: 30000 },
     email: { consecutiveFailures: 3, halfOpenAfter: 60000 }, // Email provider more sensitive
     sms: { consecutiveFailures: 3, halfOpenAfter: 60000 },   // SMS provider more sensitive

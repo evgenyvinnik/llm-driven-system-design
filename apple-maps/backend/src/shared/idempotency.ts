@@ -1,6 +1,7 @@
 import redis from '../redis.js';
 import logger from './logger.js';
 import { idempotencyHits, idempotencyMisses } from './metrics.js';
+import type { Request, Response, NextFunction } from 'express';
 
 /**
  * Idempotency Module
@@ -27,22 +28,51 @@ const IdempotencyState = {
   PROCESSING: 'processing',
   COMPLETED: 'completed',
   FAILED: 'failed',
-};
+} as const;
+
+type IdempotencyStateType = typeof IdempotencyState[keyof typeof IdempotencyState];
+
+interface IdempotencyData {
+  state: IdempotencyStateType;
+  startedAt?: number;
+  result?: unknown;
+  statusCode?: number;
+  completedAt?: number;
+  error?: string;
+  failedAt?: number;
+}
+
+interface IdempotencyCheckResult {
+  isProcessing?: boolean;
+  isReplay?: boolean;
+  retryAfter?: number;
+  result?: unknown;
+  statusCode?: number;
+}
+
+interface IdempotencyInfo {
+  operation: string;
+  key: string;
+}
+
+interface RequestWithIdempotency extends Request {
+  idempotency?: IdempotencyInfo;
+}
 
 /**
  * Generate a cache key for idempotency
  */
-function getIdempotencyKey(operation, idempotencyKey) {
+function getIdempotencyKey(operation: string, idempotencyKey: string): string {
   return `idempotency:${operation}:${idempotencyKey}`;
 }
 
 /**
  * Check if a request is a replay and return cached result
- * @param {string} operation - The operation type (e.g., 'location_update', 'incident_report')
- * @param {string} idempotencyKey - Client-provided idempotency key
- * @returns {Object|null} - Cached result if replay, null if new request
  */
-async function checkIdempotency(operation, idempotencyKey) {
+async function checkIdempotency(
+  operation: string,
+  idempotencyKey: string
+): Promise<IdempotencyCheckResult | null> {
   if (!idempotencyKey) {
     return null; // No idempotency key provided
   }
@@ -53,11 +83,11 @@ async function checkIdempotency(operation, idempotencyKey) {
     const cached = await redis.get(key);
 
     if (cached) {
-      const data = JSON.parse(cached);
+      const data: IdempotencyData = JSON.parse(cached);
 
       if (data.state === IdempotencyState.PROCESSING) {
         // Request still processing - could be concurrent duplicate or previous failure
-        const elapsedMs = Date.now() - data.startedAt;
+        const elapsedMs = Date.now() - (data.startedAt || 0);
         if (elapsedMs < PROCESSING_TIMEOUT_SECONDS * 1000) {
           // Still within timeout - tell client to retry later
           idempotencyHits.inc({ operation });
@@ -101,12 +131,12 @@ async function checkIdempotency(operation, idempotencyKey) {
 
 /**
  * Start processing a new idempotent request
- * @param {string} operation - The operation type
- * @param {string} idempotencyKey - Client-provided idempotency key
- * @param {number} ttl - TTL in seconds
- * @returns {boolean} - True if lock acquired, false if already processing
  */
-async function startIdempotentRequest(operation, idempotencyKey, ttl = DEFAULT_TTL_SECONDS) {
+async function startIdempotentRequest(
+  operation: string,
+  idempotencyKey: string,
+  ttl: number = DEFAULT_TTL_SECONDS
+): Promise<boolean> {
   if (!idempotencyKey) {
     return true; // No idempotency key - proceed normally
   }
@@ -120,7 +150,7 @@ async function startIdempotentRequest(operation, idempotencyKey, ttl = DEFAULT_T
       JSON.stringify({
         state: IdempotencyState.PROCESSING,
         startedAt: Date.now(),
-      }),
+      } as IdempotencyData),
       'EX',
       ttl,
       'NX'
@@ -143,19 +173,14 @@ async function startIdempotentRequest(operation, idempotencyKey, ttl = DEFAULT_T
 
 /**
  * Complete an idempotent request with success
- * @param {string} operation - The operation type
- * @param {string} idempotencyKey - Client-provided idempotency key
- * @param {Object} result - The result to cache
- * @param {number} statusCode - HTTP status code
- * @param {number} ttl - TTL in seconds
  */
 async function completeIdempotentRequest(
-  operation,
-  idempotencyKey,
-  result,
-  statusCode = 200,
-  ttl = DEFAULT_TTL_SECONDS
-) {
+  operation: string,
+  idempotencyKey: string,
+  result: unknown,
+  statusCode: number = 200,
+  ttl: number = DEFAULT_TTL_SECONDS
+): Promise<void> {
   if (!idempotencyKey) {
     return;
   }
@@ -171,7 +196,7 @@ async function completeIdempotentRequest(
         result,
         statusCode,
         completedAt: Date.now(),
-      })
+      } as IdempotencyData)
     );
     logger.debug({ operation, idempotencyKey }, 'Idempotency: completed successfully');
   } catch (error) {
@@ -181,11 +206,12 @@ async function completeIdempotentRequest(
 
 /**
  * Mark an idempotent request as failed
- * @param {string} operation - The operation type
- * @param {string} idempotencyKey - Client-provided idempotency key
- * @param {string} errorMessage - The error message
  */
-async function failIdempotentRequest(operation, idempotencyKey, errorMessage) {
+async function failIdempotentRequest(
+  operation: string,
+  idempotencyKey: string,
+  errorMessage: string
+): Promise<void> {
   if (!idempotencyKey) {
     return;
   }
@@ -201,7 +227,7 @@ async function failIdempotentRequest(operation, idempotencyKey, errorMessage) {
         state: IdempotencyState.FAILED,
         error: errorMessage,
         failedAt: Date.now(),
-      })
+      } as IdempotencyData)
     );
     logger.debug({ operation, idempotencyKey }, 'Idempotency: marked as failed');
   } catch (error) {
@@ -211,40 +237,42 @@ async function failIdempotentRequest(operation, idempotencyKey, errorMessage) {
 
 /**
  * Express middleware for idempotent endpoints
- * @param {string} operation - The operation name
  */
-function idempotencyMiddleware(operation) {
-  return async (req, res, next) => {
-    const idempotencyKey =
-      req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+function idempotencyMiddleware(operation: string) {
+  return async (req: RequestWithIdempotency, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey = (req.headers['idempotency-key'] || req.headers['x-idempotency-key']) as string | undefined;
 
     if (!idempotencyKey) {
       // No idempotency key provided - proceed without protection
-      return next();
+      next();
+      return;
     }
 
     // Check for existing result
     const existing = await checkIdempotency(operation, idempotencyKey);
 
     if (existing?.isProcessing) {
-      return res.status(409).json({
+      res.status(409).json({
         error: 'Request still processing',
         retryAfter: existing.retryAfter,
       });
+      return;
     }
 
     if (existing?.isReplay) {
-      return res.status(existing.statusCode).json(existing.result);
+      res.status(existing.statusCode || 200).json(existing.result);
+      return;
     }
 
     // Try to acquire lock
     const acquired = await startIdempotentRequest(operation, idempotencyKey);
     if (!acquired) {
       // Race condition - another request got the lock
-      return res.status(409).json({
+      res.status(409).json({
         error: 'Duplicate request in progress',
         retryAfter: 5,
       });
+      return;
     }
 
     // Store idempotency info on request for later completion
@@ -255,19 +283,19 @@ function idempotencyMiddleware(operation) {
 
     // Override res.json to capture the response
     const originalJson = res.json.bind(res);
-    res.json = async function (data) {
+    res.json = function (data: unknown) {
       if (req.idempotency && res.statusCode < 500) {
-        await completeIdempotentRequest(
+        void completeIdempotentRequest(
           req.idempotency.operation,
           req.idempotency.key,
           data,
           res.statusCode
         );
       } else if (req.idempotency) {
-        await failIdempotentRequest(
+        void failIdempotentRequest(
           req.idempotency.operation,
           req.idempotency.key,
-          data?.error || 'Unknown error'
+          (data as { error?: string })?.error || 'Unknown error'
         );
       }
       return originalJson(data);
@@ -285,3 +313,4 @@ export {
   idempotencyMiddleware,
   IdempotencyState,
 };
+export type { IdempotencyCheckResult, IdempotencyInfo, RequestWithIdempotency };

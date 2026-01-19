@@ -24,6 +24,45 @@ import { createModuleLogger } from './logger.js';
 
 const log = createModuleLogger('circuit-breaker');
 
+// Type definitions
+type AsyncFunction<T = unknown> = (...args: unknown[]) => Promise<T>;
+
+interface CircuitBreakerOptions {
+  timeout?: number;
+  errorThresholdPercentage?: number;
+  resetTimeout?: number;
+  volumeThreshold?: number;
+  rollingCountTimeout?: number;
+  rollingCountBuckets?: number;
+}
+
+interface CircuitBreakerStatus {
+  state: 'OPEN' | 'HALF_OPEN' | 'CLOSED';
+  stats: unknown;
+}
+
+interface CircuitBreakerHealthResult {
+  healthy: boolean;
+  openCircuits: string[];
+}
+
+interface SearchFallbackResult {
+  listings: unknown[];
+  total: number;
+  fromFallback: boolean;
+}
+
+interface AvailabilityFallbackResult {
+  available: boolean;
+  fromFallback: boolean;
+  error: string;
+}
+
+interface NotificationFallbackResult {
+  queued: boolean;
+  error: string;
+}
+
 // Circuit breaker state constants for metrics
 const CIRCUIT_STATES = {
   CLOSED: 0,
@@ -42,18 +81,23 @@ const defaultOptions = {
 };
 
 // Store for all circuit breakers
-const circuitBreakers = new Map();
+const circuitBreakers = new Map<string, CircuitBreaker<unknown[], unknown>>();
 
 /**
  * Create or get a circuit breaker for a service
- * @param {string} name - Service name for identification
- * @param {Function} fn - The function to wrap with circuit breaker
- * @param {object} options - Circuit breaker options
- * @param {Function} fallback - Fallback function when circuit is open
+ * @param name - Service name for identification
+ * @param fn - The function to wrap with circuit breaker
+ * @param options - Circuit breaker options
+ * @param fallback - Fallback function when circuit is open
  */
-export function createCircuitBreaker(name, fn, options = {}, fallback = null) {
+export function createCircuitBreaker<T>(
+  name: string,
+  fn: AsyncFunction<T>,
+  options: CircuitBreakerOptions = {},
+  fallback: AsyncFunction<T> | null = null
+): CircuitBreaker<unknown[], T> {
   if (circuitBreakers.has(name)) {
-    return circuitBreakers.get(name);
+    return circuitBreakers.get(name) as CircuitBreaker<unknown[], T>;
   }
 
   const breaker = new CircuitBreaker(fn, {
@@ -64,12 +108,12 @@ export function createCircuitBreaker(name, fn, options = {}, fallback = null) {
 
   // Set up event handlers for monitoring
 
-  breaker.on('success', (result, latencyMs) => {
+  breaker.on('success', (result: T, latencyMs: number) => {
     metrics.circuitBreakerSuccesses.inc({ service: name });
     log.debug({ service: name, latencyMs }, 'Circuit breaker success');
   });
 
-  breaker.on('failure', (error, latencyMs) => {
+  breaker.on('failure', (error: Error, latencyMs: number) => {
     metrics.circuitBreakerFailures.inc({ service: name });
     log.warn({ service: name, error: error.message, latencyMs }, 'Circuit breaker failure');
   });
@@ -106,22 +150,22 @@ export function createCircuitBreaker(name, fn, options = {}, fallback = null) {
   // Initialize metric
   metrics.circuitBreakerState.set({ service: name }, CIRCUIT_STATES.CLOSED);
 
-  circuitBreakers.set(name, breaker);
+  circuitBreakers.set(name, breaker as CircuitBreaker<unknown[], unknown>);
   return breaker;
 }
 
 /**
  * Get an existing circuit breaker
  */
-export function getCircuitBreaker(name) {
+export function getCircuitBreaker(name: string): CircuitBreaker<unknown[], unknown> | undefined {
   return circuitBreakers.get(name);
 }
 
 /**
  * Get status of all circuit breakers
  */
-export function getAllCircuitBreakersStatus() {
-  const status = {};
+export function getAllCircuitBreakersStatus(): Record<string, CircuitBreakerStatus> {
+  const status: Record<string, CircuitBreakerStatus> = {};
   for (const [name, breaker] of circuitBreakers) {
     status[name] = {
       state: breaker.opened ? 'OPEN' : (breaker.halfOpen ? 'HALF_OPEN' : 'CLOSED'),
@@ -137,7 +181,7 @@ export function getAllCircuitBreakersStatus() {
  * Circuit breaker for search operations
  * More tolerant of failures since search can return cached/stale results
  */
-export function createSearchCircuitBreaker(searchFn) {
+export function createSearchCircuitBreaker<T>(searchFn: AsyncFunction<T>): CircuitBreaker<unknown[], T | SearchFallbackResult> {
   return createCircuitBreaker(
     'search',
     searchFn,
@@ -147,7 +191,7 @@ export function createSearchCircuitBreaker(searchFn) {
       resetTimeout: 20000,         // Try again after 20 seconds
     },
     // Fallback: return empty results
-    async () => {
+    async (): Promise<SearchFallbackResult> => {
       log.warn('Search circuit breaker fallback - returning empty results');
       return { listings: [], total: 0, fromFallback: true };
     }
@@ -158,7 +202,7 @@ export function createSearchCircuitBreaker(searchFn) {
  * Circuit breaker for availability checks
  * Critical operation - needs to fail fast
  */
-export function createAvailabilityCircuitBreaker(checkFn) {
+export function createAvailabilityCircuitBreaker<T>(checkFn: AsyncFunction<T>): CircuitBreaker<unknown[], T | AvailabilityFallbackResult> {
   return createCircuitBreaker(
     'availability',
     checkFn,
@@ -168,7 +212,7 @@ export function createAvailabilityCircuitBreaker(checkFn) {
       resetTimeout: 15000,         // Try again after 15 seconds
     },
     // Fallback: assume unavailable (safe default)
-    async () => {
+    async (): Promise<AvailabilityFallbackResult> => {
       log.warn('Availability circuit breaker fallback - assuming unavailable');
       return { available: false, fromFallback: true, error: 'Service temporarily unavailable' };
     }
@@ -178,7 +222,7 @@ export function createAvailabilityCircuitBreaker(checkFn) {
 /**
  * Circuit breaker for database operations
  */
-export function createDatabaseCircuitBreaker(name, dbFn) {
+export function createDatabaseCircuitBreaker<T>(name: string, dbFn: AsyncFunction<T>): CircuitBreaker<unknown[], T> {
   return createCircuitBreaker(
     `db-${name}`,
     dbFn,
@@ -194,7 +238,7 @@ export function createDatabaseCircuitBreaker(name, dbFn) {
 /**
  * Circuit breaker for external notification service
  */
-export function createNotificationCircuitBreaker(notifyFn) {
+export function createNotificationCircuitBreaker<T>(notifyFn: AsyncFunction<T>): CircuitBreaker<unknown[], T | NotificationFallbackResult> {
   return createCircuitBreaker(
     'notification',
     notifyFn,
@@ -204,7 +248,7 @@ export function createNotificationCircuitBreaker(notifyFn) {
       resetTimeout: 60000,         // Wait longer before retry
     },
     // Fallback: queue for later
-    async (notification) => {
+    async (notification: unknown): Promise<NotificationFallbackResult> => {
       log.warn({ notification }, 'Notification circuit breaker fallback - queuing for later');
       return { queued: true, error: 'Notification service unavailable' };
     }
@@ -215,16 +259,21 @@ export function createNotificationCircuitBreaker(notifyFn) {
  * Wrap an async function with a circuit breaker
  * Convenience function for one-off protection
  */
-export function withCircuitBreaker(name, fn, options = {}, fallback = null) {
+export function withCircuitBreaker<T>(
+  name: string,
+  fn: AsyncFunction<T>,
+  options: CircuitBreakerOptions = {},
+  fallback: AsyncFunction<T> | null = null
+): (...args: unknown[]) => Promise<T> {
   const breaker = createCircuitBreaker(name, fn, options, fallback);
-  return (...args) => breaker.fire(...args);
+  return (...args: unknown[]) => breaker.fire(...args);
 }
 
 /**
  * Health check for circuit breakers
  * Returns true if all critical circuit breakers are closed
  */
-export function checkCircuitBreakersHealth() {
+export function checkCircuitBreakersHealth(): CircuitBreakerHealthResult {
   const criticalBreakers = ['availability', 'db-bookings'];
   for (const name of criticalBreakers) {
     const breaker = circuitBreakers.get(name);

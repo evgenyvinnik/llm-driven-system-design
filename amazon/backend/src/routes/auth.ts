@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import { body, validationResult } from 'express-validator';
@@ -8,31 +8,41 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+interface UserRow {
+  id: number;
+  email: string;
+  name: string;
+  role: 'user' | 'admin' | 'seller';
+  password_hash?: string;
+}
+
 // Register
 router.post('/register',
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 6 }),
   body('name').trim().notEmpty(),
-  async (req, res, next) => {
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+        res.status(400).json({ errors: errors.array() });
+        return;
       }
 
       const { email, password, name } = req.body;
 
       // Check if email exists
-      const existing = await query('SELECT id FROM users WHERE email = $1', [email]);
+      const existing = await query<{ id: number }>('SELECT id FROM users WHERE email = $1', [email]);
       if (existing.rows.length > 0) {
-        return res.status(409).json({ error: 'Email already registered' });
+        res.status(409).json({ error: 'Email already registered' });
+        return;
       }
 
       // Hash password
       const passwordHash = await bcrypt.hash(password, 10);
 
       // Create user
-      const result = await query(
+      const result = await query<UserRow>(
         `INSERT INTO users (email, password_hash, name)
          VALUES ($1, $2, $3)
          RETURNING id, email, name, role`,
@@ -59,41 +69,45 @@ router.post('/register',
 router.post('/login',
   body('email').isEmail().normalizeEmail(),
   body('password').notEmpty(),
-  async (req, res, next) => {
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+        res.status(400).json({ errors: errors.array() });
+        return;
       }
 
       const { email, password } = req.body;
 
       // Find user
-      const result = await query(
+      const result = await query<UserRow>(
         'SELECT id, email, name, role, password_hash FROM users WHERE email = $1',
         [email]
       );
 
       if (result.rows.length === 0) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
       }
 
       const user = result.rows[0];
 
       // Verify password
-      const valid = await bcrypt.compare(password, user.password_hash);
+      const valid = await bcrypt.compare(password, user.password_hash || '');
       if (!valid) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
       }
 
       // Create session
       const sessionId = uuidv4();
       await setSession(sessionId, { userId: user.id }, 86400 * 7);
 
-      delete user.password_hash;
+      // Remove password_hash from response
+      const { password_hash, ...userWithoutPassword } = user;
 
       res.json({
-        user,
+        user: userWithoutPassword,
         sessionId
       });
     } catch (error) {
@@ -103,9 +117,11 @@ router.post('/login',
 );
 
 // Logout
-router.post('/logout', requireAuth, async (req, res, next) => {
+router.post('/logout', requireAuth, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    await deleteSession(req.sessionId);
+    if (req.sessionId) {
+      await deleteSession(req.sessionId);
+    }
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
     next(error);
@@ -113,22 +129,22 @@ router.post('/logout', requireAuth, async (req, res, next) => {
 });
 
 // Get current user
-router.get('/me', requireAuth, (req, res) => {
+router.get('/me', requireAuth, (req: Request, res: Response): void => {
   res.json({ user: req.user });
 });
 
 // Update profile
 router.put('/profile', requireAuth,
   body('name').optional().trim().notEmpty(),
-  async (req, res, next) => {
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { name } = req.body;
 
-      const result = await query(
+      const result = await query<UserRow>(
         `UPDATE users SET name = COALESCE($1, name), updated_at = NOW()
          WHERE id = $2
          RETURNING id, email, name, role`,
-        [name, req.user.id]
+        [name, req.user!.id]
       );
 
       res.json({ user: result.rows[0] });

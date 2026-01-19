@@ -13,24 +13,41 @@
  * - Retry with exponential backoff for contention
  */
 
-const redis = require('../models/redis');
-const { logger } = require('./logger');
-const metrics = require('./metrics');
-const crypto = require('crypto');
+import redis from '../models/redis.js';
+import { logger } from './logger.js';
+import * as metrics from './metrics.js';
+import crypto from 'crypto';
 
 // Default lock configuration
-const DEFAULT_LOCK_TTL_MS = 30000; // 30 seconds
+export const DEFAULT_LOCK_TTL_MS = 30000; // 30 seconds
 const DEFAULT_RETRY_COUNT = 3;
 const DEFAULT_RETRY_DELAY_MS = 100;
 const DEFAULT_RETRY_JITTER_MS = 50;
 
+export interface LockOptions {
+  ttlMs?: number;
+  retryCount?: number;
+  retryDelayMs?: number;
+  retryJitterMs?: number;
+}
+
+export interface Lock {
+  id: string;
+  resource: string;
+  key: string;
+  release: () => Promise<boolean>;
+}
+
 /**
  * Acquire a distributed lock
- * @param {string} resource - Resource identifier (e.g., 'room:hotel123:type456')
- * @param {Object} options - Lock options
- * @returns {Object|null} Lock object with id and release function, or null if failed
+ * @param resource - Resource identifier (e.g., 'room:hotel123:type456')
+ * @param options - Lock options
+ * @returns Lock object with id and release function, or null if failed
  */
-async function acquireLock(resource, options = {}) {
+export async function acquireLock(
+  resource: string,
+  options: LockOptions = {}
+): Promise<Lock | null> {
   const {
     ttlMs = DEFAULT_LOCK_TTL_MS,
     retryCount = DEFAULT_RETRY_COUNT,
@@ -106,11 +123,11 @@ async function acquireLock(resource, options = {}) {
 /**
  * Release a distributed lock
  * Uses Lua script to ensure atomic check-and-delete
- * @param {string} lockKey - The lock key
- * @param {string} lockId - The lock ID to verify ownership
- * @returns {boolean} True if lock was released
+ * @param lockKey - The lock key
+ * @param lockId - The lock ID to verify ownership
+ * @returns True if lock was released
  */
-async function releaseLock(lockKey, lockId) {
+export async function releaseLock(lockKey: string, lockId: string): Promise<boolean> {
   // Lua script for atomic check-and-delete
   // Only delete if the lock value matches our lockId
   const luaScript = `
@@ -139,12 +156,16 @@ async function releaseLock(lockKey, lockId) {
 
 /**
  * Extend a lock's TTL
- * @param {string} lockKey - The lock key
- * @param {string} lockId - The lock ID to verify ownership
- * @param {number} ttlMs - New TTL in milliseconds
- * @returns {boolean} True if lock was extended
+ * @param lockKey - The lock key
+ * @param lockId - The lock ID to verify ownership
+ * @param ttlMs - New TTL in milliseconds
+ * @returns True if lock was extended
  */
-async function extendLock(lockKey, lockId, ttlMs = DEFAULT_LOCK_TTL_MS) {
+export async function extendLock(
+  lockKey: string,
+  lockId: string,
+  ttlMs: number = DEFAULT_LOCK_TTL_MS
+): Promise<boolean> {
   const luaScript = `
     if redis.call("get", KEYS[1]) == ARGV[1] then
       return redis.call("pexpire", KEYS[1], ARGV[2])
@@ -164,13 +185,17 @@ async function extendLock(lockKey, lockId, ttlMs = DEFAULT_LOCK_TTL_MS) {
 
 /**
  * Execute a function with a distributed lock
- * @param {string} resource - Resource to lock
- * @param {Function} fn - Function to execute while holding lock
- * @param {Object} options - Lock options
- * @returns {*} Result of the function
- * @throws {Error} If lock cannot be acquired
+ * @param resource - Resource to lock
+ * @param fn - Function to execute while holding lock
+ * @param options - Lock options
+ * @returns Result of the function
+ * @throws Error if lock cannot be acquired
  */
-async function withLock(resource, fn, options = {}) {
+export async function withLock<T>(
+  resource: string,
+  fn: () => Promise<T>,
+  options: LockOptions = {}
+): Promise<T> {
   const lock = await acquireLock(resource, options);
 
   if (!lock) {
@@ -186,20 +211,25 @@ async function withLock(resource, fn, options = {}) {
 
 /**
  * Create a room booking lock resource identifier
- * @param {string} hotelId - Hotel ID
- * @param {string} roomTypeId - Room type ID
- * @param {string} checkIn - Check-in date
- * @param {string} checkOut - Check-out date
- * @returns {string} Lock resource identifier
+ * @param hotelId - Hotel ID
+ * @param roomTypeId - Room type ID
+ * @param checkIn - Check-in date
+ * @param checkOut - Check-out date
+ * @returns Lock resource identifier
  */
-function createRoomLockResource(hotelId, roomTypeId, checkIn, checkOut) {
+export function createRoomLockResource(
+  hotelId: string,
+  roomTypeId: string,
+  checkIn: string,
+  checkOut: string
+): string {
   return `room:${hotelId}:${roomTypeId}:${checkIn}:${checkOut}`;
 }
 
 /**
  * Normalize resource name for metrics to avoid high cardinality
  */
-function normalizeResourceForMetrics(resource) {
+function normalizeResourceForMetrics(resource: string): string {
   if (resource.startsWith('room:')) {
     return 'room_booking';
   }
@@ -212,11 +242,11 @@ function normalizeResourceForMetrics(resource) {
 /**
  * Sleep utility
  */
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = {
+export default {
   acquireLock,
   releaseLock,
   extendLock,
