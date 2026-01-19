@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import type CircuitBreaker from 'opossum';
 import { query } from '../db.js';
 import { optionalAuth } from '../middleware/auth.js';
-import { getCachedSearchResults, _CACHE_TTL } from '../shared/cache.js';
+import { getCachedSearchResults, CACHE_TTL } from '../shared/cache.js';
 import { metrics } from '../shared/metrics.js';
 import { createModuleLogger } from '../shared/logger.js';
 import { createSearchCircuitBreaker } from '../shared/circuitBreaker.js';

@@ -1,3 +1,25 @@
+/**
+ * Business routes aggregator module.
+ * Mounts all business-related route handlers in the correct order.
+ *
+ * @module routes/businesses
+ *
+ * @description
+ * This module combines all business route handlers into a single router.
+ * Route order matters: more specific routes (like /nearby) must come before
+ * dynamic parameter routes (like /:idOrSlug) to prevent incorrect matching.
+ *
+ * Available endpoints:
+ * - GET /nearby - Get nearby businesses based on location
+ * - GET / - List businesses with pagination and filtering
+ * - GET /:idOrSlug - Get single business by ID or slug
+ * - POST / - Create a new business (authenticated)
+ * - PATCH /:id - Update a business (owner/admin only)
+ * - POST /:id/hours - Add/update business hours (owner/admin only)
+ * - POST /:id/photos - Add business photo (authenticated)
+ * - POST /:id/claim - Claim a business (authenticated)
+ * - GET /:id/reviews - Get reviews for a business
+ */
 import { Router } from 'express';
 import { router as getRouter } from './get.js';
 import { router as nearbyRouter } from './nearby.js';

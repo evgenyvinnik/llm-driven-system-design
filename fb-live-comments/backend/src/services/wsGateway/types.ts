@@ -7,7 +7,7 @@
  */
 
 import { WebSocket } from 'ws';
-import type { CommentWithUser, _ReactionCount } from '../../types/index.js';
+import type { CommentWithUser, ReactionCount } from '../../types/index.js';
 
 /**
  * Extended WebSocket interface with stream session data.
@@ -74,6 +74,19 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
 
 /**
  * Maps WebSocket close codes to human-readable reasons for metrics.
+ *
+ * @description Converts numeric WebSocket close codes to descriptive string labels
+ * for use in logging and Prometheus metrics. Covers standard RFC 6455 close codes.
+ *
+ * @param code - The numeric WebSocket close code (e.g., 1000, 1001, 1006)
+ * @returns A human-readable string describing the close reason
+ *
+ * @example
+ * ```typescript
+ * const reason = getCloseReason(1000); // Returns 'normal'
+ * const reason = getCloseReason(1006); // Returns 'abnormal'
+ * wsConnectionsClosedCounter.labels(reason).inc();
+ * ```
  */
 export function getCloseReason(code: number): string {
   switch (code) {

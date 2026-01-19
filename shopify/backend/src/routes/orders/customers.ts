@@ -1,7 +1,21 @@
 import { Request, Response } from 'express';
 import { queryWithTenant } from '../../services/db.js';
 
-// List customers for store
+/**
+ * Retrieves all customers for the current store with order statistics.
+ *
+ * @description Fetches customers from the database ordered by creation date (newest first).
+ * Each customer includes aggregated statistics: total order count and total amount spent.
+ * Results are automatically scoped to the current store via tenant isolation.
+ *
+ * @param req - Express request object with storeId populated by middleware
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent
+ *
+ * @example
+ * // GET /api/v1/customers
+ * // Response: { customers: [{ id: 1, email: "john@example.com", order_count: 5, total_spent: 499.99, ... }] }
+ */
 export async function listCustomers(req: Request, res: Response): Promise<void> {
   const { storeId } = req;
 
@@ -17,7 +31,22 @@ export async function listCustomers(req: Request, res: Response): Promise<void> 
   res.json({ customers: result.rows });
 }
 
-// Get single customer
+/**
+ * Retrieves a single customer by ID with addresses and order history.
+ *
+ * @description Fetches a specific customer from the database including their saved
+ * addresses and complete order history. The customer must belong to the current store.
+ *
+ * @param req - Express request object with storeId and customerId params
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent, or returns 404 if not found
+ *
+ * @throws Returns 404 JSON response if customer is not found
+ *
+ * @example
+ * // GET /api/v1/customers/456
+ * // Response: { customer: { id: 456, email: "john@example.com", addresses: [...], orders: [...], ... } }
+ */
 export async function getCustomer(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { customerId } = req.params;

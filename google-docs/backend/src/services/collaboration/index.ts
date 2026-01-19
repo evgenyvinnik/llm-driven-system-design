@@ -20,7 +20,7 @@ import {
   getCollaborationStats,
 } from './state.js';
 import { handleOperation } from './ot.js';
-import { handleLeaveDocument, _getDocumentPresence } from './presence.js';
+import { handleLeaveDocument, getDocumentPresence } from './presence.js';
 import { handleSubscribe } from './sync.js';
 import { handleCursor, handlePresence } from './cursors.js';
 

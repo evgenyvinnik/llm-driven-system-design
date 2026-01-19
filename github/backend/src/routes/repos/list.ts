@@ -1,3 +1,11 @@
+/**
+ * Repository Listing Routes
+ *
+ * @description Handles endpoints for listing repositories with pagination,
+ * filtering, and sorting capabilities.
+ *
+ * @module routes/repos/list
+ */
 import { Router, Request, Response } from 'express';
 import { query } from '../../db/index.js';
 import { ListQueryParams } from './types.js';
@@ -5,8 +13,27 @@ import { ListQueryParams } from './types.js';
 const router = Router();
 
 /**
- * List repositories
- * Returns paginated list of public repositories, plus private repos owned by the authenticated user
+ * GET / - List repositories
+ *
+ * @description Returns a paginated list of public repositories, plus private repositories
+ * owned by the authenticated user. Supports filtering by owner and sorting by various fields.
+ *
+ * @route GET /repos
+ *
+ * @param req.query.owner - Filter repositories by owner username
+ * @param req.query.page - Page number for pagination (default: 1)
+ * @param req.query.limit - Number of repositories per page (default: 20)
+ * @param req.query.sort - Sort field: updated_at, created_at, stars_count, or name (default: updated_at)
+ *
+ * @returns {Object} Paginated repository response
+ * @returns {Repository[]} repos - Array of repository objects with owner information
+ * @returns {number} total - Total count of matching repositories
+ * @returns {number} page - Current page number
+ * @returns {number} limit - Items per page
+ *
+ * @example
+ * // GET /repos?owner=octocat&page=1&limit=10&sort=stars_count
+ * // Response: { repos: [...], total: 25, page: 1, limit: 10 }
  */
 router.get('/', async (req: Request, res: Response): Promise<void> => {
   const { owner, page = '1', limit = '20', sort = 'updated_at' } = req.query as ListQueryParams;

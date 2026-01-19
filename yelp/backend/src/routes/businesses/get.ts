@@ -1,12 +1,47 @@
+/**
+ * Business retrieval route handlers.
+ * @module routes/businesses/get
+ */
 import { Router, Request, Response } from 'express';
 import { pool } from '../../utils/db.js';
 import { cache } from '../../utils/redis.js';
 import { optionalAuth, AuthenticatedRequest } from '../../middleware/auth.js';
 import { BusinessRow, BusinessHour, BusinessPhoto, CountRow } from './types.js';
 
+/**
+ * Express router for business retrieval endpoints.
+ */
 export const router = Router();
 
-// Get all businesses with pagination
+/**
+ * Lists all businesses with pagination and optional filtering.
+ *
+ * @description
+ * Retrieves a paginated list of businesses with support for filtering by city,
+ * category, and minimum rating. Results are sorted by rating and review count.
+ * Each business includes its categories and primary photo URL.
+ *
+ * @route GET /
+ *
+ * @param req.query.page - Page number (default: 1)
+ * @param req.query.limit - Results per page (default: 20)
+ * @param req.query.city - Filter by city name (case-insensitive)
+ * @param req.query.category - Filter by category slug
+ * @param req.query.minRating - Minimum rating threshold
+ *
+ * @returns {Object} JSON object with businesses and pagination info
+ * @returns {BusinessRow[]} response.businesses - Array of business objects
+ * @returns {Object} response.pagination - Pagination metadata
+ * @returns {number} response.pagination.page - Current page number
+ * @returns {number} response.pagination.limit - Results per page
+ * @returns {number} response.pagination.total - Total number of businesses
+ * @returns {number} response.pagination.pages - Total number of pages
+ *
+ * @throws {500} Database or server error
+ *
+ * @example
+ * // GET /businesses?city=San%20Francisco&category=restaurants&minRating=4&page=1&limit=10
+ */
 router.get(
   '/',
   async (req: Request, res: Response): Promise<void | Response> => {
@@ -105,7 +140,33 @@ router.get(
   }
 );
 
-// Get business by ID or slug
+/**
+ * Retrieves a single business by ID or slug.
+ *
+ * @description
+ * Fetches detailed business information including categories, hours, photos,
+ * and owner name. Uses Redis caching with a 5-minute TTL for improved performance.
+ * Supports both UUID-based lookups and human-readable slug lookups.
+ * If the user is authenticated, includes an `is_owner` flag.
+ *
+ * @route GET /:idOrSlug
+ *
+ * @param req.params.idOrSlug - Business UUID or URL-friendly slug
+ *
+ * @returns {Object} JSON object containing the business
+ * @returns {BusinessRow} response.business - The business with full details
+ * @returns {BusinessHour[]} response.business.hours - Operating hours by day
+ * @returns {BusinessPhoto[]} response.business.photos - Business photos
+ * @returns {string} response.business.owner_name - Owner's display name
+ * @returns {boolean} response.business.is_owner - True if current user is owner
+ *
+ * @throws {404} Business not found
+ * @throws {500} Database or server error
+ *
+ * @example
+ * // GET /businesses/joes-coffee-shop
+ * // GET /businesses/550e8400-e29b-41d4-a716-446655440000
+ */
 router.get(
   '/:idOrSlug',
   optionalAuth as any,

@@ -18,6 +18,26 @@ import type {
 
 /**
  * Creates a new transaction record in pending status.
+ *
+ * @description Inserts a new transaction into the database with 'pending' status.
+ * The transaction is created within a database transaction for atomicity.
+ * Payment method and metadata are stored as JSONB columns.
+ *
+ * @param transactionId - Pre-generated UUID for the transaction
+ * @param merchantId - UUID of the merchant creating the payment
+ * @param request - Payment request containing amount, currency, payment method, etc.
+ * @param feeAmount - Calculated platform fee in cents
+ * @param netAmount - Net amount for merchant after fees in cents
+ * @returns The newly created Transaction object
+ *
+ * @example
+ * const transaction = await createTransactionRecord(
+ *   uuidv4(),
+ *   'merchant_123',
+ *   { amount: 10000, currency: 'USD', payment_method: {...}, idempotency_key: 'key123' },
+ *   320,
+ *   9680
+ * );
  */
 export async function createTransactionRecord(
   transactionId: string,
@@ -66,7 +86,26 @@ export async function createTransactionRecord(
 
 /**
  * Updates a transaction's status and any additional fields atomically.
- * Increments the version number for optimistic locking.
+ *
+ * @description Updates the transaction status and increments the version number
+ * for optimistic locking. Additional fields can be updated in the same query
+ * (e.g., risk_score, processor_ref). The updated_at timestamp is automatically set.
+ *
+ * @param id - UUID of the transaction to update
+ * @param status - New status to set (pending, authorized, captured, failed, voided, refunded)
+ * @param additionalFields - Optional key-value pairs for additional columns to update
+ * @returns Promise that resolves when update is complete
+ *
+ * @example
+ * // Update status only
+ * await updateTransactionStatus('txn_abc123', 'authorized');
+ *
+ * @example
+ * // Update status with additional fields
+ * await updateTransactionStatus('txn_abc123', 'authorized', {
+ *   risk_score: 25,
+ *   processor_ref: 'proc_xyz789'
+ * });
  */
 export async function updateTransactionStatus(
   id: string,
@@ -91,7 +130,30 @@ export async function updateTransactionStatus(
 
 /**
  * Publishes an async fraud check message to the fraud-scoring queue.
- * Fire and forget - does not block the payment flow.
+ *
+ * @description Sends a message to RabbitMQ for asynchronous deep fraud analysis.
+ * This is a fire-and-forget operation that does not block the payment flow.
+ * Errors are logged but do not cause the payment to fail.
+ *
+ * @param transactionId - UUID of the transaction to check
+ * @param merchantId - UUID of the merchant
+ * @param amount - Transaction amount in cents
+ * @param currency - Three-letter currency code (e.g., 'USD')
+ * @param paymentMethod - Payment method details for fraud analysis
+ * @param customerEmail - Optional customer email for pattern detection
+ * @param ipAddress - Optional client IP for geolocation-based fraud detection
+ * @returns void (fire-and-forget, no return value)
+ *
+ * @example
+ * publishAsyncFraudCheck(
+ *   'txn_abc123',
+ *   'merchant_xyz',
+ *   10000,
+ *   'USD',
+ *   { type: 'card', last_four: '4242', card_brand: 'visa' },
+ *   'customer@example.com',
+ *   '192.168.1.1'
+ * );
  */
 export function publishAsyncFraudCheck(
   transactionId: string,
@@ -123,6 +185,16 @@ export function publishAsyncFraudCheck(
 
 /**
  * Generates a new transaction ID.
+ *
+ * @description Creates a new UUID v4 for use as a transaction identifier.
+ * Transaction IDs are generated before insertion to allow idempotency
+ * key association and early logging.
+ *
+ * @returns A new UUID v4 string
+ *
+ * @example
+ * const transactionId = generateTransactionId();
+ * // Returns: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
  */
 export function generateTransactionId(): string {
   return uuidv4();

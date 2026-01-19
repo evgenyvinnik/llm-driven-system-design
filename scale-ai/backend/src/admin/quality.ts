@@ -16,8 +16,37 @@ const router = Router()
 
 /**
  * POST /api/admin/quality/analyze-batch - Batch analyzes quality of unscored drawings.
- * Can optionally update scores in database and auto-flag low quality drawings.
- * Use updateScores=false for dry run.
+ *
+ * @description Fetches drawings without quality scores and runs quality analysis.
+ *   Can optionally persist scores to the database and auto-flag drawings below
+ *   a minimum threshold. Use updateScores=false for a dry run.
+ *
+ * @route POST /api/admin/quality/analyze-batch
+ *
+ * @param {Request} req - Express request with body containing:
+ *   - minScore {number} [optional] - Auto-flag drawings below this score
+ *   - limit {number} [default=100] - Maximum drawings to analyze
+ *   - updateScores {boolean} [default=false] - Persist scores to database
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Batch analysis results with summary statistics
+ * @returns {object} 500 - If analysis fails
+ *
+ * @example
+ * // Request body
+ * { "minScore": 50, "limit": 50, "updateScores": true }
+ *
+ * // Success response
+ * {
+ *   "analyzed": 50,
+ *   "failed": 2,
+ *   "passed": 35,
+ *   "avgScore": 62.5,
+ *   "flagged": 10,
+ *   "results": [{ "id": "uuid", "shape": "circle", "score": 75, "passed": true }],
+ *   "errors": [{ "id": "uuid", "error": "Failed to fetch stroke data" }],
+ *   "message": "Analyzed 50 drawings, updated scores, flagged 10 low quality"
+ * }
  */
 router.post('/analyze-batch', requireAdmin, async (req: Request, res: Response) => {
   const reqLogger = createChildLogger({ endpoint: '/api/admin/quality/analyze-batch' })
@@ -125,7 +154,35 @@ router.post('/analyze-batch', requireAdmin, async (req: Request, res: Response) 
 
 /**
  * GET /api/admin/quality/stats - Returns quality score statistics.
- * Shows distribution across quality tiers and average scores per shape.
+ *
+ * @description Aggregates quality metrics across all drawings including:
+ *   - Distribution across quality tiers (high/medium/low/unscored)
+ *   - Average quality score per shape
+ *   - Count of unscored drawings pending analysis
+ *
+ * @route GET /api/admin/quality/stats
+ *
+ * @param {Request} _req - Express request (unused, auth handled by middleware)
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Quality statistics object
+ * @returns {object} 500 - If fetching statistics fails
+ *
+ * @example
+ * // Success response
+ * {
+ *   "distribution": [
+ *     { "quality_tier": "high", "count": "150" },
+ *     { "quality_tier": "medium", "count": "200" },
+ *     { "quality_tier": "low", "count": "50" },
+ *     { "quality_tier": "unscored", "count": "100" }
+ *   ],
+ *   "perShape": [
+ *     { "shape": "circle", "avgScore": 72.5, "count": 120 },
+ *     { "shape": "square", "avgScore": 68.3, "count": 85 }
+ *   ],
+ *   "unscoredCount": 100
+ * }
  */
 router.get('/stats', requireAdmin, async (_req: Request, res: Response) => {
   try {

@@ -17,6 +17,21 @@ const wsLogger = logger.child({ module: 'room-manager' });
 
 /**
  * Manages stream rooms, including joining, leaving, and resource cleanup.
+ *
+ * @description The RoomManager orchestrates the lifecycle of stream "rooms" - logical
+ * groupings of WebSocket connections watching the same stream. It handles:
+ * - Redis Pub/Sub subscriptions for cross-server communication
+ * - Comment batching and reaction aggregation per stream
+ * - Peak viewer tracking for analytics
+ * - Resource cleanup when streams have no viewers
+ *
+ * @example
+ * ```typescript
+ * const roomManager = new RoomManager(connectionMap);
+ * await roomManager.joinStream(ws, 'stream-123', addConnectionFn);
+ * roomManager.leaveStream(ws, removeConnectionFn);
+ * roomManager.shutdown();
+ * ```
  */
 export class RoomManager {
   /** Map of stream ID to connected clients */
@@ -37,7 +52,26 @@ export class RoomManager {
 
   /**
    * Adds a user to a stream room.
-   * Sets up Redis subscriptions and batchers if this is the first viewer.
+   *
+   * @description Handles the complete stream join flow:
+   * 1. If first viewer, sets up Redis Pub/Sub subscriptions and creates batchers
+   * 2. Adds the connection to the stream's connection set
+   * 3. Updates viewer count in Redis
+   * 4. Tracks peak viewers for analytics
+   * 5. Broadcasts updated viewer count to all watchers
+   * 6. Sends recent comments to the newly joined viewer
+   *
+   * @param ws - The WebSocket connection joining the stream
+   * @param streamId - The stream ID to join
+   * @param addConnection - Callback function to add the connection to the manager
+   * @returns Promise that resolves when join is complete
+   *
+   * @example
+   * ```typescript
+   * await roomManager.joinStream(ws, 'stream-123', (streamId, ws) => {
+   *   connectionManager.addConnection(streamId, ws);
+   * });
+   * ```
    */
   async joinStream(
     ws: ExtendedWebSocket,
@@ -93,7 +127,23 @@ export class RoomManager {
 
   /**
    * Removes a user from a stream room.
-   * Cleans up resources when the last viewer leaves.
+   *
+   * @description Handles the complete stream leave flow:
+   * 1. Removes the connection from the stream's connection set
+   * 2. If last viewer, unsubscribes from Redis Pub/Sub and stops batchers
+   * 3. Otherwise, updates viewer count and broadcasts to remaining viewers
+   * 4. Clears the stream/user session from the WebSocket
+   *
+   * @param ws - The WebSocket connection leaving the stream
+   * @param removeConnection - Callback function that removes the connection and returns true if stream is now empty
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * roomManager.leaveStream(ws, (streamId, ws) => {
+   *   return connectionManager.removeConnection(streamId, ws);
+   * });
+   * ```
    */
   leaveStream(
     ws: ExtendedWebSocket,
@@ -143,6 +193,12 @@ export class RoomManager {
 
   /**
    * Gets the comment batcher for a stream.
+   *
+   * @description Retrieves the CommentBatcher instance associated with a stream.
+   * Returns undefined if no viewers are watching the stream (batcher not initialized).
+   *
+   * @param streamId - The stream ID to get the batcher for
+   * @returns The CommentBatcher instance or undefined if stream has no viewers
    */
   getCommentBatcher(streamId: string): ICommentBatcher | undefined {
     return this.commentBatchers.get(streamId);
@@ -150,6 +206,12 @@ export class RoomManager {
 
   /**
    * Gets the reaction aggregator for a stream.
+   *
+   * @description Retrieves the ReactionAggregator instance associated with a stream.
+   * Returns undefined if no viewers are watching the stream (aggregator not initialized).
+   *
+   * @param streamId - The stream ID to get the aggregator for
+   * @returns The ReactionAggregator instance or undefined if stream has no viewers
    */
   getReactionAggregator(streamId: string): IReactionAggregator | undefined {
     return this.reactionAggregators.get(streamId);
@@ -157,6 +219,12 @@ export class RoomManager {
 
   /**
    * Cleans up all batchers and aggregators during shutdown.
+   *
+   * @description Stops all comment batchers and reaction aggregators, ensuring any
+   * buffered data is flushed before shutdown. Also clears the peak viewer tracking.
+   * Should be called before closing WebSocket connections during graceful shutdown.
+   *
+   * @returns void
    */
   shutdown(): void {
     wsLogger.info('Flushing pending batches');

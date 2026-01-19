@@ -10,7 +10,7 @@
  * - Circuit breaker states
  */
 import promClient, { Registry, Counter, Histogram, Gauge } from 'prom-client';
-import { Request, Response, NextFunction, _Router } from 'express';
+import { Request, Response, NextFunction, Router } from 'express';
 
 interface ExtendedRoute {
   path?: string;

@@ -16,16 +16,28 @@ import type { Transaction, ClientInfo } from './types.js';
 
 /**
  * Cancels an authorized payment before capture, releasing the hold on customer funds.
- * No ledger entries are created since no money was moved.
  *
- * IDEMPOTENCY: Voiding an already-voided transaction returns current state.
+ * @description Voids an authorized transaction, preventing it from being captured.
+ * No ledger entries are created since no actual money was moved - only the hold
+ * on the customer's funds is released.
+ *
+ * IDEMPOTENCY: Void operations are idempotent. Voiding an already-voided
+ * transaction returns the existing state without error.
  *
  * @param transactionId - UUID of the authorized transaction to void
- * @param transaction - Transaction object (pre-fetched)
- * @param getTransactionFn - Function to fetch the transaction
- * @param clientInfo - Optional client info for audit logging
+ * @param transaction - Transaction object (must be pre-fetched by caller)
+ * @param getTransactionFn - Function to fetch updated transaction after void
+ * @param clientInfo - Optional client info for audit logging (IP, user agent)
  * @returns Updated transaction with 'voided' status
  * @throws Error if transaction not found or not in 'authorized' status
+ *
+ * @example
+ * const voided = await voidPayment(
+ *   'txn_abc123',
+ *   transaction,
+ *   (id) => paymentService.getTransaction(id),
+ *   { ipAddress: '192.168.1.1' }
+ * );
  */
 export async function voidPayment(
   transactionId: string,

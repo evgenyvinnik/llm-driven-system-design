@@ -3,7 +3,24 @@ import { queryWithTenant, getClientWithTenant } from '../../services/db.js';
 import { recalculateSubtotal, generateCartSessionId, getCartSessionFromRequest } from './cart-utils.js';
 import type { Cart, CartItem } from './types.js';
 
-// Get or create cart
+/**
+ * Retrieves the current shopping cart for a session.
+ *
+ * @description Fetches the cart associated with the current session, including enriched
+ * line item details (product title, variant title, price, image). Returns null if no
+ * cart exists for the session. Cart is identified via cookie or x-cart-session header.
+ *
+ * @param req - Express request object with storeId and cart session (cookie or header)
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent
+ *
+ * @throws Returns 404 JSON response if store is not found
+ *
+ * @example
+ * // GET /api/v1/cart
+ * // Response: { cart: { id: 1, items: [...], line_items: [...], subtotal: 59.99 } }
+ * // Or if no cart: { cart: null }
+ */
 export async function getCart(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const sessionId = getCartSessionFromRequest(req);
@@ -36,7 +53,26 @@ export async function getCart(req: Request, res: Response): Promise<void | Respo
   res.json({ cart: result.rows[0] });
 }
 
-// Add item to cart
+/**
+ * Adds a product variant to the shopping cart.
+ *
+ * @description Adds the specified variant to the cart, creating a new cart if needed.
+ * If the variant already exists in the cart, increments the quantity. Validates
+ * inventory availability before adding. Sets a cart session cookie for tracking.
+ *
+ * @param req - Express request object with storeId and body containing variantId, quantity
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent
+ *
+ * @throws Returns 404 JSON response if store or variant is not found
+ * @throws Returns 400 JSON response if variantId is missing or insufficient inventory
+ * @throws Re-throws database errors after rolling back transaction
+ *
+ * @example
+ * // POST /api/v1/cart
+ * // Body: { "variantId": 123, "quantity": 2 }
+ * // Response: { cart: { id: 1, items: [...], subtotal: 59.98 }, sessionId: "cart_123_abc" }
+ */
 export async function addToCart(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { variantId, quantity = 1 } = req.body;
@@ -98,7 +134,29 @@ export async function addToCart(req: Request, res: Response): Promise<void | Res
   }
 }
 
-// Update cart item quantity
+/**
+ * Updates the quantity of an item in the shopping cart.
+ *
+ * @description Updates the quantity for a specific variant in the cart. If quantity
+ * is set to 0 or less, the item is removed from the cart. Recalculates the subtotal
+ * after the update.
+ *
+ * @param req - Express request object with storeId and body containing variantId, quantity
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent
+ *
+ * @throws Returns 404 JSON response if store or cart is not found
+ * @throws Returns 400 JSON response if no cart session exists
+ * @throws Re-throws database errors after rolling back transaction
+ *
+ * @example
+ * // PATCH /api/v1/cart
+ * // Body: { "variantId": 123, "quantity": 5 }
+ * // Response: { cart: { id: 1, items: [...], subtotal: 149.95 } }
+ *
+ * // Remove item by setting quantity to 0:
+ * // Body: { "variantId": 123, "quantity": 0 }
+ */
 export async function updateCartItem(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { variantId, quantity } = req.body;

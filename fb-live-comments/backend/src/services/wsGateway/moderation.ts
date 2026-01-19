@@ -27,9 +27,21 @@ export interface BanCheckResult {
 /**
  * Checks if a user is banned from a stream.
  *
- * @param userId - User to check
- * @param streamId - Stream to check against
- * @returns Promise resolving to ban check result
+ * @description Queries the user service to determine if a user has been banned
+ * from participating in a specific stream. Implements a "fail open" policy -
+ * if the ban check fails due to an error, the user is allowed to proceed.
+ *
+ * @param userId - The user ID to check
+ * @param streamId - The stream ID to check against
+ * @returns Promise resolving to a BanCheckResult with isBanned status
+ *
+ * @example
+ * ```typescript
+ * const { isBanned } = await checkUserBan('user-123', 'stream-456');
+ * if (isBanned) {
+ *   // Reject the user's action
+ * }
+ * ```
  */
 export async function checkUserBan(userId: string, streamId: string): Promise<BanCheckResult> {
   try {
@@ -47,12 +59,23 @@ export async function checkUserBan(userId: string, streamId: string): Promise<Ba
 
 /**
  * Validates that a user can post in a stream.
- * Checks that the user is connected to the specified stream.
  *
- * @param ws - WebSocket connection
- * @param streamId - Expected stream ID
- * @param userId - Expected user ID
- * @returns True if validation passes, false otherwise
+ * @description Verifies that the WebSocket connection has an active stream session
+ * and that the provided stream/user IDs match the session. This prevents users
+ * from posting comments to streams they haven't joined or impersonating other users.
+ *
+ * @param ws - The WebSocket connection to validate
+ * @param streamId - The expected stream ID from the request payload
+ * @param userId - The expected user ID from the request payload
+ * @returns True if validation passes, false if validation fails (error sent to client)
+ *
+ * @example
+ * ```typescript
+ * if (!validateUserSession(ws, payload.stream_id, payload.user_id)) {
+ *   return; // Error already sent to client
+ * }
+ * // Proceed with the action
+ * ```
  */
 export function validateUserSession(
   ws: ExtendedWebSocket,
@@ -75,10 +98,22 @@ export function validateUserSession(
 /**
  * Rejects a connection if the user is banned.
  *
- * @param ws - WebSocket connection
- * @param userId - User to check
- * @param streamId - Stream to check against
- * @returns Promise resolving to true if user is banned (and error was sent)
+ * @description Combines ban checking with immediate rejection. If the user is banned,
+ * sends an error message to the client and logs the attempt. This is the primary
+ * entry point for ban enforcement during stream join operations.
+ *
+ * @param ws - The WebSocket connection attempting to join
+ * @param userId - The user ID attempting to join
+ * @param streamId - The stream ID the user is trying to join
+ * @returns Promise resolving to true if user is banned (error already sent), false if allowed
+ *
+ * @example
+ * ```typescript
+ * if (await rejectIfBanned(ws, userId, streamId)) {
+ *   return; // User is banned, error already sent
+ * }
+ * // User is allowed, proceed with join
+ * ```
  */
 export async function rejectIfBanned(
   ws: ExtendedWebSocket,

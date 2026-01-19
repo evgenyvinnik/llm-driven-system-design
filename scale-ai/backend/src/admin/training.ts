@@ -18,7 +18,29 @@ const router = Router()
 
 /**
  * POST /api/admin/training/start - Starts a new model training job.
- * Creates a job record and publishes to RabbitMQ for async processing.
+ *
+ * @description Creates a training job record in the database and publishes
+ *   it to RabbitMQ for async processing by the training worker.
+ *   Uses circuit breaker and retry patterns for queue resilience.
+ *
+ * @route POST /api/admin/training/start
+ *
+ * @param {Request} req - Express request with optional body.config {object}
+ *   containing training configuration (epochs, batch size, etc.)
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 201 - Created job with ID and status
+ * @returns {object} 503 - If RabbitMQ circuit breaker is open
+ * @returns {object} 500 - If job creation fails
+ *
+ * @throws {CircuitBreakerOpenError} When RabbitMQ circuit breaker is open
+ *
+ * @example
+ * // Request body
+ * { "config": { "epochs": 10, "batchSize": 32, "learningRate": 0.001 } }
+ *
+ * // Success response (201)
+ * { "id": "uuid", "status": "queued", "message": "Training job queued" }
  */
 router.post('/start', requireAdmin, async (req: Request, res: Response) => {
   const reqLogger = createChildLogger({ endpoint: '/api/admin/training/start' })
@@ -82,6 +104,31 @@ router.post('/start', requireAdmin, async (req: Request, res: Response) => {
 
 /**
  * GET /api/admin/training/:id - Returns status and details of a training job.
+ *
+ * @description Retrieves full details of a training job including configuration,
+ *   status, timing, error messages, metrics, and model path if completed.
+ *
+ * @route GET /api/admin/training/:id
+ *
+ * @param {Request} req - Express request with params.id {string} - Training job UUID
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Training job details
+ * @returns {object} 404 - If training job not found
+ * @returns {object} 500 - If fetching job fails
+ *
+ * @example
+ * // Success response
+ * {
+ *   "id": "uuid",
+ *   "status": "completed",
+ *   "config": { "epochs": 10 },
+ *   "error_message": null,
+ *   "started_at": "2024-01-15T10:00:00Z",
+ *   "completed_at": "2024-01-15T10:30:00Z",
+ *   "metrics": { "accuracy": 0.95, "loss": 0.05 },
+ *   "model_path": "models/v1.0/model.pt"
+ * }
  */
 router.get('/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
@@ -107,6 +154,33 @@ router.get('/:id', requireAdmin, async (req: Request, res: Response) => {
 
 /**
  * GET /api/admin/training - Lists all training jobs (most recent first).
+ *
+ * @description Retrieves a list of training jobs ordered by creation date.
+ *   Returns the most recent 50 jobs with summary information.
+ *
+ * @route GET /api/admin/training
+ *
+ * @param {Request} _req - Express request (unused, auth handled by middleware)
+ * @param {Response} res - Express response object
+ *
+ * @returns {object[]} 200 - Array of training job summaries
+ * @returns {object} 500 - If fetching jobs fails
+ *
+ * @example
+ * // Success response
+ * [
+ *   {
+ *     "id": "uuid",
+ *     "status": "completed",
+ *     "config": { "epochs": 10 },
+ *     "started_at": "2024-01-15T10:00:00Z",
+ *     "completed_at": "2024-01-15T10:30:00Z",
+ *     "created_at": "2024-01-15T09:59:00Z",
+ *     "progress": 100,
+ *     "accuracy": "0.95",
+ *     "error_message": null
+ *   }
+ * ]
  */
 router.get('/', requireAdmin, async (_req: Request, res: Response) => {
   try {
@@ -127,7 +201,28 @@ router.get('/', requireAdmin, async (_req: Request, res: Response) => {
 
 /**
  * POST /api/admin/training/:id/cancel - Cancels a training job.
- * Only pending, queued, or running jobs can be cancelled.
+ *
+ * @description Cancels a training job by updating its status to 'cancelled'.
+ *   Only jobs with status 'pending', 'queued', or 'running' can be cancelled.
+ *   Sets the completed_at timestamp to the current time.
+ *
+ * @route POST /api/admin/training/:id/cancel
+ *
+ * @param {Request} req - Express request with params.id {string} - Training job UUID
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Success response { success: true, message: string }
+ * @returns {object} 400 - If job status doesn't allow cancellation
+ * @returns {object} 404 - If training job not found
+ * @returns {object} 500 - If cancellation fails
+ *
+ * @example
+ * POST /api/admin/training/123e4567-e89b-12d3-a456-426614174000/cancel
+ * // Success response
+ * { "success": true, "message": "Training job cancelled" }
+ *
+ * // Error response (400)
+ * { "error": "Cannot cancel job with status 'completed'" }
  */
 router.post('/:id/cancel', requireAdmin, async (req: Request, res: Response) => {
   const reqLogger = createChildLogger({ endpoint: '/api/admin/training/:id/cancel' })

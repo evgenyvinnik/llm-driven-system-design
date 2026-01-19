@@ -15,11 +15,24 @@ const DEFAULT_FEE_CONFIG: FeeConfig = {
 
 /**
  * Calculates the platform fee for a given transaction amount.
- * Uses percentage + fixed fee model (e.g., 2.9% + $0.30).
+ * Uses a percentage + fixed fee model (e.g., 2.9% + $0.30), similar to Stripe.
  *
- * @param amount - Transaction amount in cents
- * @param config - Optional fee configuration override
- * @returns Fee calculation with fee amount and net amount
+ * @description Computes the platform fee and net amount for a transaction.
+ * The fee is rounded to the nearest cent using Math.round().
+ *
+ * @param amount - Transaction amount in cents (must be positive integer)
+ * @param config - Optional fee configuration override (defaults to env vars or 2.9% + $0.30)
+ * @returns Fee calculation containing feeAmount and netAmount in cents
+ *
+ * @example
+ * // Calculate fee for a $100 transaction
+ * const result = calculateFee(10000);
+ * // result.feeAmount = 320 (2.9% of 10000 + 30 = 320)
+ * // result.netAmount = 9680 (10000 - 320)
+ *
+ * @example
+ * // Use custom fee configuration
+ * const result = calculateFee(10000, { feePercent: 3.5, feeFixed: 25 });
  */
 export function calculateFee(
   amount: number,
@@ -33,11 +46,22 @@ export function calculateFee(
 /**
  * Checks if a payment request has already been processed using its idempotency key.
  * Prevents duplicate charges when clients retry failed network requests.
- * Checks Redis cache first, then falls back to database lookup.
  *
- * @param key - Unique idempotency key provided by the client
+ * @description Implements a two-tier idempotency check: first checks Redis cache for
+ * fast lookups, then falls back to database if not in cache. Found transactions are
+ * cached in Redis for 24 hours to speed up future retries.
+ *
+ * @param key - Unique idempotency key provided by the client (typically a UUID)
  * @returns Existing transaction if found, null if this is a new request
- * @deprecated Use withIdempotency from shared/idempotency.ts instead
+ *
+ * @deprecated Use withIdempotency from shared/idempotency.ts instead for new code.
+ * This function is maintained for backward compatibility.
+ *
+ * @example
+ * const existing = await checkIdempotency('payment-12345');
+ * if (existing) {
+ *   return existing; // Return cached response, don't process again
+ * }
  */
 export async function checkIdempotency(key: string): Promise<Transaction | null> {
   // First check Redis cache
@@ -63,8 +87,18 @@ export async function checkIdempotency(key: string): Promise<Transaction | null>
 /**
  * Validates that a transaction can be captured.
  *
- * @param transaction - Transaction to validate
+ * @description Checks if a transaction is in a valid state for capture.
+ * Only transactions in 'authorized' status can be captured.
+ * Returns isValid: true for already-captured transactions (idempotent behavior).
+ *
+ * @param transaction - Transaction object to validate (can be null if not found)
  * @returns Object with isValid flag and optional error message
+ *
+ * @example
+ * const { isValid, error } = validateForCapture(transaction);
+ * if (!isValid) {
+ *   throw new Error(error);
+ * }
  */
 export function validateForCapture(
   transaction: Transaction | null
@@ -88,8 +122,18 @@ export function validateForCapture(
 /**
  * Validates that a transaction can be voided.
  *
- * @param transaction - Transaction to validate
+ * @description Checks if a transaction is in a valid state for voiding.
+ * Only transactions in 'authorized' status can be voided (before capture).
+ * Returns isValid: true for already-voided transactions (idempotent behavior).
+ *
+ * @param transaction - Transaction object to validate (can be null if not found)
  * @returns Object with isValid flag and optional error message
+ *
+ * @example
+ * const { isValid, error } = validateForVoid(transaction);
+ * if (!isValid) {
+ *   throw new Error(error);
+ * }
  */
 export function validateForVoid(
   transaction: Transaction | null
@@ -112,6 +156,16 @@ export function validateForVoid(
 
 /**
  * Gets the default fee configuration.
+ *
+ * @description Returns a copy of the default fee configuration used for
+ * calculating platform fees. Values are sourced from environment variables
+ * (TRANSACTION_FEE_PERCENT, TRANSACTION_FEE_FIXED) or default to 2.9% + $0.30.
+ *
+ * @returns A copy of the default FeeConfig object
+ *
+ * @example
+ * const config = getDefaultFeeConfig();
+ * console.log(`Fee: ${config.feePercent}% + $${config.feeFixed / 100}`);
  */
 export function getDefaultFeeConfig(): FeeConfig {
   return { ...DEFAULT_FEE_CONFIG };

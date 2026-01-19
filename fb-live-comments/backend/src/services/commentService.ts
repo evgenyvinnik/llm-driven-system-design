@@ -10,7 +10,7 @@
  */
 
 import { query } from '../db/index.js';
-import { _Comment, CommentWithUser } from '../types/index.js';
+import { Comment, CommentWithUser } from '../types/index.js';
 import { snowflake } from '../utils/snowflake.js';
 import { redis, checkRateLimit } from '../utils/redis.js';
 import { streamService } from './streamService.js';

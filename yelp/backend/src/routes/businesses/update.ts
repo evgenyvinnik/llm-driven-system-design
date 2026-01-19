@@ -1,3 +1,7 @@
+/**
+ * Business update route handler.
+ * @module routes/businesses/update
+ */
 import { Router, Response } from 'express';
 import { pool } from '../../utils/db.js';
 import { cache } from '../../utils/redis.js';
@@ -5,9 +9,54 @@ import { authenticate, AuthenticatedRequest } from '../../middleware/auth.js';
 import { publishBusinessReindex } from '../../utils/queue.js';
 import { BusinessRow, OwnerCheckRow, UpdateBusinessBody } from './types.js';
 
+/**
+ * Express router for business update endpoints.
+ */
 export const router = Router();
 
-// Update business
+/**
+ * Updates an existing business.
+ *
+ * @description
+ * Updates business information for the specified business ID.
+ * Only the business owner or an admin can update a business.
+ * Supports partial updates - only provided fields are modified.
+ * After updating, clears the cache and publishes an event for Elasticsearch reindexing.
+ *
+ * @route PATCH /:id
+ *
+ * @param req.params.id - Business UUID
+ * @param req.body.name - Updated business name
+ * @param req.body.description - Updated description
+ * @param req.body.address - Updated street address
+ * @param req.body.city - Updated city
+ * @param req.body.state - Updated state/province
+ * @param req.body.zip_code - Updated postal code
+ * @param req.body.phone - Updated phone number
+ * @param req.body.website - Updated website URL
+ * @param req.body.email - Updated email address
+ * @param req.body.price_level - Updated price level (1-4)
+ * @param req.body.latitude - Updated geographic latitude
+ * @param req.body.longitude - Updated geographic longitude
+ * @param req.body.categories - Updated array of category IDs
+ *
+ * @returns {Object} JSON object containing the updated business
+ * @returns {BusinessRow} response.business - The updated business
+ *
+ * @throws {400} No updates provided
+ * @throws {401} User not authenticated
+ * @throws {403} User not authorized (not owner or admin)
+ * @throws {404} Business not found
+ * @throws {500} Database or server error
+ *
+ * @example
+ * // PATCH /businesses/550e8400-e29b-41d4-a716-446655440000
+ * // Request body
+ * {
+ *   "name": "Joe's Coffee - Downtown",
+ *   "phone": "(555) 123-4567"
+ * }
+ */
 router.patch(
   '/:id',
   authenticate as any,

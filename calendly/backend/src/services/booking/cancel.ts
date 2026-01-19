@@ -1,6 +1,11 @@
 /**
  * Booking cancellation logic.
- * Handles cancelling bookings with proper notification handling.
+ *
+ * @description Handles cancelling bookings with proper transaction handling,
+ * notification publishing, and cache invalidation. Supports optional ownership
+ * verification for security.
+ *
+ * @module services/booking/cancel
  */
 
 import { pool } from '../../db/index.js';
@@ -11,14 +16,34 @@ import { publishCancellationNotification, sendCancellationEmail } from './notifi
 import { invalidateAvailabilityCache, updateActiveBookingsGauge } from './slots.js';
 
 /**
- * Cancels a booking.
- * Frees up the time slot for new bookings.
- * Sends cancellation notification email after success.
- * @param id - The UUID of the booking to cancel
- * @param reason - Optional cancellation reason for the notification
- * @param userId - Optional user ID for ownership verification
- * @returns The cancelled booking
- * @throws Error if booking not found or already cancelled
+ * Cancels a booking and frees up the time slot for new bookings.
+ *
+ * @description Performs the cancellation within a database transaction with
+ * row-level locking to prevent concurrent modifications. After successful
+ * cancellation:
+ * - Updates booking status to 'cancelled'
+ * - Increments the version field (optimistic locking)
+ * - Records success metrics
+ * - Invalidates availability cache
+ * - Updates active bookings gauge
+ * - Publishes cancellation notification to RabbitMQ (async)
+ * - Sends cancellation email (async, legacy path)
+ *
+ * @param {string} id - The UUID of the booking to cancel
+ * @param {string} [reason] - Optional cancellation reason for the notification
+ * @param {string} [userId] - Optional user ID for ownership verification
+ * @returns {Promise<Booking>} The cancelled booking with updated status
+ * @throws {Error} "Booking not found" if the booking ID doesn't exist
+ * @throws {Error} "Unauthorized to cancel this booking" if userId doesn't match host
+ * @throws {Error} "Booking is already cancelled" if status is already 'cancelled'
+ *
+ * @example
+ * // Cancel with a reason
+ * const cancelled = await cancelBooking(bookingId, 'Schedule conflict');
+ *
+ * @example
+ * // Cancel with ownership verification
+ * const cancelled = await cancelBooking(bookingId, undefined, currentUserId);
  */
 export async function cancelBooking(
   id: string,

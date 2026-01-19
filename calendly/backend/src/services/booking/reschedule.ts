@@ -1,6 +1,11 @@
 /**
  * Booking rescheduling logic.
- * Handles moving bookings to new time slots with conflict detection.
+ *
+ * @description Handles moving bookings to new time slots with conflict detection,
+ * optimistic locking, and proper notification handling. Ensures thread-safety
+ * through database transactions and version-based concurrency control.
+ *
+ * @module services/booking/reschedule
  */
 
 import { pool } from '../../db/index.js';
@@ -12,15 +17,37 @@ import { invalidateAvailabilityCache } from './slots.js';
 import { parseISO, addMinutes } from 'date-fns';
 
 /**
- * Reschedules a booking to a new time.
- * Uses optimistic locking (version field) to prevent concurrent modification.
- * Validates that the new time slot is available before updating.
- * Sends reschedule notification email after success.
- * @param id - The UUID of the booking to reschedule
- * @param newStartTime - New start time in ISO 8601 format
- * @param userId - Optional user ID for ownership verification
- * @returns The updated booking
- * @throws Error if booking not found, cancelled, or new slot unavailable
+ * Reschedules a booking to a new time slot.
+ *
+ * @description Moves a booking to a new start time, recalculating the end time
+ * based on the meeting type's duration. Uses optimistic locking (version field)
+ * to prevent concurrent modification race conditions.
+ *
+ * The function:
+ * 1. Acquires a row lock on the existing booking
+ * 2. Validates ownership (if userId provided) and booking status
+ * 3. Calculates new time slot with buffer periods
+ * 4. Checks for conflicts with other confirmed bookings
+ * 5. Updates the booking with optimistic locking
+ * 6. Publishes reschedule notifications
+ *
+ * @param {string} id - The UUID of the booking to reschedule
+ * @param {string} newStartTime - New start time in ISO 8601 format (e.g., "2024-01-15T14:00:00Z")
+ * @param {string} [userId] - Optional user ID for ownership verification
+ * @returns {Promise<Booking>} The updated booking with new times and 'rescheduled' status
+ * @throws {Error} "Booking not found" if the booking ID doesn't exist
+ * @throws {Error} "Unauthorized to reschedule this booking" if userId doesn't match host
+ * @throws {Error} "Cannot reschedule a cancelled booking" if booking is already cancelled
+ * @throws {Error} "New time slot is not available" if there's a scheduling conflict
+ * @throws {Error} "Booking was modified by another request" if version mismatch (concurrent modification)
+ *
+ * @example
+ * const rescheduled = await rescheduleBooking(
+ *   bookingId,
+ *   '2024-01-20T15:00:00Z',
+ *   currentUserId
+ * );
+ * console.log(`New meeting time: ${rescheduled.start_time}`);
  */
 export async function rescheduleBooking(
   id: string,

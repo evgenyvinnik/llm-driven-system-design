@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { pool } from '../utils/db.js';
 import { cache } from '../utils/redis.js';
-import { authenticate, _optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { authenticate, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { publishBusinessIndexUpdate } from '../utils/queue.js';
 import { logger } from '../utils/logger.js';
 import {

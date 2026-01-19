@@ -3,6 +3,9 @@
  * Handles driver matching logic with circuit breaker protection.
  *
  * @module services/order/matching
+ * @description Implements the driver matching algorithm that sequentially offers
+ * orders to nearby drivers. Includes circuit breaker protection to handle service
+ * degradation gracefully and avoid cascading failures.
  */
 import { queryOne, execute } from '../../utils/db.js';
 import { findBestDriver } from '../driverService.js';
@@ -25,7 +28,17 @@ import {
   CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
 } from './types.js';
 
-/** Waits for driver offer response, polling the database until timeout. */
+/**
+ * Waits for a driver to respond to an offer.
+ *
+ * @description Polls the database for offer status changes until the driver
+ * accepts, rejects, or the timeout is reached. If timeout occurs, marks the
+ * offer as expired.
+ * @param {string} offerId - The offer's UUID
+ * @param {number} timeoutMs - Maximum time to wait in milliseconds
+ * @returns {Promise<'accepted' | 'rejected' | 'expired'>} The final offer status
+ * @private
+ */
 async function waitForOfferResponse(
   offerId: string,
   timeoutMs: number
@@ -53,8 +66,26 @@ async function waitForOfferResponse(
 }
 
 /**
- * Initiates driver matching for a new order. Sequentially offers to nearby
- * drivers, waiting for each response. Cancels order if no driver accepts.
+ * Initiates driver matching for a new order.
+ *
+ * @description Implements a sequential offer algorithm:
+ * 1. Finds the best available driver near the merchant location
+ * 2. Creates a time-limited offer for that driver
+ * 3. Waits for driver response (accept/reject/timeout)
+ * 4. On rejection/timeout, repeats with next best driver
+ * 5. Cancels order if MAX_OFFER_ATTEMPTS is exhausted
+ *
+ * Drivers are scored based on proximity, rating, and availability.
+ * Each offer expires after OFFER_EXPIRY_SECONDS (30s default).
+ * @param {string} orderId - The order's UUID to find a driver for
+ * @returns {Promise<boolean>} True if driver was successfully assigned, false if no driver accepted
+ * @example
+ * const matched = await startDriverMatching(orderId);
+ * if (matched) {
+ *   console.log('Driver assigned successfully');
+ * } else {
+ *   console.log('Order cancelled - no drivers available');
+ * }
  */
 export async function startDriverMatching(orderId: string): Promise<boolean> {
   const order = await getOrderWithDetails(orderId);
@@ -94,8 +125,13 @@ export async function startDriverMatching(orderId: string): Promise<boolean> {
 }
 
 /**
- * Circuit breaker for driver matching service.
- * Fails fast when service is degraded and provides fallback behavior.
+ * Circuit breaker instance for driver matching.
+ *
+ * @description Wraps the driver matching function with circuit breaker protection.
+ * Opens when error rate exceeds CIRCUIT_BREAKER_ERROR_THRESHOLD (50%) after
+ * CIRCUIT_BREAKER_VOLUME_THRESHOLD (3) requests. When open, uses fallback to
+ * queue orders for retry instead of attempting matching.
+ * @private
  */
 const driverMatchingCircuitBreaker = createCircuitBreaker<[string], boolean>(
   'driver-matching',
@@ -142,7 +178,26 @@ driverMatchingCircuitBreaker.fallback(async (orderId: string): Promise<boolean> 
 
 /**
  * Starts driver matching with circuit breaker protection.
- * Preferred entry point for initiating driver matching.
+ *
+ * @description Preferred entry point for initiating driver matching. Wraps the
+ * matching algorithm with circuit breaker protection to handle failures gracefully:
+ * - When circuit is closed: Executes normal matching algorithm
+ * - When circuit is open: Uses fallback to queue order for later retry
+ * - When circuit is half-open: Allows test request to check recovery
+ *
+ * Records metrics for monitoring (duration histogram, assignment counters).
+ * @param {string} orderId - The order's UUID to find a driver for
+ * @returns {Promise<boolean>} True if driver assigned, false if no driver or circuit open
+ * @example
+ * // Always use this function for new orders
+ * const result = await startDriverMatchingWithCircuitBreaker(orderId);
+ * if (!result) {
+ *   // Order will either be cancelled or queued for retry
+ *   const status = getDriverMatchingCircuitBreakerStatus();
+ *   if (status.state === 'open') {
+ *     console.log('Order queued - matching service degraded');
+ *   }
+ * }
  */
 export async function startDriverMatchingWithCircuitBreaker(
   orderId: string
@@ -158,7 +213,21 @@ export async function startDriverMatchingWithCircuitBreaker(
   }
 }
 
-/** Gets the current status of the driver matching circuit breaker. */
+/**
+ * Gets the current status of the driver matching circuit breaker.
+ *
+ * @description Returns the circuit breaker state and cumulative statistics.
+ * Useful for health checks, monitoring dashboards, and debugging.
+ * @returns {{state: 'open' | 'halfOpen' | 'closed', stats: {failures: number, successes: number, fallbacks: number, timeouts: number}}} Circuit breaker status object
+ * @example
+ * const status = getDriverMatchingCircuitBreakerStatus();
+ * console.log(`Circuit state: ${status.state}`);
+ * console.log(`Failures: ${status.stats.failures}, Successes: ${status.stats.successes}`);
+ *
+ * if (status.state === 'open') {
+ *   console.warn('Driver matching service is degraded');
+ * }
+ */
 export function getDriverMatchingCircuitBreakerStatus() {
   return {
     state: driverMatchingCircuitBreaker.opened

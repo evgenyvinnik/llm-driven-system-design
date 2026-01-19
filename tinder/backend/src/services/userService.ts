@@ -1,5 +1,5 @@
 import { pool, redis, elasticsearch } from '../db/index.js';
-import type { User, UserPreferences, Photo, UserProfile, _DiscoveryCard } from '../types/index.js';
+import type { User, UserPreferences, Photo, UserProfile } from '../types/index.js';
 
 /**
  * Service responsible for user account management and profile operations.

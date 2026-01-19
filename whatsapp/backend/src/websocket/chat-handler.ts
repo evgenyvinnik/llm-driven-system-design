@@ -20,8 +20,49 @@ import { getConnection, sendToSocket } from './connection-manager.js';
 const wsLogger = createServiceLogger('websocket-chat');
 
 /**
- * Handles sending a chat message.
- * Persists to database, sends acknowledgment, and routes to all participants.
+ * Chat Handler Module
+ *
+ * @description Handles the core chat message sending flow including persistence,
+ * acknowledgment, and delivery to all conversation participants. Manages both
+ * local delivery and cross-server routing via Redis pub/sub.
+ *
+ * @module chat-handler
+ */
+
+/**
+ * Handles sending a chat message from a WebSocket client.
+ *
+ * @description Processes an incoming chat message through the complete send flow:
+ * 1. Validates sender is a participant in the conversation
+ * 2. Persists message to database with retry logic
+ * 3. Starts delivery tracking for metrics
+ * 4. Sends acknowledgment to sender with message ID
+ * 5. Delivers to all other participants (locally or via Redis)
+ *
+ * On error, sends an error response to the sender and records failure metrics.
+ *
+ * @param socket - The authenticated WebSocket connection of the message sender
+ * @param message - The chat message payload containing conversationId and content
+ * @returns Promise that resolves when message processing is complete
+ * @throws Logs error but does not throw - errors are sent to client as error messages
+ *
+ * @example
+ * ```typescript
+ * // Incoming WebSocket message
+ * const wsMessage: WSChatMessage = {
+ *   type: 'message',
+ *   clientMessageId: 'client-uuid-123',
+ *   payload: {
+ *     conversationId: 'conv-456',
+ *     content: 'Hello!',
+ *     contentType: 'text'
+ *   }
+ * };
+ *
+ * await handleChatMessage(socket, wsMessage);
+ * // Sender receives: { type: 'message_ack', payload: { messageId, status: 'sent' } }
+ * // Recipients receive: { type: 'message', payload: { ...savedMessage } }
+ * ```
  */
 export async function handleChatMessage(
   socket: AuthenticatedSocket,
@@ -72,6 +113,22 @@ export async function handleChatMessage(
   }
 }
 
+/**
+ * Delivers a message to all conversation participants except the sender.
+ *
+ * @description Iterates through participants, determines their server location,
+ * and routes delivery appropriately (locally or via Redis pub/sub).
+ *
+ * @param socket - The sender's socket for sending delivery receipts
+ * @param userId - The sender's user ID
+ * @param conversationId - The conversation ID
+ * @param savedMessage - The persisted message with ID and timestamp
+ * @param conversation - The conversation metadata (name, group status)
+ * @param participants - Array of conversation participants
+ * @param sendStartTime - Timestamp when send was initiated (for latency tracking)
+ * @returns Promise that resolves when all delivery attempts complete
+ * @internal
+ */
 async function deliverToParticipants(
   socket: AuthenticatedSocket,
   userId: string,
@@ -99,6 +156,21 @@ async function deliverToParticipants(
   }
 }
 
+/**
+ * Delivers a message to a recipient connected to this server.
+ *
+ * @description Sends message directly to locally connected recipient and handles
+ * delivery receipt generation. Uses idempotent status updates to prevent
+ * duplicate receipts.
+ *
+ * @param senderSocket - The sender's socket for receiving delivery receipt
+ * @param recipientId - The recipient's user ID
+ * @param messageId - The message ID being delivered
+ * @param payload - The full message payload
+ * @param sendStartTime - Timestamp for delivery latency calculation
+ * @returns Promise that resolves when delivery and receipt are complete
+ * @internal
+ */
 async function deliverLocally(
   senderSocket: AuthenticatedSocket,
   recipientId: string,
@@ -122,6 +194,22 @@ async function deliverLocally(
   }
 }
 
+/**
+ * Routes a message through Redis pub/sub to another server.
+ *
+ * @description Publishes a message delivery request to the recipient's server
+ * channel. The target server will handle local delivery and send back
+ * delivery receipts through Redis.
+ *
+ * @param senderId - The sender's user ID (for receipt routing)
+ * @param recipientId - The recipient's user ID
+ * @param recipientServer - The server ID where the recipient is connected
+ * @param messageId - The message ID being delivered
+ * @param payload - The full message payload
+ * @param sendStartTime - Timestamp for cross-server latency tracking
+ * @returns Promise that resolves when message is published to Redis
+ * @internal
+ */
 async function deliverViaRedis(
   senderId: string,
   recipientId: string,

@@ -5,7 +5,7 @@
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import { query } from '../shared/db.js'
-import { cacheGet, cacheSet, hashGetAll, redis, _initRedis } from '../shared/cache.js'
+import { cacheGet, cacheSet, hashGetAll, redis, initRedis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
 
 const logger = createLogger('aggregation-service')

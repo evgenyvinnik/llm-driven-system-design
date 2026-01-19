@@ -3,7 +3,26 @@ import { queryWithTenant } from '../../services/db.js';
 import { ActorType, AuditContext } from '../../services/audit.js';
 import type { Order } from './types.js';
 
-// Update order status
+/**
+ * Updates an order's status fields (payment, fulfillment, notes).
+ *
+ * @description Allows merchants to update order status fields. Supports partial updates
+ * where only provided fields are modified. All changes are recorded in the audit log
+ * for compliance and dispute resolution.
+ *
+ * @param req - Express request object with storeId, orderId params, and body containing
+ *              optional fields: payment_status, fulfillment_status, notes
+ * @param res - Express response object
+ * @returns Promise that resolves when the response is sent
+ *
+ * @throws Returns 404 JSON response if order is not found
+ * @throws Returns 400 JSON response if no fields are provided for update
+ *
+ * @example
+ * // PATCH /api/v1/orders/123
+ * // Body: { "fulfillment_status": "fulfilled", "notes": "Shipped via FedEx" }
+ * // Response: { order: { id: 123, fulfillment_status: "fulfilled", ... } }
+ */
 export async function updateOrder(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { orderId } = req.params;

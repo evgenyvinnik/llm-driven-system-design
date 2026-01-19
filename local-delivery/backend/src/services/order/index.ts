@@ -3,6 +3,23 @@
  * Re-exports all order-related functionality from submodules.
  *
  * @module services/order
+ * @description Central entry point for order service functionality. Aggregates and
+ * re-exports all order-related types, constants, and functions from submodules:
+ * - types: Type definitions and configuration constants
+ * - create: Order creation from customer cart data
+ * - tracking: Order queries and statistics
+ * - status: Order status transitions
+ * - delivery: Delivery completion handling
+ * - assignment: Driver offer management
+ * - matching: Driver matching with circuit breaker
+ *
+ * @example
+ * import {
+ *   createOrder,
+ *   getOrderWithDetails,
+ *   updateOrderStatus,
+ *   startDriverMatchingWithCircuitBreaker
+ * } from '../services/order/index.js';
  */
 
 // Types and constants

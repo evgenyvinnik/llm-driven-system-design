@@ -8,7 +8,7 @@
 import { Router, Response } from 'express';
 import { authMiddleware, adminMiddleware, AuthRequest } from '../middleware/auth.js';
 import { getAllUsers, updateUserQuota, deleteUser } from '../services/authService.js';
-import { query, _queryOne } from '../utils/database.js';
+import { query, queryOne } from '../utils/database.js';
 
 const router = Router();
 

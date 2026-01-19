@@ -13,16 +13,40 @@ import { handleTyping, handleReadReceipt } from './typing-handler.js';
 /**
  * Message Handler Module
  *
- * Routes incoming WebSocket messages to appropriate specialized handlers.
- * Applies rate limiting to prevent spam.
+ * @description Routes incoming WebSocket messages to appropriate specialized handlers.
+ * Acts as the central dispatcher for all WebSocket message types.
+ * Applies rate limiting to prevent spam and abuse.
+ *
+ * @module message-handler
  */
 
 /**
  * Routes incoming WebSocket messages to appropriate handlers.
- * Applies rate limiting to prevent spam.
  *
- * @param socket - The authenticated WebSocket connection
- * @param message - The parsed WebSocket message
+ * @description Central dispatcher for all WebSocket message types. Performs
+ * rate limiting checks before processing messages. Supported message types:
+ *
+ * - `message` - Chat message to send (rate limited)
+ * - `typing` / `stop_typing` - Typing indicator events (rate limited, silently dropped when exceeded)
+ * - `read_receipt` - Mark messages as read
+ *
+ * Unknown message types receive an error response.
+ *
+ * @param socket - The authenticated WebSocket connection that sent the message
+ * @param message - The parsed WebSocket message to route
+ * @returns Promise that resolves when message handling is complete
+ *
+ * @example
+ * ```typescript
+ * socket.on('message', async (data) => {
+ *   try {
+ *     const message: WSMessage = JSON.parse(data.toString());
+ *     await handleWebSocketMessage(socket, message);
+ *   } catch (error) {
+ *     sendToSocket(socket, { type: 'error', payload: { message: 'Invalid message format' } });
+ *   }
+ * });
+ * ```
  */
 export async function handleWebSocketMessage(
   socket: AuthenticatedSocket,

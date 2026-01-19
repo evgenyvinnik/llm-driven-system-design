@@ -1,3 +1,12 @@
+/**
+ * Repository Routes Module
+ *
+ * @description Aggregates all repository-related route handlers into a single router.
+ * This module serves as the main entry point for repository API endpoints, mounting
+ * sub-routers for different repository operations.
+ *
+ * @module routes/repos
+ */
 import { Router } from 'express';
 import listRoutes from './list.js';
 import readRoutes from './read.js';
@@ -7,6 +16,10 @@ import branchesRoutes from './branches.js';
 import contentsRoutes from './contents.js';
 import settingsRoutes from './settings.js';
 
+/**
+ * Express router for repository endpoints.
+ * Mounts all repository-related sub-routers.
+ */
 const router = Router();
 
 // Mount all repository-related routes

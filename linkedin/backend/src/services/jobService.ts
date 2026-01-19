@@ -2,7 +2,7 @@ import { query, queryOne, execute } from '../utils/db.js';
 import { indexJob, searchJobs as esSearchJobs } from '../utils/elasticsearch.js';
 import { getFirstDegreeConnections } from './connectionService.js';
 import { getUserSkills, getUserExperiences } from './userService.js';
-import type { Job, JobApplication, Company, Skill, _User } from '../types/index.js';
+import type { Job, JobApplication, Company, Skill, User } from '../types/index.js';
 
 /**
  * Creates a new company in the system.

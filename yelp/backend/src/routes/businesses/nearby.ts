@@ -1,10 +1,45 @@
+/**
+ * Nearby businesses route handler.
+ * @module routes/businesses/nearby
+ */
 import { Router, Request, Response } from 'express';
 import { pool } from '../../utils/db.js';
 import { BusinessRow } from './types.js';
 
+/**
+ * Express router for nearby business search endpoints.
+ */
 export const router = Router();
 
-// Get nearby businesses
+/**
+ * Finds businesses near a geographic location.
+ *
+ * @description
+ * Performs a geo-spatial search using PostGIS to find businesses within
+ * a specified radius of the given coordinates. Results are sorted by
+ * distance from the search point (nearest first). Each business includes
+ * its distance in kilometers, categories, and primary photo URL.
+ *
+ * @route GET /nearby
+ *
+ * @param req.query.latitude - Geographic latitude of search center (required)
+ * @param req.query.longitude - Geographic longitude of search center (required)
+ * @param req.query.distance - Search radius in kilometers (default: 10)
+ * @param req.query.limit - Maximum number of results (default: 20)
+ *
+ * @returns {Object} JSON object containing nearby businesses
+ * @returns {BusinessRow[]} response.businesses - Array of businesses with distance
+ * @returns {number} response.businesses[].distance_km - Distance from search point in km
+ * @returns {string[]} response.businesses[].categories - Array of category slugs
+ * @returns {string[]} response.businesses[].category_names - Array of category names
+ * @returns {string} response.businesses[].photo_url - Primary photo URL
+ *
+ * @throws {400} Missing latitude or longitude
+ * @throws {500} Database or server error
+ *
+ * @example
+ * // GET /businesses/nearby?latitude=37.7749&longitude=-122.4194&distance=5&limit=10
+ */
 router.get(
   '/nearby',
   async (req: Request, res: Response): Promise<void | Response> => {

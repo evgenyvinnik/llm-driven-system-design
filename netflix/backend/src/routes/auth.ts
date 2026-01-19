@@ -6,7 +6,7 @@ import { setSession, deleteSession } from '../services/redis.js';
 import { authenticate } from '../middleware/auth.js';
 import { strictRateLimit } from '../middleware/rate-limit.js';
 import { authLogger } from '../services/logger.js';
-import { _Account, _Profile } from '../types/index.js';
+import { Account, Profile } from '../types/index.js';
 import { SERVER_CONFIG } from '../config.js';
 
 /**

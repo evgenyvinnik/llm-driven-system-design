@@ -15,8 +15,8 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { getSession } from '../utils/redis.js';
-import { queryOne, _query } from '../utils/database.js';
-import { User, FileItem, _FolderShare } from '../types/index.js';
+import { queryOne, query } from '../utils/database.js';
+import { User, FileItem, FolderShare } from '../types/index.js';
 import { logger } from '../shared/logger.js';
 
 /**

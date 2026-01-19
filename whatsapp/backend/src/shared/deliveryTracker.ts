@@ -17,10 +17,10 @@
  * - Metrics track delivery success rates and latency
  */
 
-import { redis, _KEYS } from '../redis.js';
+import { redis, KEYS } from '../redis.js';
 import { pool } from '../db.js';
 import { recordMessage, recordDeliveryDuration } from './metrics.js';
-import { _logger, LogEvents, logEvent } from './logger.js';
+import { logger, LogEvents, logEvent } from './logger.js';
 import { withRetry } from './retry.js';
 
 /**

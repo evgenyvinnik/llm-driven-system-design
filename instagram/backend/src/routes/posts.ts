@@ -3,7 +3,7 @@ import multer from 'multer';
 import { query, getClient } from '../services/db.js';
 import { storeOriginalImage, FILTERS } from '../services/storage.js';
 import { publishImageProcessingJob } from '../services/queue.js';
-import { _timelineAdd, timelineRemove, cacheGet, cacheSet, cacheDel } from '../services/redis.js';
+import { timelineAdd, timelineRemove, cacheGet, cacheSet, cacheDel } from '../services/redis.js';
 import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { postRateLimiter, likeRateLimiter } from '../services/rateLimiter.js';
 import logger from '../services/logger.js';

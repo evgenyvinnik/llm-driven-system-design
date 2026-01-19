@@ -1,3 +1,11 @@
+/**
+ * Repository CRUD Routes
+ *
+ * @description Handles Create, Update, and Delete operations for repositories.
+ * All operations require authentication and appropriate authorization.
+ *
+ * @module routes/repos/crud
+ */
 import { Router, Request, Response } from 'express';
 import { query } from '../../db/index.js';
 import * as gitService from '../../services/git.js';
@@ -17,7 +25,31 @@ import {
 const router = Router();
 
 /**
- * Create repository
+ * POST / - Create a new repository
+ *
+ * @description Creates a new Git repository for the authenticated user. Initializes
+ * a bare Git repository on disk, creates the database record, and optionally adds
+ * an initial README file. Also creates default labels for the repository.
+ *
+ * @route POST /repos
+ * @authentication Required
+ *
+ * @param req.body.name - Repository name (alphanumeric, underscores, and hyphens only)
+ * @param req.body.description - Optional repository description
+ * @param req.body.isPrivate - Whether the repository should be private (default: false)
+ * @param req.body.initWithReadme - Whether to create an initial README file (default: false)
+ *
+ * @returns {Repository} The created repository object
+ *
+ * @throws {400} Invalid repository name format
+ * @throws {401} Authentication required
+ * @throws {409} Repository with same name already exists for this user
+ * @throws {500} Failed to create repository
+ *
+ * @example
+ * // POST /repos
+ * // Body: { name: 'my-project', description: 'A new project', isPrivate: false }
+ * // Response: { id: 1, name: 'my-project', ... }
  */
 router.post('/', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { name, description, isPrivate, initWithReadme } = req.body as CreateRepoBody;
@@ -77,7 +109,30 @@ router.post('/', requireAuth, async (req: Request, res: Response): Promise<void>
 });
 
 /**
- * Update repository
+ * PATCH /:owner/:repo - Update repository settings
+ *
+ * @description Updates repository metadata including description, visibility, and default branch.
+ * Only the repository owner can update settings. Changes are audited and cached data is invalidated.
+ *
+ * @route PATCH /repos/:owner/:repo
+ * @authentication Required
+ *
+ * @param req.params.owner - The username of the repository owner
+ * @param req.params.repo - The name of the repository
+ * @param req.body.description - New repository description
+ * @param req.body.isPrivate - New visibility setting
+ * @param req.body.defaultBranch - New default branch name
+ *
+ * @returns {Repository} The updated repository object
+ *
+ * @throws {401} Authentication required
+ * @throws {403} User is not authorized to modify this repository
+ * @throws {404} Repository not found
+ *
+ * @example
+ * // PATCH /repos/octocat/hello-world
+ * // Body: { description: 'Updated description', isPrivate: true }
+ * // Response: { id: 1, description: 'Updated description', is_private: true, ... }
  */
 router.patch('/:owner/:repo', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;
@@ -137,7 +192,28 @@ router.patch('/:owner/:repo', requireAuth, async (req: Request, res: Response): 
 });
 
 /**
- * Delete repository
+ * DELETE /:owner/:repo - Delete a repository
+ *
+ * @description Permanently deletes a repository including all Git data, search index entries,
+ * and database records. This action cannot be undone. Only the repository owner can delete.
+ *
+ * @route DELETE /repos/:owner/:repo
+ * @authentication Required
+ *
+ * @param req.params.owner - The username of the repository owner
+ * @param req.params.repo - The name of the repository
+ *
+ * @returns {Object} Success confirmation
+ * @returns {boolean} success - true if deletion was successful
+ *
+ * @throws {401} Authentication required
+ * @throws {403} User is not authorized to delete this repository
+ * @throws {404} Repository not found
+ * @throws {500} Failed to delete repository
+ *
+ * @example
+ * // DELETE /repos/octocat/hello-world
+ * // Response: { success: true }
  */
 router.delete('/:owner/:repo', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;

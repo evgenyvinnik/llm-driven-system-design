@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction, Router } from 'express';
 import { query } from '../db.js';
-import { requireAuth, _optionalAuth, PERMISSIONS, hasPermission } from '../middleware/auth.js';
+import { requireAuth, optionalAuth, PERMISSIONS, hasPermission } from '../middleware/auth.js';
 import { createLogger } from '../shared/logger.js';
 import { getRateLimiters } from '../index.js';
 

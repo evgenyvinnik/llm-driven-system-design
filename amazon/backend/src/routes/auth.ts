@@ -112,7 +112,7 @@ router.post('/login',
       await setSession(sessionId, { userId: user.id }, 86400 * 7);
 
       // Remove password_hash from response
-      const { _password_hash, ...userWithoutPassword } = user;
+      const { password_hash, ...userWithoutPassword } = user;
 
       res.json({
         user: userWithoutPassword,

@@ -1,9 +1,9 @@
-import { Router, Response, _NextFunction, _Request } from 'express';
+import { Router, Response, NextFunction, Request } from 'express';
 import multer from 'multer';
 import { query } from '../services/db.js';
 import { processAndUploadImage } from '../services/storage.js';
 import { storyTrayGet, storyTraySet, StoryTrayUser } from '../services/redis.js';
-import { requireAuth, _optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { storyRateLimiter } from '../services/rateLimiter.js';
 import { createCircuitBreaker, fallbackWithError } from '../services/circuitBreaker.js';
 import logger from '../services/logger.js';

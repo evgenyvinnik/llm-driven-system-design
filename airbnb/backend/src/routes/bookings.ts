@@ -3,7 +3,7 @@ import { query, transaction } from '../db.js';
 import { authenticate, requireHost } from '../middleware/auth.js';
 import { invalidateAvailabilityCache } from '../shared/cache.js';
 import { metrics } from '../shared/metrics.js';
-import { auditBooking, AUDIT_EVENTS, _OUTCOMES } from '../shared/audit.js';
+import { auditBooking, AUDIT_EVENTS, OUTCOMES } from '../shared/audit.js';
 import { publishBookingCreated, publishBookingConfirmed, publishBookingCancelled, publishHostAlert } from '../shared/queue.js';
 import { createModuleLogger } from '../shared/logger.js';
 

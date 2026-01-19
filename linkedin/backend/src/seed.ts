@@ -7,7 +7,7 @@
  *
  * @module seed
  */
-import { pool, _query, queryOne, execute } from './utils/db.js';
+import { pool, query, queryOne, execute } from './utils/db.js';
 import bcrypt from 'bcryptjs';
 import { indexUser, indexJob } from './utils/elasticsearch.js';
 

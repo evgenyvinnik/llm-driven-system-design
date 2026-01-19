@@ -356,10 +356,13 @@ router.get(
   '/popular',
   async (req: Request, res: Response): Promise<void | Response> => {
     try {
-      const { _latitude, _longitude } = req.query as {
+      const { latitude, longitude } = req.query as {
         latitude?: string;
         longitude?: string;
       };
+      // These are available for future geo-based filtering
+      void latitude;
+      void longitude;
 
       // Try to get popular searches from Redis sorted set
       const cacheKey = 'popular:searches';

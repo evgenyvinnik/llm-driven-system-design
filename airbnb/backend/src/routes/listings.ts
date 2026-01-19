@@ -1,7 +1,7 @@
-import { Router, type _Request, type _Response } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { query, transaction } from '../db.js';
 import { authenticate, requireHost, optionalAuth } from '../middleware/auth.js';
-import { getCachedListing, invalidateListingCache, getCachedAvailability, invalidateAvailabilityCache, _CACHE_TTL } from '../shared/cache.js';
+import { getCachedListing, invalidateListingCache, getCachedAvailability, invalidateAvailabilityCache, CACHE_TTL } from '../shared/cache.js';
 import { auditListing, AUDIT_EVENTS } from '../shared/audit.js';
 import { publishAvailabilityChanged } from '../shared/queue.js';
 import { createModuleLogger } from '../shared/logger.js';

@@ -1,6 +1,6 @@
 import { Router, Request, Response, RequestHandler } from 'express';
 import { query } from '../services/db.js';
-import { requireAuth, _optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { commentRateLimiter } from '../services/rateLimiter.js';
 import logger from '../services/logger.js';
 

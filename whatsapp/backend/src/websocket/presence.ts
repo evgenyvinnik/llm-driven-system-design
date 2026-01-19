@@ -12,15 +12,32 @@ const wsLogger = createServiceLogger('websocket-presence');
 /**
  * Presence Module
  *
- * Handles user online/offline status broadcasting and reaction updates.
- * Uses Redis pub/sub for cross-server communication.
+ * @description Handles user online/offline status broadcasting and reaction updates.
+ * Uses Redis pub/sub for cross-server communication to ensure all connected
+ * users receive real-time presence and reaction notifications.
+ *
+ * @module presence
  */
 
 /**
  * Broadcasts a user's presence change to all connected users on this server.
  *
- * @param userId - The user whose presence changed
+ * @description Notifies all locally connected users when another user comes online
+ * or goes offline. This enables real-time presence indicators in the UI.
+ * Does not notify the user about their own presence change.
+ *
+ * @param userId - The unique identifier of the user whose presence changed
  * @param status - The new presence status ('online' or 'offline')
+ * @returns Promise that resolves when all notifications are sent
+ *
+ * @example
+ * ```typescript
+ * // When user connects
+ * await broadcastPresence(userId, 'online');
+ *
+ * // When user disconnects
+ * await broadcastPresence(userId, 'offline');
+ * ```
  */
 export async function broadcastPresence(
   userId: string,
@@ -45,13 +62,27 @@ export async function broadcastPresence(
 
 /**
  * Sends a delivery or read receipt to a message sender.
- * Routes through local connection or Redis pub/sub based on recipient's server.
  *
- * @param recipientUserId - The message sender to notify
- * @param messageId - The message that was delivered/read
- * @param readerId - The user who received/read the message
- * @param status - Either 'delivered' or 'read'
- * @param allMessageIds - Optional array of all message IDs being marked
+ * @description Routes receipt notifications to the original message sender.
+ * First checks if the sender is on this server for local delivery, otherwise
+ * publishes to Redis for cross-server routing. Used to update message status
+ * indicators (single check, double check, blue check) in the UI.
+ *
+ * @param recipientUserId - The user ID of the message sender to notify
+ * @param messageId - The unique identifier of the message that was delivered/read
+ * @param readerId - The user ID who received/read the message
+ * @param status - The new status: 'delivered' or 'read'
+ * @param allMessageIds - Optional array of all message IDs being marked (for batch updates)
+ * @returns Promise that resolves when the notification is sent/queued
+ *
+ * @example
+ * ```typescript
+ * // Notify sender that message was delivered
+ * await notifyDeliveryReceipt(senderId, messageId, recipientId, 'delivered');
+ *
+ * // Notify sender that all messages were read
+ * await notifyDeliveryReceipt(senderId, messageIds[0], recipientId, 'read', messageIds);
+ * ```
  */
 export async function notifyDeliveryReceipt(
   recipientUserId: string,
@@ -94,13 +125,28 @@ export async function notifyDeliveryReceipt(
 
 /**
  * Broadcasts a reaction update to all participants in a conversation.
- * Called when a reaction is added or removed via REST API.
- * Uses local delivery for same-server recipients, Redis pub/sub for others.
  *
- * @param conversationId - The conversation containing the message
- * @param messageId - The message that was reacted to
- * @param reactions - The updated reaction summaries
- * @param actorId - The user who added/removed the reaction
+ * @description Called when a reaction is added or removed via the REST API.
+ * Delivers the updated reaction state to all conversation participants.
+ * Uses local delivery for same-server recipients and Redis pub/sub for others.
+ *
+ * @param conversationId - The unique identifier of the conversation containing the message
+ * @param messageId - The unique identifier of the message that was reacted to
+ * @param reactions - Array of updated reaction summaries (emoji + count + users)
+ * @param actorId - The user ID who added or removed the reaction
+ * @returns Promise that resolves when all notifications are sent/queued
+ * @throws Logs error but does not throw - failures are handled gracefully
+ *
+ * @example
+ * ```typescript
+ * // After adding a reaction via REST API
+ * await broadcastReactionUpdate(
+ *   conversationId,
+ *   messageId,
+ *   [{ emoji: '👍', count: 3, userIds: ['user1', 'user2', 'user3'] }],
+ *   actorUserId
+ * );
+ * ```
  */
 export async function broadcastReactionUpdate(
   conversationId: string,

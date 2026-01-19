@@ -1,3 +1,11 @@
+/**
+ * Repository Collaborator Routes
+ *
+ * @description Handles starring and unstarring repositories. These endpoints allow
+ * authenticated users to bookmark their favorite repositories.
+ *
+ * @module routes/repos/collaborators
+ */
 import { Router, Request, Response } from 'express';
 import { query } from '../../db/index.js';
 import { requireAuth } from '../../middleware/auth.js';
@@ -7,7 +15,27 @@ import { getRepoId, sendRepoNotFound } from './types.js';
 const router = Router();
 
 /**
- * Star a repository
+ * POST /:owner/:repo/star - Star a repository
+ *
+ * @description Adds the current user's star to a repository. If the user has already
+ * starred the repository, this operation is idempotent. Updates the repository's
+ * star count and invalidates the cache.
+ *
+ * @route POST /repos/:owner/:repo/star
+ * @authentication Required
+ *
+ * @param req.params.owner - The username of the repository owner
+ * @param req.params.repo - The name of the repository
+ *
+ * @returns {Object} Star status
+ * @returns {boolean} starred - true indicating the repository is now starred
+ *
+ * @throws {401} Authentication required
+ * @throws {404} Repository not found
+ *
+ * @example
+ * // POST /repos/octocat/hello-world/star
+ * // Response: { starred: true }
  */
 router.post('/:owner/:repo/star', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;
@@ -35,7 +63,26 @@ router.post('/:owner/:repo/star', requireAuth, async (req: Request, res: Respons
 });
 
 /**
- * Unstar a repository
+ * DELETE /:owner/:repo/star - Unstar a repository
+ *
+ * @description Removes the current user's star from a repository. Updates the
+ * repository's star count and invalidates the cache.
+ *
+ * @route DELETE /repos/:owner/:repo/star
+ * @authentication Required
+ *
+ * @param req.params.owner - The username of the repository owner
+ * @param req.params.repo - The name of the repository
+ *
+ * @returns {Object} Star status
+ * @returns {boolean} starred - false indicating the repository is no longer starred
+ *
+ * @throws {401} Authentication required
+ * @throws {404} Repository not found
+ *
+ * @example
+ * // DELETE /repos/octocat/hello-world/star
+ * // Response: { starred: false }
  */
 router.delete('/:owner/:repo/star', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;
@@ -59,7 +106,24 @@ router.delete('/:owner/:repo/star', requireAuth, async (req: Request, res: Respo
 });
 
 /**
- * Check if repo is starred
+ * GET /:owner/:repo/starred - Check if repository is starred
+ *
+ * @description Checks whether the authenticated user has starred the specified repository.
+ *
+ * @route GET /repos/:owner/:repo/starred
+ * @authentication Required
+ *
+ * @param req.params.owner - The username of the repository owner
+ * @param req.params.repo - The name of the repository
+ *
+ * @returns {Object} Star status
+ * @returns {boolean} starred - true if the user has starred this repository, false otherwise
+ *
+ * @throws {401} Authentication required
+ *
+ * @example
+ * // GET /repos/octocat/hello-world/starred
+ * // Response: { starred: true }
  */
 router.get('/:owner/:repo/starred', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db/index.js';
 import { getCached, setCache } from '../services/redis.js';
-import { _authenticate, _requireProfile, optionalAuth } from '../middleware/auth.js';
+import { authenticate, requireProfile, optionalAuth } from '../middleware/auth.js';
 
 /**
  * Videos router.

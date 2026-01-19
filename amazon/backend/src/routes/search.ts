@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { searchProducts, SearchFilters, _SearchResult } from '../services/elasticsearch.js';
+import { searchProducts, SearchFilters, SearchResult } from '../services/elasticsearch.js';
 import { query } from '../services/database.js';
 
 const router = Router();

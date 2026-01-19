@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { getSession } from '../services/auth.js';
 import { query } from '../db.js';
-import type { _UserPublic } from '../types/index.js';
+import type { UserPublic } from '../types/index.js';
 
 interface UserRow {
   id: number;

@@ -24,7 +24,7 @@ import {
   completeDelivery,
   getPendingOfferForDriver,
 } from '../services/order/index.js';
-import { _publisher } from '../utils/redis.js';
+import { publisher } from '../utils/redis.js';
 
 const router = Router();
 

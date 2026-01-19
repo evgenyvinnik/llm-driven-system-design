@@ -3,6 +3,8 @@
  * Handles retrieving orders and order statistics.
  *
  * @module services/order/tracking
+ * @description Provides query functions for retrieving order data, including
+ * single orders, order lists by customer/driver, and aggregate statistics.
  */
 import { query, queryOne } from '../../utils/db.js';
 import { getMerchantById } from '../merchantService.js';
@@ -11,8 +13,15 @@ import type { Order, OrderWithDetails, OrderItem } from './types.js';
 /**
  * Retrieves a basic order by its unique identifier.
  *
- * @param id - The order's UUID
- * @returns Order record or null if not found
+ * @description Fetches the raw order record from the database without any
+ * related data (items, merchant, driver, customer).
+ * @param {string} id - The order's UUID
+ * @returns {Promise<Order | null>} Order record or null if not found
+ * @example
+ * const order = await getOrderById('123e4567-e89b-12d3-a456-426614174000');
+ * if (order) {
+ *   console.log(`Order status: ${order.status}`);
+ * }
  */
 export async function getOrderById(id: string): Promise<Order | null> {
   return queryOne<Order>(`SELECT * FROM orders WHERE id = $1`, [id]);
@@ -20,10 +29,19 @@ export async function getOrderById(id: string): Promise<Order | null> {
 
 /**
  * Retrieves an order with all related data for display.
- * Includes order items, merchant, driver, and customer information.
  *
- * @param id - The order's UUID
- * @returns Order with full details or null if not found
+ * @description Fetches the order along with its items, merchant details,
+ * driver information, and customer data. Used for order detail pages and
+ * real-time tracking displays.
+ * @param {string} id - The order's UUID
+ * @returns {Promise<OrderWithDetails | null>} Order with full details or null if not found
+ * @example
+ * const orderDetails = await getOrderWithDetails(orderId);
+ * if (orderDetails) {
+ *   console.log(`Merchant: ${orderDetails.merchant?.name}`);
+ *   console.log(`Items: ${orderDetails.items.length}`);
+ *   console.log(`Driver: ${orderDetails.driver?.name}`);
+ * }
  */
 export async function getOrderWithDetails(id: string): Promise<OrderWithDetails | null> {
   const order = await getOrderById(id);
@@ -66,10 +84,16 @@ export async function getOrderWithDetails(id: string): Promise<OrderWithDetails 
 
 /**
  * Retrieves all orders placed by a customer.
- * Returns newest orders first for the order history page.
  *
- * @param customerId - The customer's UUID
- * @returns Array of customer's orders
+ * @description Returns the complete order history for a customer, sorted by
+ * creation date with newest orders first. Used for the order history page.
+ * @param {string} customerId - The customer's UUID
+ * @returns {Promise<Order[]>} Array of customer's orders, newest first
+ * @example
+ * const orders = await getCustomerOrders(customerId);
+ * orders.forEach(order => {
+ *   console.log(`Order ${order.id}: ${order.status} - $${order.total}`);
+ * });
  */
 export async function getCustomerOrders(customerId: string): Promise<Order[]> {
   return query<Order>(
@@ -80,10 +104,18 @@ export async function getCustomerOrders(customerId: string): Promise<Order[]> {
 
 /**
  * Retrieves all active orders assigned to a driver.
- * Only includes orders in pickup/transit states, not delivered or cancelled.
  *
- * @param driverId - The driver's UUID
- * @returns Array of active orders with full details
+ * @description Returns orders currently in progress for a driver, including
+ * orders awaiting pickup, being picked up, or in transit. Excludes delivered
+ * and cancelled orders. Each order includes full details (items, merchant, customer).
+ * @param {string} driverId - The driver's UUID
+ * @returns {Promise<OrderWithDetails[]>} Array of active orders with full details
+ * @example
+ * const activeOrders = await getDriverOrders(driverId);
+ * console.log(`Driver has ${activeOrders.length} active orders`);
+ * activeOrders.forEach(order => {
+ *   console.log(`Deliver to: ${order.delivery_address}`);
+ * });
  */
 export async function getDriverOrders(driverId: string): Promise<OrderWithDetails[]> {
   const orders = await query<Order>(
@@ -103,9 +135,17 @@ export async function getDriverOrders(driverId: string): Promise<OrderWithDetail
 
 /**
  * Retrieves aggregate order statistics for the admin dashboard.
- * Includes counts by status and orders created today.
  *
- * @returns Object with order counts by status category
+ * @description Calculates order counts grouped by status category: pending,
+ * in-progress (confirmed through in_transit), completed (delivered), and
+ * cancelled. Also includes total count and orders created today.
+ * @returns {Promise<{total: number, pending: number, in_progress: number, completed: number, cancelled: number, today: number}>} Object with order counts by status category
+ * @example
+ * const stats = await getOrderStats();
+ * console.log(`Total orders: ${stats.total}`);
+ * console.log(`Pending: ${stats.pending}, In Progress: ${stats.in_progress}`);
+ * console.log(`Completed: ${stats.completed}, Cancelled: ${stats.cancelled}`);
+ * console.log(`Orders today: ${stats.today}`);
  */
 export async function getOrderStats(): Promise<{
   total: number;
@@ -146,8 +186,16 @@ export async function getOrderStats(): Promise<{
 /**
  * Retrieves the most recent orders for admin monitoring.
  *
- * @param limit - Maximum number of orders to return (default 20)
- * @returns Array of recent orders, newest first
+ * @description Fetches orders sorted by creation date (newest first) with
+ * a configurable limit. Used for real-time order monitoring in the admin dashboard.
+ * @param {number} [limit=20] - Maximum number of orders to return
+ * @returns {Promise<Order[]>} Array of recent orders, newest first
+ * @example
+ * // Get last 10 orders
+ * const recentOrders = await getRecentOrders(10);
+ * recentOrders.forEach(order => {
+ *   console.log(`${order.id}: ${order.status} at ${order.created_at}`);
+ * });
  */
 export async function getRecentOrders(limit: number = 20): Promise<Order[]> {
   return query<Order>(

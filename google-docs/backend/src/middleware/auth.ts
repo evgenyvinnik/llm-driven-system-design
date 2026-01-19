@@ -3,7 +3,7 @@ import redis from '../utils/redis.js';
 import pool from '../utils/db.js';
 import logger from '../shared/logger.js';
 import { recordCacheAccess } from '../shared/metrics.js';
-import type { _User, UserPublic } from '../types/index.js';
+import type { User, UserPublic } from '../types/index.js';
 
 /**
  * Extends Express Request interface to include authenticated user information.

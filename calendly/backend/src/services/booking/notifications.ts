@@ -1,6 +1,11 @@
 /**
  * Notification handling for booking-related events.
- * Publishes to RabbitMQ for async processing and sends direct email notifications.
+ *
+ * @description Publishes booking notifications to RabbitMQ for async processing
+ * and sends direct email notifications. Handles confirmation, reschedule,
+ * cancellation, and reminder notifications.
+ *
+ * @module services/booking/notifications
  */
 
 import { type Booking } from './types.js';
@@ -10,9 +15,28 @@ import { emailNotificationsTotal } from '../../shared/metrics.js';
 import { queueService } from '../../shared/queue.js';
 
 /**
- * Publishes booking confirmation notification to RabbitMQ.
- * @param booking - The newly created booking
- * @param meetingType - Meeting type details including host info
+ * Publishes a booking confirmation notification to RabbitMQ.
+ *
+ * @description Queues a notification message for async processing by notification
+ * workers. The message contains all details needed to send confirmation emails
+ * to both invitee and host.
+ *
+ * @param {Booking} booking - The newly created booking
+ * @param {Object} meetingType - Meeting type details including host info
+ * @param {string} meetingType.name - Display name of the meeting type
+ * @param {string} meetingType.user_name - Display name of the host
+ * @param {string} meetingType.user_email - Email address of the host
+ * @param {string} meetingType.id - UUID of the meeting type
+ * @returns {Promise<void>} Resolves when message is published
+ * @throws {Error} If RabbitMQ connection fails or message cannot be published
+ *
+ * @example
+ * await publishBookingConfirmation(booking, {
+ *   name: '30 Minute Meeting',
+ *   user_name: 'John Doe',
+ *   user_email: 'john@example.com',
+ *   id: 'meeting-type-uuid'
+ * });
  */
 export async function publishBookingConfirmation(
   booking: Booking,
@@ -40,9 +64,22 @@ export async function publishBookingConfirmation(
 }
 
 /**
- * Schedules reminder notifications for a booking.
- * Schedules reminders for 24 hours and 1 hour before the meeting.
- * @param booking - The booking to schedule reminders for
+ * Schedules reminder notifications for an upcoming booking.
+ *
+ * @description Schedules two reminder notifications: one 24 hours before and
+ * one 1 hour before the meeting start time. Reminders are only scheduled if
+ * the reminder time is in the future. Uses RabbitMQ delayed message feature.
+ *
+ * @param {Booking} booking - The booking to schedule reminders for
+ * @returns {Promise<void>} Resolves when reminders are scheduled
+ * @throws {Error} If RabbitMQ connection fails
+ *
+ * @example
+ * // For a booking at 2024-01-15T14:00:00Z
+ * await scheduleReminders(booking);
+ * // Schedules reminders for:
+ * // - 2024-01-14T14:00:00Z (24 hours before)
+ * // - 2024-01-15T13:00:00Z (1 hour before)
  */
 export async function scheduleReminders(booking: Booking): Promise<void> {
   const startTime = new Date(booking.start_time);
@@ -74,9 +111,19 @@ export async function scheduleReminders(booking: Booking): Promise<void> {
 }
 
 /**
- * Publishes reschedule notification to RabbitMQ.
- * @param booking - The rescheduled booking
- * @param meetingDetails - Meeting type and host details
+ * Publishes a reschedule notification to RabbitMQ.
+ *
+ * @description Queues a notification message for async processing when a booking
+ * is rescheduled to a new time. The message includes the new meeting times.
+ *
+ * @param {Booking} booking - The rescheduled booking with updated times
+ * @param {Object} meetingDetails - Meeting type and host details
+ * @param {string} meetingDetails.meeting_type_name - Display name of the meeting type
+ * @param {string} meetingDetails.meeting_type_id - UUID of the meeting type
+ * @param {string} meetingDetails.host_name - Display name of the host
+ * @param {string} meetingDetails.host_email - Email address of the host
+ * @returns {Promise<void>} Resolves when message is published
+ * @throws {Error} If RabbitMQ connection fails or message cannot be published
  */
 export async function publishRescheduleNotification(
   booking: Booking,
@@ -103,10 +150,20 @@ export async function publishRescheduleNotification(
 }
 
 /**
- * Publishes cancellation notification to RabbitMQ.
- * @param booking - The cancelled booking
- * @param meetingDetails - Meeting type and host details
- * @param reason - Optional cancellation reason
+ * Publishes a cancellation notification to RabbitMQ.
+ *
+ * @description Queues a notification message for async processing when a booking
+ * is cancelled. The message includes an optional cancellation reason.
+ *
+ * @param {Booking} booking - The cancelled booking
+ * @param {Object} meetingDetails - Meeting type and host details
+ * @param {string} meetingDetails.meeting_type_name - Display name of the meeting type
+ * @param {string} meetingDetails.meeting_type_id - UUID of the meeting type
+ * @param {string} meetingDetails.host_name - Display name of the host
+ * @param {string} meetingDetails.host_email - Email address of the host
+ * @param {string} [reason] - Optional cancellation reason provided by the user
+ * @returns {Promise<void>} Resolves when message is published
+ * @throws {Error} If RabbitMQ connection fails or message cannot be published
  */
 export async function publishCancellationNotification(
   booking: Booking,
@@ -136,9 +193,25 @@ export async function publishCancellationNotification(
 
 /**
  * Sends confirmation emails to both invitee and host.
- * Called asynchronously after booking creation.
- * @param booking - The newly created booking
- * @param meetingType - Meeting type details for email content
+ *
+ * @description Called asynchronously after booking creation. Sends separate
+ * confirmation emails to the invitee and host with meeting details.
+ * Increments success metrics for each email sent.
+ *
+ * @param {Booking} booking - The newly created booking
+ * @param {Object} meetingType - Meeting type details for email content
+ * @param {string} meetingType.name - Display name of the meeting type
+ * @param {string} meetingType.user_name - Display name of the host
+ * @param {string} meetingType.user_email - Email address of the host
+ * @returns {Promise<void>} Resolves when both emails are sent
+ * @throws {Error} If email service fails to send either email
+ *
+ * @example
+ * await sendConfirmationEmails(booking, {
+ *   name: 'Quick Chat',
+ *   user_name: 'Jane Smith',
+ *   user_email: 'jane@example.com'
+ * });
  */
 export async function sendConfirmationEmails(
   booking: Booking,
@@ -154,17 +227,29 @@ export async function sendConfirmationEmails(
 }
 
 /**
- * Sends reschedule notification email.
- * @param booking - The rescheduled booking
+ * Sends a reschedule notification email to the invitee.
+ *
+ * @description Called after a booking is successfully rescheduled. Notifies
+ * the invitee of the new meeting time via the email service.
+ *
+ * @param {Booking} booking - The rescheduled booking with updated times
+ * @returns {Promise<void>} Resolves when email is sent
+ * @throws {Error} If email service fails to send the email
  */
 export async function sendRescheduleEmail(booking: Booking): Promise<void> {
   await emailService.sendRescheduleNotification(booking);
 }
 
 /**
- * Sends cancellation notification email.
- * @param booking - The cancelled booking
- * @param reason - Optional cancellation reason
+ * Sends a cancellation notification email to the invitee.
+ *
+ * @description Called after a booking is cancelled. Notifies the invitee
+ * of the cancellation with an optional reason via the email service.
+ *
+ * @param {Booking} booking - The cancelled booking
+ * @param {string} [reason] - Optional cancellation reason to include in the email
+ * @returns {Promise<void>} Resolves when email is sent
+ * @throws {Error} If email service fails to send the email
  */
 export async function sendCancellationEmail(
   booking: Booking,

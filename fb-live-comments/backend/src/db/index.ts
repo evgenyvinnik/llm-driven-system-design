@@ -8,7 +8,7 @@
  * @module db
  */
 
-import { Pool, PoolClient, _QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import {
   logger,
   createDatabaseCircuitBreaker,

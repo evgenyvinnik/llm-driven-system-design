@@ -1,10 +1,50 @@
+/**
+ * Business reviews route handler.
+ * @module routes/businesses/reviews
+ */
 import { Router, Request, Response } from 'express';
 import { pool } from '../../utils/db.js';
 import { ReviewWithUser, CountRow } from './types.js';
 
+/**
+ * Express router for business review endpoints.
+ */
 export const router = Router();
 
-// Get reviews for a business
+/**
+ * Retrieves reviews for a specific business.
+ *
+ * @description
+ * Fetches a paginated list of reviews for the specified business.
+ * Each review includes the reviewer's profile information, any photos
+ * attached to the review, and the business owner's response if present.
+ * Supports multiple sorting options.
+ *
+ * @route GET /:id/reviews
+ *
+ * @param req.params.id - Business UUID
+ * @param req.query.page - Page number (default: 1)
+ * @param req.query.limit - Results per page (default: 10)
+ * @param req.query.sort - Sort order: 'recent' (default), 'rating_high', 'rating_low', or 'helpful'
+ *
+ * @returns {Object} JSON object with reviews and pagination info
+ * @returns {ReviewWithUser[]} response.reviews - Array of reviews with user info
+ * @returns {string} response.reviews[].user_name - Reviewer's display name
+ * @returns {string} response.reviews[].user_avatar - Reviewer's avatar URL
+ * @returns {number} response.reviews[].user_review_count - Total reviews by this user
+ * @returns {string} response.reviews[].response_text - Owner's response text (if any)
+ * @returns {string[]} response.reviews[].photos - Array of photo URLs attached to review
+ * @returns {Object} response.pagination - Pagination metadata
+ * @returns {number} response.pagination.page - Current page number
+ * @returns {number} response.pagination.limit - Results per page
+ * @returns {number} response.pagination.total - Total number of reviews
+ * @returns {number} response.pagination.pages - Total number of pages
+ *
+ * @throws {500} Database or server error
+ *
+ * @example
+ * // GET /businesses/550e8400-e29b-41d4-a716-446655440000/reviews?sort=helpful&page=1&limit=5
+ */
 router.get(
   '/:id/reviews',
   async (req: Request, res: Response): Promise<void> => {

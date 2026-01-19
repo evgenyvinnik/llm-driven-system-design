@@ -3,6 +3,8 @@
  * Handles status transitions and timestamp updates.
  *
  * @module services/order/status
+ * @description Manages order status lifecycle transitions, automatically setting
+ * relevant timestamps and publishing real-time updates via Redis pub/sub.
  */
 import { queryOne } from '../../utils/db.js';
 import { publisher } from '../../utils/redis.js';
@@ -10,12 +12,28 @@ import type { Order, OrderStatus } from './types.js';
 
 /**
  * Updates an order's status and records relevant timestamps.
- * Publishes status change via Redis for real-time client updates.
  *
- * @param id - The order's UUID
- * @param status - New status value
- * @param additionalFields - Optional extra fields to update (e.g., cancellation_reason)
- * @returns Updated order or null if not found
+ * @description Transitions an order to a new status, automatically setting
+ * the appropriate timestamp field (confirmed_at, picked_up_at, delivered_at,
+ * or cancelled_at). Publishes status change via Redis for real-time client updates.
+ * @param {string} id - The order's UUID
+ * @param {OrderStatus} status - New status value (pending, confirmed, preparing, ready_for_pickup, driver_assigned, picked_up, in_transit, delivered, cancelled)
+ * @param {Record<string, unknown>} [additionalFields] - Optional extra fields to update (e.g., cancellation_reason, driver_id)
+ * @returns {Promise<Order | null>} Updated order or null if not found
+ * @throws {Error} Database errors are propagated
+ * @example
+ * // Simple status update
+ * const order = await updateOrderStatus(orderId, 'confirmed');
+ *
+ * // Status update with additional fields
+ * const cancelled = await updateOrderStatus(orderId, 'cancelled', {
+ *   cancellation_reason: 'Customer requested cancellation'
+ * });
+ *
+ * // Assign driver during status update
+ * const assigned = await updateOrderStatus(orderId, 'driver_assigned', {
+ *   driver_id: driverId
+ * });
  */
 export async function updateOrderStatus(
   id: string,

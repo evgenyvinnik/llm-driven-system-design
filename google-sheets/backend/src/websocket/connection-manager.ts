@@ -1,6 +1,9 @@
 /**
  * Connection manager for WebSocket room management.
- * Handles room creation, user joining/leaving, and color assignment.
+ *
+ * @description Handles the lifecycle of WebSocket connections including room creation,
+ * user joining/leaving, color assignment for presence indicators, and broadcasting
+ * messages to room members. Maintains an in-memory map of active rooms and their clients.
  *
  * @module websocket/connection-manager
  */
@@ -28,9 +31,18 @@ let colorIndex = 0;
 
 /**
  * Returns the next available color from the color palette.
- * Cycles through colors to ensure visual distinction between collaborators.
  *
- * @returns A hex color code for the user's presence indicator
+ * @description Cycles through the predefined color palette to assign visually
+ * distinct colors to collaborators. Each call increments the internal color
+ * index, ensuring sequential users get different colors.
+ *
+ * @returns {string} A hex color code (e.g., '#FF6B6B') for the user's presence indicator
+ *
+ * @example
+ * ```typescript
+ * const userColor = getNextColor(); // '#FF6B6B'
+ * const nextUserColor = getNextColor(); // '#4ECDC4'
+ * ```
  */
 export function getNextColor(): string {
   const color = COLORS[colorIndex % COLORS.length];
@@ -41,8 +53,18 @@ export function getNextColor(): string {
 /**
  * Gets or creates a room for a spreadsheet.
  *
- * @param spreadsheetId - The spreadsheet ID
- * @returns The room for the spreadsheet
+ * @description Retrieves an existing room for the given spreadsheet ID, or creates
+ * a new empty room if one doesn't exist. Rooms are used to group WebSocket
+ * connections editing the same spreadsheet.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @returns {Room} The room object containing a Set of connected clients
+ *
+ * @example
+ * ```typescript
+ * const room = getOrCreateRoom('spreadsheet-123');
+ * room.clients.add(ws);
+ * ```
  */
 export function getOrCreateRoom(spreadsheetId: string): Room {
   if (!rooms.has(spreadsheetId)) {
@@ -54,8 +76,19 @@ export function getOrCreateRoom(spreadsheetId: string): Room {
 /**
  * Gets a room for a spreadsheet if it exists.
  *
- * @param spreadsheetId - The spreadsheet ID
- * @returns The room or undefined
+ * @description Retrieves an existing room without creating one if it doesn't exist.
+ * Useful for checking if a room has active collaborators before broadcasting.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @returns {Room | undefined} The room object if it exists, undefined otherwise
+ *
+ * @example
+ * ```typescript
+ * const room = getRoom('spreadsheet-123');
+ * if (room) {
+ *   console.log(`${room.clients.size} users are editing`);
+ * }
+ * ```
  */
 export function getRoom(spreadsheetId: string): Room | undefined {
   return rooms.get(spreadsheetId);
@@ -64,8 +97,21 @@ export function getRoom(spreadsheetId: string): Room | undefined {
 /**
  * Adds a client to a room.
  *
- * @param spreadsheetId - The spreadsheet ID
- * @param ws - The WebSocket client
+ * @description Joins a WebSocket client to the specified spreadsheet room.
+ * Updates Prometheus metrics for active connections, caches the collaborator
+ * information in Redis for multi-server sync, and logs the join event.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @param {ExtendedWebSocket} ws - The WebSocket client joining the room
+ * @returns {Promise<void>} Resolves when the client has been added and cached
+ *
+ * @example
+ * ```typescript
+ * ws.userId = 'user-123';
+ * ws.userName = 'Alice';
+ * ws.userColor = '#FF6B6B';
+ * await joinRoom('spreadsheet-456', ws);
+ * ```
  */
 export async function joinRoom(spreadsheetId: string, ws: ExtendedWebSocket): Promise<void> {
   const room = getOrCreateRoom(spreadsheetId);
@@ -90,7 +136,19 @@ export async function joinRoom(spreadsheetId: string, ws: ExtendedWebSocket): Pr
 /**
  * Removes a client from a room and cleans up empty rooms.
  *
- * @param ws - The WebSocket client
+ * @description Handles client disconnection by removing the WebSocket from its room,
+ * updating Prometheus metrics, removing the collaborator from Redis cache, and
+ * cleaning up the room if it becomes empty.
+ *
+ * @param {ExtendedWebSocket} ws - The WebSocket client leaving the room
+ * @returns {Promise<void>} Resolves when cleanup is complete
+ *
+ * @example
+ * ```typescript
+ * ws.on('close', async () => {
+ *   await leaveRoom(ws);
+ * });
+ * ```
  */
 export async function leaveRoom(ws: ExtendedWebSocket): Promise<void> {
   if (!ws.spreadsheetId) return;
@@ -122,9 +180,20 @@ export async function leaveRoom(ws: ExtendedWebSocket): Promise<void> {
 /**
  * Gets the list of collaborators in a room, excluding a specific client.
  *
- * @param spreadsheetId - The spreadsheet ID
- * @param excludeWs - Optional client to exclude
- * @returns Array of collaborator info
+ * @description Retrieves information about all active collaborators in a room.
+ * Typically used to send the list of existing collaborators to a newly joined user,
+ * excluding the user themselves from the list.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @param {ExtendedWebSocket} [excludeWs] - Optional client to exclude from the list
+ * @returns {Collaborator[]} Array of collaborator information objects
+ *
+ * @example
+ * ```typescript
+ * // Get all other collaborators when a user joins
+ * const collaborators = getRoomCollaborators('spreadsheet-123', ws);
+ * ws.send(JSON.stringify({ type: 'COLLABORATORS', collaborators }));
+ * ```
  */
 export function getRoomCollaborators(
   spreadsheetId: string,
@@ -150,12 +219,26 @@ export function getRoomCollaborators(
 
 /**
  * Broadcasts a message to all clients in a spreadsheet room.
- * Optionally excludes a specific client (typically the sender).
  *
- * @param spreadsheetId - The spreadsheet room to broadcast to
- * @param message - The message object to send (will be JSON-stringified)
- * @param exclude - Optional WebSocket connection to exclude from broadcast
- * @returns Number of clients the message was sent to
+ * @description Sends a message to all connected clients in the specified room.
+ * Optionally excludes a specific client (typically the sender to avoid echo).
+ * Only sends to clients with an open WebSocket connection.
+ *
+ * @param {string} spreadsheetId - The spreadsheet room to broadcast to
+ * @param {any} message - The message object to send (will be JSON-stringified)
+ * @param {ExtendedWebSocket} [exclude] - Optional WebSocket connection to exclude from broadcast
+ * @returns {number} The number of clients the message was sent to
+ *
+ * @example
+ * ```typescript
+ * const sentCount = broadcastToRoom('spreadsheet-123', {
+ *   type: 'CELL_UPDATED',
+ *   row: 5,
+ *   col: 2,
+ *   value: 'Hello'
+ * }, senderWs);
+ * console.log(`Broadcast to ${sentCount} clients`);
+ * ```
  */
 export function broadcastToRoom(
   spreadsheetId: string,
@@ -181,8 +264,17 @@ export function broadcastToRoom(
 /**
  * Gets the number of clients in a room.
  *
- * @param spreadsheetId - The spreadsheet ID
- * @returns Number of connected clients
+ * @description Returns the count of currently connected clients in the specified room.
+ * Useful for monitoring and displaying the number of active collaborators.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @returns {number} The number of connected clients (0 if room doesn't exist)
+ *
+ * @example
+ * ```typescript
+ * const count = getRoomSize('spreadsheet-123');
+ * console.log(`${count} users currently editing`);
+ * ```
  */
 export function getRoomSize(spreadsheetId: string): number {
   const room = rooms.get(spreadsheetId);

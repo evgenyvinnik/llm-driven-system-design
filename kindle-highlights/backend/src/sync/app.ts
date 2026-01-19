@@ -7,7 +7,7 @@ import http from 'http'
 import express, { Request, Response } from 'express'
 import cors from 'cors'
 import { query } from '../shared/db.js'
-import { redis, _initRedis } from '../shared/cache.js'
+import { redis, initRedis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
 
 const logger = createLogger('sync-service')

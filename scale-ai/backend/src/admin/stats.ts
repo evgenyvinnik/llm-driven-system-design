@@ -15,8 +15,39 @@ const router = Router()
 
 /**
  * GET /api/admin/stats - Returns aggregated dashboard statistics.
- * Includes total drawings, users, flagged count, per-shape breakdown,
- * active model info, and recent training jobs. Cached for 30 seconds.
+ *
+ * @description Fetches comprehensive statistics for the admin dashboard including:
+ *   - Total drawing count and per-shape breakdown
+ *   - Flagged and today's drawing counts
+ *   - Total user count
+ *   - Active model information
+ *   - Recent training jobs (last 5)
+ *
+ *   Results are cached in Redis for 30 seconds to reduce database load.
+ *   Uses circuit breaker pattern for PostgreSQL resilience.
+ *
+ * @route GET /api/admin/stats
+ *
+ * @param {Request} _req - Express request (unused, auth handled by middleware)
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Dashboard statistics object
+ * @returns {object} 503 - If database circuit breaker is open
+ * @returns {object} 500 - If stats fetching fails
+ *
+ * @throws {CircuitBreakerOpenError} When PostgreSQL circuit breaker is open
+ *
+ * @example
+ * // Success response
+ * {
+ *   "total_drawings": 1234,
+ *   "drawings_per_shape": [{ "name": "circle", "count": "456" }],
+ *   "flagged_count": 12,
+ *   "today_count": 89,
+ *   "total_users": 567,
+ *   "active_model": { "id": "uuid", "version": "v1.0", "accuracy": 0.95 },
+ *   "recent_jobs": [{ "id": "uuid", "status": "completed", "accuracy": "0.95" }]
+ * }
  */
 router.get('/', requireAdmin, async (_req: Request, res: Response) => {
   const reqLogger = createChildLogger({ endpoint: '/api/admin/stats' })

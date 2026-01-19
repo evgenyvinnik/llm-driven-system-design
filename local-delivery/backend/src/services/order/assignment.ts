@@ -3,6 +3,8 @@
  * Handles driver offers, acceptance/rejection, and assignment.
  *
  * @module services/order/assignment
+ * @description Manages the driver offer lifecycle including creating time-limited
+ * offers, processing driver responses, and finalizing order assignments.
  */
 import { queryOne, execute } from '../../utils/db.js';
 import { addDriverOrder, publisher } from '../../utils/redis.js';
@@ -13,12 +15,19 @@ import { OFFER_EXPIRY_SECONDS } from './types.js';
 
 /**
  * Assigns a driver to an order and updates all related state.
- * Updates order status, adds to driver's active orders in Redis,
- * and sets driver status to busy.
  *
- * @param orderId - The order's UUID
- * @param driverId - The assigned driver's UUID
- * @returns Updated order or null if not found
+ * @description Finalizes driver assignment by:
+ * 1. Updating order status to 'driver_assigned' with driver_id
+ * 2. Adding order to driver's active order set in Redis
+ * 3. Setting driver status to 'busy'
+ * @param {string} orderId - The order's UUID
+ * @param {string} driverId - The assigned driver's UUID
+ * @returns {Promise<Order | null>} Updated order or null if not found
+ * @example
+ * const assignedOrder = await assignDriverToOrder(orderId, driverId);
+ * if (assignedOrder) {
+ *   console.log(`Order ${assignedOrder.id} assigned to driver ${driverId}`);
+ * }
  */
 export async function assignDriverToOrder(
   orderId: string,
@@ -41,13 +50,21 @@ export async function assignDriverToOrder(
 
 /**
  * Creates a delivery offer for a specific driver.
- * The offer has a 30-second expiry after which it moves to the next driver.
- * Publishes the offer via Redis for real-time driver notification.
  *
- * @param orderId - The order needing a driver
- * @param driverId - The driver receiving the offer
- * @returns Created offer record
- * @throws Error if offer creation fails
+ * @description Creates a time-limited offer record in the database and publishes
+ * a notification via Redis pub/sub for real-time driver notification. The offer
+ * expires after OFFER_EXPIRY_SECONDS (30 seconds by default).
+ * @param {string} orderId - The order needing a driver
+ * @param {string} driverId - The driver receiving the offer
+ * @returns {Promise<DriverOffer>} Created offer record with expiration time
+ * @throws {Error} If offer creation fails in the database
+ * @example
+ * try {
+ *   const offer = await createDriverOffer(orderId, driverId);
+ *   console.log(`Offer ${offer.id} expires at ${offer.expires_at}`);
+ * } catch (error) {
+ *   console.error('Failed to create offer:', error.message);
+ * }
  */
 export async function createDriverOffer(
   orderId: string,
@@ -83,12 +100,21 @@ export async function createDriverOffer(
 
 /**
  * Processes a driver's acceptance of a delivery offer.
- * Validates the offer is still valid (not expired, not already responded),
- * then assigns the driver to the order.
  *
- * @param offerId - The offer's UUID
- * @param driverId - The accepting driver's UUID (for verification)
- * @returns Assigned order or null if offer invalid/expired
+ * @description Validates the offer is still valid (pending status, not expired,
+ * belongs to the driver), then marks it as accepted and assigns the driver to
+ * the order. This is an atomic operation - the offer validation and acceptance
+ * happen in a single query.
+ * @param {string} offerId - The offer's UUID
+ * @param {string} driverId - The accepting driver's UUID (for verification)
+ * @returns {Promise<Order | null>} Assigned order or null if offer is invalid, expired, or belongs to another driver
+ * @example
+ * const order = await acceptDriverOffer(offerId, driverId);
+ * if (order) {
+ *   console.log(`Driver accepted order ${order.id}`);
+ * } else {
+ *   console.log('Offer expired or already responded');
+ * }
  */
 export async function acceptDriverOffer(
   offerId: string,
@@ -113,11 +139,18 @@ export async function acceptDriverOffer(
 
 /**
  * Processes a driver's rejection of a delivery offer.
- * Marks the offer as rejected so the system can try the next driver.
  *
- * @param offerId - The offer's UUID
- * @param driverId - The rejecting driver's UUID (for verification)
- * @returns True if rejection recorded, false if offer not found
+ * @description Marks the offer as rejected so the matching system can proceed
+ * to offer the order to the next available driver. Only updates offers that
+ * are still pending and belong to the specified driver.
+ * @param {string} offerId - The offer's UUID
+ * @param {string} driverId - The rejecting driver's UUID (for verification)
+ * @returns {Promise<boolean>} True if rejection was recorded, false if offer not found or already responded
+ * @example
+ * const rejected = await rejectDriverOffer(offerId, driverId);
+ * if (rejected) {
+ *   console.log('Offer rejected, finding next driver...');
+ * }
  */
 export async function rejectDriverOffer(
   offerId: string,
@@ -135,10 +168,18 @@ export async function rejectDriverOffer(
 
 /**
  * Retrieves the current pending offer for a driver, if any.
- * Used to check if driver has an active offer to display.
  *
- * @param driverId - The driver's UUID
- * @returns Pending offer or null if none
+ * @description Fetches the most recent pending (not expired) offer for a driver.
+ * Used to check if the driver has an active offer to display in the driver app.
+ * Returns only offers that haven't been responded to and haven't expired.
+ * @param {string} driverId - The driver's UUID
+ * @returns {Promise<DriverOffer | null>} Pending offer or null if none exists
+ * @example
+ * const pendingOffer = await getPendingOfferForDriver(driverId);
+ * if (pendingOffer) {
+ *   const timeLeft = new Date(pendingOffer.expires_at).getTime() - Date.now();
+ *   console.log(`Offer expires in ${timeLeft / 1000} seconds`);
+ * }
  */
 export async function getPendingOfferForDriver(
   driverId: string
@@ -154,9 +195,17 @@ export async function getPendingOfferForDriver(
 
 /**
  * Marks all expired offers as expired status.
- * Should be called periodically to clean up stale offers.
  *
- * @returns Number of offers marked as expired
+ * @description Batch updates all offers that are still pending but have passed
+ * their expiration time. Should be called periodically (e.g., via cron job or
+ * background worker) to clean up stale offers and trigger next-driver matching.
+ * @returns {Promise<number>} Number of offers marked as expired
+ * @example
+ * // Run periodically to clean up expired offers
+ * const expiredCount = await expireOldOffers();
+ * if (expiredCount > 0) {
+ *   console.log(`Expired ${expiredCount} stale offers`);
+ * }
  */
 export async function expireOldOffers(): Promise<number> {
   return execute(

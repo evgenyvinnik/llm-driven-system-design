@@ -13,15 +13,26 @@ import type { CreatePaymentRequest } from './types.js';
 
 /**
  * Result of a processor authorization attempt.
+ *
+ * @property success - True if the processor approved the authorization
+ * @property processorRef - Unique reference ID from the processor (on success)
+ * @property declineReason - Human-readable reason for decline (on failure)
  */
 export interface ProcessorAuthResult {
+  /** True if the processor authorized the payment */
   success: boolean;
+  /** Processor-assigned reference ID for captures/refunds (only on success) */
   processorRef?: string;
+  /** Reason for decline or failure (only on failure) */
   declineReason?: string;
 }
 
 /**
  * Authorizes payment with external processor using circuit breaker protection.
+ *
+ * @description Contacts the payment processor (Stripe, Adyen, etc.) to authorize
+ * the transaction. Uses a circuit breaker pattern to prevent cascading failures
+ * when the processor is unavailable.
  *
  * WHY CIRCUIT BREAKER: Payment processors can experience outages.
  * Without protection:
@@ -35,8 +46,19 @@ export interface ProcessorAuthResult {
  * - Automatic recovery when processor comes back
  *
  * @param amount - Transaction amount in cents
- * @param paymentMethod - Payment method details
+ * @param paymentMethod - Payment method details (card type, last four, etc.)
  * @returns Authorization result with success flag and processor reference
+ * @throws Never throws - returns failure result with declineReason instead
+ *
+ * @example
+ * const result = await authorizeWithProcessor(10000, {
+ *   type: 'card',
+ *   last_four: '4242',
+ *   card_brand: 'visa'
+ * });
+ * if (result.success) {
+ *   console.log(`Authorized with ref: ${result.processorRef}`);
+ * }
  */
 export async function authorizeWithProcessor(
   amount: number,
@@ -72,8 +94,11 @@ export async function authorizeWithProcessor(
 
 /**
  * Simulates payment processor authorization.
- * In production, this would call real payment processors (Stripe, Adyen, etc.).
- * Returns false for test decline card numbers or high-risk amounts.
+ *
+ * @description In production, this would call real payment processors (Stripe, Adyen, etc.).
+ * This simulation returns false for test decline card numbers (last_four='0000') or
+ * high-risk amounts (over $10,000 has 30% decline rate). Normal transactions have
+ * 95% success rate.
  *
  * @param amount - Transaction amount in cents
  * @param paymentMethod - Payment method details for simulation logic
@@ -102,11 +127,19 @@ async function simulateProcessorAuth(
 
 /**
  * Captures authorized funds with the processor.
- * In production, this would call the processor's capture API.
  *
- * @param processorRef - Reference from the authorization
- * @param amount - Amount to capture in cents
- * @returns True if capture succeeds
+ * @description Confirms the capture of previously authorized funds with the payment
+ * processor. In production, this would call the processor's capture API endpoint.
+ *
+ * @param processorRef - Reference ID from the original authorization
+ * @param amount - Amount to capture in cents (can be less than authorized amount)
+ * @returns True if capture succeeds, false otherwise
+ *
+ * @example
+ * const success = await captureWithProcessor('proc_abc123', 10000);
+ * if (!success) {
+ *   throw new Error('Capture failed with processor');
+ * }
  */
 export async function captureWithProcessor(
   processorRef: string,
@@ -122,10 +155,19 @@ export async function captureWithProcessor(
 
 /**
  * Voids an authorization with the processor.
- * In production, this would call the processor's void/cancel API.
  *
- * @param processorRef - Reference from the authorization
- * @returns True if void succeeds
+ * @description Cancels a previously authorized transaction before capture, releasing
+ * the hold on customer funds. In production, this would call the processor's void
+ * or cancel API endpoint.
+ *
+ * @param processorRef - Reference ID from the original authorization
+ * @returns True if void succeeds, false otherwise
+ *
+ * @example
+ * const success = await voidWithProcessor('proc_abc123');
+ * if (!success) {
+ *   throw new Error('Void failed with processor');
+ * }
  */
 export async function voidWithProcessor(processorRef: string): Promise<boolean> {
   // Simulate some processing time
@@ -137,11 +179,20 @@ export async function voidWithProcessor(processorRef: string): Promise<boolean> 
 
 /**
  * Initiates a refund with the processor.
- * In production, this would call the processor's refund API.
  *
- * @param processorRef - Reference from the original authorization
- * @param amount - Amount to refund in cents
- * @returns Refund processor reference if successful
+ * @description Creates a refund request with the payment processor for a previously
+ * captured transaction. In production, this would call the processor's refund API
+ * endpoint. Refunds can be partial or full.
+ *
+ * @param processorRef - Reference ID from the original authorization
+ * @param amount - Amount to refund in cents (can be less than captured amount for partial refund)
+ * @returns Object with success flag and optional refundRef on success
+ *
+ * @example
+ * const result = await refundWithProcessor('proc_abc123', 5000);
+ * if (result.success) {
+ *   console.log(`Refund created with ref: ${result.refundRef}`);
+ * }
  */
 export async function refundWithProcessor(
   processorRef: string,

@@ -7,7 +7,7 @@
  * @module services/wsGateway/connection-manager
  */
 
-import { _WebSocket, WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { IncomingMessage } from 'http';
 import { ExtendedWebSocket, getCloseReason } from './types.js';
 import {
@@ -20,11 +20,42 @@ import {
 
 const wsLogger = logger.child({ module: 'connection-manager' });
 
+/**
+ * Type definition for WebSocket message handler callback.
+ *
+ * @param ws - The WebSocket connection that received the message
+ * @param data - The raw message buffer
+ * @returns Promise that resolves when message handling is complete
+ */
 export type MessageHandler = (ws: ExtendedWebSocket, data: Buffer) => Promise<void>;
+
+/**
+ * Type definition for WebSocket disconnect handler callback.
+ *
+ * @param ws - The WebSocket connection that disconnected
+ */
 export type DisconnectHandler = (ws: ExtendedWebSocket) => void;
 
 /**
  * Manages WebSocket connections and heartbeat monitoring.
+ *
+ * @description The ConnectionManager handles low-level WebSocket server operations:
+ * - WebSocket server setup and connection lifecycle
+ * - Heartbeat/ping-pong for detecting stale connections
+ * - Connection tracking per stream with Prometheus metrics
+ * - Graceful shutdown with connection draining
+ *
+ * @example
+ * ```typescript
+ * const manager = new ConnectionManager(httpServer);
+ * manager.setup(
+ *   async (ws, data) => { // Handle incoming messages },
+ *   (ws) => { // Handle disconnections }
+ * );
+ *
+ * // Later during shutdown
+ * await manager.shutdown(10000);
+ * ```
  */
 export class ConnectionManager {
   private wss: WebSocketServer;
@@ -38,6 +69,17 @@ export class ConnectionManager {
     this.wss = new WebSocketServer({ server: server as import('http').Server });
   }
 
+  /**
+   * Initializes WebSocket handlers and starts heartbeat monitoring.
+   *
+   * @description Sets up WebSocket event handlers for new connections, messages,
+   * disconnections, and errors. Also starts the heartbeat timer that pings clients
+   * every 30 seconds to detect stale connections.
+   *
+   * @param messageHandler - Callback invoked when a message is received
+   * @param disconnectHandler - Callback invoked when a connection is closed
+   * @returns void
+   */
   setup(messageHandler: MessageHandler, disconnectHandler: DisconnectHandler): void {
     this.messageHandler = messageHandler;
     this.disconnectHandler = disconnectHandler;
@@ -90,10 +132,28 @@ export class ConnectionManager {
     }, 30000);
   }
 
+  /**
+   * Gets the map of all stream connections.
+   *
+   * @description Returns the internal connections map for use by the RoomManager.
+   * The map keys are stream IDs and values are sets of WebSocket connections.
+   *
+   * @returns Map of stream ID to set of WebSocket connections
+   */
   getConnections(): Map<string, Set<ExtendedWebSocket>> {
     return this.connections;
   }
 
+  /**
+   * Adds a WebSocket connection to a stream.
+   *
+   * @description Registers a connection with a stream, creating the stream's
+   * connection set if it doesn't exist. Updates Prometheus metrics.
+   *
+   * @param streamId - The stream ID to add the connection to
+   * @param ws - The WebSocket connection to add
+   * @returns void
+   */
   addConnection(streamId: string, ws: ExtendedWebSocket): void {
     if (!this.connections.has(streamId)) {
       this.connections.set(streamId, new Set());
@@ -102,6 +162,16 @@ export class ConnectionManager {
     wsConnectionsGauge.labels(streamId).set(this.connections.get(streamId)!.size);
   }
 
+  /**
+   * Removes a WebSocket connection from a stream.
+   *
+   * @description Unregisters a connection from a stream. If the stream has no
+   * remaining connections, removes the stream entry entirely. Updates Prometheus metrics.
+   *
+   * @param streamId - The stream ID to remove the connection from
+   * @param ws - The WebSocket connection to remove
+   * @returns True if the stream is now empty (no remaining connections), false otherwise
+   */
   removeConnection(streamId: string, ws: ExtendedWebSocket): boolean {
     const connections = this.connections.get(streamId);
     if (!connections) return false;
@@ -116,16 +186,53 @@ export class ConnectionManager {
     return false;
   }
 
+  /**
+   * Gets the number of viewers for a stream.
+   *
+   * @description Returns the count of WebSocket connections currently watching
+   * the specified stream.
+   *
+   * @param streamId - The stream ID to get viewer count for
+   * @returns The number of active connections for the stream
+   */
   getViewerCount(streamId: string): number {
     return this.connections.get(streamId)?.size || 0;
   }
 
+  /**
+   * Gets the total number of connections across all streams.
+   *
+   * @description Sums up all active WebSocket connections across all streams.
+   * Useful for monitoring overall gateway load.
+   *
+   * @returns The total count of active WebSocket connections
+   */
   getTotalConnections(): number {
     let total = 0;
     this.connections.forEach((conns) => { total += conns.size; });
     return total;
   }
 
+  /**
+   * Gracefully shuts down the WebSocket server.
+   *
+   * @description Performs a graceful shutdown by:
+   * 1. Stopping the heartbeat timer
+   * 2. Sending shutdown notification to all connected clients
+   * 3. Closing all connections with a 1001 (going away) code
+   * 4. Waiting for connections to close (with timeout)
+   * 5. Closing the WebSocket server
+   *
+   * @param timeoutMs - Maximum time to wait for graceful shutdown (default: 10000ms)
+   * @returns Promise that resolves when shutdown is complete
+   * @throws Error if WebSocket server close fails
+   *
+   * @example
+   * ```typescript
+   * // Graceful shutdown with 5 second timeout
+   * await connectionManager.shutdown(5000);
+   * ```
+   */
   async shutdown(timeoutMs = 10000): Promise<void> {
     wsLogger.info('Starting connection manager shutdown');
     this.isShuttingDown = true;

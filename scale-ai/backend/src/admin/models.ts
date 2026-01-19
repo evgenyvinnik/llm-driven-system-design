@@ -14,6 +14,31 @@ const router = Router()
 
 /**
  * GET /api/admin/models - Lists all trained models.
+ *
+ * @description Retrieves all trained models ordered by creation date (newest first).
+ *   Includes model metadata, accuracy, and associated training job configuration.
+ *
+ * @route GET /api/admin/models
+ *
+ * @param {Request} _req - Express request (unused, auth handled by middleware)
+ * @param {Response} res - Express response object
+ *
+ * @returns {object[]} 200 - Array of model records
+ * @returns {object} 500 - If fetching models fails
+ *
+ * @example
+ * // Success response
+ * [
+ *   {
+ *     "id": "uuid",
+ *     "version": "v1.0",
+ *     "is_active": true,
+ *     "accuracy": 0.95,
+ *     "model_path": "models/v1.0/model.pt",
+ *     "created_at": "2024-01-15T10:30:00Z",
+ *     "training_config": { "epochs": 10, "batchSize": 32 }
+ *   }
+ * ]
  */
 router.get('/', requireAdmin, async (_req: Request, res: Response) => {
   try {
@@ -34,8 +59,24 @@ router.get('/', requireAdmin, async (_req: Request, res: Response) => {
 
 /**
  * POST /api/admin/models/:id/activate - Activates a model for inference.
- * Deactivates all other models first (only one active at a time).
- * Computes prototype strokes from training data for shape generation.
+ *
+ * @description Activates the specified model for use by the inference service.
+ *   Deactivates all other models first (only one model can be active).
+ *   Computes prototype strokes from training data and stores them with the model
+ *   for shape generation during inference.
+ *
+ * @route POST /api/admin/models/:id/activate
+ *
+ * @param {Request} req - Express request with params.id {string} - Model UUID
+ * @param {Response} res - Express response object
+ *
+ * @returns {object} 200 - Success response { success: true, message: string }
+ * @returns {object} 500 - If activation fails
+ *
+ * @example
+ * POST /api/admin/models/123e4567-e89b-12d3-a456-426614174000/activate
+ * // Success response
+ * { "success": true, "message": "Model activated" }
  */
 router.post('/:id/activate', requireAdmin, async (req: Request, res: Response) => {
   const reqLogger = createChildLogger({ endpoint: '/api/admin/models/:id/activate' })
