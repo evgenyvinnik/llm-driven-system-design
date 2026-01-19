@@ -35,6 +35,8 @@
     "@types/pg": "^8.11.10",
     "@types/pino": "^7.0.4",
     "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
     "eslint": "^9.11.1",
     "prettier": "^3.3.3",
     "tsx": "^4.19.1",

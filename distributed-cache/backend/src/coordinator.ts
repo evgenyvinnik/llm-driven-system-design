@@ -290,19 +290,25 @@ app.get('/cluster/info', (_req, res) => {
  * Cluster stats - aggregate from all nodes
  */
 app.get('/cluster/stats', async (_req, res) => {
-  const activeNodes = ring.getAllNodes();
-  const statsPromises = activeNodes.map(async (nodeUrl) => {
+  const activeNodes = ring.getAllNodes() as string[];
+  const statsPromises = activeNodes.map(async (nodeUrl: string) => {
     const result = await nodeRequest(nodeUrl, '/stats');
-    return result.success ? { nodeUrl, ...result.data } : null;
+    return result.success ? ({ nodeUrl, ...result.data } as NodeStats) : null;
   });
 
-  const allStats = (await Promise.all(statsPromises)).filter(Boolean);
+  const allStats = (await Promise.all(statsPromises)).filter(
+    (s): s is NodeStats => s !== null
+  );
 
   // Aggregate stats
+  const totalHits = allStats.reduce((sum, s) => sum + s.hits, 0);
+  const totalMisses = allStats.reduce((sum, s) => sum + s.misses, 0);
+  const totalOps = totalHits + totalMisses;
+
   const aggregated = {
     totalNodes: allStats.length,
-    totalHits: allStats.reduce((sum, s) => sum + s.hits, 0),
-    totalMisses: allStats.reduce((sum, s) => sum + s.misses, 0),
+    totalHits,
+    totalMisses,
     totalSets: allStats.reduce((sum, s) => sum + s.sets, 0),
     totalDeletes: allStats.reduce((sum, s) => sum + s.deletes, 0),
     totalEvictions: allStats.reduce((sum, s) => sum + s.evictions, 0),
@@ -311,16 +317,12 @@ app.get('/cluster/stats', async (_req, res) => {
       .reduce((sum, s) => sum + parseFloat(s.memoryMB), 0)
       .toFixed(2),
     hotKeys: allStats.flatMap((s) =>
-      (s.hotKeys || []).map((hk) => ({ ...hk, node: s.nodeUrl }))
+      (s.hotKeys || []).map((hk: HotKey) => ({ ...hk, node: s.nodeUrl }))
     ),
     perNode: allStats,
+    overallHitRate:
+      totalOps > 0 ? ((totalHits / totalOps) * 100).toFixed(2) : '0.00',
   };
-
-  const totalOps = aggregated.totalHits + aggregated.totalMisses;
-  aggregated.overallHitRate =
-    totalOps > 0
-      ? ((aggregated.totalHits / totalOps) * 100).toFixed(2)
-      : '0.00';
 
   res.json({
     ...aggregated,
@@ -361,12 +363,12 @@ app.post('/cluster/distribution', (req, res) => {
   }
 
   const distribution = ring.getDistribution(keys);
-  const result = {};
+  const result: Record<string, { count: number; percentage: string }> = {};
 
   for (const [nodeUrl, count] of distribution) {
-    result[nodeUrl] = {
-      count,
-      percentage: ((count / keys.length) * 100).toFixed(2),
+    result[nodeUrl as string] = {
+      count: count as number,
+      percentage: (((count as number) / keys.length) * 100).toFixed(2),
     };
   }
 
@@ -380,8 +382,8 @@ app.post('/cluster/distribution', (req, res) => {
  * Get hot keys across the cluster
  */
 app.get('/cluster/hot-keys', async (_req, res) => {
-  const activeNodes = ring.getAllNodes();
-  const hotKeysPromises = activeNodes.map(async (nodeUrl) => {
+  const activeNodes = ring.getAllNodes() as string[];
+  const hotKeysPromises = activeNodes.map(async (nodeUrl: string): Promise<NodeHotKeysResult> => {
     const result = await nodeRequest(nodeUrl, '/hot-keys');
     return result.success
       ? { nodeUrl, ...result.data }
@@ -393,7 +395,7 @@ app.get('/cluster/hot-keys', async (_req, res) => {
   res.json({
     nodes: allHotKeys,
     aggregated: allHotKeys.flatMap((n) =>
-      (n.hotKeys || []).map((hk) => ({ ...hk, node: n.nodeUrl }))
+      (n.hotKeys || []).map((hk: HotKey) => ({ ...hk, node: n.nodeUrl }))
     ),
     timestamp: new Date().toISOString(),
   });
@@ -549,10 +551,10 @@ app.post('/cache/:key/incr', async (req, res) => {
  * GET /keys - List all keys from all nodes
  */
 app.get('/keys', async (req, res) => {
-  const { pattern = '*' } = req.query;
-  const activeNodes = ring.getAllNodes();
+  const pattern = (req.query.pattern as string) || '*';
+  const activeNodes = ring.getAllNodes() as string[];
 
-  const keysPromises = activeNodes.map(async (nodeUrl) => {
+  const keysPromises = activeNodes.map(async (nodeUrl: string): Promise<KeysResult> => {
     const result = await nodeRequest(
       nodeUrl,
       `/keys?pattern=${encodeURIComponent(pattern)}`
@@ -564,8 +566,8 @@ app.get('/keys', async (req, res) => {
 
   const allKeysResults = await Promise.all(keysPromises);
 
-  const allKeys = [];
-  const perNode = {};
+  const allKeys: string[] = [];
+  const perNode: Record<string, number> = {};
 
   for (const result of allKeysResults) {
     perNode[result.nodeUrl] = result.keys.length;
@@ -583,10 +585,10 @@ app.get('/keys', async (req, res) => {
 /**
  * POST /flush - Flush all nodes (requires admin auth)
  */
-app.post('/flush', requireAdminKey, async (req, res) => {
-  const activeNodes = ring.getAllNodes();
+app.post('/flush', requireAdminKey, async (_req, res) => {
+  const activeNodes = ring.getAllNodes() as string[];
 
-  const flushPromises = activeNodes.map(async (nodeUrl) => {
+  const flushPromises = activeNodes.map(async (nodeUrl: string) => {
     const result = await nodeRequest(nodeUrl, '/flush', { method: 'POST' });
     return { nodeUrl, success: result.success };
   });
@@ -684,7 +686,7 @@ app.delete('/admin/node', requireAdminKey, async (req, res) => {
 /**
  * POST /admin/health-check - Force health check of all nodes
  */
-app.post('/admin/health-check', requireAdminKey, async (req, res) => {
+app.post('/admin/health-check', requireAdminKey, async (_req, res) => {
   const results = await checkAllNodesHealth();
 
   logAdminOperation('force_health_check', {
@@ -733,7 +735,7 @@ app.post('/admin/rebalance', requireAdminKey, async (req, res) => {
  * GET /admin/rebalance/analyze - Analyze impact of adding a node
  */
 app.get('/admin/rebalance/analyze', requireAdminKey, async (req, res) => {
-  const { targetNode } = req.query;
+  const targetNode = req.query.targetNode as string | undefined;
 
   if (!targetNode) {
     return res.status(400).json({
@@ -752,10 +754,10 @@ app.get('/admin/rebalance/analyze', requireAdminKey, async (req, res) => {
 /**
  * POST /admin/snapshot - Force snapshot on all nodes
  */
-app.post('/admin/snapshot', requireAdminKey, async (req, res) => {
-  const activeNodes = ring.getAllNodes();
+app.post('/admin/snapshot', requireAdminKey, async (_req, res) => {
+  const activeNodes = ring.getAllNodes() as string[];
 
-  const snapshotPromises = activeNodes.map(async (nodeUrl) => {
+  const snapshotPromises = activeNodes.map(async (nodeUrl: string) => {
     const result = await nodeRequest(nodeUrl, '/snapshot', { method: 'POST' });
     return { nodeUrl, success: result.success, data: result.data };
   });

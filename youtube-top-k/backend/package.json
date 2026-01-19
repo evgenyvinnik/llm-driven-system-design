@@ -11,7 +11,9 @@
     "dev:server3": "PORT=3003 tsx --watch src/index.ts",
     "start": "tsx src/index.ts",
     "seed": "tsx src/seed.ts",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write src/**/*.ts",
+    "lint": "eslint src/**/*.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -30,6 +32,10 @@
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

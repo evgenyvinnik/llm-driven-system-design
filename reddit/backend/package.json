@@ -12,7 +12,9 @@
     "dev:worker": "tsx watch src/workers/voteAggregator.ts",
     "dev:ranking": "tsx watch src/workers/rankingCalculator.ts",
     "start": "tsx src/index.ts",
-    "db:seed": "tsx src/db/seed.ts"
+    "db:seed": "tsx src/db/seed.ts",
+    "format": "prettier --write src/**/*.ts",
+    "lint": "eslint src/**/*.ts"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
@@ -35,6 +37,10 @@
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

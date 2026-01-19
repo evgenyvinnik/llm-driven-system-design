@@ -13,7 +13,8 @@
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write src/**/*.ts"
   },
   "type": "module",
   "dependencies": {
@@ -46,6 +47,7 @@
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
     "eslint": "^8.55.0",
+    "prettier": "^3.4.2",
     "tsx": "^4.6.0",
     "typescript": "^5.3.2"
   }

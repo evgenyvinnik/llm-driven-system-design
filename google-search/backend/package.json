@@ -47,6 +47,8 @@
     "@types/opossum": "^8.1.9",
     "@types/pg": "^8.10.9",
     "@types/uuid": "^9.0.7",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
     "eslint": "^8.55.0",
     "prettier": "^3.4.2",
     "tsx": "^4.7.0",

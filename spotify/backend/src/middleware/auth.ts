@@ -86,7 +86,7 @@ export function clearRoleCache(userId: string): void {
  * Require authentication middleware.
  * Attaches user info to request.
  */
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+export function requireAuth(req: Request, res: Response, next: NextFunction): void | Response {
   if (!req.session || !req.session.userId) {
     authEventsTotal.inc({ event: 'unauthorized', success: 'false' });
     return res.status(401).json({ error: 'Authentication required' });
@@ -112,7 +112,7 @@ export function optionalAuth(req: Request, res: Response, next: NextFunction): v
  * @param {...string} roles - Required roles (user must have at least one)
  */
 export function requireRole(...roles: string[]) {
-  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void | Response> => {
     // First check authentication
     if (!req.session || !req.session.userId) {
       authEventsTotal.inc({ event: 'unauthorized', success: 'false' });
@@ -164,7 +164,7 @@ export function requireRole(...roles: string[]) {
  * @param {string} minimumRole - Minimum required role level
  */
 export function requireMinRole(minimumRole: string) {
-  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void | Response> => {
     if (!req.session || !req.session.userId) {
       authEventsTotal.inc({ event: 'unauthorized', success: 'false' });
       return res.status(401).json({ error: 'Authentication required' });
@@ -194,16 +194,16 @@ export function requireMinRole(minimumRole: string) {
  * Require admin role middleware.
  * Convenience wrapper for requireRole(Roles.ADMIN).
  */
-export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  return requireRole(Roles.ADMIN)(req, res, next);
+export function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void | Response> {
+  return requireRole(Roles.ADMIN)(req as AuthenticatedRequest, res, next);
 }
 
 /**
  * Require premium subscription middleware.
  * Allows premium users and admins.
  */
-export function requirePremium(req, res, next) {
-  return requireRole(Roles.PREMIUM, Roles.ADMIN)(req, res, next);
+export function requirePremium(req: Request, res: Response, next: NextFunction): Promise<void | Response> {
+  return requireRole(Roles.PREMIUM, Roles.ADMIN)(req as AuthenticatedRequest, res, next);
 }
 
 /**
@@ -214,7 +214,7 @@ export function requirePremium(req, res, next) {
  * @param {string} ownerId - Owner of the resource
  * @param {string} userRole - Role of the user
  */
-export function canAccessResource(userId, ownerId, userRole) {
+export function canAccessResource(userId: string, ownerId: string, userRole: string): boolean {
   // Admins can access anything
   if (userRole === Roles.ADMIN) return true;
   // Owner can access their own resources

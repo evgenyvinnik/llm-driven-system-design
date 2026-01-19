@@ -1,25 +1,28 @@
 import { Request, Response, NextFunction } from 'express';
 import { query } from '../utils/db.js';
 import { getSession, getSigningSession } from '../utils/redis.js';
-import '../types/express.js';
+import { AuthUser } from '../types/express.js';
 
 // Authenticate logged-in users
-export async function authenticate(req: Request, res: Response, next: NextFunction) {
+export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const token = req.cookies.token || req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-      return res.status(401).json({ error: 'Authentication required' });
+      res.status(401).json({ error: 'Authentication required' });
+      return;
     }
 
     const userId = await getSession(token);
     if (!userId) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
-    const result = await query('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
+    const result = await query<AuthUser>('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'User not found' });
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
     req.user = result.rows[0];
@@ -32,11 +35,12 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 }
 
 // Authenticate admin users
-export async function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
+export async function authenticateAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     await authenticate(req, res, () => {
-      if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Admin access required' });
+      if (!req.user || req.user.role !== 'admin') {
+        res.status(403).json({ error: 'Admin access required' });
+        return;
       }
       next();
     });
@@ -47,16 +51,17 @@ export async function authenticateAdmin(req: Request, res: Response, next: NextF
 }
 
 // Authenticate signing recipients via access token
-export async function authenticateSigner(req: Request, res: Response, next: NextFunction) {
+export async function authenticateSigner(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const accessToken = req.params.accessToken || req.query.accessToken || req.body.accessToken;
 
     if (!accessToken) {
-      return res.status(401).json({ error: 'Signing access token required' });
+      res.status(401).json({ error: 'Signing access token required' });
+      return;
     }
 
     // Check signing session in Redis first
-    let signingData = await getSigningSession(accessToken);
+    let signingData = await getSigningSession(accessToken as string);
 
     if (!signingData) {
       // Fall back to database lookup
@@ -69,7 +74,8 @@ export async function authenticateSigner(req: Request, res: Response, next: Next
       );
 
       if (result.rows.length === 0) {
-        return res.status(401).json({ error: 'Invalid signing link' });
+        res.status(401).json({ error: 'Invalid signing link' });
+        return;
       }
 
       signingData = result.rows[0];
@@ -77,23 +83,26 @@ export async function authenticateSigner(req: Request, res: Response, next: Next
 
     // Check envelope status
     if (!['sent', 'delivered'].includes(signingData.envelope_status)) {
-      return res.status(400).json({
+      res.status(400).json({
         error: 'This envelope is no longer available for signing',
         status: signingData.envelope_status
       });
+      return;
     }
 
     // Check recipient status
     if (signingData.status === 'completed') {
-      return res.status(400).json({ error: 'You have already signed this document' });
+      res.status(400).json({ error: 'You have already signed this document' });
+      return;
     }
 
     if (signingData.status === 'declined') {
-      return res.status(400).json({ error: 'This signing request was declined' });
+      res.status(400).json({ error: 'This signing request was declined' });
+      return;
     }
 
     req.signer = signingData;
-    req.accessToken = accessToken;
+    req.accessToken = accessToken as string;
     next();
   } catch (error) {
     console.error('Signer auth error:', error);
@@ -102,14 +111,14 @@ export async function authenticateSigner(req: Request, res: Response, next: Next
 }
 
 // Optional authentication - proceeds even if not authenticated
-export async function optionalAuth(req: Request, res: Response, next: NextFunction) {
+export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const token = req.cookies.token || req.headers.authorization?.replace('Bearer ', '');
 
     if (token) {
       const userId = await getSession(token);
       if (userId) {
-        const result = await query('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
+        const result = await query<AuthUser>('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
         if (result.rows.length > 0) {
           req.user = result.rows[0];
           req.token = token;

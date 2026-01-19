@@ -14,7 +14,8 @@
     "type-check": "tsc --noEmit",
     "db:backup": "pg_dump -h localhost -U figma figma_db > ./backups/backup_$(date +%Y%m%d_%H%M%S).sql",
     "db:restore": "psql -h localhost -U figma figma_db < ",
-    "cleanup": "tsx -e \"import { runAllCleanupTasks } from './src/shared/retention.js'; runAllCleanupTasks().then(() => process.exit(0));\""
+    "cleanup": "tsx -e \"import { runAllCleanupTasks } from './src/shared/retention.js'; runAllCleanupTasks().then(() => process.exit(0));\"",
+    "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -42,6 +43,7 @@
     "@typescript-eslint/eslint-plugin": "^8.3.0",
     "@typescript-eslint/parser": "^8.3.0",
     "eslint": "^9.9.1",
+    "prettier": "^3.4.2",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4"
   }

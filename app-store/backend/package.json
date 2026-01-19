@@ -17,7 +17,8 @@
     "migrate": "tsx src/scripts/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.11.0",
@@ -57,6 +58,7 @@
     "@typescript-eslint/parser": "^6.13.2",
     "eslint": "^8.55.0",
     "pino-pretty": "^13.0.0",
+    "prettier": "^3.4.2",
     "tsx": "^4.6.2",
     "typescript": "^5.3.3"
   },

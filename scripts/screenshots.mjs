@@ -393,7 +393,8 @@ async function setupDatabase(projectDir, projectName, config) {
   // Retry seeding a few times (in case database just became ready)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      execSync(`docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} < backend/db-seed/seed.sql`, {
+      // Use cat to pipe the seed file into psql (shell redirection doesn't work with docker exec)
+      execSync(`cat backend/db-seed/seed.sql | docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName}`, {
         cwd: projectDir,
         stdio: 'pipe',
       });

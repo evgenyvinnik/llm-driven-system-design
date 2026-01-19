@@ -78,7 +78,7 @@ router.post(
   '/location',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { lat, lng } = req.body as LocationBody;
 
@@ -94,7 +94,7 @@ router.post(
       console.error('Update location error:', error);
       res.status(500).json({ error: 'Failed to update location' });
     }
-  }
+  }) as never
 );
 
 // Go online
@@ -102,7 +102,7 @@ router.post(
   '/online',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { lat, lng } = req.body as LocationBody;
 
@@ -118,7 +118,7 @@ router.post(
       console.error('Go online error:', error);
       res.status(500).json({ error: 'Failed to go online' });
     }
-  }
+  }) as never
 );
 
 // Go offline
@@ -126,7 +126,7 @@ router.post(
   '/offline',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       await locationService.setDriverAvailability(req.user.id, false);
 
@@ -135,7 +135,7 @@ router.post(
       console.error('Go offline error:', error);
       res.status(500).json({ error: 'Failed to go offline' });
     }
-  }
+  }) as never
 );
 
 // Get driver status
@@ -143,7 +143,7 @@ router.get(
   '/status',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const status = await locationService.getDriverStatus(req.user.id);
       const location = await locationService.getDriverLocation(req.user.id);
@@ -177,7 +177,7 @@ router.get(
       console.error('Get status error:', error);
       res.status(500).json({ error: 'Failed to get status' });
     }
-  }
+  }) as never
 );
 
 // Accept a ride
@@ -185,7 +185,7 @@ router.post(
   '/rides/:rideId/accept',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { rideId } = req.params as unknown as RideParams;
 
@@ -201,7 +201,7 @@ router.post(
       console.error('Accept ride error:', error);
       res.status(500).json({ error: 'Failed to accept ride' });
     }
-  }
+  }) as never
 );
 
 // Decline a ride
@@ -209,7 +209,7 @@ router.post(
   '/rides/:rideId/decline',
   authenticate as never,
   requireDriver as never,
-  async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       // Just acknowledge - the matching service will try next driver
       res.json({ success: true });
@@ -217,7 +217,7 @@ router.post(
       console.error('Decline ride error:', error);
       res.status(500).json({ error: 'Failed to decline ride' });
     }
-  }
+  }) as never
 );
 
 // Notify arrival at pickup
@@ -225,7 +225,7 @@ router.post(
   '/rides/:rideId/arrived',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { rideId } = req.params as unknown as RideParams;
 
@@ -236,7 +236,7 @@ router.post(
       console.error('Arrive error:', error);
       res.status(500).json({ error: 'Failed to update arrival' });
     }
-  }
+  }) as never
 );
 
 // Start the ride
@@ -244,7 +244,7 @@ router.post(
   '/rides/:rideId/start',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { rideId } = req.params as unknown as RideParams;
 
@@ -255,7 +255,7 @@ router.post(
       console.error('Start ride error:', error);
       res.status(500).json({ error: 'Failed to start ride' });
     }
-  }
+  }) as never
 );
 
 // Complete the ride
@@ -263,7 +263,7 @@ router.post(
   '/rides/:rideId/complete',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const { rideId } = req.params as unknown as RideParams;
       const { finalDistanceMeters } = req.body as CompleteRideBody;
@@ -280,7 +280,7 @@ router.post(
       console.error('Complete ride error:', error);
       res.status(500).json({ error: 'Failed to complete ride' });
     }
-  }
+  }) as never
 );
 
 // Get earnings
@@ -288,9 +288,9 @@ router.get(
   '/earnings',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
-      const { period = 'today' } = req.query as EarningsQuery;
+      const { period = 'today' } = req.query as unknown as EarningsQuery;
 
       let dateFilter: Date;
       const now = new Date();
@@ -353,7 +353,7 @@ router.get(
       console.error('Get earnings error:', error);
       res.status(500).json({ error: 'Failed to get earnings' });
     }
-  }
+  }) as never
 );
 
 // Get driver profile
@@ -361,7 +361,7 @@ router.get(
   '/profile',
   authenticate as never,
   requireDriver as never,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const result = await query<DriverProfileRow>(
         `SELECT u.*, d.*
@@ -404,7 +404,7 @@ router.get(
       console.error('Get profile error:', error);
       res.status(500).json({ error: 'Failed to get profile' });
     }
-  }
+  }) as never
 );
 
 export default router;

@@ -32,6 +32,13 @@ interface HealthCheck {
   latencyMs?: number;
   error?: string;
   circuitBreakers?: ReturnType<typeof getStorageHealth>;
+  connectionStatus?: 'connected' | 'disconnected' | 'error';
+  queues?: {
+    notifications: { messages: number; consumers: number } | null;
+    email: { messages: number; consumers: number } | null;
+    workflow: { messages: number; consumers: number } | null;
+    deadLetter: { messages: number; consumers: number } | null;
+  };
 }
 
 interface HealthStatus {
@@ -39,7 +46,7 @@ interface HealthStatus {
   timestamp: string;
   version: string;
   uptime: number;
-  checks: Record<string, HealthCheck | ReturnType<typeof getQueueHealth>>;
+  checks: Record<string, HealthCheck>;
   circuitBreakers?: ReturnType<typeof getCircuitBreakerHealth>;
 }
 
@@ -151,9 +158,11 @@ app.get('/health', async (req: Request, res: Response) => {
   // Check RabbitMQ
   try {
     const queueHealth = await getQueueHealth();
+    const { status: queueStatus, ...queueDetails } = queueHealth;
     health.checks.rabbitmq = {
       status: isQueueHealthy() ? 'healthy' : 'unhealthy',
-      ...queueHealth,
+      connectionStatus: queueStatus,
+      ...queueDetails,
     };
     if (!isQueueHealthy()) {
       health.status = 'degraded';

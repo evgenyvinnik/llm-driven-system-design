@@ -7,7 +7,8 @@
     "build": "tsc && vite build",
     "lint": "eslint src --ext .ts,.tsx",
     "preview": "vite preview",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write src/**/*.{ts,tsx,css}"
   },
   "dependencies": {
     "pixi.js": "^8.15.0",
