@@ -188,7 +188,7 @@ export const dbConnectionPoolSize: Gauge<string> = new client.Gauge({
 // Export the registry for /metrics endpoint
 export { register };
 
-interface ExtendedRequest extends Request {
+interface ExtendedRequest extends Omit<Request, 'route'> {
   route?: { path?: string };
 }
 

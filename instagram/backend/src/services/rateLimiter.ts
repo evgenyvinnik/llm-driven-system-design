@@ -1,6 +1,7 @@
 import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import type { Request, Response, NextFunction } from 'express';
+import type { Session, SessionData } from 'express-session';
 import redis from './redis.js';
 import logger from './logger.js';
 import { rateLimitHits, followsRateLimited } from './metrics.js';
@@ -18,13 +19,13 @@ import { rateLimitHits, followsRateLimited } from './metrics.js';
  * - API abuse and scraping
  */
 
-interface ExtendedRequest extends Request {
-  session?: {
+interface ExtendedRequest extends Omit<Request, 'session'> {
+  session: Session & Partial<SessionData> & {
     userId?: string;
     username?: string;
     role?: string;
     isVerified?: boolean;
-  } & Request['session'];
+  };
 }
 
 interface RateLimiterOptions {

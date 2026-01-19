@@ -1,7 +1,38 @@
-import { RateLimiterRedis, RateLimiterMemory } from 'rate-limiter-flexible';
+import { RateLimiterRedis, RateLimiterMemory, RateLimiterRes } from 'rate-limiter-flexible';
+import { Request, Response, NextFunction } from 'express';
 import redis from '../utils/redis.js';
 import logger, { logEvent } from './logger.js';
 import { rateLimitHitsTotal } from './metrics.js';
+import { Logger } from 'pino';
+
+// ============ Type Definitions ============
+
+interface RateLimitConfig {
+  points: number;
+  duration: number;
+  blockDuration: number;
+}
+
+interface RateLimitStatus {
+  remainingPoints: number;
+  consumedPoints: number;
+  isBlocked: boolean;
+  msBeforeNext?: number;
+}
+
+interface AuthenticatedRequest extends Request {
+  user?: {
+    id: string;
+    username: string;
+    role?: string;
+  };
+  log?: Logger;
+  connection?: {
+    remoteAddress?: string;
+  };
+}
+
+type RateLimiter = RateLimiterRedis | RateLimiterMemory;
 
 /**
  * Rate Limiting Module
@@ -14,32 +45,32 @@ import { rateLimitHitsTotal } from './metrics.js';
  */
 
 // Rate limit configurations per endpoint category
-const RATE_LIMITS = {
+const RATE_LIMITS: Record<string, RateLimitConfig> = {
   // Authentication - strict to prevent brute force
   auth: {
-    points: 10,      // 10 requests
-    duration: 60,    // per 60 seconds
+    points: 10, // 10 requests
+    duration: 60, // per 60 seconds
     blockDuration: 300, // Block for 5 minutes after exceeding
   },
 
   // Upload endpoints - protect transcoding resources
   upload: {
-    points: 5,       // 5 uploads
-    duration: 60,    // per minute
+    points: 5, // 5 uploads
+    duration: 60, // per minute
     blockDuration: 120,
   },
 
   // Write operations (comments, reactions)
   write: {
-    points: 20,      // 20 writes
-    duration: 60,    // per minute
+    points: 20, // 20 writes
+    duration: 60, // per minute
     blockDuration: 60,
   },
 
   // Read operations - more permissive
   read: {
-    points: 100,     // 100 reads
-    duration: 60,    // per minute
+    points: 100, // 100 reads
+    duration: 60, // per minute
     blockDuration: 30,
   },
 
@@ -52,13 +83,13 @@ const RATE_LIMITS = {
 };
 
 // Create rate limiters (using memory as fallback if Redis unavailable)
-const rateLimiters = new Map();
+const rateLimiters = new Map<string, RateLimiter>();
 
 /**
  * Initialize a rate limiter for a category
  * Uses Redis if available, falls back to memory
  */
-function createRateLimiter(category) {
+function createRateLimiter(category: string): RateLimiter {
   const config = RATE_LIMITS[category] || RATE_LIMITS.default;
 
   try {
@@ -71,11 +102,14 @@ function createRateLimiter(category) {
       blockDuration: config.blockDuration,
     });
   } catch (error) {
-    logger.warn({
-      event: 'rate_limiter_fallback',
-      category,
-      error: error.message,
-    }, 'Falling back to memory-based rate limiter');
+    logger.warn(
+      {
+        event: 'rate_limiter_fallback',
+        category,
+        error: (error as Error).message,
+      },
+      'Falling back to memory-based rate limiter'
+    );
 
     // Fallback to memory-based limiter
     return new RateLimiterMemory({
@@ -90,18 +124,18 @@ function createRateLimiter(category) {
 /**
  * Get or create a rate limiter for a category
  */
-function getRateLimiter(category) {
+function getRateLimiter(category: string): RateLimiter {
   if (!rateLimiters.has(category)) {
     rateLimiters.set(category, createRateLimiter(category));
   }
-  return rateLimiters.get(category);
+  return rateLimiters.get(category)!;
 }
 
 /**
  * Get rate limit key from request
  * Uses user ID if authenticated, otherwise IP
  */
-function getRateLimitKey(req) {
+function getRateLimitKey(req: AuthenticatedRequest): string {
   if (req.user?.id) {
     return `user:${req.user.id}`;
   }
@@ -111,7 +145,7 @@ function getRateLimitKey(req) {
 /**
  * Classify endpoint into rate limit category
  */
-function classifyEndpoint(method, path) {
+function classifyEndpoint(method: string, path: string): string {
   // Auth endpoints
   if (path.startsWith('/api/v1/auth')) {
     return 'auth';
@@ -141,47 +175,50 @@ function classifyEndpoint(method, path) {
 /**
  * Rate limiting middleware factory
  *
- * @param {string | null} category - Optional category override
- * @returns {Function} Express middleware
+ * @param category - Optional category override
+ * @returns Express middleware
  */
-export function rateLimit(category: string | null = null) {
-  return async (req, res, next) => {
+export function rateLimit(
+  category: string | null = null
+): (req: Request, res: Response, next: NextFunction) => Promise<void> {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const authReq = req as AuthenticatedRequest;
     const limitCategory = category || classifyEndpoint(req.method, req.path);
     const limiter = getRateLimiter(limitCategory);
-    const key = getRateLimitKey(req);
+    const key = getRateLimitKey(authReq);
 
     try {
       const result = await limiter.consume(key);
 
       // Add rate limit headers
       res.set({
-        'X-RateLimit-Limit': RATE_LIMITS[limitCategory]?.points || RATE_LIMITS.default.points,
-        'X-RateLimit-Remaining': result.remainingPoints,
+        'X-RateLimit-Limit': String(RATE_LIMITS[limitCategory]?.points || RATE_LIMITS.default.points),
+        'X-RateLimit-Remaining': String(result.remainingPoints),
         'X-RateLimit-Reset': new Date(Date.now() + result.msBeforeNext).toISOString(),
       });
 
       next();
     } catch (rejRes) {
       // Rate limit exceeded
-      const retryAfter = Math.ceil(rejRes.msBeforeNext / 1000);
+      const rejection = rejRes as RateLimiterRes;
+      const retryAfter = Math.ceil(rejection.msBeforeNext / 1000);
 
-      logEvent.rateLimitExceeded(req.log || logger, {
+      logEvent.rateLimitExceeded(authReq.log || logger, {
         endpoint: req.path,
         ip: req.ip,
-        userId: req.user?.id,
-        category: limitCategory,
+        userId: authReq.user?.id,
       });
 
       rateLimitHitsTotal.inc({
         endpoint: normalizeEndpoint(req.path),
-        type: req.user?.id ? 'user' : 'ip',
+        type: authReq.user?.id ? 'user' : 'ip',
       });
 
       res.set({
-        'Retry-After': retryAfter,
-        'X-RateLimit-Limit': RATE_LIMITS[limitCategory]?.points || RATE_LIMITS.default.points,
-        'X-RateLimit-Remaining': 0,
-        'X-RateLimit-Reset': new Date(Date.now() + rejRes.msBeforeNext).toISOString(),
+        'Retry-After': String(retryAfter),
+        'X-RateLimit-Limit': String(RATE_LIMITS[limitCategory]?.points || RATE_LIMITS.default.points),
+        'X-RateLimit-Remaining': '0',
+        'X-RateLimit-Reset': new Date(Date.now() + rejection.msBeforeNext).toISOString(),
       });
 
       res.status(429).json({
@@ -196,7 +233,7 @@ export function rateLimit(category: string | null = null) {
 /**
  * Normalize endpoint path for metrics
  */
-function normalizeEndpoint(path) {
+function normalizeEndpoint(path: string): string {
   return path
     .replace(/\/[a-f0-9-]{36}/gi, '/:id')
     .replace(/\/\d+/g, '/:id')
@@ -206,10 +243,12 @@ function normalizeEndpoint(path) {
 /**
  * Create a stricter rate limiter for specific operations
  *
- * @param {object} config - Rate limit configuration
- * @returns {Function} Express middleware
+ * @param config - Rate limit configuration
+ * @returns Express middleware
  */
-export function strictRateLimit(config) {
+export function strictRateLimit(
+  config: Partial<RateLimitConfig>
+): (req: Request, res: Response, next: NextFunction) => Promise<void> {
   const limiter = new RateLimiterRedis({
     storeClient: redis,
     keyPrefix: 'ratelimit:strict',
@@ -218,14 +257,16 @@ export function strictRateLimit(config) {
     blockDuration: config.blockDuration || 600,
   });
 
-  return async (req, res, next) => {
-    const key = getRateLimitKey(req);
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const authReq = req as AuthenticatedRequest;
+    const key = getRateLimitKey(authReq);
 
     try {
       await limiter.consume(key);
       next();
     } catch (rejRes) {
-      const retryAfter = Math.ceil(rejRes.msBeforeNext / 1000);
+      const rejection = rejRes as RateLimiterRes;
+      const retryAfter = Math.ceil(rejection.msBeforeNext / 1000);
 
       res.status(429).json({
         error: 'Too many requests',
@@ -239,7 +280,10 @@ export function strictRateLimit(config) {
 /**
  * Get rate limit status for a key
  */
-export async function getRateLimitStatus(category, key) {
+export async function getRateLimitStatus(
+  category: string,
+  key: string
+): Promise<RateLimitStatus | null> {
   const limiter = getRateLimiter(category);
   try {
     const result = await limiter.get(key);
@@ -257,7 +301,7 @@ export async function getRateLimitStatus(category, key) {
       msBeforeNext: result.msBeforeNext,
     };
   } catch (error) {
-    logger.error({ error: error.message }, 'Failed to get rate limit status');
+    logger.error({ error: (error as Error).message }, 'Failed to get rate limit status');
     return null;
   }
 }

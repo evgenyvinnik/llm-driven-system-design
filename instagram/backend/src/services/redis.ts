@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
 import config from '../config/index.js';
 
-const redis = new Redis({
+const redis = new Redis.default({
   host: config.redis.host,
   port: config.redis.port,
   retryStrategy: (times: number): number => Math.min(times * 100, 3000),

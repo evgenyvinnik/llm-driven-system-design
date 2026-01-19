@@ -1,4 +1,76 @@
-const config = {
+// ============ Type Definitions ============
+
+interface PostgresConfig {
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  password: string;
+}
+
+interface RedisConfig {
+  host: string;
+  port: number;
+}
+
+interface MinioBuckets {
+  raw: string;
+  processed: string;
+  thumbnails: string;
+}
+
+interface MinioConfig {
+  endpoint: string;
+  accessKey: string;
+  secretKey: string;
+  buckets: MinioBuckets;
+}
+
+interface RabbitMQQueues {
+  transcode: string;
+}
+
+interface RabbitMQConfig {
+  url: string;
+  queues: RabbitMQQueues;
+}
+
+interface CorsConfig {
+  origin: string;
+  credentials: boolean;
+}
+
+interface SessionConfig {
+  secret: string;
+  maxAge: number;
+}
+
+interface UploadConfig {
+  maxFileSize: number;
+  chunkSize: number;
+  allowedMimeTypes: string[];
+}
+
+interface TranscodingConfig {
+  resolutions: string[];
+  simulatedDuration: number;
+}
+
+interface Config {
+  port: string | number;
+  postgres: PostgresConfig;
+  redis: RedisConfig;
+  minio: MinioConfig;
+  rabbitmq: RabbitMQConfig;
+  cors: CorsConfig;
+  session: SessionConfig;
+  upload: UploadConfig;
+  transcoding: TranscodingConfig;
+}
+
+// ============ Configuration ============
+
+const config: Config = {
   port: process.env.PORT || 3000,
 
   postgres: {

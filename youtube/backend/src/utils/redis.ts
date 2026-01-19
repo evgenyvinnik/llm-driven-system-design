@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import type { Redis as RedisType } from 'ioredis';
 import config from '../config/index.js';
 
 // ============ Type Definitions ============
@@ -15,7 +16,10 @@ export interface SessionData {
 
 // ============ Redis Client Setup ============
 
-const redis = new Redis({
+// Handle ESM/CJS interop for ioredis
+const RedisClient = (Redis as unknown as { default: typeof Redis }).default || Redis;
+
+const redis: RedisType = new RedisClient({
   host: config.redis.host,
   port: config.redis.port,
   retryStrategy: (times: number): number => {

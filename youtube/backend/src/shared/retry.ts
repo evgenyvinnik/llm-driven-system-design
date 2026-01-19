@@ -1,5 +1,23 @@
 import logger from './logger.js';
 
+// ============ Type Definitions ============
+
+interface RetryOptions {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  exponentialBase?: number;
+  jitterFactor?: number;
+  retryableErrors?: string[] | ((error: RetryableError) => boolean) | null;
+}
+
+interface RetryableError extends Error {
+  code?: string;
+  statusCode?: number;
+}
+
+type AsyncFunction<T> = () => Promise<T>;
+
 /**
  * Retry Utility with Exponential Backoff
  *
@@ -13,19 +31,21 @@ import logger from './logger.js';
 /**
  * Default retry configuration
  */
-const DEFAULT_OPTIONS = {
+const DEFAULT_OPTIONS: Required<Omit<RetryOptions, 'retryableErrors'>> & {
+  retryableErrors: null;
+} = {
   maxRetries: 3,
-  baseDelayMs: 1000,     // 1 second initial delay
-  maxDelayMs: 30000,     // 30 seconds max delay
-  exponentialBase: 2,    // Double delay each retry
-  jitterFactor: 0.2,     // 20% jitter
+  baseDelayMs: 1000, // 1 second initial delay
+  maxDelayMs: 30000, // 30 seconds max delay
+  exponentialBase: 2, // Double delay each retry
+  jitterFactor: 0.2, // 20% jitter
   retryableErrors: null, // Retry all errors by default
 };
 
 /**
  * Preset configurations for common operations
  */
-export const RETRY_PRESETS = {
+export const RETRY_PRESETS: Record<string, RetryOptions> = {
   // Fast retry for cache operations
   cache: {
     maxRetries: 2,
@@ -65,11 +85,14 @@ export const RETRY_PRESETS = {
 /**
  * Calculate delay for a retry attempt
  *
- * @param {number} attempt - Current attempt number (0-indexed)
- * @param {object} options - Retry options
- * @returns {number} Delay in milliseconds
+ * @param attempt - Current attempt number (0-indexed)
+ * @param options - Retry options
+ * @returns Delay in milliseconds
  */
-function calculateDelay(attempt, options) {
+function calculateDelay(
+  attempt: number,
+  options: Required<Omit<RetryOptions, 'retryableErrors'>>
+): number {
   const { baseDelayMs, maxDelayMs, exponentialBase, jitterFactor } = options;
 
   // Calculate exponential delay
@@ -87,21 +110,24 @@ function calculateDelay(attempt, options) {
 /**
  * Sleep for specified milliseconds
  *
- * @param {number} ms - Milliseconds to sleep
- * @returns {Promise<void>}
+ * @param ms - Milliseconds to sleep
+ * @returns Promise that resolves after delay
  */
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
  * Check if an error is retryable
  *
- * @param {Error} error - The error to check
- * @param {Array|Function|null} retryableErrors - Error check configuration
- * @returns {boolean} Whether the error is retryable
+ * @param error - The error to check
+ * @param retryableErrors - Error check configuration
+ * @returns Whether the error is retryable
  */
-function isRetryable(error, retryableErrors) {
+function isRetryable(
+  error: RetryableError,
+  retryableErrors: string[] | ((error: RetryableError) => boolean) | null
+): boolean {
   // If no filter specified, retry all errors
   if (retryableErrors === null) {
     return true;
@@ -114,8 +140,7 @@ function isRetryable(error, retryableErrors) {
 
   // If it's an array of error codes
   if (Array.isArray(retryableErrors)) {
-    return retryableErrors.includes(error.code) ||
-           retryableErrors.includes(error.name);
+    return retryableErrors.includes(error.code || '') || retryableErrors.includes(error.name);
   }
 
   return true;
@@ -124,10 +149,10 @@ function isRetryable(error, retryableErrors) {
 /**
  * Execute a function with retry logic
  *
- * @param {Function} fn - Async function to execute
- * @param {object} options - Retry configuration
- * @returns {Promise<any>} Result of the function
- * @throws {Error} Last error if all retries fail
+ * @param fn - Async function to execute
+ * @param options - Retry configuration
+ * @returns Result of the function
+ * @throws Last error if all retries fail
  *
  * @example
  * const result = await retry(
@@ -135,20 +160,20 @@ function isRetryable(error, retryableErrors) {
  *   { maxRetries: 3, baseDelayMs: 1000 }
  * );
  */
-export async function retry(fn, options = {}) {
+export async function retry<T>(fn: AsyncFunction<T>, options: RetryOptions = {}): Promise<T> {
   const config = { ...DEFAULT_OPTIONS, ...options };
   const { maxRetries, retryableErrors } = config;
 
-  let lastError;
+  let lastError: RetryableError = new Error('No attempts made');
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
-      lastError = error;
+      lastError = error as RetryableError;
 
       // Check if we should retry this error
-      if (!isRetryable(error, retryableErrors)) {
+      if (!isRetryable(lastError, retryableErrors)) {
         throw error;
       }
 
@@ -160,26 +185,32 @@ export async function retry(fn, options = {}) {
       // Calculate delay and wait
       const delay = calculateDelay(attempt, config);
 
-      logger.warn({
-        event: 'retry_attempt',
-        attempt: attempt + 1,
-        maxRetries,
-        delayMs: delay,
-        error: error.message,
-        errorCode: error.code,
-      }, `Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`);
+      logger.warn(
+        {
+          event: 'retry_attempt',
+          attempt: attempt + 1,
+          maxRetries,
+          delayMs: delay,
+          error: lastError.message,
+          errorCode: lastError.code,
+        },
+        `Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`
+      );
 
       await sleep(delay);
     }
   }
 
   // All retries exhausted
-  logger.error({
-    event: 'retry_exhausted',
-    attempts: maxRetries + 1,
-    error: lastError.message,
-    errorCode: lastError.code,
-  }, `All ${maxRetries + 1} attempts failed`);
+  logger.error(
+    {
+      event: 'retry_exhausted',
+      attempts: maxRetries + 1,
+      error: lastError.message,
+      errorCode: lastError.code,
+    },
+    `All ${maxRetries + 1} attempts failed`
+  );
 
   throw lastError;
 }
@@ -187,16 +218,19 @@ export async function retry(fn, options = {}) {
 /**
  * Create a retry wrapper for a function
  *
- * @param {Function} fn - Function to wrap
- * @param {object} options - Retry configuration
- * @returns {Function} Wrapped function with retry
+ * @param fn - Function to wrap
+ * @param options - Retry configuration
+ * @returns Wrapped function with retry
  *
  * @example
  * const fetchWithRetry = withRetry(fetchData, { maxRetries: 3 });
  * const result = await fetchWithRetry(arg1, arg2);
  */
-export function withRetry(fn, options = {}) {
-  return async (...args) => {
+export function withRetry<T, Args extends unknown[]>(
+  fn: (...args: Args) => Promise<T>,
+  options: RetryOptions = {}
+): (...args: Args) => Promise<T> {
+  return async (...args: Args): Promise<T> => {
     return retry(() => fn(...args), options);
   };
 }
@@ -204,12 +238,16 @@ export function withRetry(fn, options = {}) {
 /**
  * Create a retry wrapper using a preset
  *
- * @param {Function} fn - Function to wrap
- * @param {string} preset - Preset name from RETRY_PRESETS
- * @param {object} overrides - Optional overrides for the preset
- * @returns {Function} Wrapped function
+ * @param fn - Function to wrap
+ * @param preset - Preset name from RETRY_PRESETS
+ * @param overrides - Optional overrides for the preset
+ * @returns Wrapped function
  */
-export function withRetryPreset(fn, preset, overrides = {}) {
+export function withRetryPreset<T, Args extends unknown[]>(
+  fn: (...args: Args) => Promise<T>,
+  preset: string,
+  overrides: RetryOptions = {}
+): (...args: Args) => Promise<T> {
   const presetConfig = RETRY_PRESETS[preset] || {};
   return withRetry(fn, { ...presetConfig, ...overrides });
 }
@@ -217,29 +255,36 @@ export function withRetryPreset(fn, preset, overrides = {}) {
 /**
  * Retry with fallback value on failure
  *
- * @param {Function} fn - Async function to execute
- * @param {any} fallback - Fallback value if all retries fail
- * @param {object} options - Retry configuration
- * @returns {Promise<any>} Result or fallback
+ * @param fn - Async function to execute
+ * @param fallback - Fallback value if all retries fail
+ * @param options - Retry configuration
+ * @returns Result or fallback
  */
-export async function retryWithFallback(fn, fallback, options = {}) {
+export async function retryWithFallback<T>(
+  fn: AsyncFunction<T>,
+  fallback: T | (() => T),
+  options: RetryOptions = {}
+): Promise<T> {
   try {
     return await retry(fn, options);
   } catch (error) {
-    logger.warn({
-      event: 'retry_fallback',
-      error: error.message,
-      fallbackUsed: true,
-    }, 'Using fallback after retry failure');
+    logger.warn(
+      {
+        event: 'retry_fallback',
+        error: (error as Error).message,
+        fallbackUsed: true,
+      },
+      'Using fallback after retry failure'
+    );
 
-    return typeof fallback === 'function' ? fallback() : fallback;
+    return typeof fallback === 'function' ? (fallback as () => T)() : fallback;
   }
 }
 
 /**
  * Common retryable error codes
  */
-export const RETRYABLE_ERROR_CODES = [
+export const RETRYABLE_ERROR_CODES: string[] = [
   // Network errors
   'ECONNRESET',
   'ETIMEDOUT',
@@ -264,17 +309,17 @@ export const RETRYABLE_ERROR_CODES = [
 /**
  * Create a retryable error checker for common transient errors
  *
- * @returns {Function} Error checker function
+ * @returns Error checker function
  */
-export function createRetryableErrorChecker() {
-  return (error) => {
+export function createRetryableErrorChecker(): (error: RetryableError) => boolean {
+  return (error: RetryableError): boolean => {
     // Check error code
-    if (RETRYABLE_ERROR_CODES.includes(error.code)) {
+    if (error.code && RETRYABLE_ERROR_CODES.includes(error.code)) {
       return true;
     }
 
     // Check HTTP status codes (5xx are usually retryable)
-    if (error.statusCode >= 500 && error.statusCode < 600) {
+    if (error.statusCode && error.statusCode >= 500 && error.statusCode < 600) {
       return true;
     }
 

@@ -312,6 +312,42 @@ async function startDockerCompose(projectDir, projectName) {
 }
 
 /**
+ * Wait for Redis to be ready (if redis service exists)
+ */
+async function waitForRedis(projectDir) {
+  // Check if redis service exists in docker-compose
+  try {
+    const result = execSync('docker-compose config --services', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+      stdio: 'pipe',
+    });
+    if (!result.includes('redis')) {
+      return true; // No Redis service, skip
+    }
+  } catch {
+    return true; // Can't check services, assume no Redis
+  }
+
+  logStep('REDIS', 'Waiting for Redis to be ready...');
+  for (let i = 0; i < 15; i++) {
+    try {
+      execSync('docker-compose exec -T redis redis-cli ping', {
+        cwd: projectDir,
+        stdio: 'pipe',
+      });
+      logSuccess('Redis ready');
+      return true;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+
+  logWarning('Redis not ready after 15 seconds');
+  return false;
+}
+
+/**
  * Setup database (run seed.sql if it exists)
  * Note: init.sql is automatically run by PostgreSQL on first startup via docker-entrypoint-initdb.d
  */
@@ -740,6 +776,11 @@ async function processProject(config) {
 
     // Step 3: Start docker-compose services
     dockerStarted = await startDockerCompose(projectDir, config.name);
+
+    // Step 3.5: Wait for Redis to be ready (if applicable)
+    if (config.backendRequired) {
+      await waitForRedis(projectDir);
+    }
 
     // Step 4: Setup database (seed.sql)
     const dbSetup = await setupDatabase(projectDir, config.name, config);

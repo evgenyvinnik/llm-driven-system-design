@@ -8,6 +8,7 @@
  * - Graceful degradation
  */
 
+import { GetObjectCommandOutput } from '@aws-sdk/client-s3';
 import {
   uploadObject as baseUploadObject,
   getObject as baseGetObject,
@@ -22,30 +23,50 @@ import {
   getPublicUrl,
 } from '../utils/storage.js';
 
-import { withCircuitBreaker, createCircuitBreaker } from '../shared/circuitBreaker.js';
-import { withRetryPreset, createRetryableErrorChecker } from '../shared/retry.js';
+import { withCircuitBreaker } from '../shared/circuitBreaker.js';
+import { createRetryableErrorChecker } from '../shared/retry.js';
 import { storageOperationsTotal, storageOperationDuration } from '../shared/metrics.js';
 import logger from '../shared/logger.js';
 
+// ============ Type Definitions ============
+
+interface CircuitBreakerOptions {
+  timeout: number;
+  errorThresholdPercentage: number;
+  resetTimeout: number;
+  volumeThreshold: number;
+}
+
+interface StorageError extends Error {
+  name: string;
+  Code?: string;
+}
+
+type StorageOperationFunction<T> = (...args: unknown[]) => Promise<T>;
+
 // Circuit breaker configuration for storage
-const STORAGE_CIRCUIT_OPTIONS = {
-  timeout: 30000,           // 30s timeout for storage operations
+const STORAGE_CIRCUIT_OPTIONS: CircuitBreakerOptions = {
+  timeout: 30000, // 30s timeout for storage operations
   errorThresholdPercentage: 50,
-  resetTimeout: 30000,      // 30s before retrying
+  resetTimeout: 30000, // 30s before retrying
   volumeThreshold: 5,
 };
 
 // Create retryable error checker
-const isRetryableStorageError = createRetryableErrorChecker();
+const _isRetryableStorageError = createRetryableErrorChecker();
 
 /**
  * Wrap a storage operation with metrics, retry, and circuit breaker
  */
-function wrapStorageOperation(name, operation, retryPreset = 'storage') {
+function wrapStorageOperation<T>(
+  name: string,
+  operation: StorageOperationFunction<T>,
+  _retryPreset: string = 'storage'
+): StorageOperationFunction<T> {
   // First wrap with retry
-  const withRetry = async (...args) => {
+  const withRetry = async (...args: unknown[]): Promise<T> => {
     const start = Date.now();
-    const bucket = args[0];
+    const bucket = args[0] as string;
 
     try {
       const result = await operation(...args);
@@ -57,10 +78,7 @@ function wrapStorageOperation(name, operation, retryPreset = 'storage') {
         status: 'success',
       });
 
-      storageOperationDuration.observe(
-        { operation: name, bucket },
-        (Date.now() - start) / 1000
-      );
+      storageOperationDuration.observe({ operation: name, bucket }, (Date.now() - start) / 1000);
 
       return result;
     } catch (error) {
@@ -71,10 +89,7 @@ function wrapStorageOperation(name, operation, retryPreset = 'storage') {
         status: 'failure',
       });
 
-      storageOperationDuration.observe(
-        { operation: name, bucket },
-        (Date.now() - start) / 1000
-      );
+      storageOperationDuration.observe({ operation: name, bucket }, (Date.now() - start) / 1000);
 
       throw error;
     }
@@ -92,33 +107,39 @@ function wrapStorageOperation(name, operation, retryPreset = 'storage') {
 /**
  * Resilient upload object
  */
-export const uploadObject = async (bucket, key, body, contentType) => {
+export const uploadObject = async (
+  bucket: string,
+  key: string,
+  body: Buffer | string,
+  contentType: string
+): Promise<string> => {
   const start = Date.now();
 
   try {
-    const result = await wrapStorageOperation('put', baseUploadObject)(
-      bucket,
-      key,
-      body,
-      contentType
+    const result = await wrapStorageOperation('put', baseUploadObject)(bucket, key, body, contentType);
+
+    logger.debug(
+      {
+        event: 'storage_upload_success',
+        bucket,
+        key,
+        durationMs: Date.now() - start,
+      },
+      `Uploaded object to ${bucket}/${key}`
     );
 
-    logger.debug({
-      event: 'storage_upload_success',
-      bucket,
-      key,
-      durationMs: Date.now() - start,
-    }, `Uploaded object to ${bucket}/${key}`);
-
-    return result;
+    return result as string;
   } catch (error) {
-    logger.error({
-      event: 'storage_upload_failure',
-      bucket,
-      key,
-      error: error.message,
-      durationMs: Date.now() - start,
-    }, `Failed to upload object to ${bucket}/${key}`);
+    logger.error(
+      {
+        event: 'storage_upload_failure',
+        bucket,
+        key,
+        error: (error as Error).message,
+        durationMs: Date.now() - start,
+      },
+      `Failed to upload object to ${bucket}/${key}`
+    );
 
     throw error;
   }
@@ -127,28 +148,34 @@ export const uploadObject = async (bucket, key, body, contentType) => {
 /**
  * Resilient get object
  */
-export const getObject = async (bucket, key) => {
+export const getObject = async (bucket: string, key: string): Promise<GetObjectCommandOutput> => {
   const start = Date.now();
 
   try {
     const result = await wrapStorageOperation('get', baseGetObject)(bucket, key);
 
-    logger.debug({
-      event: 'storage_get_success',
-      bucket,
-      key,
-      durationMs: Date.now() - start,
-    }, `Retrieved object from ${bucket}/${key}`);
+    logger.debug(
+      {
+        event: 'storage_get_success',
+        bucket,
+        key,
+        durationMs: Date.now() - start,
+      },
+      `Retrieved object from ${bucket}/${key}`
+    );
 
-    return result;
+    return result as GetObjectCommandOutput;
   } catch (error) {
-    logger.error({
-      event: 'storage_get_failure',
-      bucket,
-      key,
-      error: error.message,
-      durationMs: Date.now() - start,
-    }, `Failed to retrieve object from ${bucket}/${key}`);
+    logger.error(
+      {
+        event: 'storage_get_failure',
+        bucket,
+        key,
+        error: (error as Error).message,
+        durationMs: Date.now() - start,
+      },
+      `Failed to retrieve object from ${bucket}/${key}`
+    );
 
     throw error;
   }
@@ -157,26 +184,32 @@ export const getObject = async (bucket, key) => {
 /**
  * Resilient delete object
  */
-export const deleteObject = async (bucket, key) => {
+export const deleteObject = async (bucket: string, key: string): Promise<void> => {
   const start = Date.now();
 
   try {
     await wrapStorageOperation('delete', baseDeleteObject)(bucket, key);
 
-    logger.debug({
-      event: 'storage_delete_success',
-      bucket,
-      key,
-      durationMs: Date.now() - start,
-    }, `Deleted object from ${bucket}/${key}`);
+    logger.debug(
+      {
+        event: 'storage_delete_success',
+        bucket,
+        key,
+        durationMs: Date.now() - start,
+      },
+      `Deleted object from ${bucket}/${key}`
+    );
   } catch (error) {
-    logger.error({
-      event: 'storage_delete_failure',
-      bucket,
-      key,
-      error: error.message,
-      durationMs: Date.now() - start,
-    }, `Failed to delete object from ${bucket}/${key}`);
+    logger.error(
+      {
+        event: 'storage_delete_failure',
+        bucket,
+        key,
+        error: (error as Error).message,
+        durationMs: Date.now() - start,
+      },
+      `Failed to delete object from ${bucket}/${key}`
+    );
 
     throw error;
   }
@@ -185,12 +218,13 @@ export const deleteObject = async (bucket, key) => {
 /**
  * Resilient object exists check
  */
-export const objectExists = async (bucket, key) => {
+export const objectExists = async (bucket: string, key: string): Promise<boolean> => {
   try {
-    return await wrapStorageOperation('head', baseObjectExists)(bucket, key);
+    return (await wrapStorageOperation('head', baseObjectExists)(bucket, key)) as boolean;
   } catch (error) {
+    const storageError = error as StorageError;
     // NotFound is expected, don't log as error
-    if (error.name === 'NotFound' || error.Code === 'NotFound') {
+    if (storageError.name === 'NotFound' || storageError.Code === 'NotFound') {
       return false;
     }
     throw error;
@@ -200,15 +234,25 @@ export const objectExists = async (bucket, key) => {
 /**
  * Resilient multipart upload operations
  */
-export const createMultipartUpload = async (bucket, key, contentType) => {
+export const createMultipartUpload = async (
+  bucket: string,
+  key: string,
+  contentType: string
+): Promise<string | undefined> => {
   return wrapStorageOperation('createMultipart', baseCreateMultipartUpload)(
     bucket,
     key,
     contentType
-  );
+  ) as Promise<string | undefined>;
 };
 
-export const uploadPart = async (bucket, key, uploadId, partNumber, body) => {
+export const uploadPart = async (
+  bucket: string,
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  body: Buffer
+): Promise<string | undefined> => {
   const start = Date.now();
 
   try {
@@ -220,80 +264,105 @@ export const uploadPart = async (bucket, key, uploadId, partNumber, body) => {
       body
     );
 
-    logger.debug({
-      event: 'storage_part_upload_success',
-      bucket,
-      key,
-      partNumber,
-      durationMs: Date.now() - start,
-    }, `Uploaded part ${partNumber} for ${bucket}/${key}`);
+    logger.debug(
+      {
+        event: 'storage_part_upload_success',
+        bucket,
+        key,
+        partNumber,
+        durationMs: Date.now() - start,
+      },
+      `Uploaded part ${partNumber} for ${bucket}/${key}`
+    );
 
-    return etag;
+    return etag as string | undefined;
   } catch (error) {
-    logger.error({
-      event: 'storage_part_upload_failure',
-      bucket,
-      key,
-      partNumber,
-      error: error.message,
-      durationMs: Date.now() - start,
-    }, `Failed to upload part ${partNumber} for ${bucket}/${key}`);
+    logger.error(
+      {
+        event: 'storage_part_upload_failure',
+        bucket,
+        key,
+        partNumber,
+        error: (error as Error).message,
+        durationMs: Date.now() - start,
+      },
+      `Failed to upload part ${partNumber} for ${bucket}/${key}`
+    );
 
     throw error;
   }
 };
 
-export const completeMultipartUpload = async (bucket, key, uploadId, parts) => {
+export const completeMultipartUpload = async (
+  bucket: string,
+  key: string,
+  uploadId: string,
+  parts: (string | undefined)[]
+): Promise<string> => {
   const start = Date.now();
 
   try {
-    const result = await wrapStorageOperation(
-      'completeMultipart',
-      baseCompleteMultipartUpload
-    )(bucket, key, uploadId, parts);
-
-    logger.info({
-      event: 'storage_multipart_complete',
+    const result = await wrapStorageOperation('completeMultipart', baseCompleteMultipartUpload)(
       bucket,
       key,
-      partCount: parts.length,
-      durationMs: Date.now() - start,
-    }, `Completed multipart upload for ${bucket}/${key}`);
+      uploadId,
+      parts
+    );
 
-    return result;
+    logger.info(
+      {
+        event: 'storage_multipart_complete',
+        bucket,
+        key,
+        partCount: parts.length,
+        durationMs: Date.now() - start,
+      },
+      `Completed multipart upload for ${bucket}/${key}`
+    );
+
+    return result as string;
   } catch (error) {
-    logger.error({
-      event: 'storage_multipart_complete_failure',
-      bucket,
-      key,
-      error: error.message,
-      durationMs: Date.now() - start,
-    }, `Failed to complete multipart upload for ${bucket}/${key}`);
+    logger.error(
+      {
+        event: 'storage_multipart_complete_failure',
+        bucket,
+        key,
+        error: (error as Error).message,
+        durationMs: Date.now() - start,
+      },
+      `Failed to complete multipart upload for ${bucket}/${key}`
+    );
 
     throw error;
   }
 };
 
-export const abortMultipartUpload = async (bucket, key, uploadId) => {
+export const abortMultipartUpload = async (
+  bucket: string,
+  key: string,
+  uploadId: string
+): Promise<void> => {
   try {
-    await wrapStorageOperation('abortMultipart', baseAbortMultipartUpload)(
-      bucket,
-      key,
-      uploadId
-    );
+    await wrapStorageOperation('abortMultipart', baseAbortMultipartUpload)(bucket, key, uploadId);
 
-    logger.info({
-      event: 'storage_multipart_aborted',
-      bucket,
-      key,
-    }, `Aborted multipart upload for ${bucket}/${key}`);
+    logger.info(
+      {
+        event: 'storage_multipart_aborted',
+        bucket,
+        key,
+      },
+      `Aborted multipart upload for ${bucket}/${key}`
+    );
   } catch (error) {
-    logger.warn({
-      event: 'storage_multipart_abort_failure',
-      bucket,
-      key,
-      error: error.message,
-    }, `Failed to abort multipart upload for ${bucket}/${key}`);
+    logger.warn(
+      {
+        event: 'storage_multipart_abort_failure',
+        bucket,
+        key,
+        error: (error as Error).message,
+      },
+      `Failed to abort multipart upload for ${bucket}/${key}`
+    );
 
     // Don't throw - abort failures are not critical
   }

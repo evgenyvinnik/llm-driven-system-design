@@ -1,18 +1,19 @@
 import pino, { Logger } from 'pino';
 import type { Request, Response } from 'express';
+import type { Session, SessionData } from 'express-session';
 import config from '../config/index.js';
 
 /**
  * Extended Express Request type with custom properties
  */
-export interface ExtendedRequest extends Request {
+export interface ExtendedRequest extends Omit<Request, 'session'> {
   traceId?: string;
-  session?: {
+  session: Session & Partial<SessionData> & {
     userId?: string;
     username?: string;
     role?: string;
     isVerified?: boolean;
-  } & Request['session'];
+  };
 }
 
 /**

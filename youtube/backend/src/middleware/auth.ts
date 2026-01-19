@@ -368,9 +368,9 @@ export const requireOwnership = (resourceType: string) => {
 /**
  * Create session for user
  */
-export const createSession = async (user) => {
+export const createSession = async (user: UserRow): Promise<string> => {
   const sessionId = uuidv4();
-  const sessionData = {
+  const sessionData: SessionData = {
     id: user.id,
     username: user.username,
     email: user.email,
@@ -387,7 +387,7 @@ export const createSession = async (user) => {
 /**
  * Destroy session
  */
-export const destroySession = async (sessionId) => {
+export const destroySession = async (sessionId: string): Promise<void> => {
   await sessionDelete(sessionId);
 };
 
@@ -396,12 +396,13 @@ export const destroySession = async (sessionId) => {
 /**
  * Login handler
  */
-export const login = async (req, res) => {
+export const login = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { username, password } = req.body;
 
     if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
+      res.status(400).json({ error: 'Username and password are required' });
+      return;
     }
 
     const result = await query(
@@ -410,10 +411,11 @@ export const login = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
-    const user = result.rows[0];
+    const user = result.rows[0] as UserRow;
 
     // Simple password verification (in production, use bcrypt.compare)
     // For demo, any password works for existing users
@@ -443,7 +445,7 @@ export const login = async (req, res) => {
       },
     });
   } catch (error) {
-    (req.log || logger).error({ error: error.message }, 'Login error');
+    (req.log || logger).error({ error: (error as Error).message }, 'Login error');
     res.status(500).json({ error: 'Login failed' });
   }
 };
@@ -451,12 +453,13 @@ export const login = async (req, res) => {
 /**
  * Register handler
  */
-export const register = async (req, res) => {
+export const register = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { username, email, password, channelName, role } = req.body;
 
     if (!username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+      res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
     }
 
     // Check if user exists
@@ -466,11 +469,12 @@ export const register = async (req, res) => {
     );
 
     if (existingUser.rows.length > 0) {
-      return res.status(409).json({ error: 'Username or email already exists' });
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
     }
 
     // Determine role - default to viewer, allow creator, block admin
-    let userRole = ROLES.VIEWER;
+    let userRole: string = ROLES.VIEWER;
     if (role === ROLES.CREATOR) {
       userRole = ROLES.CREATOR;
     }
@@ -484,7 +488,7 @@ export const register = async (req, res) => {
       [username, email, 'demo_hash', channelName || username, userRole]
     );
 
-    const user = result.rows[0];
+    const user = result.rows[0] as UserRow;
     const sessionId = await createSession(user);
 
     res.cookie('sessionId', sessionId, {
@@ -510,7 +514,7 @@ export const register = async (req, res) => {
       },
     });
   } catch (error) {
-    (req.log || logger).error({ error: error.message }, 'Register error');
+    (req.log || logger).error({ error: (error as Error).message }, 'Register error');
     res.status(500).json({ error: 'Registration failed' });
   }
 };
@@ -518,7 +522,7 @@ export const register = async (req, res) => {
 /**
  * Logout handler
  */
-export const logout = async (req, res) => {
+export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const sessionId = req.cookies?.sessionId;
 
@@ -529,7 +533,7 @@ export const logout = async (req, res) => {
     res.clearCookie('sessionId');
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    (req.log || logger).error({ error: error.message }, 'Logout error');
+    (req.log || logger).error({ error: (error as Error).message }, 'Logout error');
     res.status(500).json({ error: 'Logout failed' });
   }
 };
@@ -537,20 +541,21 @@ export const logout = async (req, res) => {
 /**
  * Get current user
  */
-export const getCurrentUser = async (req, res) => {
+export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<void> => {
   res.json({ user: req.user });
 };
 
 /**
  * Update user role (admin only)
  */
-export const updateUserRole = async (req, res) => {
+export const updateUserRole = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { userId } = req.params;
     const { role } = req.body;
 
     if (!Object.values(ROLES).includes(role)) {
-      return res.status(400).json({ error: 'Invalid role' });
+      res.status(400).json({ error: 'Invalid role' });
+      return;
     }
 
     const result = await query(
@@ -559,19 +564,20 @@ export const updateUserRole = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     (req.log || logger).info({
       event: 'user_role_updated',
       targetUserId: userId,
       newRole: role,
-      adminId: req.user.id,
+      adminId: req.user!.id,
     }, `User role updated to ${role}`);
 
     res.json({ user: result.rows[0] });
   } catch (error) {
-    (req.log || logger).error({ error: error.message }, 'Update role error');
+    (req.log || logger).error({ error: (error as Error).message }, 'Update role error');
     res.status(500).json({ error: 'Failed to update role' });
   }
 };
