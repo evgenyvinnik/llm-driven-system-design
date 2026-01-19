@@ -5,7 +5,12 @@ import bcrypt from 'bcryptjs';
 
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days in seconds
 
-export const createSession = async (userId) => {
+export interface Session {
+  userId: number;
+  expiresAt: string;
+}
+
+export const createSession = async (userId: number): Promise<{ sessionId: string; expiresAt: Date }> => {
   const sessionId = uuidv4();
   const expiresAt = new Date(Date.now() + SESSION_TTL * 1000);
 
@@ -25,15 +30,20 @@ export const createSession = async (userId) => {
   return { sessionId, expiresAt };
 };
 
-export const getSession = async (sessionId) => {
+interface SessionRow {
+  user_id: number;
+  expires_at: Date;
+}
+
+export const getSession = async (sessionId: string): Promise<Session | null> => {
   // Try Redis first
   const cached = await redisClient.get(`session:${sessionId}`);
   if (cached) {
-    return JSON.parse(cached);
+    return JSON.parse(cached) as Session;
   }
 
   // Fallback to PostgreSQL
-  const result = await query(
+  const result = await query<SessionRow>(
     'SELECT user_id, expires_at FROM sessions WHERE id = $1 AND expires_at > NOW()',
     [sessionId]
   );
@@ -42,9 +52,9 @@ export const getSession = async (sessionId) => {
     return null;
   }
 
-  const session = {
+  const session: Session = {
     userId: result.rows[0].user_id,
-    expiresAt: result.rows[0].expires_at,
+    expiresAt: result.rows[0].expires_at.toISOString(),
   };
 
   // Cache in Redis
@@ -57,15 +67,15 @@ export const getSession = async (sessionId) => {
   return session;
 };
 
-export const deleteSession = async (sessionId) => {
+export const deleteSession = async (sessionId: string): Promise<void> => {
   await redisClient.del(`session:${sessionId}`);
   await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
 };
 
-export const hashPassword = async (password) => {
+export const hashPassword = async (password: string): Promise<string> => {
   return bcrypt.hash(password, 10);
 };
 
-export const verifyPassword = async (password, hash) => {
+export const verifyPassword = async (password: string, hash: string): Promise<boolean> => {
   return bcrypt.compare(password, hash);
 };

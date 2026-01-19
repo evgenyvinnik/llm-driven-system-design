@@ -9,8 +9,9 @@
  * - Performance metrics embedded in logs
  */
 
-import pino from 'pino';
+import pino, { type Logger } from 'pino';
 import { v4 as uuidv4 } from 'uuid';
+import type { Request, Response, NextFunction } from 'express';
 
 // Determine log level from environment
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
@@ -48,9 +49,9 @@ const logger = pino({
  * Express middleware for request logging
  * Adds request ID and logs request/response details
  */
-export function requestLogger(req, res, next) {
+export function requestLogger(req: Request, res: Response, next: NextFunction): void {
   // Generate or use existing request ID
-  const requestId = req.headers['x-request-id'] || uuidv4();
+  const requestId = (req.headers['x-request-id'] as string) || uuidv4();
   req.requestId = requestId;
   res.setHeader('x-request-id', requestId);
 
@@ -60,7 +61,7 @@ export function requestLogger(req, res, next) {
     method: req.method,
     path: req.path,
     userAgent: req.headers['user-agent'],
-    ip: req.ip || req.connection?.remoteAddress,
+    ip: req.ip || req.socket?.remoteAddress,
   });
 
   const start = process.hrtime.bigint();
@@ -80,11 +81,11 @@ export function requestLogger(req, res, next) {
     };
 
     if (res.statusCode >= 500) {
-      req.log.error(logData, 'Request failed');
+      req.log?.error(logData, 'Request failed');
     } else if (res.statusCode >= 400) {
-      req.log.warn(logData, 'Request error');
+      req.log?.warn(logData, 'Request error');
     } else {
-      req.log.info(logData, 'Request completed');
+      req.log?.info(logData, 'Request completed');
     }
   });
 
@@ -93,20 +94,23 @@ export function requestLogger(req, res, next) {
 
 /**
  * Create a child logger for a specific module/service
- * @param {string} module - Module name
- * @returns {pino.Logger} Child logger with module context
  */
-export function createModuleLogger(module) {
+export function createModuleLogger(module: string): Logger {
   return logger.child({ module });
+}
+
+interface ErrorWithCode extends Error {
+  code?: string;
 }
 
 /**
  * Log an error with full stack trace and context
- * @param {Error} error - The error to log
- * @param {object} context - Additional context
- * @param {string} message - Log message
  */
-export function logError(error, context = {}, message = 'Error occurred') {
+export function logError(
+  error: ErrorWithCode,
+  context: Record<string, unknown> = {},
+  message = 'Error occurred'
+): void {
   logger.error({
     ...context,
     error: {
@@ -120,10 +124,8 @@ export function logError(error, context = {}, message = 'Error occurred') {
 
 /**
  * Log a business event (booking, search, etc.)
- * @param {string} eventType - Type of event
- * @param {object} data - Event data
  */
-export function logBusinessEvent(eventType, data) {
+export function logBusinessEvent(eventType: string, data: Record<string, unknown>): void {
   logger.info({
     eventType,
     eventData: data,
@@ -133,11 +135,12 @@ export function logBusinessEvent(eventType, data) {
 
 /**
  * Log a performance metric
- * @param {string} operation - Operation name
- * @param {number} durationMs - Duration in milliseconds
- * @param {object} context - Additional context
  */
-export function logPerformance(operation, durationMs, context = {}) {
+export function logPerformance(
+  operation: string,
+  durationMs: number,
+  context: Record<string, unknown> = {}
+): void {
   const level = durationMs > 1000 ? 'warn' : 'info';
   logger[level]({
     operation,
@@ -148,10 +151,8 @@ export function logPerformance(operation, durationMs, context = {}) {
 
 /**
  * Log a security event (auth failures, suspicious activity)
- * @param {string} eventType - Type of security event
- * @param {object} data - Event data
  */
-export function logSecurityEvent(eventType, data) {
+export function logSecurityEvent(eventType: string, data: Record<string, unknown>): void {
   logger.warn({
     security: true,
     eventType,

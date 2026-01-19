@@ -74,7 +74,7 @@ async function performRedisFanout(
 
 const redisFanoutCircuit = createCircuitBreaker(
   'redis-fanout',
-  performRedisFanout as (...args: unknown[]) => unknown,
+  performRedisFanout as (...args: unknown[]) => Promise<unknown>,
   {
     ...FANOUT_CIRCUIT_OPTIONS,
   },

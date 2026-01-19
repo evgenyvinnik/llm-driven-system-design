@@ -39,9 +39,9 @@ const circuitBreakers = new Map<string, CircuitBreaker>();
 /**
  * Create a circuit breaker for a given function
  */
-export function createCircuitBreaker<T extends (...args: unknown[]) => unknown>(
+export function createCircuitBreaker(
   name: string,
-  fn: T,
+  fn: (...args: unknown[]) => Promise<unknown>,
   options: CircuitBreakerOptions = {}
 ): CircuitBreaker {
   const circuitOptions = {
@@ -162,7 +162,7 @@ export const DATABASE_CIRCUIT_OPTIONS: CircuitBreakerOptions = {
 export function withCircuitBreaker<T extends (...args: unknown[]) => Promise<unknown>>(
   name: string,
   fn: T,
-  fallback: ((...args: unknown[]) => unknown) | null = null,
+  fallback: ((...args: unknown[]) => Promise<unknown>) | null = null,
   options: CircuitBreakerOptions = {}
 ): (...args: Parameters<T>) => Promise<unknown> {
   const breaker = createCircuitBreaker(name, fn, options);

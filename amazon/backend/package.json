@@ -2,16 +2,17 @@
   "name": "amazon-backend",
   "version": "1.0.0",
   "description": "Amazon e-commerce platform backend API",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
-    "dev:server1": "PORT=3001 node --watch src/index.js",
-    "dev:server2": "PORT=3002 node --watch src/index.js",
-    "dev:server3": "PORT=3003 node --watch src/index.js",
-    "seed": "node src/utils/seed.js",
-    "sync-es": "node src/utils/syncElasticsearch.js"
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "seed": "tsx src/utils/seed.ts",
+    "sync-es": "tsx src/utils/syncElasticsearch.ts",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.11.0",
@@ -29,6 +30,13 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "@types/bcrypt": "^5.0.2",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.7.3",
+    "tsx": "^4.19.2"
   }
 }

@@ -1,4 +1,4 @@
-import pg from 'pg';
+import pg, { type PoolClient, type QueryResult } from 'pg';
 
 const { Pool } = pg;
 
@@ -18,11 +18,16 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-export const query = (text, params) => pool.query(text, params);
+export const query = <T = unknown>(
+  text: string,
+  params?: unknown[]
+): Promise<QueryResult<T>> => pool.query(text, params);
 
-export const getClient = () => pool.connect();
+export const getClient = (): Promise<PoolClient> => pool.connect();
 
-export const transaction = async (callback) => {
+export const transaction = async <T>(
+  callback: (client: PoolClient) => Promise<T>
+): Promise<T> => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

@@ -2,17 +2,17 @@
   "name": "instagram-backend",
   "version": "1.0.0",
   "description": "Instagram clone backend API",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "NODE_ENV=development node --watch src/index.js",
+    "dev": "NODE_ENV=development tsx watch src/index.ts",
     "dev:server1": "PORT=3001 npm run dev",
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
-    "dev:worker": "NODE_ENV=development node --watch src/workers/image-worker.js",
-    "start": "NODE_ENV=production node src/index.js",
-    "start:worker": "NODE_ENV=production node src/workers/image-worker.js",
-    "db:seed": "node db/seed.js"
+    "dev:worker": "NODE_ENV=development tsx watch src/workers/image-worker.ts",
+    "start": "NODE_ENV=production tsx src/index.ts",
+    "start:worker": "NODE_ENV=production tsx src/workers/image-worker.ts",
+    "db:seed": "tsx db/seed.ts"
   },
   "dependencies": {
     "amqplib": "^0.10.9",
@@ -37,6 +37,17 @@
     "uuid": "^11.0.3"
   },
   "devDependencies": {
-    "eslint": "^9.17.0"
+    "@types/amqplib": "^0.10.6",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/express-session": "^1.18.1",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.6",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
   }
 }
