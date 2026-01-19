@@ -145,13 +145,14 @@ router.put('/:productId', requireAuth, async (req: Request, res: Response, next:
         [req.user!.id, productId]
       );
 
-      if (currentResult.rows.length === 0) {
+      const currentRow = currentResult.rows[0];
+      if (!currentRow) {
         const error: AppError = new Error('Item not in cart');
         error.status = 404;
         throw error;
       }
 
-      const currentQuantity = currentResult.rows[0].quantity;
+      const currentQuantity = currentRow.quantity;
       const quantityDiff = quantity - currentQuantity;
 
       if (quantityDiff > 0) {
@@ -208,11 +209,12 @@ router.delete('/:productId', requireAuth, async (req: Request, res: Response, ne
         [req.user!.id, productId]
       );
 
-      if (cartResult.rows.length === 0) {
+      const cartItem = cartResult.rows[0];
+      if (!cartItem) {
         return; // Nothing to remove
       }
 
-      const quantity = cartResult.rows[0].quantity;
+      const quantity = cartItem.quantity;
 
       // Release reservation
       await client.query(

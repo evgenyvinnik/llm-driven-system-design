@@ -29,7 +29,7 @@ interface DatabaseError extends Error {
 }
 
 // Get all templates
-router.get('/', async (req: Request, res: Response): Promise<void> => {
+router.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
     const templates = await templateService.getAllTemplates();
     res.json({ templates });
@@ -42,7 +42,7 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
 // Get template by ID
 router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
-    const template = await templateService.getTemplate(req.params.id);
+    const template = await templateService.getTemplate(req.params.id as string);
 
     if (!template) {
       res.status(404).json({ error: 'Template not found' });
@@ -97,7 +97,7 @@ router.patch('/:id', adminMiddleware, async (req: Request, res: Response): Promi
   try {
     const { name, description, channels, variables } = req.body as UpdateTemplateRequest;
 
-    const template = await templateService.updateTemplate(req.params.id, {
+    const template = await templateService.updateTemplate(req.params.id as string, {
       name,
       description,
       channels,
@@ -119,7 +119,7 @@ router.patch('/:id', adminMiddleware, async (req: Request, res: Response): Promi
 // Delete template (admin only)
 router.delete('/:id', adminMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
-    const deleted = await templateService.deleteTemplate(req.params.id);
+    const deleted = await templateService.deleteTemplate(req.params.id as string);
 
     if (!deleted) {
       res.status(404).json({ error: 'Template not found' });
@@ -136,7 +136,7 @@ router.delete('/:id', adminMiddleware, async (req: Request, res: Response): Prom
 // Preview template rendering
 router.post('/:id/preview', async (req: Request, res: Response): Promise<void> => {
   try {
-    const template = await templateService.getTemplate(req.params.id);
+    const template = await templateService.getTemplate(req.params.id as string);
 
     if (!template) {
       res.status(404).json({ error: 'Template not found' });

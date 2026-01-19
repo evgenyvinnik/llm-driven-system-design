@@ -59,7 +59,7 @@ router.get('/folder', async (req: AuthRequest, res: Response) => {
  */
 router.get('/folder/:folderId', async (req: AuthRequest, res: Response) => {
   try {
-    const contents = await getFolderContents(req.user!.id, req.params.folderId);
+    const contents = await getFolderContents(req.user!.id, req.params.folderId as string);
     res.json(contents);
   } catch (error) {
     console.error('Get folder error:', error);
@@ -249,7 +249,7 @@ router.post('/upload', upload.single('file'), async (req: AuthRequest, res: Resp
  */
 router.get('/file/:fileId', async (req: AuthRequest, res: Response) => {
   try {
-    const file = await getFile(req.user!.id, req.params.fileId);
+    const file = await getFile(req.user!.id, req.params.fileId as string);
 
     if (!file) {
       res.status(404).json({ error: 'File not found' });
@@ -269,7 +269,7 @@ router.get('/file/:fileId', async (req: AuthRequest, res: Response) => {
  */
 router.get('/file/:fileId/download', async (req: AuthRequest, res: Response) => {
   try {
-    const { data, file } = await downloadFile(req.user!.id, req.params.fileId);
+    const { data, file } = await downloadFile(req.user!.id, req.params.fileId as string);
 
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
     res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
@@ -288,7 +288,7 @@ router.get('/file/:fileId/download', async (req: AuthRequest, res: Response) => 
  */
 router.get('/file/:fileId/chunks', async (req: AuthRequest, res: Response) => {
   try {
-    const file = await getFile(req.user!.id, req.params.fileId);
+    const file = await getFile(req.user!.id, req.params.fileId as string);
 
     if (!file || file.isFolder) {
       res.status(404).json({ error: 'File not found' });
@@ -325,7 +325,7 @@ router.patch('/file/:fileId/rename', async (req: AuthRequest, res: Response) => 
       return;
     }
 
-    const file = await renameItem(req.user!.id, req.params.fileId, name);
+    const file = await renameItem(req.user!.id, req.params.fileId as string, name);
     res.json(file);
   } catch (error) {
     console.error('Rename error:', error);
@@ -341,7 +341,7 @@ router.patch('/file/:fileId/move', async (req: AuthRequest, res: Response) => {
   try {
     const { parentId } = req.body;
 
-    const file = await moveItem(req.user!.id, req.params.fileId, parentId || null);
+    const file = await moveItem(req.user!.id, req.params.fileId as string, parentId || null);
     res.json(file);
   } catch (error) {
     console.error('Move error:', error);
@@ -354,7 +354,7 @@ router.patch('/file/:fileId/move', async (req: AuthRequest, res: Response) => {
  */
 router.delete('/file/:fileId', async (req: AuthRequest, res: Response) => {
   try {
-    await deleteItem(req.user!.id, req.params.fileId);
+    await deleteItem(req.user!.id, req.params.fileId as string);
     res.json({ message: 'Deleted successfully' });
   } catch (error) {
     console.error('Delete error:', error);
@@ -367,7 +367,7 @@ router.delete('/file/:fileId', async (req: AuthRequest, res: Response) => {
  */
 router.get('/file/:fileId/versions', async (req: AuthRequest, res: Response) => {
   try {
-    const versions = await getFileVersions(req.user!.id, req.params.fileId);
+    const versions = await getFileVersions(req.user!.id, req.params.fileId as string);
     res.json(versions);
   } catch (error) {
     console.error('Get versions error:', error);
@@ -382,8 +382,8 @@ router.post('/file/:fileId/versions/:versionId/restore', async (req: AuthRequest
   try {
     const file = await restoreFileVersion(
       req.user!.id,
-      req.params.fileId,
-      req.params.versionId
+      req.params.fileId as string,
+      req.params.versionId as string
     );
     res.json(file);
   } catch (error) {

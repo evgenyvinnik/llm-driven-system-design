@@ -67,7 +67,7 @@ router.patch('/', async (req: Request, res: Response): Promise<void> => {
 // Enable/disable a specific channel
 router.patch('/channels/:channel', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { channel } = req.params;
+    const channel = req.params.channel as string;
     const { enabled } = req.body as UpdateChannelRequest;
 
     if (!['push', 'email', 'sms'].includes(channel)) {

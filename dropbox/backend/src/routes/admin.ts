@@ -116,7 +116,7 @@ router.patch('/users/:userId/quota', async (req: AuthRequest, res: Response) => 
       return;
     }
 
-    const user = await updateUserQuota(req.params.userId, quotaBytes);
+    const user = await updateUserQuota(req.params.userId as string, quotaBytes);
     res.json(user);
   } catch (error) {
     console.error('Update quota error:', error);
@@ -136,7 +136,7 @@ router.delete('/users/:userId', async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    await deleteUser(req.params.userId);
+    await deleteUser(req.params.userId as string);
     res.json({ message: 'User deleted' });
   } catch (error) {
     console.error('Delete user error:', error);

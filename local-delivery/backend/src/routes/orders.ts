@@ -94,7 +94,7 @@ router.get('/', authenticate, requireCustomer, async (req: Request, res: Respons
 // Get order by ID
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id);
+    const order = await getOrderWithDetails(req.params.id as string);
 
     if (!order) {
       res.status(404).json({
@@ -133,7 +133,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 // Cancel order (customer)
 router.post('/:id/cancel', authenticate, requireCustomer, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id);
+    const order = await getOrderWithDetails(req.params.id as string);
 
     if (!order) {
       res.status(404).json({
@@ -162,7 +162,7 @@ router.post('/:id/cancel', authenticate, requireCustomer, async (req: Request, r
 
     const { reason } = req.body;
 
-    const updatedOrder = await updateOrderStatus(req.params.id, 'cancelled', {
+    const updatedOrder = await updateOrderStatus(req.params.id as string, 'cancelled', {
       cancellation_reason: reason || 'Cancelled by customer',
     });
 
@@ -184,7 +184,7 @@ router.post('/:id/cancel', authenticate, requireCustomer, async (req: Request, r
 // Add tip to order
 router.post('/:id/tip', authenticate, requireCustomer, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id);
+    const order = await getOrderWithDetails(req.params.id as string);
 
     if (!order) {
       res.status(404).json({
@@ -247,7 +247,7 @@ router.post('/:id/rate/driver', authenticate, requireCustomer, async (req: Reque
     const ratingRecord = await createRating(
       req.userId!,
       {
-        order_id: req.params.id,
+        order_id: req.params.id as string,
         rating,
         comment,
       },
@@ -283,7 +283,7 @@ router.post('/:id/rate/merchant', authenticate, requireCustomer, async (req: Req
     const ratingRecord = await createRating(
       req.userId!,
       {
-        order_id: req.params.id,
+        order_id: req.params.id as string,
         rating,
         comment,
       },

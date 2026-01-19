@@ -73,7 +73,7 @@ router.get('/links', authMiddleware, async (req: AuthRequest, res: Response) => 
  */
 router.delete('/link/:linkId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    await deleteSharedLink(req.user!.id, req.params.linkId);
+    await deleteSharedLink(req.user!.id, req.params.linkId as string);
     res.json({ message: 'Link deleted' });
   } catch (error) {
     console.error('Delete share link error:', error);
@@ -88,7 +88,7 @@ router.delete('/link/:linkId', authMiddleware, async (req: AuthRequest, res: Res
 router.get('/:token', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { password } = req.query;
-    const result = await validateSharedLink(req.params.token, password as string | undefined);
+    const result = await validateSharedLink(req.params.token as string, password as string | undefined);
 
     if (!result.valid) {
       res.status(result.error === 'Password required' ? 401 : 400).json({
@@ -112,7 +112,7 @@ router.get('/:token', optionalAuthMiddleware, async (req: AuthRequest, res: Resp
 router.get('/:token/download', optionalAuthMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { password } = req.query;
-    const result = await validateSharedLink(req.params.token, password as string | undefined);
+    const result = await validateSharedLink(req.params.token as string, password as string | undefined);
 
     if (!result.valid || !result.file) {
       res.status(400).json({ error: result.error });
@@ -143,7 +143,7 @@ router.get('/:token/download', optionalAuthMiddleware, async (req: AuthRequest, 
     const data = Buffer.concat(chunkBuffers);
 
     // Increment download count
-    await incrementDownloadCount(req.params.token);
+    await incrementDownloadCount(req.params.token as string);
 
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(result.file.name)}"`);
     res.setHeader('Content-Type', result.file.mimeType || 'application/octet-stream');
@@ -200,7 +200,7 @@ router.get('/shared-with-me', authMiddleware, async (req: AuthRequest, res: Resp
  */
 router.get('/folder/:folderId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const shares = await getFolderShares(req.user!.id, req.params.folderId);
+    const shares = await getFolderShares(req.user!.id, req.params.folderId as string);
     res.json(shares);
   } catch (error) {
     console.error('Get folder shares error:', error);
@@ -213,7 +213,7 @@ router.get('/folder/:folderId', authMiddleware, async (req: AuthRequest, res: Re
  */
 router.delete('/folder/:folderId/:userId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    await removeFolderShare(req.user!.id, req.params.folderId, req.params.userId);
+    await removeFolderShare(req.user!.id, req.params.folderId as string, req.params.userId as string);
     res.json({ message: 'Share removed' });
   } catch (error) {
     console.error('Remove folder share error:', error);

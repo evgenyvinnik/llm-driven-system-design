@@ -293,7 +293,7 @@ export function requirePermission(
         return;
       }
 
-      const fileId = req.params[paramName];
+      const fileId = req.params[paramName] as string;
 
       if (!fileId) {
         res.status(400).json({ error: `Missing ${paramName} parameter` });
@@ -382,7 +382,7 @@ export function requireOwnership(paramName: string = 'fileId') {
         return;
       }
 
-      const fileId = req.params[paramName];
+      const fileId = req.params[paramName] as string;
 
       if (!fileId) {
         res.status(400).json({ error: `Missing ${paramName} parameter` });

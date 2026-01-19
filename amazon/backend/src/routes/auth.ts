@@ -50,6 +50,10 @@ router.post('/register',
       );
 
       const user = result.rows[0];
+      if (!user) {
+        res.status(500).json({ error: 'Failed to create user' });
+        return;
+      }
 
       // Create session
       const sessionId = uuidv4();
@@ -91,6 +95,10 @@ router.post('/login',
       }
 
       const user = result.rows[0];
+      if (!user) {
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
+      }
 
       // Verify password
       const valid = await bcrypt.compare(password, user.password_hash || '');

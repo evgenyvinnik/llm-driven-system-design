@@ -125,7 +125,7 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
 }
 
 // Get metrics endpoint handler
-export async function getMetrics(req: Request, res: Response): Promise<void> {
+export async function getMetrics(_req: Request, res: Response): Promise<void> {
   try {
     res.set('Content-Type', register.contentType);
     res.end(await register.metrics());
