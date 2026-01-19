@@ -39,6 +39,7 @@
     "@types/express": "^4.17.21",
     "@types/express-session": "^1.18.0",
     "@types/node": "^20.11.0",
+    "@types/opossum": "^8.1.9",
     "@types/uuid": "^9.0.7",
     "eslint": "^8.56.0",
     "pino-pretty": "^13.1.3",

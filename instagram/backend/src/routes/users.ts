@@ -560,7 +560,7 @@ router.get('/:username/following', async (req: Request, res: Response): Promise<
     const following = result.rows.slice(0, limitNum);
 
     res.json({
-      following: following.map((f) => ({
+      following: following.map((f: FollowUserRow) => ({
         id: f.id,
         username: f.username,
         displayName: f.display_name,
@@ -603,7 +603,7 @@ router.get('/search/users', async (req: Request, res: Response): Promise<void> =
     );
 
     res.json({
-      users: result.rows.map((u) => ({
+      users: result.rows.map((u: UserRow) => ({
         id: u.id,
         username: u.username,
         displayName: u.display_name,

@@ -8,9 +8,12 @@ import {
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
   HeadObjectCommand,
+  GetObjectCommandOutput,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import config from '../config/index.js';
+
+// ============ S3 Client Setup ============
 
 const s3Client = new S3Client({
   endpoint: config.minio.endpoint,
@@ -22,8 +25,17 @@ const s3Client = new S3Client({
   forcePathStyle: true, // Required for MinIO
 });
 
-// Simple upload for small files
-export const uploadObject = async (bucket, key, body, contentType) => {
+// ============ Basic Operations ============
+
+/**
+ * Simple upload for small files
+ */
+export const uploadObject = async (
+  bucket: string,
+  key: string,
+  body: Buffer | string,
+  contentType: string
+): Promise<string> => {
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -35,8 +47,13 @@ export const uploadObject = async (bucket, key, body, contentType) => {
   return `${config.minio.endpoint}/${bucket}/${key}`;
 };
 
-// Get object
-export const getObject = async (bucket, key) => {
+/**
+ * Get object
+ */
+export const getObject = async (
+  bucket: string,
+  key: string
+): Promise<GetObjectCommandOutput> => {
   const command = new GetObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -45,8 +62,10 @@ export const getObject = async (bucket, key) => {
   return s3Client.send(command);
 };
 
-// Delete object
-export const deleteObject = async (bucket, key) => {
+/**
+ * Delete object
+ */
+export const deleteObject = async (bucket: string, key: string): Promise<void> => {
   const command = new DeleteObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -55,8 +74,10 @@ export const deleteObject = async (bucket, key) => {
   await s3Client.send(command);
 };
 
-// Check if object exists
-export const objectExists = async (bucket, key) => {
+/**
+ * Check if object exists
+ */
+export const objectExists = async (bucket: string, key: string): Promise<boolean> => {
   try {
     const command = new HeadObjectCommand({
       Bucket: bucket,
@@ -65,15 +86,23 @@ export const objectExists = async (bucket, key) => {
     await s3Client.send(command);
     return true;
   } catch (error) {
-    if (error.name === 'NotFound') {
+    if ((error as { name?: string }).name === 'NotFound') {
       return false;
     }
     throw error;
   }
 };
 
-// Multipart upload operations
-export const createMultipartUpload = async (bucket, key, contentType) => {
+// ============ Multipart Upload Operations ============
+
+/**
+ * Create multipart upload
+ */
+export const createMultipartUpload = async (
+  bucket: string,
+  key: string,
+  contentType: string
+): Promise<string | undefined> => {
   const command = new CreateMultipartUploadCommand({
     Bucket: bucket,
     Key: key,
@@ -84,7 +113,16 @@ export const createMultipartUpload = async (bucket, key, contentType) => {
   return response.UploadId;
 };
 
-export const uploadPart = async (bucket, key, uploadId, partNumber, body) => {
+/**
+ * Upload a part
+ */
+export const uploadPart = async (
+  bucket: string,
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  body: Buffer
+): Promise<string | undefined> => {
   const command = new UploadPartCommand({
     Bucket: bucket,
     Key: key,
@@ -97,7 +135,15 @@ export const uploadPart = async (bucket, key, uploadId, partNumber, body) => {
   return response.ETag;
 };
 
-export const completeMultipartUpload = async (bucket, key, uploadId, parts) => {
+/**
+ * Complete multipart upload
+ */
+export const completeMultipartUpload = async (
+  bucket: string,
+  key: string,
+  uploadId: string,
+  parts: (string | undefined)[]
+): Promise<string> => {
   const command = new CompleteMultipartUploadCommand({
     Bucket: bucket,
     Key: key,
@@ -114,7 +160,14 @@ export const completeMultipartUpload = async (bucket, key, uploadId, parts) => {
   return `${config.minio.endpoint}/${bucket}/${key}`;
 };
 
-export const abortMultipartUpload = async (bucket, key, uploadId) => {
+/**
+ * Abort multipart upload
+ */
+export const abortMultipartUpload = async (
+  bucket: string,
+  key: string,
+  uploadId: string
+): Promise<void> => {
   const command = new AbortMultipartUploadCommand({
     Bucket: bucket,
     Key: key,
@@ -124,8 +177,17 @@ export const abortMultipartUpload = async (bucket, key, uploadId) => {
   await s3Client.send(command);
 };
 
-// Generate presigned URL for direct upload
-export const getPresignedUploadUrl = async (bucket, key, contentType, expiresIn = 3600) => {
+// ============ Presigned URLs ============
+
+/**
+ * Generate presigned URL for direct upload
+ */
+export const getPresignedUploadUrl = async (
+  bucket: string,
+  key: string,
+  contentType: string,
+  expiresIn: number = 3600
+): Promise<string> => {
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -135,8 +197,14 @@ export const getPresignedUploadUrl = async (bucket, key, contentType, expiresIn 
   return getSignedUrl(s3Client, command, { expiresIn });
 };
 
-// Generate presigned URL for download/streaming
-export const getPresignedDownloadUrl = async (bucket, key, expiresIn = 3600) => {
+/**
+ * Generate presigned URL for download/streaming
+ */
+export const getPresignedDownloadUrl = async (
+  bucket: string,
+  key: string,
+  expiresIn: number = 3600
+): Promise<string> => {
   const command = new GetObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -145,8 +213,10 @@ export const getPresignedDownloadUrl = async (bucket, key, expiresIn = 3600) => 
   return getSignedUrl(s3Client, command, { expiresIn });
 };
 
-// Get public URL (for publicly accessible buckets)
-export const getPublicUrl = (bucket, key) => {
+/**
+ * Get public URL (for publicly accessible buckets)
+ */
+export const getPublicUrl = (bucket: string, key: string): string => {
   return `${config.minio.endpoint}/${bucket}/${key}`;
 };
 

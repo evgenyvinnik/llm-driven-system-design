@@ -10,7 +10,7 @@ import {
   recordCacheMiss,
 } from '../shared/metrics.js';
 import logger from '../shared/logger.js';
-import type { SuggestionService } from '../services/suggestion-service.js';
+import type { SuggestionService, SuggestionOptions } from '../services/suggestion-service.js';
 import type { RankingService, RankedSuggestion } from '../services/ranking-service.js';
 import type { AggregationService } from '../services/aggregation-service.js';
 
@@ -24,28 +24,20 @@ declare module 'express-serve-static-core' {
 
 const router: Router = express.Router();
 
-interface SuggestionArgs {
-  prefix: string;
-  options: {
-    userId?: string | null;
-    limit: number;
-  };
-}
-
 // Circuit breaker for suggestion service
-let suggestionCircuit: CircuitBreaker<RankedSuggestion[], [SuggestionArgs]> | null = null;
+let suggestionCircuit: CircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]> | null = null;
 
 /**
  * Initialize circuit breaker lazily (needs access to suggestionService)
  */
 function getSuggestionCircuit(
   suggestionService: SuggestionService
-): CircuitBreaker<RankedSuggestion[], [SuggestionArgs]> {
+): CircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]> {
   if (!suggestionCircuit) {
-    suggestionCircuit = createCircuitBreaker<RankedSuggestion[], [SuggestionArgs]>(
+    suggestionCircuit = createCircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]>(
       'suggestions',
-      async (args: SuggestionArgs) => {
-        return suggestionService.getSuggestions(args.prefix, args.options);
+      async (prefix: string, options: SuggestionOptions) => {
+        return suggestionService.getSuggestions(prefix, options);
       },
       {
         timeout: 100, // 100ms timeout for suggestions
@@ -112,10 +104,10 @@ router.get('/', suggestionRateLimiter, async (req: Request, res: Response) => {
     } else {
       // Use circuit breaker for regular suggestions
       try {
-        suggestions = await circuit.fire({
+        suggestions = await circuit.fire(
           prefix,
-          options: { userId: userId as string | undefined, limit: parseInt(limit as string) },
-        });
+          { userId: userId as string | undefined, limit: parseInt(limit as string) }
+        );
       } catch (circuitError) {
         // Circuit breaker fallback already triggered
         suggestions = [];

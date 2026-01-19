@@ -39,7 +39,8 @@ const DEFAULT_OPTIONS: CircuitBreakerOptions = {
 };
 
 // Map to store circuit breakers by name
-const circuits = new Map<string, CircuitBreaker>();
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const circuits = new Map<string, CircuitBreaker<any>>();
 
 /**
  * Create or get a circuit breaker for a named operation
@@ -121,7 +122,8 @@ export function createCircuitBreaker<T, A extends unknown[]>(
 /**
  * Get circuit breaker by name
  */
-export function getCircuitBreaker(name: string): CircuitBreaker | undefined {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getCircuitBreaker(name: string): CircuitBreaker<any> | undefined {
   return circuits.get(name);
 }
 
@@ -131,13 +133,15 @@ export function getCircuitBreaker(name: string): CircuitBreaker | undefined {
 export function getCircuitStatus(): Record<string, CircuitStatus> {
   const status: Record<string, CircuitStatus> = {};
   for (const [name, breaker] of circuits) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const breakerAny = breaker as any;
     status[name] = {
       state: breaker.opened ? 'open' : breaker.halfOpen ? 'half-open' : 'closed',
       stats: breaker.stats,
       options: {
-        timeout: breaker.options.timeout,
-        errorThresholdPercentage: breaker.options.errorThresholdPercentage,
-        resetTimeout: breaker.options.resetTimeout,
+        timeout: breakerAny.options?.timeout ?? 0,
+        errorThresholdPercentage: breakerAny.options?.errorThresholdPercentage ?? 0,
+        resetTimeout: breakerAny.options?.resetTimeout ?? 0,
       },
     };
   }

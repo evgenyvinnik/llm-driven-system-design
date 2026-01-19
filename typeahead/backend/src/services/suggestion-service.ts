@@ -47,7 +47,13 @@ export class SuggestionService {
 
     if (!prefix || prefix.trim().length === 0) {
       // Return top popular queries when no prefix
-      return this._getPopularQueries(limit);
+      const popular = await this._getPopularQueries(limit);
+      // Convert Suggestion[] to RankedSuggestion[]
+      return popular.map(s => ({
+        ...s,
+        score: s.count,
+        scores: { popularity: s.count, recency: 0, personal: 0, trending: 0, match: 0 }
+      }));
     }
 
     const normalizedPrefix = prefix.toLowerCase().trim();

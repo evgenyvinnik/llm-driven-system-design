@@ -11,6 +11,7 @@ import pino from 'pino';
 import pinoHttp from 'pino-http';
 import crypto from 'crypto';
 import type { IncomingMessage, ServerResponse } from 'http';
+import type { Request, Response, NextFunction } from 'express';
 
 // Create base logger with structured output
 const logger = pino({
@@ -27,37 +28,33 @@ const logger = pino({
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 
-interface PinoRequest extends IncomingMessage {
-  id?: string | number;
-  method?: string;
-  url?: string;
-  query?: { q?: string };
-}
-
-/**
- * HTTP request logging middleware.
- * Logs request/response with timing and correlation ID.
- */
-export const httpLogger = (pinoHttp as unknown as typeof pinoHttp.default)({
+// Use pino-http with explicit any to avoid type conflicts
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pinoHttpMiddleware = (pinoHttp as any)({
   logger,
   genReqId: (req: IncomingMessage) =>
     (req.headers['x-request-id'] as string) || crypto.randomUUID(),
-  customProps: (req: IncomingMessage & { id?: string | number }) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customProps: (req: any) => ({
     requestId: req.id,
   }),
-  customLogLevel: (_req: IncomingMessage, res: ServerResponse, err?: Error) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customLogLevel: (_req: any, res: ServerResponse, err?: Error) => {
     if (res.statusCode >= 500 || err) return 'error';
     if (res.statusCode >= 400) return 'warn';
     return 'info';
   },
-  customSuccessMessage: (req: IncomingMessage) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customSuccessMessage: (req: any) => {
     return `${req.method} ${req.url} completed`;
   },
-  customErrorMessage: (req: IncomingMessage, _res: ServerResponse, err?: Error) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customErrorMessage: (req: any, _res: ServerResponse, err?: Error) => {
     return `${req.method} ${req.url} failed: ${err?.message || 'unknown error'}`;
   },
   serializers: {
-    req: (req: PinoRequest) => ({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    req: (req: any) => ({
       id: req.id,
       method: req.method,
       url: req.url,
@@ -69,6 +66,14 @@ export const httpLogger = (pinoHttp as unknown as typeof pinoHttp.default)({
     }),
   },
 });
+
+/**
+ * HTTP request logging middleware.
+ * Logs request/response with timing and correlation ID.
+ */
+export const httpLogger = (req: Request, res: Response, next: NextFunction): void => {
+  pinoHttpMiddleware(req, res, next);
+};
 
 /**
  * Audit logger for sensitive operations.

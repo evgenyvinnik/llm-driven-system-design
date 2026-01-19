@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { query, transaction } from '../db/pool.js';
 import { authenticateApiKey, AuthenticatedRequest } from '../middleware/auth.js';
 import { idempotencyMiddleware } from '../middleware/idempotency.js';
-import { assessRisk, getRiskAssessment, RiskAssessmentResult, RiskAssessmentRow } from '../services/fraud.js';
+import { assessRisk, getRiskAssessment, RiskAssessmentResult } from '../services/fraud.js';
 import { createChargeEntries, calculateFee } from '../services/ledger.js';
 import { authorize, capture, AuthorizeParams, CaptureParams } from '../services/cardNetwork.js';
 import { sendWebhook } from '../services/webhooks.js';
@@ -448,14 +448,14 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req: AuthenticatedRequ
     });
 
     // Record fraud metrics
-    recordFraudCheck(riskResult.score, riskResult.decision);
+    recordFraudCheck(riskResult.riskScore, riskResult.decision);
 
     // Audit log: Fraud check
     await auditLogger.logFraudCheck(
       intent.id,
-      riskResult.score,
+      riskResult.riskScore,
       riskResult.decision,
-      riskResult.rules || [],
+      riskResult.signals.map(s => s.rule),
       {
         ipAddress: req.ip,
         traceId: req.headers['x-trace-id'] as string,
@@ -479,13 +479,13 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req: AuthenticatedRequ
       await auditLogger.logPaymentIntentFailed(intent, 'fraudulent', {
         ipAddress: req.ip,
         traceId: req.headers['x-trace-id'] as string,
-        metadata: { fraud_score: riskResult.score },
+        metadata: { fraud_score: riskResult.riskScore },
       });
 
       logger.warn({
         event: 'payment_blocked_fraud',
         intent_id: intent.id,
-        risk_score: riskResult.score,
+        risk_score: riskResult.riskScore,
       });
 
       res.status(402).json({
@@ -520,7 +520,7 @@ router.post('/:id/confirm', idempotencyMiddleware, async (req: AuthenticatedRequ
       logger.info({
         event: 'payment_requires_3ds',
         intent_id: intent.id,
-        risk_score: riskResult.score,
+        risk_score: riskResult.riskScore,
       });
 
       res.json(formatted);

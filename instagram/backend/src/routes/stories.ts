@@ -173,7 +173,7 @@ router.post('/', requireAuth, storyRateLimiter, upload.single('media'), async (r
 // Get story tray (list of users with active stories)
 router.get('/tray', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const userId = req.session.userId;
+    const userId = req.session.userId!;
 
     // Try cache first
     const cached = await storyTrayGet(userId);
@@ -201,7 +201,7 @@ router.get('/tray', requireAuth, async (req: AuthenticatedRequest, res: Response
       [userId]
     );
 
-    const users: StoryTrayUser[] = result.rows.map((u) => ({
+    const users: StoryTrayUser[] = result.rows.map((u: StoryTrayRow) => ({
       id: u.id,
       username: u.username,
       displayName: u.display_name,
@@ -262,7 +262,7 @@ router.get('/user/:userId', requireAuth, async (req: AuthenticatedRequest, res: 
         displayName: user.display_name,
         profilePictureUrl: user.profile_picture_url,
       },
-      stories: result.rows.map((s): StoryResponse => ({
+      stories: result.rows.map((s: StoryRow): StoryResponse => ({
         id: s.id,
         mediaUrl: s.media_url,
         mediaType: s.media_type,
@@ -289,7 +289,7 @@ router.get('/user/:userId', requireAuth, async (req: AuthenticatedRequest, res: 
 router.post('/:storyId/view', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { storyId } = req.params;
-    const viewerId = req.session.userId;
+    const viewerId = req.session.userId!;
 
     // Check story exists and is active
     const storyCheck = await query<{ user_id: string }>(
@@ -378,7 +378,7 @@ router.get('/:storyId/viewers', requireAuth, async (req: AuthenticatedRequest, r
     const viewers = result.rows.slice(0, parsedLimit);
 
     res.json({
-      viewers: viewers.map((v) => ({
+      viewers: viewers.map((v: ViewerRow) => ({
         id: v.id,
         username: v.username,
         displayName: v.display_name,
@@ -446,7 +446,7 @@ router.get('/me', requireAuth, async (req: AuthenticatedRequest, res: Response):
     );
 
     res.json({
-      stories: result.rows.map((s): StoryResponse => ({
+      stories: result.rows.map((s: StoryRow): StoryResponse => ({
         id: s.id,
         mediaUrl: s.media_url,
         mediaType: s.media_type,
