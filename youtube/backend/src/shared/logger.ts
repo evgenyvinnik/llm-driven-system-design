@@ -1,5 +1,34 @@
-import pino from 'pino';
-import config from '../config/index.js';
+import pino, { Logger } from 'pino';
+import { Request, Response, NextFunction } from 'express';
+
+// ============ Type Definitions ============
+
+interface RequestWithLog extends Request {
+  log: Logger;
+  connection?: {
+    remoteAddress?: string;
+  };
+}
+
+interface LogEventData {
+  videoId?: string;
+  userId?: string;
+  fileSize?: number;
+  filename?: string;
+  duration?: number;
+  resolutions?: string[];
+  error?: string;
+  username?: string;
+  channelId?: string;
+  service?: string;
+  failures?: number;
+  endpoint?: string;
+  ip?: string;
+  key?: string;
+  watchDuration?: number;
+}
+
+// ============ Logger Setup ============
 
 /**
  * Structured JSON logger using pino
@@ -20,7 +49,7 @@ import config from '../config/index.js';
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
 // Create base logger
-const logger = pino({
+const logger: Logger = pino({
   level: process.env.LOG_LEVEL || (isDevelopment ? 'debug' : 'info'),
   transport: isDevelopment
     ? {
@@ -37,17 +66,15 @@ const logger = pino({
     pid: process.pid,
   },
   formatters: {
-    level: (label) => ({ level: label }),
+    level: (label: string) => ({ level: label }),
   },
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 
 /**
  * Create a child logger with request context
- * @param {object} context - Context to bind to all log messages
- * @returns {pino.Logger} Child logger instance
  */
-export const createChildLogger = (context) => {
+export const createChildLogger = (context: Record<string, unknown>): Logger => {
   return logger.child(context);
 };
 
@@ -55,16 +82,23 @@ export const createChildLogger = (context) => {
  * Express middleware to attach request-scoped logger
  * Adds requestId and logs request/response
  */
-export const requestLogger = (req, res, next) => {
+export const requestLogger = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
+  const reqWithLog = req as RequestWithLog;
+
   // Generate or use existing request ID
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  const requestId =
+    (req.headers['x-request-id'] as string | undefined) || crypto.randomUUID();
 
   // Create child logger with request context
-  req.log = logger.child({
+  reqWithLog.log = logger.child({
     requestId,
     method: req.method,
     path: req.path,
-    ip: req.ip || req.connection?.remoteAddress,
+    ip: req.ip || reqWithLog.connection?.remoteAddress,
   });
 
   // Set response header for tracing
@@ -73,7 +107,7 @@ export const requestLogger = (req, res, next) => {
   // Log request start
   const startTime = Date.now();
 
-  req.log.info({ event: 'request_start' }, `${req.method} ${req.path}`);
+  reqWithLog.log.info({ event: 'request_start' }, `${req.method} ${req.path}`);
 
   // Log response on finish
   res.on('finish', () => {
@@ -85,11 +119,11 @@ export const requestLogger = (req, res, next) => {
     };
 
     if (res.statusCode >= 500) {
-      req.log.error(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+      reqWithLog.log.error(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
     } else if (res.statusCode >= 400) {
-      req.log.warn(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+      reqWithLog.log.warn(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
     } else {
-      req.log.info(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+      reqWithLog.log.info(logData, `${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
     }
   });
 
@@ -101,105 +135,141 @@ export const requestLogger = (req, res, next) => {
  */
 export const logEvent = {
   // Video events
-  videoUploaded: (log, data) => {
-    log.info({
-      event: 'video_uploaded',
-      videoId: data.videoId,
-      userId: data.userId,
-      fileSize: data.fileSize,
-      filename: data.filename,
-    }, 'Video upload completed');
+  videoUploaded: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'video_uploaded',
+        videoId: data.videoId,
+        userId: data.userId,
+        fileSize: data.fileSize,
+        filename: data.filename,
+      },
+      'Video upload completed'
+    );
   },
 
-  videoTranscoded: (log, data) => {
-    log.info({
-      event: 'video_transcoded',
-      videoId: data.videoId,
-      duration: data.duration,
-      resolutions: data.resolutions,
-    }, 'Video transcoding completed');
+  videoTranscoded: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'video_transcoded',
+        videoId: data.videoId,
+        duration: data.duration,
+        resolutions: data.resolutions,
+      },
+      'Video transcoding completed'
+    );
   },
 
-  videoTranscodeFailed: (log, data) => {
-    log.error({
-      event: 'video_transcode_failed',
-      videoId: data.videoId,
-      error: data.error,
-    }, 'Video transcoding failed');
+  videoTranscodeFailed: (log: Logger, data: LogEventData): void => {
+    log.error(
+      {
+        event: 'video_transcode_failed',
+        videoId: data.videoId,
+        error: data.error,
+      },
+      'Video transcoding failed'
+    );
   },
 
-  videoViewed: (log, data) => {
-    log.info({
-      event: 'video_viewed',
-      videoId: data.videoId,
-      userId: data.userId,
-      watchDuration: data.watchDuration,
-    }, 'Video view recorded');
+  videoViewed: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'video_viewed',
+        videoId: data.videoId,
+        userId: data.userId,
+        watchDuration: data.watchDuration,
+      },
+      'Video view recorded'
+    );
   },
 
   // User events
-  userRegistered: (log, data) => {
-    log.info({
-      event: 'user_registered',
-      userId: data.userId,
-      username: data.username,
-    }, 'New user registered');
+  userRegistered: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'user_registered',
+        userId: data.userId,
+        username: data.username,
+      },
+      'New user registered'
+    );
   },
 
-  userLoggedIn: (log, data) => {
-    log.info({
-      event: 'user_logged_in',
-      userId: data.userId,
-      username: data.username,
-    }, 'User logged in');
+  userLoggedIn: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'user_logged_in',
+        userId: data.userId,
+        username: data.username,
+      },
+      'User logged in'
+    );
   },
 
   // Channel events
-  channelSubscribed: (log, data) => {
-    log.info({
-      event: 'channel_subscribed',
-      userId: data.userId,
-      channelId: data.channelId,
-    }, 'User subscribed to channel');
+  channelSubscribed: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'channel_subscribed',
+        userId: data.userId,
+        channelId: data.channelId,
+      },
+      'User subscribed to channel'
+    );
   },
 
   // System events
-  circuitBreakerOpen: (log, data) => {
-    log.warn({
-      event: 'circuit_breaker_open',
-      service: data.service,
-      failures: data.failures,
-    }, `Circuit breaker opened for ${data.service}`);
+  circuitBreakerOpen: (log: Logger, data: LogEventData): void => {
+    log.warn(
+      {
+        event: 'circuit_breaker_open',
+        service: data.service,
+        failures: data.failures,
+      },
+      `Circuit breaker opened for ${data.service}`
+    );
   },
 
-  circuitBreakerClose: (log, data) => {
-    log.info({
-      event: 'circuit_breaker_close',
-      service: data.service,
-    }, `Circuit breaker closed for ${data.service}`);
+  circuitBreakerClose: (log: Logger, data: LogEventData): void => {
+    log.info(
+      {
+        event: 'circuit_breaker_close',
+        service: data.service,
+      },
+      `Circuit breaker closed for ${data.service}`
+    );
   },
 
-  rateLimitExceeded: (log, data) => {
-    log.warn({
-      event: 'rate_limit_exceeded',
-      endpoint: data.endpoint,
-      ip: data.ip,
-      userId: data.userId,
-    }, 'Rate limit exceeded');
+  rateLimitExceeded: (log: Logger, data: LogEventData): void => {
+    log.warn(
+      {
+        event: 'rate_limit_exceeded',
+        endpoint: data.endpoint,
+        ip: data.ip,
+        userId: data.userId,
+      },
+      'Rate limit exceeded'
+    );
   },
 
-  cacheHit: (log, data) => {
-    log.debug({
-      event: 'cache_hit',
-      key: data.key,
-    }, 'Cache hit');
+  cacheHit: (log: Logger, data: LogEventData): void => {
+    log.debug(
+      {
+        event: 'cache_hit',
+        key: data.key,
+      },
+      'Cache hit'
+    );
   },
 
-  cacheMiss: (log, data) => {
-    log.debug({
-      event: 'cache_miss',
-      key: data.key,
-    }, 'Cache miss');
+  cacheMiss: (log: Logger, data: LogEventData): void => {
+    log.debug(
+      {
+        event: 'cache_miss',
+        key: data.key,
+      },
+      'Cache miss'
+    );
   },
 };
 

@@ -25,16 +25,18 @@ declare module 'express-serve-static-core' {
 const router: Router = express.Router();
 
 // Circuit breaker for suggestion service
-let suggestionCircuit: CircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]> | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let suggestionCircuit: CircuitBreaker<any> | null = null;
 
 /**
  * Initialize circuit breaker lazily (needs access to suggestionService)
  */
 function getSuggestionCircuit(
   suggestionService: SuggestionService
-): CircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+): CircuitBreaker<any> {
   if (!suggestionCircuit) {
-    suggestionCircuit = createCircuitBreaker<RankedSuggestion[], [string, SuggestionOptions]>(
+    suggestionCircuit = createCircuitBreaker<RankedSuggestion[]>(
       'suggestions',
       async (prefix: string, options: SuggestionOptions) => {
         return suggestionService.getSuggestions(prefix, options);
@@ -107,7 +109,7 @@ router.get('/', suggestionRateLimiter, async (req: Request, res: Response) => {
         suggestions = await circuit.fire(
           prefix,
           { userId: userId as string | undefined, limit: parseInt(limit as string) }
-        );
+        ) as RankedSuggestion[];
       } catch (circuitError) {
         // Circuit breaker fallback already triggered
         suggestions = [];

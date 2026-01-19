@@ -223,7 +223,7 @@ const feedGenerationBreaker = createCircuitBreaker(
           createdAt: post.created_at,
           isLiked: likeCheck.rows.length > 0,
           isSaved: savedCheck.rows.length > 0,
-          media: mediaResult.rows.map((m) => ({
+          media: mediaResult.rows.map((m: MediaRow) => ({
             id: m.id,
             mediaType: m.media_type,
             mediaUrl: m.media_url,

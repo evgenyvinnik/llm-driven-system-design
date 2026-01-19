@@ -265,7 +265,7 @@ async function getRecommendations(
       sections.push({
         title: 'Continue Watching',
         type: 'continue_watching',
-        items: continueWatching.rows.map(row => ({
+        items: continueWatching.rows.map((row: ContentRow) => ({
           ...row,
           progressPercent: Math.round((row.progress_pct ?? 0) * 100)
         }))

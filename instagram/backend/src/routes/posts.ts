@@ -188,7 +188,7 @@ router.post(
 );
 
 // Get single post
-router.get('/:postId', optionalAuth as express.RequestHandler, async (req: Request, res: Response): Promise<void> => {
+router.get('/:postId', optionalAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
   try {
     const { postId } = req.params;
     const authReq = req as AuthenticatedRequest;

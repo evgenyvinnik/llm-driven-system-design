@@ -70,7 +70,7 @@ router.get('/stats', isAuthenticated, isAdmin, async (req: Request, res: Respons
       totalUsers: parseInt(users.rows[0].count),
       totalContent: parseInt(content.rows[0].count),
       totalViews: parseInt(views.rows[0].total || '0') || 0,
-      activeSubscriptions: subscriptions.rows.reduce((acc: Record<string, number>, row) => {
+      activeSubscriptions: subscriptions.rows.reduce((acc: Record<string, number>, row: StatsRow) => {
         if (row.subscription_tier) {
           acc[row.subscription_tier] = parseInt(row.count);
         }

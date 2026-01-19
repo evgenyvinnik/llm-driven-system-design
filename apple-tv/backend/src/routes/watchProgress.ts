@@ -124,7 +124,7 @@ router.get('/continue', isAuthenticated, async (req: Request, res: Response): Pr
       LIMIT 20
     `, [req.session.profileId]);
 
-    const items = result.rows.map(row => ({
+    const items = result.rows.map((row: ContinueWatchingRow) => ({
       ...row,
       progressPercent: Math.round(row.progress_pct * 100),
       remainingMinutes: Math.round((row.duration - row.position) / 60)

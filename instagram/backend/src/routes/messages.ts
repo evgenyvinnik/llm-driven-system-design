@@ -137,7 +137,7 @@ router.post('/conversations', requireAuth, requireCassandra, async (req: Authent
  */
 router.get('/conversations/:conversationId', requireAuth, requireCassandra, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { conversationId } = req.params;
+    const conversationId = req.params.conversationId as string;
     const { limit: limitStr = '50', before: beforeMessageId } = req.query as { limit?: string; before?: string };
     const limit = parseInt(limitStr);
 
@@ -165,7 +165,7 @@ interface SendMessageBody {
 router.post('/conversations/:conversationId', requireAuth, requireCassandra, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.session.userId!;
-    const { conversationId } = req.params;
+    const conversationId = req.params.conversationId as string;
     const { content, contentType = 'text', mediaUrl, replyToMessageId } = req.body as SendMessageBody;
 
     if (!content && !mediaUrl) {
@@ -201,7 +201,7 @@ interface MarkReadBody {
 router.post('/conversations/:conversationId/read', requireAuth, requireCassandra, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.session.userId!;
-    const { conversationId } = req.params;
+    const conversationId = req.params.conversationId as string;
     const { lastMessageId } = req.body as MarkReadBody;
 
     if (!lastMessageId) {
@@ -226,7 +226,7 @@ router.post('/conversations/:conversationId/read', requireAuth, requireCassandra
 router.post('/conversations/:conversationId/typing', requireAuth, requireCassandra, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.session.userId!;
-    const { conversationId } = req.params;
+    const conversationId = req.params.conversationId as string;
 
     await setTypingIndicator(conversationId, userId);
 

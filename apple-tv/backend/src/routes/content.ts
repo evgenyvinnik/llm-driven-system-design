@@ -250,7 +250,7 @@ router.get('/meta/genres', async (req: Request, res: Response): Promise<void> =>
       ORDER BY genre
     `);
 
-    const genres = result.rows.map(r => r.genre);
+    const genres = result.rows.map((r: { genre: string }) => r.genre);
 
     await redis.setEx('content:genres', 3600, JSON.stringify(genres));
 

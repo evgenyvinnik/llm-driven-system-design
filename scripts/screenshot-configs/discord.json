@@ -2,6 +2,7 @@
   "name": "discord",
   "frontendPort": 5173,
   "backendRequired": true,
+  "backendPort": 3001,
   "dbName": "babydiscord",
   "dbUser": "discord",
   "auth": {
@@ -12,7 +13,7 @@
     },
     "usernameSelector": "input#nickname, input[name='nickname'], input[type='text']",
     "submitSelector": "button[type='submit']",
-    "successIndicator": ".bg-discord-darker, .bg-discord-channel, aside"
+    "successIndicator": ".bg-discord-darker, .bg-discord-channel, aside, main"
   },
   "screens": [
     {
@@ -25,7 +26,31 @@
     {
       "name": "02-home",
       "path": "/channels/@me",
-      "waitFor": "aside, main",
+      "waitFor": "main, .text-2xl",
+      "delay": 1500
+    },
+    {
+      "name": "03-general-channel",
+      "path": "/channels/general",
+      "waitFor": ".font-semibold, [class*='MessageList'], .flex-1",
+      "delay": 2000
+    },
+    {
+      "name": "04-tech-talk-channel",
+      "path": "/channels/tech-talk",
+      "waitFor": ".font-semibold",
+      "delay": 1500
+    },
+    {
+      "name": "05-gaming-channel",
+      "path": "/channels/gaming",
+      "waitFor": ".font-semibold",
+      "delay": 1500
+    },
+    {
+      "name": "06-random-channel",
+      "path": "/channels/random",
+      "waitFor": ".font-semibold",
       "delay": 1500
     }
   ],

@@ -260,7 +260,7 @@ router.post('/comments/:commentId/like', requireAuth as RequestHandler, async (r
 });
 
 // Unlike comment - idempotent operation
-router.delete('/comments/:commentId/like', requireAuth as express.RequestHandler, async (req: Request, res: Response): Promise<void> => {
+router.delete('/comments/:commentId/like', requireAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
   try {
     const { commentId } = req.params;
     const authReq = req as AuthenticatedRequest;
@@ -319,7 +319,7 @@ router.get('/comments/:commentId/replies', async (req: Request, res: Response): 
     const replies = result.rows.slice(0, limitNum);
 
     res.json({
-      replies: replies.map((c) => ({
+      replies: replies.map((c: CommentRow) => ({
         id: c.id,
         userId: c.user_id,
         username: c.username,

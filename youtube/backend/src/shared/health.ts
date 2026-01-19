@@ -1,3 +1,4 @@
+import { Request, Response } from 'express';
 import { query } from '../utils/db.js';
 import redis from '../utils/redis.js';
 import { objectExists } from '../utils/storage.js';
@@ -5,6 +6,32 @@ import { getCircuitBreakerHealth, hasOpenCircuit } from './circuitBreaker.js';
 import { transcodeQueueDepth } from './metrics.js';
 import logger from './logger.js';
 import config from '../config/index.js';
+
+// ============ Type Definitions ============
+
+interface HealthCheckResult {
+  status: 'healthy' | 'unhealthy';
+  latencyMs: number;
+  error?: string;
+}
+
+interface MemoryUsage {
+  heapUsed: number;
+  heapTotal: number;
+  external: number;
+  rss: number;
+}
+
+interface HealthResponse {
+  status: 'ok' | 'healthy' | 'degraded' | 'error';
+  timestamp: string;
+  uptime?: number;
+  version?: string;
+  checks?: Record<string, HealthCheckResult>;
+  circuitBreakers?: Record<string, unknown>;
+  memory?: MemoryUsage;
+  error?: string;
+}
 
 /**
  * Health Check Module
@@ -14,10 +41,12 @@ import config from '../config/index.js';
  * 2. Readiness: Deep check of all dependencies
  */
 
+// ============ Health Check Functions ============
+
 /**
  * Check database health
  */
-async function checkDatabase() {
+async function checkDatabase(): Promise<HealthCheckResult> {
   const start = Date.now();
   try {
     await query('SELECT 1');
@@ -26,11 +55,11 @@ async function checkDatabase() {
       latencyMs: Date.now() - start,
     };
   } catch (error) {
-    logger.error({ error: error.message }, 'Database health check failed');
+    logger.error({ error: (error as Error).message }, 'Database health check failed');
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -38,7 +67,7 @@ async function checkDatabase() {
 /**
  * Check Redis health
  */
-async function checkRedis() {
+async function checkRedis(): Promise<HealthCheckResult> {
   const start = Date.now();
   try {
     await redis.ping();
@@ -47,11 +76,11 @@ async function checkRedis() {
       latencyMs: Date.now() - start,
     };
   } catch (error) {
-    logger.error({ error: error.message }, 'Redis health check failed');
+    logger.error({ error: (error as Error).message }, 'Redis health check failed');
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -59,7 +88,7 @@ async function checkRedis() {
 /**
  * Check MinIO health
  */
-async function checkStorage() {
+async function checkStorage(): Promise<HealthCheckResult> {
   const start = Date.now();
   try {
     // Try to check if a test key exists (doesn't need to exist)
@@ -69,18 +98,19 @@ async function checkStorage() {
       latencyMs: Date.now() - start,
     };
   } catch (error) {
+    const err = error as { name?: string; Code?: string; message?: string };
     // NotFound is OK - it means storage is reachable
-    if (error.name === 'NotFound' || error.Code === 'NotFound') {
+    if (err.name === 'NotFound' || err.Code === 'NotFound') {
       return {
         status: 'healthy',
         latencyMs: Date.now() - start,
       };
     }
-    logger.error({ error: error.message }, 'Storage health check failed');
+    logger.error({ error: err.message }, 'Storage health check failed');
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: err.message,
     };
   }
 }
@@ -88,7 +118,7 @@ async function checkStorage() {
 /**
  * Get memory usage
  */
-function getMemoryUsage() {
+function getMemoryUsage(): MemoryUsage {
   const usage = process.memoryUsage();
   return {
     heapUsed: Math.round(usage.heapUsed / 1024 / 1024),
@@ -98,11 +128,13 @@ function getMemoryUsage() {
   };
 }
 
+// ============ Handler Functions ============
+
 /**
  * Liveness check handler
  * Quick check - just confirms the service is running
  */
-export const livenessHandler = (req, res) => {
+export const livenessHandler = (_req: Request, res: Response): void => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -114,7 +146,7 @@ export const livenessHandler = (req, res) => {
  * Readiness check handler
  * Deep check - verifies all dependencies are healthy
  */
-export const readinessHandler = async (req, res) => {
+export const readinessHandler = async (_req: Request, res: Response): Promise<void> => {
   try {
     // Run all health checks in parallel
     const [database, redisHealth, storage] = await Promise.all([
@@ -133,7 +165,7 @@ export const readinessHandler = async (req, res) => {
 
     const status = allHealthy && !hasCircuitIssues ? 'healthy' : 'degraded';
 
-    const response = {
+    const response: HealthResponse = {
       status,
       timestamp: new Date().toISOString(),
       uptime: Math.round(process.uptime()),
@@ -148,11 +180,11 @@ export const readinessHandler = async (req, res) => {
 
     res.status(httpStatus).json(response);
   } catch (error) {
-    logger.error({ error: error.message }, 'Health check error');
+    logger.error({ error: (error as Error).message }, 'Health check error');
     res.status(503).json({
       status: 'error',
       timestamp: new Date().toISOString(),
-      error: error.message,
+      error: (error as Error).message,
     });
   }
 };
@@ -160,7 +192,7 @@ export const readinessHandler = async (req, res) => {
 /**
  * Detailed health handler for monitoring dashboards
  */
-export const detailedHealthHandler = async (req, res) => {
+export const detailedHealthHandler = async (_req: Request, res: Response): Promise<void> => {
   try {
     const [database, redisHealth, storage] = await Promise.all([
       checkDatabase(),
@@ -177,7 +209,7 @@ export const detailedHealthHandler = async (req, res) => {
       const { getQueueLength } = await import('../services/transcoding.js');
       queueDepth = getQueueLength();
       transcodeQueueDepth.set(queueDepth);
-    } catch (e) {
+    } catch {
       // Ignore if transcoding service not available
     }
 
@@ -209,10 +241,10 @@ export const detailedHealthHandler = async (req, res) => {
       },
     });
   } catch (error) {
-    logger.error({ error: error.message }, 'Detailed health check error');
+    logger.error({ error: (error as Error).message }, 'Detailed health check error');
     res.status(503).json({
       status: 'error',
-      error: error.message,
+      error: (error as Error).message,
     });
   }
 };
@@ -220,13 +252,13 @@ export const detailedHealthHandler = async (req, res) => {
 /**
  * Format uptime to human readable
  */
-function formatUptime(seconds) {
+function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
 
-  const parts = [];
+  const parts: string[] = [];
   if (days > 0) parts.push(`${days}d`);
   if (hours > 0) parts.push(`${hours}h`);
   if (minutes > 0) parts.push(`${minutes}m`);
