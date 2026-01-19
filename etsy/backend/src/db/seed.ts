@@ -1,7 +1,45 @@
 import bcrypt from 'bcrypt';
 import db from './index.js';
 
-const categories = [
+interface Category {
+  name: string;
+  slug: string;
+}
+
+interface User {
+  email: string;
+  password: string;
+  username: string;
+  full_name: string;
+  role: string;
+}
+
+interface Shop {
+  ownerEmail: string;
+  name: string;
+  slug: string;
+  description: string;
+  location: string;
+  shipping_policy: { processing_days: number; ships_from: string };
+  return_policy: string;
+}
+
+interface Product {
+  shopSlug: string;
+  categorySlug: string;
+  title: string;
+  description: string;
+  price: number;
+  quantity: number;
+  tags: string[];
+  images: string[];
+  is_vintage?: boolean;
+  is_handmade?: boolean;
+  shipping_price: number;
+  processing_time: string;
+}
+
+const categories: Category[] = [
   { name: 'Jewelry & Accessories', slug: 'jewelry-accessories' },
   { name: 'Clothing & Shoes', slug: 'clothing-shoes' },
   { name: 'Home & Living', slug: 'home-living' },
@@ -12,7 +50,7 @@ const categories = [
   { name: 'Toys & Games', slug: 'toys-games' },
 ];
 
-const users = [
+const users: User[] = [
   {
     email: 'alice@example.com',
     password: 'password123',
@@ -50,10 +88,10 @@ const users = [
   },
 ];
 
-const shops = [
+const shops: Shop[] = [
   {
     ownerEmail: 'alice@example.com',
-    name: 'Alice\'s Handmade Jewelry',
+    name: "Alice's Handmade Jewelry",
     slug: 'alices-handmade-jewelry',
     description: 'Beautiful handcrafted jewelry made with love. Each piece is unique and made with high-quality materials.',
     location: 'Portland, Oregon',
@@ -62,7 +100,7 @@ const shops = [
   },
   {
     ownerEmail: 'bob@example.com',
-    name: 'Bob\'s Woodwork Studio',
+    name: "Bob's Woodwork Studio",
     slug: 'bobs-woodwork-studio',
     description: 'Handcrafted wooden items for your home. Made from sustainably sourced wood with traditional techniques.',
     location: 'Austin, Texas',
@@ -71,7 +109,7 @@ const shops = [
   },
   {
     ownerEmail: 'carol@example.com',
-    name: 'Carol\'s Vintage Finds',
+    name: "Carol's Vintage Finds",
     slug: 'carols-vintage-finds',
     description: 'Curated collection of vintage and antique items. Each piece has a story to tell.',
     location: 'Brooklyn, New York',
@@ -80,7 +118,7 @@ const shops = [
   },
 ];
 
-const products = [
+const products: Product[] = [
   // Alice's jewelry
   {
     shopSlug: 'alices-handmade-jewelry',
@@ -220,7 +258,7 @@ const products = [
   },
 ];
 
-async function seed() {
+async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   try {
@@ -248,7 +286,7 @@ async function seed() {
     // Insert shops
     console.log('Inserting shops...');
     for (const shop of shops) {
-      const userResult = await db.query('SELECT id FROM users WHERE email = $1', [shop.ownerEmail]);
+      const userResult = await db.query<{ id: number }>('SELECT id FROM users WHERE email = $1', [shop.ownerEmail]);
       if (userResult.rows.length > 0) {
         await db.query(
           `INSERT INTO shops (owner_id, name, slug, description, location, shipping_policy, return_policy)
@@ -262,8 +300,8 @@ async function seed() {
     // Insert products
     console.log('Inserting products...');
     for (const product of products) {
-      const shopResult = await db.query('SELECT id FROM shops WHERE slug = $1', [product.shopSlug]);
-      const categoryResult = await db.query('SELECT id FROM categories WHERE slug = $1', [product.categorySlug]);
+      const shopResult = await db.query<{ id: number }>('SELECT id FROM shops WHERE slug = $1', [product.shopSlug]);
+      const categoryResult = await db.query<{ id: number }>('SELECT id FROM categories WHERE slug = $1', [product.categorySlug]);
 
       if (shopResult.rows.length > 0 && categoryResult.rows.length > 0) {
         await db.query(

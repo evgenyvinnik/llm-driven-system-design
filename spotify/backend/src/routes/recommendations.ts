@@ -1,17 +1,23 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import recommendationService from '../services/recommendationService.js';
-import { requireAuth, optionalAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
 import { rateLimiters } from '../shared/rateLimit.js';
 import { recommendationLatency } from '../shared/metrics.js';
+import type { AuthenticatedRequest } from '../types.js';
 
 const router = Router();
 
+interface RecommendationsQuery {
+  limit?: string;
+}
+
 // Get personalized recommendations (requires auth)
-router.get('/for-you', requireAuth, rateLimiters.recommendations, async (req, res) => {
+router.get('/for-you', requireAuth, rateLimiters.recommendations, async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   const startTime = Date.now();
   try {
-    const { limit = 30 } = req.query;
-    const tracks = await recommendationService.getRecommendations(req.session.userId, {
+    const { limit = '30' } = req.query as RecommendationsQuery;
+    const tracks = await recommendationService.getRecommendations(authReq.session.userId!, {
       limit: parseInt(limit),
     });
 
@@ -20,17 +26,19 @@ router.get('/for-you', requireAuth, rateLimiters.recommendations, async (req, re
 
     res.json({ tracks });
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Get recommendations error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Get recommendations error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Get Discover Weekly (requires auth)
-router.get('/discover-weekly', requireAuth, rateLimiters.recommendations, async (req, res) => {
+router.get('/discover-weekly', requireAuth, rateLimiters.recommendations, async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   const startTime = Date.now();
   try {
-    const tracks = await recommendationService.getDiscoverWeekly(req.session.userId);
+    const tracks = await recommendationService.getDiscoverWeekly(authReq.session.userId!);
 
     // Record latency
     recommendationLatency.observe({ algorithm: 'discover_weekly' }, (Date.now() - startTime) / 1000);
@@ -41,16 +49,17 @@ router.get('/discover-weekly', requireAuth, rateLimiters.recommendations, async 
       tracks,
     });
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Get discover weekly error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Get discover weekly error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Get popular/trending tracks (no auth required)
-router.get('/popular', async (req, res) => {
+router.get('/popular', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { limit = 30 } = req.query;
+    const { limit = '30' } = req.query as RecommendationsQuery;
     const tracks = await recommendationService.getPopularTracks({
       limit: parseInt(limit),
     });
@@ -62,9 +71,9 @@ router.get('/popular', async (req, res) => {
 });
 
 // Get similar tracks
-router.get('/similar/:trackId', async (req, res) => {
+router.get('/similar/:trackId', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { limit = 20 } = req.query;
+    const { limit = '20' } = req.query as RecommendationsQuery;
     const tracks = await recommendationService.getSimilarTracks(req.params.trackId, {
       limit: parseInt(limit),
     });
@@ -76,9 +85,9 @@ router.get('/similar/:trackId', async (req, res) => {
 });
 
 // Get artist radio
-router.get('/radio/artist/:artistId', async (req, res) => {
+router.get('/radio/artist/:artistId', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { limit = 50 } = req.query;
+    const { limit = '50' } = req.query as RecommendationsQuery;
     const tracks = await recommendationService.getArtistRadio(req.params.artistId, {
       limit: parseInt(limit),
     });

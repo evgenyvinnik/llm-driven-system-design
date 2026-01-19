@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../utils/db.js';
 import { authenticate } from '../middleware/auth.js';
@@ -6,42 +6,80 @@ import { auditService } from '../services/auditService.js';
 
 const router = Router();
 
+interface EnvelopeRow {
+  id: string;
+  sender_id: string;
+  status: string;
+}
+
+interface RecipientRow {
+  id: string;
+  envelope_id: string;
+  name: string;
+  email: string;
+  role: string;
+  routing_order: number;
+  status: string;
+  access_token: string;
+  phone: string | null;
+  access_code: string | null;
+  created_at: string;
+  sender_id?: string;
+  envelope_status?: string;
+  field_count?: string;
+  completed_field_count?: string;
+}
+
+interface RecipientOrderUpdate {
+  id: string;
+  routingOrder: number;
+}
+
 // Add recipient to envelope
-router.post('/:envelopeId', authenticate, async (req, res) => {
+router.post('/:envelopeId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { envelopeId } = req.params;
     const { name, email, role = 'signer', routingOrder = 1, phone, accessCode } = req.body;
 
     if (!name || !email) {
-      return res.status(400).json({ error: 'Name and email are required' });
+      res.status(400).json({ error: 'Name and email are required' });
+      return;
+    }
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     // Verify envelope ownership and status
-    const envelopeResult = await query(
+    const envelopeResult = await query<EnvelopeRow>(
       'SELECT * FROM envelopes WHERE id = $1 AND sender_id = $2',
       [envelopeId, req.user.id]
     );
 
     if (envelopeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Envelope not found' });
+      res.status(404).json({ error: 'Envelope not found' });
+      return;
     }
 
     if (envelopeResult.rows[0].status !== 'draft') {
-      return res.status(400).json({ error: 'Can only add recipients to draft envelopes' });
+      res.status(400).json({ error: 'Can only add recipients to draft envelopes' });
+      return;
     }
 
     // Check for duplicate email in envelope
-    const existingResult = await query(
+    const existingResult = await query<{ id: string }>(
       'SELECT id FROM recipients WHERE envelope_id = $1 AND email = $2',
       [envelopeId, email]
     );
 
     if (existingResult.rows.length > 0) {
-      return res.status(400).json({ error: 'Recipient with this email already exists in envelope' });
+      res.status(400).json({ error: 'Recipient with this email already exists in envelope' });
+      return;
     }
 
     const recipientId = uuid();
-    const result = await query(
+    const result = await query<RecipientRow>(
       `INSERT INTO recipients (id, envelope_id, name, email, role, routing_order, phone, access_code)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
@@ -68,21 +106,27 @@ router.post('/:envelopeId', authenticate, async (req, res) => {
 });
 
 // Get recipients for envelope
-router.get('/envelope/:envelopeId', authenticate, async (req, res) => {
+router.get('/envelope/:envelopeId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { envelopeId } = req.params;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify envelope ownership
-    const envelopeResult = await query(
+    const envelopeResult = await query<EnvelopeRow>(
       'SELECT * FROM envelopes WHERE id = $1 AND sender_id = $2',
       [envelopeId, req.user.id]
     );
 
     if (envelopeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Envelope not found' });
+      res.status(404).json({ error: 'Envelope not found' });
+      return;
     }
 
-    const result = await query(
+    const result = await query<RecipientRow>(
       `SELECT r.*,
               (SELECT COUNT(*) FROM document_fields df
                JOIN documents d ON df.document_id = d.id
@@ -104,13 +148,18 @@ router.get('/envelope/:envelopeId', authenticate, async (req, res) => {
 });
 
 // Update recipient
-router.put('/:id', authenticate, async (req, res) => {
+router.put('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const { name, email, role, routingOrder, phone, accessCode } = req.body;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify recipient and envelope ownership
-    const recipientResult = await query(
+    const recipientResult = await query<RecipientRow>(
       `SELECT r.*, e.sender_id, e.status as envelope_status
        FROM recipients r
        JOIN envelopes e ON r.envelope_id = e.id
@@ -119,32 +168,36 @@ router.put('/:id', authenticate, async (req, res) => {
     );
 
     if (recipientResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Recipient not found' });
+      res.status(404).json({ error: 'Recipient not found' });
+      return;
     }
 
     const recipient = recipientResult.rows[0];
 
     if (recipient.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (recipient.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only edit recipients in draft envelopes' });
+      res.status(400).json({ error: 'Can only edit recipients in draft envelopes' });
+      return;
     }
 
     // Check for duplicate email if changing
     if (email && email !== recipient.email) {
-      const existingResult = await query(
+      const existingResult = await query<{ id: string }>(
         'SELECT id FROM recipients WHERE envelope_id = $1 AND email = $2 AND id != $3',
         [recipient.envelope_id, email, id]
       );
 
       if (existingResult.rows.length > 0) {
-        return res.status(400).json({ error: 'Recipient with this email already exists in envelope' });
+        res.status(400).json({ error: 'Recipient with this email already exists in envelope' });
+        return;
       }
     }
 
-    const result = await query(
+    const result = await query<RecipientRow>(
       `UPDATE recipients
        SET name = COALESCE($2, name),
            email = COALESCE($3, email),
@@ -165,12 +218,17 @@ router.put('/:id', authenticate, async (req, res) => {
 });
 
 // Delete recipient
-router.delete('/:id', authenticate, async (req, res) => {
+router.delete('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify recipient and envelope ownership
-    const recipientResult = await query(
+    const recipientResult = await query<RecipientRow>(
       `SELECT r.*, e.sender_id, e.status as envelope_status
        FROM recipients r
        JOIN envelopes e ON r.envelope_id = e.id
@@ -179,17 +237,20 @@ router.delete('/:id', authenticate, async (req, res) => {
     );
 
     if (recipientResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Recipient not found' });
+      res.status(404).json({ error: 'Recipient not found' });
+      return;
     }
 
     const recipient = recipientResult.rows[0];
 
     if (recipient.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (recipient.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only delete recipients from draft envelopes' });
+      res.status(400).json({ error: 'Can only delete recipients from draft envelopes' });
+      return;
     }
 
     await query('DELETE FROM recipients WHERE id = $1', [id]);
@@ -202,27 +263,35 @@ router.delete('/:id', authenticate, async (req, res) => {
 });
 
 // Reorder recipients
-router.post('/envelope/:envelopeId/reorder', authenticate, async (req, res) => {
+router.post('/envelope/:envelopeId/reorder', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { envelopeId } = req.params;
-    const { recipients } = req.body; // Array of { id, routingOrder }
+    const { recipients } = req.body as { recipients: RecipientOrderUpdate[] };
 
     if (!Array.isArray(recipients)) {
-      return res.status(400).json({ error: 'Recipients array is required' });
+      res.status(400).json({ error: 'Recipients array is required' });
+      return;
+    }
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     // Verify envelope ownership
-    const envelopeResult = await query(
+    const envelopeResult = await query<EnvelopeRow>(
       'SELECT * FROM envelopes WHERE id = $1 AND sender_id = $2',
       [envelopeId, req.user.id]
     );
 
     if (envelopeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Envelope not found' });
+      res.status(404).json({ error: 'Envelope not found' });
+      return;
     }
 
     if (envelopeResult.rows[0].status !== 'draft') {
-      return res.status(400).json({ error: 'Can only reorder recipients in draft envelopes' });
+      res.status(400).json({ error: 'Can only reorder recipients in draft envelopes' });
+      return;
     }
 
     // Update routing orders
@@ -234,7 +303,7 @@ router.post('/envelope/:envelopeId/reorder', authenticate, async (req, res) => {
     }
 
     // Return updated recipients
-    const result = await query(
+    const result = await query<RecipientRow>(
       'SELECT * FROM recipients WHERE envelope_id = $1 ORDER BY routing_order ASC',
       [envelopeId]
     );

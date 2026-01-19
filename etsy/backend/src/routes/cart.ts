@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
 
@@ -10,10 +10,62 @@ const logger = createLogger('cart');
 
 const router = Router();
 
+interface CartItemRow {
+  id: number;
+  user_id: number;
+  product_id: number;
+  quantity: number;
+  reserved_until: Date | null;
+  created_at: Date;
+  updated_at: Date;
+  title?: string;
+  price?: string;
+  available?: number;
+  images?: string[];
+  shipping_price?: string;
+  shop_id?: number;
+  shop_name?: string;
+  shop_slug?: string;
+}
+
+interface ProductRow {
+  id: number;
+  quantity: number;
+  title: string;
+}
+
+interface CartItemBody {
+  productId: number | string;
+  quantity?: number | string;
+}
+
+interface UpdateCartItemBody {
+  quantity: number | string;
+}
+
+interface ShopGroup {
+  shopId: number;
+  shopName: string;
+  shopSlug: string;
+  items: {
+    id: number;
+    productId: number;
+    title: string;
+    price: number;
+    quantity: number;
+    available: number;
+    images: string[];
+    shippingPrice: number;
+    itemTotal: number;
+  }[];
+  subtotal: number;
+  shippingTotal: number;
+}
+
 // Get user's cart (grouped by shop)
-router.get('/', isAuthenticated, async (req, res) => {
+router.get('/', isAuthenticated, async (req: Request, res: Response) => {
   try {
-    const result = await db.query(
+    const result = await db.query<CartItemRow>(
       `SELECT ci.*, p.title, p.price, p.quantity as available, p.images, p.shipping_price,
               s.id as shop_id, s.name as shop_name, s.slug as shop_slug
        FROM cart_items ci
@@ -25,32 +77,33 @@ router.get('/', isAuthenticated, async (req, res) => {
     );
 
     // Group by shop
-    const byShop = result.rows.reduce((acc, item) => {
-      if (!acc[item.shop_id]) {
-        acc[item.shop_id] = {
-          shopId: item.shop_id,
-          shopName: item.shop_name,
-          shopSlug: item.shop_slug,
+    const byShop = result.rows.reduce<Record<number, ShopGroup>>((acc, item) => {
+      const shopId = item.shop_id!;
+      if (!acc[shopId]) {
+        acc[shopId] = {
+          shopId: shopId,
+          shopName: item.shop_name!,
+          shopSlug: item.shop_slug!,
           items: [],
           subtotal: 0,
           shippingTotal: 0,
         };
       }
 
-      const itemTotal = parseFloat(item.price) * item.quantity;
-      acc[item.shop_id].items.push({
+      const itemTotal = parseFloat(item.price!) * item.quantity;
+      acc[shopId].items.push({
         id: item.id,
         productId: item.product_id,
-        title: item.title,
-        price: parseFloat(item.price),
+        title: item.title!,
+        price: parseFloat(item.price!),
         quantity: item.quantity,
-        available: item.available,
-        images: item.images,
-        shippingPrice: parseFloat(item.shipping_price),
+        available: item.available!,
+        images: item.images || [],
+        shippingPrice: parseFloat(item.shipping_price!),
         itemTotal,
       });
-      acc[item.shop_id].subtotal += itemTotal;
-      acc[item.shop_id].shippingTotal += parseFloat(item.shipping_price);
+      acc[shopId].subtotal += itemTotal;
+      acc[shopId].shippingTotal += parseFloat(item.shipping_price!);
       return acc;
     }, {});
 
@@ -75,7 +128,7 @@ router.get('/', isAuthenticated, async (req, res) => {
 });
 
 // Add item to cart
-router.post('/items', isAuthenticated, async (req, res) => {
+router.post('/items', isAuthenticated, async (req: Request<object, object, CartItemBody>, res: Response) => {
   try {
     const { productId, quantity = 1 } = req.body;
 
@@ -83,10 +136,13 @@ router.post('/items', isAuthenticated, async (req, res) => {
       return res.status(400).json({ error: 'Product ID is required' });
     }
 
+    const parsedProductId = parseInt(String(productId));
+    const parsedQuantity = parseInt(String(quantity));
+
     // Check product exists and is available
-    const productResult = await db.query(
+    const productResult = await db.query<ProductRow>(
       'SELECT id, quantity, title FROM products WHERE id = $1 AND is_active = true',
-      [parseInt(productId)]
+      [parsedProductId]
     );
 
     if (productResult.rows.length === 0) {
@@ -95,19 +151,19 @@ router.post('/items', isAuthenticated, async (req, res) => {
 
     const product = productResult.rows[0];
 
-    if (product.quantity < quantity) {
+    if (product.quantity < parsedQuantity) {
       return res.status(400).json({ error: 'Not enough stock available' });
     }
 
     // Check if product already in cart
-    const existingResult = await db.query(
+    const existingResult = await db.query<{ id: number; quantity: number }>(
       'SELECT id, quantity FROM cart_items WHERE user_id = $1 AND product_id = $2',
-      [req.session.userId, parseInt(productId)]
+      [req.session.userId, parsedProductId]
     );
 
     if (existingResult.rows.length > 0) {
       // Update quantity
-      const newQuantity = existingResult.rows[0].quantity + parseInt(quantity);
+      const newQuantity = existingResult.rows[0].quantity + parsedQuantity;
 
       if (newQuantity > product.quantity) {
         return res.status(400).json({ error: 'Not enough stock available' });
@@ -119,7 +175,7 @@ router.post('/items', isAuthenticated, async (req, res) => {
       );
 
       cartOperations.labels('update').inc();
-      logger.debug({ userId: req.session.userId, productId, newQuantity }, 'Cart item quantity updated');
+      logger.debug({ userId: req.session.userId, productId: parsedProductId, newQuantity }, 'Cart item quantity updated');
     } else {
       // Add new item with reservation for unique items
       const reservedUntil = product.quantity === 1
@@ -128,11 +184,11 @@ router.post('/items', isAuthenticated, async (req, res) => {
 
       await db.query(
         'INSERT INTO cart_items (user_id, product_id, quantity, reserved_until) VALUES ($1, $2, $3, $4)',
-        [req.session.userId, parseInt(productId), parseInt(quantity), reservedUntil]
+        [req.session.userId, parsedProductId, parsedQuantity, reservedUntil]
       );
 
       cartOperations.labels('add').inc();
-      logger.debug({ userId: req.session.userId, productId, quantity }, 'Item added to cart');
+      logger.debug({ userId: req.session.userId, productId: parsedProductId, quantity: parsedQuantity }, 'Item added to cart');
     }
 
     res.json({ message: 'Item added to cart' });
@@ -143,17 +199,19 @@ router.post('/items', isAuthenticated, async (req, res) => {
 });
 
 // Update cart item quantity
-router.put('/items/:itemId', isAuthenticated, async (req, res) => {
+router.put('/items/:itemId', isAuthenticated, async (req: Request<{ itemId: string }, object, UpdateCartItemBody>, res: Response) => {
   try {
     const { itemId } = req.params;
     const { quantity } = req.body;
 
-    if (!quantity || quantity < 1) {
+    const parsedQuantity = parseInt(String(quantity));
+
+    if (!parsedQuantity || parsedQuantity < 1) {
       return res.status(400).json({ error: 'Valid quantity is required' });
     }
 
     // Get cart item and check ownership
-    const cartItemResult = await db.query(
+    const cartItemResult = await db.query<CartItemRow & { available: number }>(
       `SELECT ci.*, p.quantity as available
        FROM cart_items ci
        JOIN products p ON ci.product_id = p.id
@@ -167,17 +225,17 @@ router.put('/items/:itemId', isAuthenticated, async (req, res) => {
 
     const cartItem = cartItemResult.rows[0];
 
-    if (parseInt(quantity) > cartItem.available) {
+    if (parsedQuantity > cartItem.available) {
       return res.status(400).json({ error: 'Not enough stock available' });
     }
 
     await db.query(
       'UPDATE cart_items SET quantity = $1, updated_at = NOW() WHERE id = $2',
-      [parseInt(quantity), parseInt(itemId)]
+      [parsedQuantity, parseInt(itemId)]
     );
 
     cartOperations.labels('update').inc();
-    logger.debug({ userId: req.session.userId, itemId, quantity }, 'Cart item updated');
+    logger.debug({ userId: req.session.userId, itemId, quantity: parsedQuantity }, 'Cart item updated');
 
     res.json({ message: 'Cart updated' });
   } catch (error) {
@@ -187,11 +245,11 @@ router.put('/items/:itemId', isAuthenticated, async (req, res) => {
 });
 
 // Remove item from cart
-router.delete('/items/:itemId', isAuthenticated, async (req, res) => {
+router.delete('/items/:itemId', isAuthenticated, async (req: Request<{ itemId: string }>, res: Response) => {
   try {
     const { itemId } = req.params;
 
-    const result = await db.query(
+    const result = await db.query<{ id: number }>(
       'DELETE FROM cart_items WHERE id = $1 AND user_id = $2 RETURNING id',
       [parseInt(itemId), req.session.userId]
     );
@@ -211,9 +269,9 @@ router.delete('/items/:itemId', isAuthenticated, async (req, res) => {
 });
 
 // Clear cart
-router.delete('/', isAuthenticated, async (req, res) => {
+router.delete('/', isAuthenticated, async (req: Request, res: Response) => {
   try {
-    const result = await db.query(
+    const result = await db.query<{ id: number }>(
       'DELETE FROM cart_items WHERE user_id = $1 RETURNING id',
       [req.session.userId]
     );

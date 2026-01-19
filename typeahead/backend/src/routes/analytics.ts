@@ -1,16 +1,38 @@
-import express from 'express';
+import express, { Router, Request, Response } from 'express';
+import type { Pool } from 'pg';
+import type { Trie } from '../data-structures/trie.js';
+import type { AggregationService } from '../services/aggregation-service.js';
 
-const router = express.Router();
+const router: Router = express.Router();
+
+interface QueryRow {
+  query: string;
+  count: string;
+  last_seen: Date;
+}
+
+interface PhraseRow {
+  phrase: string;
+  count: string;
+  last_updated: Date;
+}
+
+interface HourlyRow {
+  hour: Date;
+  query_count: string;
+  unique_queries: string;
+  unique_users: string;
+}
 
 /**
  * GET /api/v1/analytics/summary
  * Get analytics summary for the typeahead service.
  */
-router.get('/summary', async (req, res) => {
+router.get('/summary', async (req: Request, res: Response) => {
   try {
-    const pgPool = req.app.get('pgPool');
-    const trie = req.app.get('trie');
-    const aggregationService = req.app.get('aggregationService');
+    const pgPool = req.app.get('pgPool') as Pool;
+    const trie = req.app.get('trie') as Trie;
+    const aggregationService = req.app.get('aggregationService') as AggregationService;
 
     // Get today's query stats
     const todayStats = await pgPool.query(`
@@ -49,19 +71,19 @@ router.get('/summary', async (req, res) => {
 
     res.json({
       today: {
-        totalQueries: parseInt(todayStats.rows[0]?.total_queries || 0),
-        uniqueQueries: parseInt(todayStats.rows[0]?.unique_queries || 0),
-        uniqueUsers: parseInt(todayStats.rows[0]?.unique_users || 0),
-        avgQueryLength: parseFloat(todayStats.rows[0]?.avg_query_length || 0).toFixed(2),
+        totalQueries: parseInt(todayStats.rows[0]?.total_queries || '0'),
+        uniqueQueries: parseInt(todayStats.rows[0]?.unique_queries || '0'),
+        uniqueUsers: parseInt(todayStats.rows[0]?.unique_users || '0'),
+        avgQueryLength: parseFloat(todayStats.rows[0]?.avg_query_length || '0').toFixed(2),
       },
       allTime: {
-        totalQueries: parseInt(allTimeStats.rows[0]?.total_queries || 0),
-        uniqueQueries: parseInt(allTimeStats.rows[0]?.unique_queries || 0),
+        totalQueries: parseInt(allTimeStats.rows[0]?.total_queries || '0'),
+        uniqueQueries: parseInt(allTimeStats.rows[0]?.unique_queries || '0'),
       },
       phrases: {
-        totalPhrases: parseInt(phraseStats.rows[0]?.total_phrases || 0),
-        totalSearches: parseInt(phraseStats.rows[0]?.total_searches || 0),
-        maxPhraseCount: parseInt(phraseStats.rows[0]?.max_phrase_count || 0),
+        totalPhrases: parseInt(phraseStats.rows[0]?.total_phrases || '0'),
+        totalSearches: parseInt(phraseStats.rows[0]?.total_searches || '0'),
+        maxPhraseCount: parseInt(phraseStats.rows[0]?.max_phrase_count || '0'),
       },
       trie: trieStats,
       aggregation: aggStats,
@@ -71,7 +93,7 @@ router.get('/summary', async (req, res) => {
     console.error('Analytics summary error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -85,13 +107,13 @@ router.get('/summary', async (req, res) => {
  * - offset: Pagination offset (default: 0)
  * - search: Filter by query text (optional)
  */
-router.get('/queries', async (req, res) => {
+router.get('/queries', async (req: Request, res: Response) => {
   try {
-    const { limit = 50, offset = 0, search } = req.query;
-    const pgPool = req.app.get('pgPool');
+    const { limit = '50', offset = '0', search } = req.query;
+    const pgPool = req.app.get('pgPool') as Pool;
 
-    let query;
-    let params;
+    let query: string;
+    let params: (string | number)[];
 
     if (search) {
       query = `
@@ -102,7 +124,7 @@ router.get('/queries', async (req, res) => {
         ORDER BY count DESC
         LIMIT $2 OFFSET $3
       `;
-      params = [`%${search}%`, parseInt(limit), parseInt(offset)];
+      params = [`%${search}%`, parseInt(limit as string), parseInt(offset as string)];
     } else {
       query = `
         SELECT query, COUNT(*) as count, MAX(timestamp) as last_seen
@@ -112,28 +134,28 @@ router.get('/queries', async (req, res) => {
         ORDER BY count DESC
         LIMIT $1 OFFSET $2
       `;
-      params = [parseInt(limit), parseInt(offset)];
+      params = [parseInt(limit as string), parseInt(offset as string)];
     }
 
-    const result = await pgPool.query(query, params);
+    const result = await pgPool.query<QueryRow>(query, params);
 
     res.json({
-      queries: result.rows.map(row => ({
+      queries: result.rows.map((row) => ({
         query: row.query,
         count: parseInt(row.count),
         lastSeen: row.last_seen,
       })),
       meta: {
         count: result.rows.length,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
+        limit: parseInt(limit as string),
+        offset: parseInt(offset as string),
       },
     });
   } catch (error) {
     console.error('Analytics queries error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -145,21 +167,24 @@ router.get('/queries', async (req, res) => {
  * Query params:
  * - limit: Max number of phrases (default: 50)
  */
-router.get('/top-phrases', async (req, res) => {
+router.get('/top-phrases', async (req: Request, res: Response) => {
   try {
-    const { limit = 50 } = req.query;
-    const pgPool = req.app.get('pgPool');
+    const { limit = '50' } = req.query;
+    const pgPool = req.app.get('pgPool') as Pool;
 
-    const result = await pgPool.query(`
+    const result = await pgPool.query<PhraseRow>(
+      `
       SELECT phrase, count, last_updated
       FROM phrase_counts
       WHERE is_filtered = false
       ORDER BY count DESC
       LIMIT $1
-    `, [parseInt(limit)]);
+    `,
+      [parseInt(limit as string)]
+    );
 
     res.json({
-      phrases: result.rows.map(row => ({
+      phrases: result.rows.map((row) => ({
         phrase: row.phrase,
         count: parseInt(row.count),
         lastUpdated: row.last_updated,
@@ -172,7 +197,7 @@ router.get('/top-phrases', async (req, res) => {
     console.error('Analytics top-phrases error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -181,11 +206,11 @@ router.get('/top-phrases', async (req, res) => {
  * GET /api/v1/analytics/hourly
  * Get query volume by hour for the last 24 hours.
  */
-router.get('/hourly', async (req, res) => {
+router.get('/hourly', async (req: Request, res: Response) => {
   try {
-    const pgPool = req.app.get('pgPool');
+    const pgPool = req.app.get('pgPool') as Pool;
 
-    const result = await pgPool.query(`
+    const result = await pgPool.query<HourlyRow>(`
       SELECT
         DATE_TRUNC('hour', timestamp) as hour,
         COUNT(*) as query_count,
@@ -198,7 +223,7 @@ router.get('/hourly', async (req, res) => {
     `);
 
     res.json({
-      hourly: result.rows.map(row => ({
+      hourly: result.rows.map((row) => ({
         hour: row.hour,
         queryCount: parseInt(row.query_count),
         uniqueQueries: parseInt(row.unique_queries),
@@ -209,7 +234,7 @@ router.get('/hourly', async (req, res) => {
     console.error('Analytics hourly error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });

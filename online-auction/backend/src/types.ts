@@ -196,7 +196,7 @@ export interface CurrentBidInfo {
 
 // Idempotent bid result
 export interface IdempotentBidResult {
-  bid?: Bid;
+  bid?: Bid | null;
   current_price: number;
   is_winning: boolean;
 }

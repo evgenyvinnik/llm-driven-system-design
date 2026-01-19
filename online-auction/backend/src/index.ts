@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import http from 'http';
@@ -17,6 +17,7 @@ import { query } from './db.js';
 import logger from './shared/logger.js';
 import { metricsMiddleware, getMetrics, getContentType } from './shared/metrics.js';
 import { getCircuitBreakerHealth } from './shared/circuitBreaker.js';
+import type { HealthStatus } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,7 +40,7 @@ app.use(metricsMiddleware);
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // Prometheus metrics endpoint (should be before other routes)
-app.get('/metrics', async (req, res) => {
+app.get('/metrics', async (_req: Request, res: Response): Promise<void> => {
   try {
     const metrics = await getMetrics();
     res.set('Content-Type', getContentType());
@@ -58,16 +59,16 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/admin', adminRoutes);
 
 // Basic health check (simple, fast)
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req: Request, res: Response): void => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // Detailed health check with dependency status
-app.get('/api/health/detailed', async (req, res) => {
+app.get('/api/health/detailed', async (_req: Request, res: Response): Promise<void> => {
   const startTime = Date.now();
 
   // Check database health
-  let dbHealth = { status: 'unknown' };
+  let dbHealth: HealthStatus = { status: 'unknown' };
   try {
     const dbStart = Date.now();
     await query('SELECT 1');
@@ -76,9 +77,10 @@ app.get('/api/health/detailed', async (req, res) => {
       latency: `${Date.now() - dbStart}ms`,
     };
   } catch (error) {
+    const err = error as Error;
     dbHealth = {
       status: 'unhealthy',
-      error: error.message,
+      error: err.message,
     };
   }
 
@@ -115,28 +117,34 @@ app.get('/api/health/detailed', async (req, res) => {
 });
 
 // Readiness probe (for Kubernetes-style deployments)
-app.get('/api/ready', async (req, res) => {
+app.get('/api/ready', async (_req: Request, res: Response): Promise<void> => {
   try {
     await query('SELECT 1');
     const redisHealth = await checkRedisHealth();
 
     if (redisHealth.status !== 'healthy') {
-      return res.status(503).json({ ready: false, reason: 'Redis not ready' });
+      res.status(503).json({ ready: false, reason: 'Redis not ready' });
+      return;
     }
 
     res.json({ ready: true });
   } catch (error) {
-    res.status(503).json({ ready: false, reason: error.message });
+    const err = error as Error;
+    res.status(503).json({ ready: false, reason: err.message });
   }
 });
 
 // Liveness probe
-app.get('/api/live', (req, res) => {
+app.get('/api/live', (_req: Request, res: Response): void => {
   res.json({ alive: true, timestamp: new Date().toISOString() });
 });
 
 // Error handling middleware
-app.use((err, req, res, next) => {
+interface MulterError extends Error {
+  code?: string;
+}
+
+app.use((err: MulterError, req: Request, res: Response, _next: NextFunction): void => {
   logger.error(
     {
       err: {
@@ -152,9 +160,11 @@ app.use((err, req, res, next) => {
 
   if (err.name === 'MulterError') {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
+      res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
+      return;
     }
-    return res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message });
+    return;
   }
 
   res.status(500).json({ error: 'Internal server error' });

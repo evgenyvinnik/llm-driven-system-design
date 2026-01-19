@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import config from './config/index.js';
@@ -26,7 +26,6 @@ import {
 // Routes
 import {
   resolveStore,
-  requireStore,
   getStore,
   getStoreBySubdomain,
   listStores,
@@ -70,6 +69,20 @@ import {
   getStorefrontCollection,
 } from './routes/collections.js';
 
+// Health check response interface
+interface HealthCheck {
+  status: 'ok' | 'degraded';
+  timestamp: string;
+  uptime: number;
+  version: string;
+  checks: {
+    database?: { status: 'healthy' | 'unhealthy'; latencyMs?: number; error?: string };
+    redis?: { status: 'healthy' | 'unhealthy'; latencyMs?: number; error?: string };
+    rabbitmq?: { status: 'healthy' | 'unhealthy' };
+  };
+  circuitBreakers?: ReturnType<typeof getCircuitBreakerStats>;
+}
+
 const app = express();
 
 // ===== Global Middleware =====
@@ -93,8 +106,8 @@ app.use(idempotencyMiddleware);
 app.use(auditContextMiddleware);
 
 // ===== Health Check Endpoint =====
-app.get('/health', async (req, res) => {
-  const health = {
+app.get('/health', async (_req: Request, res: Response) => {
+  const health: HealthCheck = {
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
@@ -113,7 +126,7 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     health.checks.database = {
       status: 'unhealthy',
-      error: error.message,
+      error: (error as Error).message,
     };
     health.status = 'degraded';
   }
@@ -129,7 +142,7 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     health.checks.redis = {
       status: 'unhealthy',
-      error: error.message,
+      error: (error as Error).message,
     };
     health.status = 'degraded';
   }
@@ -150,24 +163,24 @@ app.get('/health', async (req, res) => {
 });
 
 // ===== Readiness Check (for Kubernetes) =====
-app.get('/ready', async (req, res) => {
+app.get('/ready', async (_req: Request, res: Response) => {
   try {
     // Check critical dependencies
     await pool.query('SELECT 1');
     await redisClient.ping();
     res.status(200).json({ ready: true });
   } catch (error) {
-    res.status(503).json({ ready: false, error: error.message });
+    res.status(503).json({ ready: false, error: (error as Error).message });
   }
 });
 
 // ===== Liveness Check (for Kubernetes) =====
-app.get('/live', (req, res) => {
+app.get('/live', (_req: Request, res: Response) => {
   res.status(200).json({ alive: true });
 });
 
 // ===== Prometheus Metrics Endpoint =====
-app.get('/metrics', async (req, res) => {
+app.get('/metrics', async (_req: Request, res: Response) => {
   try {
     const metrics = await getMetrics();
     res.set('Content-Type', getContentType());
@@ -243,8 +256,13 @@ app.put('/api/storefront/:subdomain/cart/update', resolveStore, updateCartItem);
 app.post('/api/storefront/:subdomain/checkout', resolveStore, checkout);
 
 // ===== Error Handler =====
-app.use((err, req, res, next) => {
-  const requestId = req.headers['x-request-id'] || 'unknown';
+interface ErrorWithMessage {
+  message: string;
+  stack?: string;
+}
+
+app.use((err: ErrorWithMessage, req: Request, res: Response, _next: NextFunction) => {
+  const requestId = req.headers['x-request-id'] as string || 'unknown';
 
   logger.error({
     err,
@@ -263,7 +281,7 @@ app.use((err, req, res, next) => {
 // ===== Start Server =====
 const PORT = config.server.port;
 
-async function startServer() {
+async function startServer(): Promise<void> {
   // Connect to RabbitMQ (non-blocking, will retry in background)
   connectRabbitMQ().catch(err => {
     logger.warn({ err }, 'Initial RabbitMQ connection failed, will retry in background');

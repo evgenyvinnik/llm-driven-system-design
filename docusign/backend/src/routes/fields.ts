@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../utils/db.js';
 import { authenticate } from '../middleware/auth.js';
@@ -6,26 +6,87 @@ import { auditService } from '../services/auditService.js';
 
 const router = Router();
 
+interface DocumentRow {
+  id: string;
+  envelope_id: string;
+  name: string;
+  page_count: number;
+  s3_key: string;
+  status: string;
+  file_size: number;
+  sender_id?: string;
+  envelope_status?: string;
+}
+
+interface FieldRow {
+  id: string;
+  document_id: string;
+  recipient_id: string;
+  type: string;
+  page_number: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  required: boolean;
+  completed: boolean;
+  value?: string;
+  signature_id?: string;
+  envelope_id?: string;
+  sender_id?: string;
+  envelope_status?: string;
+  recipient_name?: string;
+  recipient_email?: string;
+}
+
+interface RecipientRow {
+  id: string;
+  envelope_id: string;
+}
+
+interface FieldDimensions {
+  width: number;
+  height: number;
+}
+
+interface BulkField {
+  recipientId: string;
+  type: string;
+  pageNumber: number;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  required?: boolean;
+}
+
 // Add field to document
-router.post('/:documentId', authenticate, async (req, res) => {
+router.post('/:documentId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { documentId } = req.params;
     const { recipientId, type, pageNumber, x, y, width, height, required = true } = req.body;
 
     if (!recipientId || !type || pageNumber === undefined || x === undefined || y === undefined) {
-      return res.status(400).json({
+      res.status(400).json({
         error: 'recipientId, type, pageNumber, x, and y are required'
       });
+      return;
     }
 
     // Validate field type
     const validTypes = ['signature', 'initial', 'date', 'text', 'checkbox'];
     if (!validTypes.includes(type)) {
-      return res.status(400).json({ error: `Invalid field type. Must be one of: ${validTypes.join(', ')}` });
+      res.status(400).json({ error: `Invalid field type. Must be one of: ${validTypes.join(', ')}` });
+      return;
+    }
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     // Verify document and envelope ownership
-    const docResult = await query(
+    const docResult = await query<DocumentRow>(
       `SELECT d.*, e.sender_id, e.status as envelope_status
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -34,38 +95,43 @@ router.post('/:documentId', authenticate, async (req, res) => {
     );
 
     if (docResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = docResult.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (document.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only add fields to draft envelopes' });
+      res.status(400).json({ error: 'Can only add fields to draft envelopes' });
+      return;
     }
 
     // Validate page number
     if (pageNumber < 1 || pageNumber > document.page_count) {
-      return res.status(400).json({
+      res.status(400).json({
         error: `Page number must be between 1 and ${document.page_count}`
       });
+      return;
     }
 
     // Verify recipient belongs to this envelope
-    const recipientResult = await query(
+    const recipientResult = await query<RecipientRow>(
       'SELECT * FROM recipients WHERE id = $1 AND envelope_id = $2',
       [recipientId, document.envelope_id]
     );
 
     if (recipientResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Recipient not found in this envelope' });
+      res.status(400).json({ error: 'Recipient not found in this envelope' });
+      return;
     }
 
     // Default dimensions based on field type
-    const defaultDimensions = {
+    const defaultDimensions: Record<string, FieldDimensions> = {
       signature: { width: 200, height: 50 },
       initial: { width: 80, height: 40 },
       date: { width: 120, height: 30 },
@@ -77,7 +143,7 @@ router.post('/:documentId', authenticate, async (req, res) => {
     const fieldWidth = width || defaultDimensions[type].width;
     const fieldHeight = height || defaultDimensions[type].height;
 
-    const result = await query(
+    const result = await query<FieldRow>(
       `INSERT INTO document_fields
         (id, document_id, recipient_id, type, page_number, x, y, width, height, required)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -105,12 +171,17 @@ router.post('/:documentId', authenticate, async (req, res) => {
 });
 
 // Get fields for document
-router.get('/document/:documentId', authenticate, async (req, res) => {
+router.get('/document/:documentId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { documentId } = req.params;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify document ownership
-    const docResult = await query(
+    const docResult = await query<DocumentRow>(
       `SELECT d.*, e.sender_id
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -119,14 +190,16 @@ router.get('/document/:documentId', authenticate, async (req, res) => {
     );
 
     if (docResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     if (docResult.rows[0].sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
-    const result = await query(
+    const result = await query<FieldRow>(
       `SELECT df.*, r.name as recipient_name, r.email as recipient_email
        FROM document_fields df
        JOIN recipients r ON df.recipient_id = r.id
@@ -143,13 +216,18 @@ router.get('/document/:documentId', authenticate, async (req, res) => {
 });
 
 // Update field
-router.put('/:id', authenticate, async (req, res) => {
+router.put('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const { recipientId, type, pageNumber, x, y, width, height, required } = req.body;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify field and envelope ownership
-    const fieldResult = await query(
+    const fieldResult = await query<FieldRow>(
       `SELECT df.*, d.envelope_id, e.sender_id, e.status as envelope_status
        FROM document_fields df
        JOIN documents d ON df.document_id = d.id
@@ -159,32 +237,36 @@ router.put('/:id', authenticate, async (req, res) => {
     );
 
     if (fieldResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Field not found' });
+      res.status(404).json({ error: 'Field not found' });
+      return;
     }
 
     const field = fieldResult.rows[0];
 
     if (field.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (field.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only edit fields in draft envelopes' });
+      res.status(400).json({ error: 'Can only edit fields in draft envelopes' });
+      return;
     }
 
     // If changing recipient, verify they belong to this envelope
     if (recipientId) {
-      const recipientResult = await query(
+      const recipientResult = await query<{ id: string }>(
         'SELECT id FROM recipients WHERE id = $1 AND envelope_id = $2',
         [recipientId, field.envelope_id]
       );
 
       if (recipientResult.rows.length === 0) {
-        return res.status(400).json({ error: 'Recipient not found in this envelope' });
+        res.status(400).json({ error: 'Recipient not found in this envelope' });
+        return;
       }
     }
 
-    const result = await query(
+    const result = await query<FieldRow>(
       `UPDATE document_fields
        SET recipient_id = COALESCE($2, recipient_id),
            type = COALESCE($3, type),
@@ -207,12 +289,17 @@ router.put('/:id', authenticate, async (req, res) => {
 });
 
 // Delete field
-router.delete('/:id', authenticate, async (req, res) => {
+router.delete('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify field and envelope ownership
-    const fieldResult = await query(
+    const fieldResult = await query<FieldRow>(
       `SELECT df.*, d.envelope_id, e.sender_id, e.status as envelope_status
        FROM document_fields df
        JOIN documents d ON df.document_id = d.id
@@ -222,17 +309,20 @@ router.delete('/:id', authenticate, async (req, res) => {
     );
 
     if (fieldResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Field not found' });
+      res.status(404).json({ error: 'Field not found' });
+      return;
     }
 
     const field = fieldResult.rows[0];
 
     if (field.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (field.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only delete fields from draft envelopes' });
+      res.status(400).json({ error: 'Can only delete fields from draft envelopes' });
+      return;
     }
 
     await query('DELETE FROM document_fields WHERE id = $1', [id]);
@@ -245,17 +335,23 @@ router.delete('/:id', authenticate, async (req, res) => {
 });
 
 // Bulk add fields
-router.post('/bulk/:documentId', authenticate, async (req, res) => {
+router.post('/bulk/:documentId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { documentId } = req.params;
-    const { fields } = req.body;
+    const { fields } = req.body as { fields: BulkField[] };
 
     if (!Array.isArray(fields) || fields.length === 0) {
-      return res.status(400).json({ error: 'Fields array is required' });
+      res.status(400).json({ error: 'Fields array is required' });
+      return;
+    }
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     // Verify document ownership
-    const docResult = await query(
+    const docResult = await query<DocumentRow>(
       `SELECT d.*, e.sender_id, e.status as envelope_status
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -264,24 +360,27 @@ router.post('/bulk/:documentId', authenticate, async (req, res) => {
     );
 
     if (docResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = docResult.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (document.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only add fields to draft envelopes' });
+      res.status(400).json({ error: 'Can only add fields to draft envelopes' });
+      return;
     }
 
-    const createdFields = [];
+    const createdFields: FieldRow[] = [];
 
     for (const field of fields) {
       const fieldId = uuid();
-      const result = await query(
+      const result = await query<FieldRow>(
         `INSERT INTO document_fields
           (id, document_id, recipient_id, type, page_number, x, y, width, height, required)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)

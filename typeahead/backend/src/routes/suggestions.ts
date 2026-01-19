@@ -1,4 +1,5 @@
-import express from 'express';
+import express, { Router, Request, Response } from 'express';
+import type CircuitBreaker from 'opossum';
 import { suggestionRateLimiter, logRateLimiter } from '../shared/rate-limiter.js';
 import { createCircuitBreaker } from '../shared/circuit-breaker.js';
 import {
@@ -9,20 +10,41 @@ import {
   recordCacheMiss,
 } from '../shared/metrics.js';
 import logger from '../shared/logger.js';
+import type { SuggestionService } from '../services/suggestion-service.js';
+import type { RankingService, RankedSuggestion } from '../services/ranking-service.js';
+import type { AggregationService } from '../services/aggregation-service.js';
 
-const router = express.Router();
+// Extend Express Request locals
+declare module 'express-serve-static-core' {
+  interface Locals {
+    cacheHit?: boolean;
+    suggestionCount?: number;
+  }
+}
+
+const router: Router = express.Router();
+
+interface SuggestionArgs {
+  prefix: string;
+  options: {
+    userId?: string | null;
+    limit: number;
+  };
+}
 
 // Circuit breaker for suggestion service
-let suggestionCircuit = null;
+let suggestionCircuit: CircuitBreaker<RankedSuggestion[], [SuggestionArgs]> | null = null;
 
 /**
  * Initialize circuit breaker lazily (needs access to suggestionService)
  */
-function getSuggestionCircuit(suggestionService, prefix, options) {
+function getSuggestionCircuit(
+  suggestionService: SuggestionService
+): CircuitBreaker<RankedSuggestion[], [SuggestionArgs]> {
   if (!suggestionCircuit) {
-    suggestionCircuit = createCircuitBreaker(
+    suggestionCircuit = createCircuitBreaker<RankedSuggestion[], [SuggestionArgs]>(
       'suggestions',
-      async (args) => {
+      async (args: SuggestionArgs) => {
         return suggestionService.getSuggestions(args.prefix, args.options);
       },
       {
@@ -55,41 +77,45 @@ function getSuggestionCircuit(suggestionService, prefix, options) {
  * - userId: User ID for personalization (optional)
  * - fuzzy: Enable fuzzy matching (default: false)
  */
-router.get('/', suggestionRateLimiter, async (req, res) => {
+router.get('/', suggestionRateLimiter, async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
   const startTime = Date.now();
   let cacheHit = false;
   let suggestionCount = 0;
 
   try {
-    const { q: prefix, limit = 5, userId, fuzzy = 'false' } = req.query;
+    const { q: prefix, limit = '5', userId, fuzzy = 'false' } = req.query;
 
     if (!prefix || typeof prefix !== 'string') {
       timer({ endpoint: 'suggestions', cache_hit: 'false', status: 'error' });
       suggestionRequests.inc({ endpoint: 'suggestions', status: 'validation_error' });
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Missing or invalid query parameter "q"',
       });
+      return;
     }
 
     // Track query prefix length for analytics
     queryAnalytics.prefixLength.observe(prefix.length);
 
-    const suggestionService = req.app.get('suggestionService');
-    const circuit = getSuggestionCircuit(suggestionService, prefix, { userId, limit: parseInt(limit) });
+    const suggestionService = req.app.get('suggestionService') as SuggestionService;
+    const circuit = getSuggestionCircuit(suggestionService);
 
-    let suggestions;
+    let suggestions: RankedSuggestion[];
 
     if (fuzzy === 'true') {
       // Fuzzy matching bypasses circuit breaker (less critical)
-      suggestions = await suggestionService.getFuzzySuggestions(prefix, {
-        userId,
-        limit: parseInt(limit),
-      });
+      suggestions = (await suggestionService.getFuzzySuggestions(prefix, {
+        userId: userId as string | undefined,
+        limit: parseInt(limit as string),
+      })) as RankedSuggestion[];
     } else {
       // Use circuit breaker for regular suggestions
       try {
-        suggestions = await circuit.fire({ prefix, options: { userId, limit: parseInt(limit) } });
+        suggestions = await circuit.fire({
+          prefix,
+          options: { userId: userId as string | undefined, limit: parseInt(limit as string) },
+        });
       } catch (circuitError) {
         // Circuit breaker fallback already triggered
         suggestions = [];
@@ -97,7 +123,7 @@ router.get('/', suggestionRateLimiter, async (req, res) => {
         logger.warn({
           event: 'circuit_breaker_triggered',
           prefix: prefix.substring(0, 3),
-          error: circuitError.message,
+          error: (circuitError as Error).message,
         });
       }
     }
@@ -140,13 +166,13 @@ router.get('/', suggestionRateLimiter, async (req, res) => {
 
     logger.error({
       event: 'suggestion_error',
-      error: error.message,
-      stack: error.stack,
+      error: (error as Error).message,
+      stack: (error as Error).stack,
     });
 
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -161,25 +187,30 @@ router.get('/', suggestionRateLimiter, async (req, res) => {
  * - userId: User ID (optional)
  * - sessionId: Session ID (optional)
  */
-router.post('/log', logRateLimiter, async (req, res) => {
+router.post('/log', logRateLimiter, async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
 
   try {
-    const { query, userId, sessionId } = req.body;
+    const { query, userId, sessionId } = req.body as {
+      query?: string;
+      userId?: string;
+      sessionId?: string;
+    };
 
     if (!query || typeof query !== 'string') {
       timer({ endpoint: 'log', cache_hit: 'false', status: 'error' });
       suggestionRequests.inc({ endpoint: 'log', status: 'validation_error' });
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Missing or invalid "query" in request body',
       });
+      return;
     }
 
-    const aggregationService = req.app.get('aggregationService');
-    const rankingService = req.app.get('rankingService');
+    const aggregationService = req.app.get('aggregationService') as AggregationService;
+    const rankingService = req.app.get('rankingService') as RankingService;
 
     // Process the query (updates counts, trending, logs)
-    await aggregationService.processQuery(query, userId, sessionId);
+    await aggregationService.processQuery(query, userId || null, sessionId || null);
 
     // Update user history if userId provided
     if (userId) {
@@ -205,12 +236,12 @@ router.post('/log', logRateLimiter, async (req, res) => {
 
     logger.error({
       event: 'log_error',
-      error: error.message,
+      error: (error as Error).message,
     });
 
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -222,14 +253,14 @@ router.post('/log', logRateLimiter, async (req, res) => {
  * Query params:
  * - limit: Max number of trending queries (default: 10)
  */
-router.get('/trending', async (req, res) => {
+router.get('/trending', async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
 
   try {
-    const { limit = 10 } = req.query;
+    const { limit = '10' } = req.query;
 
-    const rankingService = req.app.get('rankingService');
-    const trending = await rankingService.getTopTrending(parseInt(limit));
+    const rankingService = req.app.get('rankingService') as RankingService;
+    const trending = await rankingService.getTopTrending(parseInt(limit as string));
 
     timer({ endpoint: 'trending', cache_hit: 'false', status: 'success' });
     suggestionRequests.inc({ endpoint: 'trending', status: 'success' });
@@ -247,12 +278,12 @@ router.get('/trending', async (req, res) => {
 
     logger.error({
       event: 'trending_error',
-      error: error.message,
+      error: (error as Error).message,
     });
 
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -264,15 +295,15 @@ router.get('/trending', async (req, res) => {
  * Query params:
  * - limit: Max number of queries (default: 10)
  */
-router.get('/popular', async (req, res) => {
+router.get('/popular', async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
 
   try {
-    const { limit = 10 } = req.query;
+    const { limit = '10' } = req.query;
 
-    const suggestionService = req.app.get('suggestionService');
+    const suggestionService = req.app.get('suggestionService') as SuggestionService;
     const popular = await suggestionService.getSuggestions('', {
-      limit: parseInt(limit),
+      limit: parseInt(limit as string),
     });
 
     timer({ endpoint: 'popular', cache_hit: 'false', status: 'success' });
@@ -290,12 +321,12 @@ router.get('/popular', async (req, res) => {
 
     logger.error({
       event: 'popular_error',
-      error: error.message,
+      error: (error as Error).message,
     });
 
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });
@@ -308,22 +339,23 @@ router.get('/popular', async (req, res) => {
  * - userId: User ID (required)
  * - limit: Max number of history items (default: 10)
  */
-router.get('/history', async (req, res) => {
+router.get('/history', async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
 
   try {
-    const { userId, limit = 10 } = req.query;
+    const { userId, limit = '10' } = req.query;
 
     if (!userId) {
       timer({ endpoint: 'history', cache_hit: 'false', status: 'error' });
       suggestionRequests.inc({ endpoint: 'history', status: 'validation_error' });
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Missing userId parameter',
       });
+      return;
     }
 
-    const rankingService = req.app.get('rankingService');
-    const history = await rankingService.getUserHistory(userId, parseInt(limit));
+    const rankingService = req.app.get('rankingService') as RankingService;
+    const history = await rankingService.getUserHistory(userId as string, parseInt(limit as string));
 
     timer({ endpoint: 'history', cache_hit: 'false', status: 'success' });
     suggestionRequests.inc({ endpoint: 'history', status: 'success' });
@@ -341,12 +373,12 @@ router.get('/history', async (req, res) => {
 
     logger.error({
       event: 'history_error',
-      error: error.message,
+      error: (error as Error).message,
     });
 
     res.status(500).json({
       error: 'Internal server error',
-      message: error.message,
+      message: (error as Error).message,
     });
   }
 });

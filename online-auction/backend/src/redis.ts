@@ -1,8 +1,8 @@
-import Redis from 'ioredis';
+import IORedis from 'ioredis';
 import { lockAcquireTotal, lockHoldDuration, cacheHitsTotal, cacheMissesTotal } from './shared/metrics.js';
 import type { Lock, RateLimitResult, HealthStatus, Bid, CurrentBidInfo, IdempotentBidResult, Auction } from './types.js';
 
-const redis = new Redis({
+const redis = new IORedis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
   retryDelayOnFailover: 100,

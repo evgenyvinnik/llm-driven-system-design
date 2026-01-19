@@ -1,7 +1,7 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import { createServer } from 'http';
+import { createServer, Server } from 'http';
 
 import { setupWebSocket } from './websocket.js';
 import { authMiddleware } from './middleware/auth.js';
@@ -18,8 +18,27 @@ import { initializeKafka, closeKafka, isKafkaReady } from './shared/kafka.js';
 import pool from './db.js';
 import redisClient from './redis.js';
 
+interface HealthCheck {
+  status: string;
+  latency?: number;
+  error?: string;
+  note?: string;
+}
+
+interface HealthResponse {
+  status: 'ok' | 'degraded';
+  timestamp: string;
+  uptime: number;
+  checks: Record<string, HealthCheck>;
+  memory?: {
+    heapUsed: string;
+    heapTotal: string;
+    rss: string;
+  };
+}
+
 const app = express();
-const server = createServer(app);
+const server: Server = createServer(app);
 
 // Middleware
 app.use(
@@ -47,8 +66,8 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/drivers', driverRoutes);
 
 // Health check endpoint - comprehensive check of all dependencies
-app.get('/health', async (req, res) => {
-  const health = {
+app.get('/health', async (req: Request, res: Response): Promise<void> => {
+  const health: HealthResponse = {
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
@@ -63,7 +82,8 @@ app.get('/health', async (req, res) => {
       status: 'healthy',
       latency: Date.now() - start,
     };
-  } catch (error) {
+  } catch (err) {
+    const error = err as Error;
     health.checks.postgres = {
       status: 'unhealthy',
       error: error.message,
@@ -79,7 +99,8 @@ app.get('/health', async (req, res) => {
       status: 'healthy',
       latency: Date.now() - start,
     };
-  } catch (error) {
+  } catch (err) {
+    const error = err as Error;
     health.checks.redis = {
       status: 'unhealthy',
       error: error.message,
@@ -106,17 +127,18 @@ app.get('/health', async (req, res) => {
 });
 
 // Liveness check - simple check that the service is running
-app.get('/health/live', (req, res) => {
+app.get('/health/live', (req: Request, res: Response): void => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // Readiness check - service is ready to receive traffic
-app.get('/health/ready', async (req, res) => {
+app.get('/health/ready', async (req: Request, res: Response): Promise<void> => {
   try {
     // Check if both postgres and redis are available
     await Promise.all([pool.query('SELECT 1'), redisClient.ping()]);
     res.json({ status: 'ready', timestamp: new Date().toISOString() });
-  } catch (error) {
+  } catch (err) {
+    const error = err as Error;
     res.status(503).json({
       status: 'not ready',
       error: error.message,
@@ -126,11 +148,12 @@ app.get('/health/ready', async (req, res) => {
 });
 
 // Prometheus metrics endpoint
-app.get('/metrics', async (req, res) => {
+app.get('/metrics', async (req: Request, res: Response): Promise<void> => {
   try {
     res.set('Content-Type', getContentType());
     res.end(await getMetrics());
-  } catch (error) {
+  } catch (err) {
+    const error = err as Error;
     logger.error({ error: error.message }, 'Failed to get metrics');
     res.status(500).end(error.message);
   }
@@ -142,7 +165,8 @@ setupWebSocket(server);
 const PORT = process.env.PORT || 3000;
 
 // Initialize Kafka (non-blocking)
-initializeKafka().catch((error) => {
+initializeKafka().catch((err) => {
+  const error = err as Error;
   logger.warn({ error: error.message }, 'Kafka initialization failed - events will not be published');
 });
 
@@ -161,21 +185,24 @@ process.on('SIGTERM', async () => {
     try {
       await pool.end();
       logger.info('PostgreSQL connection pool closed');
-    } catch (error) {
+    } catch (err) {
+      const error = err as Error;
       logger.error({ error: error.message }, 'Error closing PostgreSQL');
     }
 
     try {
       await redisClient.quit();
       logger.info('Redis connection closed');
-    } catch (error) {
+    } catch (err) {
+      const error = err as Error;
       logger.error({ error: error.message }, 'Error closing Redis');
     }
 
     try {
       await closeKafka();
       logger.info('Kafka connection closed');
-    } catch (error) {
+    } catch (err) {
+      const error = err as Error;
       logger.error({ error: error.message }, 'Error closing Kafka');
     }
 
@@ -195,11 +222,11 @@ process.on('SIGINT', () => {
 });
 
 // Log unhandled errors
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', (error: Error) => {
   logger.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception');
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) => {
   logger.error({ reason, promise }, 'Unhandled rejection');
 });

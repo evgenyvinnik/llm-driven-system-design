@@ -30,6 +30,7 @@ interface SearchParams {
   limit?: string | number;
   offset?: string | number;
   sort?: string;
+  [key: string]: string | number | string[] | undefined;
 }
 
 interface SearchResult {
@@ -91,7 +92,9 @@ let searchCircuitBreaker: CircuitBreaker<unknown[], SearchResult> | null = null;
 
 const initSearchCircuitBreaker = (): CircuitBreaker<unknown[], SearchResult> => {
   if (!searchCircuitBreaker) {
-    searchCircuitBreaker = createSearchCircuitBreaker(executeSearch) as CircuitBreaker<unknown[], SearchResult>;
+    // Wrap executeSearch to match the expected signature
+    const wrappedSearch = (params: unknown): Promise<SearchResult> => executeSearch(params as SearchParams);
+    searchCircuitBreaker = createSearchCircuitBreaker(wrappedSearch) as CircuitBreaker<unknown[], SearchResult>;
   }
   return searchCircuitBreaker;
 };

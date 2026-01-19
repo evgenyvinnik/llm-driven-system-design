@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import express, { Router } from 'express';
+import express, { Router, Request, Response, NextFunction, ErrorRequestHandler } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import session from 'express-session';
@@ -8,7 +8,7 @@ import { pool } from './utils/db.js';
 
 // Shared modules
 import { getMetrics, getContentType, httpMetricsMiddleware } from './shared/metrics.js';
-import { logger, requestLoggerMiddleware } from './shared/logger.js';
+import { logger, requestLoggerMiddleware, RequestWithLog } from './shared/logger.js';
 import { createHealthRoutes, checkReadiness, HealthStatus } from './shared/health.js';
 import config from './shared/config.js';
 
@@ -32,10 +32,10 @@ const log = logger.child({ component: 'server' });
 // ============================================
 
 // Request logging (before other middleware)
-app.use(requestLoggerMiddleware);
+app.use(requestLoggerMiddleware as express.RequestHandler);
 
 // Prometheus metrics middleware
-app.use(httpMetricsMiddleware);
+app.use(httpMetricsMiddleware as express.RequestHandler);
 
 // CORS
 app.use(cors({
@@ -50,6 +50,14 @@ app.use(cookieParser());
 // Session setup with Redis store
 const RedisStore = (await import('connect-redis')).default;
 const redisClient = createClient();
+
+declare module 'express-session' {
+  interface SessionData {
+    userId?: string;
+    username?: string;
+    role?: string;
+  }
+}
 
 app.use(session({
   store: new RedisStore({ client: redisClient }),
@@ -75,13 +83,14 @@ app.use(healthRouter);
 // Prometheus Metrics Endpoint
 // ============================================
 
-app.get('/metrics', async (req, res) => {
+app.get('/metrics', async (_req: Request, res: Response) => {
   try {
     const metrics = await getMetrics();
     res.set('Content-Type', getContentType());
     res.send(metrics);
   } catch (error) {
-    log.error({ error: error.message }, 'Failed to get metrics');
+    const err = error as Error;
+    log.error({ error: err.message }, 'Failed to get metrics');
     res.status(500).send('Error collecting metrics');
   }
 });
@@ -101,10 +110,15 @@ app.use('/api/stats', statsRoutes);
 // Error Handling Middleware
 // ============================================
 
-app.use((err, req, res, next) => {
-  const log = req.log || logger;
+interface ErrorWithStatus extends Error {
+  status?: number;
+}
 
-  log.error({
+const errorHandler: ErrorRequestHandler = (err: ErrorWithStatus, req: Request, res: Response, _next: NextFunction) => {
+  const reqWithLog = req as RequestWithLog;
+  const reqLog = reqWithLog.log || logger;
+
+  reqLog.error({
     error: {
       name: err.name,
       message: err.message,
@@ -115,13 +129,15 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({
     error: config.env.isProduction ? 'Internal server error' : err.message
   });
-});
+};
+
+app.use(errorHandler);
 
 // ============================================
 // Graceful Shutdown
 // ============================================
 
-async function shutdown(signal) {
+async function shutdown(signal: string): Promise<void> {
   log.info({ signal }, 'Received shutdown signal');
 
   // Stop accepting new connections
@@ -134,7 +150,8 @@ async function shutdown(signal) {
     await pool.end();
     log.info('Database connections closed');
   } catch (error) {
-    log.error({ error: error.message }, 'Error closing database connections');
+    const err = error as Error;
+    log.error({ error: err.message }, 'Error closing database connections');
   }
 
   // Close Redis connection
@@ -142,7 +159,8 @@ async function shutdown(signal) {
     await redisClient.quit();
     log.info('Redis connection closed');
   } catch (error) {
-    log.error({ error: error.message }, 'Error closing Redis connection');
+    const err = error as Error;
+    log.error({ error: err.message }, 'Error closing Redis connection');
   }
 
   process.exit(0);

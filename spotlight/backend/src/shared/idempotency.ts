@@ -108,17 +108,12 @@ export function generateIdempotencyKey(operation: string, data: unknown): string
   return `${operation}:${hash.digest('hex').substring(0, 32)}`;
 }
 
-// Extended Response type for idempotency middleware
-interface IdempotencyResponse extends Response {
-  json: (body: unknown) => Response;
-}
-
 /**
  * Express middleware for handling idempotency
  * Checks Idempotency-Key header and returns cached results if available
  */
 export function idempotencyMiddleware(operationType: string = 'unknown') {
-  return async (req: Request, res: IdempotencyResponse, next: NextFunction): Promise<void> => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
     if (!idempotencyKey) {
@@ -238,7 +233,8 @@ export async function withIdempotency<T extends Record<string, unknown>>(
       cacheHit: true
     }, 'Idempotency cache hit');
 
-    return { ...(cached.result as T), replayed: true };
+    const cachedResult = cached.result as unknown as T;
+    return { ...cachedResult, replayed: true };
   }
 
   // Mark as in progress

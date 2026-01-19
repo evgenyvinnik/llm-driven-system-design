@@ -1,9 +1,24 @@
-import { Router } from 'express';
+import { Router, Response } from 'express';
 import { query } from '../db/pool.js';
-import { authenticateApiKey } from '../middleware/auth.js';
-import { getMerchantBalance, getAccountLedger, verifyLedgerIntegrity, getPlatformRevenue } from '../services/ledger.js';
+import { authenticateApiKey, AuthenticatedRequest } from '../middleware/auth.js';
+import { getMerchantBalance, getAccountLedger } from '../services/ledger.js';
 
 const router = Router();
+
+// Interfaces
+interface ChargesSummaryRow {
+  successful_charges: string;
+  failed_charges: string;
+  total_amount: string;
+  total_fees: string;
+  total_net: string;
+  total_refunded: string;
+}
+
+interface TodayStatsRow {
+  charges: string;
+  amount: string;
+}
 
 // All routes require authentication
 router.use(authenticateApiKey);
@@ -12,9 +27,9 @@ router.use(authenticateApiKey);
  * Get merchant balance
  * GET /v1/balance
  */
-router.get('/', async (req, res) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const balance = await getMerchantBalance(req.merchantId);
+    const balance = await getMerchantBalance(req.merchantId!);
 
     res.json({
       object: 'balance',
@@ -47,21 +62,24 @@ router.get('/', async (req, res) => {
  * Get balance transactions (ledger entries)
  * GET /v1/balance/transactions
  */
-router.get('/transactions', async (req, res) => {
+router.get('/transactions', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = '50', offset = '0' } = req.query as { limit?: string; offset?: string };
 
     const account = `merchant:${req.merchantId}:payable`;
     const entries = await getAccountLedger(account, parseInt(limit), parseInt(offset));
 
     // Get total count
-    const countResult = await query(`
+    const countResult = await query<{ count: string }>(
+      `
       SELECT COUNT(*) FROM ledger_entries WHERE account = $1
-    `, [account]);
+    `,
+      [account]
+    );
 
     res.json({
       object: 'list',
-      data: entries.map(e => ({
+      data: entries.map((e) => ({
         id: `txn_${e.id}`,
         object: 'balance_transaction',
         amount: e.credit - e.debit, // Net change to merchant balance
@@ -91,10 +109,11 @@ router.get('/transactions', async (req, res) => {
  * Get charges summary
  * GET /v1/balance/summary
  */
-router.get('/summary', async (req, res) => {
+router.get('/summary', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     // Get totals for merchant
-    const result = await query(`
+    const result = await query<ChargesSummaryRow>(
+      `
       SELECT
         COUNT(*) FILTER (WHERE status = 'succeeded') as successful_charges,
         COUNT(*) FILTER (WHERE status = 'failed') as failed_charges,
@@ -104,12 +123,15 @@ router.get('/summary', async (req, res) => {
         COALESCE(SUM(amount_refunded), 0) as total_refunded
       FROM charges
       WHERE merchant_id = $1
-    `, [req.merchantId]);
+    `,
+      [req.merchantId]
+    );
 
     const row = result.rows[0];
 
     // Get today's stats
-    const todayResult = await query(`
+    const todayResult = await query<TodayStatsRow>(
+      `
       SELECT
         COUNT(*) as charges,
         COALESCE(SUM(amount), 0) as amount
@@ -117,7 +139,9 @@ router.get('/summary', async (req, res) => {
       WHERE merchant_id = $1
         AND created_at >= CURRENT_DATE
         AND status = 'succeeded'
-    `, [req.merchantId]);
+    `,
+      [req.merchantId]
+    );
 
     const today = todayResult.rows[0];
 

@@ -5,34 +5,42 @@
  * Run after setting up a user and device.
  *
  * Usage:
- *   node scripts/generate-sample-data.js <userId> <deviceId> [days]
+ *   npx tsx scripts/generate-sample-data.ts <userId> <deviceId> [days]
  *
  * Example:
- *   node scripts/generate-sample-data.js abc123 def456 30
+ *   npx tsx scripts/generate-sample-data.ts abc123 def456 30
  */
 
-import pg from 'pg';
+import pg, { Pool as PgPool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 
 const { Pool } = pg;
 
-const pool = new Pool({
+interface HealthSample {
+  type: string;
+  value: number;
+  unit: string;
+  startDate: Date;
+  endDate: Date;
+}
+
+const pool: PgPool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://health_user:health_password@localhost:5432/health_data'
 });
 
 // Generate random number within range
-function randomInRange(min, max) {
+function randomInRange(min: number, max: number): number {
   return Math.random() * (max - min) + min;
 }
 
 // Generate random integer within range
-function randomIntInRange(min, max) {
+function randomIntInRange(min: number, max: number): number {
   return Math.floor(randomInRange(min, max));
 }
 
 // Generate step data for a day
-function generateStepsForDay(date) {
-  const samples = [];
+function generateStepsForDay(date: Date): HealthSample[] {
+  const samples: HealthSample[] = [];
   const totalSteps = randomIntInRange(3000, 15000);
   const hoursActive = randomIntInRange(8, 16);
 
@@ -56,8 +64,8 @@ function generateStepsForDay(date) {
 }
 
 // Generate heart rate data for a day
-function generateHeartRateForDay(date) {
-  const samples = [];
+function generateHeartRateForDay(date: Date): HealthSample[] {
+  const samples: HealthSample[] = [];
   const restingHR = randomIntInRange(55, 75);
 
   for (let hour = 0; hour < 24; hour++) {
@@ -96,8 +104,8 @@ function generateHeartRateForDay(date) {
 }
 
 // Generate sleep data for a night
-function generateSleepForNight(date) {
-  const samples = [];
+function generateSleepForNight(date: Date): HealthSample[] {
+  const samples: HealthSample[] = [];
   const sleepHours = randomInRange(5, 9);
   const sleepMinutes = Math.round(sleepHours * 60);
 
@@ -120,9 +128,8 @@ function generateSleepForNight(date) {
 }
 
 // Generate calories data for a day
-function generateCaloriesForDay(date) {
-  const samples = [];
-  const totalCalories = randomIntInRange(200, 600);
+function generateCaloriesForDay(date: Date): HealthSample[] {
+  const samples: HealthSample[] = [];
 
   for (let hour = 7; hour < 22; hour++) {
     if (Math.random() > 0.6) {
@@ -146,7 +153,7 @@ function generateCaloriesForDay(date) {
 }
 
 // Generate weight data (once per week)
-function generateWeightForDay(date, dayIndex) {
+function generateWeightForDay(date: Date, dayIndex: number): HealthSample[] {
   if (dayIndex % 7 !== 0) return [];
 
   const baseWeight = 70 + Math.random() * 20;
@@ -164,10 +171,10 @@ function generateWeightForDay(date, dayIndex) {
   }];
 }
 
-async function generateData(userId, deviceId, days) {
+async function generateData(userId: string, deviceId: string, days: number): Promise<void> {
   console.log(`Generating ${days} days of health data for user ${userId}...`);
 
-  const allSamples = [];
+  const allSamples: HealthSample[] = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -189,8 +196,8 @@ async function generateData(userId, deviceId, days) {
   for (let i = 0; i < allSamples.length; i += batchSize) {
     const batch = allSamples.slice(i, i + batchSize);
 
-    const values = [];
-    const placeholders = [];
+    const values: unknown[] = [];
+    const placeholders: string[] = [];
     let paramIndex = 1;
 
     for (const sample of batch) {
@@ -267,7 +274,7 @@ async function generateData(userId, deviceId, days) {
 // Main
 const args = process.argv.slice(2);
 if (args.length < 2) {
-  console.log('Usage: node scripts/generate-sample-data.js <userId> <deviceId> [days]');
+  console.log('Usage: npx tsx scripts/generate-sample-data.ts <userId> <deviceId> [days]');
   console.log('\nTo get userId and deviceId:');
   console.log('1. Register a user via the API or frontend');
   console.log('2. Add a device via the API or frontend');
@@ -283,7 +290,7 @@ generateData(userId, deviceId, days)
   .then(() => {
     pool.end();
   })
-  .catch(err => {
+  .catch((err: Error) => {
     console.error('Error:', err);
     pool.end();
     process.exit(1);

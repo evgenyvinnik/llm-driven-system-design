@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { pool } from './db/index.js';
@@ -7,7 +7,7 @@ import { redis } from './services/redis.js';
 // Shared modules
 import { logger, requestLogger } from './shared/logger.js';
 import { metricsMiddleware, metricsHandler } from './shared/metrics.js';
-import { globalLimiter, streamLimiter, searchLimiter, adminLimiter, loginLimiter } from './shared/rateLimit.js';
+import { globalLimiter, streamLimiter, adminLimiter, loginLimiter } from './shared/rateLimit.js';
 import { validateIdempotencyKeyMiddleware } from './shared/idempotency.js';
 import { registerHealthRoutes } from './shared/health.js';
 
@@ -20,6 +20,10 @@ import streamingRoutes from './routes/streaming.js';
 import radioRoutes from './routes/radio.js';
 import recommendationsRoutes from './routes/recommendations.js';
 import adminRoutes from './routes/admin.js';
+
+interface HttpError extends Error {
+  status?: number;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -97,12 +101,12 @@ app.use('/api/admin', adminLimiter, adminRoutes);
 // ============================================
 
 // 404 handler
-app.use((req, res) => {
+app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: 'Not found' });
 });
 
 // Global error handler with structured logging
-app.use((err, req, res, next) => {
+const errorHandler: ErrorRequestHandler = (err: HttpError, req: Request, res: Response, _next: NextFunction): void => {
   // Log error with request context
   const errorLog = {
     err,
@@ -122,7 +126,9 @@ app.use((err, req, res, next) => {
     error: err.message || 'Internal server error',
     ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
   });
-});
+};
+
+app.use(errorHandler);
 
 // ============================================
 // Server Startup
@@ -139,7 +145,7 @@ app.listen(PORT, () => {
 // Graceful Shutdown
 // ============================================
 
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Received shutdown signal, closing connections');
 
   try {
@@ -160,12 +166,12 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Handle uncaught errors
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', (err: Error) => {
   logger.fatal({ err }, 'Uncaught exception');
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) => {
   logger.error({ reason, promise }, 'Unhandled rejection');
 });
 

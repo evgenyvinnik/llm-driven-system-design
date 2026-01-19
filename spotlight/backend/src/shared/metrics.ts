@@ -199,17 +199,10 @@ register.registerMetric(serviceHealth);
 // Middleware Functions
 // ============================================================================
 
-// Extended Express Request with route property
-interface RequestWithRoute extends Request {
-  route?: {
-    path: string;
-  };
-}
-
 /**
  * Express middleware to track HTTP request metrics
  */
-export function metricsMiddleware(req: RequestWithRoute, res: Response, next: NextFunction): void {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const start = process.hrtime.bigint();
 
   res.on('finish', () => {

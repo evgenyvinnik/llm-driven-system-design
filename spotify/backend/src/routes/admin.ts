@@ -1,25 +1,48 @@
-import { Router } from 'express';
+import { Router, Response } from 'express';
 import { pool } from '../db.js';
-import { requireAdmin, requireRole, Roles, clearRoleCache } from '../middleware/auth.js';
+import { requireAdmin, Roles, clearRoleCache } from '../middleware/auth.js';
 import { rateLimiters } from '../shared/rateLimit.js';
 import { auditLog, AuditActions, queryAuditLogs } from '../shared/audit.js';
+import type { AuthenticatedRequest, User, PlatformStats } from '../types.js';
 
 const router = Router();
+
+interface AdminQuery {
+  limit?: string;
+  offset?: string;
+  search?: string;
+  actorId?: string;
+  action?: string;
+  resourceType?: string;
+  resourceId?: string;
+  startDate?: string;
+  endDate?: string;
+  success?: string;
+}
+
+interface RoleUpdateBody {
+  role?: string;
+}
+
+interface BanBody {
+  reason?: string;
+}
 
 // All admin routes require admin role and rate limiting
 router.use(requireAdmin);
 router.use(rateLimiters.admin);
 
 // Get all users (paginated)
-router.get('/users', async (req, res) => {
+router.get('/users', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { limit = 50, offset = 0, search = '' } = req.query;
+    const { limit = '50', offset = '0', search = '' } = req.query as AdminQuery;
 
     let query = `
       SELECT id, email, username, display_name, avatar_url, is_premium, role, created_at, updated_at
       FROM users
     `;
-    const params = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (search) {
@@ -40,20 +63,22 @@ router.get('/users', async (req, res) => {
     const countResult = await pool.query(countQuery, countParams);
 
     res.json({
-      users: result.rows,
-      total: parseInt(countResult.rows[0].count),
+      users: result.rows as User[],
+      total: parseInt(countResult.rows[0].count as string),
       limit: parseInt(limit),
       offset: parseInt(offset),
     });
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin get users error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin get users error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Get user by ID
-router.get('/users/:id', async (req, res) => {
+router.get('/users/:id', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const result = await pool.query(
       `SELECT id, email, username, display_name, avatar_url, is_premium, role, created_at, updated_at
@@ -62,36 +87,41 @@ router.get('/users/:id', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
-    res.json(result.rows[0]);
+    res.json(result.rows[0] as User);
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin get user error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin get user error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Update user role
-router.patch('/users/:id/role', async (req, res) => {
+router.patch('/users/:id/role', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { role } = req.body;
+    const { role } = req.body as RoleUpdateBody;
     const validRoles = Object.values(Roles);
 
-    if (!role || !validRoles.includes(role)) {
-      return res.status(400).json({
+    if (!role || !validRoles.includes(role as typeof Roles[keyof typeof Roles])) {
+      res.status(400).json({
         error: 'Invalid role',
         validRoles,
       });
+      return;
     }
 
     // Get current role for audit log
     const currentResult = await pool.query('SELECT role FROM users WHERE id = $1', [req.params.id]);
     if (currentResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
-    const previousRole = currentResult.rows[0].role;
+    const previousRole = currentResult.rows[0].role as string;
 
     // Update role
     const result = await pool.query(
@@ -106,7 +136,7 @@ router.patch('/users/:id/role', async (req, res) => {
 
     // Audit log
     await auditLog(
-      req,
+      authReq,
       AuditActions.ADMIN_ROLE_CHANGE,
       'user',
       req.params.id,
@@ -115,21 +145,24 @@ router.patch('/users/:id/role', async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin update role error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin update role error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Ban user
-router.post('/users/:id/ban', async (req, res) => {
+router.post('/users/:id/ban', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { reason } = req.body;
+    const { reason } = req.body as BanBody;
 
     // Check user exists
     const userCheck = await pool.query('SELECT id, email FROM users WHERE id = $1', [req.params.id]);
     if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     // Update user to banned (using role field)
@@ -143,28 +176,31 @@ router.post('/users/:id/ban', async (req, res) => {
 
     // Audit log
     await auditLog(
-      req,
+      authReq,
       AuditActions.ADMIN_USER_BAN,
       'user',
       req.params.id,
-      { reason, email: userCheck.rows[0].email }
+      { reason, email: userCheck.rows[0].email as string }
     );
 
     res.json({ success: true, userId: req.params.id });
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin ban user error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin ban user error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Unban user
-router.post('/users/:id/unban', async (req, res) => {
+router.post('/users/:id/unban', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     // Check user exists
     const userCheck = await pool.query('SELECT id, email FROM users WHERE id = $1', [req.params.id]);
     if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     // Update user to regular user role
@@ -178,23 +214,25 @@ router.post('/users/:id/unban', async (req, res) => {
 
     // Audit log
     await auditLog(
-      req,
+      authReq,
       AuditActions.ADMIN_USER_UNBAN,
       'user',
       req.params.id,
-      { email: userCheck.rows[0].email }
+      { email: userCheck.rows[0].email as string }
     );
 
     res.json({ success: true, userId: req.params.id });
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin unban user error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin unban user error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Get audit logs
-router.get('/audit-logs', async (req, res) => {
+router.get('/audit-logs', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const {
       actorId,
@@ -204,15 +242,15 @@ router.get('/audit-logs', async (req, res) => {
       startDate,
       endDate,
       success,
-      limit = 100,
-      offset = 0,
-    } = req.query;
+      limit = '100',
+      offset = '0',
+    } = req.query as AdminQuery;
 
     const result = await queryAuditLogs({
-      actorId,
-      action,
-      resourceType,
-      resourceId,
+      actorId: actorId || null,
+      action: action || null,
+      resourceType: resourceType || null,
+      resourceId: resourceId || null,
       startDate: startDate ? new Date(startDate) : null,
       endDate: endDate ? new Date(endDate) : null,
       success: success !== undefined ? success === 'true' : null,
@@ -222,14 +260,16 @@ router.get('/audit-logs', async (req, res) => {
 
     res.json(result);
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin get audit logs error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin get audit logs error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Platform statistics
-router.get('/stats', async (req, res) => {
+router.get('/stats', async (req, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const [users, tracks, playlists, streams] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users'),
@@ -238,15 +278,18 @@ router.get('/stats', async (req, res) => {
       pool.query('SELECT SUM(stream_count) FROM tracks'),
     ]);
 
-    res.json({
-      totalUsers: parseInt(users.rows[0].count),
-      totalTracks: parseInt(tracks.rows[0].count),
-      totalPlaylists: parseInt(playlists.rows[0].count),
-      totalStreams: parseInt(streams.rows[0].sum) || 0,
-    });
+    const stats: PlatformStats = {
+      totalUsers: parseInt(users.rows[0].count as string),
+      totalTracks: parseInt(tracks.rows[0].count as string),
+      totalPlaylists: parseInt(playlists.rows[0].count as string),
+      totalStreams: parseInt(streams.rows[0].sum as string) || 0,
+    };
+
+    res.json(stats);
   } catch (error) {
-    const log = req.log || console;
-    log.error({ error: error.message }, 'Admin get stats error');
+    const log = authReq.log || console;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    log.error({ error: errorMessage }, 'Admin get stats error');
     res.status(500).json({ error: 'Internal server error' });
   }
 });

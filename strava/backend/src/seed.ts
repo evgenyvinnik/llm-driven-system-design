@@ -5,19 +5,34 @@ import {
   generateSampleRoute,
   calculateMetrics,
   encodePolyline,
-  calculateBoundingBox
+  calculateBoundingBox,
+  GpsPoint
 } from './utils/gps.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-async function seed() {
+interface UserData {
+  username: string;
+  email: string;
+  bio: string;
+  location: string;
+  role?: string;
+}
+
+interface LocationData {
+  lat: number;
+  lng: number;
+  name: string;
+}
+
+async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   // Create sample users
   const passwordHash = await bcrypt.hash('password123', 10);
 
-  const users = [
+  const users: UserData[] = [
     { username: 'alice_runner', email: 'alice@example.com', bio: 'Marathon runner and trail enthusiast', location: 'San Francisco, CA' },
     { username: 'bob_cyclist', email: 'bob@example.com', bio: 'Weekend warrior cyclist', location: 'Oakland, CA' },
     { username: 'charlie_triathlete', email: 'charlie@example.com', bio: 'Ironman finisher, always training', location: 'Berkeley, CA' },
@@ -25,11 +40,11 @@ async function seed() {
     { username: 'admin', email: 'admin@example.com', bio: 'Platform administrator', location: 'San Francisco, CA', role: 'admin' }
   ];
 
-  const userIds = [];
+  const userIds: string[] = [];
 
   for (const user of users) {
     try {
-      const result = await query(
+      const result = await query<{ id: string }>(
         `INSERT INTO users (username, email, password_hash, bio, location, role)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (username) DO UPDATE SET bio = EXCLUDED.bio
@@ -39,12 +54,13 @@ async function seed() {
       userIds.push(result.rows[0].id);
       console.log(`Created user: ${user.username}`);
     } catch (error) {
-      console.error(`Error creating user ${user.username}:`, error.message);
+      const err = error as Error;
+      console.error(`Error creating user ${user.username}:`, err.message);
     }
   }
 
   // Create follow relationships
-  const followPairs = [
+  const followPairs: [number, number][] = [
     [0, 1], [0, 2], [0, 3],
     [1, 0], [1, 2],
     [2, 0], [2, 1], [2, 3],
@@ -66,7 +82,7 @@ async function seed() {
   console.log('Created follow relationships');
 
   // Create sample activities
-  const sfLocations = [
+  const sfLocations: LocationData[] = [
     { lat: 37.7749, lng: -122.4194, name: 'Downtown SF' },
     { lat: 37.7694, lng: -122.4862, name: 'Golden Gate Park' },
     { lat: 37.8024, lng: -122.4058, name: 'Embarcadero' },
@@ -93,7 +109,7 @@ async function seed() {
       const startTime = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
 
       try {
-        const activityResult = await query(
+        const activityResult = await query<{ id: string }>(
           `INSERT INTO activities (
             user_id, type, name, start_time, elapsed_time, moving_time,
             distance, elevation_gain, avg_speed, max_speed, polyline,
@@ -134,7 +150,8 @@ async function seed() {
 
         console.log(`Created ${type} activity for user ${i + 1}`);
       } catch (error) {
-        console.error('Error creating activity:', error.message);
+        const err = error as Error;
+        console.error('Error creating activity:', err.message);
       }
     }
   }
@@ -170,15 +187,16 @@ async function seed() {
         ggpPoints[0].longitude,
         ggpPoints[ggpPoints.length - 1].latitude,
         ggpPoints[ggpPoints.length - 1].longitude,
-        ggpBbox.minLat,
-        ggpBbox.minLng,
-        ggpBbox.maxLat,
-        ggpBbox.maxLng
+        ggpBbox?.minLat,
+        ggpBbox?.minLng,
+        ggpBbox?.maxLat,
+        ggpBbox?.maxLng
       ]
     );
     console.log('Created Golden Gate Park segment');
   } catch (error) {
-    console.error('Error creating segment:', error.message);
+    const err = error as Error;
+    console.error('Error creating segment:', err.message);
   }
 
   // Embarcadero segment
@@ -205,20 +223,21 @@ async function seed() {
         embPoints[0].longitude,
         embPoints[embPoints.length - 1].latitude,
         embPoints[embPoints.length - 1].longitude,
-        embBbox.minLat,
-        embBbox.minLng,
-        embBbox.maxLat,
-        embBbox.maxLng
+        embBbox?.minLat,
+        embBbox?.minLng,
+        embBbox?.maxLat,
+        embBbox?.maxLng
       ]
     );
     console.log('Created Embarcadero segment');
   } catch (error) {
-    console.error('Error creating segment:', error.message);
+    const err = error as Error;
+    console.error('Error creating segment:', err.message);
   }
 
   // Add some kudos
   console.log('Adding kudos...');
-  const activities = await query('SELECT id, user_id FROM activities LIMIT 20');
+  const activities = await query<{ id: string; user_id: string }>('SELECT id, user_id FROM activities LIMIT 20');
 
   for (const activity of activities.rows) {
     const numKudos = Math.floor(Math.random() * 4);

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
 import multer from 'multer';
 import { PDFDocument } from 'pdf-lib';
@@ -8,6 +8,25 @@ import { authenticate } from '../middleware/auth.js';
 import { auditService } from '../services/auditService.js';
 
 const router = Router();
+
+interface EnvelopeRow {
+  id: string;
+  sender_id: string;
+  status: string;
+}
+
+interface DocumentRow {
+  id: string;
+  envelope_id: string;
+  name: string;
+  page_count: number;
+  s3_key: string;
+  status: string;
+  file_size: number;
+  created_at: string;
+  sender_id?: string;
+  envelope_status?: string;
+}
 
 // Configure multer for file uploads
 const upload = multer({
@@ -25,37 +44,46 @@ const upload = multer({
 });
 
 // Upload document to envelope
-router.post('/upload/:envelopeId', authenticate, upload.single('document'), async (req, res) => {
+router.post('/upload/:envelopeId', authenticate, upload.single('document'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { envelopeId } = req.params;
 
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      res.status(400).json({ error: 'No file uploaded' });
+      return;
+    }
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     // Verify envelope ownership and status
-    const envelopeResult = await query(
+    const envelopeResult = await query<EnvelopeRow>(
       'SELECT * FROM envelopes WHERE id = $1 AND sender_id = $2',
       [envelopeId, req.user.id]
     );
 
     if (envelopeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Envelope not found' });
+      res.status(404).json({ error: 'Envelope not found' });
+      return;
     }
 
     if (envelopeResult.rows[0].status !== 'draft') {
-      return res.status(400).json({ error: 'Can only add documents to draft envelopes' });
+      res.status(400).json({ error: 'Can only add documents to draft envelopes' });
+      return;
     }
 
     // Process PDF
-    let pdfDoc;
-    let pageCount;
+    let pdfDoc: PDFDocument;
+    let pageCount: number;
 
     try {
       pdfDoc = await PDFDocument.load(req.file.buffer);
       pageCount = pdfDoc.getPageCount();
     } catch (pdfError) {
-      return res.status(400).json({ error: 'Invalid PDF file' });
+      res.status(400).json({ error: 'Invalid PDF file' });
+      return;
     }
 
     // Store document in MinIO
@@ -65,7 +93,7 @@ router.post('/upload/:envelopeId', authenticate, upload.single('document'), asyn
     await uploadDocument(s3Key, req.file.buffer, 'application/pdf');
 
     // Create document record
-    const result = await query(
+    const result = await query<DocumentRow>(
       `INSERT INTO documents (id, envelope_id, name, page_count, s3_key, status, file_size)
        VALUES ($1, $2, $3, $4, $5, 'ready', $6)
        RETURNING *`,
@@ -91,11 +119,16 @@ router.post('/upload/:envelopeId', authenticate, upload.single('document'), asyn
 });
 
 // Get document info
-router.get('/:id', authenticate, async (req, res) => {
+router.get('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    const result = await query(
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
+    const result = await query<DocumentRow>(
       `SELECT d.*, e.sender_id
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -104,13 +137,15 @@ router.get('/:id', authenticate, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = result.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     // Get presigned URL for document
@@ -124,11 +159,16 @@ router.get('/:id', authenticate, async (req, res) => {
 });
 
 // Get document file (download)
-router.get('/:id/download', authenticate, async (req, res) => {
+router.get('/:id/download', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    const result = await query(
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
+    const result = await query<DocumentRow>(
       `SELECT d.*, e.sender_id
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -137,13 +177,15 @@ router.get('/:id/download', authenticate, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = result.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     const buffer = await getDocumentBuffer(document.s3_key);
@@ -158,11 +200,16 @@ router.get('/:id/download', authenticate, async (req, res) => {
 });
 
 // Get document for viewing (inline)
-router.get('/:id/view', authenticate, async (req, res) => {
+router.get('/:id/view', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    const result = await query(
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
+    const result = await query<DocumentRow>(
       `SELECT d.*, e.sender_id
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -171,13 +218,15 @@ router.get('/:id/view', authenticate, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = result.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     const buffer = await getDocumentBuffer(document.s3_key);
@@ -192,11 +241,16 @@ router.get('/:id/view', authenticate, async (req, res) => {
 });
 
 // Delete document
-router.delete('/:id', authenticate, async (req, res) => {
+router.delete('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    const result = await query(
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
+    const result = await query<DocumentRow>(
       `SELECT d.*, e.sender_id, e.status as envelope_status
        FROM documents d
        JOIN envelopes e ON d.envelope_id = e.id
@@ -205,17 +259,20 @@ router.delete('/:id', authenticate, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Document not found' });
+      res.status(404).json({ error: 'Document not found' });
+      return;
     }
 
     const document = result.rows[0];
 
     if (document.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
+      res.status(403).json({ error: 'Access denied' });
+      return;
     }
 
     if (document.envelope_status !== 'draft') {
-      return res.status(400).json({ error: 'Can only delete documents from draft envelopes' });
+      res.status(400).json({ error: 'Can only delete documents from draft envelopes' });
+      return;
     }
 
     await query('DELETE FROM documents WHERE id = $1', [id]);
@@ -228,21 +285,27 @@ router.delete('/:id', authenticate, async (req, res) => {
 });
 
 // Get documents for an envelope
-router.get('/envelope/:envelopeId', authenticate, async (req, res) => {
+router.get('/envelope/:envelopeId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { envelopeId } = req.params;
 
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     // Verify envelope ownership
-    const envelopeResult = await query(
+    const envelopeResult = await query<EnvelopeRow>(
       'SELECT * FROM envelopes WHERE id = $1 AND sender_id = $2',
       [envelopeId, req.user.id]
     );
 
     if (envelopeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Envelope not found' });
+      res.status(404).json({ error: 'Envelope not found' });
+      return;
     }
 
-    const result = await query(
+    const result = await query<DocumentRow>(
       'SELECT * FROM documents WHERE envelope_id = $1 ORDER BY created_at ASC',
       [envelopeId]
     );

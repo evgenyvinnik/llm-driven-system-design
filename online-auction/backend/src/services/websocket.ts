@@ -37,7 +37,7 @@ export const setupWebSocket = (server: Server): WebSocketServer => {
         const result = await query('SELECT id, username FROM users WHERE id = $1', [sessionUserId]);
         if (result.rows.length > 0) {
           userId = result.rows[0].id;
-          ws.userId = userId;
+          ws.userId = userId ?? undefined;
           ws.username = result.rows[0].username;
         }
       }

@@ -233,7 +233,7 @@ router.put('/:id', authenticate, requireHost, async (req, res) => {
   // Verify ownership
   const ownerCheck = await query(
     'SELECT * FROM listings WHERE id = $1 AND host_id = $2',
-    [id, req.user.id]
+    [id, req.user!.id]
   );
 
   if (ownerCheck.rows.length === 0) {
@@ -288,7 +288,7 @@ router.put('/:id', authenticate, requireHost, async (req, res) => {
       ]
     );
 
-    const listing = result.rows[0];
+    const listing = result.rows[0] as ListingRow;
 
     // Invalidate cache
     await invalidateListingCache(id);
@@ -322,7 +322,7 @@ router.delete('/:id', authenticate, requireHost, async (req, res) => {
 
   const ownerCheck = await query(
     'SELECT * FROM listings WHERE id = $1 AND host_id = $2',
-    [id, req.user.id]
+    [id, req.user!.id]
   );
 
   if (ownerCheck.rows.length === 0) {
@@ -336,7 +336,7 @@ router.delete('/:id', authenticate, requireHost, async (req, res) => {
     await invalidateListingCache(id);
 
     // Audit log
-    await auditListing(AUDIT_EVENTS.LISTING_DELETED, ownerCheck.rows[0], req);
+    await auditListing(AUDIT_EVENTS.LISTING_DELETED, ownerCheck.rows[0] as ListingRow, req);
 
     log.info({ listingId: id }, 'Listing deleted');
 
@@ -353,21 +353,22 @@ router.post('/:id/photos', authenticate, requireHost, upload.array('photos', 10)
 
   const ownerCheck = await query(
     'SELECT id FROM listings WHERE id = $1 AND host_id = $2',
-    [id, req.user.id]
+    [id, req.user!.id]
   );
 
   if (ownerCheck.rows.length === 0) {
     return res.status(403).json({ error: 'Not authorized' });
   }
 
-  if (!req.files || req.files.length === 0) {
+  if (!req.files || !Array.isArray(req.files) || req.files.length === 0) {
     return res.status(400).json({ error: 'No files uploaded' });
   }
 
   try {
     const photos = [];
-    for (let i = 0; i < req.files.length; i++) {
-      const file = req.files[i];
+    const files = req.files as Express.Multer.File[];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       const url = `/uploads/listings/${file.filename}`;
       const result = await query(
         'INSERT INTO listing_photos (listing_id, url, display_order) VALUES ($1, $2, $3) RETURNING *',
@@ -394,7 +395,7 @@ router.delete('/:id/photos/:photoId', authenticate, requireHost, async (req, res
 
   const ownerCheck = await query(
     'SELECT l.id FROM listings l JOIN listing_photos p ON p.listing_id = l.id WHERE l.id = $1 AND l.host_id = $2 AND p.id = $3',
-    [id, req.user.id, photoId]
+    [id, req.user!.id, photoId]
   );
 
   if (ownerCheck.rows.length === 0) {
@@ -421,8 +422,8 @@ router.get('/:id/availability', async (req, res) => {
   const { id } = req.params;
   const { start_date, end_date } = req.query;
 
-  const startDateStr = start_date || new Date().toISOString().split('T')[0];
-  const endDateStr = end_date || new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const startDateStr = typeof start_date === 'string' ? start_date : new Date().toISOString().split('T')[0];
+  const endDateStr = typeof end_date === 'string' ? end_date : new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   try {
     // Use cache-aside pattern for availability
@@ -451,7 +452,7 @@ router.put('/:id/availability', authenticate, requireHost, async (req, res) => {
 
   const ownerCheck = await query(
     'SELECT id FROM listings WHERE id = $1 AND host_id = $2',
-    [id, req.user.id]
+    [id, req.user!.id]
   );
 
   if (ownerCheck.rows.length === 0) {
@@ -529,7 +530,7 @@ router.get('/host/my-listings', authenticate, requireHost, async (req, res) => {
       FROM listings l
       WHERE l.host_id = $1
       ORDER BY l.created_at DESC`,
-      [req.user.id]
+      [req.user!.id]
     );
 
     res.json({ listings: result.rows });

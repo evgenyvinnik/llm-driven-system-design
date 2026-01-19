@@ -1,35 +1,64 @@
-const express = require('express');
-const db = require('../db');
-const { client: redis } = require('../db/redis');
-const { isAuthenticated, hasSubscription } = require('../middleware/auth');
-const config = require('../config');
+import express, { Request, Response, Router } from 'express';
+import * as db from '../db/index.js';
+import { client as redis } from '../db/redis.js';
+import { isAuthenticated, hasSubscription } from '../middleware/auth.js';
 
 // Shared observability and resilience modules
-const { logger, auditLog, AuditEvents } = require('../shared/logger');
-const {
+import { logger, auditLog, AuditEvents } from '../shared/logger.js';
+import {
   manifestGenerationDuration,
   activeStreams,
   segmentRequestsTotal,
   streamingErrors,
   playbackStartLatency
-} = require('../shared/metrics');
-const { withCircuitBreaker } = require('../shared/circuitBreaker');
+} from '../shared/metrics.js';
+import { withCircuitBreaker } from '../shared/circuitBreaker.js';
 
-const router = express.Router();
+const router: Router = express.Router();
+
+interface ContentRow {
+  id: string;
+  title: string;
+  duration: number;
+  status: string;
+}
+
+interface VariantRow {
+  id: string;
+  resolution: number;
+  codec: string;
+  hdr: boolean;
+  bitrate: number;
+}
+
+interface AudioTrackRow {
+  id: string;
+  language: string;
+  name: string;
+  codec: string;
+  channels: number;
+}
+
+interface SubtitleRow {
+  id: string;
+  language: string;
+  name: string;
+  type: string;
+}
 
 // Track active streams per content
-const activeStreamTracking = new Map();
+const activeStreamTracking = new Map<string, number>();
 
 /**
  * Helper to track stream lifecycle
  */
-function trackStreamStart(contentId, quality, deviceType) {
+function trackStreamStart(contentId: string, quality: string, deviceType: string): void {
   const key = `${contentId}:${quality}:${deviceType}`;
   activeStreamTracking.set(key, Date.now());
   activeStreams.inc({ quality, device_type: deviceType });
 }
 
-function trackStreamEnd(contentId, quality, deviceType) {
+function trackStreamEnd(contentId: string, quality: string, deviceType: string): void {
   const key = `${contentId}:${quality}:${deviceType}`;
   if (activeStreamTracking.has(key)) {
     activeStreamTracking.delete(key);
@@ -38,30 +67,33 @@ function trackStreamEnd(contentId, quality, deviceType) {
 }
 
 // Generate HLS master playlist
-router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   const startTime = process.hrtime.bigint();
   const { contentId } = req.params;
 
   try {
     // Get content info - wrapped in circuit breaker for DB resilience
     const content = await withCircuitBreaker('storage', async () => {
-      return db.query(`
+      return db.query<ContentRow>(`
         SELECT id, title, duration, status FROM content WHERE id = $1
       `, [contentId]);
     });
 
-    if (content.rows.length === 0) {
+    if (!content || (content as { rows: ContentRow[] }).rows.length === 0) {
       streamingErrors.inc({ error_type: 'content_not_found', content_id: contentId });
-      return res.status(404).send('#EXTM3U\n# Content not found');
+      res.status(404).send('#EXTM3U\n# Content not found');
+      return;
     }
 
-    if (content.rows[0].status !== 'ready') {
+    const contentResult = content as { rows: ContentRow[] };
+    if (contentResult.rows[0].status !== 'ready') {
       streamingErrors.inc({ error_type: 'content_not_ready', content_id: contentId });
-      return res.status(404).send('#EXTM3U\n# Content not available');
+      res.status(404).send('#EXTM3U\n# Content not available');
+      return;
     }
 
     // Get encoded variants
-    const variants = await db.query(`
+    const variants = await db.query<VariantRow>(`
       SELECT id, resolution, codec, hdr, bitrate
       FROM encoded_variants
       WHERE content_id = $1
@@ -69,14 +101,14 @@ router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (r
     `, [contentId]);
 
     // Get audio tracks
-    const audioTracks = await db.query(`
+    const audioTracks = await db.query<AudioTrackRow>(`
       SELECT id, language, name, codec, channels
       FROM audio_tracks
       WHERE content_id = $1
     `, [contentId]);
 
     // Get subtitles
-    const subtitles = await db.query(`
+    const subtitles = await db.query<SubtitleRow>(`
       SELECT id, language, name, type
       FROM subtitles
       WHERE content_id = $1
@@ -113,7 +145,7 @@ router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (r
       const width = Math.round(variant.resolution * 16 / 9);
       const resolution = `${width}x${variant.resolution}`;
 
-      let codecs;
+      let codecs: string;
       if (variant.codec === 'hevc' && variant.hdr) {
         codecs = 'hvc1.2.4.L150.B0,mp4a.40.2';
       } else if (variant.codec === 'hevc') {
@@ -138,7 +170,7 @@ router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (r
       profileId: req.session.profileId,
       contentId,
       ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
+      userAgent: req.headers['user-agent'] as string,
       details: { type: 'manifest_request' }
     });
 
@@ -147,28 +179,29 @@ router.get('/:contentId/master.m3u8', isAuthenticated, hasSubscription, async (r
   } catch (error) {
     streamingErrors.inc({ error_type: 'manifest_generation', content_id: contentId });
     if (req.log) {
-      req.log.error({ error: error.message, contentId }, 'Generate master playlist error');
+      req.log.error({ error: (error as Error).message, contentId }, 'Generate master playlist error');
     } else {
-      logger.error({ error: error.message, contentId }, 'Generate master playlist error');
+      logger.error({ error: (error as Error).message, contentId }, 'Generate master playlist error');
     }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate variant playlist (video quality level)
-router.get('/:contentId/variant/:variantId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/variant/:variantId.m3u8', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   const startTime = process.hrtime.bigint();
 
   try {
     const { contentId, variantId } = req.params;
 
     // Get content duration
-    const content = await db.query(`
+    const content = await db.query<{ duration: number }>(`
       SELECT duration FROM content WHERE id = $1
     `, [contentId]);
 
     if (content.rows.length === 0) {
-      return res.status(404).send('#EXTM3U\n# Content not found');
+      res.status(404).send('#EXTM3U\n# Content not found');
+      return;
     }
 
     const duration = content.rows[0].duration;
@@ -199,25 +232,26 @@ router.get('/:contentId/variant/:variantId.m3u8', isAuthenticated, hasSubscripti
     const { contentId } = req.params;
     streamingErrors.inc({ error_type: 'variant_manifest', content_id: contentId });
     if (req.log) {
-      req.log.error({ error: error.message }, 'Generate variant playlist error');
+      req.log.error({ error: (error as Error).message }, 'Generate variant playlist error');
     }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate audio playlist
-router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   const startTime = process.hrtime.bigint();
 
   try {
-    const { contentId, audioId } = req.params;
+    const { contentId } = req.params;
 
-    const content = await db.query(`
+    const content = await db.query<{ duration: number }>(`
       SELECT duration FROM content WHERE id = $1
     `, [contentId]);
 
     if (content.rows.length === 0) {
-      return res.status(404).send('#EXTM3U\n# Content not found');
+      res.status(404).send('#EXTM3U\n# Content not found');
+      return;
     }
 
     const duration = content.rows[0].duration;
@@ -230,6 +264,7 @@ router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, 
     playlist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     playlist += '#EXT-X-PLAYLIST-TYPE:VOD\n\n';
 
+    const { audioId } = req.params;
     for (let i = 0; i < segmentCount; i++) {
       const segDuration = Math.min(segmentDuration, duration - (i * segmentDuration));
       playlist += `#EXTINF:${segDuration.toFixed(3)},\n`;
@@ -246,14 +281,14 @@ router.get('/:contentId/audio/:audioId.m3u8', isAuthenticated, hasSubscription, 
     res.send(playlist);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Generate audio playlist error');
+      req.log.error({ error: (error as Error).message }, 'Generate audio playlist error');
     }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Generate subtitle playlist
-router.get('/:contentId/subtitles/:subId.m3u8', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/subtitles/:subId.m3u8', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   const startTime = process.hrtime.bigint();
 
   try {
@@ -276,14 +311,14 @@ router.get('/:contentId/subtitles/:subId.m3u8', isAuthenticated, hasSubscription
     res.send(playlist);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Generate subtitle playlist error');
+      req.log.error({ error: (error as Error).message }, 'Generate subtitle playlist error');
     }
     res.status(500).send('#EXTM3U\n# Server error');
   }
 });
 
 // Serve video segment (simulated - in production would come from CDN/MinIO)
-router.get('/:contentId/segment/:variantId/:segmentNum.ts', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/segment/:variantId/:segmentNum.ts', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   try {
     const { contentId, variantId, segmentNum } = req.params;
 
@@ -303,14 +338,14 @@ router.get('/:contentId/segment/:variantId/:segmentNum.ts', isAuthenticated, has
     const { contentId } = req.params;
     streamingErrors.inc({ error_type: 'segment_fetch', content_id: contentId });
     if (req.log) {
-      req.log.error({ error: error.message }, 'Serve segment error');
+      req.log.error({ error: (error as Error).message }, 'Serve segment error');
     }
     res.status(500).send('Server error');
   }
 });
 
 // Serve audio segment
-router.get('/:contentId/audio-segment/:audioId/:segmentNum.aac', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/audio-segment/:audioId/:segmentNum.aac', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   try {
     const { contentId, audioId, segmentNum } = req.params;
 
@@ -324,24 +359,25 @@ router.get('/:contentId/audio-segment/:audioId/:segmentNum.aac', isAuthenticated
     res.status(200).send(''); // Would send actual audio data
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Serve audio segment error');
+      req.log.error({ error: (error as Error).message }, 'Serve audio segment error');
     }
     res.status(500).send('Server error');
   }
 });
 
 // Serve subtitle file
-router.get('/:contentId/subtitle-file/:subId.vtt', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/subtitle-file/:subId.vtt', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { contentId, subId } = req.params;
+    const { contentId } = req.params;
 
     // Generate sample VTT content
-    const content = await db.query(`
+    const content = await db.query<{ duration: number }>(`
       SELECT duration FROM content WHERE id = $1
     `, [contentId]);
 
     if (content.rows.length === 0) {
-      return res.status(404).send('Content not found');
+      res.status(404).send('Content not found');
+      return;
     }
 
     let vtt = 'WEBVTT\n\n';
@@ -356,31 +392,33 @@ router.get('/:contentId/subtitle-file/:subId.vtt', isAuthenticated, hasSubscript
     res.send(vtt);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Serve subtitle error');
+      req.log.error({ error: (error as Error).message }, 'Serve subtitle error');
     }
     res.status(500).send('Server error');
   }
 });
 
 // Get playback URL (used by client to initiate streaming)
-router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req, res) => {
+router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req: Request, res: Response): Promise<void> => {
   const startTime = process.hrtime.bigint();
 
   try {
     const { contentId } = req.params;
-    const deviceType = req.headers['x-device-type'] || 'unknown';
+    const deviceType = (req.headers['x-device-type'] as string) || 'unknown';
 
     // Verify content exists and is ready
-    const content = await db.query(`
+    const content = await db.query<ContentRow>(`
       SELECT id, title, duration, status FROM content WHERE id = $1
     `, [contentId]);
 
     if (content.rows.length === 0) {
-      return res.status(404).json({ error: 'Content not found' });
+      res.status(404).json({ error: 'Content not found' });
+      return;
     }
 
     if (content.rows[0].status !== 'ready') {
-      return res.status(404).json({ error: 'Content not available' });
+      res.status(404).json({ error: 'Content not available' });
+      return;
     }
 
     // Generate playback token (in production, this would be a signed JWT)
@@ -406,9 +444,9 @@ router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req,
       userId: req.session.userId,
       profileId: req.session.profileId,
       contentId,
-      deviceId: req.headers['x-device-id'],
+      deviceId: req.headers['x-device-id'] as string,
       ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
+      userAgent: req.headers['user-agent'] as string,
       details: { deviceType, latency }
     });
 
@@ -429,17 +467,17 @@ router.get('/:contentId/playback', isAuthenticated, hasSubscription, async (req,
     const { contentId } = req.params;
     streamingErrors.inc({ error_type: 'playback_init', content_id: contentId });
     if (req.log) {
-      req.log.error({ error: error.message }, 'Get playback URL error');
+      req.log.error({ error: (error as Error).message }, 'Get playback URL error');
     }
     res.status(500).json({ error: 'Failed to get playback URL' });
   }
 });
 
 // Endpoint to report playback end (for accurate stream tracking)
-router.post('/:contentId/playback/end', isAuthenticated, async (req, res) => {
+router.post('/:contentId/playback/end', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     const { contentId } = req.params;
-    const { quality, deviceType } = req.body;
+    const { quality, deviceType } = req.body as { quality?: string; deviceType?: string };
 
     trackStreamEnd(contentId, quality || 'auto', deviceType || 'unknown');
 
@@ -450,10 +488,10 @@ router.post('/:contentId/playback/end', isAuthenticated, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Report playback end error');
+      req.log.error({ error: (error as Error).message }, 'Report playback end error');
     }
     res.status(500).json({ error: 'Failed to report playback end' });
   }
 });
 
-module.exports = router;
+export default router;

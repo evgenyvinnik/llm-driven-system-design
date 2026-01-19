@@ -102,7 +102,10 @@ export function requestLogger(
     if (typeof encodingOrCallback === 'function') {
       return originalEnd(chunk, encodingOrCallback);
     }
-    return originalEnd(chunk, encodingOrCallback, callback);
+    if (encodingOrCallback !== undefined) {
+      return originalEnd(chunk, encodingOrCallback, callback);
+    }
+    return originalEnd(chunk);
   };
 
   next();

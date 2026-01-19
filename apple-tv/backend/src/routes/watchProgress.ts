@@ -1,26 +1,78 @@
-const express = require('express');
-const db = require('../db');
-const { client: redis } = require('../db/redis');
-const { isAuthenticated } = require('../middleware/auth');
+import express, { Request, Response, Router } from 'express';
+import * as db from '../db/index.js';
+import { client as redis } from '../db/redis.js';
+import { isAuthenticated } from '../middleware/auth.js';
 
 // Shared observability and resilience modules
-const { logger } = require('../shared/logger');
-const { watchProgressUpdates } = require('../shared/metrics');
-const {
+import { logger } from '../shared/logger.js';
+import { watchProgressUpdates } from '../shared/metrics.js';
+import {
   watchProgressIdempotency,
   completeWatchProgressIdempotency
-} = require('../shared/idempotency');
+} from '../shared/idempotency.js';
 
-const router = express.Router();
+const router: Router = express.Router();
+
+interface WatchProgressRow {
+  content_id: string;
+  position: number;
+  duration: number;
+  completed: boolean;
+  updated_at: Date;
+  title: string;
+  thumbnail_url: string;
+  content_type: string;
+  series_id: string | null;
+  season_number: number | null;
+  episode_number: number | null;
+}
+
+interface ContinueWatchingRow {
+  id: string;
+  title: string;
+  thumbnail_url: string;
+  duration: number;
+  content_type: string;
+  series_id: string | null;
+  season_number: number | null;
+  episode_number: number | null;
+  position: number;
+  progress_pct: number;
+  series_title: string | null;
+  series_thumbnail: string | null;
+  progressPercent?: number;
+  remainingMinutes?: number;
+}
+
+interface WatchHistoryRow {
+  id: string;
+  watched_at: Date;
+  content_id: string;
+  title: string;
+  thumbnail_url: string;
+  content_type: string;
+  duration: number;
+  series_id: string | null;
+  season_number: number | null;
+  episode_number: number | null;
+  series_title: string | null;
+}
+
+interface ProgressUpdateResult {
+  position: number;
+  completed: boolean;
+  was_updated: boolean;
+}
 
 // Get watch progress for current profile
-router.get('/progress', isAuthenticated, async (req, res) => {
+router.get('/progress', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
-    const result = await db.query(`
+    const result = await db.query<WatchProgressRow>(`
       SELECT wp.content_id, wp.position, wp.duration, wp.completed, wp.updated_at,
              c.title, c.thumbnail_url, c.content_type, c.series_id,
              c.season_number, c.episode_number
@@ -33,20 +85,21 @@ router.get('/progress', isAuthenticated, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Get progress error');
+      req.log.error({ error: (error as Error).message }, 'Get progress error');
     }
     res.status(500).json({ error: 'Failed to get progress' });
   }
 });
 
 // Get continue watching list
-router.get('/continue', isAuthenticated, async (req, res) => {
+router.get('/continue', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
-    const result = await db.query(`
+    const result = await db.query<ContinueWatchingRow>(`
       SELECT
         c.id,
         c.title,
@@ -80,7 +133,7 @@ router.get('/continue', isAuthenticated, async (req, res) => {
     res.json(items);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Get continue watching error');
+      req.log.error({ error: (error as Error).message }, 'Get continue watching error');
     }
     res.status(500).json({ error: 'Failed to get continue watching' });
   }
@@ -101,22 +154,29 @@ router.get('/continue', isAuthenticated, async (req, res) => {
  * - duration: Total content duration in seconds
  * - clientTimestamp: (optional) Client-side timestamp for conflict resolution
  */
-router.post('/progress/:contentId', isAuthenticated, watchProgressIdempotency(redis), async (req, res) => {
+router.post('/progress/:contentId', isAuthenticated, watchProgressIdempotency(redis), async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
     const { contentId } = req.params;
-    const { position, duration, clientTimestamp } = req.body;
+    const { position, duration, clientTimestamp } = req.body as {
+      position?: number;
+      duration?: number;
+      clientTimestamp?: number;
+    };
 
     if (typeof position !== 'number' || typeof duration !== 'number') {
-      return res.status(400).json({ error: 'Position and duration are required' });
+      res.status(400).json({ error: 'Position and duration are required' });
+      return;
     }
 
     // Validate position bounds
     if (position < 0 || position > duration) {
-      return res.status(400).json({ error: 'Invalid position value' });
+      res.status(400).json({ error: 'Invalid position value' });
+      return;
     }
 
     // Check if completed (> 90%)
@@ -128,7 +188,7 @@ router.post('/progress/:contentId', isAuthenticated, watchProgressIdempotency(re
       Date.now();
 
     // Update with last-write-wins semantic using client timestamp
-    const updateResult = await db.query(`
+    const updateResult = await db.query<ProgressUpdateResult>(`
       INSERT INTO watch_progress (user_id, profile_id, content_id, position, duration, completed, client_timestamp, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
       ON CONFLICT (profile_id, content_id)
@@ -201,11 +261,26 @@ router.post('/progress/:contentId', isAuthenticated, watchProgressIdempotency(re
   } catch (error) {
     watchProgressUpdates.inc({ status: 'error' });
     if (req.log) {
-      req.log.error({ error: error.message }, 'Update progress error');
+      req.log.error({ error: (error as Error).message }, 'Update progress error');
     }
     res.status(500).json({ error: 'Failed to update progress' });
   }
 });
+
+interface BatchUpdate {
+  contentId: string;
+  position: number;
+  duration: number;
+  clientTimestamp?: number;
+}
+
+interface BatchResult {
+  contentId: string;
+  success: boolean;
+  wasUpdated?: boolean;
+  completed?: boolean;
+  error?: string;
+}
 
 /**
  * Batch update watch progress
@@ -216,23 +291,26 @@ router.post('/progress/:contentId', isAuthenticated, watchProgressIdempotency(re
  * Request body:
  * - updates: Array of { contentId, position, duration, clientTimestamp }
  */
-router.post('/progress/batch', isAuthenticated, async (req, res) => {
+router.post('/progress/batch', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
-    const { updates } = req.body;
+    const { updates } = req.body as { updates?: BatchUpdate[] };
 
     if (!Array.isArray(updates) || updates.length === 0) {
-      return res.status(400).json({ error: 'Updates array is required' });
+      res.status(400).json({ error: 'Updates array is required' });
+      return;
     }
 
     if (updates.length > 50) {
-      return res.status(400).json({ error: 'Maximum 50 updates per batch' });
+      res.status(400).json({ error: 'Maximum 50 updates per batch' });
+      return;
     }
 
-    const results = [];
+    const results: BatchResult[] = [];
 
     for (const update of updates) {
       const { contentId, position, duration, clientTimestamp } = update;
@@ -246,7 +324,7 @@ router.post('/progress/batch', isAuthenticated, async (req, res) => {
         const completed = position / duration > 0.9;
         const effectiveTimestamp = clientTimestamp || Date.now();
 
-        const updateResult = await db.query(`
+        const updateResult = await db.query<{ was_updated: boolean }>(`
           INSERT INTO watch_progress (user_id, profile_id, content_id, position, duration, completed, client_timestamp, updated_at)
           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
           ON CONFLICT (profile_id, content_id)
@@ -294,7 +372,7 @@ router.post('/progress/batch', isAuthenticated, async (req, res) => {
           `, [req.session.userId, req.session.profileId, contentId]);
         }
       } catch (updateError) {
-        results.push({ contentId, success: false, error: updateError.message });
+        results.push({ contentId, success: false, error: (updateError as Error).message });
         watchProgressUpdates.inc({ status: 'error' });
       }
     }
@@ -311,22 +389,23 @@ router.post('/progress/batch', isAuthenticated, async (req, res) => {
     res.json({ success: true, results });
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Batch update progress error');
+      req.log.error({ error: (error as Error).message }, 'Batch update progress error');
     }
     res.status(500).json({ error: 'Failed to batch update progress' });
   }
 });
 
 // Get watch history
-router.get('/history', isAuthenticated, async (req, res) => {
+router.get('/history', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = '50', offset = '0' } = req.query as Record<string, string>;
 
-    const result = await db.query(`
+    const result = await db.query<WatchHistoryRow>(`
       SELECT
         wh.id,
         wh.watched_at,
@@ -350,17 +429,18 @@ router.get('/history', isAuthenticated, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Get history error');
+      req.log.error({ error: (error as Error).message }, 'Get history error');
     }
     res.status(500).json({ error: 'Failed to get history' });
   }
 });
 
 // Clear watch history
-router.delete('/history', isAuthenticated, async (req, res) => {
+router.delete('/history', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
     await db.query(`
@@ -378,34 +458,42 @@ router.delete('/history', isAuthenticated, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Clear history error');
+      req.log.error({ error: (error as Error).message }, 'Clear history error');
     }
     res.status(500).json({ error: 'Failed to clear history' });
   }
 });
 
 // Get progress for specific content
-router.get('/progress/:contentId', isAuthenticated, async (req, res) => {
+router.get('/progress/:contentId', isAuthenticated, async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.session.profileId) {
-      return res.status(400).json({ error: 'Profile not selected' });
+      res.status(400).json({ error: 'Profile not selected' });
+      return;
     }
 
     const { contentId } = req.params;
 
-    const result = await db.query(`
+    const result = await db.query<{
+      position: number;
+      duration: number;
+      completed: boolean;
+      updated_at: Date;
+      client_timestamp: number | null;
+    }>(`
       SELECT position, duration, completed, updated_at, client_timestamp
       FROM watch_progress
       WHERE profile_id = $1 AND content_id = $2
     `, [req.session.profileId, contentId]);
 
     if (result.rows.length === 0) {
-      return res.json({
+      res.json({
         position: 0,
         duration: 0,
         completed: false,
         clientTimestamp: null
       });
+      return;
     }
 
     const row = result.rows[0];
@@ -418,10 +506,10 @@ router.get('/progress/:contentId', isAuthenticated, async (req, res) => {
     });
   } catch (error) {
     if (req.log) {
-      req.log.error({ error: error.message }, 'Get content progress error');
+      req.log.error({ error: (error as Error).message }, 'Get content progress error');
     }
     res.status(500).json({ error: 'Failed to get progress' });
   }
 });
 
-module.exports = router;
+export default router;

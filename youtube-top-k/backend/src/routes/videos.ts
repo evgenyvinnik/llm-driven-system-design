@@ -183,9 +183,12 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
  */
 router.post('/:id/view', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { id } = req.params;
-    const requestId = req.headers['x-request-id'] as string | undefined;
-    const sessionId = (req.headers['x-session-id'] as string) || (req.body as { sessionId?: string }).sessionId;
+    const id = req.params.id as string;
+    const rawRequestId = req.headers['x-request-id'];
+    const requestId: string | undefined = Array.isArray(rawRequestId) ? rawRequestId[0] : rawRequestId;
+    const rawSessionId = req.headers['x-session-id'];
+    const bodySessionId = (req.body as { sessionId?: string }).sessionId;
+    const sessionId: string | undefined = Array.isArray(rawSessionId) ? rawSessionId[0] : (rawSessionId || bodySessionId);
 
     // Check if video exists and get category
     const videoResult = await query<{ id: string; category: string; total_views: number }>(

@@ -1,12 +1,52 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
-import { getSignedDownloadUrl, getPublicUrl, BUCKETS } from '../services/minio.js';
+import { getSignedDownloadUrl, BUCKETS } from '../services/minio.js';
 import { authenticate, optionalAuth } from '../middleware/auth.js';
 import { streamStartLatency, activeStreams, streamsTotal, cacheHits } from '../shared/metrics.js';
 import { logger, logStreamEvent } from '../shared/logger.js';
 
 const router = Router();
+
+interface QualitySettings {
+  format: string;
+  bitrate: number;
+  sampleRate: number;
+  bitDepth: number;
+}
+
+interface StreamQuery {
+  quality?: string;
+  network?: string;
+}
+
+interface PrefetchBody {
+  trackId: string;
+  quality?: string;
+  network?: string;
+}
+
+interface ProgressBody {
+  trackId: string;
+  position: number;
+  duration: number;
+  completed?: boolean;
+}
+
+interface EndStreamBody {
+  trackId: string;
+  reason?: string;
+}
+
+interface AudioFileRow {
+  quality: string;
+  format: string;
+  bitrate: number;
+  sample_rate: number;
+  bit_depth: number;
+  minio_key: string;
+  file_size?: number;
+}
 
 /**
  * Streaming routes with comprehensive metrics.
@@ -19,7 +59,7 @@ const router = Router();
  */
 
 // Quality options and their settings
-const QUALITY_OPTIONS = {
+const QUALITY_OPTIONS: Record<string, QualitySettings> = {
   '256_aac': { format: 'aac', bitrate: 256, sampleRate: 44100, bitDepth: 16 },
   '256_aac_plus': { format: 'aac', bitrate: 256, sampleRate: 48000, bitDepth: 16 },
   'lossless': { format: 'alac', bitrate: 1411, sampleRate: 44100, bitDepth: 16 },
@@ -27,28 +67,29 @@ const QUALITY_OPTIONS = {
 };
 
 // Subscription tier max quality
-const TIER_MAX_QUALITY = {
+const TIER_MAX_QUALITY: Record<string, string> = {
   'free': '256_aac',
   'student': 'lossless',
   'individual': 'hi_res_lossless',
   'family': 'hi_res_lossless'
 };
 
+// Network max quality mapping
+const NETWORK_MAX_QUALITY: Record<string, string> = {
+  'wifi': 'hi_res_lossless',
+  'cellular_5g': 'lossless',
+  'cellular_lte': '256_aac_plus',
+  'cellular_3g': '256_aac'
+};
+
 // Select quality based on preferences and network
-function selectQuality(preferred, network, maxTierQuality) {
+function selectQuality(preferred: string, network: string, maxTierQuality: string): string {
   const qualities = ['256_aac', '256_aac_plus', 'lossless', 'hi_res_lossless'];
 
   const preferredIndex = qualities.indexOf(preferred);
   const maxIndex = qualities.indexOf(maxTierQuality);
 
-  // Network constraints
-  const networkMax = {
-    'wifi': 'hi_res_lossless',
-    'cellular_5g': 'lossless',
-    'cellular_lte': '256_aac_plus',
-    'cellular_3g': '256_aac'
-  }[network] || 'lossless';
-
+  const networkMax = NETWORK_MAX_QUALITY[network] || 'lossless';
   const networkIndex = qualities.indexOf(networkMax);
 
   const selectedIndex = Math.min(
@@ -61,14 +102,14 @@ function selectQuality(preferred, network, maxTierQuality) {
 }
 
 // Get stream URL for a track
-router.get('/:trackId', authenticate, async (req, res) => {
+router.get('/:trackId', authenticate, async (req: Request<{ trackId: string }, unknown, unknown, StreamQuery>, res: Response) => {
   const startTime = Date.now();
 
   try {
     const { trackId } = req.params;
     const { quality: preferredQuality, network = 'wifi' } = req.query;
-    const userId = req.user.id;
-    const subscriptionTier = req.user.subscriptionTier || 'free';
+    const userId = req.user!.id;
+    const subscriptionTier = req.user!.subscriptionTier || 'free';
 
     // Get track info
     const trackResult = await pool.query(
@@ -81,14 +122,15 @@ router.get('/:trackId', authenticate, async (req, res) => {
     );
 
     if (trackResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Track not found' });
+      res.status(404).json({ error: 'Track not found' });
+      return;
     }
 
     const track = trackResult.rows[0];
 
     // Determine quality
     const maxTierQuality = TIER_MAX_QUALITY[subscriptionTier] || '256_aac';
-    const userPreferred = preferredQuality || req.user.preferredQuality || '256_aac';
+    const userPreferred = preferredQuality || req.user!.preferredQuality || '256_aac';
     const quality = selectQuality(userPreferred, network, maxTierQuality);
 
     // Check for existing audio file
@@ -97,11 +139,11 @@ router.get('/:trackId', authenticate, async (req, res) => {
       [trackId, quality]
     );
 
-    let streamUrl;
-    let audioFile;
+    let streamUrl: string;
+    let audioFile: AudioFileRow;
 
     if (audioFileResult.rows.length > 0) {
-      audioFile = audioFileResult.rows[0];
+      audioFile = audioFileResult.rows[0] as AudioFileRow;
       // Generate signed URL
       streamUrl = await getSignedDownloadUrl(BUCKETS.AUDIO, audioFile.minio_key, 3600);
       cacheHits.inc({ cache: 'audio_file', result: 'hit' });
@@ -116,7 +158,8 @@ router.get('/:trackId', authenticate, async (req, res) => {
         format: qualitySettings.format,
         bitrate: qualitySettings.bitrate,
         sample_rate: qualitySettings.sampleRate,
-        bit_depth: qualitySettings.bitDepth
+        bit_depth: qualitySettings.bitDepth,
+        minio_key: ''
       };
       cacheHits.inc({ cache: 'audio_file', result: 'miss' });
     }
@@ -167,13 +210,13 @@ router.get('/:trackId', authenticate, async (req, res) => {
 });
 
 // Prefetch next track (for gapless playback)
-router.post('/prefetch', authenticate, async (req, res) => {
+router.post('/prefetch', authenticate, async (req: Request<object, unknown, PrefetchBody>, res: Response) => {
   const startTime = Date.now();
 
   try {
     const { trackId, quality: preferredQuality, network = 'wifi' } = req.body;
-    const userId = req.user.id;
-    const subscriptionTier = req.user.subscriptionTier || 'free';
+    const userId = req.user!.id;
+    const subscriptionTier = req.user!.subscriptionTier || 'free';
 
     // Get track info
     const trackResult = await pool.query(
@@ -186,14 +229,15 @@ router.post('/prefetch', authenticate, async (req, res) => {
     );
 
     if (trackResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Track not found' });
+      res.status(404).json({ error: 'Track not found' });
+      return;
     }
 
     const track = trackResult.rows[0];
 
     // Determine quality
     const maxTierQuality = TIER_MAX_QUALITY[subscriptionTier] || '256_aac';
-    const userPreferred = preferredQuality || req.user.preferredQuality || '256_aac';
+    const userPreferred = preferredQuality || req.user!.preferredQuality || '256_aac';
     const quality = selectQuality(userPreferred, network, maxTierQuality);
 
     const qualitySettings = QUALITY_OPTIONS[quality];
@@ -234,7 +278,7 @@ router.post('/prefetch', authenticate, async (req, res) => {
 });
 
 // Get available qualities for a track
-router.get('/:trackId/qualities', optionalAuth, async (req, res) => {
+router.get('/:trackId/qualities', optionalAuth, async (req: Request<{ trackId: string }>, res: Response) => {
   try {
     const { trackId } = req.params;
 
@@ -252,11 +296,12 @@ router.get('/:trackId/qualities', optionalAuth, async (req, res) => {
         available: true // In demo, all are "available"
       }));
 
-      return res.json({ qualities });
+      res.json({ qualities });
+      return;
     }
 
     res.json({
-      qualities: result.rows.map(row => ({
+      qualities: (result.rows as AudioFileRow[]).map(row => ({
         quality: row.quality,
         format: row.format,
         bitrate: row.bitrate,
@@ -273,10 +318,10 @@ router.get('/:trackId/qualities', optionalAuth, async (req, res) => {
 });
 
 // Report playback progress
-router.post('/progress', authenticate, async (req, res) => {
+router.post('/progress', authenticate, async (req: Request<object, unknown, ProgressBody>, res: Response) => {
   try {
     const { trackId, position, duration, completed } = req.body;
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     // Update playback position in Redis
     await redis.setex(
@@ -326,14 +371,15 @@ router.post('/progress', authenticate, async (req, res) => {
 });
 
 // Get current playback state
-router.get('/playback/current', authenticate, async (req, res) => {
+router.get('/playback/current', authenticate, async (req: Request, res: Response) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     const playbackData = await redis.get(`playback:${userId}`);
 
     if (!playbackData) {
-      return res.json({ playing: null });
+      res.json({ playing: null });
+      return;
     }
 
     const playback = JSON.parse(playbackData);
@@ -349,7 +395,8 @@ router.get('/playback/current', authenticate, async (req, res) => {
     );
 
     if (trackResult.rows.length === 0) {
-      return res.json({ playing: null });
+      res.json({ playing: null });
+      return;
     }
 
     res.json({
@@ -367,10 +414,10 @@ router.get('/playback/current', authenticate, async (req, res) => {
 });
 
 // Report stream end (explicit stop/skip)
-router.post('/end', authenticate, async (req, res) => {
+router.post('/end', authenticate, async (req: Request<object, unknown, EndStreamBody>, res: Response) => {
   try {
     const { trackId, reason } = req.body;
-    const userId = req.user.id;
+    const userId = req.user!.id;
 
     // Get stream info and decrement active streams
     const streamInfo = await redis.get(`stream:${userId}:${trackId}`);

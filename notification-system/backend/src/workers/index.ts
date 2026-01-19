@@ -1,29 +1,74 @@
-import { initRabbitMQ, consumeQueue, QUEUES } from '../utils/rabbitmq.js';
-import { pool, initDatabase } from '../utils/database.js';
+import { initRabbitMQ, consumeQueue, QUEUES, QueueMessage } from '../utils/rabbitmq.js';
+import { pool, initDatabase, query } from '../utils/database.js';
 import { redis } from '../utils/redis.js';
-import { query } from '../utils/database.js';
 import { deliveryTracker } from '../services/delivery.js';
 import { createLogger } from '../utils/logger.js';
 import { withCircuitBreaker, initializeCircuitBreakers, CircuitBreakerOpenError } from '../utils/circuitBreaker.js';
-import { withRetry, isRetryableError, RetryPresets } from '../utils/retry.js';
+import { withRetry, isRetryableError, RetryPresets, RetryableError } from '../utils/retry.js';
 import {
   notificationsSentCounter,
   deliveryAttemptsCounter,
   processingDurationHistogram,
   queueDepthGauge,
 } from '../utils/metrics.js';
+import { Logger } from 'pino';
 
-const log = createLogger('notification-worker');
+const log: Logger = createLogger('notification-worker');
+
+interface DeviceToken {
+  id: string;
+  user_id: string;
+  platform: string;
+  token: string;
+  active: boolean;
+  last_used: Date;
+}
+
+interface UserRow {
+  id?: string;
+  email?: string;
+  email_verified?: boolean;
+  phone?: string;
+  phone_verified?: boolean;
+}
+
+interface DeliveryResult {
+  success: boolean;
+  reason?: string;
+  error?: string;
+  retryable?: boolean;
+  results?: Array<{
+    deviceId: string;
+    platform: string;
+    success: boolean;
+    error?: string;
+    circuitOpen?: boolean;
+  }>;
+  email?: string;
+  phone?: string;
+  messageId?: string;
+  verified?: boolean;
+}
+
+interface NotificationPayload {
+  userId: string;
+  content: Record<string, unknown>;
+  notificationId: string;
+}
+
+interface RetryableDeliveryError extends RetryableError {
+  deliveryResult?: DeliveryResult;
+}
 
 // Simulated channel providers with circuit breaker and retry support
 const providers = {
-  async sendPush(notification) {
-    const { userId, content, notificationId } = notification;
+  async sendPush(notification: NotificationPayload): Promise<DeliveryResult> {
+    const { userId, notificationId } = notification;
 
     log.debug({ userId, notificationId }, 'Sending push notification');
 
     // Get device tokens
-    const devices = await query(
+    const devices = await query<DeviceToken>(
       `SELECT * FROM device_tokens WHERE user_id = $1 AND active = true`,
       [userId]
     );
@@ -34,14 +79,21 @@ const providers = {
     }
 
     // Send to each device with circuit breaker protection
-    const results = [];
+    const results: Array<{
+      deviceId: string;
+      platform: string;
+      success: boolean;
+      error?: string;
+      circuitOpen?: boolean;
+    }> = [];
+
     for (const device of devices.rows) {
       try {
         // Wrap the actual send in circuit breaker
         await withCircuitBreaker('push', async () => {
           // Simulate 95% success rate
           if (Math.random() < 0.05) {
-            const error = new Error('simulated_delivery_failure');
+            const error = new Error('simulated_delivery_failure') as RetryableError;
             error.retryable = true;
             throw error;
           }
@@ -68,14 +120,14 @@ const providers = {
           deviceId: device.id,
           platform: device.platform,
           success: false,
-          error: error.message,
+          error: (error as Error).message,
           circuitOpen: isCircuitOpen,
         });
 
         log.warn({
           deviceId: device.id,
           notificationId,
-          error: error.message,
+          error: (error as Error).message,
           circuitOpen: isCircuitOpen,
         }, 'Push delivery failed for device');
       }
@@ -91,13 +143,13 @@ const providers = {
     };
   },
 
-  async sendEmail(notification) {
-    const { userId, content, notificationId } = notification;
+  async sendEmail(notification: NotificationPayload): Promise<DeliveryResult> {
+    const { userId, notificationId } = notification;
 
     log.debug({ userId, notificationId }, 'Sending email notification');
 
     // Get user email
-    const user = await query(
+    const user = await query<UserRow>(
       `SELECT email, email_verified FROM users WHERE id = $1`,
       [userId]
     );
@@ -117,7 +169,7 @@ const providers = {
       const result = await withCircuitBreaker('email', async () => {
         // Simulate 98% success rate
         if (Math.random() < 0.02) {
-          const error = new Error('simulated_smtp_error');
+          const error = new Error('simulated_smtp_error') as RetryableError;
           error.retryable = true;
           throw error;
         }
@@ -141,26 +193,26 @@ const providers = {
       log.warn({
         userId,
         notificationId,
-        error: error.message,
+        error: (error as Error).message,
         circuitOpen: isCircuitOpen,
       }, 'Email delivery failed');
 
       return {
         success: false,
         email: user.rows[0].email,
-        error: error.message,
-        retryable: isCircuitOpen || isRetryableError(error),
+        error: (error as Error).message,
+        retryable: isCircuitOpen || isRetryableError(error as RetryableError),
       };
     }
   },
 
-  async sendSMS(notification) {
-    const { userId, content, notificationId } = notification;
+  async sendSMS(notification: NotificationPayload): Promise<DeliveryResult> {
+    const { userId, notificationId } = notification;
 
     log.debug({ userId, notificationId }, 'Sending SMS notification');
 
     // Get user phone
-    const user = await query(
+    const user = await query<UserRow>(
       `SELECT phone, phone_verified FROM users WHERE id = $1`,
       [userId]
     );
@@ -175,7 +227,7 @@ const providers = {
       await withCircuitBreaker('sms', async () => {
         // Simulate 90% success rate
         if (Math.random() < 0.1) {
-          const error = new Error('simulated_sms_error');
+          const error = new Error('simulated_sms_error') as RetryableError;
           error.retryable = true;
           throw error;
         }
@@ -195,15 +247,15 @@ const providers = {
       log.warn({
         userId,
         notificationId,
-        error: error.message,
+        error: (error as Error).message,
         circuitOpen: isCircuitOpen,
       }, 'SMS delivery failed');
 
       return {
         success: false,
         phone: user.rows[0].phone,
-        error: error.message,
-        retryable: isCircuitOpen || isRetryableError(error),
+        error: (error as Error).message,
+        retryable: isCircuitOpen || isRetryableError(error as RetryableError),
       };
     }
   },
@@ -212,18 +264,18 @@ const providers = {
 // Non-retryable error reasons
 const NON_RETRYABLE_REASONS = ['no_devices', 'no_email', 'no_phone', 'email_not_verified'];
 
-function isRetryableResult(result) {
+function isRetryableResult(result: DeliveryResult): boolean {
   if (result.retryable === false) {
     return false;
   }
   if (result.retryable === true) {
     return true;
   }
-  return !NON_RETRYABLE_REASONS.includes(result.reason);
+  return !NON_RETRYABLE_REASONS.includes(result.reason || '');
 }
 
 // Process a notification from the queue
-async function processNotification(message) {
+async function processNotification(message: QueueMessage): Promise<void> {
   const {
     notificationId,
     userId,
@@ -243,9 +295,9 @@ async function processNotification(message) {
 
   try {
     // Execute the delivery with retry wrapper
-    const result = await withRetry(
+    const result = await withRetry<DeliveryResult>(
       async () => {
-        let deliveryResult;
+        let deliveryResult: DeliveryResult;
 
         switch (channel) {
           case 'push':
@@ -263,7 +315,7 @@ async function processNotification(message) {
 
         // If delivery failed but is retryable, throw to trigger retry
         if (!deliveryResult.success && isRetryableResult(deliveryResult)) {
-          const error = new Error(deliveryResult.error || deliveryResult.reason);
+          const error = new Error(deliveryResult.error || deliveryResult.reason) as RetryableDeliveryError;
           error.retryable = true;
           error.deliveryResult = deliveryResult;
           throw error;
@@ -322,18 +374,18 @@ async function processNotification(message) {
     timer();
 
     // Error during processing - check if we should trigger queue-level retry
-    const shouldRetry = retryCount < 3 && isRetryableError(error);
+    const shouldRetry = retryCount < 3 && isRetryableError(error as RetryableError);
 
     if (shouldRetry) {
       await deliveryTracker.updateStatus(notificationId, channel, 'pending', {
         retryCount: retryCount + 1,
-        error: error.message,
+        error: (error as Error).message,
         processingTime,
       });
 
       log.info({
         ...logContext,
-        error: error.message,
+        error: (error as Error).message,
         nextRetryCount: retryCount + 1,
       }, 'Notification will be retried via queue');
 
@@ -343,7 +395,7 @@ async function processNotification(message) {
       // Max retries exceeded or non-retryable error
       await deliveryTracker.updateStatus(notificationId, channel, 'failed', {
         retryCount,
-        error: error.message,
+        error: (error as Error).message,
         processingTime,
         exhaustedRetries: retryCount >= 3,
       });
@@ -361,8 +413,15 @@ async function processNotification(message) {
   }
 }
 
+interface QueueConfig {
+  queue: string;
+  prefetch: number;
+  channel: string;
+  priority: string;
+}
+
 // Start workers for all queues
-async function startWorkers() {
+async function startWorkers(): Promise<void> {
   log.info('Starting notification workers...');
 
   await initDatabase();
@@ -376,7 +435,7 @@ async function startWorkers() {
   log.info('Circuit breakers initialized');
 
   // Start consumers for each queue
-  const queues = [
+  const queues: QueueConfig[] = [
     // Push queues (higher concurrency)
     { queue: QUEUES.PUSH_CRITICAL, prefetch: 50, channel: 'push', priority: 'critical' },
     { queue: QUEUES.PUSH_HIGH, prefetch: 30, channel: 'push', priority: 'high' },
@@ -396,7 +455,7 @@ async function startWorkers() {
     { queue: QUEUES.SMS_LOW, prefetch: 2, channel: 'sms', priority: 'low' },
   ];
 
-  for (const { queue, prefetch, channel, priority } of queues) {
+  for (const { queue, prefetch, priority } of queues) {
     await consumeQueue(queue, processNotification, { prefetch });
 
     // Initialize queue depth gauge
@@ -406,7 +465,7 @@ async function startWorkers() {
   }
 
   // Dead letter queue processor
-  await consumeQueue(QUEUES.DEAD_LETTER, async (message) => {
+  await consumeQueue(QUEUES.DEAD_LETTER, async (message: QueueMessage) => {
     log.warn({ message }, 'Dead letter received');
 
     // Log to database for analysis
@@ -421,7 +480,7 @@ async function startWorkers() {
 }
 
 // Graceful shutdown
-const shutdown = async (signal) => {
+const shutdown = async (signal: string): Promise<void> => {
   log.info({ signal }, 'Received shutdown signal, shutting down workers...');
 
   try {
@@ -439,10 +498,10 @@ const shutdown = async (signal) => {
   }
 };
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-startWorkers().catch((error) => {
+startWorkers().catch((error: Error) => {
   log.fatal({ err: error }, 'Failed to start workers');
   process.exit(1);
 });

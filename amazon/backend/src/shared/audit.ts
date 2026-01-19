@@ -13,9 +13,17 @@
  * - Regulatory compliance
  * - System debugging
  */
+import { Request } from 'express';
+import { Socket } from 'net';
 import { query } from '../services/database.js';
 import logger from './logger.js';
 import { auditEventsTotal } from './metrics.js';
+
+// Extended Request for audit context
+interface ExtendedRequest extends Request {
+  correlationId?: string;
+  connection?: Socket & { remoteAddress?: string };
+}
 
 // Audit event types
 export const AuditEventTypes = {
@@ -57,14 +65,18 @@ export const AuditEventTypes = {
   AUTH_LOGOUT: 'auth.logout',
   AUTH_FAILED: 'auth.failed',
   AUTH_PASSWORD_CHANGE: 'auth.password_change'
-};
+} as const;
+
+export type AuditEventType = (typeof AuditEventTypes)[keyof typeof AuditEventTypes];
 
 // Severity levels for audit events
 export const AuditSeverity = {
   INFO: 'info',
   WARNING: 'warning',
   CRITICAL: 'critical'
-};
+} as const;
+
+export type AuditSeverityType = (typeof AuditSeverity)[keyof typeof AuditSeverity];
 
 // Actor types
 export const ActorType = {
@@ -72,25 +84,94 @@ export const ActorType = {
   ADMIN: 'admin',
   SYSTEM: 'system',
   SERVICE: 'service'
-};
+} as const;
 
-/**
- * Audit log entry structure
- * @typedef {Object} AuditEntry
- * @property {string} action - Event type from AuditEventTypes
- * @property {Object} actor - Who performed the action
- * @property {Object} resource - What was affected
- * @property {Object} changes - What changed (old/new values)
- * @property {Object} context - Additional context (IP, user agent, correlation ID)
- * @property {string} severity - Event severity
- */
+export type ActorTypeValue = (typeof ActorType)[keyof typeof ActorType];
+
+interface Actor {
+  id: number | null;
+  type: ActorTypeValue;
+  email?: string;
+}
+
+interface Resource {
+  type: string;
+  id: number | string;
+}
+
+interface Changes {
+  old?: Record<string, unknown>;
+  new?: Record<string, unknown>;
+}
+
+interface AuditContext {
+  ip?: string | string[];
+  userAgent?: string;
+  correlationId?: string;
+}
+
+interface AuditEntry {
+  action: string;
+  actor: Actor;
+  resource: Resource;
+  changes?: Changes;
+  context?: AuditContext;
+  severity?: AuditSeverityType;
+}
+
+interface AuditLogRow {
+  id: number;
+  action: string;
+  actor_id: number | null;
+  actor_type: string;
+  resource_type: string;
+  resource_id: string;
+  old_value: string | null;
+  new_value: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  correlation_id: string | null;
+  severity: string;
+  created_at: Date;
+}
+
+interface AuditQueryFilters {
+  action?: string;
+  actorId?: number;
+  actorType?: string;
+  resourceType?: string;
+  resourceId?: string | number;
+  startDate?: Date | string;
+  endDate?: Date | string;
+  severity?: string;
+  page?: number;
+  limit?: number;
+}
+
+interface CartItem {
+  product_id: number;
+  quantity: number;
+}
+
+interface Order {
+  id: number;
+  total?: string;
+  payment_method?: string;
+  status?: string;
+  payment_status?: string;
+}
+
+interface PaymentDetails {
+  transactionId?: string;
+  amount?: string;
+  method?: string;
+  lastFour?: string;
+}
 
 /**
  * Create an audit log entry
- * @param {Object} entry - Audit entry data
- * @returns {Promise<number>} Audit log ID
  */
-export async function createAuditLog(entry) {
+export async function createAuditLog(entry: AuditEntry): Promise<number | null> {
   const {
     action,
     actor,
@@ -113,7 +194,7 @@ export async function createAuditLog(entry) {
     }, `Audit: ${action}`);
 
     // Store in database
-    const result = await query(
+    const result = await query<{ id: number }>(
       `INSERT INTO audit_logs
        (action, actor_id, actor_type, resource_type, resource_id, old_value, new_value, ip_address, user_agent, correlation_id, severity)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -138,31 +219,28 @@ export async function createAuditLog(entry) {
 
     return result.rows[0].id;
   } catch (error) {
+    const err = error as Error;
     // Audit logging should never break the main flow
-    logger.error({ error: error.message, action, resource }, 'Failed to create audit log');
+    logger.error({ error: err.message, action, resource }, 'Failed to create audit log');
     return null;
   }
 }
 
 /**
  * Create audit context from Express request
- * @param {Object} req - Express request object
- * @returns {Object} Audit context
  */
-export function createAuditContext(req) {
+export function createAuditContext(req: ExtendedRequest): AuditContext {
   return {
-    ip: req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress,
+    ip: req.ip || (req.headers['x-forwarded-for'] as string) || req.connection?.remoteAddress,
     userAgent: req.headers['user-agent'],
-    correlationId: req.correlationId || req.headers['x-correlation-id']
+    correlationId: req.correlationId || (req.headers['x-correlation-id'] as string)
   };
 }
 
 /**
  * Create actor object from request
- * @param {Object} req - Express request object
- * @returns {Object} Actor object
  */
-export function createActor(req) {
+export function createActor(req: ExtendedRequest): Actor {
   if (req.user) {
     return {
       id: req.user.id,
@@ -183,11 +261,12 @@ export function createActor(req) {
 
 /**
  * Audit order creation
- * @param {Object} req - Express request
- * @param {Object} order - Created order
- * @param {Object} cartItems - Items that were in cart
  */
-export async function auditOrderCreated(req, order, cartItems = []) {
+export async function auditOrderCreated(
+  req: ExtendedRequest,
+  order: Order,
+  cartItems: CartItem[] = []
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.ORDER_CREATED,
     actor: createActor(req),
@@ -208,11 +287,12 @@ export async function auditOrderCreated(req, order, cartItems = []) {
 
 /**
  * Audit order cancellation
- * @param {Object} req - Express request
- * @param {Object} order - Cancelled order
- * @param {string} reason - Cancellation reason
  */
-export async function auditOrderCancelled(req, order, reason = '') {
+export async function auditOrderCancelled(
+  req: ExtendedRequest,
+  order: Order,
+  reason: string = ''
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.ORDER_CANCELLED,
     actor: createActor(req),
@@ -228,12 +308,13 @@ export async function auditOrderCancelled(req, order, reason = '') {
 
 /**
  * Audit order status change
- * @param {Object} req - Express request
- * @param {number} orderId - Order ID
- * @param {string} oldStatus - Previous status
- * @param {string} newStatus - New status
  */
-export async function auditOrderStatusChanged(req, orderId, oldStatus, newStatus) {
+export async function auditOrderStatusChanged(
+  req: ExtendedRequest,
+  orderId: number | string,
+  oldStatus: string,
+  newStatus: string
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.ORDER_STATUS_CHANGED,
     actor: createActor(req),
@@ -249,12 +330,13 @@ export async function auditOrderStatusChanged(req, orderId, oldStatus, newStatus
 
 /**
  * Audit order refund
- * @param {Object} req - Express request
- * @param {Object} order - Refunded order
- * @param {number} amount - Refund amount
- * @param {string} reason - Refund reason
  */
-export async function auditOrderRefunded(req, order, amount, reason = '') {
+export async function auditOrderRefunded(
+  req: ExtendedRequest,
+  order: Order,
+  amount: number,
+  reason: string = ''
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.ORDER_REFUNDED,
     actor: createActor(req),
@@ -270,11 +352,12 @@ export async function auditOrderRefunded(req, order, amount, reason = '') {
 
 /**
  * Audit payment completion
- * @param {Object} req - Express request
- * @param {number} orderId - Order ID
- * @param {Object} paymentDetails - Payment transaction details
  */
-export async function auditPaymentCompleted(req, orderId, paymentDetails) {
+export async function auditPaymentCompleted(
+  req: ExtendedRequest,
+  orderId: number,
+  paymentDetails: PaymentDetails
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.PAYMENT_COMPLETED,
     actor: createActor(req),
@@ -295,12 +378,13 @@ export async function auditPaymentCompleted(req, orderId, paymentDetails) {
 
 /**
  * Audit payment failure
- * @param {Object} req - Express request
- * @param {number} orderId - Order ID
- * @param {string} errorCode - Payment error code
- * @param {string} errorMessage - Payment error message
  */
-export async function auditPaymentFailed(req, orderId, errorCode, errorMessage) {
+export async function auditPaymentFailed(
+  req: ExtendedRequest,
+  orderId: number,
+  errorCode: string,
+  errorMessage: string
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.PAYMENT_FAILED,
     actor: createActor(req),
@@ -318,12 +402,13 @@ export async function auditPaymentFailed(req, orderId, errorCode, errorMessage) 
 
 /**
  * Audit inventory reservation
- * @param {Object} req - Express request
- * @param {number} productId - Product ID
- * @param {number} quantity - Quantity reserved
- * @param {string} reason - Reason for reservation
  */
-export async function auditInventoryReserved(req, productId, quantity, reason = 'cart') {
+export async function auditInventoryReserved(
+  req: ExtendedRequest,
+  productId: number,
+  quantity: number,
+  reason: string = 'cart'
+): Promise<void> {
   await createAuditLog({
     action: AuditEventTypes.INVENTORY_RESERVED,
     actor: createActor(req),
@@ -338,13 +423,14 @@ export async function auditInventoryReserved(req, productId, quantity, reason = 
 
 /**
  * Audit inventory release
- * @param {Object} req - Express request or null for system
- * @param {number} productId - Product ID
- * @param {number} quantity - Quantity released
- * @param {string} reason - Reason for release
  */
-export async function auditInventoryReleased(req, productId, quantity, reason = 'expiry') {
-  const actor = req
+export async function auditInventoryReleased(
+  req: ExtendedRequest | null,
+  productId: number,
+  quantity: number,
+  reason: string = 'expiry'
+): Promise<void> {
+  const actor: Actor = req
     ? createActor(req)
     : { id: null, type: ActorType.SYSTEM };
 
@@ -362,12 +448,13 @@ export async function auditInventoryReleased(req, productId, quantity, reason = 
 
 /**
  * Audit admin action
- * @param {Object} req - Express request
- * @param {string} action - Admin action type
- * @param {Object} resource - Affected resource
- * @param {Object} changes - Changes made
  */
-export async function auditAdminAction(req, action, resource, changes) {
+export async function auditAdminAction(
+  req: ExtendedRequest,
+  action: string,
+  resource: Resource,
+  changes: Changes
+): Promise<void> {
   await createAuditLog({
     action,
     actor: createActor(req),
@@ -380,10 +467,13 @@ export async function auditAdminAction(req, action, resource, changes) {
 
 /**
  * Query audit logs with filters
- * @param {Object} filters - Query filters
- * @returns {Promise<Object>} Paginated audit logs
  */
-export async function queryAuditLogs(filters = {}) {
+export async function queryAuditLogs(filters: AuditQueryFilters = {}): Promise<{
+  logs: AuditLogRow[];
+  total: number;
+  page: number;
+  limit: number;
+}> {
   const {
     action,
     actorId,
@@ -398,7 +488,7 @@ export async function queryAuditLogs(filters = {}) {
   } = filters;
 
   let whereClause = 'WHERE 1=1';
-  const params = [];
+  const params: unknown[] = [];
 
   if (action) {
     params.push(action);
@@ -442,14 +532,14 @@ export async function queryAuditLogs(filters = {}) {
 
   const offset = page * limit;
 
-  const result = await query(
+  const result = await query<AuditLogRow>(
     `SELECT * FROM audit_logs ${whereClause}
      ORDER BY created_at DESC
      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
     [...params, limit, offset]
   );
 
-  const countResult = await query(
+  const countResult = await query<{ total: string }>(
     `SELECT COUNT(*) as total FROM audit_logs ${whereClause}`,
     params
   );
@@ -465,11 +555,9 @@ export async function queryAuditLogs(filters = {}) {
 /**
  * Get audit trail for a specific order
  * Useful for dispute resolution
- * @param {number} orderId - Order ID
- * @returns {Promise<Object[]>} Audit trail
  */
-export async function getOrderAuditTrail(orderId) {
-  const result = await query(
+export async function getOrderAuditTrail(orderId: number): Promise<AuditLogRow[]> {
+  const result = await query<AuditLogRow>(
     `SELECT * FROM audit_logs
      WHERE resource_type = 'order' AND resource_id = $1
      ORDER BY created_at ASC`,

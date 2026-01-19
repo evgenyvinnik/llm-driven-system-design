@@ -1,9 +1,9 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { query } from '../db.js';
 import redisClient from '../redis.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
-import { getDriverByUserId } from '../services/auth.js';
-import { haversineDistance, calculateETA } from '../utils/geo.js';
+import { requireAuth } from '../middleware/auth.js';
+import { getDriverByUserId, Driver } from '../services/auth.js';
+import { calculateETA, ETAResult } from '../utils/geo.js';
 import { broadcast, broadcastToChannels } from '../websocket.js';
 
 // Shared modules
@@ -22,19 +22,46 @@ const router = Router();
 
 const LOCATION_TTL = 300; // 5 minutes TTL for location data
 
+interface OrderWithDetails {
+  id: number;
+  customer_id: number;
+  restaurant_id: number;
+  driver_id?: number | null;
+  status: string;
+  placed_at?: string;
+  estimated_delivery_at?: string;
+  delivery_address: {
+    lat: number;
+    lon: number;
+    address: string;
+  };
+  items?: unknown[];
+  restaurant?: {
+    id: number;
+    name: string;
+    address: string;
+    lat: number;
+    lon: number;
+    prep_time_minutes?: number;
+    owner_id?: number;
+  };
+}
+
 // Update driver location
-router.post('/location', requireAuth, async (req, res) => {
+router.post('/location', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { lat, lon } = req.body;
 
     if (lat === undefined || lon === undefined) {
-      return res.status(400).json({ error: 'lat and lon are required' });
+      res.status(400).json({ error: 'lat and lon are required' });
+      return;
     }
 
     // Get driver profile
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     // Update in PostgreSQL
@@ -84,19 +111,21 @@ router.post('/location', requireAuth, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    logger.error({ error: err.message }, 'Update location error');
+    const error = err as Error;
+    logger.error({ error: error.message }, 'Update location error');
     res.status(500).json({ error: 'Failed to update location' });
   }
 });
 
 // Toggle driver active status (go online/offline)
-router.post('/status', requireAuth, async (req, res) => {
+router.post('/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { isActive } = req.body;
 
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     const wasActive = driver.is_active;
@@ -125,17 +154,19 @@ router.post('/status', requireAuth, async (req, res) => {
 
     res.json({ isActive });
   } catch (err) {
-    logger.error({ error: err.message }, 'Update status error');
+    const error = err as Error;
+    logger.error({ error: error.message }, 'Update status error');
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
 
 // Get driver's current orders
-router.get('/orders', requireAuth, async (req, res) => {
+router.get('/orders', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     const { status = 'active' } = req.query;
@@ -163,7 +194,7 @@ router.get('/orders', requireAuth, async (req, res) => {
 
     // Get items for each order
     const orders = await Promise.all(
-      result.rows.map(async (order) => {
+      result.rows.map(async (order: { id: number }) => {
         const itemsResult = await query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
         return { ...order, items: itemsResult.rows };
       })
@@ -171,36 +202,40 @@ router.get('/orders', requireAuth, async (req, res) => {
 
     res.json({ orders });
   } catch (err) {
-    logger.error({ error: err.message }, 'Get driver orders error');
+    const error = err as Error;
+    logger.error({ error: error.message }, 'Get driver orders error');
     res.status(500).json({ error: 'Failed to get orders' });
   }
 });
 
 // Driver picks up order
-router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
+router.post('/orders/:orderId/pickup', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
 
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     // Check order
-    const orderResult = await query(
-      `SELECT * FROM orders WHERE id = $1 AND driver_id = $2`,
-      [orderId, driver.id]
-    );
+    const orderResult = await query(`SELECT * FROM orders WHERE id = $1 AND driver_id = $2`, [
+      orderId,
+      driver.id,
+    ]);
 
     if (orderResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found or not assigned to you' });
+      res.status(404).json({ error: 'Order not found or not assigned to you' });
+      return;
     }
 
     const order = orderResult.rows[0];
     const previousStatus = order.status;
 
     if (order.status !== 'READY_FOR_PICKUP') {
-      return res.status(400).json({ error: `Cannot pickup order in ${order.status} status` });
+      res.status(400).json({ error: `Cannot pickup order in ${order.status} status` });
+      return;
     }
 
     // Update status
@@ -214,15 +249,29 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
       order,
       previousStatus,
       'PICKED_UP',
-      { type: ACTOR_TYPES.DRIVER, id: req.user.id },
+      { type: ACTOR_TYPES.DRIVER, id: req.user!.id },
       { ip: req.ip, userAgent: req.get('User-Agent') }
     );
 
     // Get updated order with details
-    const updatedOrder = await getOrderWithDetails(orderId);
+    const updatedOrder = await getOrderWithDetails(parseInt(orderId));
 
     // Recalculate ETA
-    const eta = calculateETA(updatedOrder, driver, updatedOrder.restaurant);
+    const eta = calculateETA(
+      {
+        status: updatedOrder!.status,
+        delivery_address: updatedOrder!.delivery_address,
+      },
+      {
+        current_lat: driver.current_lat!,
+        current_lon: driver.current_lon!,
+      },
+      {
+        lat: updatedOrder!.restaurant!.lat,
+        lon: updatedOrder!.restaurant!.lon,
+        prep_time_minutes: updatedOrder!.restaurant!.prep_time_minutes,
+      }
+    );
     await query('UPDATE orders SET estimated_delivery_at = $1 WHERE id = $2', [eta.eta, orderId]);
 
     logger.info({ orderId, driverId: driver.id }, 'Order picked up');
@@ -245,33 +294,37 @@ router.post('/orders/:orderId/pickup', requireAuth, async (req, res) => {
 
     res.json({ order: updatedOrder, eta });
   } catch (err) {
-    logger.error({ error: err.message, orderId: req.params.orderId }, 'Pickup order error');
+    const error = err as Error;
+    logger.error({ error: error.message, orderId: req.params.orderId }, 'Pickup order error');
     res.status(500).json({ error: 'Failed to pickup order' });
   }
 });
 
 // Driver delivers order
-router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
+router.post('/orders/:orderId/deliver', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
 
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     // Check order
     const orderResult = await query(`SELECT * FROM orders WHERE id = $1 AND driver_id = $2`, [orderId, driver.id]);
 
     if (orderResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found or not assigned to you' });
+      res.status(404).json({ error: 'Order not found or not assigned to you' });
+      return;
     }
 
     const order = orderResult.rows[0];
     const previousStatus = order.status;
 
     if (order.status !== 'PICKED_UP') {
-      return res.status(400).json({ error: `Cannot deliver order in ${order.status} status` });
+      res.status(400).json({ error: `Cannot deliver order in ${order.status} status` });
+      return;
     }
 
     // Update order status
@@ -307,20 +360,23 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
       order,
       previousStatus,
       'DELIVERED',
-      { type: ACTOR_TYPES.DRIVER, id: req.user.id },
+      { type: ACTOR_TYPES.DRIVER, id: req.user!.id },
       { ip: req.ip, userAgent: req.get('User-Agent') }
     );
 
     // Get updated order
-    const updatedOrder = await getOrderWithDetails(orderId);
+    const updatedOrder = await getOrderWithDetails(parseInt(orderId));
 
-    logger.info({
-      orderId,
-      driverId: driver.id,
-      deliveryTimeMinutes: order.placed_at
-        ? Math.round((Date.now() - new Date(order.placed_at).getTime()) / 60000)
-        : null,
-    }, 'Order delivered');
+    logger.info(
+      {
+        orderId,
+        driverId: driver.id,
+        deliveryTimeMinutes: order.placed_at
+          ? Math.round((Date.now() - new Date(order.placed_at).getTime()) / 60000)
+          : null,
+      },
+      'Order delivered'
+    );
 
     // Publish order event to Kafka
     publishOrderEvent(orderId.toString(), 'delivered', {
@@ -341,17 +397,19 @@ router.post('/orders/:orderId/deliver', requireAuth, async (req, res) => {
 
     res.json({ order: updatedOrder });
   } catch (err) {
-    logger.error({ error: err.message, orderId: req.params.orderId }, 'Deliver order error');
+    const error = err as Error;
+    logger.error({ error: error.message, orderId: req.params.orderId }, 'Deliver order error');
     res.status(500).json({ error: 'Failed to deliver order' });
   }
 });
 
 // Get driver stats
-router.get('/stats', requireAuth, async (req, res) => {
+router.get('/stats', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
-    const driver = await getDriverByUserId(req.user.id);
+    const driver = await getDriverByUserId(req.user!.id);
     if (!driver) {
-      return res.status(403).json({ error: 'Not registered as driver' });
+      res.status(403).json({ error: 'Not registered as driver' });
+      return;
     }
 
     // Today's stats
@@ -389,13 +447,14 @@ router.get('/stats', requireAuth, async (req, res) => {
       activeOrders: parseInt(activeResult.rows[0].active_orders) || 0,
     });
   } catch (err) {
-    logger.error({ error: err.message }, 'Get driver stats error');
+    const error = err as Error;
+    logger.error({ error: error.message }, 'Get driver stats error');
     res.status(500).json({ error: 'Failed to get stats' });
   }
 });
 
 // Helper: Get order with details
-async function getOrderWithDetails(orderId) {
+async function getOrderWithDetails(orderId: number): Promise<OrderWithDetails | null> {
   const orderResult = await query(
     `SELECT o.*,
             r.name as restaurant_name, r.address as restaurant_address,
@@ -428,7 +487,7 @@ async function getOrderWithDetails(orderId) {
     owner_id: order.restaurant_owner_id,
   };
 
-  return order;
+  return order as OrderWithDetails;
 }
 
 export default router;
