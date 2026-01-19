@@ -1,3 +1,4 @@
+import { Request, Response, NextFunction } from 'express';
 import { redisClient } from '../db.js';
 import logger from './logger.js';
 import { rateLimitHitsTotal } from './metrics.js';
@@ -6,7 +7,7 @@ import { rateLimitHitsTotal } from './metrics.js';
  * Rate limiting using Redis sliding window algorithm.
  * More accurate than token bucket and prevents burst abuse.
  */
-export async function checkRateLimit(key, limit, windowSec) {
+export async function checkRateLimit(key: string, limit: number, windowSec: number) {
   const now = Date.now();
   const windowStart = now - windowSec * 1000;
   const fullKey = `ratelimit:${key}`;
@@ -57,8 +58,13 @@ export async function checkRateLimit(key, limit, windowSec) {
  * @param {Function} keyFn - Function to extract rate limit key from request
  * @param {string} endpointName - Name of the endpoint for metrics
  */
-export function rateLimitMiddleware(limit, windowSec, keyFn, endpointName = 'default') {
-  return async (req, res, next) => {
+export function rateLimitMiddleware(
+  limit: number,
+  windowSec: number,
+  keyFn: (req: Request) => string,
+  endpointName = 'default'
+) {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const keyValue = keyFn(req);
     const scope = req.session?.userId ? 'user' : 'ip';
 

@@ -38,8 +38,30 @@ const REBALANCE_TIMEOUT_MS = parseInt(
  * Rebalance Manager class
  * Handles gradual key migration during cluster changes
  */
+
+interface RebalanceOptions {
+  batchSize?: number;
+  delayMs?: number;
+  timeoutMs?: number;
+}
+
+interface HashRing {
+  getAllNodes(): string[];
+  getNode(key: string): string;
+}
+
+type NodeRequestFn = (node: string, path: string) => Promise<unknown>;
+
 export class RebalanceManager {
-  constructor(ring, nodeRequestFn, options = {}) {
+  private ring: HashRing;
+  private nodeRequest: NodeRequestFn;
+  private batchSize: number;
+  private delayMs: number;
+  private timeoutMs: number;
+  private isRebalancing: boolean;
+  private currentRebalance: unknown;
+
+  constructor(ring: HashRing, nodeRequestFn: NodeRequestFn, options: RebalanceOptions = {}) {
     this.ring = ring;
     this.nodeRequest = nodeRequestFn;
     this.batchSize = options.batchSize ?? REBALANCE_BATCH_SIZE;
@@ -408,7 +430,7 @@ export class RebalanceManager {
    * @param {number} ms
    * @returns {Promise}
    */
-  _delay(ms) {
+  _delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
@@ -420,7 +442,11 @@ export class RebalanceManager {
  * @param {object} options
  * @returns {RebalanceManager}
  */
-export function createRebalanceManager(ring, nodeRequestFn, options = {}) {
+export function createRebalanceManager(
+  ring: HashRing,
+  nodeRequestFn: NodeRequestFn,
+  options: RebalanceOptions = {}
+): RebalanceManager {
   return new RebalanceManager(ring, nodeRequestFn, options);
 }
 

@@ -1,7 +1,10 @@
 /**
  * WebSocket server for real-time spreadsheet collaboration.
- * Handles connection lifecycle, message routing, room management,
- * and broadcasts cell changes to all connected clients.
+ *
+ * @description Main entry point for the WebSocket collaboration system.
+ * Handles connection lifecycle including authentication, room management,
+ * message routing, and heartbeat-based stale connection detection.
+ * Broadcasts cell changes to all connected clients in real-time.
  *
  * @module websocket
  */
@@ -32,11 +35,29 @@ const wsLogger = createChildLogger({ component: 'websocket' });
 
 /**
  * Initializes the WebSocket server for real-time collaboration.
- * Handles connection lifecycle, message routing, and room management.
- * Implements heartbeat mechanism to detect and clean up stale connections.
  *
- * @param server - The HTTP server instance to attach WebSocket handling to
- * @returns The configured WebSocketServer instance
+ * @description Sets up the WebSocket server with the following features:
+ * - Connection handling with user identity assignment
+ * - Room-based grouping for spreadsheet collaboration
+ * - Message routing to appropriate handlers
+ * - Heartbeat mechanism (30-second ping/pong) for stale connection detection
+ * - Automatic cleanup on disconnect
+ *
+ * @param {any} server - The HTTP server instance to attach WebSocket handling to
+ * @returns {WebSocketServer} The configured WebSocketServer instance
+ *
+ * @example
+ * ```typescript
+ * import { createServer } from 'http';
+ * import { setupWebSocket } from './websocket/index.js';
+ *
+ * const httpServer = createServer(app);
+ * const wss = setupWebSocket(httpServer);
+ *
+ * httpServer.listen(3000, () => {
+ *   console.log('Server with WebSocket support listening on port 3000');
+ * });
+ * ```
  */
 export function setupWebSocket(server: any) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -129,8 +150,19 @@ export function setupWebSocket(server: any) {
 /**
  * Routes incoming WebSocket messages to appropriate handlers.
  *
- * @param ws - The WebSocket connection that sent the message
- * @param message - The parsed message object with type and payload
+ * @description Dispatches messages based on their type to the corresponding
+ * handler function. Supports cell edits, cursor moves, selection changes,
+ * and sheet operations (resize, rename).
+ *
+ * @param {ExtendedWebSocket} ws - The WebSocket connection that sent the message
+ * @param {any} message - The parsed message object with type and payload properties
+ * @returns {Promise<void>} Resolves when the message has been handled
+ *
+ * @example
+ * ```typescript
+ * // Internal routing - called by the message event handler
+ * await handleMessage(ws, { type: 'CELL_EDIT', sheetId: '...', row: 0, col: 0, value: 'Hello' });
+ * ```
  */
 async function handleMessage(ws: ExtendedWebSocket, message: any) {
   const { type, ...payload } = message;
@@ -162,7 +194,13 @@ async function handleMessage(ws: ExtendedWebSocket, message: any) {
 /**
  * Handles client disconnection cleanup.
  *
- * @param ws - The WebSocket connection that disconnected
+ * @description Performs cleanup when a client disconnects, including:
+ * - Broadcasting user left notification to remaining collaborators
+ * - Removing the client from the room
+ * - Cleaning up empty rooms
+ *
+ * @param {ExtendedWebSocket} ws - The WebSocket connection that disconnected
+ * @returns {Promise<void>} Resolves when cleanup is complete
  */
 async function handleDisconnect(ws: ExtendedWebSocket) {
   if (!ws.spreadsheetId) return;

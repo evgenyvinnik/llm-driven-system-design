@@ -1,6 +1,6 @@
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
-import type { _Pool } from 'pg';
+import type { Pool } from 'pg';
 import type Redis from 'ioredis';
 import dotenv from 'dotenv';
 import logger from '../shared/logger.js';

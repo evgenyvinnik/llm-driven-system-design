@@ -1,6 +1,10 @@
 /**
  * State synchronization for new WebSocket connections.
- * Loads and sends the complete spreadsheet state to newly connected clients.
+ *
+ * @description Handles loading and sending the complete spreadsheet state to newly
+ * connected clients. Fetches data from cache when available, falls back to database,
+ * and creates new spreadsheets on demand. Ensures new users immediately see the
+ * current state of the spreadsheet and active collaborators.
  *
  * @module websocket/state-sync
  */
@@ -22,11 +26,31 @@ const stateLogger = createChildLogger({ component: 'state-sync' });
 
 /**
  * Sends the complete spreadsheet state to a newly connected client.
- * Includes spreadsheet metadata, sheets, cells, dimensions, and active collaborators.
- * Uses caching to improve performance for frequently accessed spreadsheets.
  *
- * @param ws - The WebSocket connection to send state to
- * @param spreadsheetId - The spreadsheet to load state for
+ * @description Loads and transmits all data needed for a client to render
+ * the spreadsheet, including:
+ * - Spreadsheet metadata (title, settings)
+ * - All sheets in the spreadsheet
+ * - Cell data for the active sheet
+ * - Column widths and row heights
+ * - List of active collaborators
+ * - The user's own identity (userId, name, color)
+ *
+ * Uses caching to improve performance for frequently accessed spreadsheets.
+ * Creates a new spreadsheet if one doesn't exist for the given ID.
+ *
+ * @param {ExtendedWebSocket} ws - The WebSocket connection to send state to
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet to load
+ * @returns {Promise<void>} Resolves when state has been sent
+ *
+ * @example
+ * ```typescript
+ * // Called when a new user connects
+ * wss.on('connection', async (ws) => {
+ *   await sendInitialState(ws, spreadsheetId);
+ *   // Client now has full spreadsheet state
+ * });
+ * ```
  */
 export async function sendInitialState(
   ws: ExtendedWebSocket,
@@ -95,6 +119,13 @@ export async function sendInitialState(
 
 /**
  * Loads spreadsheet data, creating it if it doesn't exist.
+ *
+ * @description Attempts to load spreadsheet metadata from cache first, then
+ * falls back to database. If the spreadsheet doesn't exist, creates a new
+ * one with a default title and initial sheet.
+ *
+ * @param {string} spreadsheetId - The unique identifier of the spreadsheet
+ * @returns {Promise<any>} The spreadsheet metadata object
  */
 async function loadSpreadsheetData(spreadsheetId: string): Promise<any> {
   // Try to get spreadsheet from cache first
@@ -131,6 +162,13 @@ async function loadSpreadsheetData(spreadsheetId: string): Promise<any> {
 
 /**
  * Loads cells for a sheet from cache or database.
+ *
+ * @description Attempts to load cell data from Redis cache first. On cache miss,
+ * queries PostgreSQL for all cells in the sheet and populates the cache for
+ * future requests.
+ *
+ * @param {string | undefined} sheetId - The sheet ID to load cells for
+ * @returns {Promise<Record<string, CellData>>} Map of cell keys ("row-col") to cell data
  */
 async function loadSheetCells(sheetId: string | undefined): Promise<Record<string, CellData>> {
   const cells: Record<string, CellData> = {};
@@ -164,7 +202,15 @@ async function loadSheetCells(sheetId: string | undefined): Promise<Record<strin
   return cells;
 }
 
-/** Loads column widths for a sheet. */
+/**
+ * Loads column widths for a sheet.
+ *
+ * @description Fetches all custom column widths from the database.
+ * Columns without custom widths use the default width on the client.
+ *
+ * @param {string | undefined} sheetId - The sheet ID to load column widths for
+ * @returns {Promise<Record<number, number>>} Map of column indices to widths in pixels
+ */
 async function loadColumnWidths(sheetId: string | undefined): Promise<Record<number, number>> {
   const columnWidths: Record<number, number> = {};
   if (!sheetId) return columnWidths;
@@ -178,7 +224,15 @@ async function loadColumnWidths(sheetId: string | undefined): Promise<Record<num
   return columnWidths;
 }
 
-/** Loads row heights for a sheet. */
+/**
+ * Loads row heights for a sheet.
+ *
+ * @description Fetches all custom row heights from the database.
+ * Rows without custom heights use the default height on the client.
+ *
+ * @param {string | undefined} sheetId - The sheet ID to load row heights for
+ * @returns {Promise<Record<number, number>>} Map of row indices to heights in pixels
+ */
 async function loadRowHeights(sheetId: string | undefined): Promise<Record<number, number>> {
   const rowHeights: Record<number, number> = {};
   if (!sheetId) return rowHeights;

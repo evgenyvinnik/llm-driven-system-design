@@ -10,7 +10,19 @@ import { ApiResponse } from '../types/index.js';
 
 /**
  * Request logging middleware.
- * Logs method, URL, status, and response time for all requests.
+ * Logs HTTP method, URL path, status code, and response time for all requests.
+ *
+ * @description Attaches a listener to the response 'finish' event to capture
+ * timing information and log request details once the response is complete.
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @param next - Express next function to pass control to the next middleware
+ *
+ * @example
+ * ```typescript
+ * app.use(requestLogger);
+ * ```
  */
 export function requestLogger(
   req: Request,

@@ -8,7 +8,7 @@
 import { Router, Request, Response } from 'express';
 import { pool, redis } from '../db/connection.js';
 import { authMiddleware, optionalAuthMiddleware } from '../middleware/auth.js';
-import { fanoutPost, removeFanout, updateAffinity, _calculatePostScore } from '../services/fanout.js';
+import { fanoutPost, removeFanout, updateAffinity, calculatePostScore } from '../services/fanout.js';
 import {
   componentLoggers,
   postsCreatedTotal,

@@ -1,4 +1,4 @@
-import express, { Request, Response, _NextFunction, Router } from 'express';
+import express, { Request, Response, Router } from 'express';
 import { queryProcessor } from '../services/search.js';
 import { searchRateLimiter, autocompleteRateLimiter } from '../shared/rateLimiter.js';
 import {

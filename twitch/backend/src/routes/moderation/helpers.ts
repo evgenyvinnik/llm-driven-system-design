@@ -1,5 +1,10 @@
 /**
- * Shared helper functions for moderation routes
+ * Shared helper functions for moderation routes.
+ *
+ * Provides authentication and authorization utilities used across
+ * all moderation route handlers.
+ *
+ * @module routes/moderation/helpers
  */
 import type { Request, Response } from 'express';
 import { query } from '../../services/database.js';
@@ -7,7 +12,23 @@ import { getSession } from '../../services/redis.js';
 import type { ModeratorAccessResult, UserRow, RoleRow } from './types.js';
 
 /**
- * Helper to check if user is moderator or owner of channel
+ * Checks if a user has moderator-level access to a channel.
+ *
+ * Access is granted if the user is:
+ * - The channel owner
+ * - An assigned moderator for the channel
+ * - A platform admin
+ *
+ * @description Determines the user's access role for a given channel
+ * @param userId - The numeric ID of the user to check
+ * @param channelId - The string ID of the channel to check access for
+ * @returns A promise resolving to an object with hasAccess boolean and role string
+ *
+ * @example
+ * const access = await checkModeratorAccess(123, '456');
+ * if (access.hasAccess) {
+ *   console.log(`User has access as ${access.role}`);
+ * }
  */
 export async function checkModeratorAccess(
   userId: number,
@@ -38,7 +59,15 @@ export async function checkModeratorAccess(
 }
 
 /**
- * Helper to get username from user ID
+ * Retrieves the username for a given user ID.
+ *
+ * @description Fetches the username from the database by user ID
+ * @param userId - The numeric ID of the user
+ * @returns A promise resolving to the username string, or 'unknown' if not found
+ *
+ * @example
+ * const username = await getUsername(123);
+ * console.log(`User is: ${username}`);
  */
 export async function getUsername(userId: number): Promise<string> {
   const result = await query<UserRow>('SELECT username FROM users WHERE id = $1', [userId]);

@@ -17,7 +17,7 @@ import {
   CACHE_TTL,
 } from '../shared/cache.js';
 import { pageLoadsCounter, pageEditsCounter, pageLoadDuration } from '../shared/metrics.js';
-import { auditLogger, _AuditEventTypes } from '../shared/audit.js';
+import { auditLogger, AuditEventTypes } from '../shared/audit.js';
 
 const router = Router();
 

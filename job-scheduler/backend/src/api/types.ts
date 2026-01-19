@@ -26,8 +26,21 @@ export type RouteMiddleware = (
 
 /**
  * Wraps async route handlers to properly catch and forward errors.
- * @param fn - Async route handler function
- * @returns Express middleware that catches promise rejections
+ * Prevents unhandled promise rejections by forwarding them to Express error middleware.
+ *
+ * @description Wraps an async Express route handler to ensure any rejected promises
+ * are caught and passed to the next() error handler, enabling centralized error handling.
+ *
+ * @param fn - The async route handler function to wrap
+ * @returns Express middleware function that catches promise rejections and forwards to error handler
+ *
+ * @example
+ * ```typescript
+ * router.get('/users', asyncHandler(async (req, res) => {
+ *   const users = await db.getUsers();
+ *   res.json({ success: true, data: users });
+ * }));
+ * ```
  */
 export function asyncHandler(
   fn: AsyncHandler

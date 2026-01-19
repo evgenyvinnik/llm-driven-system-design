@@ -11,11 +11,11 @@ export const minio = new MinioClient({
 export const AUDIO_BUCKET = 'audio';
 export const COVERS_BUCKET = 'covers';
 
-export function getPublicUrl(bucket, objectName) {
+export function getPublicUrl(bucket: string, objectName: string): string {
   const endpoint = process.env.MINIO_PUBLIC_ENDPOINT || 'http://localhost:9000';
   return `${endpoint}/${bucket}/${objectName}`;
 }
 
-export async function getPresignedUrl(bucket, objectName, expiry = 3600) {
+export async function getPresignedUrl(bucket: string, objectName: string, expiry = 3600): Promise<string> {
   return await minio.presignedGetObject(bucket, objectName, expiry);
 }

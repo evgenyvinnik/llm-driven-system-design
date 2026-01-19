@@ -8,7 +8,7 @@
 
 import { Router, Request, Response } from 'express';
 import { query, execute } from '../db/postgres.js';
-import { crawlAllDueSources, _getAllSources, addSource, crawlSource } from '../services/crawler.js';
+import { crawlAllDueSources, getAllSources, addSource, crawlSource } from '../services/crawler.js';
 
 const router = Router();
 

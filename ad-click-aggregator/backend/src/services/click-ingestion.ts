@@ -26,7 +26,7 @@ import { detectFraud } from './fraud-detection.js';
 import { insertClickEvent as insertClickHouseEvent } from './clickhouse.js';
 import { logger, logHelpers } from '../shared/logger.js';
 import { clickMetrics, aggregationMetrics, timeAsync } from '../shared/metrics.js';
-import { _IDEMPOTENCY_CONFIG } from '../shared/config.js';
+import { IDEMPOTENCY_CONFIG as _IDEMPOTENCY_CONFIG } from '../shared/config.js';
 
 /**
  * Result of processing a click event through the ingestion pipeline.

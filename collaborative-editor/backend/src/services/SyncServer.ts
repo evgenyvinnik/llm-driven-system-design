@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import { v4 as uuid } from 'uuid';
 import { DocumentState } from './DocumentState.js';
-import { _TextOperation } from './TextOperation.js';
+import { TextOperation } from './TextOperation.js';
 import { db } from './database.js';
 import { getRedisClient } from './redis.js';
 import type {

@@ -7,7 +7,7 @@
 import { esClient, POSTS_INDEX } from '../config/elasticsearch.js';
 import { pool } from '../config/database.js';
 import { redis } from '../config/redis.js';
-import { _logger, logHealthCheck } from './logger.js';
+import { logger, logHealthCheck } from './logger.js';
 import {
   elasticsearchDocsCount,
   elasticsearchIndexSizeBytes,

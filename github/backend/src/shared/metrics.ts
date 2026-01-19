@@ -150,10 +150,12 @@ export const idempotencyDuplicates = new client.Counter({
   labelNames: ['operation'], // pr_create, issue_create
 });
 
+import { Request, Response, NextFunction } from 'express';
+
 /**
  * Express middleware to record request metrics
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const startTime = Date.now();
 
   // Track active connections
@@ -175,12 +177,12 @@ export function metricsMiddleware(req, res, next) {
 /**
  * Get metrics endpoint handler
  */
-export async function metricsHandler(req, res) {
+export async function metricsHandler(_req: Request, res: Response): Promise<void> {
   try {
     res.set('Content-Type', client.register.contentType);
     res.end(await client.register.metrics());
   } catch (err) {
-    res.status(500).end(err.message);
+    res.status(500).end((err as Error).message);
   }
 }
 

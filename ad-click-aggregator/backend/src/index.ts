@@ -20,7 +20,7 @@ import {
   getMetricsContentType,
   httpMetrics,
   healthMetrics,
-  clickMetrics,
+  clickMetrics as _clickMetrics,
 } from './shared/metrics.js';
 import { ENV_CONFIG, SLO_TARGETS } from './shared/config.js';
 
