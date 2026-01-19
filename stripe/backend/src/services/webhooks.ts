@@ -238,7 +238,7 @@ export function startWebhookWorker(): Worker<WebhookJobData> {
   const worker = new Worker<WebhookJobData>(
     'webhook_delivery',
     async (job: Job<WebhookJobData>) => {
-      const { eventId, _merchantId, url, event, signature } = job.data;
+      const { eventId, merchantId: _merchantId, url, event, signature } = job.data;
 
       console.log(`Delivering webhook ${event.id} to ${url} (attempt ${job.attemptsMade + 1})`);
 

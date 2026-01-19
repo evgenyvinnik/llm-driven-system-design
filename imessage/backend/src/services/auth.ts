@@ -159,7 +159,7 @@ export async function login(
   await setSession(token, sessionData, SESSION_EXPIRY_HOURS * 60 * 60);
 
   // Remove password hash from response
-  const { _password_hash, ...userWithoutPassword } = user;
+  const { password_hash: _ignored, ...userWithoutPassword } = user;
 
   return {
     user: userWithoutPassword,

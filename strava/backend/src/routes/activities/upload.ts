@@ -48,14 +48,15 @@ const upload: Multer = multer({
 });
 
 // Create activity from GPX upload
-router.post('/upload', requireAuth, upload.single('file'), async (req: MulterRequest, res: Response) => {
+router.post('/upload', requireAuth, upload.single('file'), async (req: MulterRequest, res: Response): Promise<void> => {
   const uploadStart = Date.now();
   const userId = req.session.userId!;
 
   try {
     if (!req.file) {
       activityUploadsTotal.inc({ type: 'unknown', status: 'error_no_file' });
-      return res.status(400).json({ error: 'No file uploaded' });
+      res.status(400).json({ error: 'No file uploaded' });
+      return;
     }
 
     const gpxContent = req.file.buffer.toString('utf-8');
@@ -63,14 +64,16 @@ router.post('/upload', requireAuth, upload.single('file'), async (req: MulterReq
 
     if (!points || points.length < gpsConfig.minActivityPoints) {
       activityUploadsTotal.inc({ type: 'unknown', status: 'error_invalid_gpx' });
-      return res.status(400).json({ error: `GPX file must contain at least ${gpsConfig.minActivityPoints} track points` });
+      res.status(400).json({ error: `GPX file must contain at least ${gpsConfig.minActivityPoints} track points` });
+      return;
     }
 
     if (points.length > alerts.activityUpload.maxGpsPoints) {
       activityUploadsTotal.inc({ type: 'unknown', status: 'error_too_many_points' });
-      return res.status(400).json({
+      res.status(400).json({
         error: `Activity has too many GPS points (${points.length}). Maximum is ${alerts.activityUpload.maxGpsPoints}.`
       });
+      return;
     }
 
     const startTimestamp = points[0].timestamp;
@@ -80,11 +83,12 @@ router.post('/upload', requireAuth, upload.single('file'), async (req: MulterReq
     const existingActivity = await checkIdempotency(userId, gpxContent, startTimestamp);
     if (existingActivity) {
       log.info({ userId, existingActivityId: existingActivity.id }, 'Duplicate activity upload detected');
-      return res.status(200).json({
+      res.status(200).json({
         activity: existingActivity,
         duplicate: true,
         message: 'Activity already uploaded'
       });
+      return;
     }
 
     const privacyZonesResult = await query<PrivacyZone>(

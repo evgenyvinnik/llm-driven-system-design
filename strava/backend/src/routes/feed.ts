@@ -32,7 +32,7 @@ interface ActivityFeedRow {
 }
 
 // Get personalized activity feed
-router.get('/', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.session.userId!;
     const limit = parseInt(req.query.limit as string) || 20;
@@ -57,7 +57,8 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res: Response) =>
         [userId, limit]
       );
 
-      return res.json({ activities: result.rows });
+      res.json({ activities: result.rows });
+      return;
     }
 
     // Fetch activities by IDs (maintaining order)

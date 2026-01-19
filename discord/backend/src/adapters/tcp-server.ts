@@ -22,8 +22,8 @@ import net from 'net';
 import { v4 as uuidv4 } from 'uuid';
 import { connectionManager, chatHandler } from '../core/index.js';
 import * as dbOps from '../db/index.js';
-import { _logger, tcpLogger } from '../utils/logger.js';
-import { recordConnection, _activeConnections, connectionErrors } from '../shared/metrics.js';
+import { tcpLogger } from '../utils/logger.js';
+import { recordConnection, connectionErrors } from '../shared/metrics.js';
 import { server, shutdown as shutdownConfig } from '../shared/config.js';
 
 /**

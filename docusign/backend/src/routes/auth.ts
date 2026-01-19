@@ -105,7 +105,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
     });
 
     // Remove password from response
-    const { _password_hash, ...userWithoutPassword } = user;
+    const { password_hash: _password_hash, ...userWithoutPassword } = user;
 
     res.json({ user: userWithoutPassword, token });
   } catch (error) {

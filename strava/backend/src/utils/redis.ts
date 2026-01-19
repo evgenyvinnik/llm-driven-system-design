@@ -1,24 +1,29 @@
-import Redis, { Redis as RedisClient } from 'ioredis';
+import RedisLib from 'ioredis';
+import type { Redis as RedisClient } from 'ioredis';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+// Handle ESM default export issue with ioredis
+const Redis = (RedisLib as unknown as { default?: typeof RedisLib }).default ?? RedisLib;
 
 let redisClient: RedisClient | null = null;
 
 export function createClient(): RedisClient {
   if (redisClient) return redisClient;
 
-  redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+  const client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 
-  redisClient.on('error', (err: Error) => {
+  client.on('error', (err: Error) => {
     console.error('Redis error:', err);
   });
 
-  redisClient.on('connect', () => {
+  client.on('connect', () => {
     console.log('Connected to Redis');
   });
 
-  return redisClient;
+  redisClient = client;
+  return client;
 }
 
 export function getClient(): RedisClient {

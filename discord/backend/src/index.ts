@@ -35,7 +35,7 @@ import { logger, flushLogs } from './utils/logger.js';
 import { startCleanupJob, stopCleanupJob } from './utils/cleanup.js';
 import { server, shutdown as shutdownConfig } from './shared/config.js';
 import { pubsubConnectionStatus, subscribedChannels } from './shared/metrics.js';
-import type { PubSubMessage, _ChatMessage } from './types/index.js';
+import type { PubSubMessage } from './types/index.js';
 
 /** Instance ID for multi-instance deployments */
 const instanceId = server.instanceId;

@@ -8,7 +8,7 @@ const router = Router();
 // These endpoints handle syncing activities with external services (e.g., Garmin, Wahoo)
 
 // Trigger sync with external service
-router.post('/sync/:service', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/sync/:service', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const service = req.params.service as string;
     const userId = req.session.userId!;
@@ -16,10 +16,11 @@ router.post('/sync/:service', requireAuth, async (req: AuthenticatedRequest, res
     // Validate service
     const supportedServices = ['garmin', 'wahoo', 'zwift', 'polar'];
     if (!supportedServices.includes(service)) {
-      return res.status(400).json({
+      res.status(400).json({
         error: `Unsupported service: ${service}`,
         supportedServices
       });
+      return;
     }
 
     log.info({ userId, service }, 'Sync requested');

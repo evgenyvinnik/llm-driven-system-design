@@ -1,7 +1,10 @@
 import { Request, Response, NextFunction } from 'express';
 import { query } from '../utils/db.js';
 import { getSession, getSigningSession } from '../utils/redis.js';
-import { AuthUser } from '../types/express.js';
+import { AuthUser, SignerData } from '../types/express.js';
+
+// Re-export SignerData for consumers
+export type { SignerData } from '../types/express.js';
 
 // Authenticate logged-in users
 export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -61,11 +64,11 @@ export async function authenticateSigner(req: Request, res: Response, next: Next
     }
 
     // Check signing session in Redis first
-    let signingData = await getSigningSession(accessToken as string);
+    let signingData = await getSigningSession(accessToken as string) as SignerData | null;
 
     if (!signingData) {
       // Fall back to database lookup
-      const result = await query(
+      const result = await query<SignerData>(
         `SELECT r.*, e.status as envelope_status, e.name as envelope_name
          FROM recipients r
          JOIN envelopes e ON r.envelope_id = e.id

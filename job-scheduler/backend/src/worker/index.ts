@@ -11,7 +11,7 @@ dotenv.config();
 import { queue } from '../queue/reliable-queue';
 import { distributedLock } from '../queue/leader-election';
 import * as db from '../db/repository.js';
-import { logger, createChildLogger } from '../utils/logger';
+import { _logger, createChildLogger } from '../utils/logger';
 import { ExecutionStatus, JobStatus } from '../types';
 import { getHandler, ExecutionContext } from './handlers';
 import { migrate } from '../db/migrate';

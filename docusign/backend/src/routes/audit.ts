@@ -65,7 +65,7 @@ router.get('/envelope/:envelopeId', authenticate, async (req: Request, res: Resp
       timestamp: e.timestamp,
       actor: e.actor,
       details: auditService.formatEventDetails(e),
-      data: e.data,
+      data: typeof e.data === 'string' ? JSON.parse(e.data) : e.data,
       hash: e.hash
     }));
 

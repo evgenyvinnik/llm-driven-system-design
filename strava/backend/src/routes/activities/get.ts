@@ -50,7 +50,7 @@ router.get('/', optionalAuth, async (req: AuthenticatedRequest, res: Response) =
 });
 
 // Get single activity
-router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -63,7 +63,8 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Activity not found' });
+      res.status(404).json({ error: 'Activity not found' });
+      return;
     }
 
     const activity = result.rows[0];
@@ -76,10 +77,12 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
           [req.session.userId, activity.user_id]
         );
         if (followResult.rows.length === 0) {
-          return res.status(403).json({ error: 'Activity is private' });
+          res.status(403).json({ error: 'Activity is private' });
+          return;
         }
       } else {
-        return res.status(403).json({ error: 'Activity is private' });
+        res.status(403).json({ error: 'Activity is private' });
+        return;
       }
     }
 
@@ -122,7 +125,7 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
 });
 
 // Get GPS points for activity
-router.get('/:id/gps', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/gps', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -138,7 +141,8 @@ router.get('/:id/gps', optionalAuth, async (req: AuthenticatedRequest, res: Resp
     const activity = activityResult.rows[0];
 
     if (activity.privacy !== 'public' && activity.user_id !== req.session?.userId) {
-      return res.status(403).json({ error: 'Activity is private' });
+      res.status(403).json({ error: 'Activity is private' });
+      return;
     }
 
     const result = await query<GpsPointRow>(

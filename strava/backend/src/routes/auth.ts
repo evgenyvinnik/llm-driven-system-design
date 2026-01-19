@@ -34,12 +34,13 @@ interface UserRow {
 }
 
 // Register new user
-router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
+router.post('/register', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { username, email, password, weightKg, bio, location } = req.body as RegisterBody;
 
     if (!username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+      res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
     }
 
     // Check if user exists
@@ -49,7 +50,8 @@ router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
     );
 
     if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Username or email already exists' });
+      res.status(400).json({ error: 'Username or email already exists' });
+      return;
     }
 
     // Hash password
@@ -98,12 +100,13 @@ router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Login
-router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
+router.post('/login', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body as LoginBody;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+      res.status(400).json({ error: 'Email and password are required' });
+      return;
     }
 
     const result = await query<UserRow>(
@@ -112,14 +115,16 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     const user = result.rows[0];
     const validPassword = await bcrypt.compare(password, user.password_hash);
 
     if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     // Set session
@@ -157,10 +162,11 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Logout
-router.post('/logout', (req: AuthenticatedRequest, res: Response) => {
+router.post('/logout', (req: AuthenticatedRequest, res: Response): void => {
   req.session.destroy((err) => {
     if (err) {
-      return res.status(500).json({ error: 'Logout failed' });
+      res.status(500).json({ error: 'Logout failed' });
+      return;
     }
     res.clearCookie('connect.sid');
     res.json({ message: 'Logged out successfully' });
@@ -168,9 +174,10 @@ router.post('/logout', (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Get current user
-router.get('/me', (req: AuthenticatedRequest, res: Response) => {
+router.get('/me', (req: AuthenticatedRequest, res: Response): void => {
   if (!req.session.userId) {
-    return res.status(401).json({ error: 'Not authenticated' });
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
   }
 
   res.json({

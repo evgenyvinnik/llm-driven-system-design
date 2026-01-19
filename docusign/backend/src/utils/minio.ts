@@ -26,60 +26,60 @@ export async function initializeMinio() {
   }
 }
 
-export async function uploadDocument(key, buffer, contentType) {
+export async function uploadDocument(key: string, buffer: Buffer, contentType: string): Promise<string> {
   await minioClient.putObject(DOCUMENTS_BUCKET, key, buffer, buffer.length, {
     'Content-Type': contentType
   });
   return key;
 }
 
-export async function getDocument(key) {
+export async function getDocument(key: string): Promise<NodeJS.ReadableStream> {
   return await minioClient.getObject(DOCUMENTS_BUCKET, key);
 }
 
-export async function getDocumentBuffer(key) {
+export async function getDocumentBuffer(key: string): Promise<Buffer> {
   const stream = await minioClient.getObject(DOCUMENTS_BUCKET, key);
-  const chunks = [];
+  const chunks: Buffer[] = [];
   return new Promise((resolve, reject) => {
-    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
     stream.on('end', () => resolve(Buffer.concat(chunks)));
     stream.on('error', reject);
   });
 }
 
-export async function getDocumentUrl(key, expiresInSeconds = 3600) {
+export async function getDocumentUrl(key: string, expiresInSeconds: number = 3600): Promise<string> {
   return await minioClient.presignedGetObject(DOCUMENTS_BUCKET, key, expiresInSeconds);
 }
 
-export async function uploadSignature(key, buffer, contentType) {
+export async function uploadSignature(key: string, buffer: Buffer, contentType: string): Promise<string> {
   await minioClient.putObject(SIGNATURES_BUCKET, key, buffer, buffer.length, {
     'Content-Type': contentType
   });
   return key;
 }
 
-export async function getSignature(key) {
+export async function getSignature(key: string): Promise<NodeJS.ReadableStream> {
   return await minioClient.getObject(SIGNATURES_BUCKET, key);
 }
 
-export async function getSignatureBuffer(key) {
+export async function getSignatureBuffer(key: string): Promise<Buffer> {
   const stream = await minioClient.getObject(SIGNATURES_BUCKET, key);
-  const chunks = [];
+  const chunks: Buffer[] = [];
   return new Promise((resolve, reject) => {
-    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
     stream.on('end', () => resolve(Buffer.concat(chunks)));
     stream.on('error', reject);
   });
 }
 
-export async function getSignatureUrl(key, expiresInSeconds = 3600) {
+export async function getSignatureUrl(key: string, expiresInSeconds: number = 3600): Promise<string> {
   return await minioClient.presignedGetObject(SIGNATURES_BUCKET, key, expiresInSeconds);
 }
 
-export async function deleteDocument(key) {
+export async function deleteDocument(key: string): Promise<void> {
   await minioClient.removeObject(DOCUMENTS_BUCKET, key);
 }
 
-export async function deleteSignature(key) {
+export async function deleteSignature(key: string): Promise<void> {
   await minioClient.removeObject(SIGNATURES_BUCKET, key);
 }

@@ -52,14 +52,15 @@ router.delete('/:id/kudos', requireAuth, async (req: AuthenticatedRequest, res: 
 });
 
 // Add comment to an activity
-router.post('/:id/comments', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/:id/comments', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const userId = req.session.userId!;
     const { content } = req.body as { content?: string };
 
     if (!content || content.trim().length === 0) {
-      return res.status(400).json({ error: 'Comment content is required' });
+      res.status(400).json({ error: 'Comment content is required' });
+      return;
     }
 
     const result = await query<{ id: string; content: string; created_at: Date }>(
@@ -81,7 +82,7 @@ router.post('/:id/comments', requireAuth, async (req: AuthenticatedRequest, res:
 });
 
 // Delete activity (owner only)
-router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const userId = req.session.userId!;
@@ -92,7 +93,8 @@ router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Respon
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Activity not found or not owned by you' });
+      res.status(404).json({ error: 'Activity not found or not owned by you' });
+      return;
     }
 
     log.info({ activityId: id, userId }, 'Activity deleted');

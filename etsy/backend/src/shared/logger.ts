@@ -1,10 +1,11 @@
 import pino, { Logger } from 'pino';
-import pinoHttpModule from 'pino-http';
-import type { HttpLogger, Options as PinoHttpOptions } from 'pino-http';
+import type { HttpLogger } from 'pino-http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import config from '../config.js';
 
-const pinoHttp = (pinoHttpModule as unknown as { default?: typeof pinoHttpModule }).default || pinoHttpModule;
+// Dynamic import for ESM compatibility - cast to any to avoid callable issues
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const pinoHttp = require('pino-http');
 
 // Structured JSON logger with context support
 const logger: Logger = pino({
@@ -67,7 +68,8 @@ export const httpLogger: HttpLogger = pinoHttp({
   customErrorMessage: (req: IncomingMessage & { method?: string; url?: string }, _res: ServerResponse, err: Error) => {
     return `${req.method} ${req.url} failed: ${err.message}`;
   },
-} as PinoHttpOptions);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+}) as any;
 
 // Create child loggers for specific contexts
 export function createLogger(context: string): Logger {

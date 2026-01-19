@@ -200,19 +200,19 @@ async function handleClientMessage(
 
   switch (type) {
     case 'send_message':
-      await handleSendMessage(ws, user, deviceId, payload as SendMessagePayload);
+      await handleSendMessage(ws, user, deviceId, payload as unknown as SendMessagePayload);
       break;
 
     case 'typing':
-      await handleTyping(user, payload as TypingPayload);
+      await handleTyping(user, payload as unknown as TypingPayload);
       break;
 
     case 'read':
-      await handleRead(user, deviceId, payload as ReadPayload);
+      await handleRead(user, deviceId, payload as unknown as ReadPayload);
       break;
 
     case 'reaction':
-      await handleReaction(user, payload as ReactionPayload);
+      await handleReaction(user, payload as unknown as ReactionPayload);
       break;
 
     case 'sync':

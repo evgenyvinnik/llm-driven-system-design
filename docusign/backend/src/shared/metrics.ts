@@ -1,4 +1,5 @@
 import client from 'prom-client';
+import { Request, Response, NextFunction } from 'express';
 
 // Create a Registry to register metrics
 const register = new client.Registry();
@@ -136,7 +137,7 @@ export const auditEventsLogged = new client.Counter({
 });
 
 // Express middleware for request metrics
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const end = httpRequestDuration.startTimer();
 
   res.on('finish', () => {
@@ -148,7 +149,7 @@ export function metricsMiddleware(req, res, next) {
 }
 
 // Get metrics endpoint handler
-export async function getMetrics(req, res) {
+export async function getMetrics(_req: Request, res: Response): Promise<void> {
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 }

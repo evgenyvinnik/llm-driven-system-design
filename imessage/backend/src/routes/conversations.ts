@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { authenticateRequest, AuthenticatedRequest } from '../middleware/auth.js';
 import {
   getConversations,
@@ -13,9 +13,10 @@ const router = Router();
 
 router.use(authenticateRequest as any);
 
-router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const conversations = await getConversations(req.user.id);
+    const conversations = await getConversations(authReq.user.id);
     res.json({ conversations });
   } catch (error) {
     console.error('Get conversations error:', error);
@@ -23,9 +24,10 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
   }
 });
 
-router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/:id', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const conversation = await getConversation(req.params.id, req.user.id);
+    const conversation = await getConversation(req.params.id, authReq.user.id);
     if (!conversation) {
       res.status(404).json({ error: 'Conversation not found' });
       return;
@@ -37,7 +39,8 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
   }
 });
 
-router.post('/direct', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/direct', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { userId } = req.body;
 
@@ -46,12 +49,12 @@ router.post('/direct', async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
-    if (userId === req.user.id) {
+    if (userId === authReq.user.id) {
       res.status(400).json({ error: 'Cannot create conversation with yourself' });
       return;
     }
 
-    const conversation = await createDirectConversation(req.user.id, userId);
+    const conversation = await createDirectConversation(authReq.user.id, userId);
     res.status(201).json({ conversation });
   } catch (error) {
     console.error('Create direct conversation error:', error);
@@ -59,7 +62,8 @@ router.post('/direct', async (req: AuthenticatedRequest, res: Response): Promise
   }
 });
 
-router.post('/group', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/group', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { name, participantIds } = req.body;
 
@@ -69,7 +73,7 @@ router.post('/group', async (req: AuthenticatedRequest, res: Response): Promise<
     }
 
     const conversation = await createGroupConversation(
-      req.user.id,
+      authReq.user.id,
       name,
       participantIds || []
     );
@@ -80,7 +84,8 @@ router.post('/group', async (req: AuthenticatedRequest, res: Response): Promise<
   }
 });
 
-router.post('/:id/participants', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/:id/participants', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { userId } = req.body;
 
@@ -89,7 +94,7 @@ router.post('/:id/participants', async (req: AuthenticatedRequest, res: Response
       return;
     }
 
-    await addParticipant(req.params.id, userId, req.user.id);
+    await addParticipant(req.params.id, userId, authReq.user.id);
     res.json({ message: 'Participant added' });
   } catch (error) {
     console.error('Add participant error:', error);
@@ -101,9 +106,10 @@ router.post('/:id/participants', async (req: AuthenticatedRequest, res: Response
   }
 });
 
-router.delete('/:id/participants/:userId', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.delete('/:id/participants/:userId', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    await removeParticipant(req.params.id, req.params.userId, req.user.id);
+    await removeParticipant(req.params.id, req.params.userId, authReq.user.id);
     res.json({ message: 'Participant removed' });
   } catch (error) {
     console.error('Remove participant error:', error);
@@ -115,9 +121,10 @@ router.delete('/:id/participants/:userId', async (req: AuthenticatedRequest, res
   }
 });
 
-router.delete('/:id/leave', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.delete('/:id/leave', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    await removeParticipant(req.params.id, req.user.id, req.user.id);
+    await removeParticipant(req.params.id, authReq.user.id, authReq.user.id);
     res.json({ message: 'Left conversation' });
   } catch (error) {
     console.error('Leave conversation error:', error);

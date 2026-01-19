@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { register, login, logout, getUserDevices, deactivateDevice } from '../services/auth.js';
 import { authenticateRequest, AuthenticatedRequest } from '../middleware/auth.js';
 import { loginRateLimiter } from '../shared/rate-limiter.js';
@@ -12,7 +12,8 @@ interface DbError extends Error {
   code?: string;
 }
 
-router.post('/register', async (req: LoggedRequest, res: Response): Promise<void> => {
+router.post('/register', async (req: Request, res: Response): Promise<void> => {
+  const _loggedReq = req as LoggedRequest;
   try {
     const { username, email, password, displayName, deviceName, deviceType } = req.body;
 
@@ -39,7 +40,8 @@ router.post('/register', async (req: LoggedRequest, res: Response): Promise<void
 });
 
 // Rate limited: 5 attempts per 15 minutes per IP
-router.post('/login', loginRateLimiter, async (req: LoggedRequest, res: Response): Promise<void> => {
+router.post('/login', loginRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const _loggedReq = req as LoggedRequest;
   try {
     const { usernameOrEmail, password, deviceName, deviceType } = req.body;
 
@@ -66,46 +68,50 @@ router.post('/login', loginRateLimiter, async (req: LoggedRequest, res: Response
   }
 });
 
-router.post('/logout', authenticateRequest as any, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/logout', authenticateRequest as any, async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const token = req.headers.authorization?.substring(7);
     await logout(token);
 
-    logger.info({ userId: req.user.id }, 'User logged out');
+    logger.info({ userId: authReq.user.id }, 'User logged out');
 
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Logout error');
+    logger.error({ error, userId: authReq.user?.id }, 'Logout error');
     res.status(500).json({ error: 'Logout failed' });
   }
 });
 
-router.get('/me', authenticateRequest as any, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/me', authenticateRequest as any, async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   res.json({
-    user: req.user,
-    deviceId: req.deviceId,
+    user: authReq.user,
+    deviceId: authReq.deviceId,
   });
 });
 
-router.get('/devices', authenticateRequest as any, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/devices', authenticateRequest as any, async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const devices = await getUserDevices(req.user.id);
+    const devices = await getUserDevices(authReq.user.id);
     res.json({ devices });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Get devices error');
+    logger.error({ error, userId: authReq.user?.id }, 'Get devices error');
     res.status(500).json({ error: 'Failed to get devices' });
   }
 });
 
-router.delete('/devices/:deviceId', authenticateRequest as any, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.delete('/devices/:deviceId', authenticateRequest as any, async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    await deactivateDevice(req.user.id, req.params.deviceId);
+    await deactivateDevice(authReq.user.id, req.params.deviceId);
 
-    logger.info({ userId: req.user.id, deviceId: req.params.deviceId }, 'Device deactivated');
+    logger.info({ userId: authReq.user.id, deviceId: req.params.deviceId }, 'Device deactivated');
 
     res.json({ message: 'Device deactivated' });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Deactivate device error');
+    logger.error({ error, userId: authReq.user?.id }, 'Deactivate device error');
     res.status(500).json({ error: 'Failed to deactivate device' });
   }
 });

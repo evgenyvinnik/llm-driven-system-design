@@ -1,6 +1,6 @@
-import Redis, { Redis as RedisClient } from 'ioredis';
+import { Redis } from 'ioredis';
 
-export type { RedisClient };
+export type RedisClient = Redis;
 
 export interface SessionData {
   userId: string;
@@ -20,9 +20,8 @@ export interface OfflineMessage {
   [key: string]: unknown;
 }
 
-const redis: RedisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: 3,
-  retryDelayOnFailover: 100,
   lazyConnect: true,
 });
 

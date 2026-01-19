@@ -62,7 +62,7 @@ const getDocumentBreaker: CircuitBreakerWithState = createCircuitBreaker(
     try {
       const result = await MinioOriginal.getDocumentBuffer(key);
       end();
-      return result;
+      return result as Buffer;
     } catch (error) {
       storageOperationErrors.inc({ operation: 'get', bucket: 'documents' });
       throw error;
@@ -94,7 +94,7 @@ const getSignatureBreaker: CircuitBreakerWithState = createCircuitBreaker(
     try {
       const result = await MinioOriginal.getSignatureBuffer(key);
       end();
-      return result;
+      return result as Buffer;
     } catch (error) {
       storageOperationErrors.inc({ operation: 'get', bucket: 'signatures' });
       throw error;

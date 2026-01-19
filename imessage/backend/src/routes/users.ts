@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { authenticateRequest, AuthenticatedRequest } from '../middleware/auth.js';
 import { searchUsers, getUserById, updateUser } from '../services/users.js';
 
@@ -6,7 +6,8 @@ const router = Router();
 
 router.use(authenticateRequest as any);
 
-router.get('/search', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/search', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { q, limit } = req.query;
 
@@ -15,7 +16,7 @@ router.get('/search', async (req: AuthenticatedRequest, res: Response): Promise<
       return;
     }
 
-    const users = await searchUsers(q as string, req.user.id, limit ? parseInt(limit as string) : 20);
+    const users = await searchUsers(q as string, authReq.user.id, limit ? parseInt(limit as string) : 20);
     res.json({ users });
   } catch (error) {
     console.error('Search users error:', error);
@@ -23,7 +24,7 @@ router.get('/search', async (req: AuthenticatedRequest, res: Response): Promise<
   }
 });
 
-router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const user = await getUserById(req.params.id);
     if (!user) {
@@ -37,10 +38,11 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
   }
 });
 
-router.patch('/me', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.patch('/me', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { displayName, avatarUrl } = req.body;
-    const user = await updateUser(req.user.id, {
+    const user = await updateUser(authReq.user.id, {
       display_name: displayName,
       avatar_url: avatarUrl,
     });

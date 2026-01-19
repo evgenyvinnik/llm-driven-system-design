@@ -9,7 +9,7 @@ const router = Router();
 // These endpoints provide statistics and analytics for activities
 
 // Get activity summary statistics (e.g., splits, zones)
-router.get('/:id/analysis', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/analysis', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -20,7 +20,8 @@ router.get('/:id/analysis', requireAuth, async (req: AuthenticatedRequest, res: 
     );
 
     if (activityResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Activity not found' });
+      res.status(404).json({ error: 'Activity not found' });
+      return;
     }
 
     const activity = activityResult.rows[0];

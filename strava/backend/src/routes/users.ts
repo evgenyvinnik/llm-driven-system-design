@@ -47,7 +47,7 @@ interface UserSearchRow {
 }
 
 // Get user profile
-router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
@@ -61,7 +61,8 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     const user = result.rows[0];
@@ -114,13 +115,14 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res: Response) 
 });
 
 // Follow a user
-router.post('/:id/follow', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/:id/follow', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const followerId = req.session.userId;
 
     if (followerId === id) {
-      return res.status(400).json({ error: 'Cannot follow yourself' });
+      res.status(400).json({ error: 'Cannot follow yourself' });
+      return;
     }
 
     await query(
@@ -223,12 +225,13 @@ router.get('/:id/achievements', async (req: AuthenticatedRequest, res: Response)
 });
 
 // Search users
-router.get('/', async (req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { q, limit = '20' } = req.query as { q?: string; limit?: string };
 
     if (!q || q.length < 2) {
-      return res.json({ users: [] });
+      res.json({ users: [] });
+      return;
     }
 
     const result = await query<UserSearchRow>(

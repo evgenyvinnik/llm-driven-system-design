@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { authenticateRequest, AuthenticatedRequest } from '../middleware/auth.js';
 import { isParticipant } from '../services/conversations.js';
 import {
@@ -22,19 +22,20 @@ const logger = createLogger('messages-routes');
 router.use(authenticateRequest as any);
 
 // Get messages for a conversation
-router.get('/conversation/:conversationId', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/conversation/:conversationId', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { conversationId } = req.params;
     const { limit, before, after } = req.query;
 
     // Verify user is participant
-    const isParticipantResult = await isParticipant(conversationId, req.user.id);
+    const isParticipantResult = await isParticipant(conversationId, authReq.user.id);
     if (!isParticipantResult) {
       res.status(403).json({ error: 'Not a participant of this conversation' });
       return;
     }
 
-    const messages = await getMessages(conversationId, req.user.id, {
+    const messages = await getMessages(conversationId, authReq.user.id, {
       limit: limit ? parseInt(limit as string) : 50,
       before: before as string | undefined,
       after: after as string | undefined,
@@ -42,13 +43,14 @@ router.get('/conversation/:conversationId', async (req: AuthenticatedRequest, re
 
     res.json({ messages });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Get messages error');
+    logger.error({ error, userId: authReq.user?.id }, 'Get messages error');
     res.status(500).json({ error: 'Failed to get messages' });
   }
 });
 
 // Get a single message
-router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/:id', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const message = await getMessage(req.params.id);
     if (!message) {
@@ -57,7 +59,7 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
     }
 
     // Verify user is participant
-    const isParticipantResult = await isParticipant(message.conversation_id, req.user.id);
+    const isParticipantResult = await isParticipant(message.conversation_id, authReq.user.id);
     if (!isParticipantResult) {
       res.status(403).json({ error: 'Not a participant of this conversation' });
       return;
@@ -65,7 +67,7 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
 
     res.json({ message });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Get message error');
+    logger.error({ error, userId: authReq.user?.id }, 'Get message error');
     res.status(500).json({ error: 'Failed to get message' });
   }
 });
@@ -76,7 +78,8 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
 router.post('/conversation/:conversationId',
   messageRateLimiter,
   idempotencyMiddleware,
-  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  async (req: Request, res: Response): Promise<void> => {
+    const authReq = req as AuthenticatedRequest;
     try {
       const { conversationId } = req.params;
       const { content, contentType, replyToId, clientMessageId } = req.body;
@@ -87,13 +90,13 @@ router.post('/conversation/:conversationId',
       }
 
       // Verify user is participant
-      const isParticipantResult = await isParticipant(conversationId, req.user.id);
+      const isParticipantResult = await isParticipant(conversationId, authReq.user.id);
       if (!isParticipantResult) {
         res.status(403).json({ error: 'Not a participant of this conversation' });
         return;
       }
 
-      const message = await sendMessage(conversationId, req.user.id, content, {
+      const message = await sendMessage(conversationId, authReq.user.id, content, {
         contentType,
         replyToId,
         clientMessageId: clientMessageId || req.headers['x-idempotency-key'] as string,
@@ -106,14 +109,15 @@ router.post('/conversation/:conversationId',
         isDuplicate: message.isDuplicate || false,
       });
     } catch (error) {
-      logger.error({ error, userId: req.user?.id }, 'Send message error');
+      logger.error({ error, userId: authReq.user?.id }, 'Send message error');
       res.status(500).json({ error: 'Failed to send message' });
     }
   }
 );
 
 // Edit a message
-router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.patch('/:id', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { content } = req.body;
 
@@ -122,10 +126,10 @@ router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<v
       return;
     }
 
-    const message = await editMessage(req.params.id, req.user.id, content);
+    const message = await editMessage(req.params.id, authReq.user.id, content);
     res.json({ message });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Edit message error');
+    logger.error({ error, userId: authReq.user?.id }, 'Edit message error');
     if ((error as Error).message.includes('not found')) {
       res.status(404).json({ error: (error as Error).message });
       return;
@@ -135,12 +139,13 @@ router.patch('/:id', async (req: AuthenticatedRequest, res: Response): Promise<v
 });
 
 // Delete a message
-router.delete('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.delete('/:id', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    await deleteMessage(req.params.id, req.user.id);
+    await deleteMessage(req.params.id, authReq.user.id);
     res.json({ message: 'Message deleted' });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Delete message error');
+    logger.error({ error, userId: authReq.user?.id }, 'Delete message error');
     if ((error as Error).message.includes('not found')) {
       res.status(404).json({ error: (error as Error).message });
       return;
@@ -150,7 +155,8 @@ router.delete('/:id', async (req: AuthenticatedRequest, res: Response): Promise<
 });
 
 // Add reaction
-router.post('/:id/reactions', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/:id/reactions', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { reaction } = req.body;
 
@@ -159,27 +165,29 @@ router.post('/:id/reactions', async (req: AuthenticatedRequest, res: Response): 
       return;
     }
 
-    const result = await addReaction(req.params.id, req.user.id, reaction);
+    const result = await addReaction(req.params.id, authReq.user.id, reaction);
     res.status(201).json(result);
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Add reaction error');
+    logger.error({ error, userId: authReq.user?.id }, 'Add reaction error');
     res.status(500).json({ error: 'Failed to add reaction' });
   }
 });
 
 // Remove reaction
-router.delete('/:id/reactions/:reaction', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.delete('/:id/reactions/:reaction', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    await removeReaction(req.params.id, req.user.id, req.params.reaction);
+    await removeReaction(req.params.id, authReq.user.id, req.params.reaction);
     res.json({ message: 'Reaction removed' });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Remove reaction error');
+    logger.error({ error, userId: authReq.user?.id }, 'Remove reaction error');
     res.status(500).json({ error: 'Failed to remove reaction' });
   }
 });
 
 // Mark as read
-router.post('/conversation/:conversationId/read', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/conversation/:conversationId/read', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { conversationId } = req.params;
     const { messageId } = req.body;
@@ -190,27 +198,28 @@ router.post('/conversation/:conversationId/read', async (req: AuthenticatedReque
     }
 
     // Verify user is participant
-    const isParticipantResult = await isParticipant(conversationId, req.user.id);
+    const isParticipantResult = await isParticipant(conversationId, authReq.user.id);
     if (!isParticipantResult) {
       res.status(403).json({ error: 'Not a participant of this conversation' });
       return;
     }
 
-    await markAsRead(conversationId, req.user.id, req.deviceId, messageId);
+    await markAsRead(conversationId, authReq.user.id, authReq.deviceId, messageId);
     res.json({ message: 'Marked as read' });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Mark as read error');
+    logger.error({ error, userId: authReq.user?.id }, 'Mark as read error');
     res.status(500).json({ error: 'Failed to mark as read' });
   }
 });
 
 // Get read receipts for a conversation
-router.get('/conversation/:conversationId/read-receipts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/conversation/:conversationId/read-receipts', async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const { conversationId } = req.params;
 
     // Verify user is participant
-    const isParticipantResult = await isParticipant(conversationId, req.user.id);
+    const isParticipantResult = await isParticipant(conversationId, authReq.user.id);
     if (!isParticipantResult) {
       res.status(403).json({ error: 'Not a participant of this conversation' });
       return;
@@ -219,7 +228,7 @@ router.get('/conversation/:conversationId/read-receipts', async (req: Authentica
     const receipts = await getReadReceipts(conversationId);
     res.json({ receipts });
   } catch (error) {
-    logger.error({ error, userId: req.user?.id }, 'Get read receipts error');
+    logger.error({ error, userId: authReq.user?.id }, 'Get read receipts error');
     res.status(500).json({ error: 'Failed to get read receipts' });
   }
 });

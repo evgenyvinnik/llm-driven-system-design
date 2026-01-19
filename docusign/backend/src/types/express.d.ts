@@ -28,6 +28,7 @@ declare global {
       signer?: SignerData;
       accessToken?: string;
       log?: Logger;
+      idempotencyKey?: string;
     }
   }
 }

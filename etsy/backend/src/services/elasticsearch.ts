@@ -67,10 +67,10 @@ export interface Product {
   shop_rating?: number;
   shop_sales_count?: number;
   title: string;
-  description?: string;
+  description?: string | null;
   price: number | string;
   quantity: number;
-  category_id?: number;
+  category_id?: number | null;
   category_name?: string;
   tags?: string[];
   images?: string[];

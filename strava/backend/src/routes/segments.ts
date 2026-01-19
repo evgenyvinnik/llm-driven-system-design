@@ -110,7 +110,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // Get single segment with leaderboard
-router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
 
@@ -123,7 +123,8 @@ router.get('/:id', optionalAuth, async (req: AuthenticatedRequest, res: Response
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Segment not found' });
+      res.status(404).json({ error: 'Segment not found' });
+      return;
     }
 
     const segment = result.rows[0];
@@ -248,17 +249,19 @@ router.get('/:id/leaderboard', optionalAuth, async (req: AuthenticatedRequest, r
 });
 
 // Create segment from activity
-router.post('/', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { activityId, startIndex, endIndex, name } = req.body as CreateSegmentBody;
     const userId = req.session.userId!;
 
     if (!activityId || startIndex === undefined || endIndex === undefined || !name) {
-      return res.status(400).json({ error: 'activityId, startIndex, endIndex, and name are required' });
+      res.status(400).json({ error: 'activityId, startIndex, endIndex, and name are required' });
+      return;
     }
 
     if (endIndex - startIndex < 10) {
-      return res.status(400).json({ error: 'Segment must contain at least 10 GPS points' });
+      res.status(400).json({ error: 'Segment must contain at least 10 GPS points' });
+      return;
     }
 
     // Verify user owns the activity
@@ -268,11 +271,13 @@ router.post('/', requireAuth, async (req: AuthenticatedRequest, res: Response) =
     );
 
     if (activityResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Activity not found' });
+      res.status(404).json({ error: 'Activity not found' });
+      return;
     }
 
     if (activityResult.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'You can only create segments from your own activities' });
+      res.status(403).json({ error: 'You can only create segments from your own activities' });
+      return;
     }
 
     const segment = await createSegmentFromActivity(activityId, startIndex, endIndex, name, userId);
@@ -285,13 +290,14 @@ router.post('/', requireAuth, async (req: AuthenticatedRequest, res: Response) =
 });
 
 // Get user's efforts on a segment
-router.get('/:id/efforts', optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/efforts', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const userId = (req.query.userId as string) || req.session?.userId;
 
     if (!userId) {
-      return res.status(400).json({ error: 'User ID required' });
+      res.status(400).json({ error: 'User ID required' });
+      return;
     }
 
     const result = await query<EffortRow>(
@@ -311,7 +317,7 @@ router.get('/:id/efforts', optionalAuth, async (req: AuthenticatedRequest, res: 
 });
 
 // Delete segment (creator only)
-router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const userId = req.session.userId;
@@ -322,7 +328,8 @@ router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res: Respon
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Segment not found or not owned by you' });
+      res.status(404).json({ error: 'Segment not found or not owned by you' });
+      return;
     }
 
     res.json({ message: 'Segment deleted' });

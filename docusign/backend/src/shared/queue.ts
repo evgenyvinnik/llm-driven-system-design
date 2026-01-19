@@ -1,4 +1,4 @@
-import amqp, { Connection, Channel, ConfirmChannel, ConsumeMessage } from 'amqplib';
+import amqp, { Channel, ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { v4 as uuid } from 'uuid';
 import logger from './logger.js';
 import { queueMessagesPublished, queueMessagesProcessed, queueMessagesRetried } from './metrics.js';
@@ -106,7 +106,7 @@ export interface QueueHealthStatus {
   error?: string;
 }
 
-let connection: Connection | null = null;
+let connection: Awaited<ReturnType<typeof amqp.connect>> | null = null;
 let channel: Channel | null = null;
 let confirmChannel: ConfirmChannel | null = null;
 
