@@ -1,4 +1,4 @@
-import { _pool, transaction } from './pool.js';
+import { pool, transaction } from './pool.js';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import type pg from 'pg';

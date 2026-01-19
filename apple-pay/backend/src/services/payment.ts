@@ -1,7 +1,7 @@
 import { v4 as uuid } from 'uuid';
 import { query } from '../db/index.js';
 import redis from '../db/redis.js';
-import { generateCryptogram, generateAuthCode, _validateCryptogram } from '../utils/crypto.js';
+import { generateCryptogram, generateAuthCode } from '../utils/crypto.js';
 import { PaymentRequest, PaymentResult, Transaction } from '../types/index.js';
 
 /**

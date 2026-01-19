@@ -1,3 +1,10 @@
+/**
+ * Order creation route module.
+ * @module routes/orders/create
+ * @description Handles the creation of new food delivery orders with idempotency support,
+ * validation, pricing calculation, and real-time notifications.
+ */
+
 import { Router, Request, Response } from 'express';
 import { query } from '../../db.js';
 import { requireAuth } from '../../middleware/auth.js';
@@ -12,7 +19,42 @@ import { getOrderWithDetails } from './helpers.js';
 
 const router = Router();
 
-// Place a new order - with idempotency to prevent duplicate orders
+/**
+ * POST /orders
+ * @description Creates a new food delivery order with idempotency protection.
+ *
+ * This endpoint handles the complete order creation flow:
+ * 1. Validates restaurant exists and is available
+ * 2. Validates all menu items exist and are available
+ * 3. Verifies minimum order amount is met
+ * 4. Calculates pricing (subtotal, tax, delivery fee, tip, total)
+ * 5. Creates the order and order items in the database
+ * 6. Records metrics and audit logs
+ * 7. Publishes Kafka event for downstream processing
+ * 8. Notifies restaurant via WebSocket
+ *
+ * @requires Authentication - User must be logged in
+ * @requires Idempotency-Key header - To prevent duplicate orders
+ *
+ * @param req.body.restaurantId - ID of the restaurant to order from
+ * @param req.body.items - Array of items to order
+ * @param req.body.items[].menuItemId - ID of the menu item
+ * @param req.body.items[].quantity - Quantity to order (default: 1)
+ * @param req.body.items[].specialInstructions - Optional preparation instructions
+ * @param req.body.deliveryAddress - Delivery location object
+ * @param req.body.deliveryAddress.lat - Latitude of delivery location
+ * @param req.body.deliveryAddress.lon - Longitude of delivery location
+ * @param req.body.deliveryAddress.address - Human-readable address
+ * @param req.body.deliveryInstructions - Optional delivery instructions
+ * @param req.body.tip - Tip amount for driver (default: 0)
+ *
+ * @returns 201 - Order created successfully with full order details
+ * @returns 400 - Validation error (missing fields, unavailable items, below minimum)
+ * @returns 404 - Restaurant not found
+ * @returns 500 - Server error
+ *
+ * @throws Clears idempotency key on validation errors to allow retry
+ */
 router.post(
   '/',
   requireAuth,
@@ -183,4 +225,8 @@ router.post(
   }
 );
 
+/**
+ * Express router for order creation endpoints.
+ * @description Exports the router configured with the POST / endpoint for creating orders.
+ */
 export default router;

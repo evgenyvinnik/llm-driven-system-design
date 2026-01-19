@@ -29,7 +29,7 @@ import pool from '../db/pool.js';
 import logger from '../shared/logger.js';
 import { metricsQueryBreaker, withCircuitBreaker, emptyQueryResult } from '../shared/circuitBreaker.js';
 import { generateCacheKey, determineTtl, getOrLoad } from '../shared/cache.js';
-import { queryDuration, queryRequestsTotal, _cacheOperations } from '../shared/metrics.js';
+import { queryDuration, queryRequestsTotal, cacheOperations } from '../shared/metrics.js';
 import type { MetricQueryParams, QueryResult, DataPoint } from '../types/index.js';
 
 /**

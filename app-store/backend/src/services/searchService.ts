@@ -191,7 +191,7 @@ export class SearchService {
         return { ...app, _finalScore: finalScore };
       })
       .sort((a, b) => (b._finalScore || 0) - (a._finalScore || 0))
-      .map(({ _score, _qualityScore, _finalScore, ...app }) => app);
+      .map(({ _score, _finalScore, ...app }) => app);
   }
 
   /**

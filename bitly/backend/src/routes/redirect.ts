@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { asyncHandler } from '../middleware/errorHandler.js';
-import { _getUrlByShortCode } from '../services/urlService.js';
+import { getUrlByShortCode } from '../services/urlService.js';
 import { publishClickEvent, isQueueConnected, ClickEventMessage } from '../utils/queue.js';
 import { recordClickSync } from '../services/analyticsService.js';
 import logger from '../utils/logger.js';

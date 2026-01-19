@@ -7,7 +7,13 @@ import {
   formatChannelResponse,
 } from './types.js';
 
-// Get channel by ID or username
+/**
+ * @description Retrieves a channel by its ID or username, with caching support.
+ * Automatically detects whether the identifier is a UUID or username and queries accordingly.
+ * Also fetches the count of public, ready videos for the channel.
+ * @param identifier - Either a UUID channel ID or a username string
+ * @returns The channel response object with video count, or null if not found
+ */
 export const getChannel = async (identifier: string): Promise<ChannelResponse | null> => {
   const cached = await cacheGet<ChannelResponse>(`channel:${identifier}`);
   if (cached) {
@@ -49,7 +55,13 @@ export const getChannel = async (identifier: string): Promise<ChannelResponse | 
   return channel;
 };
 
-// Update channel
+/**
+ * @description Updates a channel's profile information.
+ * Invalidates the channel cache after successful update.
+ * @param userId - The UUID of the channel/user to update
+ * @param updates - Object containing the fields to update (name, description, avatar)
+ * @returns The updated channel response, or null if channel not found
+ */
 export const updateChannel = async (
   userId: string,
   updates: ChannelUpdates

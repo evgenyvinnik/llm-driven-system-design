@@ -1,5 +1,7 @@
 /**
  * Retrieve payment intent handlers
+ * @module paymentIntents/retrieve
+ *
  * GET /v1/payment_intents/:id
  * GET /v1/payment_intents
  */
@@ -13,7 +15,16 @@ import type { PaymentIntentRow } from './types.js';
 import { formatPaymentIntent } from './utils.js';
 
 /**
- * Get a single payment intent by ID
+ * @description Retrieves a single payment intent by ID.
+ * Returns the payment intent with its current status and any associated risk assessment.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {string} req.params.id - The payment intent ID to retrieve
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with the payment intent or an error
+ *
+ * @throws {404} Payment intent not found
+ * @throws {500} Database or internal server error
  */
 export async function getPaymentIntent(
   req: AuthenticatedRequest,
@@ -68,7 +79,18 @@ export async function getPaymentIntent(
 }
 
 /**
- * List payment intents with optional filters
+ * @description Lists payment intents with optional filtering and pagination.
+ * Returns a paginated list of payment intents for the authenticated merchant.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {string} [req.query.limit='10'] - Maximum number of results to return
+ * @param {string} [req.query.offset='0'] - Number of results to skip for pagination
+ * @param {string} [req.query.status] - Filter by payment intent status
+ * @param {string} [req.query.customer] - Filter by customer ID
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with a paginated list of payment intents
+ *
+ * @throws {500} Database or internal server error
  */
 export async function listPaymentIntents(
   req: AuthenticatedRequest,

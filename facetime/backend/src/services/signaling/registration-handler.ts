@@ -34,16 +34,25 @@ import {
 
 /**
  * Handles client registration when a user connects via WebSocket.
- * Verifies user exists, creates client tracking entry, updates presence
- * in Redis, and records the device in the database.
  *
- * Uses circuit breaker for database operations to prevent cascade failures.
+ * @description Performs the complete registration flow for a new WebSocket connection:
+ * 1. Validates the userId is provided
+ * 2. Looks up user profile from cache (with database fallback using circuit breaker)
+ * 3. Creates client tracking entry with device information
+ * 4. Updates Redis presence for real-time online status
+ * 5. Records device in database for device management
+ * 6. Logs audit trail for security monitoring
+ * 7. Sends success response with user profile data
  *
- * @param ws - The WebSocket connection
- * @param clientId - Unique ID for this connection
- * @param message - The registration message containing userId and deviceId
- * @param log - Logger instance for this client
- * @returns The created ConnectedClient or null if registration failed
+ * Uses circuit breaker pattern for database operations to prevent cascade failures
+ * when the database is under stress or unavailable.
+ *
+ * @param ws - The WebSocket connection to register
+ * @param clientId - Unique ID generated for this connection
+ * @param message - The registration message containing userId, deviceId, and deviceType
+ * @param log - Logger instance scoped to this client for debugging
+ * @returns The created ConnectedClient if successful, null if registration failed
+ * @throws Never throws - errors are sent as WebSocket messages and null is returned
  */
 export async function handleRegister(
   ws: WebSocket,
@@ -170,11 +179,19 @@ export async function handleRegister(
 
 /**
  * Cleans up when a WebSocket client disconnects.
- * Removes from tracking maps, updates Redis presence,
- * and marks device as inactive in database.
+ *
+ * @description Performs complete cleanup of a disconnected client:
+ * - Removes client from the active connections map
+ * - Removes client from user-to-clients lookup
+ * - Updates Redis presence to mark device offline
+ * - Marks device as inactive in the database (fire-and-forget)
+ *
+ * Database operations use circuit breaker and are non-blocking to ensure
+ * fast cleanup even if the database is slow or unavailable.
  *
  * @param clientId - The unique ID of the disconnecting client
- * @param client - The disconnecting client's data
+ * @param client - The disconnecting client's data including userId and deviceId
+ * @returns Promise that resolves when cleanup is complete
  */
 export async function handleDisconnect(clientId: string, client: ConnectedClient): Promise<void> {
   // Remove from clients map

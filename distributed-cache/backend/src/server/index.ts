@@ -1,16 +1,28 @@
 /**
  * Cache Node - Main Server Entry Point
  *
- * An individual cache server in the distributed cluster.
+ * This is the main entry point for an individual cache server in the distributed
+ * cache cluster. Each cache node is a standalone HTTP server that stores cached
+ * data using an LRU eviction policy with TTL support.
  *
  * Features:
- * - LRU eviction with TTL support
- * - HTTP API for cache operations
- * - Health check endpoint
- * - Prometheus metrics endpoint
- * - Structured JSON logging
- * - Snapshot persistence
- * - Hot key detection
+ * - LRU eviction with configurable size and memory limits
+ * - TTL support with both lazy and active expiration
+ * - HTTP REST API for cache operations
+ * - Health check endpoint for coordinator integration
+ * - Prometheus metrics endpoint for monitoring
+ * - Structured JSON logging with Pino
+ * - Snapshot persistence for durability
+ * - Hot key detection for identifying frequently accessed keys
+ *
+ * Environment Variables:
+ * - PORT: Server port (default: 3000)
+ * - NODE_ID: Unique identifier for this node (default: node-{PORT})
+ * - MAX_SIZE: Maximum number of cache entries (default: 10000)
+ * - MAX_MEMORY_MB: Maximum memory in MB (default: 100)
+ * - DEFAULT_TTL: Default TTL in seconds for new entries (default: 0 = no expiration)
+ *
+ * @module server
  */
 
 import express from 'express';
@@ -36,6 +48,12 @@ import type { ServerConfig, ServerContext } from './types.js';
 // Configuration
 // ======================
 
+/**
+ * Server configuration loaded from environment variables.
+ *
+ * @description All configuration options with their defaults. Values are
+ * parsed from environment variables at startup.
+ */
 const config: ServerConfig = {
   port: process.env.PORT || 3000,
   nodeId: process.env.NODE_ID || `node-${process.env.PORT || 3000}`,
@@ -48,19 +66,37 @@ const config: ServerConfig = {
 // Initialize Components
 // ======================
 
+/**
+ * Pino logger instance configured with the node ID.
+ */
 const logger = createLogger({ nodeId: config.nodeId });
 
+/**
+ * LRU cache instance with configured limits.
+ *
+ * @description The main cache storage with LRU eviction policy, memory limits,
+ * and TTL support.
+ */
 const cache = new LRUCache({
   maxSize: config.maxSize,
   maxMemoryMB: config.maxMemoryMB,
   defaultTTL: config.defaultTTL,
 });
 
+/**
+ * Hot key detector for identifying frequently accessed keys.
+ *
+ * @description Monitors cache access patterns within a sliding window to
+ * detect keys that receive disproportionate traffic.
+ */
 const hotKeyDetector = new HotKeyDetector(config.nodeId, {
   windowMs: 60000,
   threshold: 0.01, // 1% of traffic
 });
 
+/**
+ * Persistence manager for snapshot-based durability.
+ */
 const persistence = createPersistenceManager(config.nodeId, cache);
 
 // Set memory limit metric
@@ -70,6 +106,12 @@ cacheMemoryLimitBytes.labels(config.nodeId).set(config.maxMemoryMB * 1024 * 1024
 // Create Server Context
 // ======================
 
+/**
+ * Shared server context passed to route handlers.
+ *
+ * @description Contains all dependencies that route handlers need access to,
+ * enabling dependency injection for testability.
+ */
 const context: ServerContext = {
   cache,
   hotKeyDetector,
@@ -102,6 +144,12 @@ app.use(createErrorHandler(context));
 // Metrics Update Timer
 // ======================
 
+/**
+ * Updates cache statistics metrics.
+ *
+ * @description Periodically collects cache stats and updates Prometheus metrics.
+ * Also checks for and logs any detected hot keys.
+ */
 function updateMetrics(): void {
   const stats = cache.getStats();
   updateCacheStats(config.nodeId, stats);
@@ -118,6 +166,15 @@ setInterval(updateMetrics, 5000);
 // Start Server
 // ======================
 
+/**
+ * Starts the cache server.
+ *
+ * @description Initializes persistence (loading any saved snapshot), hooks into
+ * cache events for metrics, and starts the HTTP server. Sets up graceful shutdown
+ * handlers for SIGTERM and SIGINT signals.
+ *
+ * @throws Exits with code 1 if startup fails (e.g., port in use, snapshot load error)
+ */
 async function start(): Promise<void> {
   try {
     // Initialize persistence and load snapshot
@@ -177,7 +234,15 @@ async function start(): Promise<void> {
 `);
     });
 
-    // Graceful shutdown
+    /**
+     * Handles graceful shutdown.
+     *
+     * @description Closes the HTTP server, saves a final snapshot, destroys
+     * the hot key detector and cache, then exits. Forces exit after 10 seconds
+     * if shutdown doesn't complete.
+     *
+     * @param {string} signal - The signal that triggered shutdown
+     */
     async function shutdown(signal: string): Promise<void> {
       logger.info({ signal }, 'shutdown_initiated');
 

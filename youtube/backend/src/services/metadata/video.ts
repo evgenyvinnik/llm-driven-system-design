@@ -9,7 +9,13 @@ import {
   formatVideoResponse,
 } from './types.js';
 
-// Get video by ID
+/**
+ * @description Retrieves a video by its ID, with caching support.
+ * First checks the Redis cache, then falls back to database query if not cached.
+ * Includes channel information (username, name, avatar, subscriber count).
+ * @param videoId - The UUID of the video to retrieve
+ * @returns The video response object, or null if not found
+ */
 export const getVideo = async (videoId: string): Promise<VideoResponse | null> => {
   const cached = await cacheGet<VideoResponse>(`video:${videoId}`);
   if (cached) {
@@ -41,7 +47,13 @@ export const getVideo = async (videoId: string): Promise<VideoResponse | null> =
   return video;
 };
 
-// Get videos with pagination
+/**
+ * @description Retrieves a paginated list of videos with optional filtering and sorting.
+ * Supports filtering by channel, status, visibility, search term, and category.
+ * Results are sorted by the specified column and order.
+ * @param options - Query options for filtering, pagination, and sorting
+ * @returns Object containing the videos array and pagination metadata
+ */
 export const getVideos = async (
   options: GetVideosOptions = {}
 ): Promise<{ videos: VideoResponse[]; pagination: Pagination }> => {
@@ -124,7 +136,15 @@ export const getVideos = async (
   };
 };
 
-// Update video
+/**
+ * @description Updates a video's metadata.
+ * Only the video owner (matching channel_id) can update the video.
+ * Invalidates the video cache after successful update.
+ * @param videoId - The UUID of the video to update
+ * @param userId - The UUID of the user attempting the update (must be the video owner)
+ * @param updates - Object containing the fields to update
+ * @returns The updated video response, or null if video not found or user not authorized
+ */
 export const updateVideo = async (
   videoId: string,
   userId: string,
@@ -160,7 +180,14 @@ export const updateVideo = async (
   return formatVideoResponse(row);
 };
 
-// Delete video
+/**
+ * @description Deletes a video from the database.
+ * Only the video owner (matching channel_id) can delete the video.
+ * Invalidates related caches (video and stream) after successful deletion.
+ * @param videoId - The UUID of the video to delete
+ * @param userId - The UUID of the user attempting the deletion (must be the video owner)
+ * @returns True if the video was deleted, false if not found or user not authorized
+ */
 export const deleteVideo = async (videoId: string, userId: string): Promise<boolean> => {
   const result = await query<{ id: string }>(
     'DELETE FROM videos WHERE id = $1 AND channel_id = $2 RETURNING id',

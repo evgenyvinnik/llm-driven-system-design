@@ -23,7 +23,7 @@
  * - Archive: Old logs moved to cold storage (not implemented in demo)
  */
 import { query } from '../db/index.js';
-import { _logger, createChildLogger } from './logger.js';
+import { createChildLogger } from './logger.js';
 import { Request } from 'express';
 
 const auditLogger = createChildLogger({ module: 'AuditLog' });

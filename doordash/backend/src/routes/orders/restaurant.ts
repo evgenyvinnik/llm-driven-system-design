@@ -1,3 +1,10 @@
+/**
+ * Restaurant orders route module.
+ * @module routes/orders/restaurant
+ * @description Handles order retrieval for restaurant owners and admins,
+ * providing access to incoming orders with customer and item details.
+ */
+
 import { Router, Request, Response } from 'express';
 import { query } from '../../db.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
@@ -5,7 +12,36 @@ import logger from '../../shared/logger.js';
 
 const router = Router();
 
-// Restaurant: Get incoming orders
+/**
+ * GET /orders/restaurant/:restaurantId
+ * @description Retrieves orders for a specific restaurant with filtering options.
+ *
+ * Returns orders placed at the restaurant with customer contact information
+ * and order items. Only accessible by the restaurant owner or admin users.
+ * Results are sorted by placement time (newest first).
+ *
+ * @requires Authentication - User must be logged in
+ * @requires Role - User must be 'restaurant_owner' or 'admin'
+ *
+ * @param req.params.restaurantId - The restaurant ID to get orders for
+ * @param req.query.status - Optional status filter:
+ *   - 'active': All orders not in DELIVERED, COMPLETED, or CANCELLED state
+ *   - Specific status string (e.g., 'PREPARING', 'READY_FOR_PICKUP')
+ * @param req.query.limit - Maximum number of orders to return (default: 50)
+ *
+ * @returns 200 - Array of orders with customer info and items
+ * @returns 403 - User not authorized (not owner and not admin)
+ * @returns 404 - Restaurant not found
+ * @returns 500 - Server error
+ *
+ * @example
+ * // Get all active orders for restaurant
+ * GET /orders/restaurant/5?status=active
+ *
+ * @example
+ * // Get orders ready for pickup
+ * GET /orders/restaurant/5?status=READY_FOR_PICKUP&limit=20
+ */
 router.get(
   '/restaurant/:restaurantId',
   requireAuth,
@@ -65,4 +101,8 @@ router.get(
   }
 );
 
+/**
+ * Express router for restaurant order endpoints.
+ * @description Exports the router configured with the GET /restaurant/:restaurantId endpoint.
+ */
 export default router;

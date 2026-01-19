@@ -1,16 +1,18 @@
 /**
  * Cache Operation Routes for Cache Server
  *
- * Provides endpoints for single-key cache operations:
- * - GET /cache/:key - Get a value
- * - POST /cache/:key - Set a value
- * - PUT /cache/:key - Update a value
- * - DELETE /cache/:key - Delete a key
- * - GET /cache/:key/exists - Check if key exists
- * - GET /cache/:key/ttl - Get TTL for a key
- * - POST /cache/:key/expire - Set TTL on existing key
- * - POST /cache/:key/incr - Increment numeric value
- * - GET /cache/:key/info - Get detailed key info
+ * This module provides Express routes for single-key cache operations:
+ * - GET /cache/:key - Get a cached value
+ * - POST /cache/:key - Set a cached value
+ * - PUT /cache/:key - Update a cached value
+ * - DELETE /cache/:key - Delete a cached key
+ * - GET /cache/:key/exists - Check if a key exists
+ * - GET /cache/:key/ttl - Get the TTL for a key
+ * - POST /cache/:key/expire - Set TTL on an existing key
+ * - POST /cache/:key/incr - Increment a numeric value
+ * - GET /cache/:key/info - Get detailed key information
+ *
+ * @module server/cache-routes
  */
 
 import { Router } from 'express';
@@ -36,10 +38,34 @@ import type {
 } from './types.js';
 
 /**
- * Create cache operation routes for single-key operations
+ * Creates cache operation routes for single-key operations.
  *
- * @param context - Server context with cache, hot key detector, and config
- * @returns Express Router with cache operation routes
+ * @description Factory function that creates an Express router handling all
+ * single-key cache operations. These are the core CRUD operations for the cache
+ * plus additional operations like TTL management and atomic increments.
+ *
+ * All routes use the :key URL parameter to identify the cache key.
+ * GET, POST, PUT, and DELETE operations are instrumented with timing metrics.
+ *
+ * Supported routes:
+ * - GET /cache/:key - Retrieve a cached value
+ * - POST /cache/:key - Store a new value
+ * - PUT /cache/:key - Update an existing value (same behavior as POST)
+ * - DELETE /cache/:key - Remove a key from the cache
+ * - GET /cache/:key/exists - Check if a key exists without retrieving its value
+ * - GET /cache/:key/ttl - Get the remaining TTL for a key
+ * - POST /cache/:key/expire - Set a new TTL on an existing key
+ * - POST /cache/:key/incr - Atomically increment a numeric value
+ * - GET /cache/:key/info - Get detailed metadata about a key
+ *
+ * @param {ServerContext} context - Server context with cache, hot key detector, and config
+ * @returns {Router} Express Router with cache operation routes
+ *
+ * @example
+ * ```typescript
+ * const cacheRouter = createCacheRoutes(context);
+ * app.use(cacheRouter);
+ * ```
  */
 export function createCacheRoutes(context: ServerContext): Router {
   const router = Router();
@@ -48,6 +74,14 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * GET /cache/:key - Get a value from cache
+   *
+   * @description Retrieves a cached value by key. Records the access for
+   * hot key detection and updates hit/miss metrics. Returns the value
+   * along with its remaining TTL.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @returns 200 with {key, value, ttl} if found
+   * @returns 404 if the key does not exist
    */
   router.get(
     '/cache/:key',
@@ -72,6 +106,16 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * POST /cache/:key - Set a value in cache
+   *
+   * @description Stores a value in the cache with an optional TTL.
+   * If the key already exists, it is overwritten. Updates set metrics
+   * and logs the operation.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @body {unknown} value - The value to store (required)
+   * @body {number} [ttl=0] - TTL in seconds (0 = no expiration)
+   * @returns 201 with {key, ttl, message} on success
+   * @returns 400 if value is not provided
    */
   router.post(
     '/cache/:key',
@@ -93,6 +137,15 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * PUT /cache/:key - Update a value in cache (same as POST)
+   *
+   * @description Updates a value in the cache. Functionally identical to POST
+   * but returns 200 instead of 201 to indicate an update rather than creation.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @body {unknown} value - The value to store (required)
+   * @body {number} [ttl=0] - TTL in seconds (0 = no expiration)
+   * @returns 200 with {key, ttl, message} on success
+   * @returns 400 if value is not provided
    */
   router.put(
     '/cache/:key',
@@ -114,6 +167,13 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * DELETE /cache/:key - Delete a key from cache
+   *
+   * @description Removes a key and its value from the cache. Updates delete
+   * metrics and logs the operation if the key existed.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @returns 200 with {key, message} if deleted
+   * @returns 404 if the key did not exist
    */
   router.delete(
     '/cache/:key',
@@ -134,6 +194,13 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * GET /cache/:key/exists - Check if a key exists
+   *
+   * @description Checks whether a key exists in the cache without retrieving
+   * its value. More efficient than GET when you only need to check existence.
+   * Does not affect TTL or access tracking.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @returns 200 with {key, exists: boolean}
    */
   router.get('/cache/:key/exists', (req: Request, res: Response) => {
     const { key } = req.params;
@@ -142,6 +209,14 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * GET /cache/:key/ttl - Get TTL for a key
+   *
+   * @description Returns the remaining TTL (time to live) for a key in seconds.
+   * Returns -1 if the key exists but has no expiration. Returns -2 (via 404)
+   * if the key does not exist.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @returns 200 with {key, ttl, hasExpiration} if key exists
+   * @returns 404 if the key does not exist
    */
   router.get('/cache/:key/ttl', (req: Request, res: Response) => {
     const { key } = req.params;
@@ -157,6 +232,15 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * POST /cache/:key/expire - Set TTL on an existing key
+   *
+   * @description Sets a new TTL on an existing key without modifying its value.
+   * The key must already exist. Use TTL of 0 to remove expiration.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @body {number} ttl - The new TTL in seconds (required)
+   * @returns 200 with {key, ttl, message} on success
+   * @returns 400 if ttl is not provided or not a number
+   * @returns 404 if the key does not exist
    */
   router.post('/cache/:key/expire', (req: Request, res: Response) => {
     const { key } = req.params;
@@ -178,6 +262,15 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * POST /cache/:key/incr - Increment a numeric value
+   *
+   * @description Atomically increments a numeric value stored at the key.
+   * If the key does not exist, it is set to 0 before incrementing.
+   * Supports negative delta for decrement operations.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @body {number} [delta=1] - Amount to increment by (negative to decrement)
+   * @returns 200 with {key, value} containing the new value
+   * @returns 400 if the stored value is not a number
    */
   router.post('/cache/:key/incr', (req: Request, res: Response) => {
     const { key } = req.params;
@@ -194,6 +287,14 @@ export function createCacheRoutes(context: ServerContext): Router {
 
   /**
    * GET /cache/:key/info - Get detailed info about a key
+   *
+   * @description Returns detailed metadata about a cached key including
+   * its value, TTL, creation time, last access time, and access count.
+   * Useful for debugging and understanding cache behavior.
+   *
+   * @param {string} key - The cache key (URL parameter)
+   * @returns 200 with detailed key information
+   * @returns 404 if the key does not exist
    */
   router.get('/cache/:key/info', (req: Request, res: Response) => {
     const { key } = req.params;

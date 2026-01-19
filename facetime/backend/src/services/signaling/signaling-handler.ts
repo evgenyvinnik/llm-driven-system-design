@@ -23,13 +23,20 @@ import {
 
 /**
  * Forwards WebRTC signaling messages between call participants.
- * Routes offer, answer, and ICE candidate messages to enable
- * peer-to-peer connection establishment.
  *
- * ICE candidates are deduplicated to handle network retries.
+ * @description Routes SDP offers, SDP answers, and ICE candidates between
+ * peers to establish WebRTC connections. This is the core of the signaling
+ * protocol that enables peer-to-peer media streaming.
  *
- * @param client - The sender's connected client
- * @param message - The signaling message to forward
+ * For ICE candidates, implements deduplication using content hashing to
+ * prevent redundant forwarding when network conditions cause retries.
+ *
+ * Messages are only forwarded to participants who are part of the active call
+ * and are on a different device than the sender.
+ *
+ * @param client - The sender's connected client containing user and device info
+ * @param message - The signaling message containing type, callId, and SDP/ICE data
+ * @returns Promise that resolves when the message has been forwarded
  */
 export async function handleSignaling(
   client: ConnectedClient,

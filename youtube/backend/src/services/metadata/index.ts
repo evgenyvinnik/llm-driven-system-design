@@ -1,3 +1,10 @@
+/**
+ * @description Metadata service module for the YouTube-like video platform.
+ * Provides operations for managing videos, channels, subscriptions, reactions, and comments.
+ * All database operations include Redis caching where appropriate for performance.
+ * @module services/metadata
+ */
+
 // Re-export all types
 export type {
   VideoRow,

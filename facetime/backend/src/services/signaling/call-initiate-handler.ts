@@ -33,12 +33,25 @@ import { handleRingTimeout } from './room-manager.js';
 
 /**
  * Handles call initiation from a caller to one or more callees.
- * Implements idempotency to prevent duplicate call creation.
- * Creates call record in database, stores state in Redis,
- * rings all callee devices, and sets a 30-second ring timeout.
  *
- * @param client - The caller's connected client
+ * @description Orchestrates the complete call initiation flow:
+ * 1. Validates callee list is provided
+ * 2. Checks idempotency key to prevent duplicate calls (returns existing call if duplicate)
+ * 3. Creates call record in PostgreSQL with circuit breaker protection
+ * 4. Adds initiator as first participant
+ * 5. Stores call state in Redis for fast signaling lookups
+ * 6. Records Prometheus metrics for call analytics
+ * 7. Logs call event and audit trail
+ * 8. Sends call_ring notification to all callee devices
+ * 9. Sets 30-second ring timeout
+ * 10. Confirms call creation to the initiator
+ *
+ * Supports both 1:1 calls and group calls (2+ callees).
+ *
+ * @param client - The caller's connected client containing user and device info
  * @param message - Message containing calleeIds, callType, and optional idempotencyKey
+ * @returns Promise that resolves when call initiation is complete
+ * @throws Never throws - errors are sent as WebSocket messages to the client
  */
 export async function handleCallInitiate(
   client: ConnectedClient,

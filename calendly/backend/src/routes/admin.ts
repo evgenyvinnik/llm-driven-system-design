@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { userService } from '../services/userService.js';
-import { _meetingTypeService } from '../services/meetingTypeService.js';
-import { _bookingService } from '../services/booking/index.js';
+import { meetingTypeService } from '../services/meetingTypeService.js';
+import { bookingService } from '../services/booking/index.js';
 import { emailService } from '../services/emailService.js';
 import { pool } from '../db/index.js';
 import { requireAdmin } from '../middleware/auth.js';

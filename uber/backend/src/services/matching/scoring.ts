@@ -2,10 +2,19 @@ import type { NearbyDriver, ScoredDriver } from '../../types/index.js';
 import { estimateTravelTime } from '../../utils/geo.js';
 
 /**
- * Score and rank drivers based on ETA and rating.
- * Lower ETA is better (inverted and normalized).
- * Higher rating is better.
- * Weighted combination: 60% ETA, 40% rating.
+ * @description Scores and ranks nearby drivers based on ETA and rating to determine the best match for a ride.
+ * Uses a weighted combination of 60% ETA score and 40% rating score.
+ * Lower ETA produces higher scores (inverted and normalized to 0-1 range assuming max 30 min ETA).
+ * Higher ratings produce higher scores (normalized from 3-5 rating scale to 0-1 range).
+ *
+ * @param {NearbyDriver[]} drivers - Array of nearby drivers with their distances and ratings
+ * @param {number} _pickupLat - Pickup latitude (currently unused, reserved for future geo-based scoring)
+ * @param {number} _pickupLng - Pickup longitude (currently unused, reserved for future geo-based scoring)
+ * @returns {ScoredDriver[]} Array of drivers with computed ETA and scores, sorted by score descending (best first)
+ *
+ * @example
+ * const scoredDrivers = scoreDrivers(nearbyDrivers, 37.7749, -122.4194);
+ * const bestDriver = scoredDrivers[0]; // Highest scored driver
  */
 export function scoreDrivers(
   drivers: NearbyDriver[],

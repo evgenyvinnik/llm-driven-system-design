@@ -17,7 +17,7 @@
  * - Supports multiple consumers for different purposes (analytics, alerts, etc.)
  */
 
-import { consumeTrades, TradeEvent, _initKafkaProducer } from '../shared/kafka.js';
+import { consumeTrades, TradeEvent, initKafkaProducer } from '../shared/kafka.js';
 import { logger } from '../shared/logger.js';
 import { redis } from '../redis.js';
 import { pool } from '../database.js';
@@ -77,7 +77,7 @@ class PortfolioUpdater {
    * Processes a trade event from Kafka.
    */
   async processTrade(event: TradeEvent): Promise<void> {
-    const { execution, order, _metadata } = event;
+    const { execution, order, metadata } = event;
     const tradeLogger = logger.child({
       executionId: execution.id,
       orderId: order.id,

@@ -6,16 +6,43 @@ import type { Order } from './types.js';
 
 /**
  * Manages the background limit order matching process.
- * Periodically checks pending limit/stop orders against current prices
- * and executes them when conditions are met.
+ *
+ * @description This class implements a background order matching engine that
+ * periodically scans for pending limit and stop orders and executes them when
+ * market conditions meet the order criteria. The matcher runs on a configurable
+ * interval (default: 2 seconds) and processes orders in FIFO order based on
+ * creation time.
+ *
+ * Order matching rules:
+ * - **Limit Buy**: Executes when ask price <= limit price
+ * - **Limit Sell**: Executes when bid price >= limit price
+ * - **Stop Buy**: Triggers when ask price >= stop price (breakout entry)
+ * - **Stop Sell**: Triggers when bid price <= stop price (stop-loss)
+ *
+ * The matcher is designed for simulation purposes and executes orders at current
+ * market prices rather than the limit price (price improvement).
+ *
+ * @example
+ * ```typescript
+ * const matcher = new LimitOrderMatcher();
+ * matcher.start();
+ * // ... trading operations ...
+ * matcher.stop();
+ * ```
  */
 export class LimitOrderMatcher {
   private executionInterval: NodeJS.Timeout | null = null;
 
   /**
    * Starts the background limit order matcher.
-   * Periodically checks pending limit/stop orders against current prices
-   * and executes them when conditions are met.
+   *
+   * @description Initializes a periodic check (every 2 seconds) that scans for
+   * pending limit and stop orders and executes them when market conditions are met.
+   * If the matcher is already running, this method does nothing (idempotent).
+   *
+   * The matcher continues running until {@link stop} is called.
+   *
+   * @returns void
    */
   start(): void {
     if (this.executionInterval) return;
@@ -29,6 +56,13 @@ export class LimitOrderMatcher {
 
   /**
    * Stops the background limit order matcher.
+   *
+   * @description Clears the periodic interval and stops scanning for orders.
+   * If the matcher is not running, this method does nothing (idempotent).
+   * Any orders that are currently being processed will complete, but no new
+   * matching cycles will be started.
+   *
+   * @returns void
    */
   stop(): void {
     if (this.executionInterval) {
@@ -40,9 +74,22 @@ export class LimitOrderMatcher {
 
   /**
    * Checks all pending limit/stop orders and executes matching ones.
-   * For limit buys, executes when ask <= limit price.
-   * For limit sells, executes when bid >= limit price.
-   * For stop orders, triggers based on stop price thresholds.
+   *
+   * @description Queries the database for all orders with status 'pending', 'submitted',
+   * or 'partial' that are of type 'limit', 'stop', or 'stop_limit'. For each order,
+   * retrieves the current quote and checks if fill conditions are met:
+   *
+   * - **Limit Buy**: Executes when ask price <= limit price
+   * - **Limit Sell**: Executes when bid price >= limit price
+   * - **Stop Buy**: Triggers when ask price >= stop price
+   * - **Stop Sell**: Triggers when bid price <= stop price
+   *
+   * Orders are processed in FIFO order (by creation time). If a quote is not available
+   * for a symbol, that order is skipped. Errors during individual order fills are
+   * caught and logged without stopping processing of other orders.
+   *
+   * @returns Promise that resolves when all eligible orders have been processed
+   * @private
    */
   private async matchLimitOrders(): Promise<void> {
     try {
@@ -76,11 +123,26 @@ export class LimitOrderMatcher {
   }
 
   /**
-   * Determines if an order should be filled based on current prices.
-   * @param order - The order to check
-   * @param askPrice - Current ask price
-   * @param bidPrice - Current bid price
-   * @returns Object indicating whether to fill and at what price
+   * Determines if an order should be filled based on current market prices.
+   *
+   * @description Evaluates whether an order's fill conditions are met by comparing
+   * the order's limit/stop price against current market prices:
+   *
+   * - **Limit orders**: Check if the market price is at or better than the limit price
+   *   - Buy: ask <= limit_price (can buy at target price or cheaper)
+   *   - Sell: bid >= limit_price (can sell at target price or higher)
+   *
+   * - **Stop orders**: Check if the market has moved through the stop price
+   *   - Buy: ask >= stop_price (price has risen to trigger level)
+   *   - Sell: bid <= stop_price (price has fallen to trigger level)
+   *
+   * @param order - The order to check for fill conditions
+   * @param askPrice - Current ask (offer) price for the symbol
+   * @param bidPrice - Current bid price for the symbol
+   * @returns Object containing:
+   *   - shouldFill: true if the order should be executed
+   *   - fillPrice: the price at which to fill (current market price, not limit price)
+   * @private
    */
   private checkFillConditions(
     order: Order,

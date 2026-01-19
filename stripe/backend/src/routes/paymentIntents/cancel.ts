@@ -1,5 +1,7 @@
 /**
  * Cancel payment intent handler
+ * @module paymentIntents/cancel
+ *
  * POST /v1/payment_intents/:id/cancel
  */
 
@@ -12,6 +14,22 @@ import { activePaymentIntents } from '../../shared/metrics.js';
 import type { PaymentIntentRow, CancelPaymentIntentBody } from './types.js';
 import { formatPaymentIntent, CANCELABLE_STATUSES } from './utils.js';
 
+/**
+ * @description Cancels a payment intent that has not yet been captured.
+ * Only payment intents in 'requires_payment_method', 'requires_confirmation',
+ * 'requires_action', or 'requires_capture' status can be canceled.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {string} req.params.id - The payment intent ID to cancel
+ * @param {CancelPaymentIntentBody} req.body - Cancellation parameters
+ * @param {string} [req.body.cancellation_reason] - Reason for cancellation
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with the canceled payment intent or an error
+ *
+ * @throws {400} Payment intent is in a non-cancelable status
+ * @throws {404} Payment intent not found
+ * @throws {500} Database or internal server error
+ */
 export async function cancelPaymentIntent(
   req: AuthenticatedRequest,
   res: Response

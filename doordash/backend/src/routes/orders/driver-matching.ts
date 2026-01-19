@@ -1,3 +1,10 @@
+/**
+ * Driver matching module.
+ * @module routes/orders/driver-matching
+ * @description Handles the automatic matching of drivers to confirmed orders
+ * using a score-based algorithm with circuit breaker protection.
+ */
+
 import { query } from '../../db.js';
 import redisClient from '../../redis.js';
 import { haversineDistance, calculateETA } from '../../utils/geo.js';
@@ -11,7 +18,25 @@ import { NearbyDriver, ScoredDriver } from './types.js';
 import { getOrderWithDetails, calculateMatchScore } from './helpers.js';
 
 /**
- * Find nearby drivers using Redis geo commands
+ * Finds available drivers within a geographic radius of a location.
+ * @description Uses Redis geo commands for efficient spatial queries. If Redis is unavailable,
+ * falls back to a database query with manual distance calculation using the Haversine formula.
+ *
+ * The function:
+ * 1. Queries Redis GEOSEARCH for drivers within the radius
+ * 2. Filters results to only include active and available drivers
+ * 3. Returns drivers sorted by distance (closest first)
+ *
+ * @param lat - Latitude of the search center point (typically restaurant location)
+ * @param lon - Longitude of the search center point
+ * @param radiusKm - Search radius in kilometers
+ * @returns Array of nearby drivers with their IDs and distances, limited to 20 results
+ *
+ * @example
+ * ```typescript
+ * const drivers = await findNearbyDrivers(37.7749, -122.4194, 5);
+ * // Returns: [{ id: 1, distance: 0.5 }, { id: 2, distance: 1.2 }, ...]
+ * ```
  */
 async function findNearbyDrivers(lat: number, lon: number, radiusKm: number): Promise<NearbyDriver[]> {
   try {
@@ -70,7 +95,37 @@ async function findNearbyDrivers(lat: number, lon: number, radiusKm: number): Pr
 }
 
 /**
- * Match a driver to an order using circuit breaker pattern
+ * Matches the best available driver to an order using a scoring algorithm.
+ * @description Implements the driver matching logic with circuit breaker protection
+ * to prevent cascading failures. The matching process:
+ *
+ * 1. Verifies the order exists and has no driver assigned
+ * 2. Finds nearby available drivers within 5km of the restaurant
+ * 3. Scores each driver based on distance, rating, and experience
+ * 4. Assigns the highest-scoring driver to the order
+ * 5. Marks the driver as unavailable
+ * 6. Calculates ETA for the delivery
+ * 7. Creates an audit log entry
+ * 8. Notifies the driver via WebSocket
+ * 9. Publishes a dispatch event to Kafka
+ *
+ * The circuit breaker prevents repeated failures from overwhelming the system
+ * when driver matching is experiencing issues.
+ *
+ * @param orderId - The ID of the order to match a driver to
+ * @returns Result object indicating success/failure and reason
+ *
+ * @example
+ * ```typescript
+ * const result = await matchDriverToOrder(123);
+ * if (result.matched) {
+ *   console.log(`Driver ${result.driverId} assigned to order`);
+ * } else {
+ *   console.log(`Matching failed: ${result.reason}`);
+ * }
+ * ```
+ *
+ * @throws Returns error result instead of throwing when matching fails
  */
 export async function matchDriverToOrder(orderId: number): Promise<DriverMatchResult> {
   const startTime = Date.now();

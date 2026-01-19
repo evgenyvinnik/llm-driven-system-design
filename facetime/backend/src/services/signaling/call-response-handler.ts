@@ -25,11 +25,24 @@ import { endCall } from './room-manager.js';
 
 /**
  * Handles when a callee answers an incoming call.
- * Updates call state to connected, notifies the initiator,
- * and stops ringing on the answerer's other devices.
+ *
+ * @description Processes a call answer with the following steps:
+ * 1. Validates callId is provided and call exists in ringing state
+ * 2. Clears the ring timeout to prevent missed call processing
+ * 3. Calculates and records call setup latency for metrics
+ * 4. Updates call state to 'connected' in PostgreSQL
+ * 5. Updates participant record with device info and join time
+ * 6. Updates Redis call state with new participant
+ * 7. Records Prometheus metrics for answered calls
+ * 8. Logs call event and audit trail
+ * 9. Sends call_end with 'answered_elsewhere' to answerer's other devices
+ * 10. Notifies the initiator that the call was answered
+ * 11. Confirms answer success to the answering device
  *
  * @param client - The answering callee's connected client
- * @param message - Message containing the callId
+ * @param message - Message containing the callId to answer
+ * @returns Promise that resolves when the answer is processed
+ * @throws Never throws - errors are sent as WebSocket messages to the client
  */
 export async function handleCallAnswer(
   client: ConnectedClient,
@@ -157,11 +170,21 @@ export async function handleCallAnswer(
 
 /**
  * Handles when a callee declines an incoming call.
- * Updates participant state and notifies the initiator.
- * If all callees decline, ends the call.
+ *
+ * @description Processes a call decline with the following steps:
+ * 1. Validates call exists in call state
+ * 2. Updates the declining participant's state to 'declined' in database
+ * 3. Logs the decline event for analytics
+ * 4. Checks if all callees have declined
+ * 5. If all declined, ends the call with 'declined' reason
+ * 6. Notifies the initiator about the decline (and whether all declined)
+ *
+ * For group calls, the call continues ringing for other callees until
+ * someone answers or all decline.
  *
  * @param client - The declining callee's connected client
- * @param message - Message containing the callId
+ * @param message - Message containing the callId to decline
+ * @returns Promise that resolves when the decline is processed
  */
 export async function handleCallDecline(
   client: ConnectedClient,
@@ -219,10 +242,15 @@ export async function handleCallDecline(
 
 /**
  * Handles when a participant ends an active call.
- * Triggers call termination for all participants.
  *
- * @param client - The connected client ending the call
- * @param message - Message containing the callId
+ * @description Triggers complete call termination for all participants.
+ * This can be called by any participant (initiator or callee) to end
+ * the call. The endCall function handles all cleanup including database
+ * updates, Redis state cleanup, and participant notifications.
+ *
+ * @param client - The connected client requesting to end the call
+ * @param message - Message containing the callId to end
+ * @returns Promise that resolves when the call end is initiated
  */
 export async function handleCallEnd(
   client: ConnectedClient,

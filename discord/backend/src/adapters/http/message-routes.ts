@@ -1,7 +1,10 @@
 /**
  * Message and Command Routes
  *
- * Handles message sending and command execution endpoints.
+ * @description Handles message sending and slash command execution endpoints.
+ * Provides REST API endpoints for users to send chat messages and execute
+ * commands like /join, /leave, /users, etc.
+ * @module adapters/http/message-routes
  */
 
 import type { Request, Response, Router } from 'express';
@@ -13,7 +16,21 @@ import { recordConnection, commandsExecuted } from '../../shared/metrics.js';
 import { server } from '../../shared/config.js';
 
 /**
- * Create command and message routes
+ * Creates an Express router with command and message endpoints.
+ *
+ * @description Sets up routes for chat interaction:
+ * - POST /command: Executes slash commands (e.g., /join #general, /leave, /users)
+ * - POST /message: Sends a chat message to the user's current room
+ *
+ * Both endpoints require a valid session ID and track metrics for monitoring.
+ * The command endpoint automatically handles disconnect commands by cleaning up
+ * the session and decrementing connection counters.
+ *
+ * @returns {Router} Express router configured with command and message routes
+ *
+ * @example
+ * // Mount command routes on the API path
+ * app.use('/api', createCommandRoutes());
  */
 export function createCommandRoutes(): Router {
   const router = express.Router();

@@ -240,10 +240,13 @@ export function deleteCallCreationTime(callId: string): boolean {
 
 /**
  * Sends a message to a connected WebSocket client.
- * Adds timestamp and handles serialization.
+ *
+ * @description Serializes the message to JSON and adds a timestamp before sending.
+ * Safely checks that the connection is open before attempting to send.
  *
  * @param ws - The WebSocket connection to send to
- * @param message - The message to send
+ * @param message - The WebSocket message object to send
+ * @returns void
  */
 export function sendToClient(ws: WebSocket, message: WebSocketMessage): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -252,11 +255,16 @@ export function sendToClient(ws: WebSocket, message: WebSocketMessage): void {
 }
 
 /**
- * Sends a message to all devices of a specific user.
+ * Sends a message to all connected devices of a specific user.
  *
- * @param userId - The user ID to send to
- * @param message - The message to send
- * @param excludeDeviceId - Optional device ID to exclude from sending
+ * @description Iterates through all active connections for a user and sends
+ * the message to each device. Optionally excludes a specific device (useful
+ * when the sender is also the recipient on another device).
+ *
+ * @param userId - The user ID whose devices should receive the message
+ * @param message - The WebSocket message object to send
+ * @param excludeDeviceId - Optional device ID to exclude from message delivery
+ * @returns void
  */
 export function sendToUser(
   userId: string,
@@ -276,9 +284,11 @@ export function sendToUser(
 
 /**
  * Returns a list of currently online users with their device counts.
- * Used by the stats endpoint to monitor active connections.
  *
- * @returns Array of objects with userId and deviceCount
+ * @description Aggregates connection data for monitoring purposes.
+ * Used by the stats endpoint to display active user sessions.
+ *
+ * @returns Array of objects containing userId and the number of connected devices
  */
 export function getOnlineUsers(): { userId: string; deviceCount: number }[] {
   const users: { userId: string; deviceCount: number }[] = [];

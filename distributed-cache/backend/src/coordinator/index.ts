@@ -1,15 +1,21 @@
 /**
  * Cache Coordinator - Routes requests to appropriate cache nodes using consistent hashing
  *
+ * The coordinator is the central entry point for the distributed cache cluster.
+ * It receives all client requests and routes them to the appropriate cache node
+ * based on consistent hashing of the cache key.
+ *
  * Features:
- * - Consistent hashing for key distribution
- * - Health monitoring of cache nodes
- * - Automatic node discovery and removal
- * - Cluster-wide statistics aggregation
+ * - Consistent hashing for even key distribution across nodes
+ * - Health monitoring with automatic node removal after failures
+ * - Automatic node discovery when new nodes come online
+ * - Cluster-wide statistics aggregation from all nodes
  * - Admin API for cluster management (with authentication)
- * - Circuit breakers for node communication
- * - Graceful rebalancing on node changes
- * - Prometheus metrics endpoint
+ * - Circuit breakers to prevent cascading failures
+ * - Graceful rebalancing when nodes are added or removed
+ * - Prometheus metrics endpoint for monitoring
+ *
+ * @module coordinator
  */
 
 import express from 'express';
@@ -77,7 +83,20 @@ app.use(createHttpLogger());
 // ======================
 
 /**
- * Coordinator health check
+ * GET /health - Coordinator health check
+ *
+ * @description Returns the health status of the coordinator and summary
+ * information about the cluster. Used by load balancers and monitoring
+ * systems to determine if the coordinator is available.
+ *
+ * @returns {Object} Health status object with:
+ *   - status: 'healthy' if at least one node is available, 'degraded' otherwise
+ *   - coordinator: true (indicates this is the coordinator)
+ *   - port: The port the coordinator is listening on
+ *   - totalNodes: Total number of configured nodes
+ *   - healthyNodes: Number of currently healthy nodes
+ *   - uptime: Coordinator uptime in seconds
+ *   - timestamp: ISO timestamp of the response
  */
 app.get('/health', (_req, res) => {
   const healthyNodes = healthMonitor.getHealthyNodesCount();
@@ -94,7 +113,14 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Prometheus metrics endpoint
+ * GET /metrics - Prometheus metrics endpoint
+ *
+ * @description Exposes Prometheus-formatted metrics for monitoring.
+ * Includes cache operation counts, latencies, node health status,
+ * and other operational metrics.
+ *
+ * @returns Prometheus text format metrics
+ * @throws 500 if metrics collection fails
  */
 app.get('/metrics', async (_req, res) => {
   try {
@@ -124,7 +150,15 @@ app.use(
 // Cache operation routes
 app.use(createCacheRouter(ring, nodeRequest));
 
-// Protected flush route (needs admin auth before cache router)
+/**
+ * POST /flush - Protected flush route
+ *
+ * @description Clears all data from all cache nodes. This is a destructive
+ * operation that requires admin authentication. The route is defined here
+ * rather than in the cache router to apply admin authentication.
+ *
+ * @returns {Object} Flush results from each node
+ */
 app.post('/flush', requireAdminKey, async (_req, res) => {
   logAdminOperation('flush', { nodes: ring.getAllNodes().length });
   // Forward to the cache router's flush handler
@@ -157,6 +191,12 @@ app.use(
 // Error Handling
 // ======================
 
+/**
+ * Global error handler middleware
+ *
+ * @description Catches unhandled errors from route handlers and returns
+ * a consistent error response format. Logs errors for debugging.
+ */
 app.use(
   (
     err: Error,
@@ -211,7 +251,15 @@ const server = app.listen(PORT, () => {
 `);
 });
 
-// Graceful shutdown
+/**
+ * Graceful shutdown handler
+ *
+ * @description Handles SIGTERM and SIGINT signals to perform a clean shutdown.
+ * Closes the HTTP server and waits for in-flight requests to complete.
+ * Forces exit after 10 seconds if shutdown doesn't complete.
+ *
+ * @param {string} signal - The signal that triggered shutdown ('SIGTERM' or 'SIGINT')
+ */
 async function shutdown(signal: string) {
   logger.info({ signal }, 'shutdown_initiated');
 

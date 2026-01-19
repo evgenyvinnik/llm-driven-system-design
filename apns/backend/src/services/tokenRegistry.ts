@@ -12,7 +12,7 @@ import {
   invalidateTokenCache,
 } from "../shared/cache.js";
 import { tokenOperations } from "../shared/metrics.js";
-import { _logger, auditToken } from "../shared/logger.js";
+import { auditToken } from "../shared/logger.js";
 
 /**
  * Token Registry Service.

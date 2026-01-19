@@ -5,7 +5,7 @@
  * @module db/migrate
  */
 
-import { pool, _query } from './pool';
+import { pool } from './pool';
 import { logger } from '../utils/logger';
 
 /**

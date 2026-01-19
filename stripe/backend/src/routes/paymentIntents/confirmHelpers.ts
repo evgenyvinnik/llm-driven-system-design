@@ -1,5 +1,7 @@
 /**
  * Helper functions for confirm payment intent handler
+ * @module paymentIntents/confirmHelpers
+ *
  * Handles different confirmation outcomes: blocked, review, declined, automatic capture, manual capture
  */
 
@@ -17,7 +19,17 @@ import type { PaymentIntentRow } from './types.js';
 import { formatPaymentIntent, getDeclineMessage } from './utils.js';
 
 /**
- * Handle blocked payment due to high fraud risk
+ * @description Handles a payment that was blocked due to high fraud risk.
+ * Updates the payment intent to 'failed' status and records the fraud block.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {Response} res - Express response object
+ * @param {PaymentIntentRow} intent - The payment intent being processed
+ * @param {string} previousStatus - The status before the block attempt
+ * @param {Object} riskResult - Fraud risk assessment result
+ * @param {number} riskResult.riskScore - Numeric risk score (0-100)
+ * @param {string} riskResult.decision - Decision: 'block'
+ * @returns {Promise<void>} Responds with a 402 error indicating fraud block
  */
 export async function handleBlockedPayment(
   req: AuthenticatedRequest,
@@ -64,7 +76,17 @@ export async function handleBlockedPayment(
 }
 
 /**
- * Handle payment requiring 3DS review
+ * @description Handles a payment requiring 3D Secure verification.
+ * Updates the payment intent to 'requires_action' status and provides a redirect URL.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {Response} res - Express response object
+ * @param {PaymentIntentRow} intent - The payment intent being processed
+ * @param {string} previousStatus - The status before the review determination
+ * @param {string} paymentMethodId - The payment method ID being used
+ * @param {Object} riskResult - Fraud risk assessment result
+ * @param {number} riskResult.riskScore - Numeric risk score (0-100)
+ * @returns {Promise<void>} Responds with the payment intent including next_action for 3DS redirect
  */
 export async function handleReviewPayment(
   req: AuthenticatedRequest,
@@ -106,7 +128,17 @@ export async function handleReviewPayment(
 }
 
 /**
- * Handle declined payment from card network
+ * @description Handles a payment declined by the card network.
+ * Updates the payment intent to 'failed' status and sends a webhook notification.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {Response} res - Express response object
+ * @param {PaymentIntentRow} intent - The payment intent being processed
+ * @param {string} previousStatus - The status before the decline
+ * @param {string} paymentMethodId - The payment method ID that was declined
+ * @param {Object} authResult - Authorization result from the card network
+ * @param {string} [authResult.declineCode] - Machine-readable decline code
+ * @returns {Promise<void>} Responds with a 402 error indicating the decline
  */
 export async function handleDeclinedPayment(
   req: AuthenticatedRequest,
@@ -162,7 +194,18 @@ export async function handleDeclinedPayment(
 }
 
 /**
- * Handle automatic capture - create charge and ledger entries immediately
+ * @description Handles automatic capture after successful authorization.
+ * Updates the payment intent to 'succeeded', creates a charge, and records ledger entries.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {Response} res - Express response object
+ * @param {PaymentIntentRow} intent - The payment intent being processed
+ * @param {string} previousStatus - The status before confirmation
+ * @param {string} paymentMethodId - The payment method ID used for the payment
+ * @param {Object} authResult - Authorization result from the card network
+ * @param {string} [authResult.authCode] - Authorization code from the card network
+ * @param {[number, number]} startTime - High-resolution time tuple from process.hrtime() for duration logging
+ * @returns {Promise<void>} Responds with the succeeded payment intent
  */
 export async function handleAutomaticCapture(
   req: AuthenticatedRequest,
@@ -266,7 +309,17 @@ export async function handleAutomaticCapture(
 }
 
 /**
- * Handle manual capture - just authorize, capture later
+ * @description Handles manual capture mode after successful authorization.
+ * Updates the payment intent to 'requires_capture' status, awaiting a separate capture call.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {Response} res - Express response object
+ * @param {PaymentIntentRow} intent - The payment intent being processed
+ * @param {string} previousStatus - The status before confirmation
+ * @param {string} paymentMethodId - The payment method ID used for the payment
+ * @param {Object} authResult - Authorization result from the card network
+ * @param {string} [authResult.authCode] - Authorization code from the card network
+ * @returns {Promise<void>} Responds with the payment intent in 'requires_capture' status
  */
 export async function handleManualCapture(
   req: AuthenticatedRequest,

@@ -41,13 +41,26 @@ export async function executeOrderImmediately(
 
 /**
  * Fills an order (or partial order) at the specified price.
- * Creates execution record, updates order status, modifies positions,
- * and adjusts buying power. Handles both full and partial fills.
- * @param order - Order to fill
+ *
+ * @description Performs a complete order fill workflow within a database transaction:
+ * 1. Creates an execution record with fill details
+ * 2. Updates the order status (filled/partial) and average fill price
+ * 3. Updates the user's position (adds shares for buys, removes for sells)
+ * 4. Adjusts the user's buying power:
+ *    - For buys: refunds any price difference if filled below estimate
+ *    - For sells: adds sale proceeds to buying power
+ * 5. Publishes order and trade events to Kafka (if connected)
+ * 6. Logs audit trail and updates Prometheus metrics
+ *
+ * Supports both full and partial fills. The order status is set to 'filled'
+ * when the entire quantity is filled, or 'partial' for partial fills.
+ *
+ * @param order - The order to fill (can be any order type)
  * @param price - Execution price per share
- * @param quantity - Number of shares to fill
- * @param context - Order context for tracing
- * @returns Promise resolving to order result with execution details
+ * @param quantity - Number of shares to fill (can be less than order quantity for partial fills)
+ * @param context - Optional order context for request tracing
+ * @returns Promise resolving to order result with execution details and updated order
+ * @throws {Error} Any database error during the transaction (transaction is rolled back)
  */
 export async function fillOrder(
   order: Order,

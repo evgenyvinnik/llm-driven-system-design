@@ -17,30 +17,60 @@ import { RIDE_PREFIX, PENDING_REQUESTS_KEY } from './types.js';
 
 const logger = createLogger('allocation');
 
-// Forward declaration for circular dependency resolution
+/**
+ * @description Function signature for sending a message to a user via WebSocket.
+ * Used for dependency injection to avoid circular dependencies.
+ */
 type SendToUserFn = (userId: string, message: WSMessage) => boolean;
+
+/**
+ * @description Map storing matching start timestamps for latency tracking.
+ * Key: rideId, Value: timestamp in milliseconds when matching started.
+ */
 type MatchingTimers = Map<string, number>;
 
 let sendToUserFn: SendToUserFn;
 let matchingTimers: MatchingTimers;
 
 /**
- * Set the sendToUser function (to avoid circular dependencies)
+ * @description Sets the function used to send WebSocket messages to users.
+ * This setter pattern is used to break circular dependencies between matching modules.
+ *
+ * @param {SendToUserFn} fn - Function that sends a WebSocket message to a specific user
+ * @returns {void}
  */
 export function setSendToUser(fn: SendToUserFn): void {
   sendToUserFn = fn;
 }
 
 /**
- * Set the matching timers map (to avoid circular dependencies)
+ * @description Sets the matching timers map for tracking matching latency.
+ * This setter pattern is used to share state between matching modules.
+ *
+ * @param {MatchingTimers} timers - Map containing ride IDs to matching start timestamps
+ * @returns {void}
  */
 export function setMatchingTimers(timers: MatchingTimers): void {
   matchingTimers = timers;
 }
 
 /**
- * Offer ride to a driver via WebSocket.
- * Returns true if the offer was successfully sent.
+ * @description Sends a ride offer to a driver via WebSocket.
+ * Retrieves ride and rider details, calculates ETA from driver's current location to pickup,
+ * and sends a complete ride offer message to the driver's WebSocket connection.
+ * The driver has 15 seconds to accept the offer before it expires.
+ *
+ * @param {string} rideId - Unique identifier of the ride to offer
+ * @param {string} driverId - ID of the driver to receive the offer
+ * @param {number} pickupLat - Latitude of the pickup location
+ * @param {number} pickupLng - Longitude of the pickup location
+ * @returns {Promise<boolean>} True if the offer was successfully sent to the driver's WebSocket
+ *
+ * @example
+ * const sent = await offerRideToDriver('ride-123', 'driver-456', 37.7749, -122.4194);
+ * if (sent) {
+ *   console.log('Offer sent, waiting for driver response');
+ * }
  */
 export async function offerRideToDriver(
   rideId: string,
@@ -109,8 +139,24 @@ export async function offerRideToDriver(
 }
 
 /**
- * Driver accepts the ride.
- * Updates ride status, notifies rider, and sets driver as busy.
+ * @description Processes a driver's acceptance of a ride offer.
+ * Implements optimistic locking to prevent race conditions when multiple drivers try to accept.
+ * Updates ride status in both PostgreSQL and Redis, marks driver as busy,
+ * adjusts demand metrics, tracks matching duration, and notifies the rider.
+ *
+ * @param {string} rideId - Unique identifier of the ride being accepted
+ * @param {string} driverId - ID of the driver accepting the ride
+ * @returns {Promise<AcceptRideResult>} Result object containing success status, error message if failed, or ride details if successful
+ *
+ * @throws Will not throw - errors are captured in the result object
+ *
+ * @example
+ * const result = await acceptRide('ride-123', 'driver-456');
+ * if (result.success) {
+ *   console.log('Ride accepted:', result.ride);
+ * } else {
+ *   console.log('Failed:', result.error);
+ * }
  */
 export async function acceptRide(rideId: string, driverId: string): Promise<AcceptRideResult> {
   // Check if ride is still pending

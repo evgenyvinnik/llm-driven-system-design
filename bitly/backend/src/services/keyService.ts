@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../utils/database.js';
 import { URL_CONFIG, SERVER_ID } from '../config.js';
-import { _KeyPoolEntry } from '../models/types.js';
+import { KeyPoolEntry } from '../models/types.js';
 import logger from '../utils/logger.js';
 
 /**

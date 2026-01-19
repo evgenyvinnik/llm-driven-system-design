@@ -89,7 +89,7 @@ export class RefundService {
     clientInfo?: { ipAddress?: string; userAgent?: string }
   ): Promise<Refund> {
     const startTime = Date.now();
-    const { _amount, _reason, idempotency_key } = request;
+    const { idempotency_key } = request;
 
     // Use shared idempotency wrapper for refund operations
     const { result, fromCache } = await withIdempotency<Refund>(

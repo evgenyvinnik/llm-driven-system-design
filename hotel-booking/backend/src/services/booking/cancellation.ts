@@ -11,7 +11,36 @@ import { formatBooking } from './formatter.js';
 import type { Booking, BookingRow } from './types.js';
 
 /**
- * Cancel a booking
+ * @description Cancels an existing booking (either reserved or confirmed).
+ * Updates the booking status to 'cancelled', making the room(s) available again.
+ *
+ * This function:
+ * 1. Updates the booking status to 'cancelled'
+ * 2. Records cancellation metrics with the reason for analytics
+ * 3. Invalidates the availability cache so the freed rooms appear available
+ *
+ * @param {string} bookingId - The unique identifier of the booking to cancel
+ * @param {string} userId - The ID of the user who owns the booking (for authorization)
+ * @param {string} [reason='user_requested'] - The reason for cancellation (e.g., 'user_requested',
+ *        'payment_failed', 'hotel_requested'). Used for analytics and reporting.
+ * @returns {Promise<Booking>} The cancelled booking object
+ * @throws {Error} Throws 'Booking not found or cannot be cancelled' if:
+ *         - The booking doesn't exist
+ *         - The booking doesn't belong to the specified user
+ *         - The booking is not in 'reserved' or 'confirmed' status
+ *
+ * @example
+ * // Cancel a booking with default reason
+ * const booking = await cancelBooking('booking-123', 'user-456');
+ * console.log(`Booking ${booking.id} has been cancelled`);
+ *
+ * @example
+ * // Cancel with a specific reason
+ * const booking = await cancelBooking(
+ *   'booking-123',
+ *   'user-456',
+ *   'payment_failed'
+ * );
  */
 export async function cancelBooking(
   bookingId: string,
@@ -49,7 +78,34 @@ export async function cancelBooking(
 }
 
 /**
- * Expire stale reservations (to be called by a background job)
+ * @description Expires stale reservations that have passed their hold time.
+ * This function should be called by a background job (e.g., every minute) to
+ * clean up abandoned bookings and make rooms available again.
+ *
+ * Reservations are created with a `reserved_until` timestamp (typically 15 minutes
+ * from creation). If the user doesn't complete payment within this window,
+ * the reservation expires and the rooms become available for others.
+ *
+ * This function:
+ * 1. Updates all bookings with status 'reserved' and expired `reserved_until` to 'expired'
+ * 2. Invalidates availability cache for each expired reservation
+ * 3. Logs the number of expired reservations for monitoring
+ *
+ * @returns {Promise<number>} The number of reservations that were expired
+ *
+ * @example
+ * // Run in a background job
+ * setInterval(async () => {
+ *   const count = await expireStaleReservations();
+ *   if (count > 0) {
+ *     console.log(`Expired ${count} stale reservations`);
+ *   }
+ * }, 60000); // Every minute
+ *
+ * @example
+ * // Call manually for testing
+ * const expiredCount = await expireStaleReservations();
+ * console.log(`Cleaned up ${expiredCount} abandoned reservations`);
  */
 export async function expireStaleReservations(): Promise<number> {
   const result = await query<{ hotel_id: string; room_type_id: string; check_in: Date; check_out: Date }>(

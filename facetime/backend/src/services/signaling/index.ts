@@ -39,10 +39,29 @@ import { sendToClient, getAllClients, getOnlineUsers, getClientCount } from './c
 
 /**
  * Initializes WebSocket signaling server with event handlers.
- * This is the core of the real-time communication system, handling
- * client registration, call signaling, and WebRTC offer/answer exchange.
  *
- * @param wss - The WebSocket server instance to configure
+ * @description Sets up the complete WebSocket-based signaling infrastructure:
+ *
+ * **Connection Handling:**
+ * - Accepts new WebSocket connections with unique client IDs
+ * - Tracks active connections using Prometheus metrics
+ * - Handles connection errors and clean disconnection
+ *
+ * **Message Processing:**
+ * - Routes incoming messages to appropriate handlers based on type
+ * - Supports: register, call_initiate, call_answer, call_decline, call_end
+ * - Supports WebRTC signaling: offer, answer, ice_candidate
+ * - Handles ping/pong heartbeats for connection health
+ *
+ * **Health Monitoring:**
+ * - Runs heartbeat check every 30 seconds
+ * - Terminates clients that haven't sent a ping in 60 seconds
+ * - Records signaling latency metrics for each message type
+ *
+ * This is the core entry point for real-time communication in the FaceTime system.
+ *
+ * @param wss - The WebSocket server instance to configure with event handlers
+ * @returns void
  */
 export function setupWebSocketServer(wss: WebSocketServer): void {
   wss.on('connection', (ws: WebSocket, _req: IncomingMessage) => {

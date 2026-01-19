@@ -18,13 +18,22 @@
  * @module services/file
  */
 
-// Upload operations
+/**
+ * @description Upload operations for chunked file uploads with deduplication
+ * @see {@link ./upload.js} for implementation details
+ */
 export { createUploadSession, uploadFileChunk, completeUpload } from './upload.js';
 
-// Download operations
+/**
+ * @description Download operations for reassembling files from chunks
+ * @see {@link ./download.js} for implementation details
+ */
 export { downloadFile, getFileChunks } from './download.js';
 
-// Metadata operations
+/**
+ * @description Metadata operations for files and folders (CRUD, navigation)
+ * @see {@link ./metadata.js} for implementation details
+ */
 export {
   getFile,
   createFolder,
@@ -34,5 +43,8 @@ export {
   deleteItem,
 } from './metadata.js';
 
-// Versioning operations
+/**
+ * @description Versioning operations for file history and restore
+ * @see {@link ./versioning.js} for implementation details
+ */
 export { getFileVersions, restoreFileVersion } from './versioning.js';

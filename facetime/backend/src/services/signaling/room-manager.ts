@@ -27,11 +27,20 @@ import { logger } from '../../shared/logger.js';
 
 /**
  * Terminates a call and notifies all participants.
- * Updates database records, cleans up Redis state,
- * and calculates call duration for ended calls.
+ *
+ * @description Performs complete call cleanup including:
+ * - Clearing any pending ring timeout
+ * - Removing call creation time tracking
+ * - Calculating and recording call duration
+ * - Updating call state in PostgreSQL database
+ * - Recording Prometheus metrics for call analytics
+ * - Logging call events and audit trail
+ * - Sending call_end notifications to all participants
+ * - Cleaning up Redis call state
  *
  * @param callId - Unique identifier of the call to end
- * @param reason - Reason for ending: 'ended', 'missed', or 'declined'
+ * @param reason - Reason for ending: 'ended' (normal), 'missed' (timeout), or 'declined' (all declined)
+ * @returns Promise that resolves when cleanup is complete
  */
 export async function endCall(callId: string, reason: string): Promise<void> {
   const callState = await getCallState(callId);
@@ -109,10 +118,14 @@ export async function endCall(callId: string, reason: string): Promise<void> {
 }
 
 /**
- * Handles ring timeout when no callee answers within 30 seconds.
- * Ends the call with 'missed' status if still ringing.
+ * Handles ring timeout when no callee answers within the timeout period.
+ *
+ * @description Called by a scheduled timeout (typically 30 seconds after call initiation).
+ * Checks if the call is still in 'ringing' state before marking it as missed.
+ * This prevents processing timeouts for calls that have already been answered or declined.
  *
  * @param callId - Unique identifier of the timed-out call
+ * @returns Promise that resolves when the timeout is processed
  */
 export async function handleRingTimeout(callId: string): Promise<void> {
   const callState = await getCallState(callId);

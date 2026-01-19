@@ -1,3 +1,10 @@
+/**
+ * Order retrieval route module.
+ * @module routes/orders/get
+ * @description Handles fetching individual orders and listing customer orders
+ * with proper authorization checks.
+ */
+
 import { Router, Request, Response } from 'express';
 import { query } from '../../db.js';
 import { requireAuth } from '../../middleware/auth.js';
@@ -6,7 +13,25 @@ import { getOrderWithDetails } from './helpers.js';
 
 const router = Router();
 
-// Get order by ID
+/**
+ * GET /orders/:id
+ * @description Retrieves a single order by ID with full details.
+ *
+ * Authorization is checked to ensure only authorized parties can view the order:
+ * - The customer who placed the order
+ * - The restaurant owner fulfilling the order
+ * - The driver assigned to deliver the order
+ * - Admin users
+ *
+ * @requires Authentication - User must be logged in
+ *
+ * @param req.params.id - The order ID to retrieve
+ *
+ * @returns 200 - Order found with full details (restaurant, driver, items)
+ * @returns 403 - User not authorized to view this order
+ * @returns 404 - Order not found
+ * @returns 500 - Server error
+ */
 router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
@@ -36,7 +61,26 @@ router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<voi
   }
 });
 
-// Get customer's orders (list)
+/**
+ * GET /orders
+ * @description Retrieves a paginated list of orders for the authenticated customer.
+ *
+ * Returns orders placed by the current user with basic restaurant information.
+ * Results are sorted by placement time (newest first).
+ *
+ * @requires Authentication - User must be logged in
+ *
+ * @param req.query.status - Optional status filter (e.g., 'PLACED', 'DELIVERED')
+ * @param req.query.limit - Maximum number of orders to return (default: 20)
+ * @param req.query.offset - Number of orders to skip for pagination (default: 0)
+ *
+ * @returns 200 - Array of orders with basic restaurant info
+ * @returns 500 - Server error
+ *
+ * @example
+ * // Get first page of delivered orders
+ * GET /orders?status=DELIVERED&limit=10&offset=0
+ */
 router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { status, limit = '20', offset = '0' } = req.query;
@@ -67,4 +111,8 @@ router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> 
   }
 });
 
+/**
+ * Express router for order retrieval endpoints.
+ * @description Exports the router configured with GET endpoints for fetching orders.
+ */
 export default router;

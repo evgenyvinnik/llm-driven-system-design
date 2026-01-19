@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
-import type { WSMessage, PresenceState, Operation, _CanvasData } from '../types/index.js';
+import type { WSMessage, PresenceState, Operation, CanvasData } from '../types/index.js';
 import { fileService } from '../services/fileService.js';
 import { presenceService } from '../services/presenceService.js';
 import { operationService } from '../services/operationService.js';

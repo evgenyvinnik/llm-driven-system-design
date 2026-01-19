@@ -28,7 +28,34 @@ import type {
 } from './types.js';
 
 /**
- * Check availability for a room type on a date range
+ * @description Checks room availability for a specific room type over a date range.
+ * Uses Redis caching to reduce database load during high-traffic periods.
+ *
+ * The function performs the following steps:
+ * 1. Checks Redis cache for existing availability data
+ * 2. If cache miss, queries the database to calculate available rooms
+ * 3. Caches the result for future requests
+ * 4. Records metrics for cache hits/misses
+ *
+ * @param {string} hotelId - The unique identifier of the hotel
+ * @param {string} roomTypeId - The unique identifier of the room type
+ * @param {string} checkIn - Check-in date in ISO format (YYYY-MM-DD)
+ * @param {string} checkOut - Check-out date in ISO format (YYYY-MM-DD)
+ * @param {number} [roomCount=1] - Number of rooms requested
+ * @returns {Promise<AvailabilityCheck>} Availability information including whether rooms are available
+ * @throws {Error} Throws if the room type is not found or inactive
+ *
+ * @example
+ * const availability = await checkAvailability(
+ *   'hotel-123',
+ *   'room-type-456',
+ *   '2024-03-15',
+ *   '2024-03-20',
+ *   2
+ * );
+ * if (availability.available) {
+ *   console.log(`${availability.availableRooms} rooms available`);
+ * }
  */
 export async function checkAvailability(
   hotelId: string,
@@ -105,8 +132,27 @@ export async function checkAvailability(
 }
 
 /**
- * Get availability calendar for a month
- * Cached aggressively as calendar data changes less frequently
+ * @description Generates an availability calendar for a specific room type for an entire month.
+ * Returns daily availability counts and prices, suitable for displaying a calendar UI.
+ *
+ * The function:
+ * 1. Checks Redis cache for the month's calendar data
+ * 2. If cache miss, queries room type info, bookings, and price overrides
+ * 3. Builds a day-by-day calendar with availability and pricing
+ * 4. Caches the result for 5 minutes
+ *
+ * @param {string} hotelId - The unique identifier of the hotel
+ * @param {string} roomTypeId - The unique identifier of the room type
+ * @param {number} year - The year (e.g., 2024)
+ * @param {number} month - The month (1-12)
+ * @returns {Promise<CalendarDay[]>} Array of calendar days with availability and pricing
+ * @throws {Error} Throws if the room type is not found
+ *
+ * @example
+ * const calendar = await getAvailabilityCalendar('hotel-123', 'room-type-456', 2024, 3);
+ * calendar.forEach(day => {
+ *   console.log(`${day.date}: ${day.available}/${day.total} rooms at $${day.price}`);
+ * });
  */
 export async function getAvailabilityCalendar(
   hotelId: string,

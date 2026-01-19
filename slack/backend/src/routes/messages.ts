@@ -13,7 +13,7 @@ import { rateLimit } from '../middleware/rateLimit.js';
 import { loadMembership, hasPermission } from '../middleware/rbac.js';
 import { publishToUser } from '../services/redis.js';
 import { indexMessage, updateMessageIndex, deleteMessageIndex } from '../services/elasticsearch.js';
-import { getCachedChannelMembers, getCachedUser, _invalidateChannelCache } from '../services/cache.js';
+import { getCachedChannelMembers, getCachedUser } from '../services/cache.js';
 import { logger } from '../services/logger.js';
 import { messagesSentCounter } from '../services/metrics.js';
 import type { Message, Channel } from '../types/index.js';

@@ -1,3 +1,10 @@
+/**
+ * Order status update route module.
+ * @module routes/orders/status
+ * @description Handles order status transitions with validation, authorization,
+ * metrics tracking, audit logging, and real-time notifications.
+ */
+
 import { Router, Request, Response } from 'express';
 import { query } from '../../db.js';
 import { requireAuth } from '../../middleware/auth.js';
@@ -18,7 +25,50 @@ import { matchDriverToOrder } from './driver-matching.js';
 
 const router = Router();
 
-// Update order status
+/**
+ * PATCH /orders/:id/status
+ * @description Updates the status of an order following the defined state machine.
+ *
+ * This endpoint handles the complete status update flow:
+ * 1. Validates the order exists
+ * 2. Validates the transition is allowed per ORDER_TRANSITIONS state machine
+ * 3. Checks authorization based on the actor type required for the transition
+ * 4. Updates the order status and relevant timestamps
+ * 5. Records metrics (transitions, delivery times, ETA accuracy)
+ * 6. Triggers driver matching when order is confirmed
+ * 7. Creates audit log entry
+ * 8. Publishes Kafka event for downstream processing
+ * 9. Calculates updated ETA if driver is assigned
+ * 10. Broadcasts update to all relevant parties via WebSocket
+ *
+ * Authorization rules:
+ * - CANCELLED from PLACED: Customer, restaurant owner, or admin
+ * - CANCELLED from other states: Restaurant owner or admin only
+ * - Restaurant transitions (CONFIRMED, PREPARING, READY_FOR_PICKUP): Restaurant owner or admin
+ * - Driver transitions (PICKED_UP, DELIVERED): Assigned driver or admin
+ *
+ * @requires Authentication - User must be logged in
+ *
+ * @param req.params.id - The order ID to update
+ * @param req.body.status - The new status to transition to
+ * @param req.body.cancelReason - Optional reason for cancellation (when status is CANCELLED)
+ *
+ * @returns 200 - Status updated successfully with order details and ETA
+ * @returns 400 - Invalid status transition
+ * @returns 403 - User not authorized to perform this transition
+ * @returns 404 - Order not found
+ * @returns 500 - Server error
+ *
+ * @example
+ * // Restaurant confirms an order
+ * PATCH /orders/123/status
+ * { "status": "CONFIRMED" }
+ *
+ * @example
+ * // Cancel order with reason
+ * PATCH /orders/123/status
+ * { "status": "CANCELLED", "cancelReason": "Customer requested cancellation" }
+ */
 router.patch('/:id/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
@@ -207,4 +257,8 @@ router.patch('/:id/status', requireAuth, async (req: Request, res: Response): Pr
   }
 });
 
+/**
+ * Express router for order status update endpoints.
+ * @description Exports the router configured with PATCH /:id/status endpoint.
+ */
 export default router;

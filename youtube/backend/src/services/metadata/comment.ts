@@ -9,7 +9,18 @@ import {
   DatabaseError,
 } from './types.js';
 
-// Add comment
+/**
+ * @description Adds a new comment to a video.
+ * Uses a database transaction to insert the comment and update the video's comment count.
+ * Supports both top-level comments and replies to existing comments.
+ * Invalidates the video cache after successful creation.
+ * @param userId - The UUID of the user posting the comment
+ * @param videoId - The UUID of the video being commented on
+ * @param text - The comment text content
+ * @param parentId - The UUID of the parent comment (null for top-level comments)
+ * @returns The created comment response with user info
+ * @throws Error if comment creation fails or user not found
+ */
 export const addComment = async (
   userId: string,
   videoId: string,
@@ -65,7 +76,17 @@ export const addComment = async (
   };
 };
 
-// Get comments for video
+/**
+ * @description Retrieves a paginated list of comments for a video.
+ * Can fetch either top-level comments (parentId = null) or replies to a specific comment.
+ * Results are sorted by like count (descending) and then by creation date (descending).
+ * Includes reply count for each comment.
+ * @param videoId - The UUID of the video to get comments for
+ * @param page - Page number for pagination (1-indexed, defaults to 1)
+ * @param limit - Number of comments per page (defaults to 20)
+ * @param parentId - The UUID of the parent comment to get replies for (null for top-level)
+ * @returns Object containing the comments array and pagination metadata
+ */
 export const getComments = async (
   videoId: string,
   page: number = 1,
@@ -125,7 +146,15 @@ export const getComments = async (
   };
 };
 
-// Delete comment
+/**
+ * @description Deletes a comment from a video.
+ * Only the comment author can delete their own comment.
+ * Uses a database transaction to delete the comment and decrement the video's comment count.
+ * Invalidates the video cache after successful deletion.
+ * @param commentId - The UUID of the comment to delete
+ * @param userId - The UUID of the user attempting deletion (must be comment author)
+ * @returns True if the comment was deleted, false if not found or user not authorized
+ */
 export const deleteComment = async (commentId: string, userId: string): Promise<boolean> => {
   const result = await transaction(async (client: PoolClient) => {
     const comment = await client.query<{ video_id: string }>(
@@ -156,7 +185,16 @@ export const deleteComment = async (commentId: string, userId: string): Promise<
   return result !== null;
 };
 
-// Like comment
+/**
+ * @description Toggles a like on a comment.
+ * If the user hasn't liked the comment, adds a like.
+ * If the user has already liked the comment, removes the like.
+ * Updates the comment's like count accordingly.
+ * @param userId - The UUID of the user liking/unliking the comment
+ * @param commentId - The UUID of the comment to like/unlike
+ * @returns Result indicating whether the comment is now liked (true) or unliked (false)
+ * @throws Re-throws database errors other than unique constraint violations
+ */
 export const likeComment = async (
   userId: string,
   commentId: string

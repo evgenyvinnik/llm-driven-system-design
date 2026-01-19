@@ -8,12 +8,37 @@ import type { Order, OrderContext } from './types.js';
 
 /**
  * Cancels a pending, submitted, or partially filled order.
- * Releases reserved funds (buy) or shares (sell) back to the user.
- * @param userId - ID of the order owner
- * @param orderId - ID of the order to cancel
- * @param context - Optional context for tracing
- * @returns Promise resolving to the cancelled order
- * @throws Error if order not found or cannot be cancelled
+ *
+ * @description Performs a complete order cancellation workflow within a database transaction:
+ * 1. Retrieves the order with a FOR UPDATE lock to prevent concurrent modifications
+ * 2. Validates that the order can be cancelled (must be in pending/submitted/partial status)
+ * 3. Releases reserved resources:
+ *    - For buy orders: Returns reserved funds to user's buying power
+ *    - For sell orders: Unreserves shares in the user's position
+ * 4. Updates the order status to 'cancelled' with cancellation timestamp
+ * 5. Publishes cancellation event to Kafka (if connected)
+ * 6. Logs audit trail and updates Prometheus metrics
+ *
+ * Only the unfilled portion of the order has resources released. For partially
+ * filled orders, the filled portion remains executed.
+ *
+ * @param userId - Unique identifier of the order owner
+ * @param orderId - Unique identifier of the order to cancel
+ * @param context - Optional order context for request tracing
+ * @returns Promise resolving to the cancelled order with updated status
+ * @throws {Error} 'Order not found' - If the order does not exist or belongs to a different user
+ * @throws {Error} 'Cannot cancel order with status: {status}' - If the order is already
+ *   filled, cancelled, or rejected and cannot be cancelled
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   const cancelledOrder = await cancelOrder('user-123', 'order-456');
+ *   console.log(`Order cancelled at ${cancelledOrder.cancelled_at}`);
+ * } catch (error) {
+ *   console.error('Cancellation failed:', error.message);
+ * }
+ * ```
  */
 export async function cancelOrder(
   userId: string,

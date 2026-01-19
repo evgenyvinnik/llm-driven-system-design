@@ -10,8 +10,19 @@ import type {
 import { RIDE_PREFIX } from './types.js';
 
 /**
- * Get ride status.
- * Tries Redis first for active rides, falls back to database for completed rides.
+ * @description Retrieves the current status and details of a ride.
+ * Uses a two-tier lookup strategy: first checks Redis for active rides (faster),
+ * then falls back to PostgreSQL for completed/cancelled rides (comprehensive).
+ * For active rides with an assigned driver, includes real-time driver location.
+ *
+ * @param {string} rideId - Unique identifier of the ride to look up
+ * @returns {Promise<Ride | null>} Ride object with current status, locations, driver info, and fare details; null if ride not found
+ *
+ * @example
+ * const ride = await getRideStatus('ride-123');
+ * if (ride) {
+ *   console.log(`Status: ${ride.status}, Driver: ${ride.driver?.name}`);
+ * }
  */
 export async function getRideStatus(rideId: string): Promise<Ride | null> {
   // Try Redis first for active rides

@@ -2,8 +2,8 @@ import { Router, Request, Response } from 'express';
 import { query } from '../db.js';
 import redisClient from '../redis.js';
 import { requireAuth } from '../middleware/auth.js';
-import { getDriverByUserId, _Driver } from '../services/auth.js';
-import { calculateETA, _ETAResult } from '../utils/geo.js';
+import { getDriverByUserId, Driver } from '../services/auth.js';
+import { calculateETA, ETAResult } from '../utils/geo.js';
 import { broadcast, broadcastToChannels } from '../websocket.js';
 
 // Shared modules

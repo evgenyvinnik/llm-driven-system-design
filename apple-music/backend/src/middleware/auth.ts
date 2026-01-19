@@ -134,7 +134,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
  * Optional authentication middleware.
  * Attaches user if session exists, continues otherwise.
  */
-export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+export async function optionalAuth(req: Request, _res: Response, next: NextFunction): Promise<void> {
   try {
     const token = req.cookies.session_token || req.headers.authorization?.replace('Bearer ', '');
 

@@ -36,7 +36,38 @@ import { formatBooking } from './formatter.js';
 import type { CreateBookingData, BookingTransactionData, Booking, BookingRow, RoomTypeRow } from './types.js';
 
 /**
- * Create a booking with idempotency and distributed locking
+ * @description Creates a new hotel booking with full idempotency and distributed locking support.
+ * This is the main entry point for the booking flow.
+ *
+ * The function implements a multi-layer concurrency control strategy:
+ * 1. **Idempotency Check**: Generates a deterministic key from booking parameters and checks
+ *    if a booking with the same key already exists, preventing duplicate bookings from retries.
+ * 2. **Distributed Lock**: Acquires a Redis-based lock for the specific room type and date range
+ *    to prevent race conditions across multiple API server instances.
+ * 3. **Database Transaction**: Executes the booking within a PostgreSQL transaction with
+ *    pessimistic row-level locking for additional safety.
+ *
+ * @param {CreateBookingData} bookingData - The booking details including hotel, room type, dates, and guest info
+ * @param {string} userId - The ID of the user making the booking
+ * @returns {Promise<Booking>} The created booking object. If this was a duplicate request,
+ *          the booking will have `deduplicated: true` set.
+ * @throws {Error} Throws if the room type is not found, rooms are unavailable, or the transaction fails
+ *
+ * @example
+ * const booking = await createBooking({
+ *   hotelId: 'hotel-123',
+ *   roomTypeId: 'room-type-456',
+ *   checkIn: '2024-03-15',
+ *   checkOut: '2024-03-20',
+ *   guestCount: 2,
+ *   guestFirstName: 'John',
+ *   guestLastName: 'Doe',
+ *   guestEmail: 'john@example.com',
+ * }, 'user-789');
+ *
+ * if (booking.deduplicated) {
+ *   console.log('This was a duplicate request');
+ * }
  */
 export async function createBooking(bookingData: CreateBookingData, userId: string): Promise<Booking> {
   const startTime = Date.now();
@@ -138,8 +169,40 @@ export async function createBooking(bookingData: CreateBookingData, userId: stri
 }
 
 /**
- * Execute the booking transaction with pessimistic locking
- * Called within a distributed lock for additional safety
+ * @description Executes the booking transaction with pessimistic database locking.
+ * This function is called within a distributed lock for additional safety.
+ *
+ * The transaction flow:
+ * 1. Begins a PostgreSQL transaction
+ * 2. Acquires a `FOR UPDATE` lock on the room type row to prevent concurrent modifications
+ * 3. Validates room type exists and is active
+ * 4. Calculates availability by checking overlapping bookings for each day in the range
+ * 5. Computes total price using the room service (includes dynamic pricing)
+ * 6. Creates the booking with 'reserved' status and a reservation expiry time
+ * 7. Commits the transaction and invalidates availability cache
+ *
+ * @param {BookingTransactionData} bookingData - The booking details including the idempotency key
+ * @param {string} userId - The ID of the user making the booking
+ * @returns {Promise<Booking>} The created booking object
+ * @throws {Error} Throws 'Room type not found' if the room type doesn't exist or is inactive
+ * @throws {Error} Throws 'Only X rooms available...' if not enough rooms are available
+ * @throws {Error} Throws 'Failed to create booking' if the INSERT fails
+ * @throws {Error} Re-throws any database errors after rolling back the transaction
+ *
+ * @example
+ * // This function is typically called internally by createBooking()
+ * const booking = await executeBookingTransaction({
+ *   hotelId: 'hotel-123',
+ *   roomTypeId: 'room-type-456',
+ *   checkIn: '2024-03-15',
+ *   checkOut: '2024-03-20',
+ *   roomCount: 1,
+ *   guestCount: 2,
+ *   guestFirstName: 'John',
+ *   guestLastName: 'Doe',
+ *   guestEmail: 'john@example.com',
+ *   idempotencyKey: 'abc123',
+ * }, 'user-789');
  */
 export async function executeBookingTransaction(
   bookingData: BookingTransactionData,

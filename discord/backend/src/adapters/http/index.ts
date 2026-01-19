@@ -1,21 +1,29 @@
 /**
  * HTTP Server Adapter
  *
- * Provides a REST API and SSE (Server-Sent Events) interface for the chat system.
- * This adapter enables browser clients to connect using standard HTTP.
+ * @description Provides a REST API and SSE (Server-Sent Events) interface for the chat system.
+ * This adapter enables browser clients to connect using standard HTTP, implementing the
+ * Adapter pattern to decouple transport concerns from core chat functionality.
  *
- * Endpoints:
- * - GET  /health                 - Comprehensive health check
- * - GET  /metrics                - Prometheus metrics endpoint
- * - GET  /api/health             - Server health check (legacy)
- * - POST /api/connect            - Authenticate with nickname, get session token
- * - POST /api/disconnect         - End session
- * - POST /api/command            - Execute a slash command
- * - POST /api/message            - Send a chat message
- * - GET  /api/rooms              - List available rooms
- * - GET  /api/rooms/:room/history - Get room message history
- * - GET  /api/session/:sessionId - Get session details
- * - GET  /api/messages/:room     - SSE stream for real-time messages
+ * @module adapters/http
+ *
+ * @remarks
+ * The HTTP server provides the following endpoints:
+ *
+ * **Observability (root level):**
+ * - GET  /health                 - Comprehensive health check with DB, Redis, and connection stats
+ * - GET  /metrics                - Prometheus-formatted metrics for scraping
+ *
+ * **API endpoints:**
+ * - GET  /api/health             - Server health check (legacy endpoint)
+ * - POST /api/connect            - Authenticate with nickname, receive session token
+ * - POST /api/disconnect         - End user session
+ * - POST /api/command            - Execute a slash command (e.g., /join #general)
+ * - POST /api/message            - Send a chat message to current room
+ * - GET  /api/rooms              - List available chat rooms
+ * - GET  /api/rooms/:room/history - Get last 10 messages from room history buffer
+ * - GET  /api/session/:sessionId - Get session details for reconnection
+ * - GET  /api/messages/:room     - SSE stream for real-time message updates
  *
  * The SSE endpoint maintains a persistent connection for pushing messages
  * to the client, while commands use regular POST requests.
@@ -33,28 +41,41 @@ import { createCommandRoutes } from './message-routes.js';
 import { createObservabilityRoutes, createApiHealthRoutes } from './observability-routes.js';
 
 /**
- * HTTP/REST server for Baby Discord.
+ * HTTP/REST server for Baby Discord chat application.
  *
- * Implements the Adapter pattern to provide an HTTP interface over
+ * @description Implements the Adapter pattern to provide an HTTP interface over
  * the core chat functionality. Supports both REST endpoints for commands
- * and SSE for real-time message streaming.
+ * and SSE for real-time message streaming to browser clients.
+ *
+ * @class HTTPServer
+ *
+ * @example
+ * // Create and start the HTTP server
+ * const server = new HTTPServer(3000);
+ * await server.start();
+ *
+ * // Gracefully stop with 10-second drain period
+ * await server.stop(10000);
  */
 export class HTTPServer {
-  /** Express application instance */
+  /** @private Express application instance */
   private app: express.Application;
-  /** Port to listen on */
+  /** @private Port number the server listens on */
   private port: number;
-  /** Node.js HTTP server instance */
+  /** @private Node.js HTTP server instance, null when not running */
   private server: ReturnType<typeof express.application.listen> | null = null;
-  /** SSE manager for tracking connections */
+  /** @private SSE manager for tracking client connections and drain state */
   private sseManager: SSEManager;
-  /** SSE handler for SSE operations */
+  /** @private SSE handler for SSE-specific operations */
   private sseHandler: SSEHandler;
 
   /**
-   * Create a new HTTP server.
+   * Creates a new HTTP server instance.
    *
-   * @param port - Port number to listen on (default: 3001)
+   * @description Initializes the Express application, SSE manager, and sets up
+   * all middleware and routes. The server is not started until start() is called.
+   *
+   * @param {number} [port=3001] - Port number to listen on
    */
   constructor(port: number = 3001) {
     this.port = port;
@@ -74,16 +95,27 @@ export class HTTPServer {
   }
 
   /**
-   * Configure Express middleware.
-   * Sets up CORS, JSON parsing, and request logging.
+   * Configures Express middleware stack.
+   *
+   * @description Sets up CORS, JSON parsing, request logging with request IDs,
+   * and connection draining middleware for graceful shutdown handling.
+   *
+   * @private
+   * @returns {void}
    */
   private setupMiddleware(): void {
     applyMiddleware(this.app, this.sseManager);
   }
 
   /**
-   * Set up API routes.
-   * Registers all REST endpoints and the SSE stream.
+   * Sets up all API routes.
+   *
+   * @description Registers all REST endpoints and the SSE stream handler.
+   * Routes are organized into logical groups: observability, authentication,
+   * rooms, commands, and real-time messaging.
+   *
+   * @private
+   * @returns {void}
    */
   private setupRoutes(): void {
     // Root-level observability routes (metrics, health)
@@ -98,31 +130,41 @@ export class HTTPServer {
   }
 
   /**
-   * Send a message to all SSE clients for a specific session.
-   * Called by ConnectionManager when messages need to be delivered.
+   * Sends a message to all SSE clients for a specific session.
    *
-   * @param sessionId - Target session's ID
-   * @param message - Message string to send
+   * @description Delegates to the SSE handler to write a message event to all
+   * SSE connections associated with the given session ID. Called by the
+   * ConnectionManager when messages need to be delivered to HTTP clients.
+   *
+   * @param {string} sessionId - Target session's unique identifier
+   * @param {string} message - Message string to send as SSE data
+   * @returns {void}
    */
   sendSSEMessage(sessionId: string, message: string): void {
     this.sseHandler.sendSSEMessage(sessionId, message);
   }
 
   /**
-   * Broadcast a message to all SSE clients in a specific room.
-   * Used for room-wide announcements and messages.
+   * Broadcasts a chat message to all SSE clients in a specific room.
    *
-   * @param roomName - Target room name
-   * @param message - Chat message to broadcast
+   * @description Sends the message to all clients subscribed to the given room
+   * via their SSE connections. Used for room-wide announcements and chat messages.
+   *
+   * @param {string} roomName - Name of the target room
+   * @param {ChatMessage} message - Chat message object to broadcast
+   * @returns {void}
    */
   broadcastToRoom(roomName: string, message: ChatMessage): void {
     this.sseHandler.broadcastToRoom(roomName, message);
   }
 
   /**
-   * Start the HTTP server and begin accepting connections.
+   * Starts the HTTP server and begins accepting connections.
    *
-   * @returns Promise that resolves when server is listening
+   * @description Binds to the configured port and starts listening for incoming
+   * HTTP requests. The returned promise resolves when the server is ready.
+   *
+   * @returns {Promise<void>} Resolves when the server is listening
    */
   start(): Promise<void> {
     return new Promise((resolve) => {
@@ -134,16 +176,20 @@ export class HTTPServer {
   }
 
   /**
-   * Stop the HTTP server and close all SSE connections gracefully.
+   * Stops the HTTP server and closes all SSE connections gracefully.
    *
-   * WHY Graceful Shutdown Prevents Message Loss:
-   * - Allows in-flight requests to complete
-   * - Sends shutdown notifications to connected SSE clients
-   * - Ensures database writes are flushed
-   * - Prevents abrupt connection termination that could lose messages
+   * @description Implements graceful shutdown to prevent message loss:
+   * 1. Sets draining mode to reject new non-health requests with 503
+   * 2. Notifies SSE clients of impending shutdown
+   * 3. Waits for grace period to allow in-flight requests to complete
+   * 4. Forcibly closes remaining connections
+   * 5. Shuts down the HTTP server
    *
-   * @param gracePeriodMs - Time to wait for connections to close
-   * @returns Promise that resolves when server is fully stopped
+   * This ensures database writes are flushed and clients can reconnect to
+   * another server instance without losing messages.
+   *
+   * @param {number} [gracePeriodMs=10000] - Time in milliseconds to wait for connections to close gracefully
+   * @returns {Promise<void>} Resolves when the server is fully stopped
    */
   async stop(gracePeriodMs: number = 10000): Promise<void> {
     this.sseManager.isDraining = true;
@@ -166,19 +212,24 @@ export class HTTPServer {
   }
 
   /**
-   * Get the Express application instance.
-   * Used for testing.
+   * Gets the Express application instance.
    *
-   * @returns Express application
+   * @description Provides access to the underlying Express app for testing
+   * purposes, allowing direct request simulation with supertest or similar.
+   *
+   * @returns {express.Application} The Express application instance
    */
   getApp(): express.Application {
     return this.app;
   }
 
   /**
-   * Get the number of active SSE connections.
+   * Gets the count of active SSE connections.
    *
-   * @returns Number of SSE client connections
+   * @description Returns the current number of SSE client connections tracked
+   * by the server. Useful for monitoring and debugging.
+   *
+   * @returns {number} Number of active SSE client connections
    */
   getSSEClientCount(): number {
     return this.sseManager.clients.size;

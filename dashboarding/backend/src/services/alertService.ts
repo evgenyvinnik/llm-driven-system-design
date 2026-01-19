@@ -12,7 +12,7 @@ import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { queryMetrics } from './queryService.js';
 import logger from '../shared/logger.js';
-import { _alertsFiring, alertEvaluationsTotal } from '../shared/metrics.js';
+import { alertsFiring, alertEvaluationsTotal } from '../shared/metrics.js';
 import type {
   AlertRule,
   AlertInstance,

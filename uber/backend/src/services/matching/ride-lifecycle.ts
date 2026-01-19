@@ -16,30 +16,54 @@ import { RIDE_PREFIX, PENDING_REQUESTS_KEY } from './types.js';
 
 const logger = createLogger('ride-lifecycle');
 
-// Forward declaration for circular dependency resolution
+/**
+ * @description Function signature for sending a message to a user via WebSocket.
+ * Used for dependency injection to avoid circular dependencies.
+ */
 type SendToUserFn = (userId: string, message: WSMessage) => boolean;
+
+/**
+ * @description Map storing matching start timestamps for latency tracking.
+ * Key: rideId, Value: timestamp in milliseconds when matching started.
+ */
 type MatchingTimers = Map<string, number>;
 
 let sendToUserFn: SendToUserFn;
 let matchingTimers: MatchingTimers;
 
 /**
- * Set the sendToUser function (to avoid circular dependencies)
+ * @description Sets the function used to send WebSocket messages to users.
+ * This setter pattern is used to break circular dependencies between matching modules.
+ *
+ * @param {SendToUserFn} fn - Function that sends a WebSocket message to a specific user
+ * @returns {void}
  */
 export function setSendToUser(fn: SendToUserFn): void {
   sendToUserFn = fn;
 }
 
 /**
- * Set the matching timers map (to avoid circular dependencies)
+ * @description Sets the matching timers map for tracking matching latency.
+ * This setter pattern is used to share state between matching modules.
+ *
+ * @param {MatchingTimers} timers - Map containing ride IDs to matching start timestamps
+ * @returns {void}
  */
 export function setMatchingTimers(timers: MatchingTimers): void {
   matchingTimers = timers;
 }
 
 /**
- * Driver arrives at pickup.
- * Updates ride status and notifies rider.
+ * @description Marks a ride as having the driver arrived at the pickup location.
+ * Updates ride status in both PostgreSQL and Redis, updates metrics,
+ * and sends a real-time notification to the rider.
+ *
+ * @param {string} rideId - Unique identifier of the ride
+ * @param {string} driverId - ID of the driver who arrived
+ * @returns {Promise<{success: boolean}>} Object indicating operation success
+ *
+ * @example
+ * const result = await driverArrived('ride-123', 'driver-456');
  */
 export async function driverArrived(rideId: string, driverId: string): Promise<{ success: boolean }> {
   await query(`UPDATE rides SET status = 'driver_arrived', driver_arrived_at = NOW() WHERE id = $1`, [rideId]);
@@ -66,8 +90,17 @@ export async function driverArrived(rideId: string, driverId: string): Promise<{
 }
 
 /**
- * Start the ride (pickup completed).
- * Updates ride status and notifies rider.
+ * @description Starts the ride after the rider has been picked up.
+ * Transitions the ride from 'driver_arrived' to 'picked_up' status.
+ * Updates status in both PostgreSQL and Redis, updates metrics,
+ * and notifies the rider that the ride has begun.
+ *
+ * @param {string} rideId - Unique identifier of the ride
+ * @param {string} driverId - ID of the driver starting the ride
+ * @returns {Promise<{success: boolean}>} Object indicating operation success
+ *
+ * @example
+ * const result = await startRide('ride-123', 'driver-456');
  */
 export async function startRide(rideId: string, driverId: string): Promise<{ success: boolean }> {
   await query(`UPDATE rides SET status = 'picked_up', picked_up_at = NOW() WHERE id = $1`, [rideId]);
@@ -94,8 +127,22 @@ export async function startRide(rideId: string, driverId: string): Promise<{ suc
 }
 
 /**
- * Complete the ride.
- * Calculates final fare, updates driver stats, and notifies rider.
+ * @description Completes a ride after reaching the dropoff location.
+ * Calculates the final fare based on actual distance and duration,
+ * updates driver statistics and earnings, cleans up Redis state,
+ * marks driver as available again, updates metrics, and notifies the rider.
+ * Also publishes a completion event to the ride events exchange.
+ *
+ * @param {string} rideId - Unique identifier of the ride to complete
+ * @param {string} driverId - ID of the driver completing the ride
+ * @param {number | null} [finalDistanceMeters=null] - Actual distance traveled in meters (uses estimated if null)
+ * @returns {Promise<CompleteRideResult>} Result with success status and final fare details, or error message
+ *
+ * @example
+ * const result = await completeRide('ride-123', 'driver-456', 5200);
+ * if (result.success) {
+ *   console.log(`Final fare: ${result.fare.totalFareCents} cents`);
+ * }
  */
 export async function completeRide(
   rideId: string,
@@ -187,8 +234,21 @@ export async function completeRide(
 }
 
 /**
- * Cancel the ride.
- * Cleans up resources and notifies both rider and driver.
+ * @description Cancels a ride at any stage before completion.
+ * Cleans up Redis state, adjusts demand metrics if ride was still pending,
+ * tracks failed matching metrics, makes the driver available if one was assigned,
+ * notifies both rider and driver, and publishes a cancellation event.
+ *
+ * @param {string} rideId - Unique identifier of the ride to cancel
+ * @param {string} cancelledBy - User ID of who cancelled (rider, driver, or 'system')
+ * @param {string | null} [reason=null] - Optional cancellation reason
+ * @returns {Promise<CancelRideResult>} Result with success status or error message
+ *
+ * @example
+ * const result = await cancelRide('ride-123', 'rider-456', 'Changed my mind');
+ * if (result.success) {
+ *   console.log('Ride cancelled successfully');
+ * }
  */
 export async function cancelRide(
   rideId: string,
@@ -277,8 +337,17 @@ export async function cancelRide(
 }
 
 /**
- * Handle no drivers found.
- * Cancels the ride and notifies the rider.
+ * @description Handles the scenario when no drivers are available for a ride request.
+ * Called after all matching attempts have been exhausted without finding a driver.
+ * Cancels the ride with 'system' as the canceller and 'No drivers available' reason,
+ * cleans up Redis state, adjusts demand and matching metrics, and notifies the rider.
+ *
+ * @param {string} rideId - Unique identifier of the ride that couldn't be matched
+ * @returns {Promise<void>} Resolves when cleanup and notification are complete
+ *
+ * @example
+ * await handleNoDriversFound('ride-123');
+ * // Rider receives 'no_drivers_available' WebSocket message
  */
 export async function handleNoDriversFound(rideId: string): Promise<void> {
   await query(

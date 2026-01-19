@@ -10,7 +10,15 @@ import {
   formatChannelResponse,
 } from './types.js';
 
-// Subscribe to channel
+/**
+ * @description Subscribes a user to a channel.
+ * Prevents self-subscription. Handles duplicate subscription attempts gracefully.
+ * Invalidates the channel cache to update subscriber count.
+ * @param subscriberId - The UUID of the user subscribing
+ * @param channelId - The UUID of the channel to subscribe to
+ * @returns Result indicating success and whether already subscribed
+ * @throws Error if attempting to subscribe to own channel
+ */
 export const subscribe = async (
   subscriberId: string,
   channelId: string
@@ -39,7 +47,13 @@ export const subscribe = async (
   }
 };
 
-// Unsubscribe from channel
+/**
+ * @description Unsubscribes a user from a channel.
+ * Invalidates the channel cache to update subscriber count.
+ * @param subscriberId - The UUID of the user unsubscribing
+ * @param channelId - The UUID of the channel to unsubscribe from
+ * @returns Result indicating whether the unsubscription occurred (false if wasn't subscribed)
+ */
 export const unsubscribe = async (
   subscriberId: string,
   channelId: string
@@ -55,7 +69,12 @@ export const unsubscribe = async (
   return { unsubscribed: result.rows.length > 0 };
 };
 
-// Check subscription status
+/**
+ * @description Checks if a user is subscribed to a specific channel.
+ * @param subscriberId - The UUID of the user to check
+ * @param channelId - The UUID of the channel to check subscription for
+ * @returns True if the user is subscribed, false otherwise
+ */
 export const isSubscribed = async (subscriberId: string, channelId: string): Promise<boolean> => {
   const result = await query(
     'SELECT 1 FROM subscriptions WHERE subscriber_id = $1 AND channel_id = $2',
@@ -65,7 +84,14 @@ export const isSubscribed = async (subscriberId: string, channelId: string): Pro
   return result.rows.length > 0;
 };
 
-// Get user's subscriptions
+/**
+ * @description Retrieves a paginated list of channels a user is subscribed to.
+ * Results are sorted by subscription date (most recent first).
+ * @param userId - The UUID of the user whose subscriptions to retrieve
+ * @param page - Page number for pagination (1-indexed, defaults to 1)
+ * @param limit - Number of subscriptions per page (defaults to 20)
+ * @returns Object containing the subscriptions array and pagination metadata
+ */
 export const getSubscriptions = async (
   userId: string,
   page: number = 1,

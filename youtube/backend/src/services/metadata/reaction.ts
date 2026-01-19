@@ -4,7 +4,22 @@ import { cacheDelete, updateTrendingScore } from '../../utils/redis.js';
 import { ReactionResult, calculateTrendingScore } from './types.js';
 import { getVideo } from './video.js';
 
-// Like/dislike video
+/**
+ * @description Adds, changes, or removes a reaction (like/dislike) on a video.
+ * Uses a database transaction to ensure consistency between the reaction record
+ * and the video's like/dislike counts. Also updates the video's trending score.
+ *
+ * Behavior:
+ * - If no existing reaction: adds the new reaction
+ * - If same reaction exists: removes the reaction (toggle off)
+ * - If different reaction exists: changes from one reaction to the other
+ *
+ * @param userId - The UUID of the user reacting
+ * @param videoId - The UUID of the video being reacted to
+ * @param reactionType - The type of reaction: 'like' or 'dislike'
+ * @returns Result containing the current reaction state
+ * @throws Error if reactionType is not 'like' or 'dislike'
+ */
 export const reactToVideo = async (
   userId: string,
   videoId: string,
@@ -78,7 +93,12 @@ export const reactToVideo = async (
   return { reaction: reactionType };
 };
 
-// Get user's reaction to video
+/**
+ * @description Retrieves the current user's reaction to a specific video.
+ * @param userId - The UUID of the user to check
+ * @param videoId - The UUID of the video to check reaction for
+ * @returns The reaction type ('like' or 'dislike'), or null if no reaction exists
+ */
 export const getUserReaction = async (
   userId: string,
   videoId: string

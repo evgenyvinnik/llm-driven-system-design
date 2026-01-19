@@ -42,13 +42,24 @@ import { getRideStatus } from './ride-status.js';
 const logger = createLogger('matching-service');
 
 /**
- * MatchingService class that orchestrates all matching-related operations.
- * Maintains the same public API as the original monolithic implementation.
+ * @description Main orchestrator service for ride matching operations.
+ * Coordinates WebSocket connections, ride requests, driver matching, and ride lifecycle management.
+ * Uses a modular architecture with separate modules for scoring, allocation, and lifecycle management.
+ * Implements dependency injection to break circular dependencies between modules.
+ *
+ * The service maintains two internal maps:
+ * - wsClients: Maps user IDs to their WebSocket connections for real-time updates
+ * - matchingTimers: Tracks matching start times for latency metrics
  */
 class MatchingService {
   private wsClients: Map<string, WebSocket> = new Map();
   private matchingTimers: Map<string, number> = new Map();
 
+  /**
+   * @description Initializes the MatchingService and wires up dependencies between modules.
+   * Sets up function references for modules that need to call each other without creating
+   * circular import dependencies.
+   */
   constructor() {
     // Wire up dependencies between modules
     setOfferRideToDriver(this.offerRideToDriver.bind(this));
@@ -59,19 +70,33 @@ class MatchingService {
     setLifecycleTimers(this.matchingTimers);
   }
 
-  // Register WebSocket connection for real-time updates
+  /**
+   * @description Registers a WebSocket connection for a user to receive real-time updates.
+   * @param {string} userId - Unique identifier of the user (rider or driver)
+   * @param {WebSocket} ws - WebSocket connection instance
+   * @returns {void}
+   */
   registerClient(userId: string, ws: WebSocket): void {
     this.wsClients.set(userId, ws);
     logger.debug({ userId }, 'WebSocket client registered');
   }
 
-  // Unregister WebSocket connection
+  /**
+   * @description Removes a user's WebSocket connection when they disconnect.
+   * @param {string} userId - Unique identifier of the user to unregister
+   * @returns {void}
+   */
   unregisterClient(userId: string): void {
     this.wsClients.delete(userId);
     logger.debug({ userId }, 'WebSocket client unregistered');
   }
 
-  // Send message to a user
+  /**
+   * @description Sends a message to a specific user via their WebSocket connection.
+   * @param {string} userId - Unique identifier of the user to send to
+   * @param {WSMessage} message - Message object to send (will be JSON stringified)
+   * @returns {boolean} True if message was sent successfully, false if user not connected or WebSocket not open
+   */
   sendToUser(userId: string, message: WSMessage): boolean {
     const ws = this.wsClients.get(userId);
     if (ws && ws.readyState === 1) {
@@ -82,7 +107,12 @@ class MatchingService {
     return false;
   }
 
-  // Initialize queue consumers for async matching
+  /**
+   * @description Initializes RabbitMQ queue consumers for asynchronous matching.
+   * Sets up consumption of the matching requests queue with retry logic.
+   * Should be called once during service startup.
+   * @returns {Promise<void>} Resolves when consumers are initialized
+   */
   async initializeQueues(): Promise<void> {
     try {
       // Start consuming matching requests
@@ -101,7 +131,26 @@ class MatchingService {
     }
   }
 
-  // Request a ride - now publishes to queue for async processing
+  /**
+   * @description Creates a new ride request and initiates the matching process.
+   * Calculates fare estimate with surge pricing, persists ride to PostgreSQL and Redis,
+   * publishes matching request to queue for async processing, and emits ride event.
+   *
+   * @param {string} riderId - ID of the rider requesting the ride
+   * @param {number} pickupLat - Latitude of pickup location
+   * @param {number} pickupLng - Longitude of pickup location
+   * @param {number} dropoffLat - Latitude of dropoff location
+   * @param {number} dropoffLng - Longitude of dropoff location
+   * @param {VehicleType} [vehicleType='economy'] - Type of vehicle requested
+   * @param {string | null} [pickupAddress=null] - Human-readable pickup address
+   * @param {string | null} [dropoffAddress=null] - Human-readable dropoff address
+   * @returns {Promise<RideRequestResult>} Result containing ride ID, status, fare estimate, and locations
+   *
+   * @example
+   * const result = await matchingService.requestRide(
+   *   'rider-123', 37.7749, -122.4194, 37.7849, -122.4094, 'economy'
+   * );
+   */
   async requestRide(
     riderId: string,
     pickupLat: number,
@@ -231,12 +280,26 @@ class MatchingService {
     };
   }
 
-  // Process matching request from queue - delegates to driver-finder module
+  /**
+   * @description Processes a matching request from the RabbitMQ queue.
+   * Delegates to the driver-finder module.
+   * @param {MatchingRequest} message - The matching request message
+   * @returns {Promise<void>}
+   */
   async processMatchingRequest(message: MatchingRequest): Promise<void> {
     return processMatchingRequest(message);
   }
 
-  // Find a driver for the ride - delegates to driver-finder module
+  /**
+   * @description Finds a driver for a ride request.
+   * Delegates to the driver-finder module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {number} pickupLat - Pickup latitude
+   * @param {number} pickupLng - Pickup longitude
+   * @param {VehicleType} vehicleType - Type of vehicle requested
+   * @param {number} [attempt=1] - Current matching attempt number
+   * @returns {Promise<void>}
+   */
   async findDriver(
     rideId: string,
     pickupLat: number,
@@ -247,10 +310,21 @@ class MatchingService {
     return findDriver(rideId, pickupLat, pickupLng, vehicleType, attempt);
   }
 
-  // Score drivers for ranking - delegates to scoring module
+  /**
+   * @description Reference to the driver scoring function.
+   * Scores and ranks drivers based on ETA and rating.
+   */
   scoreDrivers = scoreDrivers;
 
-  // Offer ride to a driver - delegates to allocation module
+  /**
+   * @description Sends a ride offer to a driver via WebSocket.
+   * Delegates to the allocation module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} driverId - ID of the driver to receive the offer
+   * @param {number} pickupLat - Pickup latitude
+   * @param {number} pickupLng - Pickup longitude
+   * @returns {Promise<boolean>} True if offer was sent successfully
+   */
   async offerRideToDriver(
     rideId: string,
     driverId: string,
@@ -260,22 +334,47 @@ class MatchingService {
     return offerRideToDriver(rideId, driverId, pickupLat, pickupLng);
   }
 
-  // Driver accepts the ride - delegates to allocation module
+  /**
+   * @description Processes a driver's acceptance of a ride offer.
+   * Delegates to the allocation module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} driverId - ID of the driver accepting the ride
+   * @returns {Promise<AcceptRideResult>} Result with success status and ride details
+   */
   async acceptRide(rideId: string, driverId: string): Promise<AcceptRideResult> {
     return acceptRide(rideId, driverId);
   }
 
-  // Driver arrives at pickup - delegates to ride-lifecycle module
+  /**
+   * @description Marks a ride as having the driver arrived at pickup.
+   * Delegates to the ride-lifecycle module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} driverId - ID of the driver
+   * @returns {Promise<{success: boolean}>} Object indicating success
+   */
   async driverArrived(rideId: string, driverId: string): Promise<{ success: boolean }> {
     return driverArrived(rideId, driverId);
   }
 
-  // Start the ride (pickup completed) - delegates to ride-lifecycle module
+  /**
+   * @description Starts the ride after rider pickup.
+   * Delegates to the ride-lifecycle module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} driverId - ID of the driver
+   * @returns {Promise<{success: boolean}>} Object indicating success
+   */
   async startRide(rideId: string, driverId: string): Promise<{ success: boolean }> {
     return startRide(rideId, driverId);
   }
 
-  // Complete the ride - delegates to ride-lifecycle module
+  /**
+   * @description Completes a ride and calculates final fare.
+   * Delegates to the ride-lifecycle module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} driverId - ID of the driver
+   * @param {number | null} [finalDistanceMeters=null] - Actual distance traveled
+   * @returns {Promise<CompleteRideResult>} Result with success status and fare details
+   */
   async completeRide(
     rideId: string,
     driverId: string,
@@ -284,7 +383,14 @@ class MatchingService {
     return completeRide(rideId, driverId, finalDistanceMeters);
   }
 
-  // Cancel the ride - delegates to ride-lifecycle module
+  /**
+   * @description Cancels a ride at any stage.
+   * Delegates to the ride-lifecycle module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @param {string} cancelledBy - User ID of who cancelled
+   * @param {string | null} [reason=null] - Cancellation reason
+   * @returns {Promise<CancelRideResult>} Result with success status
+   */
   async cancelRide(
     rideId: string,
     cancelledBy: string,
@@ -293,12 +399,22 @@ class MatchingService {
     return cancelRide(rideId, cancelledBy, reason);
   }
 
-  // Handle no drivers found - delegates to ride-lifecycle module
+  /**
+   * @description Handles the case when no drivers are found for a ride.
+   * Delegates to the ride-lifecycle module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @returns {Promise<void>}
+   */
   async handleNoDriversFound(rideId: string): Promise<void> {
     return handleNoDriversFound(rideId);
   }
 
-  // Get ride status - delegates to ride-lifecycle module
+  /**
+   * @description Retrieves the current status of a ride.
+   * Delegates to the ride-status module.
+   * @param {string} rideId - Unique identifier of the ride
+   * @returns {Promise<Ride | null>} Ride object with current status, or null if not found
+   */
   async getRideStatus(rideId: string): Promise<Ride | null> {
     return getRideStatus(rideId);
   }

@@ -1,6 +1,6 @@
 import express, { Request, Response, Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
-import { deviceSyncService, _SyncResult } from '../services/deviceSyncService.js';
+import { deviceSyncService, SyncResult } from '../services/deviceSyncService.js';
 import { HealthSampleData } from '../models/healthSample.js';
 import { logger } from '../shared/logger.js';
 import { checkIdempotency, storeIdempotencyKey, generateIdempotencyKey } from '../shared/idempotency.js';

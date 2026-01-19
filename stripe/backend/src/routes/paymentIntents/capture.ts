@@ -1,5 +1,7 @@
 /**
  * Capture payment intent handler
+ * @module paymentIntents/capture
+ *
  * POST /v1/payment_intents/:id/capture
  */
 
@@ -17,6 +19,24 @@ import type { PoolClient } from 'pg';
 import type { PaymentIntentRow, CapturePaymentIntentBody, CardNetworkError } from './types.js';
 import { formatPaymentIntent } from './utils.js';
 
+/**
+ * @description Captures a previously authorized payment intent.
+ * Only payment intents in 'requires_capture' status (manual capture mode) can be captured.
+ * This completes the payment and creates a charge with ledger entries.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {string} req.params.id - The payment intent ID to capture
+ * @param {CapturePaymentIntentBody} req.body - Capture parameters
+ * @param {number} [req.body.amount_to_capture] - Amount to capture in cents (default: full authorized amount)
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with the captured payment intent or an error
+ *
+ * @throws {400} Payment intent is not in 'requires_capture' status, or capture amount exceeds authorized amount
+ * @throws {402} Card network capture failed
+ * @throws {404} Payment intent not found
+ * @throws {500} Database or internal server error
+ * @throws {503} Payment processor temporarily unavailable
+ */
 export async function capturePaymentIntent(
   req: AuthenticatedRequest,
   res: Response

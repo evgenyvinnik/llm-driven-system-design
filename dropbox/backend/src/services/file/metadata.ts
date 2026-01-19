@@ -235,6 +235,19 @@ export async function renameItem(userId: string, itemId: string, newName: string
 /**
  * Moves a file or folder to a different parent folder.
  * Validates that the move is allowed (prevents moving folder into itself).
+ *
+ * @description Relocates an item to a new parent folder. Performs validation
+ * to prevent circular references (moving a folder into its own subtree) and
+ * checks for duplicate names in the destination. Updates sync events and caches.
+ *
+ * @param {string} userId - The ID of the user performing the move
+ * @param {string} itemId - The ID of the file or folder to move
+ * @param {string | null} newParentId - The ID of the destination folder, or null for root
+ * @returns {Promise<FileItem>} The moved item metadata with updated parentId
+ * @throws {Error} If item is not found
+ * @throws {Error} If destination folder is not found
+ * @throws {Error} If attempting to move a folder into itself or its children
+ * @throws {Error} If a file or folder with the same name exists in destination
  */
 export async function moveItem(
   userId: string,
@@ -318,6 +331,15 @@ export async function moveItem(
  * Soft-deletes a file or folder and all its children.
  * Items are marked with deleted_at timestamp rather than removed.
  * Updates user's storage usage for deleted files.
+ *
+ * @description Performs a soft delete by setting the deleted_at timestamp
+ * on the item and all its descendants (for folders). Storage quota is
+ * adjusted for deleted files. Items can potentially be restored later.
+ *
+ * @param {string} userId - The ID of the user performing the deletion
+ * @param {string} itemId - The ID of the file or folder to delete
+ * @returns {Promise<void>} Resolves when deletion is complete
+ * @throws {Error} If item is not found
  */
 export async function deleteItem(userId: string, itemId: string): Promise<void> {
   const item = await getFile(userId, itemId);

@@ -1,5 +1,7 @@
 /**
  * Confirm payment intent handler
+ * @module paymentIntents/confirm
+ *
  * POST /v1/payment_intents/:id/confirm
  */
 
@@ -26,6 +28,24 @@ import {
   handleManualCapture,
 } from './confirmHelpers.js';
 
+/**
+ * @description Confirms a payment intent and initiates the payment process.
+ * Performs fraud risk assessment, authorizes the payment with the card network,
+ * and either captures immediately (automatic) or awaits manual capture.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {string} req.params.id - The payment intent ID to confirm
+ * @param {ConfirmPaymentIntentBody} req.body - Confirmation parameters
+ * @param {string} [req.body.payment_method] - Payment method ID to use (optional if already attached)
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with the confirmed payment intent or an error
+ *
+ * @throws {400} Payment intent is not confirmable, or payment method is missing/invalid
+ * @throws {402} Payment declined due to fraud or card network rejection
+ * @throws {404} Payment intent not found
+ * @throws {500} Database or internal server error
+ * @throws {503} Payment processor temporarily unavailable
+ */
 export async function confirmPaymentIntent(
   req: AuthenticatedRequest,
   res: Response

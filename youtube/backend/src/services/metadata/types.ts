@@ -370,6 +370,13 @@ export const formatChannelResponse = (row: ChannelRow): ChannelResponse => ({
   createdAt: row.created_at,
 });
 
+/**
+ * @description Calculates a trending score for a video based on engagement and recency.
+ * Uses an exponential decay function to prioritize recent content while
+ * weighting different engagement metrics (views, likes, comments).
+ * @param video - The video response object to calculate the score for
+ * @returns A numeric trending score (higher means more trending)
+ */
 export const calculateTrendingScore = (video: VideoResponse): number => {
   const ageHours = (Date.now() - new Date(video.publishedAt).getTime()) / (1000 * 60 * 60);
   const decayFactor = Math.exp(-ageHours / 48); // Decay over 48 hours

@@ -8,7 +8,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import pool, { testConnection } from './db/postgres.js';
 import redis from './db/redis.js';
-import { setupWebSocket, _getFileUserCount, getTotalConnections } from './websocket/handler.js';
+import { setupWebSocket, getFileUserCount, getTotalConnections } from './websocket/handler.js';
 import filesRouter from './routes/files.js';
 import {
   logger,

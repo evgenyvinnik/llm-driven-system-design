@@ -312,7 +312,7 @@ export class PushService {
   private async deliverNotification(
     notification: PendingNotification
   ): Promise<{ delivered: boolean; queued: boolean }> {
-    const { id, device_id, payload, priority, expiration, _collapse_id } =
+    const { id, device_id, payload, priority, expiration, collapse_id } =
       notification;
 
     // Check expiration

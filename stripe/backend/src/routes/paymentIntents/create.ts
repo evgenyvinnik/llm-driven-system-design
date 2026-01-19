@@ -1,5 +1,7 @@
 /**
  * Create payment intent handler
+ * @module paymentIntents/create
+ *
  * POST /v1/payment_intents
  */
 
@@ -13,6 +15,26 @@ import { paymentAmountCents, activePaymentIntents } from '../../shared/metrics.j
 import type { PaymentIntentRow, CreatePaymentIntentBody, DatabaseError } from './types.js';
 import { formatPaymentIntent, VALID_CURRENCIES } from './utils.js';
 
+/**
+ * @description Creates a new payment intent for processing a payment.
+ * The payment intent tracks the lifecycle of a payment from creation through confirmation and capture.
+ *
+ * @param {AuthenticatedRequest} req - Express request with authenticated merchant context
+ * @param {CreatePaymentIntentBody} req.body - Payment intent creation parameters
+ * @param {number} req.body.amount - Required. Payment amount in cents
+ * @param {string} [req.body.currency='usd'] - Three-letter ISO currency code
+ * @param {string} [req.body.customer] - Customer ID to associate with this payment
+ * @param {string} [req.body.payment_method] - Payment method ID to attach
+ * @param {string} [req.body.capture_method='automatic'] - 'automatic' or 'manual'
+ * @param {string} [req.body.description] - Description for the payment
+ * @param {Record<string, unknown>} [req.body.metadata={}] - Key-value metadata
+ * @param {Response} res - Express response object
+ * @returns {Promise<void>} Responds with the created payment intent or an error
+ *
+ * @throws {400} Invalid amount or unsupported currency
+ * @throws {409} Idempotency key conflict
+ * @throws {500} Database or internal server error
+ */
 export async function createPaymentIntent(
   req: AuthenticatedRequest,
   res: Response

@@ -1,6 +1,6 @@
 import { db } from '../config/database.js';
 import { cache } from '../config/redis.js';
-import { HealthDataTypes, DevicePriority, getAggregationType, AggregationType, _HealthDataTypeKey } from '../models/healthTypes.js';
+import { HealthDataTypes, DevicePriority, getAggregationType, AggregationType, HealthDataTypeKey } from '../models/healthTypes.js';
 
 interface DateRange {
   start: Date;
