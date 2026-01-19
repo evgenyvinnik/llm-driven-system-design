@@ -1,4 +1,13 @@
 /**
+ * Suggestion stored in trie nodes
+ */
+export interface Suggestion {
+  phrase: string;
+  count: number;
+  lastUpdated: number;
+}
+
+/**
  * TrieNode represents a single node in the Trie.
  * Each node stores:
  * - children: Map of character to child TrieNode
@@ -7,13 +16,30 @@
  * - count: frequency count if this is an end node
  */
 class TrieNode {
-  constructor() {
-    this.children = new Map(); // Character -> TrieNode
-    this.isEndOfWord = false;
-    this.suggestions = []; // Top-k suggestions at this prefix: { phrase, count, lastUpdated }
-    this.count = 0;
-    this.lastUpdated = Date.now();
-  }
+  children: Map<string, TrieNode> = new Map();
+  isEndOfWord: boolean = false;
+  suggestions: Suggestion[] = [];
+  count: number = 0;
+  lastUpdated: number = Date.now();
+}
+
+/**
+ * Trie statistics
+ */
+export interface TrieStats {
+  phraseCount: number;
+  nodeCount: number;
+  maxDepth: number;
+  topK: number;
+}
+
+/**
+ * Serialized trie data
+ */
+interface SerializedTrie {
+  topK: number;
+  size: number;
+  phrases: Array<{ phrase: string; count: number }>;
 }
 
 /**
@@ -21,18 +47,23 @@ class TrieNode {
  * This design trades memory for query speed - O(prefix_length) lookups.
  */
 export class Trie {
-  constructor(topK = 10) {
+  root: TrieNode;
+  topK: number;
+  size: number;
+  phraseMap: Map<string, number>;
+
+  constructor(topK: number = 10) {
     this.root = new TrieNode();
     this.topK = topK;
     this.size = 0;
-    this.phraseMap = new Map(); // Quick lookup for phrase existence
+    this.phraseMap = new Map();
   }
 
   /**
    * Insert or update a phrase in the trie with its count.
    * Updates top-k suggestions at each prefix node.
    */
-  insert(phrase, count) {
+  insert(phrase: string, count: number): void {
     if (!phrase || phrase.length === 0) return;
 
     const normalizedPhrase = phrase.toLowerCase().trim();
@@ -49,7 +80,7 @@ export class Trie {
       if (!node.children.has(char)) {
         node.children.set(char, new TrieNode());
       }
-      node = node.children.get(char);
+      node = node.children.get(char)!;
 
       // Update top-k suggestions at each prefix node
       this._updateSuggestions(node, normalizedPhrase, count);
@@ -64,9 +95,9 @@ export class Trie {
    * Update the top-k suggestions at a node.
    * Maintains sorted order by count (descending).
    */
-  _updateSuggestions(node, phrase, count) {
+  private _updateSuggestions(node: TrieNode, phrase: string, count: number): void {
     // Find existing suggestion for this phrase
-    const existingIndex = node.suggestions.findIndex(s => s.phrase === phrase);
+    const existingIndex = node.suggestions.findIndex((s) => s.phrase === phrase);
 
     if (existingIndex !== -1) {
       // Update existing
@@ -94,14 +125,14 @@ export class Trie {
    * Get suggestions for a prefix.
    * Returns pre-computed top-k suggestions.
    */
-  getSuggestions(prefix) {
+  getSuggestions(prefix: string): Suggestion[] {
     if (!prefix || prefix.length === 0) {
       // Return top suggestions from root
       return this.root.suggestions.slice();
     }
 
     const normalizedPrefix = prefix.toLowerCase().trim();
-    let node = this.root;
+    let node: TrieNode | undefined = this.root;
 
     for (const char of normalizedPrefix) {
       if (!node.children.has(char)) {
@@ -110,13 +141,13 @@ export class Trie {
       node = node.children.get(char);
     }
 
-    return node.suggestions.slice();
+    return node ? node.suggestions.slice() : [];
   }
 
   /**
    * Increment the count for an existing phrase or insert with count 1.
    */
-  incrementCount(phrase, delta = 1) {
+  incrementCount(phrase: string, delta: number = 1): void {
     const normalizedPhrase = phrase.toLowerCase().trim();
     const currentCount = this.phraseMap.get(normalizedPhrase) || 0;
     this.insert(normalizedPhrase, currentCount + delta);
@@ -125,14 +156,14 @@ export class Trie {
   /**
    * Check if a phrase exists in the trie.
    */
-  has(phrase) {
+  has(phrase: string): boolean {
     return this.phraseMap.has(phrase.toLowerCase().trim());
   }
 
   /**
    * Get the count for a phrase.
    */
-  getCount(phrase) {
+  getCount(phrase: string): number {
     return this.phraseMap.get(phrase.toLowerCase().trim()) || 0;
   }
 
@@ -141,21 +172,21 @@ export class Trie {
    * Note: This doesn't remove the nodes, just marks it as not end of word
    * and removes from suggestions. For full cleanup, rebuild the trie.
    */
-  remove(phrase) {
+  remove(phrase: string): boolean {
     const normalizedPhrase = phrase.toLowerCase().trim();
     if (!this.phraseMap.has(normalizedPhrase)) {
       return false;
     }
 
-    let node = this.root;
-    const path = [this.root];
+    let node: TrieNode | undefined = this.root;
+    const path: TrieNode[] = [this.root];
 
     // Traverse to the end
     for (const char of normalizedPhrase) {
       if (!node.children.has(char)) {
         return false;
       }
-      node = node.children.get(char);
+      node = node.children.get(char)!;
       path.push(node);
     }
 
@@ -165,7 +196,7 @@ export class Trie {
 
     // Remove from suggestions at each level
     for (const pathNode of path) {
-      pathNode.suggestions = pathNode.suggestions.filter(s => s.phrase !== normalizedPhrase);
+      pathNode.suggestions = pathNode.suggestions.filter((s) => s.phrase !== normalizedPhrase);
     }
 
     this.phraseMap.delete(normalizedPhrase);
@@ -177,10 +208,10 @@ export class Trie {
   /**
    * Get all phrases in the trie (for debugging/export).
    */
-  getAllPhrases() {
-    const phrases = [];
+  getAllPhrases(): Array<{ phrase: string; count: number }> {
+    const phrases: Array<{ phrase: string; count: number }> = [];
 
-    const traverse = (node, prefix) => {
+    const traverse = (node: TrieNode, prefix: string): void => {
       if (node.isEndOfWord) {
         phrases.push({ phrase: prefix, count: node.count });
       }
@@ -197,8 +228,8 @@ export class Trie {
   /**
    * Serialize the trie to JSON for storage/transfer.
    */
-  serialize() {
-    const data = {
+  serialize(): string {
+    const data: SerializedTrie = {
       topK: this.topK,
       size: this.size,
       phrases: this.getAllPhrases(),
@@ -210,8 +241,8 @@ export class Trie {
   /**
    * Deserialize a trie from JSON.
    */
-  static deserialize(json) {
-    const data = JSON.parse(json);
+  static deserialize(json: string): Trie {
+    const data: SerializedTrie = JSON.parse(json);
     const trie = new Trie(data.topK);
 
     for (const { phrase, count } of data.phrases) {
@@ -224,11 +255,11 @@ export class Trie {
   /**
    * Get statistics about the trie.
    */
-  getStats() {
+  getStats(): TrieStats {
     let nodeCount = 0;
     let maxDepth = 0;
 
-    const traverse = (node, depth) => {
+    const traverse = (node: TrieNode, depth: number): void => {
       nodeCount++;
       maxDepth = Math.max(maxDepth, depth);
 

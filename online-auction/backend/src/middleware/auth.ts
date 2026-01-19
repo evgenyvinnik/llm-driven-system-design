@@ -1,27 +1,36 @@
+import type { Response, NextFunction } from 'express';
 import { getSession } from '../redis.js';
 import { query } from '../db.js';
+import type { AuthenticatedRequest, User } from '../types.js';
 
-export const authenticate = async (req, res, next) => {
+export const authenticate = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
   const token = req.cookies?.session_token || req.headers.authorization?.replace('Bearer ', '');
 
   if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+    res.status(401).json({ error: 'Authentication required' });
+    return;
   }
 
   try {
     const userId = await getSession(token);
 
     if (!userId) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
     const result = await query('SELECT id, username, email, role FROM users WHERE id = $1', [userId]);
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'User not found' });
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
-    req.user = result.rows[0];
+    req.user = result.rows[0] as User;
     req.sessionToken = token;
     next();
   } catch (error) {
@@ -30,11 +39,16 @@ export const authenticate = async (req, res, next) => {
   }
 };
 
-export const optionalAuth = async (req, res, next) => {
+export const optionalAuth = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
   const token = req.cookies?.session_token || req.headers.authorization?.replace('Bearer ', '');
 
   if (!token) {
-    return next();
+    next();
+    return;
   }
 
   try {
@@ -44,7 +58,7 @@ export const optionalAuth = async (req, res, next) => {
       const result = await query('SELECT id, username, email, role FROM users WHERE id = $1', [userId]);
 
       if (result.rows.length > 0) {
-        req.user = result.rows[0];
+        req.user = result.rows[0] as User;
         req.sessionToken = token;
       }
     }
@@ -55,9 +69,10 @@ export const optionalAuth = async (req, res, next) => {
   next();
 };
 
-export const requireAdmin = (req, res, next) => {
+export const requireAdmin = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   if (!req.user || req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 };

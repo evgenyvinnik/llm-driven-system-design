@@ -1,5 +1,5 @@
 import * as Minio from 'minio';
-import sharp from 'sharp';
+import sharp, { Metadata } from 'sharp';
 import { v4 as uuidv4 } from 'uuid';
 import config from '../config/index.js';
 
@@ -14,7 +14,7 @@ const minioClient = new Minio.Client({
 const BUCKET_NAME = config.minio.bucket;
 
 // Ensure bucket exists
-export const ensureBucket = async () => {
+export const ensureBucket = async (): Promise<void> => {
   try {
     const exists = await minioClient.bucketExists(BUCKET_NAME);
     if (!exists) {
@@ -26,8 +26,13 @@ export const ensureBucket = async () => {
   }
 };
 
+interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
 // Image sizes for processing
-const IMAGE_SIZES = {
+const IMAGE_SIZES: Record<string, ImageDimensions | null> = {
   original: null,
   large: { width: 1080, height: 1080 },
   medium: { width: 640, height: 640 },
@@ -36,7 +41,7 @@ const IMAGE_SIZES = {
 };
 
 // CSS filters mapping (simplified for browser-side application)
-export const FILTERS = {
+export const FILTERS: Record<string, string> = {
   none: '',
   clarendon: 'contrast(1.2) saturate(1.35)',
   gingham: 'brightness(1.05) sepia(0.05)',
@@ -52,24 +57,38 @@ export const FILTERS = {
 };
 
 // Upload processed image to MinIO
-const uploadBuffer = async (buffer, key, contentType) => {
-  await minioClient.putObject(BUCKET_NAME, key, buffer, {
+const uploadBuffer = async (buffer: Buffer, key: string, contentType: string): Promise<string> => {
+  await minioClient.putObject(BUCKET_NAME, key, buffer, buffer.length, {
     'Content-Type': contentType,
   });
   return getPublicUrl(key);
 };
 
 // Get public URL for object
-export const getPublicUrl = (key) => {
+export const getPublicUrl = (key: string): string => {
   const protocol = config.minio.useSSL ? 'https' : 'http';
   return `${protocol}://${config.minio.endPoint}:${config.minio.port}/${BUCKET_NAME}/${key}`;
 };
 
+export interface ProcessedImageResult {
+  id: string;
+  urls: Record<string, string>;
+  width: number | undefined;
+  height: number | undefined;
+  filter: string;
+  mediaUrl: string;
+  thumbnailUrl: string;
+}
+
 // Process and upload image
-export const processAndUploadImage = async (fileBuffer, originalName, filterName = 'none') => {
+export const processAndUploadImage = async (
+  fileBuffer: Buffer,
+  originalName: string,
+  filterName: string = 'none'
+): Promise<ProcessedImageResult> => {
   const fileId = uuidv4();
   const ext = 'jpg';
-  const results = {};
+  const results: Record<string, string> = {};
 
   // Process image at different sizes
   for (const [sizeName, dimensions] of Object.entries(IMAGE_SIZES)) {
@@ -88,7 +107,7 @@ export const processAndUploadImage = async (fileBuffer, originalName, filterName
   }
 
   // Get image dimensions
-  const metadata = await sharp(fileBuffer).metadata();
+  const metadata: Metadata = await sharp(fileBuffer).metadata();
 
   return {
     id: fileId,
@@ -101,13 +120,19 @@ export const processAndUploadImage = async (fileBuffer, originalName, filterName
   };
 };
 
+export interface VideoUploadResult {
+  id: string;
+  mediaUrl: string;
+  thumbnailUrl: string | null;
+}
+
 // Upload video (basic - no transcoding in this implementation)
-export const uploadVideo = async (fileBuffer, originalName) => {
+export const uploadVideo = async (fileBuffer: Buffer, originalName: string): Promise<VideoUploadResult> => {
   const fileId = uuidv4();
   const ext = originalName.split('.').pop() || 'mp4';
   const key = `videos/${fileId}/original.${ext}`;
 
-  await minioClient.putObject(BUCKET_NAME, key, fileBuffer, {
+  await minioClient.putObject(BUCKET_NAME, key, fileBuffer, fileBuffer.length, {
     'Content-Type': `video/${ext}`,
   });
 
@@ -119,7 +144,7 @@ export const uploadVideo = async (fileBuffer, originalName) => {
 };
 
 // Upload profile picture
-export const uploadProfilePicture = async (fileBuffer) => {
+export const uploadProfilePicture = async (fileBuffer: Buffer): Promise<string> => {
   const fileId = uuidv4();
 
   // Resize to 150x150 for profile
@@ -135,7 +160,7 @@ export const uploadProfilePicture = async (fileBuffer) => {
 };
 
 // Delete object
-export const deleteObject = async (key) => {
+export const deleteObject = async (key: string): Promise<void> => {
   try {
     await minioClient.removeObject(BUCKET_NAME, key);
   } catch (error) {
@@ -143,13 +168,18 @@ export const deleteObject = async (key) => {
   }
 };
 
+export interface StoredOriginalResult {
+  key: string;
+  fileId: string;
+}
+
 // Store original image for async processing
-export const storeOriginalImage = async (fileBuffer, originalName) => {
+export const storeOriginalImage = async (fileBuffer: Buffer, originalName: string): Promise<StoredOriginalResult> => {
   const fileId = uuidv4();
   const ext = originalName.split('.').pop() || 'jpg';
   const key = `originals/${fileId}.${ext}`;
 
-  await minioClient.putObject(BUCKET_NAME, key, fileBuffer, {
+  await minioClient.putObject(BUCKET_NAME, key, fileBuffer, fileBuffer.length, {
     'Content-Type': 'image/jpeg',
   });
 
@@ -157,17 +187,20 @@ export const storeOriginalImage = async (fileBuffer, originalName) => {
 };
 
 // Fetch original image from MinIO (for worker)
-export const fetchOriginalImage = async (key) => {
+export const fetchOriginalImage = async (key: string): Promise<Buffer> => {
   const stream = await minioClient.getObject(BUCKET_NAME, key);
-  const chunks = [];
+  const chunks: Buffer[] = [];
   for await (const chunk of stream) {
-    chunks.push(chunk);
+    chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks);
 };
 
 // Process image from stored original (for worker)
-export const processStoredImage = async (originalKey, filterName = 'none') => {
+export const processStoredImage = async (
+  originalKey: string,
+  filterName: string = 'none'
+): Promise<ProcessedImageResult> => {
   const fileBuffer = await fetchOriginalImage(originalKey);
   return processAndUploadImage(fileBuffer, originalKey, filterName);
 };

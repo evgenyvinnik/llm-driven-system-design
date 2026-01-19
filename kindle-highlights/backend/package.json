@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm:dev:*\"",
-    "dev:highlight": "node --watch --experimental-strip-types src/highlight/index.ts",
-    "dev:sync": "node --watch --experimental-strip-types src/sync/index.ts",
-    "dev:aggregation": "node --watch --experimental-strip-types src/aggregation/index.ts",
-    "dev:social": "node --watch --experimental-strip-types src/social/index.ts",
-    "dev:worker": "node --watch --experimental-strip-types src/aggregation/worker.ts",
+    "dev:highlight": "tsx watch src/highlight/index.ts",
+    "dev:sync": "tsx watch src/sync/index.ts",
+    "dev:aggregation": "tsx watch src/aggregation/index.ts",
+    "dev:social": "tsx watch src/social/index.ts",
+    "dev:worker": "tsx watch src/aggregation/worker.ts",
     "build": "tsc",
     "start": "node dist/highlight/index.js",
-    "db:seed": "node --experimental-strip-types src/db/seed.ts",
+    "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -34,6 +34,7 @@
     "@types/uuid": "^10.0.0",
     "@types/ws": "^8.5.13",
     "concurrently": "^9.1.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   }

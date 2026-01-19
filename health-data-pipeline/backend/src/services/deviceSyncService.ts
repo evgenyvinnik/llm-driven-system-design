@@ -1,17 +1,40 @@
 import { db } from '../config/database.js';
 import { cache } from '../config/redis.js';
-import { HealthSample } from '../models/healthSample.js';
-import { DevicePriority } from '../models/healthTypes.js';
+import { HealthSample, HealthSampleData } from '../models/healthSample.js';
+import { DevicePriority, DeviceType } from '../models/healthTypes.js';
 import { aggregationService } from './aggregationService.js';
 
+export interface DeviceData {
+  deviceType: string;
+  deviceName: string;
+  deviceIdentifier: string;
+}
+
+export interface UserDevice {
+  id: string;
+  user_id: string;
+  device_type: string;
+  device_name: string;
+  device_identifier: string;
+  priority: number;
+  last_sync: Date | null;
+  created_at: Date;
+}
+
+export interface SyncResult {
+  synced: number;
+  errors: number;
+  errorDetails: Array<{ sample: HealthSampleData; error: string }>;
+}
+
 export class DeviceSyncService {
-  async registerDevice(userId, deviceData) {
+  async registerDevice(userId: string, deviceData: DeviceData): Promise<UserDevice> {
     const { deviceType, deviceName, deviceIdentifier } = deviceData;
 
     // Set default priority based on device type
-    const priority = DevicePriority[deviceType] || 50;
+    const priority = DevicePriority[deviceType as DeviceType] || 50;
 
-    const result = await db.query(
+    const result = await db.query<UserDevice>(
       `INSERT INTO user_devices (user_id, device_type, device_name, device_identifier, priority)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (user_id, device_identifier)
@@ -23,8 +46,8 @@ export class DeviceSyncService {
     return result.rows[0];
   }
 
-  async getUserDevices(userId) {
-    const result = await db.query(
+  async getUserDevices(userId: string): Promise<UserDevice[]> {
+    const result = await db.query<UserDevice>(
       `SELECT * FROM user_devices
        WHERE user_id = $1
        ORDER BY priority DESC, created_at DESC`,
@@ -34,9 +57,9 @@ export class DeviceSyncService {
     return result.rows;
   }
 
-  async syncFromDevice(userId, deviceId, samples) {
-    const validSamples = [];
-    const errors = [];
+  async syncFromDevice(userId: string, deviceId: string, samples: HealthSampleData[]): Promise<SyncResult> {
+    const validSamples: HealthSample[] = [];
+    const errors: Array<{ sample: HealthSampleData; error: string }> = [];
 
     for (const sampleData of samples) {
       try {
@@ -51,7 +74,7 @@ export class DeviceSyncService {
       } catch (error) {
         errors.push({
           sample: sampleData,
-          error: error.message
+          error: (error as Error).message
         });
       }
     }
@@ -83,11 +106,11 @@ export class DeviceSyncService {
     };
   }
 
-  async batchInsert(samples) {
+  async batchInsert(samples: HealthSample[]): Promise<void> {
     if (samples.length === 0) return;
 
-    const values = [];
-    const placeholders = [];
+    const values: unknown[] = [];
+    const placeholders: string[] = [];
     let paramIndex = 1;
 
     for (const sample of samples) {
@@ -118,7 +141,7 @@ export class DeviceSyncService {
     );
   }
 
-  getDateRange(samples) {
+  getDateRange(samples: HealthSample[]): { start: Date; end: Date } {
     const dates = samples.map(s => s.startDate.getTime());
     return {
       start: new Date(Math.min(...dates)),

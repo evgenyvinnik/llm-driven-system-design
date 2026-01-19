@@ -8,31 +8,58 @@
  * - Idempotency: Safe request retries
  */
 
-const logger = require('./logger');
-const metrics = require('./metrics');
-const circuitBreaker = require('./circuitBreaker');
-const idempotency = require('./idempotency');
+export {
+  logger,
+  auditLogger,
+  auditLog,
+  AuditEvents,
+  requestLoggerMiddleware
+} from './logger.js';
 
-module.exports = {
-  // Logger exports
-  logger: logger.logger,
-  auditLogger: logger.auditLogger,
-  auditLog: logger.auditLog,
-  AuditEvents: logger.AuditEvents,
-  requestLoggerMiddleware: logger.requestLoggerMiddleware,
+export type { AuditLogData, AuditEventType } from './logger.js';
 
-  // Metrics exports
-  metrics,
-  metricsMiddleware: metrics.metricsMiddleware,
-  metricsHandler: metrics.metricsHandler,
+export {
+  register,
+  metricsMiddleware,
+  metricsHandler,
+  httpRequestDuration,
+  httpRequestTotal,
+  playbackStartLatency,
+  activeStreams,
+  manifestGenerationDuration,
+  segmentRequestsTotal,
+  streamingErrors,
+  cdnCacheHits,
+  cdnCacheMisses,
+  drmLicenseRequests,
+  drmLicenseLatency,
+  transcodingJobDuration,
+  transcodingJobsTotal,
+  circuitBreakerState,
+  circuitBreakerFailures,
+  circuitBreakerSuccesses,
+  watchProgressUpdates,
+  idempotentRequestsTotal
+} from './metrics.js';
 
-  // Circuit breaker exports
-  withCircuitBreaker: circuitBreaker.withCircuitBreaker,
-  getCircuitBreakerHealth: circuitBreaker.getCircuitBreakerHealth,
-  createCircuitBreaker: circuitBreaker.createCircuitBreaker,
+export {
+  withCircuitBreaker,
+  getCircuitBreakerHealth,
+  createCircuitBreaker,
+  serviceConfigs
+} from './circuitBreaker.js';
 
-  // Idempotency exports
-  idempotencyMiddleware: idempotency.idempotencyMiddleware,
-  watchProgressIdempotency: idempotency.watchProgressIdempotency,
-  completeWatchProgressIdempotency: idempotency.completeWatchProgressIdempotency
-};
+export type { ServiceConfig, CircuitBreakerHealth, ServiceName } from './circuitBreaker.js';
+
+export {
+  idempotencyMiddleware,
+  watchProgressIdempotency,
+  completeWatchProgressIdempotency,
+  createIdempotencyKey,
+  checkIdempotency,
+  markIdempotent,
+  IDEMPOTENCY_TTL,
+  LOCK_TTL
+} from './idempotency.js';
+
+export type { WatchProgressMeta, CachedResponse } from './idempotency.js';

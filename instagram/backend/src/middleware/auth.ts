@@ -1,3 +1,4 @@
+import type { Request, Response, NextFunction } from 'express';
 import logger from '../services/logger.js';
 
 /**
@@ -22,22 +23,41 @@ import logger from '../services/logger.js';
  * }
  */
 
+export type Role = 'anonymous' | 'user' | 'verified' | 'admin';
+
 // Role hierarchy: higher number = more permissions
-const ROLE_LEVELS = {
+export const ROLE_LEVELS: Record<Role, number> = {
   anonymous: 0,
   user: 1,
   verified: 2,
   admin: 3,
 };
 
+export interface SessionData {
+  userId?: string;
+  username?: string;
+  role?: Role;
+  isVerified?: boolean;
+}
+
+export interface AuthenticatedRequest extends Request {
+  session: Request['session'] & SessionData;
+  isResourceOwner?: boolean;
+  resourceOwnerId?: string;
+  isSelf?: boolean;
+  userContext?: {
+    userId?: string;
+    username?: string;
+    role: Role;
+    isVerified?: boolean;
+  };
+}
+
 /**
  * Check if user has required role level
- * @param {string} userRole - User's current role
- * @param {string} requiredRole - Minimum required role
- * @returns {boolean} True if user has sufficient permissions
  */
-const hasPermission = (userRole, requiredRole) => {
-  const userLevel = ROLE_LEVELS[userRole] || 0;
+const hasPermission = (userRole: Role | undefined, requiredRole: Role): boolean => {
+  const userLevel = ROLE_LEVELS[userRole || 'anonymous'] || 0;
   const requiredLevel = ROLE_LEVELS[requiredRole] || 0;
   return userLevel >= requiredLevel;
 };
@@ -46,15 +66,22 @@ const hasPermission = (userRole, requiredRole) => {
  * Require authentication middleware
  * Denies access if user is not logged in
  */
-export const requireAuth = (req, res, next) => {
+export const requireAuth = (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Response | void => {
   if (!req.session || !req.session.userId) {
-    logger.debug({
-      type: 'auth',
-      result: 'denied',
-      reason: 'not_authenticated',
-      path: req.path,
-      ip: req.ip,
-    }, 'Authentication required');
+    logger.debug(
+      {
+        type: 'auth',
+        result: 'denied',
+        reason: 'not_authenticated',
+        path: req.path,
+        ip: req.ip,
+      },
+      'Authentication required'
+    );
     return res.status(401).json({ error: 'Authentication required' });
   }
   next();
@@ -64,27 +91,37 @@ export const requireAuth = (req, res, next) => {
  * Require admin role middleware
  * Only allows admin users to proceed
  */
-export const requireAdmin = (req, res, next) => {
+export const requireAdmin = (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Response | void => {
   if (!req.session || !req.session.userId) {
-    logger.debug({
-      type: 'auth',
-      result: 'denied',
-      reason: 'not_authenticated',
-      path: req.path,
-    }, 'Authentication required for admin access');
+    logger.debug(
+      {
+        type: 'auth',
+        result: 'denied',
+        reason: 'not_authenticated',
+        path: req.path,
+      },
+      'Authentication required for admin access'
+    );
     return res.status(401).json({ error: 'Authentication required' });
   }
 
   if (req.session.role !== 'admin') {
-    logger.warn({
-      type: 'auth',
-      result: 'denied',
-      reason: 'insufficient_role',
-      userRole: req.session.role,
-      requiredRole: 'admin',
-      userId: req.session.userId,
-      path: req.path,
-    }, `Admin access denied for user ${req.session.userId}`);
+    logger.warn(
+      {
+        type: 'auth',
+        result: 'denied',
+        reason: 'insufficient_role',
+        userRole: req.session.role,
+        requiredRole: 'admin',
+        userId: req.session.userId,
+        path: req.path,
+      },
+      `Admin access denied for user ${req.session.userId}`
+    );
     return res.status(403).json({ error: 'Admin access required' });
   }
 
@@ -95,20 +132,27 @@ export const requireAdmin = (req, res, next) => {
  * Require verified user role middleware
  * Only allows verified or admin users to proceed
  */
-export const requireVerified = (req, res, next) => {
+export const requireVerified = (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Response | void => {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
   if (!hasPermission(req.session.role, 'verified')) {
-    logger.debug({
-      type: 'auth',
-      result: 'denied',
-      reason: 'not_verified',
-      userRole: req.session.role,
-      userId: req.session.userId,
-      path: req.path,
-    }, `Verified access denied for user ${req.session.userId}`);
+    logger.debug(
+      {
+        type: 'auth',
+        result: 'denied',
+        reason: 'not_verified',
+        userRole: req.session.role,
+        userId: req.session.userId,
+        path: req.path,
+      },
+      `Verified access denied for user ${req.session.userId}`
+    );
     return res.status(403).json({ error: 'Verified account required' });
   }
 
@@ -118,26 +162,28 @@ export const requireVerified = (req, res, next) => {
 /**
  * Require minimum role middleware factory
  * Creates middleware that requires at least the specified role
- *
- * @param {string} minimumRole - Minimum role required ('user', 'verified', 'admin')
- * @returns {Function} Express middleware
  */
-export const requireRole = (minimumRole) => {
-  return (req, res, next) => {
+export const requireRole = (
+  minimumRole: Role
+): ((req: AuthenticatedRequest, res: Response, next: NextFunction) => Response | void) => {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction): Response | void => {
     if (!req.session || !req.session.userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
     if (!hasPermission(req.session.role, minimumRole)) {
-      logger.warn({
-        type: 'auth',
-        result: 'denied',
-        reason: 'insufficient_role',
-        userRole: req.session.role,
-        requiredRole: minimumRole,
-        userId: req.session.userId,
-        path: req.path,
-      }, `Role ${minimumRole} required, user has ${req.session.role}`);
+      logger.warn(
+        {
+          type: 'auth',
+          result: 'denied',
+          reason: 'insufficient_role',
+          userRole: req.session.role,
+          requiredRole: minimumRole,
+          userId: req.session.userId,
+          path: req.path,
+        },
+        `Role ${minimumRole} required, user has ${req.session.role}`
+      );
       return res.status(403).json({
         error: `${minimumRole.charAt(0).toUpperCase() + minimumRole.slice(1)} access required`,
       });
@@ -152,21 +198,26 @@ export const requireRole = (minimumRole) => {
  * Adds user info if logged in, but doesn't require it
  * Useful for endpoints that work for both anonymous and authenticated users
  */
-export const optionalAuth = (req, res, next) => {
+export const optionalAuth = (_req: Request, _res: Response, next: NextFunction): void => {
   // Session info is already available if user is logged in via express-session
   // This middleware just ensures we don't block unauthenticated requests
   next();
 };
 
+export type GetOwnerIdFn = (req: AuthenticatedRequest) => Promise<string | null>;
+
 /**
  * Resource ownership middleware factory
  * Checks if the current user owns a resource or is an admin
- *
- * @param {Function} getOwnerId - Async function that takes req and returns owner user ID
- * @returns {Function} Express middleware
  */
-export const requireOwnership = (getOwnerId) => {
-  return async (req, res, next) => {
+export const requireOwnership = (
+  getOwnerId: GetOwnerIdFn
+): ((req: AuthenticatedRequest, res: Response, next: NextFunction) => Promise<Response | void>) => {
+  return async (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<Response | void> => {
     if (!req.session || !req.session.userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
@@ -182,14 +233,17 @@ export const requireOwnership = (getOwnerId) => {
       const isAdmin = req.session.role === 'admin';
 
       if (!isOwner && !isAdmin) {
-        logger.warn({
-          type: 'auth',
-          result: 'denied',
-          reason: 'not_owner',
-          userId: req.session.userId,
-          ownerId,
-          path: req.path,
-        }, `Ownership denied: ${req.session.userId} tried to access resource owned by ${ownerId}`);
+        logger.warn(
+          {
+            type: 'auth',
+            result: 'denied',
+            reason: 'not_owner',
+            userId: req.session.userId,
+            ownerId,
+            path: req.path,
+          },
+          `Ownership denied: ${req.session.userId} tried to access resource owned by ${ownerId}`
+        );
         return res.status(403).json({ error: 'Not authorized to access this resource' });
       }
 
@@ -197,11 +251,15 @@ export const requireOwnership = (getOwnerId) => {
       req.resourceOwnerId = ownerId;
       next();
     } catch (error) {
-      logger.error({
-        type: 'auth',
-        error: error.message,
-        path: req.path,
-      }, 'Error checking resource ownership');
+      const err = error as Error;
+      logger.error(
+        {
+          type: 'auth',
+          error: err.message,
+          path: req.path,
+        },
+        'Error checking resource ownership'
+      );
       return res.status(500).json({ error: 'Internal server error' });
     }
   };
@@ -210,12 +268,11 @@ export const requireOwnership = (getOwnerId) => {
 /**
  * Admin or self middleware
  * Allows access if user is admin or accessing their own data
- *
- * @param {string} userIdParam - Request param name containing user ID (default: 'userId')
- * @returns {Function} Express middleware
  */
-export const requireAdminOrSelf = (userIdParam = 'userId') => {
-  return (req, res, next) => {
+export const requireAdminOrSelf = (
+  userIdParam: string = 'userId'
+): ((req: AuthenticatedRequest, res: Response, next: NextFunction) => Response | void) => {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction): Response | void => {
     if (!req.session || !req.session.userId) {
       return res.status(401).json({ error: 'Authentication required' });
     }
@@ -237,7 +294,11 @@ export const requireAdminOrSelf = (userIdParam = 'userId') => {
  * Attach user context middleware
  * Adds additional user context to request for logging and metrics
  */
-export const attachUserContext = (req, res, next) => {
+export const attachUserContext = (
+  req: AuthenticatedRequest,
+  _res: Response,
+  next: NextFunction
+): void => {
   if (req.session?.userId) {
     req.userContext = {
       userId: req.session.userId,

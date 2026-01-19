@@ -13,6 +13,7 @@
  */
 
 export { default as logger, createChildLogger, requestLogger, auditLogger, logAuditEvent } from './logger.js';
+export type { AuditEvent } from './logger.js';
 
 export {
   registry,
@@ -34,6 +35,7 @@ export {
   metricsHandler,
   startTimer,
 } from './metrics.js';
+export type { TimerResult } from './metrics.js';
 
 export {
   TTL,
@@ -44,12 +46,14 @@ export {
   SyncStateCache,
   createCaches,
 } from './cache.js';
+export type { FileMetadata, StorageInfo, SyncData, Caches } from './cache.js';
 
 export {
   createCircuitBreaker,
   StorageCircuitBreakers,
   createDatabaseCircuitBreaker,
 } from './circuitBreaker.js';
+export type { BreakerOptions, StorageHealth, BreakerHealth, BreakerStats } from './circuitBreaker.js';
 
 export {
   createIdempotencyMiddleware,
@@ -58,5 +62,14 @@ export {
   generateIdempotencyKey,
   IDEMPOTENCY_KEY_HEADER,
 } from './idempotency.js';
+export type { IdempotencyResult, CheckResult } from './idempotency.js';
 
 export { HealthChecker, createHealthRoutes } from './health.js';
+export type {
+  ComponentHealth,
+  CircuitBreakerStatus,
+  FullHealth,
+  Liveness,
+  Readiness,
+  HealthCheckerDeps,
+} from './health.js';

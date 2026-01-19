@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db/index.js';
@@ -7,13 +7,31 @@ import { authenticate } from '../middleware/auth.js';
 
 const router = Router();
 
+interface RegisterBody {
+  email: string;
+  username: string;
+  password: string;
+  displayName?: string;
+}
+
+interface LoginBody {
+  email: string;
+  password: string;
+}
+
+interface PreferencesBody {
+  preferredQuality?: string;
+  displayName?: string;
+}
+
 // Register new user
-router.post('/register', async (req, res) => {
+router.post('/register', async (req: Request<object, unknown, RegisterBody>, res: Response) => {
   try {
     const { email, username, password, displayName } = req.body;
 
     if (!email || !username || !password) {
-      return res.status(400).json({ error: 'Email, username, and password are required' });
+      res.status(400).json({ error: 'Email, username, and password are required' });
+      return;
     }
 
     // Check if user exists
@@ -23,7 +41,8 @@ router.post('/register', async (req, res) => {
     );
 
     if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'User already exists' });
+      res.status(409).json({ error: 'User already exists' });
+      return;
     }
 
     // Hash password
@@ -90,12 +109,13 @@ router.post('/register', async (req, res) => {
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', async (req: Request<object, unknown, LoginBody>, res: Response) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+      res.status(400).json({ error: 'Email and password are required' });
+      return;
     }
 
     // Find user
@@ -107,7 +127,8 @@ router.post('/login', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     const user = result.rows[0];
@@ -115,7 +136,8 @@ router.post('/login', async (req, res) => {
     // Verify password
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     // Create session
@@ -169,7 +191,7 @@ router.post('/login', async (req, res) => {
 });
 
 // Logout
-router.post('/logout', authenticate, async (req, res) => {
+router.post('/logout', authenticate, async (req: Request, res: Response) => {
   try {
     const token = req.cookies.session_token || req.headers.authorization?.replace('Bearer ', '');
 
@@ -187,16 +209,16 @@ router.post('/logout', authenticate, async (req, res) => {
 });
 
 // Get current user
-router.get('/me', authenticate, async (req, res) => {
+router.get('/me', authenticate, async (req: Request, res: Response) => {
   res.json({ user: req.user });
 });
 
 // Update user preferences
-router.patch('/preferences', authenticate, async (req, res) => {
+router.patch('/preferences', authenticate, async (req: Request<object, unknown, PreferencesBody>, res: Response) => {
   try {
     const { preferredQuality, displayName } = req.body;
-    const updates = [];
-    const values = [];
+    const updates: string[] = [];
+    const values: (string | undefined)[] = [];
     let paramCount = 1;
 
     if (preferredQuality) {
@@ -210,11 +232,12 @@ router.patch('/preferences', authenticate, async (req, res) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No updates provided' });
+      res.status(400).json({ error: 'No updates provided' });
+      return;
     }
 
     updates.push(`updated_at = NOW()`);
-    values.push(req.user.id);
+    values.push(req.user!.id);
 
     const result = await pool.query(
       `UPDATE users SET ${updates.join(', ')}

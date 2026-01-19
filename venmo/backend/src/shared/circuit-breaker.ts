@@ -23,25 +23,52 @@
  * - HALF_OPEN: Testing if service recovered, limited requests allowed
  */
 
-const { logger } = require('./logger');
-const { circuitBreakerState, circuitBreakerFailures } = require('./metrics');
+import { logger } from './logger.js';
+import { circuitBreakerState, circuitBreakerFailures } from './metrics.js';
 
-const STATES = {
+export const STATES = {
   CLOSED: 0,
   HALF_OPEN: 1,
   OPEN: 2,
-};
+} as const;
 
-class CircuitBreaker {
-  /**
-   * @param {string} name - Service name for logging and metrics
-   * @param {Object} options - Configuration options
-   * @param {number} options.failureThreshold - Failures before opening (default: 5)
-   * @param {number} options.resetTimeout - Ms before trying half-open (default: 30000)
-   * @param {number} options.halfOpenRequests - Successes needed to close (default: 3)
-   * @param {number} options.timeout - Request timeout in ms (default: 10000)
-   */
-  constructor(name, options = {}) {
+export type CircuitState = typeof STATES[keyof typeof STATES];
+
+export interface CircuitBreakerOptions {
+  failureThreshold?: number;
+  resetTimeout?: number;
+  halfOpenRequests?: number;
+  timeout?: number;
+}
+
+export interface CircuitBreakerStats {
+  name: string;
+  state: string;
+  failures: number;
+  failureThreshold: number;
+  lastFailureTime: number | null;
+  halfOpenAttempts: number;
+  halfOpenRequests: number;
+  timeUntilRetry: number | null;
+}
+
+interface CircuitBreakerError extends Error {
+  code?: string;
+}
+
+export class CircuitBreaker {
+  private name: string;
+  private failureThreshold: number;
+  private resetTimeout: number;
+  private halfOpenRequests: number;
+  private timeout: number;
+  private state: CircuitState;
+  private failures: number;
+  private successes: number;
+  private lastFailureTime: number | null;
+  private halfOpenAttempts: number;
+
+  constructor(name: string, options: CircuitBreakerOptions = {}) {
     this.name = name;
     this.failureThreshold = options.failureThreshold || 5;
     this.resetTimeout = options.resetTimeout || 30000;
@@ -73,7 +100,7 @@ class CircuitBreaker {
   /**
    * Get current state as string
    */
-  getState() {
+  getState(): string {
     switch (this.state) {
       case STATES.CLOSED:
         return 'CLOSED';
@@ -89,22 +116,21 @@ class CircuitBreaker {
   /**
    * Update Prometheus metrics for this circuit breaker
    */
-  _updateMetrics() {
+  private _updateMetrics(): void {
     circuitBreakerState.set({ service: this.name }, this.state);
   }
 
   /**
    * Check if circuit breaker allows requests
-   * @returns {boolean} true if request is allowed
    */
-  canExecute() {
+  canExecute(): boolean {
     if (this.state === STATES.CLOSED) {
       return true;
     }
 
     if (this.state === STATES.OPEN) {
       // Check if enough time has passed to try half-open
-      const timeSinceFailure = Date.now() - this.lastFailureTime;
+      const timeSinceFailure = Date.now() - (this.lastFailureTime || 0);
       if (timeSinceFailure >= this.resetTimeout) {
         this._transitionToHalfOpen();
         return true;
@@ -118,20 +144,20 @@ class CircuitBreaker {
 
   /**
    * Execute an operation with circuit breaker protection
-   * @param {Function} operation - Async function to execute
-   * @param {Function} fallback - Optional fallback function if circuit is open
-   * @returns {Promise} Result of operation or fallback
    */
-  async execute(operation, fallback = null) {
+  async execute<T>(
+    operation: () => Promise<T>,
+    fallback: ((error: Error) => T) | null = null
+  ): Promise<T> {
     if (!this.canExecute()) {
-      const error = new Error(`Circuit breaker ${this.name} is OPEN`);
+      const error: CircuitBreakerError = new Error(`Circuit breaker ${this.name} is OPEN`);
       error.code = 'CIRCUIT_BREAKER_OPEN';
 
       logger.warn({
         event: 'circuit_breaker_rejected',
         circuitBreaker: this.name,
         state: this.getState(),
-        timeUntilRetry: this.resetTimeout - (Date.now() - this.lastFailureTime),
+        timeUntilRetry: this.resetTimeout - (Date.now() - (this.lastFailureTime || 0)),
       });
 
       if (fallback) {
@@ -146,7 +172,7 @@ class CircuitBreaker {
       this._onSuccess();
       return result;
     } catch (error) {
-      this._onFailure(error);
+      this._onFailure(error as Error);
       throw error;
     }
   }
@@ -154,12 +180,12 @@ class CircuitBreaker {
   /**
    * Execute operation with timeout
    */
-  async _executeWithTimeout(operation) {
+  private async _executeWithTimeout<T>(operation: () => Promise<T>): Promise<T> {
     return Promise.race([
       operation(),
-      new Promise((_, reject) => {
+      new Promise<T>((_, reject) => {
         setTimeout(() => {
-          const error = new Error(`Circuit breaker ${this.name} timeout after ${this.timeout}ms`);
+          const error: CircuitBreakerError = new Error(`Circuit breaker ${this.name} timeout after ${this.timeout}ms`);
           error.code = 'CIRCUIT_BREAKER_TIMEOUT';
           reject(error);
         }, this.timeout);
@@ -170,7 +196,7 @@ class CircuitBreaker {
   /**
    * Handle successful operation
    */
-  _onSuccess() {
+  private _onSuccess(): void {
     this.failures = 0;
 
     if (this.state === STATES.HALF_OPEN) {
@@ -192,7 +218,7 @@ class CircuitBreaker {
   /**
    * Handle failed operation
    */
-  _onFailure(error) {
+  private _onFailure(error: Error): void {
     this.failures++;
     this.lastFailureTime = Date.now();
 
@@ -223,7 +249,7 @@ class CircuitBreaker {
   /**
    * Transition to OPEN state
    */
-  _transitionToOpen() {
+  private _transitionToOpen(): void {
     const previousState = this.getState();
     this.state = STATES.OPEN;
     this._updateMetrics();
@@ -240,7 +266,7 @@ class CircuitBreaker {
   /**
    * Transition to HALF_OPEN state
    */
-  _transitionToHalfOpen() {
+  private _transitionToHalfOpen(): void {
     const previousState = this.getState();
     this.state = STATES.HALF_OPEN;
     this.halfOpenAttempts = 0;
@@ -256,7 +282,7 @@ class CircuitBreaker {
   /**
    * Transition to CLOSED state
    */
-  _transitionToClosed() {
+  private _transitionToClosed(): void {
     const previousState = this.getState();
     this.state = STATES.CLOSED;
     this.failures = 0;
@@ -273,7 +299,7 @@ class CircuitBreaker {
   /**
    * Force open the circuit (for manual intervention)
    */
-  forceOpen() {
+  forceOpen(): void {
     logger.warn({
       event: 'circuit_breaker_force_opened',
       circuitBreaker: this.name,
@@ -284,7 +310,7 @@ class CircuitBreaker {
   /**
    * Force close the circuit (for manual intervention)
    */
-  forceClose() {
+  forceClose(): void {
     logger.info({
       event: 'circuit_breaker_force_closed',
       circuitBreaker: this.name,
@@ -295,7 +321,7 @@ class CircuitBreaker {
   /**
    * Get circuit breaker statistics
    */
-  getStats() {
+  getStats(): CircuitBreakerStats {
     return {
       name: this.name,
       state: this.getState(),
@@ -306,38 +332,30 @@ class CircuitBreaker {
       halfOpenRequests: this.halfOpenRequests,
       timeUntilRetry:
         this.state === STATES.OPEN
-          ? Math.max(0, this.resetTimeout - (Date.now() - this.lastFailureTime))
+          ? Math.max(0, this.resetTimeout - (Date.now() - (this.lastFailureTime || 0)))
           : null,
     };
   }
 }
 
 // Pre-configured circuit breakers for external services
-const bankApiCircuit = new CircuitBreaker('bank-api', {
+export const bankApiCircuit = new CircuitBreaker('bank-api', {
   failureThreshold: 3,
   resetTimeout: 60000, // 1 minute
   halfOpenRequests: 3,
   timeout: 15000, // Bank APIs can be slow
 });
 
-const cardNetworkCircuit = new CircuitBreaker('card-network', {
+export const cardNetworkCircuit = new CircuitBreaker('card-network', {
   failureThreshold: 5,
   resetTimeout: 30000, // 30 seconds
   halfOpenRequests: 3,
   timeout: 10000,
 });
 
-const achNetworkCircuit = new CircuitBreaker('ach-network', {
+export const achNetworkCircuit = new CircuitBreaker('ach-network', {
   failureThreshold: 3,
   resetTimeout: 120000, // 2 minutes (ACH is batch-oriented)
   halfOpenRequests: 2,
   timeout: 30000,
 });
-
-module.exports = {
-  CircuitBreaker,
-  STATES,
-  bankApiCircuit,
-  cardNetworkCircuit,
-  achNetworkCircuit,
-};

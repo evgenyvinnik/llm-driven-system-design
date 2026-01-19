@@ -1,13 +1,30 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import db from '../db/index.js';
 import { isAuthenticated } from '../middleware/auth.js';
 
 const router = Router();
 
+interface FavoriteBody {
+  type: 'product' | 'shop';
+  id: number | string;
+}
+
+interface FavoriteRow {
+  id: number;
+  user_id: number;
+  favoritable_type: string;
+  favoritable_id: number;
+  name: string | null;
+  image: string | null;
+  price: string | null;
+  slug: string | null;
+  created_at: Date;
+}
+
 // Get user's favorites
-router.get('/', isAuthenticated, async (req, res) => {
+router.get('/', isAuthenticated, async (req: Request, res: Response) => {
   try {
-    const { type } = req.query; // 'product' or 'shop'
+    const { type } = req.query as { type?: string }; // 'product' or 'shop'
 
     let query = `
       SELECT f.*,
@@ -33,7 +50,7 @@ router.get('/', isAuthenticated, async (req, res) => {
       LEFT JOIN shops s ON f.favoritable_type = 'shop' AND f.favoritable_id = s.id
       WHERE f.user_id = $1
     `;
-    const params = [req.session.userId];
+    const params: (number | string)[] = [req.session.userId!];
 
     if (type) {
       query += ` AND f.favoritable_type = $${params.length + 1}`;
@@ -42,7 +59,7 @@ router.get('/', isAuthenticated, async (req, res) => {
 
     query += ' ORDER BY f.created_at DESC';
 
-    const result = await db.query(query, params);
+    const result = await db.query<FavoriteRow>(query, params);
 
     res.json({ favorites: result.rows });
   } catch (error) {
@@ -52,7 +69,7 @@ router.get('/', isAuthenticated, async (req, res) => {
 });
 
 // Add to favorites
-router.post('/', isAuthenticated, async (req, res) => {
+router.post('/', isAuthenticated, async (req: Request<object, object, FavoriteBody>, res: Response) => {
   try {
     const { type, id } = req.body;
 
@@ -66,7 +83,7 @@ router.post('/', isAuthenticated, async (req, res) => {
 
     // Check if item exists
     const table = type === 'product' ? 'products' : 'shops';
-    const existsResult = await db.query(`SELECT id FROM ${table} WHERE id = $1`, [parseInt(id)]);
+    const existsResult = await db.query<{ id: number }>(`SELECT id FROM ${table} WHERE id = $1`, [parseInt(String(id))]);
     if (existsResult.rows.length === 0) {
       return res.status(404).json({ error: `${type} not found` });
     }
@@ -76,14 +93,14 @@ router.post('/', isAuthenticated, async (req, res) => {
       `INSERT INTO favorites (user_id, favoritable_type, favoritable_id)
        VALUES ($1, $2, $3)
        ON CONFLICT (user_id, favoritable_type, favoritable_id) DO NOTHING`,
-      [req.session.userId, type, parseInt(id)]
+      [req.session.userId, type, parseInt(String(id))]
     );
 
     // Update favorite count if product
     if (type === 'product') {
       await db.query(
         'UPDATE products SET favorite_count = favorite_count + 1 WHERE id = $1',
-        [parseInt(id)]
+        [parseInt(String(id))]
       );
     }
 
@@ -95,11 +112,11 @@ router.post('/', isAuthenticated, async (req, res) => {
 });
 
 // Remove from favorites
-router.delete('/:type/:id', isAuthenticated, async (req, res) => {
+router.delete('/:type/:id', isAuthenticated, async (req: Request<{ type: string; id: string }>, res: Response) => {
   try {
     const { type, id } = req.params;
 
-    const result = await db.query(
+    const result = await db.query<{ id: number }>(
       'DELETE FROM favorites WHERE user_id = $1 AND favoritable_type = $2 AND favoritable_id = $3 RETURNING id',
       [req.session.userId, type, parseInt(id)]
     );
@@ -124,11 +141,11 @@ router.delete('/:type/:id', isAuthenticated, async (req, res) => {
 });
 
 // Check if item is favorited
-router.get('/check/:type/:id', isAuthenticated, async (req, res) => {
+router.get('/check/:type/:id', isAuthenticated, async (req: Request<{ type: string; id: string }>, res: Response) => {
   try {
     const { type, id } = req.params;
 
-    const result = await db.query(
+    const result = await db.query<{ id: number }>(
       'SELECT id FROM favorites WHERE user_id = $1 AND favoritable_type = $2 AND favoritable_id = $3',
       [req.session.userId, type, parseInt(id)]
     );

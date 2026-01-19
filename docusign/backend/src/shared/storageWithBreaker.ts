@@ -1,4 +1,4 @@
-import { createCircuitBreaker } from './circuitBreaker.js';
+import { createCircuitBreaker, CircuitBreakerWithState } from './circuitBreaker.js';
 import { storageOperationDuration, storageOperationErrors } from './metrics.js';
 import logger from './logger.js';
 import * as MinioOriginal from '../utils/minio.js';
@@ -29,10 +29,19 @@ import * as MinioOriginal from '../utils/minio.js';
  *    storage outages, keeping other system components operational.
  */
 
+export interface StorageHealthStatus {
+  uploadDocument: { opened: boolean; halfOpen: boolean };
+  getDocument: { opened: boolean; halfOpen: boolean };
+  uploadSignature: { opened: boolean; halfOpen: boolean };
+  getSignature: { opened: boolean; halfOpen: boolean };
+  presignDocument: { opened: boolean; halfOpen: boolean };
+  presignSignature: { opened: boolean; halfOpen: boolean };
+}
+
 // Create circuit breakers for storage operations
-const uploadDocumentBreaker = createCircuitBreaker(
+const uploadDocumentBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_upload_document',
-  async (key, buffer, contentType) => {
+  async (key: string, buffer: Buffer, contentType: string): Promise<string> => {
     const end = storageOperationDuration.startTimer({ operation: 'upload', bucket: 'documents' });
     try {
       const result = await MinioOriginal.uploadDocument(key, buffer, contentType);
@@ -46,9 +55,9 @@ const uploadDocumentBreaker = createCircuitBreaker(
   { timeout: 30000, errorThresholdPercentage: 50 }
 );
 
-const getDocumentBreaker = createCircuitBreaker(
+const getDocumentBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_get_document',
-  async (key) => {
+  async (key: string): Promise<Buffer> => {
     const end = storageOperationDuration.startTimer({ operation: 'get', bucket: 'documents' });
     try {
       const result = await MinioOriginal.getDocumentBuffer(key);
@@ -62,9 +71,9 @@ const getDocumentBreaker = createCircuitBreaker(
   { timeout: 15000, errorThresholdPercentage: 50 }
 );
 
-const uploadSignatureBreaker = createCircuitBreaker(
+const uploadSignatureBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_upload_signature',
-  async (key, buffer, contentType) => {
+  async (key: string, buffer: Buffer, contentType: string): Promise<string> => {
     const end = storageOperationDuration.startTimer({ operation: 'upload', bucket: 'signatures' });
     try {
       const result = await MinioOriginal.uploadSignature(key, buffer, contentType);
@@ -78,9 +87,9 @@ const uploadSignatureBreaker = createCircuitBreaker(
   { timeout: 15000, errorThresholdPercentage: 50 }
 );
 
-const getSignatureBreaker = createCircuitBreaker(
+const getSignatureBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_get_signature',
-  async (key) => {
+  async (key: string): Promise<Buffer> => {
     const end = storageOperationDuration.startTimer({ operation: 'get', bucket: 'signatures' });
     try {
       const result = await MinioOriginal.getSignatureBuffer(key);
@@ -94,9 +103,9 @@ const getSignatureBreaker = createCircuitBreaker(
   { timeout: 15000, errorThresholdPercentage: 50 }
 );
 
-const getDocumentUrlBreaker = createCircuitBreaker(
+const getDocumentUrlBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_presign_document',
-  async (key, expiresInSeconds) => {
+  async (key: string, expiresInSeconds: number): Promise<string> => {
     const end = storageOperationDuration.startTimer({ operation: 'presign', bucket: 'documents' });
     try {
       const result = await MinioOriginal.getDocumentUrl(key, expiresInSeconds);
@@ -110,9 +119,9 @@ const getDocumentUrlBreaker = createCircuitBreaker(
   { timeout: 5000, errorThresholdPercentage: 50 }
 );
 
-const getSignatureUrlBreaker = createCircuitBreaker(
+const getSignatureUrlBreaker: CircuitBreakerWithState = createCircuitBreaker(
   'minio_presign_signature',
-  async (key, expiresInSeconds) => {
+  async (key: string, expiresInSeconds: number): Promise<string> => {
     const end = storageOperationDuration.startTimer({ operation: 'presign', bucket: 'signatures' });
     try {
       const result = await MinioOriginal.getSignatureUrl(key, expiresInSeconds);
@@ -129,11 +138,12 @@ const getSignatureUrlBreaker = createCircuitBreaker(
 /**
  * Upload document with circuit breaker protection.
  */
-export async function uploadDocument(key, buffer, contentType) {
+export async function uploadDocument(key: string, buffer: Buffer, contentType: string): Promise<string> {
   try {
-    return await uploadDocumentBreaker.fire(key, buffer, contentType);
+    return await uploadDocumentBreaker.fire(key, buffer, contentType) as string;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Document upload failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Document upload failed (circuit breaker)');
     throw error;
   }
 }
@@ -141,11 +151,12 @@ export async function uploadDocument(key, buffer, contentType) {
 /**
  * Get document buffer with circuit breaker protection.
  */
-export async function getDocumentBuffer(key) {
+export async function getDocumentBuffer(key: string): Promise<Buffer> {
   try {
-    return await getDocumentBreaker.fire(key);
+    return await getDocumentBreaker.fire(key) as Buffer;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Document retrieval failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Document retrieval failed (circuit breaker)');
     throw error;
   }
 }
@@ -153,11 +164,12 @@ export async function getDocumentBuffer(key) {
 /**
  * Upload signature with circuit breaker protection.
  */
-export async function uploadSignature(key, buffer, contentType) {
+export async function uploadSignature(key: string, buffer: Buffer, contentType: string): Promise<string> {
   try {
-    return await uploadSignatureBreaker.fire(key, buffer, contentType);
+    return await uploadSignatureBreaker.fire(key, buffer, contentType) as string;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Signature upload failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Signature upload failed (circuit breaker)');
     throw error;
   }
 }
@@ -165,11 +177,12 @@ export async function uploadSignature(key, buffer, contentType) {
 /**
  * Get signature buffer with circuit breaker protection.
  */
-export async function getSignatureBuffer(key) {
+export async function getSignatureBuffer(key: string): Promise<Buffer> {
   try {
-    return await getSignatureBreaker.fire(key);
+    return await getSignatureBreaker.fire(key) as Buffer;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Signature retrieval failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Signature retrieval failed (circuit breaker)');
     throw error;
   }
 }
@@ -177,11 +190,12 @@ export async function getSignatureBuffer(key) {
 /**
  * Get presigned document URL with circuit breaker protection.
  */
-export async function getDocumentUrl(key, expiresInSeconds = 3600) {
+export async function getDocumentUrl(key: string, expiresInSeconds: number = 3600): Promise<string> {
   try {
-    return await getDocumentUrlBreaker.fire(key, expiresInSeconds);
+    return await getDocumentUrlBreaker.fire(key, expiresInSeconds) as string;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Document URL generation failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Document URL generation failed (circuit breaker)');
     throw error;
   }
 }
@@ -189,11 +203,12 @@ export async function getDocumentUrl(key, expiresInSeconds = 3600) {
 /**
  * Get presigned signature URL with circuit breaker protection.
  */
-export async function getSignatureUrl(key, expiresInSeconds = 3600) {
+export async function getSignatureUrl(key: string, expiresInSeconds: number = 3600): Promise<string> {
   try {
-    return await getSignatureUrlBreaker.fire(key, expiresInSeconds);
+    return await getSignatureUrlBreaker.fire(key, expiresInSeconds) as string;
   } catch (error) {
-    logger.error({ error: error.message, key }, 'Signature URL generation failed (circuit breaker)');
+    const err = error as Error;
+    logger.error({ error: err.message, key }, 'Signature URL generation failed (circuit breaker)');
     throw error;
   }
 }
@@ -204,7 +219,7 @@ export { minioClient, initializeMinio } from '../utils/minio.js';
 /**
  * Get storage health status including circuit breaker states.
  */
-export function getStorageHealth() {
+export function getStorageHealth(): StorageHealthStatus {
   return {
     uploadDocument: {
       opened: uploadDocumentBreaker.opened,

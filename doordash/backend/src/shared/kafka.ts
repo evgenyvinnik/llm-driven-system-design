@@ -6,7 +6,7 @@
  * - location-updates: Real-time driver location updates
  * - dispatch-events: Driver assignment and dispatch events
  */
-import { Kafka, logLevel } from 'kafkajs';
+import { Kafka, logLevel, Producer } from 'kafkajs';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('kafka');
@@ -18,7 +18,7 @@ export const TOPICS = {
   ORDER_EVENTS: 'order-events',
   LOCATION_UPDATES: 'location-updates',
   DISPATCH_EVENTS: 'dispatch-events',
-};
+} as const;
 
 const kafka = new Kafka({
   clientId: CLIENT_ID,
@@ -30,13 +30,13 @@ const kafka = new Kafka({
   },
 });
 
-let producer = null;
+let producer: Producer | null = null;
 let isConnected = false;
 
 /**
  * Initialize Kafka producer and create topics.
  */
-export async function initializeKafka() {
+export async function initializeKafka(): Promise<void> {
   try {
     logger.info({ brokers: KAFKA_BROKERS }, 'Connecting to Kafka');
 
@@ -50,18 +50,20 @@ export async function initializeKafka() {
 
     logger.info('Kafka producer connected');
   } catch (error) {
-    logger.error({ error: error.message }, 'Failed to connect to Kafka');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Failed to connect to Kafka');
     throw error;
   }
 }
 
 /**
  * Publish an order event to Kafka.
- * @param {string} orderId - The order ID
- * @param {string} eventType - Event type (created, confirmed, preparing, ready, picked_up, delivered, cancelled)
- * @param {Object} payload - Additional event data
  */
-export async function publishOrderEvent(orderId, eventType, payload = {}) {
+export async function publishOrderEvent(
+  orderId: string,
+  eventType: string,
+  payload: Record<string, unknown> = {}
+): Promise<boolean> {
   if (!producer || !isConnected) {
     logger.warn({ orderId, eventType }, 'Kafka not connected, skipping event publish');
     return false;
@@ -91,19 +93,21 @@ export async function publishOrderEvent(orderId, eventType, payload = {}) {
     logger.info({ orderId, eventType }, 'Published order event');
     return true;
   } catch (error) {
-    logger.error({ error: error.message, orderId, eventType }, 'Failed to publish order event');
+    const err = error as Error;
+    logger.error({ error: err.message, orderId, eventType }, 'Failed to publish order event');
     return false;
   }
 }
 
 /**
  * Publish a driver location update to Kafka.
- * @param {string} driverId - The driver ID
- * @param {number} latitude - Current latitude
- * @param {number} longitude - Current longitude
- * @param {string} orderId - Optional associated order ID
  */
-export async function publishLocationUpdate(driverId, latitude, longitude, orderId = null) {
+export async function publishLocationUpdate(
+  driverId: string,
+  latitude: number,
+  longitude: number,
+  orderId: string | null = null
+): Promise<boolean> {
   if (!producer || !isConnected) {
     return false;
   }
@@ -129,19 +133,21 @@ export async function publishLocationUpdate(driverId, latitude, longitude, order
 
     return true;
   } catch (error) {
-    logger.error({ error: error.message, driverId }, 'Failed to publish location update');
+    const err = error as Error;
+    logger.error({ error: err.message, driverId }, 'Failed to publish location update');
     return false;
   }
 }
 
 /**
  * Publish a dispatch event to Kafka.
- * @param {string} orderId - The order ID
- * @param {string} driverId - The assigned driver ID
- * @param {string} eventType - Event type (assigned, accepted, declined, unassigned)
- * @param {Object} payload - Additional event data
  */
-export async function publishDispatchEvent(orderId, driverId, eventType, payload = {}) {
+export async function publishDispatchEvent(
+  orderId: string,
+  driverId: string,
+  eventType: string,
+  payload: Record<string, unknown> = {}
+): Promise<boolean> {
   if (!producer || !isConnected) {
     return false;
   }
@@ -171,7 +177,8 @@ export async function publishDispatchEvent(orderId, driverId, eventType, payload
     logger.info({ orderId, driverId, eventType }, 'Published dispatch event');
     return true;
   } catch (error) {
-    logger.error({ error: error.message, orderId, driverId }, 'Failed to publish dispatch event');
+    const err = error as Error;
+    logger.error({ error: err.message, orderId, driverId }, 'Failed to publish dispatch event');
     return false;
   }
 }
@@ -179,14 +186,14 @@ export async function publishDispatchEvent(orderId, driverId, eventType, payload
 /**
  * Check if Kafka is connected.
  */
-export function isKafkaReady() {
+export function isKafkaReady(): boolean {
   return isConnected;
 }
 
 /**
  * Close Kafka connection gracefully.
  */
-export async function closeKafka() {
+export async function closeKafka(): Promise<void> {
   try {
     if (producer) {
       await producer.disconnect();
@@ -195,6 +202,7 @@ export async function closeKafka() {
       logger.info('Kafka producer disconnected');
     }
   } catch (error) {
-    logger.error({ error: error.message }, 'Error closing Kafka connection');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Error closing Kafka connection');
   }
 }

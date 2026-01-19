@@ -1,21 +1,38 @@
 import { Router } from 'express';
+import type { Request, Response } from 'express';
 import routingService from '../services/routingService.js';
 import logger from '../shared/logger.js';
 
 const router = Router();
 
+interface RouteRequestBody {
+  origin?: {
+    lat: number;
+    lng: number;
+  };
+  destination?: {
+    lat: number;
+    lng: number;
+  };
+  options?: {
+    avoidTolls?: boolean;
+    avoidHighways?: boolean;
+  };
+}
+
 /**
  * Calculate route between two points
  * POST /api/routes
  */
-router.post('/', async (req, res) => {
+router.post('/', async (req: Request<object, unknown, RouteRequestBody>, res: Response): Promise<void> => {
   try {
     const { origin, destination, options = {} } = req.body;
 
     if (!origin || !destination) {
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Origin and destination are required',
       });
+      return;
     }
 
     const route = await routingService.findRoute(
@@ -31,9 +48,9 @@ router.post('/', async (req, res) => {
       route,
     });
   } catch (error) {
-    logger.error({ error: error.message, path: '/api/routes' }, 'Route calculation error');
+    logger.error({ error: (error as Error).message, path: '/api/routes' }, 'Route calculation error');
     res.status(500).json({
-      error: error.message || 'Failed to calculate route',
+      error: (error as Error).message || 'Failed to calculate route',
     });
   }
 });
@@ -42,14 +59,15 @@ router.post('/', async (req, res) => {
  * Get route with alternatives
  * POST /api/routes/alternatives
  */
-router.post('/alternatives', async (req, res) => {
+router.post('/alternatives', async (req: Request<object, unknown, RouteRequestBody>, res: Response): Promise<void> => {
   try {
     const { origin, destination, options = {} } = req.body;
 
     if (!origin || !destination) {
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Origin and destination are required',
       });
+      return;
     }
 
     const primaryRoute = await routingService.findRoute(
@@ -74,9 +92,9 @@ router.post('/alternatives', async (req, res) => {
       routes: [primaryRoute, ...alternatives],
     });
   } catch (error) {
-    logger.error({ error: error.message, path: '/api/routes/alternatives' }, 'Route alternatives error');
+    logger.error({ error: (error as Error).message, path: '/api/routes/alternatives' }, 'Route alternatives error');
     res.status(500).json({
-      error: error.message || 'Failed to calculate routes',
+      error: (error as Error).message || 'Failed to calculate routes',
     });
   }
 });

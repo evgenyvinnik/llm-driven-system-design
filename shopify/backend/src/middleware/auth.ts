@@ -1,10 +1,43 @@
+import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { getSession, setSession, deleteSession } from '../services/redis.js';
+import { getSession, setSession, deleteSession, SessionData } from '../services/redis.js';
 import { query } from '../services/db.js';
 import bcrypt from 'bcryptjs';
 
+// User interface
+interface User {
+  id: number;
+  email: string;
+  name: string;
+  role: string;
+}
+
+// User row from database
+interface UserRow {
+  id: number;
+  email: string;
+  password_hash: string;
+  name: string;
+  role: string;
+}
+
+// Extend Express Request to include user and session properties
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+      sessionId?: string;
+      storeId?: number;
+    }
+  }
+}
+
 // Authenticate merchant from session cookie
-export async function authMiddleware(req, res, next) {
+export async function authMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void | Response> {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
@@ -22,7 +55,11 @@ export async function authMiddleware(req, res, next) {
 }
 
 // Authenticate and require store ownership
-export async function storeOwnerMiddleware(req, res, next) {
+export async function storeOwnerMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void | Response> {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
@@ -53,7 +90,7 @@ export async function storeOwnerMiddleware(req, res, next) {
 }
 
 // Login handler
-export async function login(req, res) {
+export async function login(req: Request, res: Response): Promise<void | Response> {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -69,7 +106,7 @@ export async function login(req, res) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  const user = result.rows[0];
+  const user = result.rows[0] as UserRow;
   const validPassword = await bcrypt.compare(password, user.password_hash);
 
   if (!validPassword) {
@@ -78,14 +115,15 @@ export async function login(req, res) {
 
   // Create session
   const sessionId = uuidv4();
-  await setSession(sessionId, {
+  const sessionData: SessionData = {
     user: {
       id: user.id,
       email: user.email,
       name: user.name,
       role: user.role,
     },
-  });
+  };
+  await setSession(sessionId, sessionData);
 
   res.cookie('session', sessionId, {
     httpOnly: true,
@@ -105,7 +143,7 @@ export async function login(req, res) {
 }
 
 // Register handler
-export async function register(req, res) {
+export async function register(req: Request, res: Response): Promise<void | Response> {
   const { email, password, name } = req.body;
 
   if (!email || !password) {
@@ -127,11 +165,12 @@ export async function register(req, res) {
     [email, passwordHash, name || email.split('@')[0]]
   );
 
-  const user = result.rows[0];
+  const user = result.rows[0] as User;
 
   // Create session
   const sessionId = uuidv4();
-  await setSession(sessionId, { user });
+  const sessionData: SessionData = { user };
+  await setSession(sessionId, sessionData);
 
   res.cookie('session', sessionId, {
     httpOnly: true,
@@ -144,7 +183,7 @@ export async function register(req, res) {
 }
 
 // Logout handler
-export async function logout(req, res) {
+export async function logout(req: Request, res: Response): Promise<void> {
   const sessionId = req.cookies?.session;
   if (sessionId) {
     await deleteSession(sessionId);
@@ -154,7 +193,7 @@ export async function logout(req, res) {
 }
 
 // Get current user
-export async function me(req, res) {
+export async function me(req: Request, res: Response): Promise<void | Response> {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {

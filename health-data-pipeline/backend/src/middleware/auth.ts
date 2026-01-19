@@ -1,23 +1,43 @@
-import { authService } from '../services/authService.js';
+import { Request, Response, NextFunction } from 'express';
+import { authService, User } from '../services/authService.js';
 
-export async function authMiddleware(req, res, next) {
+// Extend Express Request to include user and token
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+      token?: string;
+      requestId?: string;
+      log?: import('pino').Logger;
+    }
+  }
+}
+
+export async function authMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No authentication token provided' });
+      res.status(401).json({ error: 'No authentication token provided' });
+      return;
     }
 
     const token = authHeader.substring(7);
     const userId = await authService.validateSession(token);
 
     if (!userId) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
     }
 
     const user = await authService.getUser(userId);
     if (!user) {
-      return res.status(401).json({ error: 'User not found' });
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
     req.user = user;
@@ -29,9 +49,14 @@ export async function authMiddleware(req, res, next) {
   }
 }
 
-export function adminMiddleware(req, res, next) {
+export function adminMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
   if (!req.user || req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 }

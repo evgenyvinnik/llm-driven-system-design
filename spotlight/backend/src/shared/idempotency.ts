@@ -1,13 +1,31 @@
 import crypto from 'crypto';
+import { Request, Response, NextFunction } from 'express';
 import { redis, cacheGet, cacheSet, cacheDel } from './redis.js';
 import { idempotencyCacheHitsTotal } from './metrics.js';
 import { indexLogger } from './logger.js';
+
+export interface IdempotencyCacheEntry {
+  result: {
+    statusCode?: number;
+    body: unknown;
+  } | null;
+  status: 'completed' | 'in_progress';
+  timestamp: number;
+}
+
+export interface IdempotencyResult {
+  replayed?: boolean;
+  [key: string]: unknown;
+}
 
 /**
  * Redis-backed idempotency store
  * Provides distributed idempotency checking across multiple server instances
  */
 class IdempotencyStore {
+  private ttlSeconds: number;
+  private keyPrefix: string;
+
   constructor() {
     // Default TTL: 24 hours (in seconds for Redis)
     this.ttlSeconds = 24 * 60 * 60;
@@ -16,21 +34,16 @@ class IdempotencyStore {
 
   /**
    * Get a cached result for an idempotency key
-   * @param {string} key - Idempotency key
-   * @returns {Promise<Object|null>} - Cached result or null
    */
-  async get(key) {
-    const entry = await cacheGet(this.keyPrefix + key);
+  async get(key: string): Promise<IdempotencyCacheEntry | null> {
+    const entry = await cacheGet<IdempotencyCacheEntry>(this.keyPrefix + key);
     return entry;
   }
 
   /**
    * Set a result for an idempotency key
-   * @param {string} key - Idempotency key
-   * @param {Object} result - Result to cache
-   * @param {string} status - Status of the operation
    */
-  async set(key, result, status = 'completed') {
+  async set(key: string, result: unknown, status: 'completed' | 'in_progress' = 'completed'): Promise<void> {
     await cacheSet(
       this.keyPrefix + key,
       { result, status, timestamp: Date.now() },
@@ -41,10 +54,8 @@ class IdempotencyStore {
   /**
    * Mark an operation as in-progress
    * Uses Redis SETNX for atomic check-and-set
-   * @param {string} key - Idempotency key
-   * @returns {Promise<boolean>} - True if successfully marked, false if already in progress
    */
-  async markInProgress(key) {
+  async markInProgress(key: string): Promise<boolean> {
     const redisKey = this.keyPrefix + key;
     // Use SETNX (SET if Not eXists) for atomic operation
     const result = await redis.setnx(redisKey, JSON.stringify({
@@ -63,17 +74,15 @@ class IdempotencyStore {
 
   /**
    * Remove an idempotency key (for failed operations that should be retried)
-   * @param {string} key - Idempotency key
    */
-  async remove(key) {
+  async remove(key: string): Promise<void> {
     await cacheDel(this.keyPrefix + key);
   }
 
   /**
    * Get the approximate number of cached entries (for monitoring)
-   * @returns {Promise<number>} - Number of entries
    */
-  async size() {
+  async size(): Promise<number> {
     const keys = await redis.keys(this.keyPrefix + '*');
     return keys.length;
   }
@@ -81,7 +90,7 @@ class IdempotencyStore {
   /**
    * Stop the store (no-op for Redis, kept for API compatibility)
    */
-  stop() {
+  stop(): void {
     // Redis handles its own connection management
   }
 }
@@ -91,25 +100,26 @@ const store = new IdempotencyStore();
 
 /**
  * Generate an idempotency key from request data
- * @param {string} operation - Operation type (e.g., 'index_file')
- * @param {Object} data - Request data to hash
- * @returns {string} - Generated idempotency key
  */
-export function generateIdempotencyKey(operation, data) {
+export function generateIdempotencyKey(operation: string, data: unknown): string {
   const hash = crypto.createHash('sha256');
   hash.update(operation);
   hash.update(JSON.stringify(data));
   return `${operation}:${hash.digest('hex').substring(0, 32)}`;
 }
 
+// Extended Response type for idempotency middleware
+interface IdempotencyResponse extends Response {
+  json: (body: unknown) => Response;
+}
+
 /**
  * Express middleware for handling idempotency
  * Checks Idempotency-Key header and returns cached results if available
- * @param {string} operationType - Type of operation for logging/metrics
  */
-export function idempotencyMiddleware(operationType = 'unknown') {
-  return async (req, res, next) => {
-    const idempotencyKey = req.headers['idempotency-key'];
+export function idempotencyMiddleware(operationType: string = 'unknown') {
+  return async (req: Request, res: IdempotencyResponse, next: NextFunction): Promise<void> => {
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
     if (!idempotencyKey) {
       // No idempotency key provided, proceed normally
@@ -122,11 +132,12 @@ export function idempotencyMiddleware(operationType = 'unknown') {
     if (cached) {
       if (cached.status === 'in_progress') {
         // Operation is still in progress
-        return res.status(409).json({
+        res.status(409).json({
           error: 'Request with this idempotency key is still in progress',
           code: 'OPERATION_IN_PROGRESS',
           idempotencyKey
         });
+        return;
       }
 
       // Return cached result
@@ -139,26 +150,29 @@ export function idempotencyMiddleware(operationType = 'unknown') {
 
       res.set('X-Idempotency-Key', idempotencyKey);
       res.set('X-Idempotency-Replayed', 'true');
-      return res.status(cached.result.statusCode || 200).json(cached.result.body);
+      const result = cached.result as { statusCode?: number; body: unknown } | null;
+      res.status(result?.statusCode || 200).json(result?.body);
+      return;
     }
 
     // Mark operation as in progress
     const marked = await store.markInProgress(idempotencyKey);
     if (!marked) {
       // Race condition: another request just started
-      return res.status(409).json({
+      res.status(409).json({
         error: 'Request with this idempotency key is being processed',
         code: 'OPERATION_IN_PROGRESS',
         idempotencyKey
       });
+      return;
     }
 
     // Store original json method to capture response
     const originalJson = res.json.bind(res);
-    let responseBody = null;
+    let responseBody: unknown = null;
     let responseStatus = 200;
 
-    res.json = (body) => {
+    res.json = (body: unknown): Response => {
       responseBody = body;
       responseStatus = res.statusCode;
       return originalJson(body);
@@ -198,15 +212,15 @@ export function idempotencyMiddleware(operationType = 'unknown') {
 
 /**
  * Wrapper function for idempotent operations
- * @param {string} idempotencyKey - The idempotency key
- * @param {Function} operation - Async function to execute
- * @param {string} operationType - Type of operation for logging
- * @returns {Promise<Object>} - Result of the operation
  */
-export async function withIdempotency(idempotencyKey, operation, operationType = 'unknown') {
+export async function withIdempotency<T extends Record<string, unknown>>(
+  idempotencyKey: string | undefined | null,
+  operation: () => Promise<T>,
+  operationType: string = 'unknown'
+): Promise<T & IdempotencyResult> {
   if (!idempotencyKey) {
     // No key, just execute the operation
-    return operation();
+    return operation() as Promise<T & IdempotencyResult>;
   }
 
   // Check for cached result
@@ -224,7 +238,7 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
       cacheHit: true
     }, 'Idempotency cache hit');
 
-    return { ...cached.result, replayed: true };
+    return { ...(cached.result as T), replayed: true };
   }
 
   // Mark as in progress
@@ -245,7 +259,7 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
       cached: true
     }, 'Idempotency result cached');
 
-    return result;
+    return result as T & IdempotencyResult;
   } catch (error) {
     // Remove from cache on failure so operation can be retried
     await store.remove(idempotencyKey);
@@ -255,16 +269,15 @@ export async function withIdempotency(idempotencyKey, operation, operationType =
 
 /**
  * Get the idempotency store (for testing/monitoring)
- * @returns {IdempotencyStore} - The store instance
  */
-export function getIdempotencyStore() {
+export function getIdempotencyStore(): IdempotencyStore {
   return store;
 }
 
 /**
  * Clear the idempotency store (for testing)
  */
-export async function clearIdempotencyStore() {
+export async function clearIdempotencyStore(): Promise<void> {
   const keys = await redis.keys('idempotency:*');
   if (keys.length > 0) {
     await redis.del(...keys);

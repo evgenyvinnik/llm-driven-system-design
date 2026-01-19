@@ -1,9 +1,45 @@
 import { db } from '../config/database.js';
-import { cache } from '../config/redis.js';
+
+export interface Insight {
+  type: string;
+  severity: string;
+  direction: string | null;
+  message: string;
+  recommendation: string;
+  data: Record<string, unknown>;
+}
+
+export interface InsightRow {
+  id: string;
+  user_id: string;
+  type: string;
+  severity: string;
+  direction: string | null;
+  message: string;
+  recommendation: string;
+  data: Record<string, unknown>;
+  acknowledged: boolean;
+  created_at: Date;
+}
+
+interface AggregateRow {
+  period_start: Date;
+  value: number;
+}
+
+interface GetInsightsOptions {
+  limit?: number;
+  unreadOnly?: boolean;
+}
+
+interface TrendResult {
+  slope: number;
+  intercept: number;
+}
 
 export class InsightsService {
-  async analyzeUser(userId) {
-    const insights = [];
+  async analyzeUser(userId: string): Promise<Insight[]> {
+    const insights: Insight[] = [];
 
     // Heart rate trends
     const hrInsight = await this.analyzeHeartRate(userId);
@@ -29,8 +65,8 @@ export class InsightsService {
     return insights;
   }
 
-  async analyzeHeartRate(userId) {
-    const data = await db.query(
+  async analyzeHeartRate(userId: string): Promise<Insight | null> {
+    const data = await db.query<AggregateRow>(
       `SELECT period_start, value
        FROM health_aggregates
        WHERE user_id = $1
@@ -71,8 +107,8 @@ export class InsightsService {
     return null;
   }
 
-  async analyzeSleep(userId) {
-    const data = await db.query(
+  async analyzeSleep(userId: string): Promise<Insight | null> {
+    const data = await db.query<AggregateRow>(
       `SELECT period_start, value
        FROM health_aggregates
        WHERE user_id = $1
@@ -111,8 +147,8 @@ export class InsightsService {
     return null;
   }
 
-  async analyzeActivity(userId) {
-    const thisWeek = await db.query(
+  async analyzeActivity(userId: string): Promise<Insight | null> {
+    const thisWeek = await db.query<{ total: string }>(
       `SELECT COALESCE(SUM(value), 0) as total
        FROM health_aggregates
        WHERE user_id = $1
@@ -122,7 +158,7 @@ export class InsightsService {
       [userId]
     );
 
-    const lastMonth = await db.query(
+    const lastMonth = await db.query<{ avg: string }>(
       `SELECT COALESCE(AVG(weekly_total), 0) as avg
        FROM (
          SELECT DATE_TRUNC('week', period_start) as week, SUM(value) as weekly_total
@@ -162,8 +198,8 @@ export class InsightsService {
     return null;
   }
 
-  async analyzeWeight(userId) {
-    const data = await db.query(
+  async analyzeWeight(userId: string): Promise<Insight | null> {
+    const data = await db.query<AggregateRow>(
       `SELECT period_start, value
        FROM health_aggregates
        WHERE user_id = $1
@@ -196,7 +232,7 @@ export class InsightsService {
     return null;
   }
 
-  calculateTrend(values) {
+  calculateTrend(values: number[]): TrendResult {
     const n = values.length;
     if (n < 2) return { slope: 0, intercept: values[0] || 0 };
 
@@ -211,9 +247,9 @@ export class InsightsService {
     return { slope, intercept };
   }
 
-  async storeInsight(userId, insight) {
+  async storeInsight(userId: string, insight: Insight): Promise<void> {
     // Check for duplicate recent insight
-    const existing = await db.query(
+    const existing = await db.query<{ id: string }>(
       `SELECT id FROM health_insights
        WHERE user_id = $1
          AND type = $2
@@ -238,14 +274,14 @@ export class InsightsService {
     }
   }
 
-  async getUserInsights(userId, options = {}) {
+  async getUserInsights(userId: string, options: GetInsightsOptions = {}): Promise<InsightRow[]> {
     const { limit = 10, unreadOnly = false } = options;
 
     let query = `
       SELECT * FROM health_insights
       WHERE user_id = $1
     `;
-    const params = [userId];
+    const params: unknown[] = [userId];
 
     if (unreadOnly) {
       query += ` AND acknowledged = false`;
@@ -254,11 +290,11 @@ export class InsightsService {
     query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
     params.push(limit);
 
-    const result = await db.query(query, params);
+    const result = await db.query<InsightRow>(query, params);
     return result.rows;
   }
 
-  async acknowledgeInsight(userId, insightId) {
+  async acknowledgeInsight(userId: string, insightId: string): Promise<void> {
     await db.query(
       `UPDATE health_insights
        SET acknowledged = true

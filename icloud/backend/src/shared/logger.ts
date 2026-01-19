@@ -6,7 +6,9 @@
  * and analysis while remaining human-readable in development with pino-pretty.
  */
 
-import pino from 'pino';
+import crypto from 'crypto';
+import pino, { Logger } from 'pino';
+import type { Request, Response, NextFunction } from 'express';
 
 const isDevelopment = process.env.NODE_ENV === 'development';
 
@@ -20,7 +22,7 @@ const loggerConfig = {
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   formatters: {
-    level: (label) => ({ level: label }),
+    level: (label: string) => ({ level: label }),
   },
 };
 
@@ -36,7 +38,7 @@ const transport = isDevelopment
     }
   : undefined;
 
-export const logger = pino({
+export const logger: Logger = pino({
   ...loggerConfig,
   ...(transport && { transport }),
 });
@@ -45,16 +47,25 @@ export const logger = pino({
  * Create a child logger with additional context
  * Useful for request-scoped logging with correlation IDs
  */
-export function createChildLogger(bindings) {
+export function createChildLogger(bindings: Record<string, unknown>): Logger {
   return logger.child(bindings);
+}
+
+// Extend Express Request type to include log property
+declare global {
+  namespace Express {
+    interface Request {
+      log?: Logger;
+    }
+  }
 }
 
 /**
  * Request logging middleware for Express
  * Adds correlation ID and logs request/response details
  */
-export function requestLogger(req, res, next) {
-  const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
+export function requestLogger(req: Request, res: Response, next: NextFunction): void {
+  const correlationId = (req.headers['x-correlation-id'] as string) || crypto.randomUUID();
   const startTime = Date.now();
 
   // Attach logger to request for use in handlers
@@ -74,7 +85,7 @@ export function requestLogger(req, res, next) {
   // Log response on finish
   res.on('finish', () => {
     const duration = Date.now() - startTime;
-    req.log.info({
+    req.log?.info({
       event: 'request.completed',
       statusCode: res.statusCode,
       durationMs: duration,
@@ -91,9 +102,21 @@ export function requestLogger(req, res, next) {
  * Audit logger for security and compliance events
  * These logs should have longer retention and stricter access controls
  */
-export const auditLogger = logger.child({ type: 'audit' });
+export const auditLogger: Logger = logger.child({ type: 'audit' });
 
-export function logAuditEvent(event) {
+export interface AuditEvent {
+  type: string;
+  userId?: string;
+  deviceId?: string;
+  resourceType?: string;
+  resourceId?: string;
+  action?: string;
+  metadata?: Record<string, unknown>;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+export function logAuditEvent(event: AuditEvent): void {
   auditLogger.info({
     event: event.type,
     userId: event.userId,

@@ -11,34 +11,60 @@
  */
 
 import crypto from 'crypto';
+import type { Redis } from 'ioredis';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { TTL } from './cache.js';
 import logger from './logger.js';
 
-const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
+export const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
 const LOCK_PREFIX = 'idempotency:lock:';
 const RESULT_PREFIX = 'idempotency:result:';
+
+export interface IdempotencyResult {
+  statusCode: number;
+  body: unknown;
+  processedAt: string;
+}
+
+export interface CheckResult {
+  processed: boolean;
+  result?: IdempotencyResult;
+  conflict?: boolean;
+  error?: string;
+}
+
+// Extend Express Request to include idempotency handler
+declare global {
+  namespace Express {
+    interface Request {
+      idempotency?: IdempotencyHandler;
+    }
+  }
+}
 
 /**
  * Idempotency middleware factory
  */
-export function createIdempotencyMiddleware(redis) {
-  return function idempotencyMiddleware(req, res, next) {
-    const idempotencyKey = req.headers[IDEMPOTENCY_KEY_HEADER];
+export function createIdempotencyMiddleware(redis: Redis): RequestHandler {
+  return function idempotencyMiddleware(req: Request, res: Response, next: NextFunction): void {
+    const idempotencyKey = req.headers[IDEMPOTENCY_KEY_HEADER] as string | undefined;
 
     // If no idempotency key provided, proceed normally
     if (!idempotencyKey) {
-      return next();
+      next();
+      return;
     }
 
     // Validate key format (should be a reasonable length string)
     if (typeof idempotencyKey !== 'string' || idempotencyKey.length > 256) {
-      return res.status(400).json({
+      res.status(400).json({
         error: 'Invalid idempotency key format',
       });
+      return;
     }
 
     // Attach idempotency handler to request
-    req.idempotency = new IdempotencyHandler(redis, idempotencyKey, req, res);
+    req.idempotency = new IdempotencyHandler(redis, idempotencyKey);
     next();
   };
 }
@@ -47,11 +73,14 @@ export function createIdempotencyMiddleware(redis) {
  * Idempotency handler for individual requests
  */
 export class IdempotencyHandler {
-  constructor(redis, key, req, res) {
+  private redis: Redis;
+  private key: string;
+  private lockKey: string;
+  private resultKey: string;
+
+  constructor(redis: Redis, key: string) {
     this.redis = redis;
     this.key = key;
-    this.req = req;
-    this.res = res;
     this.lockKey = `${LOCK_PREFIX}${key}`;
     this.resultKey = `${RESULT_PREFIX}${key}`;
   }
@@ -61,7 +90,7 @@ export class IdempotencyHandler {
    * Returns { processed: true, result: {...} } if already done
    * Returns { processed: false } if new request
    */
-  async checkAndLock() {
+  async checkAndLock(): Promise<CheckResult> {
     // Check if result already exists
     const existingResult = await this.redis.get(this.resultKey);
     if (existingResult) {
@@ -71,7 +100,7 @@ export class IdempotencyHandler {
       );
       return {
         processed: true,
-        result: JSON.parse(existingResult),
+        result: JSON.parse(existingResult) as IdempotencyResult,
       };
     }
 
@@ -113,8 +142,8 @@ export class IdempotencyHandler {
   /**
    * Save the result for future duplicate requests
    */
-  async saveResult(result, statusCode = 200) {
-    const resultData = {
+  async saveResult(result: unknown, statusCode: number = 200): Promise<IdempotencyResult> {
+    const resultData: IdempotencyResult = {
       statusCode,
       body: result,
       processedAt: new Date().toISOString(),
@@ -138,20 +167,20 @@ export class IdempotencyHandler {
    * Release lock on error without saving result
    * This allows the request to be retried
    */
-  async releaseLock() {
+  async releaseLock(): Promise<void> {
     await this.redis.del(this.lockKey);
   }
 
   /**
    * Wait for another request to complete and return its result
    */
-  async _waitForResult(maxWaitMs = 30000, pollIntervalMs = 100) {
+  private async _waitForResult(maxWaitMs: number = 30000, pollIntervalMs: number = 100): Promise<IdempotencyResult | null> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitMs) {
       const result = await this.redis.get(this.resultKey);
       if (result) {
-        return JSON.parse(result);
+        return JSON.parse(result) as IdempotencyResult;
       }
 
       // Check if lock still exists
@@ -172,42 +201,47 @@ export class IdempotencyHandler {
  * Express middleware that wraps sync operations with idempotency
  * Use this decorator for routes that need idempotency protection
  */
-export function withIdempotency(handler) {
-  return async (req, res, next) => {
+export function withIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>
+): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // If no idempotency handler attached, run normally
     if (!req.idempotency) {
-      return handler(req, res, next);
+      await handler(req, res, next);
+      return;
     }
 
     try {
       // Check for existing result
       const check = await req.idempotency.checkAndLock();
 
-      if (check.processed) {
+      if (check.processed && check.result) {
         // Return cached result
-        return res
-          .status(check.result.statusCode)
-          .json(check.result.body);
+        res.status(check.result.statusCode).json(check.result.body);
+        return;
       }
 
       if (check.conflict) {
-        return res.status(409).json({
+        res.status(409).json({
           error: check.error,
           retryAfter: 5,
         });
+        return;
       }
 
       // Override res.json to capture the result
       const originalJson = res.json.bind(res);
-      res.json = async function (data) {
-        try {
-          await req.idempotency.saveResult(data, res.statusCode);
-        } catch (saveError) {
-          logger.error(
-            { error: saveError.message },
-            'Failed to save idempotent result'
-          );
-        }
+      res.json = function (data: unknown) {
+        (async () => {
+          try {
+            await req.idempotency?.saveResult(data, res.statusCode);
+          } catch (saveError) {
+            logger.error(
+              { error: (saveError as Error).message },
+              'Failed to save idempotent result'
+            );
+          }
+        })();
         return originalJson(data);
       };
 
@@ -225,7 +259,7 @@ export function withIdempotency(handler) {
  * Generate an idempotency key from request data
  * Useful for clients to generate deterministic keys
  */
-export function generateIdempotencyKey(userId, operation, data) {
+export function generateIdempotencyKey(userId: string, operation: string, data: unknown): string {
   const payload = JSON.stringify({
     userId,
     operation,

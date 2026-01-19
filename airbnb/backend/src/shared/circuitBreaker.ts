@@ -182,16 +182,16 @@ export function getAllCircuitBreakersStatus(): Record<string, CircuitBreakerStat
  * More tolerant of failures since search can return cached/stale results
  */
 export function createSearchCircuitBreaker<T>(searchFn: AsyncFunction<T>): CircuitBreaker<unknown[], T | SearchFallbackResult> {
-  return createCircuitBreaker(
+  return createCircuitBreaker<T | SearchFallbackResult>(
     'search',
-    searchFn,
+    searchFn as AsyncFunction<T | SearchFallbackResult>,
     {
       timeout: 5000,              // 5 second timeout
       errorThresholdPercentage: 60, // More tolerant
       resetTimeout: 20000,         // Try again after 20 seconds
     },
     // Fallback: return empty results
-    async (): Promise<SearchFallbackResult> => {
+    async (): Promise<T | SearchFallbackResult> => {
       log.warn('Search circuit breaker fallback - returning empty results');
       return { listings: [], total: 0, fromFallback: true };
     }
@@ -203,16 +203,16 @@ export function createSearchCircuitBreaker<T>(searchFn: AsyncFunction<T>): Circu
  * Critical operation - needs to fail fast
  */
 export function createAvailabilityCircuitBreaker<T>(checkFn: AsyncFunction<T>): CircuitBreaker<unknown[], T | AvailabilityFallbackResult> {
-  return createCircuitBreaker(
+  return createCircuitBreaker<T | AvailabilityFallbackResult>(
     'availability',
-    checkFn,
+    checkFn as AsyncFunction<T | AvailabilityFallbackResult>,
     {
       timeout: 3000,              // 3 second timeout
       errorThresholdPercentage: 40, // Less tolerant
       resetTimeout: 15000,         // Try again after 15 seconds
     },
     // Fallback: assume unavailable (safe default)
-    async (): Promise<AvailabilityFallbackResult> => {
+    async (): Promise<T | AvailabilityFallbackResult> => {
       log.warn('Availability circuit breaker fallback - assuming unavailable');
       return { available: false, fromFallback: true, error: 'Service temporarily unavailable' };
     }

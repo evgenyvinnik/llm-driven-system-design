@@ -25,10 +25,30 @@
  * - Retry only on specific error types (network, timeout, rate limit)
  */
 
-const { logger } = require('./logger');
+import { logger } from './logger.js';
+
+export interface RetryConfig {
+  maxRetries: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+  retryableErrors: string[];
+  jitterFactor: number;
+}
+
+export interface RetryOptions extends Partial<RetryConfig> {
+  operationName?: string;
+  configType?: 'database' | 'externalPayment' | 'cache';
+  context?: Record<string, unknown>;
+}
+
+interface RetryableError extends Error {
+  code?: string;
+  status?: number;
+}
 
 // Retry configurations for different operation types
-const RETRY_CONFIGS = {
+export const RETRY_CONFIGS: Record<string, RetryConfig> = {
   // Internal database operations - quick retries
   database: {
     maxRetries: 3,
@@ -80,10 +100,8 @@ const RETRY_CONFIGS = {
 
 /**
  * Sleep for a specified duration with optional jitter
- * @param {number} ms - Base sleep time in milliseconds
- * @param {number} jitterFactor - Jitter factor (0.1 = +/- 10%)
  */
-async function sleep(ms, jitterFactor = 0) {
+export async function sleep(ms: number, jitterFactor: number = 0): Promise<void> {
   const jitter = jitterFactor > 0 ? ms * jitterFactor * (Math.random() * 2 - 1) : 0;
   const actualDelay = Math.max(0, Math.round(ms + jitter));
   return new Promise((resolve) => setTimeout(resolve, actualDelay));
@@ -91,10 +109,8 @@ async function sleep(ms, jitterFactor = 0) {
 
 /**
  * Check if an error is retryable based on configuration
- * @param {Error} error - The error to check
- * @param {string[]} retryableErrors - List of retryable error patterns
  */
-function isRetryable(error, retryableErrors) {
+export function isRetryable(error: RetryableError, retryableErrors: string[]): boolean {
   const errorString = `${error.code || ''} ${error.message || ''} ${error.status || ''}`;
   return retryableErrors.some(
     (pattern) => errorString.includes(pattern) || error.code === pattern
@@ -103,15 +119,11 @@ function isRetryable(error, retryableErrors) {
 
 /**
  * Execute an operation with retry and exponential backoff
- *
- * @param {Function} operation - Async function to execute
- * @param {Object} options - Retry configuration
- * @param {string} options.operationName - Name for logging
- * @param {string} options.configType - Config preset: 'database', 'externalPayment', 'cache'
- * @param {Object} options.context - Additional context for logging
- * @returns {Promise} Result of the operation
  */
-async function retryWithBackoff(operation, options = {}) {
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  options: RetryOptions = {}
+): Promise<T> {
   const {
     operationName = 'unknown_operation',
     configType = 'database',
@@ -129,7 +141,7 @@ async function retryWithBackoff(operation, options = {}) {
     jitterFactor,
   } = config;
 
-  let lastError;
+  let lastError: RetryableError | undefined;
   let delay = initialDelayMs;
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
@@ -149,16 +161,16 @@ async function retryWithBackoff(operation, options = {}) {
 
       return result;
     } catch (error) {
-      lastError = error;
+      lastError = error as RetryableError;
 
       // Check if error is retryable
-      if (!isRetryable(error, retryableErrors)) {
+      if (!isRetryable(lastError, retryableErrors)) {
         logger.debug({
           event: 'retry_not_retryable',
           operation: operationName,
           attempt,
-          errorCode: error.code,
-          errorMessage: error.message,
+          errorCode: lastError.code,
+          errorMessage: lastError.message,
           ...context,
         });
         throw error;
@@ -171,8 +183,8 @@ async function retryWithBackoff(operation, options = {}) {
           operation: operationName,
           attempts: attempt,
           maxRetries,
-          errorCode: error.code,
-          errorMessage: error.message,
+          errorCode: lastError.code,
+          errorMessage: lastError.message,
           ...context,
         });
         throw error;
@@ -185,8 +197,8 @@ async function retryWithBackoff(operation, options = {}) {
         attempt,
         maxRetries: maxRetries + 1,
         delayMs: delay,
-        errorCode: error.code,
-        errorMessage: error.message,
+        errorCode: lastError.code,
+        errorMessage: lastError.message,
         ...context,
       });
 
@@ -203,13 +215,16 @@ async function retryWithBackoff(operation, options = {}) {
 
 /**
  * Decorator to wrap an async function with retry logic
- * @param {Object} options - Retry configuration
  */
-function withRetry(options = {}) {
-  return function (target, propertyKey, descriptor) {
-    const originalMethod = descriptor.value;
+export function withRetry(options: RetryOptions = {}) {
+  return function <T>(
+    _target: unknown,
+    propertyKey: string,
+    descriptor: PropertyDescriptor
+  ): PropertyDescriptor {
+    const originalMethod = descriptor.value as (...args: unknown[]) => Promise<T>;
 
-    descriptor.value = async function (...args) {
+    descriptor.value = async function (this: unknown, ...args: unknown[]): Promise<T> {
       return retryWithBackoff(() => originalMethod.apply(this, args), {
         operationName: propertyKey,
         ...options,
@@ -222,25 +237,17 @@ function withRetry(options = {}) {
 
 /**
  * Create a retryable version of an async function
- * @param {Function} fn - Async function to wrap
- * @param {Object} options - Retry configuration
  */
-function makeRetryable(fn, options = {}) {
+export function makeRetryable<T extends (...args: unknown[]) => Promise<unknown>>(
+  fn: T,
+  options: RetryOptions = {}
+): T {
   const operationName = options.operationName || fn.name || 'anonymous';
 
-  return async function (...args) {
+  return (async function (this: unknown, ...args: unknown[]) {
     return retryWithBackoff(() => fn.apply(this, args), {
       operationName,
       ...options,
     });
-  };
+  }) as T;
 }
-
-module.exports = {
-  retryWithBackoff,
-  withRetry,
-  makeRetryable,
-  sleep,
-  isRetryable,
-  RETRY_CONFIGS,
-};

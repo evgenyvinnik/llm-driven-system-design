@@ -90,14 +90,14 @@ interface Listing {
 
 type MessageHandler = (event: QueueEvent, msg: ConsumeMessage) => Promise<void>;
 
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 let isConnecting = false;
 
 /**
  * Initialize RabbitMQ connection and channels
  */
-export async function initQueue(): Promise<{ connection: Connection; channel: Channel }> {
+export async function initQueue(): Promise<{ connection: ChannelModel; channel: Channel }> {
   if (connection && channel) {
     return { connection, channel };
   }
@@ -112,25 +112,28 @@ export async function initQueue(): Promise<{ connection: Connection; channel: Ch
 
   try {
     log.info('Connecting to RabbitMQ...');
-    connection = await amqp.connect(RABBITMQ_URL);
-    channel = await connection.createChannel();
+    const conn = await amqp.connect(RABBITMQ_URL);
+    const chan = await conn.createChannel();
+
+    connection = conn;
+    channel = chan;
 
     // Handle connection errors
-    connection.on('error', (err) => {
+    conn.on('error', (err) => {
       log.error({ error: err }, 'RabbitMQ connection error');
       connection = null;
       channel = null;
     });
 
-    connection.on('close', () => {
+    conn.on('close', () => {
       log.warn('RabbitMQ connection closed');
       connection = null;
       channel = null;
     });
 
     // Declare exchanges
-    await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
-    await channel.assertExchange(DEAD_LETTER_EXCHANGE, 'topic', { durable: true });
+    await chan.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+    await chan.assertExchange(DEAD_LETTER_EXCHANGE, 'topic', { durable: true });
 
     // Declare queues with dead-letter configuration
     const queueOptions = {
@@ -139,32 +142,32 @@ export async function initQueue(): Promise<{ connection: Connection; channel: Ch
       messageTtl: 86400000, // 24 hours
     };
 
-    await channel.assertQueue(QUEUES.BOOKING_EVENTS, queueOptions);
-    await channel.assertQueue(QUEUES.NOTIFICATION_SEND, queueOptions);
-    await channel.assertQueue(QUEUES.HOST_ALERTS, queueOptions);
-    await channel.assertQueue(QUEUES.SEARCH_REINDEX, { ...queueOptions, messageTtl: 3600000 }); // 1 hour
-    await channel.assertQueue(QUEUES.ANALYTICS_EVENTS, { ...queueOptions, messageTtl: 3600000 });
+    await chan.assertQueue(QUEUES.BOOKING_EVENTS, queueOptions);
+    await chan.assertQueue(QUEUES.NOTIFICATION_SEND, queueOptions);
+    await chan.assertQueue(QUEUES.HOST_ALERTS, queueOptions);
+    await chan.assertQueue(QUEUES.SEARCH_REINDEX, { ...queueOptions, messageTtl: 3600000 }); // 1 hour
+    await chan.assertQueue(QUEUES.ANALYTICS_EVENTS, { ...queueOptions, messageTtl: 3600000 });
 
     // Declare DLQ queues
-    await channel.assertQueue('dlq.booking.events', { durable: true });
-    await channel.assertQueue('dlq.notification.send', { durable: true });
+    await chan.assertQueue('dlq.booking.events', { durable: true });
+    await chan.assertQueue('dlq.notification.send', { durable: true });
 
     // Bind queues to exchange
-    await channel.bindQueue(QUEUES.BOOKING_EVENTS, EXCHANGE_NAME, 'booking.*');
-    await channel.bindQueue(QUEUES.NOTIFICATION_SEND, EXCHANGE_NAME, 'notification.*');
-    await channel.bindQueue(QUEUES.HOST_ALERTS, EXCHANGE_NAME, 'host.*');
-    await channel.bindQueue(QUEUES.SEARCH_REINDEX, EXCHANGE_NAME, 'listing.*');
-    await channel.bindQueue(QUEUES.ANALYTICS_EVENTS, EXCHANGE_NAME, '*.created');
-    await channel.bindQueue(QUEUES.ANALYTICS_EVENTS, EXCHANGE_NAME, '*.completed');
+    await chan.bindQueue(QUEUES.BOOKING_EVENTS, EXCHANGE_NAME, 'booking.*');
+    await chan.bindQueue(QUEUES.NOTIFICATION_SEND, EXCHANGE_NAME, 'notification.*');
+    await chan.bindQueue(QUEUES.HOST_ALERTS, EXCHANGE_NAME, 'host.*');
+    await chan.bindQueue(QUEUES.SEARCH_REINDEX, EXCHANGE_NAME, 'listing.*');
+    await chan.bindQueue(QUEUES.ANALYTICS_EVENTS, EXCHANGE_NAME, '*.created');
+    await chan.bindQueue(QUEUES.ANALYTICS_EVENTS, EXCHANGE_NAME, '*.completed');
 
     // Bind DLQ
-    await channel.bindQueue('dlq.booking.events', DEAD_LETTER_EXCHANGE, 'booking.*');
-    await channel.bindQueue('dlq.notification.send', DEAD_LETTER_EXCHANGE, 'notification.*');
+    await chan.bindQueue('dlq.booking.events', DEAD_LETTER_EXCHANGE, 'booking.*');
+    await chan.bindQueue('dlq.notification.send', DEAD_LETTER_EXCHANGE, 'notification.*');
 
     log.info('RabbitMQ connected and queues initialized');
     isConnecting = false;
 
-    return { connection, channel };
+    return { connection: conn, channel: chan };
   } catch (error) {
     isConnecting = false;
     log.error({ error }, 'Failed to connect to RabbitMQ');

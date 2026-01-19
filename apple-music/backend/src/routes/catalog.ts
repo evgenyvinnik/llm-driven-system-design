@@ -1,21 +1,36 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../db/index.js';
 import { redis } from '../services/redis.js';
 import { optionalAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+interface SearchQuery {
+  q?: string;
+  type?: string;
+  limit?: string;
+  offset?: string;
+}
+
+interface PaginationQuery {
+  limit?: string;
+  offset?: string;
+  sort?: string;
+  order?: string;
+}
+
 // Search catalog
-router.get('/search', optionalAuth, async (req, res) => {
+router.get('/search', optionalAuth, async (req: Request<object, unknown, unknown, SearchQuery>, res: Response) => {
   try {
-    const { q, type = 'all', limit = 20, offset = 0 } = req.query;
+    const { q, type = 'all', limit = '20', offset = '0' } = req.query;
 
     if (!q || q.trim().length === 0) {
-      return res.status(400).json({ error: 'Search query required' });
+      res.status(400).json({ error: 'Search query required' });
+      return;
     }
 
     const searchTerm = `%${q.toLowerCase()}%`;
-    const results = { tracks: [], albums: [], artists: [] };
+    const results: { tracks: unknown[]; albums: unknown[]; artists: unknown[] } = { tracks: [], albums: [], artists: [] };
 
     if (type === 'all' || type === 'tracks') {
       const tracks = await pool.query(
@@ -63,15 +78,16 @@ router.get('/search', optionalAuth, async (req, res) => {
 });
 
 // Get all tracks with pagination
-router.get('/tracks', optionalAuth, async (req, res) => {
+router.get('/tracks', optionalAuth, async (req: Request<object, unknown, unknown, PaginationQuery>, res: Response) => {
   try {
-    const { limit = 50, offset = 0, sort = 'created_at', order = 'desc' } = req.query;
+    const { limit = '50', offset = '0', sort = 'created_at', order = 'desc' } = req.query;
 
     const cacheKey = `tracks:${limit}:${offset}:${sort}:${order}`;
     const cached = await redis.get(cacheKey);
 
     if (cached) {
-      return res.json(JSON.parse(cached));
+      res.json(JSON.parse(cached));
+      return;
     }
 
     const validSort = ['created_at', 'title', 'play_count', 'duration_ms'].includes(sort) ? sort : 'created_at';
@@ -106,7 +122,7 @@ router.get('/tracks', optionalAuth, async (req, res) => {
 });
 
 // Get single track
-router.get('/tracks/:id', optionalAuth, async (req, res) => {
+router.get('/tracks/:id', optionalAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -121,7 +137,8 @@ router.get('/tracks/:id', optionalAuth, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Track not found' });
+      res.status(404).json({ error: 'Track not found' });
+      return;
     }
 
     res.json(result.rows[0]);
@@ -132,15 +149,16 @@ router.get('/tracks/:id', optionalAuth, async (req, res) => {
 });
 
 // Get all albums
-router.get('/albums', optionalAuth, async (req, res) => {
+router.get('/albums', optionalAuth, async (req: Request<object, unknown, unknown, PaginationQuery>, res: Response) => {
   try {
-    const { limit = 50, offset = 0, sort = 'release_date', order = 'desc' } = req.query;
+    const { limit = '50', offset = '0', sort = 'release_date', order = 'desc' } = req.query;
 
     const cacheKey = `albums:${limit}:${offset}:${sort}:${order}`;
     const cached = await redis.get(cacheKey);
 
     if (cached) {
-      return res.json(JSON.parse(cached));
+      res.json(JSON.parse(cached));
+      return;
     }
 
     const validSort = ['release_date', 'title', 'created_at'].includes(sort) ? sort : 'release_date';
@@ -174,7 +192,7 @@ router.get('/albums', optionalAuth, async (req, res) => {
 });
 
 // Get single album with tracks
-router.get('/albums/:id', optionalAuth, async (req, res) => {
+router.get('/albums/:id', optionalAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -187,7 +205,8 @@ router.get('/albums/:id', optionalAuth, async (req, res) => {
     );
 
     if (albumResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Album not found' });
+      res.status(404).json({ error: 'Album not found' });
+      return;
     }
 
     const tracksResult = await pool.query(
@@ -210,15 +229,16 @@ router.get('/albums/:id', optionalAuth, async (req, res) => {
 });
 
 // Get all artists
-router.get('/artists', optionalAuth, async (req, res) => {
+router.get('/artists', optionalAuth, async (req: Request<object, unknown, unknown, PaginationQuery>, res: Response) => {
   try {
-    const { limit = 50, offset = 0, sort = 'name', order = 'asc' } = req.query;
+    const { limit = '50', offset = '0', sort = 'name', order = 'asc' } = req.query;
 
     const cacheKey = `artists:${limit}:${offset}:${sort}:${order}`;
     const cached = await redis.get(cacheKey);
 
     if (cached) {
-      return res.json(JSON.parse(cached));
+      res.json(JSON.parse(cached));
+      return;
     }
 
     const validSort = ['name', 'created_at'].includes(sort) ? sort : 'name';
@@ -250,7 +270,7 @@ router.get('/artists', optionalAuth, async (req, res) => {
 });
 
 // Get single artist with albums
-router.get('/artists/:id', optionalAuth, async (req, res) => {
+router.get('/artists/:id', optionalAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -260,7 +280,8 @@ router.get('/artists/:id', optionalAuth, async (req, res) => {
     );
 
     if (artistResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Artist not found' });
+      res.status(404).json({ error: 'Artist not found' });
+      return;
     }
 
     const albumsResult = await pool.query(
@@ -293,13 +314,14 @@ router.get('/artists/:id', optionalAuth, async (req, res) => {
 });
 
 // Get genres
-router.get('/genres', optionalAuth, async (req, res) => {
+router.get('/genres', optionalAuth, async (_req: Request, res: Response) => {
   try {
     const cacheKey = 'genres:all';
     const cached = await redis.get(cacheKey);
 
     if (cached) {
-      return res.json(JSON.parse(cached));
+      res.json(JSON.parse(cached));
+      return;
     }
 
     const result = await pool.query(
@@ -320,10 +342,10 @@ router.get('/genres', optionalAuth, async (req, res) => {
 });
 
 // Get tracks by genre
-router.get('/genres/:genre/tracks', optionalAuth, async (req, res) => {
+router.get('/genres/:genre/tracks', optionalAuth, async (req: Request<{ genre: string }, unknown, unknown, { limit?: string; offset?: string }>, res: Response) => {
   try {
     const { genre } = req.params;
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = '50', offset = '0' } = req.query;
 
     const result = await pool.query(
       `SELECT t.*, a.name as artist_name, al.title as album_title, al.artwork_url

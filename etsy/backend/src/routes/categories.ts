@@ -1,12 +1,32 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import db from '../db/index.js';
 
 const router = Router();
 
+interface CategoryRow {
+  id: number;
+  name: string;
+  slug: string;
+  created_at: Date;
+}
+
+interface ProductRow {
+  id: number;
+  title: string;
+  price: string;
+  shop_name: string;
+  shop_slug: string;
+  shop_rating: number;
+}
+
+interface CountRow {
+  count: string;
+}
+
 // Get all categories
-router.get('/', async (req, res) => {
+router.get('/', async (_req: Request, res: Response) => {
   try {
-    const result = await db.query(
+    const result = await db.query<CategoryRow>(
       'SELECT * FROM categories ORDER BY name ASC'
     );
     res.json({ categories: result.rows });
@@ -17,11 +37,11 @@ router.get('/', async (req, res) => {
 });
 
 // Get category by slug
-router.get('/slug/:slug', async (req, res) => {
+router.get('/slug/:slug', async (req: Request<{ slug: string }>, res: Response) => {
   try {
     const { slug } = req.params;
 
-    const result = await db.query(
+    const result = await db.query<CategoryRow>(
       'SELECT * FROM categories WHERE slug = $1',
       [slug]
     );
@@ -38,10 +58,14 @@ router.get('/slug/:slug', async (req, res) => {
 });
 
 // Get products in category
-router.get('/:id/products', async (req, res) => {
+router.get('/:id/products', async (req: Request<{ id: string }>, res: Response) => {
   try {
     const { id } = req.params;
-    const { sort = 'newest', limit = 20, offset = 0 } = req.query;
+    const { sort = 'newest', limit = '20', offset = '0' } = req.query as {
+      sort?: string;
+      limit?: string;
+      offset?: string;
+    };
 
     let orderBy = 'p.created_at DESC';
     switch (sort) {
@@ -56,7 +80,7 @@ router.get('/:id/products', async (req, res) => {
         break;
     }
 
-    const result = await db.query(
+    const result = await db.query<ProductRow>(
       `SELECT p.*, s.name as shop_name, s.slug as shop_slug, s.rating as shop_rating
        FROM products p
        JOIN shops s ON p.shop_id = s.id
@@ -66,7 +90,7 @@ router.get('/:id/products', async (req, res) => {
       [parseInt(id), parseInt(limit), parseInt(offset)]
     );
 
-    const countResult = await db.query(
+    const countResult = await db.query<CountRow>(
       `SELECT COUNT(*) FROM products p
        JOIN shops s ON p.shop_id = s.id
        WHERE p.category_id = $1 AND p.is_active = true AND p.quantity > 0 AND s.is_active = true`,

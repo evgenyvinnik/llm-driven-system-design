@@ -1,9 +1,16 @@
-import { create, all } from 'mathjs';
+import { create, all, MathJsInstance } from 'mathjs';
 
-const math = create(all);
+const math: MathJsInstance = create(all);
+
+// Unit conversion interface
+interface UnitConversion {
+  category: string;
+  si: string;
+  factor: number;
+}
 
 // Unit conversion mappings
-const unitConversions = {
+const unitConversions: Record<string, UnitConversion> = {
   // Length
   km: { category: 'length', si: 'm', factor: 1000 },
   m: { category: 'length', si: 'm', factor: 1 },
@@ -83,9 +90,38 @@ const unitConversions = {
   tb: { category: 'data', si: 'b', factor: 1099511627776 }
 };
 
+export interface DateFilter {
+  startDate: Date;
+  endDate: Date;
+}
+
+export interface ParsedQuery {
+  raw: string;
+  type: 'search' | 'math' | 'conversion' | 'date_filter';
+  expression?: string;
+  value?: number;
+  fromUnit?: string;
+  toUnit?: string;
+  dateFilter?: DateFilter | null;
+}
+
+export interface ConversionResult {
+  value: number;
+  unit: string;
+}
+
+export interface SpecialResult {
+  type: string;
+  name: string;
+  value: string | number;
+  unit?: string;
+  icon: string;
+  score: number;
+}
+
 // Parse query to detect special queries
-export function parseQuery(queryString) {
-  const query = {
+export function parseQuery(queryString: string): ParsedQuery {
+  const query: ParsedQuery = {
     raw: queryString,
     type: 'search'
   };
@@ -124,7 +160,7 @@ export function parseQuery(queryString) {
 }
 
 // Handle math calculation
-export function evaluateMath(expression) {
+export function evaluateMath(expression: string): string | null {
   try {
     const result = math.evaluate(expression);
     if (typeof result === 'number') {
@@ -141,7 +177,7 @@ export function evaluateMath(expression) {
 }
 
 // Handle unit conversion
-export function convertUnits(value, fromUnit, toUnit) {
+export function convertUnits(value: number, fromUnit: string, toUnit: string): ConversionResult | null {
   const from = unitConversions[fromUnit.toLowerCase()];
   const to = unitConversions[toUnit.toLowerCase()];
 
@@ -168,12 +204,12 @@ export function convertUnits(value, fromUnit, toUnit) {
   };
 }
 
-function convertTemperature(value, from, to) {
+function convertTemperature(value: number, from: string, to: string): ConversionResult | null {
   // Normalize unit names
   const fromNorm = from === 'celsius' ? 'c' : from === 'fahrenheit' ? 'f' : from === 'kelvin' ? 'k' : from;
   const toNorm = to === 'celsius' ? 'c' : to === 'fahrenheit' ? 'f' : to === 'kelvin' ? 'k' : to;
 
-  let celsius;
+  let celsius: number;
 
   // Convert to Celsius first
   switch (fromNorm) {
@@ -191,8 +227,8 @@ function convertTemperature(value, from, to) {
   }
 
   // Convert from Celsius to target
-  let result;
-  let unitName;
+  let result: number;
+  let unitName: string;
 
   switch (toNorm) {
     case 'c':
@@ -218,10 +254,10 @@ function convertTemperature(value, from, to) {
 }
 
 // Parse date filters from natural language
-function parseDateFilter(queryString) {
+function parseDateFilter(queryString: string): DateFilter | null {
   const now = new Date();
-  let startDate = null;
-  let endDate = null;
+  let startDate: Date | null = null;
+  let endDate: Date | null = null;
 
   // Today
   if (/\btoday\b/i.test(queryString)) {
@@ -263,8 +299,8 @@ function parseDateFilter(queryString) {
 }
 
 // Format result for display
-export function formatSpecialResult(query) {
-  if (query.type === 'math') {
+export function formatSpecialResult(query: ParsedQuery): SpecialResult | null {
+  if (query.type === 'math' && query.expression) {
     const result = evaluateMath(query.expression);
     if (result !== null) {
       return {
@@ -277,7 +313,7 @@ export function formatSpecialResult(query) {
     }
   }
 
-  if (query.type === 'conversion') {
+  if (query.type === 'conversion' && query.value !== undefined && query.fromUnit && query.toUnit) {
     const result = convertUnits(query.value, query.fromUnit, query.toUnit);
     if (result) {
       return {

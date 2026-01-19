@@ -30,12 +30,14 @@
  * - Retained per regulatory requirements (typically 7 years)
  */
 
-const { pool } = require('../db/pool');
-const { logger } = require('./logger');
-const { auditEventsTotal } = require('./metrics');
+import { pool } from '../db/pool.js';
+import { logger } from './logger.js';
+import { auditEventsTotal } from './metrics.js';
+import type { Request } from 'express';
+import type { Socket } from 'net';
 
 // Audit action types
-const AUDIT_ACTIONS = {
+export const AUDIT_ACTIONS = {
   // Money movement
   TRANSFER_INITIATED: 'transfer_initiated',
   TRANSFER_COMPLETED: 'transfer_completed',
@@ -72,36 +74,90 @@ const AUDIT_ACTIONS = {
 
   // Privacy
   PRIVACY_SETTINGS_CHANGED: 'privacy_settings_changed',
-};
+} as const;
 
 // Actor types
-const ACTOR_TYPES = {
+export const ACTOR_TYPES = {
   USER: 'user',
   ADMIN: 'admin',
   SYSTEM: 'system',
-};
+} as const;
 
 // Outcome types
-const OUTCOMES = {
+export const OUTCOMES = {
   SUCCESS: 'success',
   FAILURE: 'failure',
   DENIED: 'denied',
-};
+} as const;
+
+export type AuditAction = typeof AUDIT_ACTIONS[keyof typeof AUDIT_ACTIONS];
+export type ActorType = typeof ACTOR_TYPES[keyof typeof ACTOR_TYPES];
+export type Outcome = typeof OUTCOMES[keyof typeof OUTCOMES];
+
+interface AuditRequest extends Request {
+  requestId?: string;
+  connection?: Socket & { remoteAddress?: string };
+}
+
+export interface AuditLogParams {
+  action: string;
+  actorId: string;
+  actorType?: ActorType;
+  resourceType?: string | null;
+  resourceId?: string | null;
+  outcome?: Outcome;
+  details?: Record<string, unknown>;
+  request?: AuditRequest | null;
+}
+
+export interface Transfer {
+  id?: string;
+  sender_id: string;
+  receiver_id: string;
+  amount: number;
+  funding_source?: string;
+  visibility?: string;
+}
+
+export interface Cashout {
+  id: string;
+  user_id: string;
+  amount: number;
+  fee?: number;
+  speed?: string;
+  payment_method_id?: string;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  actor_id: string;
+  actor_type: string;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  request_id: string | null;
+  details: string;
+  outcome: string;
+  timestamp: Date;
+}
+
+export interface QueryAuditLogsParams {
+  actorId?: string | null;
+  action?: string | null;
+  resourceType?: string | null;
+  resourceId?: string | null;
+  startDate?: Date | null;
+  endDate?: Date | null;
+  limit?: number;
+  offset?: number;
+}
 
 /**
  * Create an audit log entry
- *
- * @param {Object} params - Audit log parameters
- * @param {string} params.action - Action performed (from AUDIT_ACTIONS)
- * @param {string} params.actorId - ID of user/admin/system performing action
- * @param {string} params.actorType - Type of actor (from ACTOR_TYPES)
- * @param {string} params.resourceType - Type of resource affected
- * @param {string} params.resourceId - ID of the affected resource
- * @param {string} params.outcome - Result (from OUTCOMES)
- * @param {Object} params.details - Additional context (amounts, reasons, etc.)
- * @param {Object} params.request - Express request object (for IP, user agent)
  */
-async function createAuditLog({
+export async function createAuditLog({
   action,
   actorId,
   actorType = ACTOR_TYPES.USER,
@@ -110,7 +166,7 @@ async function createAuditLog({
   outcome = OUTCOMES.SUCCESS,
   details = {},
   request = null,
-}) {
+}: AuditLogParams): Promise<void> {
   try {
     // Extract request context
     const requestContext = request
@@ -165,7 +221,7 @@ async function createAuditLog({
     // but must be logged for investigation
     logger.error({
       event: 'audit_log_failure',
-      error: error.message,
+      error: (error as Error).message,
       action,
       actorId,
       resourceType,
@@ -178,7 +234,7 @@ async function createAuditLog({
 /**
  * Remove sensitive fields from details object
  */
-function sanitizeDetails(details) {
+function sanitizeDetails(details: Record<string, unknown>): Record<string, unknown> {
   const sensitiveFields = [
     'password',
     'pin',
@@ -198,9 +254,6 @@ function sanitizeDetails(details) {
   }
 
   // Mask account numbers to last 4
-  if (sanitized.last4) {
-    // last4 is already masked, keep it
-  }
   if (sanitized.bank_account && typeof sanitized.bank_account === 'string') {
     sanitized.bank_account = '****' + sanitized.bank_account.slice(-4);
   }
@@ -211,7 +264,13 @@ function sanitizeDetails(details) {
 /**
  * Helper for logging transfer operations
  */
-async function logTransfer(action, transfer, outcome, request, additionalDetails = {}) {
+export async function logTransfer(
+  action: string,
+  transfer: Transfer,
+  outcome: Outcome,
+  request: AuditRequest | null,
+  additionalDetails: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     action,
     actorId: transfer.sender_id,
@@ -233,7 +292,13 @@ async function logTransfer(action, transfer, outcome, request, additionalDetails
 /**
  * Helper for logging cashout operations
  */
-async function logCashout(action, cashout, outcome, request, additionalDetails = {}) {
+export async function logCashout(
+  action: string,
+  cashout: Cashout,
+  outcome: Outcome,
+  request: AuditRequest | null,
+  additionalDetails: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     action,
     actorId: cashout.user_id,
@@ -255,7 +320,13 @@ async function logCashout(action, cashout, outcome, request, additionalDetails =
 /**
  * Helper for logging authentication events
  */
-async function logAuth(action, userId, outcome, request, additionalDetails = {}) {
+export async function logAuth(
+  action: string,
+  userId: string,
+  outcome: Outcome,
+  request: AuditRequest | null,
+  additionalDetails: Record<string, unknown> = {}
+): Promise<void> {
   await createAuditLog({
     action,
     actorId: userId,
@@ -270,18 +341,8 @@ async function logAuth(action, userId, outcome, request, additionalDetails = {})
 
 /**
  * Query audit logs for investigation
- *
- * @param {Object} filters - Query filters
- * @param {string} filters.actorId - Filter by actor
- * @param {string} filters.action - Filter by action type
- * @param {string} filters.resourceType - Filter by resource type
- * @param {string} filters.resourceId - Filter by specific resource
- * @param {Date} filters.startDate - Filter by start date
- * @param {Date} filters.endDate - Filter by end date
- * @param {number} filters.limit - Result limit
- * @param {number} filters.offset - Pagination offset
  */
-async function queryAuditLogs({
+export async function queryAuditLogs({
   actorId = null,
   action = null,
   resourceType = null,
@@ -290,9 +351,9 @@ async function queryAuditLogs({
   endDate = null,
   limit = 100,
   offset = 0,
-}) {
-  const conditions = [];
-  const params = [];
+}: QueryAuditLogsParams): Promise<AuditLogEntry[]> {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
   let paramIndex = 1;
 
   if (actorId) {
@@ -339,14 +400,3 @@ async function queryAuditLogs({
   const result = await pool.query(query, params);
   return result.rows;
 }
-
-module.exports = {
-  createAuditLog,
-  logTransfer,
-  logCashout,
-  logAuth,
-  queryAuditLogs,
-  AUDIT_ACTIONS,
-  ACTOR_TYPES,
-  OUTCOMES,
-};

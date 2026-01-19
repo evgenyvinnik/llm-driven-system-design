@@ -11,22 +11,36 @@ import {
   heapSize as heapSizeMetric,
 } from '../shared/metrics.js';
 
-export class MinHeap {
-  constructor(compareFn = (a, b) => a.score - b.score, heapName = 'default') {
+export interface HeapItem {
+  id: string;
+  score: number;
+}
+
+type CompareFn<T> = (a: T, b: T) => number;
+
+export class MinHeap<T = HeapItem> {
+  private heap: T[];
+  private compare: CompareFn<T>;
+  private heapName: string;
+
+  constructor(
+    compareFn: CompareFn<T> = ((a, b) => (a as HeapItem).score - (b as HeapItem).score) as CompareFn<T>,
+    heapName = 'default'
+  ) {
     this.heap = [];
     this.compare = compareFn;
     this.heapName = heapName;
   }
 
-  get size() {
+  get size(): number {
     return this.heap.length;
   }
 
-  peek() {
+  peek(): T | undefined {
     return this.heap[0];
   }
 
-  push(item) {
+  push(item: T): void {
     const start = process.hrtime.bigint();
 
     this.heap.push(item);
@@ -39,7 +53,7 @@ export class MinHeap {
     heapSizeMetric.set({ type: this.heapName }, this.heap.length);
   }
 
-  pop() {
+  pop(): T | undefined {
     const start = process.hrtime.bigint();
 
     if (this.heap.length === 0) return undefined;
@@ -51,7 +65,7 @@ export class MinHeap {
     }
 
     const min = this.heap[0];
-    this.heap[0] = this.heap.pop();
+    this.heap[0] = this.heap.pop()!;
     this._bubbleDown(0);
 
     // Record metrics
@@ -63,7 +77,7 @@ export class MinHeap {
     return min;
   }
 
-  _bubbleUp(index) {
+  private _bubbleUp(index: number): void {
     while (index > 0) {
       const parentIndex = Math.floor((index - 1) / 2);
       if (this.compare(this.heap[index], this.heap[parentIndex]) >= 0) break;
@@ -72,7 +86,7 @@ export class MinHeap {
     }
   }
 
-  _bubbleDown(index) {
+  private _bubbleDown(index: number): void {
     const length = this.heap.length;
     while (true) {
       const leftChild = 2 * index + 1;
@@ -93,11 +107,11 @@ export class MinHeap {
     }
   }
 
-  toArray() {
+  toArray(): T[] {
     return [...this.heap];
   }
 
-  toSortedArray() {
+  toSortedArray(): T[] {
     return [...this.heap].sort((a, b) => this.compare(b, a)); // Descending order
   }
 }
@@ -127,17 +141,22 @@ export class MinHeap {
  * - Latency spikes may correlate with heap size
  */
 export class TopK {
+  private k: number;
+  private category: string;
+  private heap: MinHeap<HeapItem>;
+  private itemMap: Map<string, HeapItem>;
+
   constructor(k = 10, category = 'all') {
     this.k = k;
     this.category = category;
-    this.heap = new MinHeap((a, b) => a.score - b.score, `topk-${category}`);
+    this.heap = new MinHeap<HeapItem>((a, b) => a.score - b.score, `topk-${category}`);
     this.itemMap = new Map(); // Track items in heap for updates
   }
 
   /**
    * Update or insert an item with a new score
    */
-  update(id, score) {
+  update(id: string, score: number): void {
     // If item is already in heap, we need to handle update
     if (this.itemMap.has(id)) {
       const start = process.hrtime.bigint();
@@ -147,7 +166,7 @@ export class TopK {
       const items = this.heap.toArray().filter(item => item.id !== id);
       items.push({ id, score });
 
-      this.heap = new MinHeap((a, b) => a.score - b.score, `topk-${this.category}`);
+      this.heap = new MinHeap<HeapItem>((a, b) => a.score - b.score, `topk-${this.category}`);
       this.itemMap.clear();
 
       // Re-add all items
@@ -167,29 +186,34 @@ export class TopK {
     this._addItem({ id, score });
   }
 
-  _addItem(item) {
+  private _addItem(item: HeapItem): void {
     if (this.heap.size < this.k) {
       this.heap.push(item);
       this.itemMap.set(item.id, item);
-    } else if (item.score > this.heap.peek().score) {
-      const removed = this.heap.pop();
-      this.itemMap.delete(removed.id);
-      this.heap.push(item);
-      this.itemMap.set(item.id, item);
+    } else {
+      const peek = this.heap.peek();
+      if (peek && item.score > peek.score) {
+        const removed = this.heap.pop();
+        if (removed) {
+          this.itemMap.delete(removed.id);
+        }
+        this.heap.push(item);
+        this.itemMap.set(item.id, item);
+      }
     }
   }
 
   /**
    * Get the current top K items sorted by score descending
    */
-  getTopK() {
+  getTopK(): HeapItem[] {
     return this.heap.toSortedArray();
   }
 
   /**
    * Build top K from a map of id -> score
    */
-  static fromMap(scoreMap, k = 10, category = 'all') {
+  static fromMap(scoreMap: Map<string, number>, k = 10, category = 'all'): TopK {
     const topK = new TopK(k, category);
     for (const [id, score] of scoreMap.entries()) {
       topK.update(id, score);
@@ -209,6 +233,11 @@ export class TopK {
  * - Error: O(total / width) with probability 1 - (1/2)^depth
  */
 export class CountMinSketch {
+  private width: number;
+  private depth: number;
+  private tables: number[][];
+  private seeds: number[];
+
   constructor(width = 10000, depth = 5) {
     this.width = width;
     this.depth = depth;
@@ -220,7 +249,7 @@ export class CountMinSketch {
    * Simple hash function for demonstration
    * In production, use MurmurHash or similar
    */
-  _hash(item, seed) {
+  private _hash(item: string | number, seed: number): number {
     const str = String(item);
     let hash = seed;
     for (let i = 0; i < str.length; i++) {
@@ -232,7 +261,7 @@ export class CountMinSketch {
   /**
    * Increment count for an item
    */
-  increment(item, count = 1) {
+  increment(item: string | number, count = 1): void {
     for (let i = 0; i < this.depth; i++) {
       const index = this._hash(item, this.seeds[i]);
       this.tables[i][index] += count;
@@ -242,7 +271,7 @@ export class CountMinSketch {
   /**
    * Get estimated count for an item (minimum across all tables)
    */
-  estimate(item) {
+  estimate(item: string | number): number {
     let min = Infinity;
     for (let i = 0; i < this.depth; i++) {
       const index = this._hash(item, this.seeds[i]);
@@ -250,6 +279,17 @@ export class CountMinSketch {
     }
     return min;
   }
+}
+
+interface SpaceSavingEntry {
+  count: number;
+  error: number;
+}
+
+export interface SpaceSavingTopKItem {
+  id: string;
+  count: number;
+  error: number;
 }
 
 /**
@@ -260,6 +300,11 @@ export class CountMinSketch {
  * where n is total count and k is number of counters
  */
 export class SpaceSaving {
+  private k: number;
+  private counters: Map<string, SpaceSavingEntry>;
+  private minBucket: Map<number, Set<string>>;
+  private minCount: number;
+
   constructor(k = 100) {
     this.k = k;
     this.counters = new Map(); // id -> { count, error }
@@ -270,10 +315,10 @@ export class SpaceSaving {
   /**
    * Increment count for an item
    */
-  increment(id) {
+  increment(id: string): void {
     if (this.counters.has(id)) {
       // Item already tracked - increment its count
-      const entry = this.counters.get(id);
+      const entry = this.counters.get(id)!;
       this._removeFromBucket(id, entry.count);
       entry.count++;
       this._addToBucket(id, entry.count);
@@ -286,28 +331,30 @@ export class SpaceSaving {
     } else {
       // Replace minimum counter
       const minId = this._getMinId();
-      const minEntry = this.counters.get(minId);
+      if (minId) {
+        const minEntry = this.counters.get(minId)!;
 
-      // Remove old entry
-      this._removeFromBucket(minId, minEntry.count);
-      this.counters.delete(minId);
+        // Remove old entry
+        this._removeFromBucket(minId, minEntry.count);
+        this.counters.delete(minId);
 
-      // Add new entry with count = minCount + 1
-      const newCount = this.minCount + 1;
-      this.counters.set(id, { count: newCount, error: this.minCount });
-      this._addToBucket(id, newCount);
-      this._updateMinCount();
+        // Add new entry with count = minCount + 1
+        const newCount = this.minCount + 1;
+        this.counters.set(id, { count: newCount, error: this.minCount });
+        this._addToBucket(id, newCount);
+        this._updateMinCount();
+      }
     }
   }
 
-  _addToBucket(id, count) {
+  private _addToBucket(id: string, count: number): void {
     if (!this.minBucket.has(count)) {
       this.minBucket.set(count, new Set());
     }
-    this.minBucket.get(count).add(id);
+    this.minBucket.get(count)!.add(id);
   }
 
-  _removeFromBucket(id, count) {
+  private _removeFromBucket(id: string, count: number): void {
     const bucket = this.minBucket.get(count);
     if (bucket) {
       bucket.delete(id);
@@ -317,15 +364,15 @@ export class SpaceSaving {
     }
   }
 
-  _getMinId() {
-    const minBucket = this.minBucket.get(this.minCount);
-    if (minBucket && minBucket.size > 0) {
-      return minBucket.values().next().value;
+  private _getMinId(): string | null {
+    const bucket = this.minBucket.get(this.minCount);
+    if (bucket && bucket.size > 0) {
+      return bucket.values().next().value ?? null;
     }
     return null;
   }
 
-  _updateMinCount() {
+  private _updateMinCount(): void {
     if (this.counters.size === 0) {
       this.minCount = 0;
       return;
@@ -334,7 +381,7 @@ export class SpaceSaving {
     // Find the minimum count with a non-empty bucket
     const counts = Array.from(this.minBucket.keys()).sort((a, b) => a - b);
     for (const count of counts) {
-      if (this.minBucket.get(count)?.size > 0) {
+      if (this.minBucket.get(count)?.size ?? 0 > 0) {
         this.minCount = count;
         return;
       }
@@ -344,7 +391,7 @@ export class SpaceSaving {
   /**
    * Get top K items sorted by count
    */
-  getTopK(k) {
+  getTopK(k: number): SpaceSavingTopKItem[] {
     const entries = Array.from(this.counters.entries())
       .map(([id, { count, error }]) => ({ id, count, error }))
       .sort((a, b) => b.count - a.count);
@@ -355,7 +402,7 @@ export class SpaceSaving {
   /**
    * Get estimated count for an item
    */
-  getCount(id) {
+  getCount(id: string): number {
     const entry = this.counters.get(id);
     return entry ? entry.count : 0;
   }

@@ -1,20 +1,67 @@
-import { v4 as uuid } from 'uuid';
-import { query, transaction } from '../db.js';
-import { queueOfflineMessage, getUserConnections } from '../redis.js';
-import { getParticipantIds } from './conversations.js';
+import { query } from '../db.js';
 import { createLogger } from '../shared/logger.js';
 import {
   messagesTotal,
   messageDeliveryDuration,
   messageDeliveryStatus,
-  syncLatency,
   dbQueryDuration,
 } from '../shared/metrics.js';
 import idempotencyService from '../shared/idempotency.js';
 
 const logger = createLogger('messages-service');
 
-export async function getMessages(conversationId, userId, options = {}) {
+interface MessageRow {
+  id: string;
+  conversation_id: string;
+  sender_id: string;
+  content: string;
+  content_type: string;
+  reply_to_id: string | null;
+  edited_at: Date | null;
+  deleted_at?: Date | null;
+  created_at: Date;
+  sender_username?: string;
+  sender_display_name?: string;
+  sender_avatar_url?: string | null;
+  reactions?: unknown;
+  reply_to?: unknown;
+}
+
+interface Message extends MessageRow {
+  isDuplicate?: boolean;
+}
+
+interface GetMessagesOptions {
+  limit?: number;
+  before?: string;
+  after?: string;
+}
+
+interface SendMessageOptions {
+  contentType?: string;
+  replyToId?: string;
+  clientMessageId?: string;
+}
+
+interface ReadReceipt {
+  user_id: string;
+  last_read_message_id: string;
+  last_read_at: Date;
+  username: string;
+  display_name: string;
+  avatar_url: string | null;
+}
+
+interface SyncCursor {
+  last_synced_message_id: string;
+  last_synced_at: Date;
+}
+
+export async function getMessages(
+  conversationId: string,
+  userId: string,
+  options: GetMessagesOptions = {}
+): Promise<MessageRow[]> {
   const { limit = 50, before, after } = options;
 
   let sql = `
@@ -51,7 +98,7 @@ export async function getMessages(conversationId, userId, options = {}) {
     WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
   `;
 
-  const params = [conversationId];
+  const params: unknown[] = [conversationId];
   let paramIndex = 2;
 
   if (before) {
@@ -69,14 +116,14 @@ export async function getMessages(conversationId, userId, options = {}) {
   sql += ` ORDER BY m.created_at DESC LIMIT $${paramIndex}`;
   params.push(limit);
 
-  const result = await query(sql, params);
+  const result = await query<MessageRow>(sql, params);
 
   // Reverse to get chronological order
   return result.rows.reverse();
 }
 
-export async function getMessage(messageId) {
-  const result = await query(
+export async function getMessage(messageId: string): Promise<MessageRow | null> {
+  const result = await query<MessageRow>(
     `SELECT
       m.id,
       m.conversation_id,
@@ -98,7 +145,12 @@ export async function getMessage(messageId) {
   return result.rows[0] || null;
 }
 
-export async function sendMessage(conversationId, senderId, content, options = {}) {
+export async function sendMessage(
+  conversationId: string,
+  senderId: string,
+  content: string,
+  options: SendMessageOptions = {}
+): Promise<Message> {
   const { contentType = 'text', replyToId, clientMessageId } = options;
   const startTime = Date.now();
 
@@ -137,7 +189,7 @@ export async function sendMessage(conversationId, senderId, content, options = {
     messagesTotal.inc({ status: 'sent', content_type: contentType });
     messageDeliveryStatus.inc({ status: 'delivered' });
 
-    return result;
+    return result as Message;
   }
 
   // No idempotency key - proceed with normal message creation
@@ -164,10 +216,16 @@ export async function sendMessage(conversationId, senderId, content, options = {
 /**
  * Internal function to create a message in the database
  */
-async function createMessage(conversationId, senderId, content, contentType, replyToId) {
+async function createMessage(
+  conversationId: string,
+  senderId: string,
+  content: string,
+  contentType: string,
+  replyToId?: string
+): Promise<Message> {
   const dbStart = Date.now();
 
-  const result = await query(
+  const result = await query<MessageRow>(
     `INSERT INTO messages (conversation_id, sender_id, content, content_type, reply_to_id)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING id, conversation_id, sender_id, content, content_type, reply_to_id, created_at`,
@@ -185,7 +243,7 @@ async function createMessage(conversationId, senderId, content, contentType, rep
   );
 
   // Get sender info
-  const senderResult = await query(
+  const senderResult = await query<{ username: string; display_name: string; avatar_url: string | null }>(
     'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
     [senderId]
   );
@@ -202,8 +260,12 @@ async function createMessage(conversationId, senderId, content, contentType, rep
   };
 }
 
-export async function editMessage(messageId, userId, newContent) {
-  const result = await query(
+export async function editMessage(
+  messageId: string,
+  userId: string,
+  newContent: string
+): Promise<MessageRow> {
+  const result = await query<MessageRow>(
     `UPDATE messages
      SET content = $1, edited_at = NOW()
      WHERE id = $2 AND sender_id = $3 AND deleted_at IS NULL
@@ -218,8 +280,11 @@ export async function editMessage(messageId, userId, newContent) {
   return result.rows[0];
 }
 
-export async function deleteMessage(messageId, userId) {
-  const result = await query(
+export async function deleteMessage(
+  messageId: string,
+  userId: string
+): Promise<{ id: string; conversation_id: string }> {
+  const result = await query<{ id: string; conversation_id: string }>(
     `UPDATE messages
      SET deleted_at = NOW()
      WHERE id = $1 AND sender_id = $2
@@ -234,8 +299,22 @@ export async function deleteMessage(messageId, userId) {
   return result.rows[0];
 }
 
-export async function addReaction(messageId, userId, reaction) {
-  const result = await query(
+interface ReactionResult {
+  reaction: {
+    id?: string;
+    message_id: string;
+    user_id: string;
+    reaction: string;
+  };
+  conversationId: string | undefined;
+}
+
+export async function addReaction(
+  messageId: string,
+  userId: string,
+  reaction: string
+): Promise<ReactionResult> {
+  const result = await query<{ id: string; message_id: string; user_id: string; reaction: string }>(
     `INSERT INTO reactions (message_id, user_id, reaction)
      VALUES ($1, $2, $3)
      ON CONFLICT (message_id, user_id, reaction) DO NOTHING
@@ -244,7 +323,7 @@ export async function addReaction(messageId, userId, reaction) {
   );
 
   // Get the message's conversation for broadcasting
-  const messageResult = await query(
+  const messageResult = await query<{ conversation_id: string }>(
     'SELECT conversation_id FROM messages WHERE id = $1',
     [messageId]
   );
@@ -255,14 +334,18 @@ export async function addReaction(messageId, userId, reaction) {
   };
 }
 
-export async function removeReaction(messageId, userId, reaction) {
+export async function removeReaction(
+  messageId: string,
+  userId: string,
+  reaction: string
+): Promise<{ conversationId: string | undefined }> {
   await query(
     'DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND reaction = $3',
     [messageId, userId, reaction]
   );
 
   // Get the message's conversation for broadcasting
-  const messageResult = await query(
+  const messageResult = await query<{ conversation_id: string }>(
     'SELECT conversation_id FROM messages WHERE id = $1',
     [messageId]
   );
@@ -272,7 +355,12 @@ export async function removeReaction(messageId, userId, reaction) {
   };
 }
 
-export async function markAsRead(conversationId, userId, deviceId, messageId) {
+export async function markAsRead(
+  conversationId: string,
+  userId: string,
+  deviceId: string,
+  messageId: string
+): Promise<{ conversationId: string; userId: string; messageId: string }> {
   await query(
     `INSERT INTO read_receipts (user_id, device_id, conversation_id, last_read_message_id, last_read_at)
      VALUES ($1, $2, $3, $4, NOW())
@@ -284,8 +372,8 @@ export async function markAsRead(conversationId, userId, deviceId, messageId) {
   return { conversationId, userId, messageId };
 }
 
-export async function getReadReceipts(conversationId) {
-  const result = await query(
+export async function getReadReceipts(conversationId: string): Promise<ReadReceipt[]> {
+  const result = await query<ReadReceipt>(
     `SELECT DISTINCT ON (rr.user_id)
       rr.user_id,
       rr.last_read_message_id,
@@ -303,8 +391,11 @@ export async function getReadReceipts(conversationId) {
   return result.rows;
 }
 
-export async function getMessagesSince(conversationId, sinceTimestamp) {
-  const result = await query(
+export async function getMessagesSince(
+  conversationId: string,
+  sinceTimestamp: string
+): Promise<MessageRow[]> {
+  const result = await query<MessageRow>(
     `SELECT
       m.id,
       m.conversation_id,
@@ -328,8 +419,11 @@ export async function getMessagesSince(conversationId, sinceTimestamp) {
   return result.rows;
 }
 
-export async function getSyncCursor(deviceId, conversationId) {
-  const result = await query(
+export async function getSyncCursor(
+  deviceId: string,
+  conversationId: string
+): Promise<SyncCursor | null> {
+  const result = await query<SyncCursor>(
     `SELECT last_synced_message_id, last_synced_at
      FROM sync_cursors
      WHERE device_id = $1 AND conversation_id = $2`,
@@ -339,7 +433,11 @@ export async function getSyncCursor(deviceId, conversationId) {
   return result.rows[0] || null;
 }
 
-export async function updateSyncCursor(deviceId, conversationId, messageId) {
+export async function updateSyncCursor(
+  deviceId: string,
+  conversationId: string,
+  messageId: string
+): Promise<void> {
   await query(
     `INSERT INTO sync_cursors (device_id, conversation_id, last_synced_message_id, last_synced_at)
      VALUES ($1, $2, $3, NOW())

@@ -257,10 +257,10 @@ async function executeSearch(searchParams: SearchParams): Promise<SearchResult> 
   sql += ` ORDER BY ${orderBy}`;
 
   // Pagination
-  params.push(parseInt(limit), parseInt(offset));
+  params.push(parseInt(String(limit)), parseInt(String(offset)));
   sql += ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
-  const result = await query(sql, params);
+  const result = await query<ListingRow>(sql, params);
 
   // Get total count for pagination
   let countSql = `
@@ -282,20 +282,20 @@ async function executeSearch(searchParams: SearchParams): Promise<SearchResult> 
   }
 
   const countParams = params.slice(0, -2); // Remove limit and offset
-  const countResult = await query(countSql, countParams);
+  const countResult = await query<{ total: string }>(countSql, countParams);
 
   return {
     listings: result.rows,
-    total: parseInt(countResult.rows[0]?.total || 0),
-    limit: parseInt(limit),
-    offset: parseInt(offset),
+    total: parseInt(countResult.rows[0]?.total || '0'),
+    limit: parseInt(String(limit)),
+    offset: parseInt(String(offset)),
   };
 }
 
 // Search listings with geographic filter and availability
-router.get('/', optionalAuth, async (req, res) => {
+router.get('/', optionalAuth, async (req: Request, res: Response) => {
   const startTime = process.hrtime.bigint();
-  const searchParams = req.query;
+  const searchParams = req.query as SearchParams;
 
   const hasLocation = !!(searchParams.latitude && searchParams.longitude);
   const hasDates = !!(searchParams.check_in && searchParams.check_out);
@@ -350,15 +350,15 @@ router.get('/', optionalAuth, async (req, res) => {
 });
 
 // Suggest locations based on search term
-router.get('/suggest', async (req, res) => {
+router.get('/suggest', async (req: Request, res: Response) => {
   const { q } = req.query;
 
-  if (!q || q.length < 2) {
+  if (!q || (typeof q === 'string' && q.length < 2)) {
     return res.json({ suggestions: [] });
   }
 
   try {
-    const result = await query(
+    const result = await query<SuggestionRow>(
       `SELECT DISTINCT city, state, country,
         ST_X(location::geometry) as longitude,
         ST_Y(location::geometry) as latitude
@@ -386,9 +386,9 @@ router.get('/suggest', async (req, res) => {
 });
 
 // Get popular destinations
-router.get('/popular-destinations', async (req, res) => {
+router.get('/popular-destinations', async (_req: Request, res: Response) => {
   try {
-    const result = await query(
+    const result = await query<DestinationRow>(
       `SELECT
         city,
         state,

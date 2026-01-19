@@ -25,10 +25,10 @@ export interface IdempotencyCheckResult {
   executedAt?: string;
 }
 
-export interface IdempotencyResult {
+export interface IdempotencyResult<T = Record<string, unknown>> {
   idempotent: boolean;
   cachedAt?: string;
-  [key: string]: unknown;
+  data: T;
 }
 
 export interface DocumentForIdempotency {
@@ -142,7 +142,7 @@ export const withIdempotency = async <T extends Record<string, unknown>>(
   key: string,
   operation: () => Promise<T>,
   options: WithIdempotencyOptions = {}
-): Promise<IdempotencyResult> => {
+): Promise<IdempotencyResult<T>> => {
   const { ttl = DEFAULT_TTL, lockTimeout = 60 } = options;
 
   // Check if already executed
@@ -150,7 +150,7 @@ export const withIdempotency = async <T extends Record<string, unknown>>(
   if (cached.executed) {
     logger.info({ key, executedAt: cached.executedAt }, 'Returning cached idempotent result');
     return {
-      ...(cached.result as T),
+      data: cached.result as T,
       idempotent: true,
       cachedAt: cached.executedAt,
     };
@@ -166,7 +166,7 @@ export const withIdempotency = async <T extends Record<string, unknown>>(
     const rechecked = await checkIdempotency(key);
     if (rechecked.executed) {
       return {
-        ...(rechecked.result as T),
+        data: rechecked.result as T,
         idempotent: true,
         cachedAt: rechecked.executedAt,
       };
@@ -186,7 +186,7 @@ export const withIdempotency = async <T extends Record<string, unknown>>(
     // Release the lock
     await releaseIdempotencyLock(key);
 
-    return { ...result, idempotent: false };
+    return { data: result, idempotent: false };
   } catch (error) {
     // Release lock on error to allow retry
     await releaseIdempotencyLock(key);

@@ -1,10 +1,10 @@
-import pg from 'pg';
+import pg, { Pool as PoolType, QueryResult } from 'pg';
 
 const { Pool } = pg;
 
-let pool = null;
+let pool: PoolType | null = null;
 
-export function getPool() {
+export function getPool(): PoolType {
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -13,18 +13,18 @@ export function getPool() {
       connectionTimeoutMillis: 2000,
     });
 
-    pool.on('error', (err) => {
+    pool.on('error', (err: Error) => {
       console.error('Unexpected PostgreSQL error:', err);
     });
   }
   return pool;
 }
 
-export async function initializeDatabase() {
-  const pool = getPool();
+export async function initializeDatabase(): Promise<void> {
+  const dbPool = getPool();
 
   // Create tables
-  await pool.query(`
+  await dbPool.query(`
     CREATE TABLE IF NOT EXISTS videos (
       id UUID PRIMARY KEY,
       title VARCHAR(500) NOT NULL,
@@ -44,7 +44,7 @@ export async function initializeDatabase() {
   `);
 
   // Create view events table for historical tracking
-  await pool.query(`
+  await dbPool.query(`
     CREATE TABLE IF NOT EXISTS view_events (
       id SERIAL PRIMARY KEY,
       video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
@@ -57,7 +57,7 @@ export async function initializeDatabase() {
   `);
 
   // Create trending snapshots table
-  await pool.query(`
+  await dbPool.query(`
     CREATE TABLE IF NOT EXISTS trending_snapshots (
       id SERIAL PRIMARY KEY,
       window_type VARCHAR(50) NOT NULL,
@@ -72,10 +72,13 @@ export async function initializeDatabase() {
   console.log('Database initialized successfully');
 }
 
-export async function query(text, params) {
-  const pool = getPool();
+export async function query<T = unknown>(
+  text: string,
+  params?: unknown[]
+): Promise<QueryResult<T>> {
+  const dbPool = getPool();
   const start = Date.now();
-  const result = await pool.query(text, params);
+  const result = await dbPool.query<T>(text, params);
   const duration = Date.now() - start;
   if (duration > 100) {
     console.log('Slow query:', { text, duration, rows: result.rowCount });

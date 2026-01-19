@@ -6,13 +6,13 @@
 import { indexer } from '../services/indexer.js';
 import { db } from '../models/db.js';
 import { redis } from '../models/redis.js';
-import { initElasticsearch } from '../models/elasticsearch.js';
+import { initializeIndices } from '../models/elasticsearch.js';
 
 async function main(): Promise<void> {
   console.log('Starting index build...');
 
   // Initialize Elasticsearch
-  await initElasticsearch();
+  await initializeIndices();
 
   // Update inlink counts first (for ranking)
   await indexer.updateInlinkCounts();

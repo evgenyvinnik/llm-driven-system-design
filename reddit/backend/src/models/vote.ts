@@ -6,7 +6,33 @@ import { updateUserKarma } from './user.js';
 import logger from '../shared/logger.js';
 import { voteTotal, karmaCalculationDuration } from '../shared/metrics.js';
 
-export const castVote = async (userId, targetType, targetId, direction) => {
+export type VoteDirection = 1 | -1 | 0;
+export type VoteTargetType = 'post' | 'comment';
+
+export interface Vote {
+  id: number;
+  user_id: number;
+  post_id: number | null;
+  comment_id: number | null;
+  direction: VoteDirection;
+  created_at: Date;
+}
+
+export interface VoteResult {
+  success: boolean;
+}
+
+export interface AggregationResult {
+  postsAggregated: number | null;
+  commentsAggregated: number | null;
+}
+
+export const castVote = async (
+  userId: number,
+  targetType: VoteTargetType,
+  targetId: number,
+  direction: VoteDirection
+): Promise<VoteResult> => {
   // direction: 1 = upvote, -1 = downvote, 0 = remove vote
 
   const isPost = targetType === 'post';
@@ -14,7 +40,7 @@ export const castVote = async (userId, targetType, targetId, direction) => {
   const otherColumn = isPost ? 'comment_id' : 'post_id';
 
   // Check existing vote
-  const existingResult = await query(
+  const existingResult = await query<{ id: number; direction: VoteDirection }>(
     `SELECT id, direction FROM votes WHERE user_id = $1 AND ${column} = $2`,
     [userId, targetId]
   );
@@ -66,7 +92,7 @@ export const castVote = async (userId, targetType, targetId, direction) => {
   return { success: true };
 };
 
-export const getUserVote = async (userId, targetType, targetId) => {
+export const getUserVote = async (userId: number, targetType: VoteTargetType, targetId: number): Promise<number> => {
   // Check Redis cache first
   const cacheKey = `vote:${userId}:${targetType}:${targetId}`;
   const cached = await redis.get(cacheKey);
@@ -75,7 +101,7 @@ export const getUserVote = async (userId, targetType, targetId) => {
   }
 
   const column = targetType === 'post' ? 'post_id' : 'comment_id';
-  const result = await query(
+  const result = await query<{ direction: number }>(
     `SELECT direction FROM votes WHERE user_id = $1 AND ${column} = $2`,
     [userId, targetId]
   );
@@ -88,40 +114,46 @@ export const getUserVote = async (userId, targetType, targetId) => {
   return direction;
 };
 
-export const getUserVotesForPosts = async (userId, postIds) => {
+export const getUserVotesForPosts = async (
+  userId: number,
+  postIds: number[]
+): Promise<Record<number, number>> => {
   if (!postIds.length) return {};
 
-  const result = await query(
+  const result = await query<{ post_id: number; direction: number }>(
     `SELECT post_id, direction FROM votes WHERE user_id = $1 AND post_id = ANY($2)`,
     [userId, postIds]
   );
 
-  const votes = {};
+  const votes: Record<number, number> = {};
   for (const row of result.rows) {
     votes[row.post_id] = row.direction;
   }
   return votes;
 };
 
-export const getUserVotesForComments = async (userId, commentIds) => {
+export const getUserVotesForComments = async (
+  userId: number,
+  commentIds: number[]
+): Promise<Record<number, number>> => {
   if (!commentIds.length) return {};
 
-  const result = await query(
+  const result = await query<{ comment_id: number; direction: number }>(
     `SELECT comment_id, direction FROM votes WHERE user_id = $1 AND comment_id = ANY($2)`,
     [userId, commentIds]
   );
 
-  const votes = {};
+  const votes: Record<number, number> = {};
   for (const row of result.rows) {
     votes[row.comment_id] = row.direction;
   }
   return votes;
 };
 
-export const aggregateVotesForTarget = async (targetType, targetId) => {
+export const aggregateVotesForTarget = async (targetType: VoteTargetType, targetId: number): Promise<void> => {
   const column = targetType === 'post' ? 'post_id' : 'comment_id';
 
-  const result = await query(
+  const result = await query<{ upvotes: string; downvotes: string }>(
     `SELECT
        COALESCE(SUM(CASE WHEN direction = 1 THEN 1 ELSE 0 END), 0) as upvotes,
        COALESCE(SUM(CASE WHEN direction = -1 THEN 1 ELSE 0 END), 0) as downvotes
@@ -133,21 +165,21 @@ export const aggregateVotesForTarget = async (targetType, targetId) => {
   const { upvotes, downvotes } = result.rows[0];
 
   if (targetType === 'post') {
-    await updatePostScore(targetId, parseInt(upvotes), parseInt(downvotes));
+    await updatePostScore(targetId, parseInt(upvotes, 10), parseInt(downvotes, 10));
 
     // Update author karma
     const start = Date.now();
-    const postResult = await query(`SELECT author_id FROM posts WHERE id = $1`, [targetId]);
+    const postResult = await query<{ author_id: number }>(`SELECT author_id FROM posts WHERE id = $1`, [targetId]);
     if (postResult.rows[0]?.author_id) {
       await updateUserKarma(postResult.rows[0].author_id);
       karmaCalculationDuration.observe((Date.now() - start) / 1000);
     }
   } else {
-    await updateCommentScore(targetId, parseInt(upvotes), parseInt(downvotes));
+    await updateCommentScore(targetId, parseInt(upvotes, 10), parseInt(downvotes, 10));
 
     // Update author karma
     const start = Date.now();
-    const commentResult = await query(`SELECT author_id FROM comments WHERE id = $1`, [targetId]);
+    const commentResult = await query<{ author_id: number }>(`SELECT author_id FROM comments WHERE id = $1`, [targetId]);
     if (commentResult.rows[0]?.author_id) {
       await updateUserKarma(commentResult.rows[0].author_id);
       karmaCalculationDuration.observe((Date.now() - start) / 1000);
@@ -156,9 +188,9 @@ export const aggregateVotesForTarget = async (targetType, targetId) => {
 };
 
 // Background aggregation for all pending votes
-export const aggregateAllVotes = async () => {
+export const aggregateAllVotes = async (): Promise<AggregationResult> => {
   // Get all posts with votes in the last interval
-  const postsResult = await query(`
+  const postsResult = await query<{ post_id: number }>(`
     SELECT DISTINCT post_id FROM votes
     WHERE post_id IS NOT NULL
       AND created_at > NOW() - INTERVAL '1 minute'
@@ -169,7 +201,7 @@ export const aggregateAllVotes = async () => {
   }
 
   // Get all comments with votes in the last interval
-  const commentsResult = await query(`
+  const commentsResult = await query<{ comment_id: number }>(`
     SELECT DISTINCT comment_id FROM votes
     WHERE comment_id IS NOT NULL
       AND created_at > NOW() - INTERVAL '1 minute'

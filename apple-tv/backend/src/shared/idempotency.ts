@@ -9,33 +9,56 @@
  * Uses Redis to store request results with TTL.
  * Clients send an Idempotency-Key header to enable this behavior.
  */
-const { v4: uuid } = require('uuid');
-const { logger } = require('./logger');
-const { idempotentRequestsTotal } = require('./metrics');
+import { v4 as uuid } from 'uuid';
+import { Request, Response, NextFunction } from 'express';
+import { RedisClientType } from 'redis';
+import { logger } from './logger.js';
+import { idempotentRequestsTotal } from './metrics.js';
 
 // TTL for idempotency records (24 hours)
-const IDEMPOTENCY_TTL = 86400;
+export const IDEMPOTENCY_TTL = 86400;
 // Lock TTL to prevent concurrent processing (30 seconds)
-const LOCK_TTL = 30;
+export const LOCK_TTL = 30;
+
+export interface WatchProgressMeta {
+  idempotencyKey: string;
+  clientTimestamp: number;
+}
+
+export interface CachedResponse {
+  status: number;
+  body: unknown;
+}
+
+// Extend Express Request type
+declare global {
+  namespace Express {
+    interface Request {
+      watchProgressMeta?: WatchProgressMeta;
+    }
+  }
+}
 
 /**
  * Express middleware for idempotent request handling
  *
- * @param {Object} redis - Redis client
- * @returns {Function} Express middleware
+ * @param redis - Redis client
+ * @returns Express middleware
  */
-function idempotencyMiddleware(redis) {
-  return async (req, res, next) => {
+export function idempotencyMiddleware(redis: RedisClientType) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // Only apply to mutating methods
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-      return next();
+      next();
+      return;
     }
 
-    const idempotencyKey = req.headers['idempotency-key'];
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
     // If no idempotency key, proceed normally
     if (!idempotencyKey) {
-      return next();
+      next();
+      return;
     }
 
     const userId = req.session?.userId || 'anonymous';
@@ -46,7 +69,7 @@ function idempotencyMiddleware(redis) {
       // Check if we already have a cached response
       const cached = await redis.get(cacheKey);
       if (cached) {
-        const response = JSON.parse(cached);
+        const response = JSON.parse(cached) as CachedResponse;
         idempotentRequestsTotal.inc({ result: 'cached' });
 
         if (req.log) {
@@ -56,7 +79,8 @@ function idempotencyMiddleware(redis) {
           }, 'Returning cached idempotent response');
         }
 
-        return res.status(response.status).json(response.body);
+        res.status(response.status).json(response.body);
+        return;
       }
 
       // Try to acquire lock for processing
@@ -68,10 +92,11 @@ function idempotencyMiddleware(redis) {
       if (!lockAcquired) {
         // Another request is processing this idempotency key
         idempotentRequestsTotal.inc({ result: 'in_progress' });
-        return res.status(409).json({
+        res.status(409).json({
           error: 'Request already in progress',
           idempotencyKey
         });
+        return;
       }
 
       // Store original response methods
@@ -79,43 +104,47 @@ function idempotencyMiddleware(redis) {
       const originalSend = res.send.bind(res);
 
       // Override json method to cache the response
-      res.json = async (body) => {
-        try {
-          // Cache the response
-          await redis.setEx(cacheKey, IDEMPOTENCY_TTL, JSON.stringify({
-            status: res.statusCode,
-            body
-          }));
-          // Release lock
-          await redis.del(lockKey);
-          idempotentRequestsTotal.inc({ result: 'new' });
-        } catch (cacheError) {
-          logger.error({
-            error: cacheError.message,
-            idempotencyKey
-          }, 'Failed to cache idempotent response');
-        }
+      res.json = function(body: unknown): Response {
+        (async () => {
+          try {
+            // Cache the response
+            await redis.setEx(cacheKey, IDEMPOTENCY_TTL, JSON.stringify({
+              status: res.statusCode,
+              body
+            }));
+            // Release lock
+            await redis.del(lockKey);
+            idempotentRequestsTotal.inc({ result: 'new' });
+          } catch (cacheError) {
+            logger.error({
+              error: (cacheError as Error).message,
+              idempotencyKey
+            }, 'Failed to cache idempotent response');
+          }
+        })();
 
         return originalJson(body);
       };
 
       // Override send method similarly
-      res.send = async (body) => {
-        try {
-          // Only cache JSON responses
-          if (res.get('Content-Type')?.includes('application/json')) {
-            await redis.setEx(cacheKey, IDEMPOTENCY_TTL, JSON.stringify({
-              status: res.statusCode,
-              body: typeof body === 'string' ? JSON.parse(body) : body
-            }));
+      res.send = function(body: unknown): Response {
+        (async () => {
+          try {
+            // Only cache JSON responses
+            if (res.get('Content-Type')?.includes('application/json')) {
+              await redis.setEx(cacheKey, IDEMPOTENCY_TTL, JSON.stringify({
+                status: res.statusCode,
+                body: typeof body === 'string' ? JSON.parse(body) : body
+              }));
+            }
+            await redis.del(lockKey);
+          } catch (cacheError) {
+            logger.error({
+              error: (cacheError as Error).message,
+              idempotencyKey
+            }, 'Failed to cache idempotent response');
           }
-          await redis.del(lockKey);
-        } catch (cacheError) {
-          logger.error({
-            error: cacheError.message,
-            idempotencyKey
-          }, 'Failed to cache idempotent response');
-        }
+        })();
 
         return originalSend(body);
       };
@@ -123,7 +152,7 @@ function idempotencyMiddleware(redis) {
       next();
     } catch (error) {
       logger.error({
-        error: error.message,
+        error: (error as Error).message,
         idempotencyKey
       }, 'Idempotency middleware error');
 
@@ -137,22 +166,25 @@ function idempotencyMiddleware(redis) {
  * Create an idempotency key for a specific operation
  * Useful for server-side idempotency (e.g., background jobs)
  *
- * @param {string} operation - Operation name
- * @param {...string} parts - Additional key parts
- * @returns {string} Idempotency key
+ * @param operation - Operation name
+ * @param parts - Additional key parts
+ * @returns Idempotency key
  */
-function createIdempotencyKey(operation, ...parts) {
+export function createIdempotencyKey(operation: string, ...parts: string[]): string {
   return `${operation}:${parts.join(':')}:${uuid()}`;
 }
 
 /**
  * Check if an operation has already been performed (idempotent check)
  *
- * @param {Object} redis - Redis client
- * @param {string} key - Idempotency key
- * @returns {Promise<Object|null>} Cached result or null
+ * @param redis - Redis client
+ * @param key - Idempotency key
+ * @returns Cached result or null
  */
-async function checkIdempotency(redis, key) {
+export async function checkIdempotency(
+  redis: RedisClientType,
+  key: string
+): Promise<unknown | null> {
   const cached = await redis.get(`idempotency:${key}`);
   return cached ? JSON.parse(cached) : null;
 }
@@ -160,12 +192,17 @@ async function checkIdempotency(redis, key) {
 /**
  * Mark an operation as completed (idempotent store)
  *
- * @param {Object} redis - Redis client
- * @param {string} key - Idempotency key
- * @param {Object} result - Operation result to cache
- * @param {number} ttl - TTL in seconds (default 24 hours)
+ * @param redis - Redis client
+ * @param key - Idempotency key
+ * @param result - Operation result to cache
+ * @param ttl - TTL in seconds (default 24 hours)
  */
-async function markIdempotent(redis, key, result, ttl = IDEMPOTENCY_TTL) {
+export async function markIdempotent(
+  redis: RedisClientType,
+  key: string,
+  result: unknown,
+  ttl: number = IDEMPOTENCY_TTL
+): Promise<void> {
   await redis.setEx(`idempotency:${key}`, ttl, JSON.stringify(result));
 }
 
@@ -173,21 +210,23 @@ async function markIdempotent(redis, key, result, ttl = IDEMPOTENCY_TTL) {
  * Middleware specifically for watch progress updates
  * Uses content-based idempotency with timestamp comparison
  *
- * @param {Object} redis - Redis client
- * @returns {Function} Express middleware
+ * @param redis - Redis client
+ * @returns Express middleware
  */
-function watchProgressIdempotency(redis) {
-  return async (req, res, next) => {
+export function watchProgressIdempotency(redis: RedisClientType) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     if (req.method !== 'POST') {
-      return next();
+      next();
+      return;
     }
 
     const { contentId } = req.params;
     const profileId = req.session?.profileId;
-    const { position, clientTimestamp } = req.body;
+    const { clientTimestamp } = req.body as { position?: number; clientTimestamp?: number };
 
     if (!profileId || !contentId) {
-      return next();
+      next();
+      return;
     }
 
     // Create a deterministic key based on the update parameters
@@ -198,7 +237,7 @@ function watchProgressIdempotency(redis) {
       const lastUpdate = await redis.get(idempotencyKey);
 
       if (lastUpdate) {
-        const parsed = JSON.parse(lastUpdate);
+        const parsed = JSON.parse(lastUpdate) as { clientTimestamp: number };
 
         // If client timestamp is older or equal, skip update
         if (clientTimestamp && parsed.clientTimestamp >= clientTimestamp) {
@@ -211,11 +250,12 @@ function watchProgressIdempotency(redis) {
             }, 'Skipping stale progress update');
           }
 
-          return res.json({
+          res.json({
             success: true,
             skipped: true,
             reason: 'stale_update'
           });
+          return;
         }
       }
 
@@ -229,7 +269,7 @@ function watchProgressIdempotency(redis) {
       next();
     } catch (error) {
       logger.error({
-        error: error.message,
+        error: (error as Error).message,
         contentId,
         profileId
       }, 'Watch progress idempotency check failed');
@@ -241,10 +281,13 @@ function watchProgressIdempotency(redis) {
 /**
  * Helper to complete watch progress idempotency after successful update
  *
- * @param {Object} redis - Redis client
- * @param {Object} meta - Idempotency metadata from request
+ * @param redis - Redis client
+ * @param meta - Idempotency metadata from request
  */
-async function completeWatchProgressIdempotency(redis, meta) {
+export async function completeWatchProgressIdempotency(
+  redis: RedisClientType,
+  meta?: WatchProgressMeta
+): Promise<void> {
   if (!meta?.idempotencyKey) return;
 
   await redis.setEx(meta.idempotencyKey, 60, JSON.stringify({
@@ -252,14 +295,3 @@ async function completeWatchProgressIdempotency(redis, meta) {
     updatedAt: Date.now()
   }));
 }
-
-module.exports = {
-  idempotencyMiddleware,
-  createIdempotencyKey,
-  checkIdempotency,
-  markIdempotent,
-  watchProgressIdempotency,
-  completeWatchProgressIdempotency,
-  IDEMPOTENCY_TTL,
-  LOCK_TTL
-};

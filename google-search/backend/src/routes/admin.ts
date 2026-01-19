@@ -216,19 +216,19 @@ router.post('/index/build', async (req: AdminRequest, res: Response) => {
     )
       .then((result) => {
         log.info(
-          { count: result.count, durationMs: result.duration, idempotent: result.idempotent },
+          { count: result.data.count, durationMs: result.data.duration, idempotent: result.idempotent },
           'Indexing completed'
         );
         indexOperationsCounter.labels('build', 'success').inc();
-        indexLatencyHistogram.labels('build').observe(result.duration / 1000);
-        documentsIndexedGauge.set(result.count);
+        indexLatencyHistogram.labels('build').observe(result.data.duration / 1000);
+        documentsIndexedGauge.set(result.data.count);
 
         auditLog('index_build', {
           actor: 'system',
           resource: 'elasticsearch',
           resourceId: 'documents',
           outcome: 'success',
-          metadata: { documentCount: result.count, durationMs: result.duration },
+          metadata: { documentCount: result.data.count, durationMs: result.data.duration },
         });
       })
       .catch((error: Error) => {
@@ -294,7 +294,7 @@ router.post('/pagerank/calculate', async (req: AdminRequest, res: Response) => {
     )
       .then((result) => {
         log.info(
-          { topPagesCount: result.topPages?.length, durationMs: result.duration },
+          { topPagesCount: result.data.topPages?.length, durationMs: result.data.duration },
           'PageRank calculation completed'
         );
 
@@ -302,7 +302,7 @@ router.post('/pagerank/calculate', async (req: AdminRequest, res: Response) => {
           actor: 'system',
           resource: 'pagerank',
           outcome: 'success',
-          metadata: { durationMs: result.duration },
+          metadata: { durationMs: result.data.duration },
         });
       })
       .catch((error: Error) => {

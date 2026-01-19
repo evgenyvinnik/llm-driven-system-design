@@ -2,7 +2,7 @@
  * RabbitMQ integration for async image processing.
  * Provides queue management for image processing jobs.
  */
-import amqp from 'amqplib';
+import amqp, { Connection, Channel, ConsumeMessage } from 'amqplib';
 import logger from './logger.js';
 
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://instagram:instagram123@localhost:5672';
@@ -10,30 +10,37 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://instagram:instagram123@
 export const QUEUES = {
   IMAGE_PROCESSING: 'image-processing',
   IMAGE_PROCESSING_DLQ: 'image-processing-dlq',
-};
+} as const;
 
-let connection = null;
-let channel = null;
+let connection: Connection | null = null;
+let channel: Channel | null = null;
 let isConnecting = false;
 
 /**
  * Image processing job payload.
- * @typedef {Object} ImageProcessingJob
- * @property {string} postId - Post ID to process images for
- * @property {string} userId - User who created the post
- * @property {Array<{originalKey: string, filterName: string, orderIndex: number}>} mediaItems - Media items to process
  */
+export interface MediaItem {
+  originalKey: string;
+  filterName: string;
+  orderIndex: number;
+}
+
+export interface ImageProcessingJob {
+  postId: string;
+  userId: string;
+  mediaItems: MediaItem[];
+}
 
 /**
  * Initialize RabbitMQ connection and declare queues.
  */
-export async function initializeQueue() {
+export async function initializeQueue(): Promise<void> {
   if (connection && channel) {
     return;
   }
 
   if (isConnecting) {
-    await new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       const check = setInterval(() => {
         if (connection && channel) {
           clearInterval(check);
@@ -53,7 +60,7 @@ export async function initializeQueue() {
     channel = await connection.createChannel();
 
     // Set up error handlers
-    connection.on('error', (err) => {
+    connection.on('error', (err: Error) => {
       logger.error({ error: err.message }, 'RabbitMQ connection error');
       connection = null;
       channel = null;
@@ -88,7 +95,8 @@ export async function initializeQueue() {
 
     logger.info('RabbitMQ connected, queues declared');
   } catch (error) {
-    logger.error({ error: error.message }, 'Failed to connect to RabbitMQ');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Failed to connect to RabbitMQ');
     throw error;
   } finally {
     isConnecting = false;
@@ -97,9 +105,8 @@ export async function initializeQueue() {
 
 /**
  * Publish an image processing job to the queue.
- * @param {ImageProcessingJob} job - Job to publish
  */
-export async function publishImageProcessingJob(job) {
+export async function publishImageProcessingJob(job: ImageProcessingJob): Promise<boolean> {
   if (!channel) {
     logger.warn('RabbitMQ channel not available, skipping job publish');
     return false;
@@ -115,39 +122,42 @@ export async function publishImageProcessingJob(job) {
     logger.info({ postId: job.postId, mediaCount: job.mediaItems.length }, 'Published image processing job');
     return true;
   } catch (error) {
-    logger.error({ error: error.message, postId: job.postId }, 'Failed to publish image processing job');
+    const err = error as Error;
+    logger.error({ error: err.message, postId: job.postId }, 'Failed to publish image processing job');
     return false;
   }
 }
 
+export type JobHandler = (job: ImageProcessingJob) => Promise<void>;
+
 /**
  * Consume image processing jobs from the queue.
- * @param {function(ImageProcessingJob): Promise<void>} handler - Job handler function
  */
-export async function consumeImageProcessingJobs(handler) {
+export async function consumeImageProcessingJobs(handler: JobHandler): Promise<void> {
   if (!channel) {
     await initializeQueue();
   }
 
-  await channel.consume(
+  await channel!.consume(
     QUEUES.IMAGE_PROCESSING,
-    async (msg) => {
+    async (msg: ConsumeMessage | null) => {
       if (!msg) return;
 
       const jobLogger = logger.child({ messageId: msg.properties.messageId });
 
       try {
-        const job = JSON.parse(msg.content.toString());
+        const job: ImageProcessingJob = JSON.parse(msg.content.toString());
         jobLogger.info({ postId: job.postId }, 'Processing image job');
 
         await handler(job);
 
-        channel.ack(msg);
+        channel!.ack(msg);
         jobLogger.info({ postId: job.postId }, 'Image job completed');
       } catch (error) {
-        jobLogger.error({ error: error.message }, 'Image job failed');
+        const err = error as Error;
+        jobLogger.error({ error: err.message }, 'Image job failed');
         // Reject and send to DLQ (no requeue)
-        channel.nack(msg, false, false);
+        channel!.nack(msg, false, false);
       }
     },
     { noAck: false }
@@ -159,7 +169,7 @@ export async function consumeImageProcessingJobs(handler) {
 /**
  * Close RabbitMQ connection gracefully.
  */
-export async function closeQueue() {
+export async function closeQueue(): Promise<void> {
   try {
     if (channel) {
       await channel.close();
@@ -171,13 +181,14 @@ export async function closeQueue() {
     }
     logger.info('RabbitMQ connection closed');
   } catch (error) {
-    logger.error({ error: error.message }, 'Error closing RabbitMQ connection');
+    const err = error as Error;
+    logger.error({ error: err.message }, 'Error closing RabbitMQ connection');
   }
 }
 
 /**
  * Check if queue is ready.
  */
-export function isQueueReady() {
+export function isQueueReady(): boolean {
   return connection !== null && channel !== null;
 }

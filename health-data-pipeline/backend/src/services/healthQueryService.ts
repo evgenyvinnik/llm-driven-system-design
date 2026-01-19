@@ -1,15 +1,106 @@
 import { db } from '../config/database.js';
 import { cache } from '../config/redis.js';
 
+interface GetSamplesOptions {
+  type?: string;
+  startDate?: Date;
+  endDate?: Date;
+  limit?: number;
+  offset?: number;
+}
+
+interface GetAggregatesOptions {
+  types: string[];
+  period?: string;
+  startDate: Date;
+  endDate: Date;
+}
+
+interface SampleRow {
+  id: string;
+  user_id: string;
+  type: string;
+  value: number;
+  unit: string;
+  start_date: Date;
+  end_date: Date;
+  source_device: string | null;
+  source_device_id: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: Date;
+}
+
+interface AggregateRow {
+  type: string;
+  period_start: Date;
+  value: number;
+  min_value: number;
+  max_value: number;
+  sample_count: number;
+}
+
+interface AggregateData {
+  date: Date;
+  value: number;
+  minValue: number;
+  maxValue: number;
+  sampleCount: number;
+}
+
+interface WeeklySummaryRow {
+  type: string;
+  total: string;
+  average: string;
+  min_value: number;
+  max_value: number;
+  sample_count: string;
+}
+
+interface SummaryData {
+  value: number;
+  minValue: number;
+  maxValue: number;
+  sampleCount: number;
+}
+
+interface WeeklySummaryData {
+  total: number;
+  average: number;
+  minValue: number;
+  maxValue: number;
+  sampleCount: number;
+}
+
+interface LatestMetricRow {
+  type: string;
+  value: number;
+  date: Date;
+}
+
+interface HistoricalRow {
+  date: Date;
+  value: number;
+  min_value: number;
+  max_value: number;
+  sample_count: number;
+}
+
+interface HealthDataTypeRow {
+  type: string;
+  category: string;
+  unit: string;
+  aggregation: string;
+}
+
 export class HealthQueryService {
-  async getSamples(userId, options) {
+  async getSamples(userId: string, options: GetSamplesOptions): Promise<SampleRow[]> {
     const { type, startDate, endDate, limit = 1000, offset = 0 } = options;
 
     let query = `
       SELECT * FROM health_samples
       WHERE user_id = $1
     `;
-    const params = [userId];
+    const params: unknown[] = [userId];
     let paramIndex = 2;
 
     if (type) {
@@ -30,19 +121,19 @@ export class HealthQueryService {
     query += ` ORDER BY start_date DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
     params.push(limit, offset);
 
-    const result = await db.query(query, params);
+    const result = await db.query<SampleRow>(query, params);
     return result.rows;
   }
 
-  async getAggregates(userId, options) {
+  async getAggregates(userId: string, options: GetAggregatesOptions): Promise<Record<string, AggregateData[]>> {
     const { types, period = 'day', startDate, endDate } = options;
 
     // Check cache first
-    const cacheKey = `aggregates:${userId}:${types.join(',')}:${period}:${startDate}:${endDate}`;
-    const cached = await cache.get(cacheKey);
+    const cacheKey = `aggregates:${userId}:${types.join(',')}:${period}:${startDate.toISOString()}:${endDate.toISOString()}`;
+    const cached = await cache.get<Record<string, AggregateData[]>>(cacheKey);
     if (cached) return cached;
 
-    const result = await db.query(
+    const result = await db.query<AggregateRow>(
       `SELECT type, period_start, value, min_value, max_value, sample_count
        FROM health_aggregates
        WHERE user_id = $1
@@ -55,7 +146,7 @@ export class HealthQueryService {
     );
 
     // Group by type
-    const grouped = {};
+    const grouped: Record<string, AggregateData[]> = {};
     for (const row of result.rows) {
       if (!grouped[row.type]) {
         grouped[row.type] = [];
@@ -75,17 +166,17 @@ export class HealthQueryService {
     return grouped;
   }
 
-  async getDailySummary(userId, date) {
+  async getDailySummary(userId: string, date: Date): Promise<Record<string, SummaryData>> {
     const startOfDay = new Date(date);
     startOfDay.setHours(0, 0, 0, 0);
     const endOfDay = new Date(date);
     endOfDay.setHours(23, 59, 59, 999);
 
     const cacheKey = `summary:${userId}:${startOfDay.toISOString().split('T')[0]}`;
-    const cached = await cache.get(cacheKey);
+    const cached = await cache.get<Record<string, SummaryData>>(cacheKey);
     if (cached) return cached;
 
-    const result = await db.query(
+    const result = await db.query<AggregateRow>(
       `SELECT type, value, min_value, max_value, sample_count
        FROM health_aggregates
        WHERE user_id = $1
@@ -95,7 +186,7 @@ export class HealthQueryService {
       [userId, startOfDay, endOfDay]
     );
 
-    const summary = {};
+    const summary: Record<string, SummaryData> = {};
     for (const row of result.rows) {
       summary[row.type] = {
         value: row.value,
@@ -111,12 +202,12 @@ export class HealthQueryService {
     return summary;
   }
 
-  async getWeeklySummary(userId) {
+  async getWeeklySummary(userId: string): Promise<Record<string, WeeklySummaryData>> {
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - 7);
 
-    const result = await db.query(
+    const result = await db.query<WeeklySummaryRow>(
       `SELECT type,
               SUM(value) as total,
               AVG(value) as average,
@@ -132,7 +223,7 @@ export class HealthQueryService {
       [userId, startDate, endDate]
     );
 
-    const summary = {};
+    const summary: Record<string, WeeklySummaryData> = {};
     for (const row of result.rows) {
       summary[row.type] = {
         total: parseFloat(row.total),
@@ -146,16 +237,16 @@ export class HealthQueryService {
     return summary;
   }
 
-  async getHealthDataTypes() {
-    const result = await db.query(
+  async getHealthDataTypes(): Promise<HealthDataTypeRow[]> {
+    const result = await db.query<HealthDataTypeRow>(
       `SELECT * FROM health_data_types ORDER BY category, type`
     );
     return result.rows;
   }
 
-  async getLatestMetrics(userId) {
+  async getLatestMetrics(userId: string): Promise<Record<string, { value: number; date: Date }>> {
     // Get latest value for each metric type
-    const result = await db.query(
+    const result = await db.query<LatestMetricRow>(
       `SELECT DISTINCT ON (type) type, value, period_start as date
        FROM health_aggregates
        WHERE user_id = $1 AND period = 'day'
@@ -163,7 +254,7 @@ export class HealthQueryService {
       [userId]
     );
 
-    const latest = {};
+    const latest: Record<string, { value: number; date: Date }> = {};
     for (const row of result.rows) {
       latest[row.type] = {
         value: row.value,
@@ -174,12 +265,12 @@ export class HealthQueryService {
     return latest;
   }
 
-  async getHistoricalData(userId, type, days = 30) {
+  async getHistoricalData(userId: string, type: string, days: number = 30): Promise<HistoricalRow[]> {
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
 
-    const result = await db.query(
+    const result = await db.query<HistoricalRow>(
       `SELECT period_start as date, value, min_value, max_value, sample_count
        FROM health_aggregates
        WHERE user_id = $1

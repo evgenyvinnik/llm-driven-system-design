@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { query, transaction } from '../db.js';
 import { authenticate, requireHost } from '../middleware/auth.js';
 import { invalidateAvailabilityCache } from '../shared/cache.js';
@@ -10,16 +10,41 @@ import { createModuleLogger } from '../shared/logger.js';
 const router = Router();
 const log = createModuleLogger('bookings');
 
+// Type definitions
+interface ListingRow {
+  id: number;
+  host_id: number;
+  title: string;
+  city: string | null;
+  property_type: string | null;
+  price_per_night: string | number;
+  cleaning_fee: string | number | null;
+  service_fee_percent: string | number | null;
+  minimum_nights: number;
+  maximum_nights: number;
+  max_guests: number;
+  instant_book: boolean;
+}
+
+interface BookingPricing {
+  nights: number;
+  pricePerNight: number;
+  subtotal: number;
+  cleaningFee: number;
+  serviceFee: number;
+  total: number;
+}
+
 // Calculate booking price
-const calculateBookingPrice = (listing, checkIn, checkOut) => {
+const calculateBookingPrice = (listing: ListingRow, checkIn: string, checkOut: string): BookingPricing => {
   const checkInDate = new Date(checkIn);
   const checkOutDate = new Date(checkOut);
-  const nights = Math.ceil((checkOutDate - checkInDate) / (1000 * 60 * 60 * 24));
+  const nights = Math.ceil((checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24));
 
-  const pricePerNight = parseFloat(listing.price_per_night);
-  const cleaningFee = parseFloat(listing.cleaning_fee || 0);
+  const pricePerNight = parseFloat(String(listing.price_per_night));
+  const cleaningFee = parseFloat(String(listing.cleaning_fee || 0));
   const subtotal = pricePerNight * nights;
-  const serviceFee = subtotal * (parseFloat(listing.service_fee_percent || 10) / 100);
+  const serviceFee = subtotal * (parseFloat(String(listing.service_fee_percent || 10)) / 100);
   const total = subtotal + cleaningFee + serviceFee;
 
   return {
@@ -33,7 +58,7 @@ const calculateBookingPrice = (listing, checkIn, checkOut) => {
 };
 
 // Check availability
-router.get('/check-availability', async (req, res) => {
+router.get('/check-availability', async (req: Request, res: Response) => {
   const { listing_id, check_in, check_out } = req.query;
   const startTime = process.hrtime.bigint();
 

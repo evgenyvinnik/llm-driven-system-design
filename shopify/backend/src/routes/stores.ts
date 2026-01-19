@@ -1,12 +1,33 @@
+import { Request, Response, NextFunction } from 'express';
 import { query, queryWithTenant } from '../services/db.js';
 import { getDomainMapping, setDomainMapping } from '../services/redis.js';
 
-// Resolve store from subdomain or custom domain
-export async function resolveStore(req, res, next) {
-  const host = req.get('host');
-  const subdomain = req.query.subdomain || req.headers['x-store-subdomain'];
+// Store row interface
+interface StoreRow {
+  id: number;
+  name: string;
+  subdomain: string;
+  custom_domain?: string | null;
+  description?: string | null;
+  logo_url?: string | null;
+  currency: string;
+  theme: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  status: string;
+  created_at: Date;
+  owner_id: number;
+}
 
-  let storeId = null;
+// Resolve store from subdomain or custom domain
+export async function resolveStore(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const host = req.get('host') || '';
+  const subdomain = (req.query.subdomain as string) || req.headers['x-store-subdomain'] as string;
+
+  let storeId: number | null = null;
 
   // Check for subdomain parameter (for local development)
   if (subdomain) {
@@ -15,7 +36,7 @@ export async function resolveStore(req, res, next) {
       [subdomain, 'active']
     );
     if (result.rows.length > 0) {
-      storeId = result.rows[0].id;
+      storeId = (result.rows[0] as { id: number }).id;
     }
   } else {
     // Try to resolve from custom domain cache first
@@ -25,13 +46,13 @@ export async function resolveStore(req, res, next) {
       // Check if it's a subdomain pattern (e.g., demo.shopify.local)
       const subdomainMatch = host.match(/^([^.]+)\./);
       if (subdomainMatch) {
-        const subdomain = subdomainMatch[1];
+        const subdomainFromHost = subdomainMatch[1];
         const result = await query(
           'SELECT id FROM stores WHERE subdomain = $1 AND status = $2',
-          [subdomain, 'active']
+          [subdomainFromHost, 'active']
         );
         if (result.rows.length > 0) {
-          storeId = result.rows[0].id;
+          storeId = (result.rows[0] as { id: number }).id;
           await setDomainMapping(host, storeId);
         }
       }
@@ -43,19 +64,23 @@ export async function resolveStore(req, res, next) {
           [host]
         );
         if (result.rows.length > 0) {
-          storeId = result.rows[0].store_id;
+          storeId = (result.rows[0] as { store_id: number }).store_id;
           await setDomainMapping(host, storeId);
         }
       }
     }
   }
 
-  req.storeId = storeId;
+  req.storeId = storeId || undefined;
   next();
 }
 
 // Require store context to be resolved
-export function requireStore(req, res, next) {
+export function requireStore(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void | Response {
   if (!req.storeId) {
     return res.status(404).json({ error: 'Store not found' });
   }
@@ -63,7 +88,7 @@ export function requireStore(req, res, next) {
 }
 
 // Get store details
-export async function getStore(req, res) {
+export async function getStore(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req.params;
 
   const result = await query(
@@ -81,7 +106,7 @@ export async function getStore(req, res) {
 }
 
 // Get store by subdomain (for storefront)
-export async function getStoreBySubdomain(req, res) {
+export async function getStoreBySubdomain(req: Request, res: Response): Promise<void | Response> {
   const { subdomain } = req.params;
 
   const result = await query(
@@ -98,8 +123,8 @@ export async function getStoreBySubdomain(req, res) {
 }
 
 // List stores for authenticated user
-export async function listStores(req, res) {
-  const userId = req.user.id;
+export async function listStores(req: Request, res: Response): Promise<void> {
+  const userId = req.user!.id;
 
   const result = await query(
     `SELECT id, name, subdomain, custom_domain, logo_url, status, created_at
@@ -112,9 +137,9 @@ export async function listStores(req, res) {
 }
 
 // Create new store
-export async function createStore(req, res) {
+export async function createStore(req: Request, res: Response): Promise<void | Response> {
   const { name, subdomain, description } = req.body;
-  const userId = req.user.id;
+  const userId = req.user!.id;
 
   if (!name || !subdomain) {
     return res.status(400).json({ error: 'Name and subdomain required' });
@@ -144,12 +169,12 @@ export async function createStore(req, res) {
 }
 
 // Update store
-export async function updateStore(req, res) {
+export async function updateStore(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { name, description, logo_url, currency, theme, settings } = req.body;
 
-  const updates = [];
-  const values = [];
+  const updates: string[] = [];
+  const values: unknown[] = [];
   let paramCount = 1;
 
   if (name !== undefined) {
@@ -193,13 +218,21 @@ export async function updateStore(req, res) {
   res.json({ store: result.rows[0] });
 }
 
+// Order stats interface
+interface OrderStats {
+  total_orders: string;
+  total_revenue: string;
+  paid_orders: string;
+  unfulfilled_orders: string;
+}
+
 // Get store analytics
-export async function getStoreAnalytics(req, res) {
+export async function getStoreAnalytics(req: Request, res: Response): Promise<void> {
   const { storeId } = req;
 
   // Get order stats
   const orderStats = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT
        COUNT(*) as total_orders,
        COALESCE(SUM(total), 0) as total_revenue,
@@ -210,36 +243,40 @@ export async function getStoreAnalytics(req, res) {
 
   // Get product stats
   const productStats = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT COUNT(*) as total_products FROM products WHERE status = 'active'`
   );
 
   // Get customer stats
   const customerStats = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT COUNT(*) as total_customers FROM customers`
   );
 
   // Get recent orders
   const recentOrders = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT id, order_number, customer_email, total, payment_status, fulfillment_status, created_at
      FROM orders ORDER BY created_at DESC LIMIT 5`
   );
 
+  const stats = orderStats.rows[0] as OrderStats;
+  const prodStats = productStats.rows[0] as { total_products: string };
+  const custStats = customerStats.rows[0] as { total_customers: string };
+
   res.json({
     analytics: {
       orders: {
-        total: parseInt(orderStats.rows[0].total_orders),
-        revenue: parseFloat(orderStats.rows[0].total_revenue),
-        paid: parseInt(orderStats.rows[0].paid_orders),
-        unfulfilled: parseInt(orderStats.rows[0].unfulfilled_orders),
+        total: parseInt(stats.total_orders),
+        revenue: parseFloat(stats.total_revenue),
+        paid: parseInt(stats.paid_orders),
+        unfulfilled: parseInt(stats.unfulfilled_orders),
       },
       products: {
-        total: parseInt(productStats.rows[0].total_products),
+        total: parseInt(prodStats.total_products),
       },
       customers: {
-        total: parseInt(customerStats.rows[0].total_customers),
+        total: parseInt(custStats.total_customers),
       },
       recentOrders: recentOrders.rows,
     },

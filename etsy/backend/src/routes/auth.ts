@@ -1,11 +1,40 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import db from '../db/index.js';
 
 const router = Router();
 
+interface RegisterBody {
+  email: string;
+  password: string;
+  username: string;
+  fullName?: string;
+}
+
+interface LoginBody {
+  email: string;
+  password: string;
+}
+
+interface UserRow {
+  id: number;
+  email: string;
+  password_hash: string;
+  username: string;
+  full_name: string | null;
+  role: string;
+  avatar_url: string | null;
+  created_at: Date;
+}
+
+interface ShopRow {
+  id: number;
+  name?: string;
+  slug?: string;
+}
+
 // Register
-router.post('/register', async (req, res) => {
+router.post('/register', async (req: Request<object, object, RegisterBody>, res: Response) => {
   try {
     const { email, password, username, fullName } = req.body;
 
@@ -23,7 +52,7 @@ router.post('/register', async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const result = await db.query(
+    const result = await db.query<UserRow>(
       `INSERT INTO users (email, password_hash, username, full_name)
        VALUES ($1, $2, $3, $4)
        RETURNING id, email, username, full_name, role, created_at`,
@@ -33,7 +62,7 @@ router.post('/register', async (req, res) => {
     const user = result.rows[0];
 
     // Get user's shops
-    const shopsResult = await db.query('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
+    const shopsResult = await db.query<ShopRow>('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
     const shopIds = shopsResult.rows.map((s) => s.id);
 
     // Set session
@@ -58,7 +87,7 @@ router.post('/register', async (req, res) => {
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', async (req: Request<object, object, LoginBody>, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -66,7 +95,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const result = await db.query(
+    const result = await db.query<UserRow>(
       'SELECT id, email, password_hash, username, full_name, role, avatar_url FROM users WHERE email = $1',
       [email]
     );
@@ -83,7 +112,7 @@ router.post('/login', async (req, res) => {
     }
 
     // Get user's shops
-    const shopsResult = await db.query('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
+    const shopsResult = await db.query<ShopRow>('SELECT id FROM shops WHERE owner_id = $1', [user.id]);
     const shopIds = shopsResult.rows.map((s) => s.id);
 
     // Set session
@@ -109,7 +138,7 @@ router.post('/login', async (req, res) => {
 });
 
 // Logout
-router.post('/logout', (req, res) => {
+router.post('/logout', (req: Request, res: Response) => {
   req.session.destroy((err) => {
     if (err) {
       return res.status(500).json({ error: 'Logout failed' });
@@ -120,26 +149,26 @@ router.post('/logout', (req, res) => {
 });
 
 // Get current user
-router.get('/me', async (req, res) => {
+router.get('/me', async (req: Request, res: Response) => {
   if (!req.session.userId) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
 
   try {
-    const result = await db.query(
+    const result = await db.query<UserRow>(
       'SELECT id, email, username, full_name, role, avatar_url FROM users WHERE id = $1',
       [req.session.userId]
     );
 
     if (result.rows.length === 0) {
-      req.session.destroy();
+      req.session.destroy(() => {});
       return res.status(401).json({ error: 'User not found' });
     }
 
     const user = result.rows[0];
 
     // Get user's shops
-    const shopsResult = await db.query('SELECT id, name, slug FROM shops WHERE owner_id = $1', [user.id]);
+    const shopsResult = await db.query<ShopRow>('SELECT id, name, slug FROM shops WHERE owner_id = $1', [user.id]);
 
     res.json({
       user: {

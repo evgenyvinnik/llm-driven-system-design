@@ -1,8 +1,8 @@
 import express from 'express';
+import type { Response } from 'express';
 import {
   createUser,
   findUserByUsername,
-  findUserById,
   verifyPassword,
   createSession,
   deleteSession,
@@ -12,29 +12,49 @@ import { listPostsByUser } from '../models/post.js';
 import { requireAuth } from '../middleware/auth.js';
 import logger from '../shared/logger.js';
 import { auditLogin } from '../shared/audit.js';
+import type { AuthenticatedRequest } from '../shared/logger.js';
+
+interface RegisterRequestBody {
+  username: string;
+  email: string;
+  password: string;
+}
+
+interface LoginRequestBody {
+  username: string;
+  password: string;
+}
+
+interface DatabaseError extends Error {
+  code?: string;
+}
 
 const router = express.Router();
 
 // Register
-router.post('/register', async (req, res) => {
+router.post('/register', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { username, email, password } = req.body;
+    const { username, email, password } = req.body as RegisterRequestBody;
 
     if (!username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+      res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
     }
 
     if (username.length < 3 || username.length > 20) {
-      return res.status(400).json({ error: 'Username must be 3-20 characters' });
+      res.status(400).json({ error: 'Username must be 3-20 characters' });
+      return;
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      res.status(400).json({ error: 'Password must be at least 6 characters' });
+      return;
     }
 
     const existingUser = await findUserByUsername(username);
     if (existingUser) {
-      return res.status(409).json({ error: 'Username already taken' });
+      res.status(409).json({ error: 'Username already taken' });
+      return;
     }
 
     const user = await createUser(username, email, password);
@@ -65,20 +85,23 @@ router.post('/register', async (req, res) => {
     });
   } catch (error) {
     logger.error({ err: error }, 'Registration error');
-    if (error.code === '23505') {
-      return res.status(409).json({ error: 'Username or email already exists' });
+    const dbError = error as DatabaseError;
+    if (dbError.code === '23505') {
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
     }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { username, password } = req.body;
+    const { username, password } = req.body as LoginRequestBody;
 
     if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
+      res.status(400).json({ error: 'Username and password are required' });
+      return;
     }
 
     const user = await findUserByUsername(username);
@@ -86,7 +109,13 @@ router.post('/login', async (req, res) => {
       // Audit failed login attempt
       await auditLogin(req, null, false);
       logger.warn({ username }, 'Login failed - user not found');
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+
+    if (!user.password_hash) {
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     const valid = await verifyPassword(password, user.password_hash);
@@ -94,7 +123,8 @@ router.post('/login', async (req, res) => {
       // Audit failed login attempt
       await auditLogin(req, user.id, false);
       logger.warn({ userId: user.id, username }, 'Login failed - invalid password');
-      return res.status(401).json({ error: 'Invalid credentials' });
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
     }
 
     const sessionId = await createSession(user.id);
@@ -129,14 +159,14 @@ router.post('/login', async (req, res) => {
 });
 
 // Logout
-router.post('/logout', requireAuth, async (req, res) => {
+router.post('/logout', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const sessionId = req.cookies?.session || req.headers['x-session-id'];
-    if (sessionId) {
+    if (sessionId && typeof sessionId === 'string') {
       await deleteSession(sessionId);
     }
 
-    logger.info({ userId: req.user.id }, 'User logged out');
+    logger.info({ userId: req.user?.id }, 'User logged out');
 
     res.clearCookie('session');
     res.json({ success: true });
@@ -147,9 +177,10 @@ router.post('/logout', requireAuth, async (req, res) => {
 });
 
 // Get current user
-router.get('/me', async (req, res) => {
+router.get('/me', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (!req.user) {
-    return res.json({ user: null });
+    res.json({ user: null });
+    return;
   }
   res.json({
     user: {
@@ -164,11 +195,12 @@ router.get('/me', async (req, res) => {
 });
 
 // Get user profile
-router.get('/users/:username', async (req, res) => {
+router.get('/users/:username', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const user = await findUserByUsername(req.params.username);
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
     res.json({
       id: user.id,
@@ -184,15 +216,18 @@ router.get('/users/:username', async (req, res) => {
 });
 
 // Get user's posts
-router.get('/users/:username/posts', async (req, res) => {
+router.get('/users/:username/posts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const user = await findUserByUsername(req.params.username);
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
-    const limit = Math.min(parseInt(req.query.limit) || 25, 100);
-    const offset = parseInt(req.query.offset) || 0;
+    const limitParam = req.query.limit;
+    const offsetParam = req.query.offset;
+    const limit = Math.min(parseInt(typeof limitParam === 'string' ? limitParam : '25', 10) || 25, 100);
+    const offset = parseInt(typeof offsetParam === 'string' ? offsetParam : '0', 10) || 0;
 
     const posts = await listPostsByUser(user.id, limit, offset);
     res.json(posts);
@@ -203,11 +238,12 @@ router.get('/users/:username/posts', async (req, res) => {
 });
 
 // Get user's subscriptions
-router.get('/users/:username/subscriptions', async (req, res) => {
+router.get('/users/:username/subscriptions', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const user = await findUserByUsername(req.params.username);
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     const subscriptions = await getUserSubscriptions(user.id);

@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../utils/database.js';
 import { publishToQueue, getQueueName } from '../utils/rabbitmq.js';
-import { preferencesService } from './preferences.js';
+import { preferencesService, UserPreferences } from './preferences.js';
 import { rateLimiter } from './rateLimiter.js';
 import { templateService } from './templates.js';
 import { deduplicationService, deliveryTracker } from './delivery.js';
@@ -12,8 +12,58 @@ import {
   rateLimitedCounter,
   deduplicatedCounter,
 } from '../utils/metrics.js';
+import { Logger } from 'pino';
 
-const log = createLogger('notification-service');
+const log: Logger = createLogger('notification-service');
+
+export interface NotificationRequest {
+  idempotencyKey?: string;
+  userId: string;
+  templateId?: string;
+  data?: Record<string, unknown>;
+  channels?: string[];
+  priority?: 'critical' | 'high' | 'normal' | 'low';
+  scheduledAt?: Date | null;
+  deduplicationWindow?: number;
+}
+
+export interface NotificationResult {
+  notificationId: string | null;
+  status: string;
+  reason?: string;
+  retryAfter?: number;
+  channels?: string[];
+  channel?: string;
+  scheduledFor?: Date;
+}
+
+interface GetNotificationsOptions {
+  limit?: number;
+  offset?: number;
+  status?: string;
+}
+
+interface NotificationRow {
+  id: string;
+  user_id: string;
+  template_id: string | null;
+  content: Record<string, unknown>;
+  channels: string[];
+  priority: string;
+  status: string;
+  scheduled_at: Date | null;
+  created_at: Date;
+  delivered_at: Date | null;
+  delivery_statuses: unknown[];
+}
+
+interface LogContext {
+  userId: string;
+  templateId?: string;
+  priority: string;
+  channels: string[];
+  notificationId?: string;
+}
 
 export class NotificationService {
   /**
@@ -22,31 +72,24 @@ export class NotificationService {
    * If an idempotency key is provided, the request will be deduplicated:
    * - Same key with completed request: returns cached result
    * - Same key with in-progress request: returns 409 Conflict
-   *
-   * @param {Object} request - Notification request
-   * @param {string} request.idempotencyKey - Optional client-provided idempotency key
-   * @returns {Promise<Object>} - Notification result
    */
-  async sendNotification(request) {
+  async sendNotification(request: NotificationRequest): Promise<NotificationResult> {
     const {
       idempotencyKey,
       userId,
       templateId,
-      data = {},
-      channels = ['push', 'email'],
       priority = 'normal',
-      scheduledAt,
-      deduplicationWindow = 60,
+      channels = ['push', 'email'],
     } = request;
 
-    const logContext = { userId, templateId, priority, channels };
+    const logContext: LogContext = { userId, templateId, priority, channels };
 
     // If idempotency key provided, use idempotency service
     if (idempotencyKey) {
       log.debug({ ...logContext, idempotencyKey }, 'Processing request with idempotency key');
 
       try {
-        const { result, cached } = await idempotencyService.executeWithIdempotency(
+        const { result, cached } = await idempotencyService.executeWithIdempotency<NotificationResult>(
           idempotencyKey,
           () => this.processNotification(request)
         );
@@ -78,7 +121,7 @@ export class NotificationService {
    * Internal method to process the notification.
    * Separated from sendNotification to support idempotency wrapping.
    */
-  async processNotification(request) {
+  async processNotification(request: NotificationRequest): Promise<NotificationResult> {
     const {
       userId,
       templateId,
@@ -89,7 +132,7 @@ export class NotificationService {
       deduplicationWindow = 60,
     } = request;
 
-    const logContext = { userId, templateId, priority, channels };
+    const logContext: LogContext = { userId, templateId, priority, channels };
 
     // Validate request
     await this.validate(request);
@@ -119,7 +162,7 @@ export class NotificationService {
         channel: rateLimitResult.channel,
       }, 'Notification rate limited');
 
-      rateLimitedCounter.labels(rateLimitResult.reason, rateLimitResult.channel).inc();
+      rateLimitedCounter.labels(rateLimitResult.reason || '', rateLimitResult.channel || '').inc();
 
       return {
         notificationId: null,
@@ -180,14 +223,14 @@ export class NotificationService {
     }
 
     // Render content for each channel
-    let content = {};
+    let content: Record<string, unknown> = {};
     if (templateId) {
       const template = await templateService.getTemplate(templateId);
       if (template) {
         for (const channel of allowedChannels) {
           try {
             content[channel] = templateService.renderTemplate(template, channel, data);
-          } catch (e) {
+          } catch (_e) {
             log.debug({ channel, templateId }, 'Channel not supported by template');
           }
         }
@@ -196,7 +239,7 @@ export class NotificationService {
 
     // If no template, use provided content directly
     if (Object.keys(content).length === 0) {
-      content = data.content || { title: data.title, body: data.body };
+      content = (data.content as Record<string, unknown>) || { title: data.title, body: data.body };
     }
 
     // Create notification record
@@ -219,7 +262,13 @@ export class NotificationService {
     // Route to channel queues
     if (!scheduledAt) {
       for (const channel of allowedChannels) {
-        await this.routeToChannel(notificationId, userId, channel, priority, content[channel] || content);
+        await this.routeToChannel(
+          notificationId,
+          userId,
+          channel,
+          priority,
+          (content[channel] as Record<string, unknown>) || content
+        );
       }
     }
 
@@ -238,7 +287,13 @@ export class NotificationService {
     };
   }
 
-  async routeToChannel(notificationId, userId, channel, priority, content) {
+  async routeToChannel(
+    notificationId: string,
+    userId: string,
+    channel: string,
+    priority: string,
+    content: Record<string, unknown>
+  ): Promise<void> {
     const queueName = getQueueName(channel, priority);
 
     await publishToQueue(queueName, {
@@ -261,13 +316,13 @@ export class NotificationService {
     }, 'Notification routed to channel queue');
   }
 
-  async validate(request) {
+  async validate(request: NotificationRequest): Promise<void> {
     if (!request.userId) {
       throw new Error('userId is required');
     }
 
     // Check if user exists
-    const userResult = await query(
+    const userResult = await query<{ id: string }>(
       `SELECT id FROM users WHERE id = $1`,
       [request.userId]
     );
@@ -291,9 +346,9 @@ export class NotificationService {
     }
   }
 
-  calculateEndOfQuietHours(preferences) {
+  calculateEndOfQuietHours(preferences: UserPreferences): Date {
     const now = new Date();
-    const endMinutes = preferences.quietHoursEnd;
+    const endMinutes = preferences.quietHoursEnd || 0;
 
     const endTime = new Date(now);
     endTime.setHours(Math.floor(endMinutes / 60));
@@ -309,7 +364,10 @@ export class NotificationService {
     return endTime;
   }
 
-  async getUserNotifications(userId, options = {}) {
+  async getUserNotifications(
+    userId: string,
+    options: GetNotificationsOptions = {}
+  ): Promise<NotificationRow[]> {
     const { limit = 50, offset = 0, status } = options;
 
     let queryStr = `
@@ -318,7 +376,7 @@ export class NotificationService {
       LEFT JOIN delivery_status ds ON n.id = ds.notification_id
       WHERE n.user_id = $1
     `;
-    const params = [userId];
+    const params: unknown[] = [userId];
 
     if (status) {
       params.push(status);
@@ -328,16 +386,16 @@ export class NotificationService {
     queryStr += ` GROUP BY n.id ORDER BY n.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
-    const result = await query(queryStr, params);
+    const result = await query<NotificationRow>(queryStr, params);
     return result.rows;
   }
 
-  async getNotificationById(notificationId) {
+  async getNotificationById(notificationId: string) {
     return deliveryTracker.getNotificationStatus(notificationId);
   }
 
-  async cancelNotification(notificationId, userId) {
-    const result = await query(
+  async cancelNotification(notificationId: string, userId: string): Promise<boolean> {
+    const result = await query<{ id: string }>(
       `UPDATE notifications
        SET status = 'cancelled'
        WHERE id = $1 AND user_id = $2 AND status IN ('pending', 'scheduled')

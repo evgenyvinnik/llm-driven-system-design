@@ -1,22 +1,49 @@
 import { sessions } from '../utils/redis.js';
 import { pool } from '../utils/db.js';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
+
+// User interface
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string;
+  avatar_url: string | null;
+  role: 'user' | 'business_owner' | 'admin';
+  review_count: number;
+}
+
+// Extended request with user
+export interface AuthenticatedRequest extends Request {
+  user?: AuthUser;
+  sessionToken?: string;
+}
 
 // Authenticate user from session token
-export async function authenticate(req, res, next) {
+export async function authenticate(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void | Response> {
   try {
-    const token = req.cookies?.session_token || req.headers.authorization?.replace('Bearer ', '');
+    const token =
+      req.cookies?.session_token ||
+      req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-      return res.status(401).json({ error: { message: 'Authentication required' } });
+      return res
+        .status(401)
+        .json({ error: { message: 'Authentication required' } });
     }
 
     const session = await sessions.get(token);
     if (!session) {
-      return res.status(401).json({ error: { message: 'Invalid or expired session' } });
+      return res
+        .status(401)
+        .json({ error: { message: 'Invalid or expired session' } });
     }
 
     // Get user from database
-    const result = await pool.query(
+    const result = await pool.query<AuthUser>(
       'SELECT id, email, name, avatar_url, role, review_count FROM users WHERE id = $1',
       [session.userId]
     );
@@ -35,14 +62,20 @@ export async function authenticate(req, res, next) {
 }
 
 // Optional authentication - doesn't fail if not authenticated
-export async function optionalAuth(req, res, next) {
+export async function optionalAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   try {
-    const token = req.cookies?.session_token || req.headers.authorization?.replace('Bearer ', '');
+    const token =
+      req.cookies?.session_token ||
+      req.headers.authorization?.replace('Bearer ', '');
 
     if (token) {
       const session = await sessions.get(token);
       if (session) {
-        const result = await pool.query(
+        const result = await pool.query<AuthUser>(
           'SELECT id, email, name, avatar_url, role, review_count FROM users WHERE id = $1',
           [session.userId]
         );
@@ -60,14 +93,24 @@ export async function optionalAuth(req, res, next) {
 }
 
 // Require specific roles
-export function requireRole(...roles) {
-  return (req, res, next) => {
+export function requireRole(
+  ...roles: Array<'user' | 'business_owner' | 'admin'>
+): RequestHandler {
+  return (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): void | Response => {
     if (!req.user) {
-      return res.status(401).json({ error: { message: 'Authentication required' } });
+      return res
+        .status(401)
+        .json({ error: { message: 'Authentication required' } });
     }
 
     if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: { message: 'Insufficient permissions' } });
+      return res
+        .status(403)
+        .json({ error: { message: 'Insufficient permissions' } });
     }
 
     next();
@@ -75,7 +118,10 @@ export function requireRole(...roles) {
 }
 
 // Require admin role
-export const requireAdmin = requireRole('admin');
+export const requireAdmin: RequestHandler = requireRole('admin');
 
 // Require business owner or admin
-export const requireBusinessOwner = requireRole('business_owner', 'admin');
+export const requireBusinessOwner: RequestHandler = requireRole(
+  'business_owner',
+  'admin'
+);

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import type { Request, Response } from 'express';
 import pool from '../db.js';
 import redis from '../redis.js';
 import { getCircuitBreakerHealth } from '../shared/circuitBreaker.js';
@@ -26,16 +27,34 @@ const router = Router();
 const DB_TIMEOUT = 3000;
 const REDIS_TIMEOUT = 2000;
 
+interface HealthCheckResult {
+  status: 'healthy' | 'unhealthy' | 'degraded';
+  latencyMs: number;
+  error?: string;
+  connections?: {
+    total: number;
+    idle: number;
+    waiting: number;
+  };
+  memoryUsedBytes?: number | null;
+  message?: string;
+  nodes?: number;
+  segments?: number;
+  totalSegments?: number;
+  freshSegments?: number;
+  freshnessRatio?: string;
+}
+
 /**
  * Check PostgreSQL health
  */
-async function checkDatabase() {
+async function checkDatabase(): Promise<HealthCheckResult> {
   const start = Date.now();
 
   try {
     // Set query timeout using a promise race
     const queryPromise = pool.query('SELECT 1 as health_check');
-    const timeoutPromise = new Promise((_, reject) =>
+    const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('Database health check timeout')), DB_TIMEOUT)
     );
 
@@ -59,7 +78,7 @@ async function checkDatabase() {
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -67,11 +86,11 @@ async function checkDatabase() {
 /**
  * Check Redis health
  */
-async function checkRedis() {
+async function checkRedis(): Promise<HealthCheckResult> {
   const start = Date.now();
 
   try {
-    const timeoutPromise = new Promise((_, reject) =>
+    const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('Redis health check timeout')), REDIS_TIMEOUT)
     );
 
@@ -92,7 +111,7 @@ async function checkRedis() {
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -101,19 +120,19 @@ async function checkRedis() {
  * Check routing graph status
  * Verifies that road network data is loaded and queryable
  */
-async function checkRoutingGraph() {
+async function checkRoutingGraph(): Promise<HealthCheckResult> {
   const start = Date.now();
 
   try {
     const result = await pool.query(
       'SELECT COUNT(*) as node_count FROM road_nodes'
     );
-    const nodeCount = parseInt(result.rows[0].node_count);
+    const nodeCount = parseInt(result.rows[0]?.node_count || '0');
 
     const segmentResult = await pool.query(
       'SELECT COUNT(*) as segment_count FROM road_segments'
     );
-    const segmentCount = parseInt(segmentResult.rows[0].segment_count);
+    const segmentCount = parseInt(segmentResult.rows[0]?.segment_count || '0');
 
     if (nodeCount < 10 || segmentCount < 10) {
       return {
@@ -136,7 +155,7 @@ async function checkRoutingGraph() {
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -144,7 +163,7 @@ async function checkRoutingGraph() {
 /**
  * Check traffic data freshness
  */
-async function checkTrafficData() {
+async function checkTrafficData(): Promise<HealthCheckResult> {
   const start = Date.now();
 
   try {
@@ -159,12 +178,12 @@ async function checkTrafficData() {
       ) latest
     `);
 
-    const { total_segments, fresh_segments } = result.rows[0];
+    const { total_segments, fresh_segments } = result.rows[0] || { total_segments: '0', fresh_segments: '0' };
     const totalSegments = parseInt(total_segments);
     const freshSegments = parseInt(fresh_segments);
     const freshnessRatio = totalSegments > 0 ? freshSegments / totalSegments : 0;
 
-    let status = 'healthy';
+    let status: 'healthy' | 'unhealthy' | 'degraded' = 'healthy';
     if (freshnessRatio < 0.5) status = 'degraded';
     if (freshnessRatio < 0.1) status = 'unhealthy';
 
@@ -177,7 +196,7 @@ async function checkTrafficData() {
     };
   } catch (error) {
     // Traffic data might not exist yet - this is acceptable
-    if (error.message.includes('relation') && error.message.includes('does not exist')) {
+    if ((error as Error).message.includes('relation') && (error as Error).message.includes('does not exist')) {
       return {
         status: 'degraded',
         latencyMs: Date.now() - start,
@@ -188,7 +207,7 @@ async function checkTrafficData() {
     return {
       status: 'unhealthy',
       latencyMs: Date.now() - start,
-      error: error.message,
+      error: (error as Error).message,
     };
   }
 }
@@ -197,7 +216,7 @@ async function checkTrafficData() {
  * Full health check endpoint
  * GET /health
  */
-router.get('/', async (req, res) => {
+router.get('/', async (_req: Request, res: Response): Promise<void> => {
   const startTime = Date.now();
 
   // Run all checks in parallel
@@ -218,7 +237,7 @@ router.get('/', async (req, res) => {
   const anyUnhealthy = Object.values(checks).some((c) => c.status === 'unhealthy');
   const anyDegraded = Object.values(checks).some((c) => c.status === 'degraded');
 
-  let overallStatus;
+  let overallStatus: 'healthy' | 'unhealthy' | 'degraded';
   if (!allCriticalHealthy || anyUnhealthy) {
     overallStatus = 'unhealthy';
   } else if (anyDegraded) {
@@ -247,7 +266,7 @@ router.get('/', async (req, res) => {
  * Returns 200 if the process is running
  * Used by Kubernetes to determine if container should be restarted
  */
-router.get('/live', (req, res) => {
+router.get('/live', (_req: Request, res: Response): void => {
   res.json({
     status: 'alive',
     timestamp: new Date().toISOString(),
@@ -262,7 +281,7 @@ router.get('/live', (req, res) => {
  * Returns 200 only if the service can handle traffic
  * Used by Kubernetes/load balancer for routing decisions
  */
-router.get('/ready', async (req, res) => {
+router.get('/ready', async (_req: Request, res: Response): Promise<void> => {
   const database = await checkDatabase();
   const cache = await checkRedis();
 

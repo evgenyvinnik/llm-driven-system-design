@@ -1,14 +1,14 @@
-import { createClient } from 'redis';
+import { createClient, RedisClientType } from 'redis';
 
-let client = null;
+let client: RedisClientType | null = null;
 
-export async function getRedisClient() {
+export async function getRedisClient(): Promise<RedisClientType> {
   if (!client) {
     client = createClient({
       url: process.env.REDIS_URL || 'redis://localhost:6379',
     });
 
-    client.on('error', (err) => console.error('Redis Client Error:', err));
+    client.on('error', (err: Error) => console.error('Redis Client Error:', err));
     client.on('connect', () => console.log('Redis connected'));
     client.on('reconnecting', () => console.log('Redis reconnecting'));
   }
@@ -20,12 +20,17 @@ export async function getRedisClient() {
   return client;
 }
 
-export async function initializeRedis() {
-  const client = await getRedisClient();
+export async function initializeRedis(): Promise<RedisClientType> {
+  const redisClient = await getRedisClient();
   // Verify connection
-  await client.ping();
+  await redisClient.ping();
   console.log('Redis initialized successfully');
-  return client;
+  return redisClient;
+}
+
+export interface TopKResult {
+  videoId: string;
+  viewCount: number;
 }
 
 /**
@@ -33,6 +38,9 @@ export async function initializeRedis() {
  * Uses Redis sorted sets with time-based bucketing for efficient windowed counting
  */
 export class WindowedViewCounter {
+  private windowMinutes: number;
+  private bucketMinutes: number;
+
   constructor(windowMinutes = 60, bucketMinutes = 1) {
     this.windowMinutes = windowMinutes;
     this.bucketMinutes = bucketMinutes;
@@ -41,7 +49,7 @@ export class WindowedViewCounter {
   /**
    * Get the current time bucket
    */
-  getCurrentBucket() {
+  getCurrentBucket(): number {
     const now = Date.now();
     return Math.floor(now / (this.bucketMinutes * 60 * 1000));
   }
@@ -49,19 +57,19 @@ export class WindowedViewCounter {
   /**
    * Get the key for a specific time bucket
    */
-  getBucketKey(bucket, category = 'all') {
+  getBucketKey(bucket: number, category = 'all'): string {
     return `views:bucket:${category}:${bucket}`;
   }
 
   /**
    * Record a view for a video
    */
-  async recordView(videoId, category = 'all') {
-    const client = await getRedisClient();
+  async recordView(videoId: string, category = 'all'): Promise<void> {
+    const redisClient = await getRedisClient();
     const bucket = this.getCurrentBucket();
 
     // Use pipeline for atomic operations
-    const pipeline = client.multi();
+    const pipeline = redisClient.multi();
 
     // Increment view count in current bucket for 'all' category
     const allKey = this.getBucketKey(bucket, 'all');
@@ -84,13 +92,13 @@ export class WindowedViewCounter {
   /**
    * Get aggregated view counts for a time window
    */
-  async getWindowedCounts(category = 'all') {
-    const client = await getRedisClient();
+  async getWindowedCounts(category = 'all'): Promise<Map<string, number>> {
+    const redisClient = await getRedisClient();
     const currentBucket = this.getCurrentBucket();
     const bucketsNeeded = Math.ceil(this.windowMinutes / this.bucketMinutes);
 
     // Collect all bucket keys within the window
-    const bucketKeys = [];
+    const bucketKeys: string[] = [];
     for (let i = 0; i < bucketsNeeded; i++) {
       const bucket = currentBucket - i;
       bucketKeys.push(this.getBucketKey(bucket, category));
@@ -101,14 +109,14 @@ export class WindowedViewCounter {
 
     if (bucketKeys.length === 1) {
       // Just copy the single bucket
-      const counts = await client.zRangeWithScores(bucketKeys[0], 0, -1, { REV: true });
+      const counts = await redisClient.zRangeWithScores(bucketKeys[0], 0, -1, { REV: true });
       return new Map(counts.map(({ value, score }) => [value, score]));
     }
 
     // Aggregate multiple buckets
-    await client.zUnionStore(tempKey, bucketKeys);
-    const counts = await client.zRangeWithScores(tempKey, 0, -1, { REV: true });
-    await client.del(tempKey);
+    await redisClient.zUnionStore(tempKey, bucketKeys);
+    const counts = await redisClient.zRangeWithScores(tempKey, 0, -1, { REV: true });
+    await redisClient.del(tempKey);
 
     return new Map(counts.map(({ value, score }) => [value, score]));
   }
@@ -116,22 +124,22 @@ export class WindowedViewCounter {
   /**
    * Get top K videos by view count in the current window
    */
-  async getTopK(k = 10, category = 'all') {
-    const client = await getRedisClient();
+  async getTopK(k = 10, category = 'all'): Promise<TopKResult[]> {
+    const redisClient = await getRedisClient();
     const currentBucket = this.getCurrentBucket();
     const bucketsNeeded = Math.ceil(this.windowMinutes / this.bucketMinutes);
 
     // Collect all bucket keys within the window
-    const bucketKeys = [];
+    const bucketKeys: string[] = [];
     for (let i = 0; i < bucketsNeeded; i++) {
       const bucket = currentBucket - i;
       bucketKeys.push(this.getBucketKey(bucket, category));
     }
 
     // Filter to only existing keys
-    const existingKeys = [];
+    const existingKeys: string[] = [];
     for (const key of bucketKeys) {
-      const exists = await client.exists(key);
+      const exists = await redisClient.exists(key);
       if (exists) {
         existingKeys.push(key);
       }
@@ -145,13 +153,13 @@ export class WindowedViewCounter {
     const tempKey = `temp:topk:${category}:${Date.now()}`;
 
     if (existingKeys.length === 1) {
-      const topVideos = await client.zRangeWithScores(existingKeys[0], 0, k - 1, { REV: true });
+      const topVideos = await redisClient.zRangeWithScores(existingKeys[0], 0, k - 1, { REV: true });
       return topVideos.map(({ value, score }) => ({ videoId: value, viewCount: score }));
     }
 
-    await client.zUnionStore(tempKey, existingKeys);
-    const topVideos = await client.zRangeWithScores(tempKey, 0, k - 1, { REV: true });
-    await client.del(tempKey);
+    await redisClient.zUnionStore(tempKey, existingKeys);
+    const topVideos = await redisClient.zRangeWithScores(tempKey, 0, k - 1, { REV: true });
+    await redisClient.del(tempKey);
 
     return topVideos.map(({ value, score }) => ({ videoId: value, viewCount: score }));
   }
@@ -159,18 +167,18 @@ export class WindowedViewCounter {
   /**
    * Get total view count for a video (all time)
    */
-  async getTotalViews(videoId) {
-    const client = await getRedisClient();
-    const count = await client.hGet('views:total', videoId);
+  async getTotalViews(videoId: string): Promise<number> {
+    const redisClient = await getRedisClient();
+    const count = await redisClient.hGet('views:total', videoId);
     return parseInt(count || '0', 10);
   }
 
   /**
    * Get view counts for multiple videos
    */
-  async getMultipleTotalViews(videoIds) {
-    const client = await getRedisClient();
-    const counts = await client.hMGet('views:total', videoIds);
+  async getMultipleTotalViews(videoIds: string[]): Promise<Map<string, number>> {
+    const redisClient = await getRedisClient();
+    const counts = await redisClient.hMGet('views:total', videoIds);
     return new Map(videoIds.map((id, i) => [id, parseInt(counts[i] || '0', 10)]));
   }
 }

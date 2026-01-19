@@ -10,12 +10,13 @@
 import pino from 'pino';
 import pinoHttp from 'pino-http';
 import crypto from 'crypto';
+import type { IncomingMessage, ServerResponse } from 'http';
 
 // Create base logger with structured output
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   formatters: {
-    level: (label) => ({ level: label }),
+    level: (label: string) => ({ level: label }),
   },
   base: {
     service: 'typeahead',
@@ -26,36 +27,45 @@ const logger = pino({
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 
+interface PinoRequest extends IncomingMessage {
+  id?: string;
+  method?: string;
+  url?: string;
+  query?: { q?: string };
+  headers: IncomingMessage['headers'] & { 'x-request-id'?: string; 'x-user-id'?: string };
+}
+
 /**
  * HTTP request logging middleware.
  * Logs request/response with timing and correlation ID.
  */
 export const httpLogger = pinoHttp({
   logger,
-  genReqId: (req) => req.headers['x-request-id'] || crypto.randomUUID(),
-  customProps: (req, res) => ({
+  genReqId: (req: PinoRequest) =>
+    (req.headers['x-request-id'] as string) || crypto.randomUUID(),
+  customProps: (req: PinoRequest) => ({
     requestId: req.id,
   }),
-  customLogLevel: (req, res, err) => {
+  customLogLevel: (_req: PinoRequest, res: ServerResponse, err?: Error) => {
     if (res.statusCode >= 500 || err) return 'error';
     if (res.statusCode >= 400) return 'warn';
     return 'info';
   },
-  customSuccessMessage: (req, res) => {
+  customSuccessMessage: (req: PinoRequest) => {
     return `${req.method} ${req.url} completed`;
   },
-  customErrorMessage: (req, res, err) => {
+  customErrorMessage: (req: PinoRequest, _res: ServerResponse, err?: Error) => {
     return `${req.method} ${req.url} failed: ${err?.message || 'unknown error'}`;
   },
   serializers: {
-    req: (req) => ({
+    req: (req: PinoRequest) => ({
       id: req.id,
       method: req.method,
       url: req.url,
       query: req.query?.q ? req.query.q.substring(0, 50) : undefined, // Truncate for privacy
       userId: req.headers['x-user-id'] || 'anonymous',
     }),
-    res: (res) => ({
+    res: (res: ServerResponse) => ({
       statusCode: res.statusCode,
     }),
   },
@@ -69,11 +79,16 @@ export const auditLogger = {
   /**
    * Log filter list changes
    */
-  logFilterChange(action, phrase, reason, adminUserId = 'system') {
+  logFilterChange(
+    action: 'add' | 'remove',
+    phrase: string | undefined,
+    reason: string,
+    adminUserId: string = 'system'
+  ): void {
     logger.info({
       type: 'audit',
       event: 'filter_change',
-      action, // 'add' or 'remove'
+      action,
       phrase: phrase?.substring(0, 50),
       reason,
       adminUserId,
@@ -83,11 +98,11 @@ export const auditLogger = {
   /**
    * Log trie rebuild operations
    */
-  logTrieRebuild(triggeredBy, phraseCount, durationMs) {
+  logTrieRebuild(triggeredBy: string, phraseCount: number, durationMs: number): void {
     logger.info({
       type: 'audit',
       event: 'trie_rebuild',
-      triggeredBy, // 'scheduled', 'manual', 'threshold'
+      triggeredBy,
       phraseCount,
       durationMs,
     });
@@ -96,7 +111,11 @@ export const auditLogger = {
   /**
    * Log cache invalidation
    */
-  logCacheInvalidation(pattern, reason, adminUserId = 'system') {
+  logCacheInvalidation(
+    pattern: string | undefined,
+    reason: string,
+    adminUserId: string = 'system'
+  ): void {
     logger.info({
       type: 'audit',
       event: 'cache_invalidation',
@@ -109,7 +128,12 @@ export const auditLogger = {
   /**
    * Log rate limit violations
    */
-  logRateLimitViolation(clientId, endpoint, currentRate, limit) {
+  logRateLimitViolation(
+    clientId: string,
+    endpoint: string,
+    currentRate: number,
+    limit: number
+  ): void {
     logger.warn({
       type: 'audit',
       event: 'rate_limit_exceeded',
@@ -123,7 +147,7 @@ export const auditLogger = {
   /**
    * Log idempotent operation skip
    */
-  logIdempotencySkip(idempotencyKey, operation) {
+  logIdempotencySkip(idempotencyKey: string, operation: string): void {
     logger.info({
       type: 'audit',
       event: 'idempotency_skip',
@@ -135,7 +159,12 @@ export const auditLogger = {
   /**
    * Log circuit breaker state change
    */
-  logCircuitStateChange(circuitName, oldState, newState, reason) {
+  logCircuitStateChange(
+    circuitName: string,
+    oldState: string,
+    newState: string,
+    reason: string
+  ): void {
     logger.warn({
       type: 'audit',
       event: 'circuit_state_change',
