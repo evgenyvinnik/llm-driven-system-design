@@ -1,23 +1,29 @@
 import { query } from '../db.js';
 import { getEndingAuctions, removeAuctionFromSchedule, publishBidUpdate } from '../redis.js';
+import type { Auction, Bid } from '../types.js';
+
+interface CloseAuctionResult {
+  winnerId: string | null;
+  winningAmount: number | null;
+}
 
 // Close an auction and determine winner
-export const closeAuction = async (auctionId) => {
+export const closeAuction = async (auctionId: string): Promise<CloseAuctionResult | undefined> => {
   try {
     console.log(`Closing auction: ${auctionId}`);
 
     // Get auction details
-    const auctionResult = await query(
-      'SELECT * FROM auctions WHERE id = $1 AND status = $2',
-      [auctionId, 'active']
-    );
+    const auctionResult = await query('SELECT * FROM auctions WHERE id = $1 AND status = $2', [
+      auctionId,
+      'active',
+    ]);
 
     if (auctionResult.rows.length === 0) {
       console.log(`Auction ${auctionId} not found or already closed`);
       return;
     }
 
-    const auction = auctionResult.rows[0];
+    const auction = auctionResult.rows[0] as Auction;
 
     // Get the highest bid
     const highestBidResult = await query(
@@ -30,15 +36,15 @@ export const closeAuction = async (auctionId) => {
       [auctionId]
     );
 
-    let winnerId = null;
-    let winningBidId = null;
-    let winningAmount = null;
+    let winnerId: string | null = null;
+    let winningBidId: string | null = null;
+    let winningAmount: number | null = null;
 
     if (highestBidResult.rows.length > 0) {
-      const winningBid = highestBidResult.rows[0];
+      const winningBid = highestBidResult.rows[0] as Bid & { bidder_name: string; bidder_email: string };
 
       // Check if reserve price was met
-      if (auction.reserve_price && winningBid.amount < parseFloat(auction.reserve_price)) {
+      if (auction.reserve_price && winningBid.amount < auction.reserve_price) {
         console.log(`Auction ${auctionId} did not meet reserve price`);
         // Notify seller that reserve was not met
         await query(
@@ -143,10 +149,10 @@ export const closeAuction = async (auctionId) => {
 };
 
 // Scheduler service that checks for ending auctions
-export const startScheduler = () => {
+export const startScheduler = (): void => {
   console.log('Starting auction scheduler...');
 
-  const checkEndingAuctions = async () => {
+  const checkEndingAuctions = async (): Promise<void> => {
     try {
       const now = Date.now();
       const endingAuctions = await getEndingAuctions(now);

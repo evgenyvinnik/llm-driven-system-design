@@ -1,4 +1,5 @@
-import pino from 'pino';
+import pino, { Logger, LoggerOptions, TransportTargetOptions, Bindings } from 'pino';
+import { Request, Response, NextFunction } from 'express';
 import { config } from '../config/index.js';
 
 /**
@@ -14,7 +15,7 @@ import { config } from '../config/index.js';
 const logLevel = config.nodeEnv === 'production' ? 'info' : 'debug';
 
 // Base logger configuration
-const loggerOptions = {
+const loggerOptions: LoggerOptions = {
   level: logLevel,
   // Redact sensitive fields from logs
   redact: {
@@ -31,8 +32,8 @@ const loggerOptions = {
   timestamp: pino.stdTimeFunctions.isoTime,
   // Format error objects properly
   formatters: {
-    level: (label) => ({ level: label }),
-    bindings: (bindings) => ({
+    level: (label: string) => ({ level: label }),
+    bindings: (bindings: Bindings) => ({
       pid: bindings.pid,
       host: bindings.hostname
     })
@@ -40,7 +41,7 @@ const loggerOptions = {
 };
 
 // Use pretty printing in development
-const transport = config.nodeEnv === 'development'
+const transport: TransportTargetOptions | undefined = config.nodeEnv === 'development'
   ? {
       target: 'pino-pretty',
       options: {
@@ -51,17 +52,27 @@ const transport = config.nodeEnv === 'development'
     }
   : undefined;
 
-export const logger = pino(
+export const logger: Logger = pino(
   loggerOptions,
   transport ? pino.transport(transport) : undefined
 );
+
+interface SyncResult {
+  synced: number;
+  errors: number;
+}
+
+interface DateRange {
+  start: Date;
+  end: Date;
+}
 
 /**
  * Create a child logger with request context.
  * Enables request tracing across service calls.
  */
-export function createRequestLogger(req) {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+export function createRequestLogger(req: Request): Logger {
+  const requestId = (req.headers['x-request-id'] as string) || crypto.randomUUID();
 
   return logger.child({
     requestId,
@@ -75,9 +86,9 @@ export function createRequestLogger(req) {
  * Express middleware for request logging.
  * Logs request start and completion with timing.
  */
-export function requestLoggingMiddleware(req, res, next) {
+export function requestLoggingMiddleware(req: Request, res: Response, next: NextFunction): void {
   const startTime = Date.now();
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  const requestId = (req.headers['x-request-id'] as string) || crypto.randomUUID();
 
   // Attach request ID for downstream use
   req.requestId = requestId;
@@ -105,11 +116,11 @@ export function requestLoggingMiddleware(req, res, next) {
 
     // Use different log levels based on status code
     if (res.statusCode >= 500) {
-      req.log.error(logData);
+      req.log!.error(logData);
     } else if (res.statusCode >= 400) {
-      req.log.warn(logData);
+      req.log!.warn(logData);
     } else {
-      req.log.info(logData);
+      req.log!.info(logData);
     }
   });
 
@@ -119,7 +130,7 @@ export function requestLoggingMiddleware(req, res, next) {
 /**
  * Log health data sync operations with sample counts and timing.
  */
-export function logSyncOperation(userId, deviceId, result, durationMs) {
+export function logSyncOperation(userId: string, deviceId: string, result: SyncResult, durationMs: number): void {
   logger.info({
     msg: 'Health data sync completed',
     operation: 'device_sync',
@@ -134,7 +145,7 @@ export function logSyncOperation(userId, deviceId, result, durationMs) {
 /**
  * Log aggregation operations.
  */
-export function logAggregation(userId, types, dateRange, durationMs) {
+export function logAggregation(userId: string, types: string[], dateRange: DateRange, durationMs: number): void {
   logger.info({
     msg: 'Aggregation completed',
     operation: 'aggregation',
@@ -148,7 +159,7 @@ export function logAggregation(userId, types, dateRange, durationMs) {
 /**
  * Log database operations for performance monitoring.
  */
-export function logDbQuery(query, params, durationMs) {
+export function logDbQuery(query: string, params: unknown[], durationMs: number): void {
   // Only log slow queries in production
   const threshold = config.nodeEnv === 'production' ? 100 : 500;
 

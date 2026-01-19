@@ -1,16 +1,29 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import * as searchService from '../services/search.js';
 
 const router = Router();
 
+interface SearchQueryParams {
+  q?: string;
+  language?: string;
+  repo?: string;
+  owner?: string;
+  path?: string;
+  kind?: string;
+  type?: string;
+  page?: string;
+  limit?: string;
+}
+
 /**
  * Search code
  */
-router.get('/code', async (req, res) => {
-  const { q, language, repo, owner, path, page = 1, limit = 20 } = req.query;
+router.get('/code', async (req: Request, res: Response): Promise<void> => {
+  const { q, language, repo, owner, path, page = '1', limit = '20' } = req.query as SearchQueryParams;
 
   if (!q) {
-    return res.status(400).json({ error: 'Query required' });
+    res.status(400).json({ error: 'Query required' });
+    return;
   }
 
   try {
@@ -33,11 +46,12 @@ router.get('/code', async (req, res) => {
 /**
  * Search symbols
  */
-router.get('/symbols', async (req, res) => {
-  const { q, language, repo, owner, kind, page = 1, limit = 20 } = req.query;
+router.get('/symbols', async (req: Request, res: Response): Promise<void> => {
+  const { q, language, repo, owner, kind, page = '1', limit = '20' } = req.query as SearchQueryParams;
 
   if (!q) {
-    return res.status(400).json({ error: 'Query required' });
+    res.status(400).json({ error: 'Query required' });
+    return;
   }
 
   try {
@@ -57,20 +71,27 @@ router.get('/symbols', async (req, res) => {
   }
 });
 
+interface SearchResults {
+  repositories: object[];
+  issues: object[];
+  users: object[];
+}
+
 /**
  * Combined search (repos, issues, users)
  */
-router.get('/', async (req, res) => {
-  const { q, type = 'all' } = req.query;
+router.get('/', async (req: Request, res: Response): Promise<void> => {
+  const { q, type = 'all' } = req.query as { q?: string; type?: string };
 
   if (!q) {
-    return res.status(400).json({ error: 'Query required' });
+    res.status(400).json({ error: 'Query required' });
+    return;
   }
 
   // Import query from db inside function to avoid circular deps
   const { query: dbQuery } = await import('../db/index.js');
 
-  const results = {
+  const results: SearchResults = {
     repositories: [],
     issues: [],
     users: [],

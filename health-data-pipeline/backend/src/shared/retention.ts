@@ -16,11 +16,77 @@ import { logger } from './logger.js';
  * - Cold: Archived data, Parquet files in object storage (MinIO)
  */
 
+interface RetentionPeriod {
+  hot: number | null;
+  warm?: number;
+  delete: number | null;
+}
+
+interface ShareTokensRetention {
+  afterExpiry: number;
+}
+
+interface SessionsRetention {
+  ttlSeconds: number;
+  delete: number;
+}
+
+interface RetentionConfig {
+  samples: Required<RetentionPeriod>;
+  hourlyAggregates: { hot: number; delete: number };
+  dailyAggregates: RetentionPeriod;
+  insights: { hot: number; delete: number };
+  shareTokens: ShareTokensRetention;
+  sessions: SessionsRetention;
+  auditLogs: Required<RetentionPeriod>;
+}
+
+interface CacheTTLItem {
+  ttlSeconds: number;
+  prefix: string;
+}
+
+interface CacheTTLConfig {
+  session: CacheTTLItem;
+  aggregates: CacheTTLItem;
+  latestMetrics: CacheTTLItem;
+  insights: CacheTTLItem;
+  idempotency: CacheTTLItem;
+}
+
+interface RetentionError {
+  operation: string;
+  error: string;
+}
+
+interface RetentionCleanupResults {
+  samplesDeleted: number;
+  aggregatesDeleted: number;
+  insightsDeleted: number;
+  tokensDeleted: number;
+  sessionsDeleted: number;
+  errors: RetentionError[];
+}
+
+interface CompressionResult {
+  samplesChunks?: number | null;
+  aggregatesChunks?: number | null;
+  skipped?: boolean;
+  reason?: string;
+}
+
+interface RetentionStatusResult {
+  hot_samples: string;
+  warm_samples: string;
+  oldest_sample: Date | null;
+  newest_sample: Date | null;
+}
+
 /**
  * Retention policy configuration.
  * All durations in days.
  */
-export const retentionConfig = {
+export const retentionConfig: RetentionConfig = {
   // Raw health samples
   samples: {
     hot: 90,           // Uncompressed, fast access
@@ -69,7 +135,7 @@ export const retentionConfig = {
  * Cache TTL configuration.
  * Balances freshness vs. database load.
  */
-export const cacheTTLConfig = {
+export const cacheTTLConfig: CacheTTLConfig = {
   // User session
   session: {
     ttlSeconds: 86400,      // 24 hours
@@ -105,8 +171,8 @@ export const cacheTTLConfig = {
  * Execute data retention cleanup.
  * Should be run as a scheduled job (daily).
  */
-export async function runRetentionCleanup() {
-  const results = {
+export async function runRetentionCleanup(): Promise<RetentionCleanupResults> {
+  const results: RetentionCleanupResults = {
     samplesDeleted: 0,
     aggregatesDeleted: 0,
     insightsDeleted: 0,
@@ -124,14 +190,14 @@ export async function runRetentionCleanup() {
       WHERE start_date < NOW() - INTERVAL '${retentionConfig.samples.delete} days'
       RETURNING id
     `);
-    results.samplesDeleted = samplesResult.rowCount;
+    results.samplesDeleted = samplesResult.rowCount || 0;
     logger.info({
       msg: 'Deleted expired samples',
       count: results.samplesDeleted
     });
   } catch (error) {
-    results.errors.push({ operation: 'samples', error: error.message });
-    logger.error({ msg: 'Failed to delete samples', error: error.message });
+    results.errors.push({ operation: 'samples', error: (error as Error).message });
+    logger.error({ msg: 'Failed to delete samples', error: (error as Error).message });
   }
 
   // Delete old hourly aggregates
@@ -142,14 +208,14 @@ export async function runRetentionCleanup() {
         AND period_start < NOW() - INTERVAL '${retentionConfig.hourlyAggregates.delete} days'
       RETURNING id
     `);
-    results.aggregatesDeleted = aggResult.rowCount;
+    results.aggregatesDeleted = aggResult.rowCount || 0;
     logger.info({
       msg: 'Deleted expired hourly aggregates',
       count: results.aggregatesDeleted
     });
   } catch (error) {
-    results.errors.push({ operation: 'aggregates', error: error.message });
-    logger.error({ msg: 'Failed to delete aggregates', error: error.message });
+    results.errors.push({ operation: 'aggregates', error: (error as Error).message });
+    logger.error({ msg: 'Failed to delete aggregates', error: (error as Error).message });
   }
 
   // Delete old insights
@@ -159,14 +225,14 @@ export async function runRetentionCleanup() {
       WHERE created_at < NOW() - INTERVAL '${retentionConfig.insights.delete} days'
       RETURNING id
     `);
-    results.insightsDeleted = insightsResult.rowCount;
+    results.insightsDeleted = insightsResult.rowCount || 0;
     logger.info({
       msg: 'Deleted expired insights',
       count: results.insightsDeleted
     });
   } catch (error) {
-    results.errors.push({ operation: 'insights', error: error.message });
-    logger.error({ msg: 'Failed to delete insights', error: error.message });
+    results.errors.push({ operation: 'insights', error: (error as Error).message });
+    logger.error({ msg: 'Failed to delete insights', error: (error as Error).message });
   }
 
   // Delete expired share tokens
@@ -176,14 +242,14 @@ export async function runRetentionCleanup() {
       WHERE expires_at < NOW() - INTERVAL '${retentionConfig.shareTokens.afterExpiry} days'
       RETURNING id
     `);
-    results.tokensDeleted = tokensResult.rowCount;
+    results.tokensDeleted = tokensResult.rowCount || 0;
     logger.info({
       msg: 'Deleted expired share tokens',
       count: results.tokensDeleted
     });
   } catch (error) {
-    results.errors.push({ operation: 'tokens', error: error.message });
-    logger.error({ msg: 'Failed to delete share tokens', error: error.message });
+    results.errors.push({ operation: 'tokens', error: (error as Error).message });
+    logger.error({ msg: 'Failed to delete share tokens', error: (error as Error).message });
   }
 
   // Delete expired sessions
@@ -193,14 +259,14 @@ export async function runRetentionCleanup() {
       WHERE expires_at < NOW() - INTERVAL '${retentionConfig.sessions.delete} days'
       RETURNING id
     `);
-    results.sessionsDeleted = sessionsResult.rowCount;
+    results.sessionsDeleted = sessionsResult.rowCount || 0;
     logger.info({
       msg: 'Deleted expired sessions',
       count: results.sessionsDeleted
     });
   } catch (error) {
-    results.errors.push({ operation: 'sessions', error: error.message });
-    logger.error({ msg: 'Failed to delete sessions', error: error.message });
+    results.errors.push({ operation: 'sessions', error: (error as Error).message });
+    logger.error({ msg: 'Failed to delete sessions', error: (error as Error).message });
   }
 
   logger.info({
@@ -215,7 +281,7 @@ export async function runRetentionCleanup() {
  * Compress old TimescaleDB chunks.
  * Moves data from hot to warm tier.
  */
-export async function compressOldChunks() {
+export async function compressOldChunks(): Promise<CompressionResult> {
   logger.info({ msg: 'Starting chunk compression' });
 
   try {
@@ -245,8 +311,8 @@ export async function compressOldChunks() {
     };
   } catch (error) {
     // TimescaleDB might not be installed in dev
-    if (error.message.includes('function compress_chunk') ||
-        error.message.includes('function show_chunks')) {
+    if ((error as Error).message.includes('function compress_chunk') ||
+        (error as Error).message.includes('function show_chunks')) {
       logger.warn({
         msg: 'TimescaleDB compression not available (expected in development)'
       });
@@ -255,7 +321,7 @@ export async function compressOldChunks() {
 
     logger.error({
       msg: 'Chunk compression failed',
-      error: error.message
+      error: (error as Error).message
     });
     throw error;
   }
@@ -265,7 +331,7 @@ export async function compressOldChunks() {
  * Replay aggregation for a user and date range.
  * Used after bug fixes or data corrections.
  */
-export async function replayAggregation(userId, startDate, endDate) {
+export async function replayAggregation(userId: string, startDate: Date, endDate: Date): Promise<void> {
   logger.info({
     msg: 'Starting aggregation replay',
     userId,
@@ -304,8 +370,8 @@ export async function replayAggregation(userId, startDate, endDate) {
  * Get retention policy status for a user.
  * Useful for admin dashboards.
  */
-export async function getRetentionStatus(userId) {
-  const result = await db.query(`
+export async function getRetentionStatus(userId: string): Promise<RetentionStatusResult> {
+  const result = await db.query<RetentionStatusResult>(`
     SELECT
       COUNT(*) FILTER (WHERE start_date >= NOW() - INTERVAL '${retentionConfig.samples.hot} days') as hot_samples,
       COUNT(*) FILTER (WHERE start_date < NOW() - INTERVAL '${retentionConfig.samples.hot} days') as warm_samples,

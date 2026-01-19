@@ -1,4 +1,5 @@
-import promClient from 'prom-client';
+import promClient, { Histogram, Counter, Gauge, Registry } from 'prom-client';
+import { Request, Response, NextFunction } from 'express';
 import { config } from '../config/index.js';
 
 /**
@@ -17,7 +18,7 @@ import { config } from '../config/index.js';
  */
 
 // Create a Registry which registers the metrics
-const register = new promClient.Registry();
+const register: Registry = new promClient.Registry();
 
 // Add default labels
 register.setDefaultLabels({
@@ -37,7 +38,7 @@ promClient.collectDefaultMetrics({
  * HTTP request duration histogram (for latency percentiles).
  * Buckets optimized for API response times.
  */
-export const httpRequestDuration = new promClient.Histogram({
+export const httpRequestDuration: Histogram<string> = new promClient.Histogram({
   name: 'health_pipeline_http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
   labelNames: ['method', 'route', 'status_code'],
@@ -48,7 +49,7 @@ export const httpRequestDuration = new promClient.Histogram({
 /**
  * HTTP request counter (for rate calculation).
  */
-export const httpRequestTotal = new promClient.Counter({
+export const httpRequestTotal: Counter<string> = new promClient.Counter({
   name: 'health_pipeline_http_requests_total',
   help: 'Total number of HTTP requests',
   labelNames: ['method', 'route', 'status_code'],
@@ -60,7 +61,7 @@ export const httpRequestTotal = new promClient.Counter({
 /**
  * Health samples ingested counter.
  */
-export const samplesIngestedTotal = new promClient.Counter({
+export const samplesIngestedTotal: Counter<string> = new promClient.Counter({
   name: 'health_pipeline_samples_ingested_total',
   help: 'Total number of health samples ingested',
   labelNames: ['type', 'device_type', 'status'],
@@ -70,7 +71,7 @@ export const samplesIngestedTotal = new promClient.Counter({
 /**
  * Sync operation duration histogram.
  */
-export const syncDuration = new promClient.Histogram({
+export const syncDuration: Histogram<string> = new promClient.Histogram({
   name: 'health_pipeline_sync_duration_seconds',
   help: 'Duration of device sync operations in seconds',
   labelNames: ['device_type'],
@@ -81,7 +82,7 @@ export const syncDuration = new promClient.Histogram({
 /**
  * Aggregation operation duration.
  */
-export const aggregationDuration = new promClient.Histogram({
+export const aggregationDuration: Histogram<string> = new promClient.Histogram({
   name: 'health_pipeline_aggregation_duration_seconds',
   help: 'Duration of aggregation operations in seconds',
   labelNames: ['type', 'period'],
@@ -92,7 +93,7 @@ export const aggregationDuration = new promClient.Histogram({
 /**
  * Active users gauge (users with data synced in last 24h).
  */
-export const activeUsers = new promClient.Gauge({
+export const activeUsers: Gauge<string> = new promClient.Gauge({
   name: 'health_pipeline_active_users',
   help: 'Number of active users (synced in last 24h)',
   registers: [register]
@@ -103,7 +104,7 @@ export const activeUsers = new promClient.Gauge({
 /**
  * Database query duration histogram.
  */
-export const dbQueryDuration = new promClient.Histogram({
+export const dbQueryDuration: Histogram<string> = new promClient.Histogram({
   name: 'health_pipeline_db_query_duration_seconds',
   help: 'Duration of database queries in seconds',
   labelNames: ['operation', 'table'],
@@ -114,7 +115,7 @@ export const dbQueryDuration = new promClient.Histogram({
 /**
  * Database connection pool metrics.
  */
-export const dbPoolSize = new promClient.Gauge({
+export const dbPoolSize: Gauge<string> = new promClient.Gauge({
   name: 'health_pipeline_db_pool_size',
   help: 'Database connection pool size',
   labelNames: ['state'], // idle, active, waiting
@@ -126,7 +127,7 @@ export const dbPoolSize = new promClient.Gauge({
 /**
  * Cache hit/miss counter.
  */
-export const cacheOperations = new promClient.Counter({
+export const cacheOperations: Counter<string> = new promClient.Counter({
   name: 'health_pipeline_cache_operations_total',
   help: 'Total cache operations',
   labelNames: ['operation', 'result'], // get/set, hit/miss
@@ -138,7 +139,7 @@ export const cacheOperations = new promClient.Counter({
 /**
  * Idempotency key operations.
  */
-export const idempotencyOperations = new promClient.Counter({
+export const idempotencyOperations: Counter<string> = new promClient.Counter({
   name: 'health_pipeline_idempotency_operations_total',
   help: 'Idempotency key operations',
   labelNames: ['result'], // new, duplicate, expired
@@ -147,15 +148,22 @@ export const idempotencyOperations = new promClient.Counter({
 
 // ----- Express Middleware -----
 
+interface RouteRequest extends Request {
+  route?: {
+    path?: string;
+  };
+  baseUrl?: string;
+}
+
 /**
  * Middleware to record HTTP metrics.
  */
-export function metricsMiddleware(req, res, next) {
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const startTime = Date.now();
 
   res.on('finish', () => {
     const duration = (Date.now() - startTime) / 1000;
-    const route = getRoutePath(req);
+    const route = getRoutePath(req as RouteRequest);
     const labels = {
       method: req.method,
       route,
@@ -172,10 +180,10 @@ export function metricsMiddleware(req, res, next) {
 /**
  * Extract route pattern from request (normalize path params).
  */
-function getRoutePath(req) {
+function getRoutePath(req: RouteRequest): string {
   // Use the matched route pattern if available
   if (req.route && req.route.path) {
-    return req.baseUrl + req.route.path;
+    return (req.baseUrl || '') + req.route.path;
   }
 
   // Fall back to URL, but normalize IDs
@@ -187,33 +195,39 @@ function getRoutePath(req) {
 /**
  * Endpoint to expose metrics for Prometheus scraping.
  */
-export async function getMetrics() {
+export async function getMetrics(): Promise<string> {
   return register.metrics();
 }
 
 /**
  * Get content type for metrics response.
  */
-export function getMetricsContentType() {
+export function getMetricsContentType(): string {
   return register.contentType;
 }
 
 /**
  * Helper to time async operations.
  */
-export function createTimer(histogram, labels) {
+export function createTimer(histogram: Histogram<string>, labels: Record<string, string>): () => number {
   const start = Date.now();
-  return () => {
+  return (): number => {
     const duration = (Date.now() - start) / 1000;
     histogram.observe(labels, duration);
     return duration;
   };
 }
 
+interface PoolStats {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+}
+
 /**
  * Record database pool metrics.
  */
-export function recordPoolMetrics(pool) {
+export function recordPoolMetrics(pool: PoolStats): void {
   dbPoolSize.set({ state: 'total' }, pool.totalCount);
   dbPoolSize.set({ state: 'idle' }, pool.idleCount);
   dbPoolSize.set({ state: 'waiting' }, pool.waitingCount);

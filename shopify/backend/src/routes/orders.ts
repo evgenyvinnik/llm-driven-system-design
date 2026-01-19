@@ -1,7 +1,8 @@
+import { Request, Response } from 'express';
 import { queryWithTenant, getClientWithTenant } from '../services/db.js';
 import logger from '../services/logger.js';
 import { withIdempotency } from '../services/idempotency.js';
-import { logInventoryChange, logOrderCreated, logCheckoutEvent, logPaymentEvent, AuditAction, ActorType } from '../services/audit.js';
+import { logInventoryChange, logOrderCreated, logCheckoutEvent, logPaymentEvent, AuditAction, ActorType, AuditContext } from '../services/audit.js';
 import { publishOrderCreated, publishInventoryUpdated, queueEmailNotification } from '../services/rabbitmq.js';
 import { processPayment } from '../services/circuit-breaker.js';
 import {
@@ -15,12 +16,92 @@ import {
 } from '../services/metrics.js';
 import config from '../config/index.js';
 
+// Order interface
+interface Order {
+  id: number;
+  store_id: number;
+  order_number: string;
+  customer_email: string;
+  subtotal: number;
+  shipping_cost: number;
+  tax: number;
+  total: number;
+  payment_status: string;
+  fulfillment_status: string;
+  notes?: string;
+  created_at: Date;
+  updated_at: Date;
+  items?: OrderItem[];
+}
+
+// Order item interface
+interface OrderItem {
+  id: number;
+  order_id: number;
+  store_id: number;
+  variant_id: number;
+  title: string;
+  variant_title: string;
+  sku: string | null;
+  quantity: number;
+  price: number;
+  total: number;
+}
+
+// Cart item interface
+interface CartItem {
+  variant_id: number;
+  quantity: number;
+}
+
+// Cart interface
+interface Cart {
+  id: number;
+  store_id: number;
+  session_id: string;
+  items: CartItem[];
+  subtotal: number;
+}
+
+// Variant interface
+interface Variant {
+  id: number;
+  product_id: number;
+  store_id: number;
+  sku: string | null;
+  title: string;
+  price: number;
+  compare_at_price: number | null;
+  inventory_quantity: number;
+  options: Record<string, unknown>;
+  product_title?: string;
+}
+
+// Line item interface for checkout
+interface LineItem {
+  variant: Variant;
+  quantity: number;
+  price: number;
+  total: number;
+  oldQuantity: number;
+}
+
+// Address interface
+interface Address {
+  address1?: string;
+  address2?: string;
+  city?: string;
+  province?: string;
+  country?: string;
+  zip?: string;
+}
+
 // List orders for store
-export async function listOrders(req, res) {
+export async function listOrders(req: Request, res: Response): Promise<void> {
   const { storeId } = req;
 
   const result = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT o.*,
             (SELECT json_agg(oi.*) FROM order_items oi WHERE oi.order_id = o.id) as items
      FROM orders o
@@ -31,12 +112,12 @@ export async function listOrders(req, res) {
 }
 
 // Get single order
-export async function getOrder(req, res) {
+export async function getOrder(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { orderId } = req.params;
 
   const result = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT o.*,
             (SELECT json_agg(oi.*) FROM order_items oi WHERE oi.order_id = o.id) as items
      FROM orders o
@@ -52,14 +133,14 @@ export async function getOrder(req, res) {
 }
 
 // Update order status
-export async function updateOrder(req, res) {
+export async function updateOrder(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { orderId } = req.params;
   const { payment_status, fulfillment_status, notes } = req.body;
 
   // Get current state for audit
   const currentResult = await queryWithTenant(
-    storeId,
+    storeId!,
     'SELECT payment_status, fulfillment_status, notes FROM orders WHERE id = $1',
     [orderId]
   );
@@ -68,10 +149,10 @@ export async function updateOrder(req, res) {
     return res.status(404).json({ error: 'Order not found' });
   }
 
-  const before = currentResult.rows[0];
+  const before = currentResult.rows[0] as { payment_status: string; fulfillment_status: string; notes: string };
 
-  const updates = [];
-  const values = [];
+  const updates: string[] = [];
+  const values: unknown[] = [];
   let paramCount = 1;
 
   if (payment_status !== undefined) {
@@ -95,29 +176,30 @@ export async function updateOrder(req, res) {
   values.push(orderId);
 
   const result = await queryWithTenant(
-    storeId,
+    storeId!,
     `UPDATE orders SET ${updates.join(', ')} WHERE id = $${paramCount}
      RETURNING *`,
     values
   );
 
-  const order = result.rows[0];
+  const order = result.rows[0] as Order;
 
   // Audit log the update
-  const auditContext = {
-    storeId,
-    userId: req.user?.id,
+  const auditContext: AuditContext = {
+    storeId: storeId!,
+    userId: req.user?.id || null,
     userType: req.user?.role || ActorType.MERCHANT,
     ip: req.ip,
-    userAgent: req.headers['user-agent'],
+    userAgent: req.headers['user-agent'] as string | undefined,
   };
 
-  await import('../services/audit.js').then(m => m.logOrderUpdated(
+  const { logOrderUpdated } = await import('../services/audit.js');
+  await logOrderUpdated(
     auditContext,
-    orderId,
+    parseInt(orderId),
     before,
     { payment_status: order.payment_status, fulfillment_status: order.fulfillment_status, notes: order.notes }
-  ));
+  );
 
   res.json({ order });
 }
@@ -125,9 +207,9 @@ export async function updateOrder(req, res) {
 // === Cart & Checkout (Storefront) ===
 
 // Get or create cart
-export async function getCart(req, res) {
+export async function getCart(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
-  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'];
+  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'] as string | undefined;
 
   if (!storeId) {
     return res.status(404).json({ error: 'Store not found' });
@@ -164,10 +246,10 @@ export async function getCart(req, res) {
 }
 
 // Add item to cart
-export async function addToCart(req, res) {
+export async function addToCart(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { variantId, quantity = 1 } = req.body;
-  let sessionId = req.cookies?.cartSession || req.headers['x-cart-session'];
+  let sessionId = req.cookies?.cartSession || req.headers['x-cart-session'] as string | undefined;
 
   if (!storeId) {
     return res.status(404).json({ error: 'Store not found' });
@@ -188,7 +270,9 @@ export async function addToCart(req, res) {
     return res.status(404).json({ error: 'Variant not found' });
   }
 
-  if (variant.rows[0].inventory_quantity < quantity) {
+  const variantData = variant.rows[0] as { id: number; price: number; inventory_quantity: number };
+
+  if (variantData.inventory_quantity < quantity) {
     return res.status(400).json({ error: 'Insufficient inventory' });
   }
 
@@ -198,13 +282,13 @@ export async function addToCart(req, res) {
     await client.query('BEGIN');
 
     // Check if cart exists
-    let cart;
+    let cart: Cart | undefined;
     if (sessionId) {
       const existing = await client.query(
         'SELECT * FROM carts WHERE session_id = $1',
         [sessionId]
       );
-      cart = existing.rows[0];
+      cart = existing.rows[0] as Cart | undefined;
     }
 
     if (!cart) {
@@ -214,13 +298,13 @@ export async function addToCart(req, res) {
         `INSERT INTO carts (store_id, session_id, items, subtotal)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
-        [storeId, sessionId, JSON.stringify([{ variant_id: variantId, quantity }]), variant.rows[0].price * quantity]
+        [storeId, sessionId, JSON.stringify([{ variant_id: variantId, quantity }]), variantData.price * quantity]
       );
-      cart = result.rows[0];
+      cart = result.rows[0] as Cart;
     } else {
       // Update existing cart
-      const items = cart.items || [];
-      const existingIndex = items.findIndex(i => i.variant_id === variantId);
+      const items: CartItem[] = cart.items || [];
+      const existingIndex = items.findIndex((i: CartItem) => i.variant_id === variantId);
 
       if (existingIndex >= 0) {
         items[existingIndex].quantity += quantity;
@@ -233,7 +317,7 @@ export async function addToCart(req, res) {
       for (const item of items) {
         const v = await client.query('SELECT price FROM variants WHERE id = $1', [item.variant_id]);
         if (v.rows.length > 0) {
-          subtotal += v.rows[0].price * item.quantity;
+          subtotal += (v.rows[0] as { price: number }).price * item.quantity;
         }
       }
 
@@ -241,7 +325,7 @@ export async function addToCart(req, res) {
         `UPDATE carts SET items = $1, subtotal = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
         [JSON.stringify(items), subtotal, cart.id]
       );
-      cart = result.rows[0];
+      cart = result.rows[0] as Cart;
     }
 
     await client.query('COMMIT');
@@ -262,10 +346,10 @@ export async function addToCart(req, res) {
 }
 
 // Update cart item quantity
-export async function updateCartItem(req, res) {
+export async function updateCartItem(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { variantId, quantity } = req.body;
-  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'];
+  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'] as string | undefined;
 
   if (!storeId) {
     return res.status(404).json({ error: 'Store not found' });
@@ -282,18 +366,19 @@ export async function updateCartItem(req, res) {
 
     const existing = await client.query('SELECT * FROM carts WHERE session_id = $1', [sessionId]);
     if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Cart not found' });
     }
 
-    const cart = existing.rows[0];
-    let items = cart.items || [];
+    const cart = existing.rows[0] as Cart;
+    let items: CartItem[] = cart.items || [];
 
     if (quantity <= 0) {
       // Remove item
-      items = items.filter(i => i.variant_id !== variantId);
+      items = items.filter((i: CartItem) => i.variant_id !== variantId);
     } else {
       // Update quantity
-      const index = items.findIndex(i => i.variant_id === variantId);
+      const index = items.findIndex((i: CartItem) => i.variant_id === variantId);
       if (index >= 0) {
         items[index].quantity = quantity;
       }
@@ -304,7 +389,7 @@ export async function updateCartItem(req, res) {
     for (const item of items) {
       const v = await client.query('SELECT price FROM variants WHERE id = $1', [item.variant_id]);
       if (v.rows.length > 0) {
-        subtotal += v.rows[0].price * item.quantity;
+        subtotal += (v.rows[0] as { price: number }).price * item.quantity;
       }
     }
 
@@ -334,22 +419,26 @@ export async function updateCartItem(req, res) {
  * 4. Async queues - reliable delivery of order notifications
  * 5. Metrics - tracks checkout latency and success rates
  */
-export async function checkout(req, res) {
+export async function checkout(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
-  const { email, shippingAddress, billingAddress } = req.body;
-  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'];
-  const idempotencyKey = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+  const { email, shippingAddress, billingAddress } = req.body as {
+    email: string;
+    shippingAddress?: Address;
+    billingAddress?: Address;
+  };
+  const sessionId = req.cookies?.cartSession || req.headers['x-cart-session'] as string | undefined;
+  const idempotencyKey = (req.headers['idempotency-key'] || req.headers['x-idempotency-key']) as string | undefined;
 
   // Track checkout start time for latency metrics
   const checkoutStartTime = Date.now();
 
   // Build audit context
-  const auditContext = {
-    storeId,
+  const auditContext: AuditContext = {
+    storeId: storeId!,
     userId: null, // Guest checkout
     userType: ActorType.CUSTOMER,
-    ip: req.ip || req.connection?.remoteAddress,
-    userAgent: req.headers['user-agent'],
+    ip: req.ip || req.socket?.remoteAddress,
+    userAgent: req.headers['user-agent'] as string | undefined,
   };
 
   if (!storeId) {
@@ -414,7 +503,7 @@ export async function checkout(req, res) {
     // Log checkout failure
     await logCheckoutEvent(auditContext, AuditAction.CHECKOUT_FAILED, {
       cartId: sessionId,
-      error: error.message,
+      error: (error as Error).message,
     });
 
     logger.error({ err: error, storeId, sessionId }, 'Checkout failed');
@@ -425,7 +514,14 @@ export async function checkout(req, res) {
 /**
  * Internal checkout processing with transaction, inventory updates, and audit logging
  */
-async function processCheckoutInternal(storeId, sessionId, email, shippingAddress, billingAddress, auditContext) {
+async function processCheckoutInternal(
+  storeId: number,
+  sessionId: string,
+  email: string,
+  shippingAddress: Address | undefined,
+  billingAddress: Address | undefined,
+  auditContext: AuditContext
+): Promise<Order> {
   const client = await getClientWithTenant(storeId);
 
   try {
@@ -438,15 +534,15 @@ async function processCheckoutInternal(storeId, sessionId, email, shippingAddres
       throw new Error('Cart not found');
     }
 
-    const cart = cartResult.rows[0];
-    const items = cart.items || [];
+    const cart = cartResult.rows[0] as Cart;
+    const items: CartItem[] = cart.items || [];
 
     if (items.length === 0) {
       throw new Error('Cart is empty');
     }
 
     // Validate and reserve inventory with pessimistic locking
-    const lineItems = [];
+    const lineItems: LineItem[] = [];
     for (const item of items) {
       // SELECT FOR UPDATE prevents concurrent modifications
       const variant = await client.query(
@@ -462,7 +558,7 @@ async function processCheckoutInternal(storeId, sessionId, email, shippingAddres
         throw new Error(`Variant ${item.variant_id} no longer exists`);
       }
 
-      const variantData = variant.rows[0];
+      const variantData = variant.rows[0] as Variant;
       const oldQuantity = variantData.inventory_quantity;
 
       if (oldQuantity < item.quantity) {
@@ -576,7 +672,7 @@ async function processCheckoutInternal(storeId, sessionId, email, shippingAddres
       ]
     );
 
-    const order = orderResult.rows[0];
+    const order = orderResult.rows[0] as Order;
 
     // Create order items
     for (const item of lineItems) {
@@ -646,11 +742,11 @@ async function processCheckoutInternal(storeId, sessionId, email, shippingAddres
 }
 
 // List customers for store
-export async function listCustomers(req, res) {
+export async function listCustomers(req: Request, res: Response): Promise<void> {
   const { storeId } = req;
 
   const result = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT c.*,
             (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) as order_count,
             (SELECT COALESCE(SUM(total), 0) FROM orders o WHERE o.customer_id = c.id) as total_spent
@@ -662,12 +758,12 @@ export async function listCustomers(req, res) {
 }
 
 // Get single customer
-export async function getCustomer(req, res) {
+export async function getCustomer(req: Request, res: Response): Promise<void | Response> {
   const { storeId } = req;
   const { customerId } = req.params;
 
   const result = await queryWithTenant(
-    storeId,
+    storeId!,
     `SELECT c.*,
             (SELECT json_agg(a.*) FROM customer_addresses a WHERE a.customer_id = c.id) as addresses,
             (SELECT json_agg(o.* ORDER BY o.created_at DESC) FROM orders o WHERE o.customer_id = c.id) as orders

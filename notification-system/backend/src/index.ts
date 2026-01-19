@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { pool, initDatabase } from './utils/database.js';
 import { redis } from './utils/redis.js';
@@ -13,10 +13,33 @@ import templateRoutes from './routes/templates.js';
 import campaignRoutes from './routes/campaigns.js';
 import adminRoutes from './routes/admin.js';
 import { authMiddleware } from './middleware/auth.js';
+import { Logger } from 'pino';
+import { Server } from 'http';
+import { Socket } from 'net';
 
-const log = createLogger('api-server');
-const app = express();
-const PORT = process.env.PORT || 3000;
+const log: Logger = createLogger('api-server');
+const app: Express = express();
+const PORT: number = parseInt(process.env.PORT || '3000');
+
+interface ComponentStatus {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  latencyMs?: number;
+  error?: string;
+}
+
+interface HealthCheckResponse {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  timestamp: string;
+  uptime: number;
+  components: Record<string, ComponentStatus>;
+  circuitBreakers: Record<string, string>;
+  version: string;
+}
+
+interface AppError extends Error {
+  status?: number;
+  code?: string;
+}
 
 // Middleware
 app.use(cors({
@@ -47,9 +70,9 @@ app.get('/metrics', getMetrics);
  * - Load balancer health checks
  * - Monitoring dashboards
  */
-app.get('/health', async (req, res) => {
-  const components = {};
-  let overallStatus = 'healthy';
+app.get('/health', async (req: Request, res: Response): Promise<void> => {
+  const components: Record<string, ComponentStatus> = {};
+  let overallStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
 
   // Check PostgreSQL
   try {
@@ -62,7 +85,7 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     components.postgres = {
       status: 'unhealthy',
-      error: error.message,
+      error: (error as Error).message,
     };
     overallStatus = 'unhealthy';
   }
@@ -78,7 +101,7 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     components.redis = {
       status: 'unhealthy',
-      error: error.message,
+      error: (error as Error).message,
     };
     overallStatus = 'unhealthy';
   }
@@ -100,7 +123,7 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     components.rabbitmq = {
       status: 'unhealthy',
-      error: error.message,
+      error: (error as Error).message,
     };
     overallStatus = 'unhealthy';
   }
@@ -118,21 +141,23 @@ app.get('/health', async (req, res) => {
 
   const statusCode = overallStatus === 'unhealthy' ? 503 : 200;
 
-  res.status(statusCode).json({
+  const response: HealthCheckResponse = {
     status: overallStatus,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     components,
     circuitBreakers,
     version: process.env.npm_package_version || '1.0.0',
-  });
+  };
+
+  res.status(statusCode).json(response);
 });
 
 /**
  * Liveness probe - simple check that the process is running
  * Use for Kubernetes liveness probes
  */
-app.get('/health/live', (req, res) => {
+app.get('/health/live', (req: Request, res: Response): void => {
   res.json({ status: 'alive', timestamp: new Date().toISOString() });
 });
 
@@ -140,7 +165,7 @@ app.get('/health/live', (req, res) => {
  * Readiness probe - checks if the service can accept traffic
  * Use for Kubernetes readiness probes and load balancer health checks
  */
-app.get('/health/ready', async (req, res) => {
+app.get('/health/ready', async (req: Request, res: Response): Promise<void> => {
   try {
     // Quick checks only - must be fast
     await Promise.all([
@@ -153,7 +178,7 @@ app.get('/health/ready', async (req, res) => {
     log.error({ err: error }, 'Readiness check failed');
     res.status(503).json({
       status: 'not_ready',
-      error: error.message,
+      error: (error as Error).message,
       timestamp: new Date().toISOString(),
     });
   }
@@ -170,7 +195,7 @@ app.use('/api/v1/campaigns', authMiddleware, campaignRoutes);
 app.use('/api/v1/admin', authMiddleware, adminRoutes);
 
 // Error handling middleware with structured logging
-app.use((err, req, res, next) => {
+app.use((err: AppError, req: Request, res: Response, _next: NextFunction): void => {
   const logContext = {
     err,
     reqId: req.id,
@@ -180,7 +205,7 @@ app.use((err, req, res, next) => {
   };
 
   // Log error with appropriate level
-  if (err.status >= 500 || !err.status) {
+  if ((err.status && err.status >= 500) || !err.status) {
     log.error(logContext, 'Server error');
   } else if (err.status >= 400) {
     log.warn(logContext, 'Client error');
@@ -197,7 +222,7 @@ app.use((err, req, res, next) => {
 let connectionCount = 0;
 
 // Initialize and start
-async function start() {
+async function start(): Promise<void> {
   try {
     // Initialize database connection
     await initDatabase();
@@ -211,12 +236,12 @@ async function start() {
     initializeCircuitBreakers();
     log.info('Circuit breakers initialized');
 
-    const server = app.listen(PORT, () => {
+    const server: Server = app.listen(PORT, () => {
       log.info({ port: PORT }, `Notification API server running on port ${PORT}`);
     });
 
     // Track connections for graceful shutdown
-    server.on('connection', (socket) => {
+    server.on('connection', (socket: Socket) => {
       connectionCount++;
       activeConnections.labels('http').set(connectionCount);
 
@@ -227,7 +252,7 @@ async function start() {
     });
 
     // Graceful shutdown handler
-    const shutdown = async (signal) => {
+    const shutdown = async (signal: string): Promise<void> => {
       log.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
 
       server.close(async () => {
@@ -255,8 +280,8 @@ async function start() {
       }, 30000);
     };
 
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    process.on('SIGINT', () => void shutdown('SIGINT'));
 
   } catch (error) {
     log.fatal({ err: error }, 'Failed to start server');
@@ -264,4 +289,4 @@ async function start() {
   }
 }
 
-start();
+void start();

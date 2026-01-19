@@ -1,3 +1,4 @@
+import { Request, Response, NextFunction } from 'express';
 import { redis } from '../config/redis.js';
 import { logger } from './logger.js';
 import { cacheTTLConfig } from './retention.js';
@@ -27,13 +28,22 @@ import { idempotencyOperations } from './metrics.js';
 const IDEMPOTENCY_PREFIX = cacheTTLConfig.idempotency.prefix;
 const IDEMPOTENCY_TTL = cacheTTLConfig.idempotency.ttlSeconds;
 
+interface IdempotencyCheckResult {
+  isDuplicate: boolean;
+  cachedResponse: unknown;
+}
+
+interface SampleData {
+  type: string;
+  value: number;
+  startDate: Date | string;
+  endDate?: Date | string;
+}
+
 /**
  * Check if a request is a duplicate based on idempotency key.
- *
- * @param {string} idempotencyKey - Unique key for this request
- * @returns {Promise<{isDuplicate: boolean, cachedResponse: any}>}
  */
-export async function checkIdempotency(idempotencyKey) {
+export async function checkIdempotency(idempotencyKey: string): Promise<IdempotencyCheckResult> {
   if (!idempotencyKey) {
     return { isDuplicate: false, cachedResponse: null };
   }
@@ -57,7 +67,7 @@ export async function checkIdempotency(idempotencyKey) {
     // On cache error, proceed with request (fail open)
     logger.warn({
       msg: 'Idempotency check failed, proceeding',
-      error: error.message,
+      error: (error as Error).message,
       idempotencyKey
     });
     return { isDuplicate: false, cachedResponse: null };
@@ -66,11 +76,8 @@ export async function checkIdempotency(idempotencyKey) {
 
 /**
  * Store idempotency key and response.
- *
- * @param {string} idempotencyKey - Unique key for this request
- * @param {object} response - Response to cache
  */
-export async function storeIdempotencyKey(idempotencyKey, response) {
+export async function storeIdempotencyKey(idempotencyKey: string, response: unknown): Promise<void> {
   if (!idempotencyKey) {
     return;
   }
@@ -90,7 +97,7 @@ export async function storeIdempotencyKey(idempotencyKey, response) {
     // Log but don't fail the request
     logger.warn({
       msg: 'Failed to store idempotency key',
-      error: error.message,
+      error: (error as Error).message,
       idempotencyKey
     });
   }
@@ -99,13 +106,8 @@ export async function storeIdempotencyKey(idempotencyKey, response) {
 /**
  * Generate an idempotency key from request data.
  * Combines user ID, device ID, and content hash.
- *
- * @param {string} userId
- * @param {string} deviceId
- * @param {Array} samples - Array of health samples
- * @returns {string} Idempotency key
  */
-export function generateIdempotencyKey(userId, deviceId, samples) {
+export function generateIdempotencyKey(userId: string, deviceId: string, samples: SampleData[]): string {
   // Create a deterministic hash of the samples
   const sampleSignature = samples.map(s => ({
     type: s.type,
@@ -124,7 +126,7 @@ export function generateIdempotencyKey(userId, deviceId, samples) {
  * Simple hash function for idempotency keys.
  * For production, consider using crypto.createHash('sha256').
  */
-function simpleHash(str) {
+function simpleHash(str: string): string {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
@@ -134,16 +136,21 @@ function simpleHash(str) {
   return Math.abs(hash).toString(36);
 }
 
+interface ExtendedResponse extends Response {
+  json: (data: unknown) => Response;
+}
+
 /**
  * Express middleware for idempotent POST requests.
  * Checks X-Idempotency-Key header.
  */
-export function idempotencyMiddleware(req, res, next) {
-  const idempotencyKey = req.headers['x-idempotency-key'];
+export function idempotencyMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
 
   if (!idempotencyKey) {
     // No idempotency key provided, proceed normally
-    return next();
+    next();
+    return;
   }
 
   // Check for duplicate
@@ -151,22 +158,23 @@ export function idempotencyMiddleware(req, res, next) {
     .then(({ isDuplicate, cachedResponse }) => {
       if (isDuplicate) {
         // Return cached response
-        return res.json(cachedResponse);
+        res.json(cachedResponse);
+        return;
       }
 
       // Store original res.json to intercept response
       const originalJson = res.json.bind(res);
-      res.json = (data) => {
+      (res as ExtendedResponse).json = (data: unknown): Response => {
         // Store the response for future duplicates
         storeIdempotencyKey(idempotencyKey, data)
-          .catch(err => logger.error({ msg: 'Failed to cache response', error: err.message }));
+          .catch(err => logger.error({ msg: 'Failed to cache response', error: (err as Error).message }));
 
         return originalJson(data);
       };
 
       next();
     })
-    .catch(error => {
+    .catch((error: Error) => {
       logger.error({ msg: 'Idempotency middleware error', error: error.message });
       next();
     });
@@ -176,7 +184,7 @@ export function idempotencyMiddleware(req, res, next) {
  * Clean up expired idempotency keys.
  * Not strictly necessary (Redis handles TTL), but useful for monitoring.
  */
-export async function cleanupExpiredKeys() {
+export async function cleanupExpiredKeys(): Promise<number> {
   // Redis handles TTL automatically, but we can scan for stats
   const keys = await redis.keys(`${IDEMPOTENCY_PREFIX}*`);
   logger.info({

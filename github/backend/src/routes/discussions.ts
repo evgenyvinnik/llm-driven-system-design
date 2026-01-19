@@ -1,26 +1,58 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+interface Discussion {
+  id: number;
+  repo_id: number;
+  number: number;
+  title: string;
+  body: string;
+  category: string;
+  author_id: number;
+  is_answered: boolean;
+  answer_comment_id: number | null;
+  created_at: Date;
+  updated_at: Date;
+  author_name?: string;
+  author_avatar?: string;
+  author_display_name?: string;
+  owner_id?: number;
+  comments_count?: string;
+}
+
+interface Comment {
+  id: number;
+  discussion_id: number;
+  user_id: number;
+  parent_id: number | null;
+  body: string;
+  upvotes: number;
+  created_at: Date;
+  user_name?: string;
+  user_avatar?: string;
+  replies?: Comment[];
+}
+
 /**
  * Get next discussion number for a repo
  */
-async function getNextNumber(repoId) {
+async function getNextNumber(repoId: number): Promise<number> {
   const result = await query(
     'SELECT COALESCE(MAX(number), 0) as max_num FROM discussions WHERE repo_id = $1',
     [repoId]
   );
-  return parseInt(result.rows[0].max_num) + 1;
+  return parseInt(result.rows[0].max_num as string) + 1;
 }
 
 /**
  * List discussions for a repo
  */
-router.get('/:owner/:repo/discussions', async (req, res) => {
+router.get('/:owner/:repo/discussions', async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;
-  const { category, page = 1, limit = 20 } = req.query;
+  const { category, page = '1', limit = '20' } = req.query as { category?: string; page?: string; limit?: string };
 
   const repoResult = await query(
     `SELECT r.id FROM repositories r
@@ -30,12 +62,13 @@ router.get('/:owner/:repo/discussions', async (req, res) => {
   );
 
   if (repoResult.rows.length === 0) {
-    return res.status(404).json({ error: 'Repository not found' });
+    res.status(404).json({ error: 'Repository not found' });
+    return;
   }
 
-  const repoId = repoResult.rows[0].id;
+  const repoId = repoResult.rows[0].id as number;
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  const params = [repoId];
+  const params: unknown[] = [repoId];
 
   let whereClause = 'WHERE d.repo_id = $1';
 
@@ -64,7 +97,7 @@ router.get('/:owner/:repo/discussions', async (req, res) => {
 
   res.json({
     discussions: result.rows,
-    total: parseInt(countResult.rows[0].count),
+    total: parseInt(countResult.rows[0].count as string),
     page: parseInt(page),
     limit: parseInt(limit),
   });
@@ -73,7 +106,7 @@ router.get('/:owner/:repo/discussions', async (req, res) => {
 /**
  * Get single discussion
  */
-router.get('/:owner/:repo/discussions/:number', async (req, res) => {
+router.get('/:owner/:repo/discussions/:number', async (req: Request, res: Response): Promise<void> => {
   const { owner, repo, number } = req.params;
 
   const result = await query(
@@ -90,10 +123,11 @@ router.get('/:owner/:repo/discussions/:number', async (req, res) => {
   );
 
   if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'Discussion not found' });
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
   }
 
-  const discussion = result.rows[0];
+  const discussion = result.rows[0] as Discussion;
 
   // Get comments with nested replies
   const comments = await query(
@@ -108,7 +142,7 @@ router.get('/:owner/:repo/discussions/:number', async (req, res) => {
   );
 
   // Get replies for each comment
-  for (const comment of comments.rows) {
+  for (const comment of comments.rows as Comment[]) {
     const replies = await query(
       `SELECT c.*,
               u.username as user_name,
@@ -119,7 +153,7 @@ router.get('/:owner/:repo/discussions/:number', async (req, res) => {
        ORDER BY c.created_at ASC`,
       [comment.id]
     );
-    comment.replies = replies.rows;
+    comment.replies = replies.rows as Comment[];
   }
 
   res.json({
@@ -131,12 +165,13 @@ router.get('/:owner/:repo/discussions/:number', async (req, res) => {
 /**
  * Create discussion
  */
-router.post('/:owner/:repo/discussions', requireAuth, async (req, res) => {
+router.post('/:owner/:repo/discussions', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo } = req.params;
-  const { title, body, category } = req.body;
+  const { title, body, category } = req.body as { title?: string; body?: string; category?: string };
 
   if (!title || !body) {
-    return res.status(400).json({ error: 'Title and body required' });
+    res.status(400).json({ error: 'Title and body required' });
+    return;
   }
 
   const repoResult = await query(
@@ -147,17 +182,18 @@ router.post('/:owner/:repo/discussions', requireAuth, async (req, res) => {
   );
 
   if (repoResult.rows.length === 0) {
-    return res.status(404).json({ error: 'Repository not found' });
+    res.status(404).json({ error: 'Repository not found' });
+    return;
   }
 
-  const repoId = repoResult.rows[0].id;
+  const repoId = repoResult.rows[0].id as number;
   const number = await getNextNumber(repoId);
 
   const result = await query(
     `INSERT INTO discussions (repo_id, number, title, body, category, author_id)
      VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
-    [repoId, number, title, body, category || 'general', req.user.id]
+    [repoId, number, title, body, category || 'general', req.user!.id]
   );
 
   res.status(201).json(result.rows[0]);
@@ -166,12 +202,13 @@ router.post('/:owner/:repo/discussions', requireAuth, async (req, res) => {
 /**
  * Add comment to discussion
  */
-router.post('/:owner/:repo/discussions/:number/comments', requireAuth, async (req, res) => {
+router.post('/:owner/:repo/discussions/:number/comments', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo, number } = req.params;
-  const { body, parentId } = req.body;
+  const { body, parentId } = req.body as { body?: string; parentId?: number };
 
   if (!body) {
-    return res.status(400).json({ error: 'Comment body required' });
+    res.status(400).json({ error: 'Comment body required' });
+    return;
   }
 
   const discussionResult = await query(
@@ -183,14 +220,15 @@ router.post('/:owner/:repo/discussions/:number/comments', requireAuth, async (re
   );
 
   if (discussionResult.rows.length === 0) {
-    return res.status(404).json({ error: 'Discussion not found' });
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
   }
 
   const result = await query(
     `INSERT INTO discussion_comments (discussion_id, user_id, parent_id, body)
      VALUES ($1, $2, $3, $4)
      RETURNING *`,
-    [discussionResult.rows[0].id, req.user.id, parentId || null, body]
+    [discussionResult.rows[0].id, req.user!.id, parentId || null, body]
   );
 
   res.status(201).json(result.rows[0]);
@@ -199,9 +237,9 @@ router.post('/:owner/:repo/discussions/:number/comments', requireAuth, async (re
 /**
  * Mark answer
  */
-router.post('/:owner/:repo/discussions/:number/answer', requireAuth, async (req, res) => {
+router.post('/:owner/:repo/discussions/:number/answer', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { owner, repo, number } = req.params;
-  const { commentId } = req.body;
+  const { commentId } = req.body as { commentId?: number };
 
   const discussionResult = await query(
     `SELECT d.*, r.owner_id FROM discussions d
@@ -212,14 +250,16 @@ router.post('/:owner/:repo/discussions/:number/answer', requireAuth, async (req,
   );
 
   if (discussionResult.rows.length === 0) {
-    return res.status(404).json({ error: 'Discussion not found' });
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
   }
 
-  const discussion = discussionResult.rows[0];
+  const discussion = discussionResult.rows[0] as Discussion;
 
   // Only author or repo owner can mark answer
-  if (discussion.author_id !== req.user.id && discussion.owner_id !== req.user.id) {
-    return res.status(403).json({ error: 'Not authorized' });
+  if (discussion.author_id !== req.user!.id && discussion.owner_id !== req.user!.id) {
+    res.status(403).json({ error: 'Not authorized' });
+    return;
   }
 
   await query(
@@ -233,7 +273,7 @@ router.post('/:owner/:repo/discussions/:number/answer', requireAuth, async (req,
 /**
  * Upvote comment
  */
-router.post('/:owner/:repo/discussions/:number/comments/:commentId/upvote', requireAuth, async (req, res) => {
+router.post('/:owner/:repo/discussions/:number/comments/:commentId/upvote', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { commentId } = req.params;
 
   await query(

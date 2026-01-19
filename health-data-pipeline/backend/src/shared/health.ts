@@ -1,3 +1,4 @@
+import { Express, Request, Response } from 'express';
 import { pool } from '../config/database.js';
 import { redis } from '../config/redis.js';
 import { logger } from './logger.js';
@@ -18,11 +19,50 @@ import { logger } from './logger.js';
 
 const startTime = Date.now();
 
+interface LivenessResult {
+  status: string;
+  timestamp: string;
+  uptime: number;
+  version: string;
+}
+
+interface PoolStats {
+  total: number;
+  idle: number;
+  waiting: number;
+}
+
+interface DatabaseCheckResult {
+  healthy: boolean;
+  latencyMs: number;
+  pool?: PoolStats;
+  error?: string;
+}
+
+interface CacheCheckResult {
+  healthy: boolean;
+  latencyMs: number;
+  usedMemoryBytes?: number | null;
+  error?: string;
+}
+
+interface ReadinessChecks {
+  database: DatabaseCheckResult;
+  cache: CacheCheckResult;
+}
+
+interface ReadinessResult {
+  status: string;
+  timestamp: string;
+  uptime: number;
+  checks: ReadinessChecks;
+}
+
 /**
  * Liveness check - is the process responsive?
  * Should be fast and always succeed unless the process is truly dead.
  */
-export async function livenessCheck() {
+export async function livenessCheck(): Promise<LivenessResult> {
   return {
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -35,16 +75,18 @@ export async function livenessCheck() {
  * Readiness check - can the service handle requests?
  * Checks all critical dependencies.
  */
-export async function readinessCheck() {
-  const checks = {};
+export async function readinessCheck(): Promise<ReadinessResult> {
+  const checks: ReadinessChecks = {
+    database: await checkDatabase(),
+    cache: await checkCache()
+  };
+
   let allHealthy = true;
 
   // Check database
-  checks.database = await checkDatabase();
   if (!checks.database.healthy) allHealthy = false;
 
   // Check Redis/Valkey cache
-  checks.cache = await checkCache();
   if (!checks.cache.healthy) allHealthy = false;
 
   return {
@@ -58,14 +100,14 @@ export async function readinessCheck() {
 /**
  * Check database connectivity and query performance.
  */
-async function checkDatabase() {
+async function checkDatabase(): Promise<DatabaseCheckResult> {
   const start = Date.now();
   try {
     // Run a simple query to verify connectivity
-    const result = await pool.query('SELECT 1 as check');
+    await pool.query('SELECT 1 as check');
 
     // Also check pool health
-    const poolStats = {
+    const poolStats: PoolStats = {
       total: pool.totalCount,
       idle: pool.idleCount,
       waiting: pool.waitingCount
@@ -90,12 +132,12 @@ async function checkDatabase() {
   } catch (error) {
     logger.error({
       msg: 'Database health check failed',
-      error: error.message
+      error: (error as Error).message
     });
 
     return {
       healthy: false,
-      error: error.message,
+      error: (error as Error).message,
       latencyMs: Date.now() - start
     };
   }
@@ -104,7 +146,7 @@ async function checkDatabase() {
 /**
  * Check Redis/Valkey connectivity.
  */
-async function checkCache() {
+async function checkCache(): Promise<CacheCheckResult> {
   const start = Date.now();
   try {
     // PING to verify connection
@@ -128,12 +170,12 @@ async function checkCache() {
   } catch (error) {
     logger.error({
       msg: 'Cache health check failed',
-      error: error.message
+      error: (error as Error).message
     });
 
     return {
       healthy: false,
-      error: error.message,
+      error: (error as Error).message,
       latencyMs: Date.now() - start
     };
   }
@@ -142,32 +184,32 @@ async function checkCache() {
 /**
  * Express router for health endpoints.
  */
-export function healthRoutes(app) {
+export function healthRoutes(app: Express): void {
   // Liveness probe - is the process alive?
-  app.get('/health', async (req, res) => {
+  app.get('/health', async (req: Request, res: Response): Promise<void> => {
     try {
       const health = await livenessCheck();
       res.json(health);
     } catch (error) {
-      logger.error({ msg: 'Liveness check failed', error: error.message });
-      res.status(500).json({ status: 'error', error: error.message });
+      logger.error({ msg: 'Liveness check failed', error: (error as Error).message });
+      res.status(500).json({ status: 'error', error: (error as Error).message });
     }
   });
 
   // Readiness probe - is the service ready to handle traffic?
-  app.get('/ready', async (req, res) => {
+  app.get('/ready', async (req: Request, res: Response): Promise<void> => {
     try {
       const ready = await readinessCheck();
       const statusCode = ready.status === 'ready' ? 200 : 503;
       res.status(statusCode).json(ready);
     } catch (error) {
-      logger.error({ msg: 'Readiness check failed', error: error.message });
-      res.status(503).json({ status: 'error', error: error.message });
+      logger.error({ msg: 'Readiness check failed', error: (error as Error).message });
+      res.status(503).json({ status: 'error', error: (error as Error).message });
     }
   });
 
   // Deep health check with more details (for debugging)
-  app.get('/health/deep', async (req, res) => {
+  app.get('/health/deep', async (req: Request, res: Response): Promise<void> => {
     try {
       const ready = await readinessCheck();
       const liveness = await livenessCheck();
@@ -179,8 +221,8 @@ export function healthRoutes(app) {
         pid: process.pid
       });
     } catch (error) {
-      logger.error({ msg: 'Deep health check failed', error: error.message });
-      res.status(500).json({ status: 'error', error: error.message });
+      logger.error({ msg: 'Deep health check failed', error: (error as Error).message });
+      res.status(500).json({ status: 'error', error: (error as Error).message });
     }
   });
 }

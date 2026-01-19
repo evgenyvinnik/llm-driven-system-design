@@ -1,13 +1,36 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+interface User {
+  id: number;
+  username: string;
+  email: string;
+  display_name: string;
+  bio: string | null;
+  avatar_url: string | null;
+  location: string | null;
+  company: string | null;
+  website: string | null;
+  created_at: Date;
+}
+
+interface Organization {
+  id: number;
+  name: string;
+  display_name: string;
+  description: string | null;
+  avatar_url: string | null;
+  created_by: number;
+  created_at: Date;
+}
+
 /**
  * Get user profile
  */
-router.get('/:username', async (req, res) => {
+router.get('/:username', async (req: Request, res: Response): Promise<void> => {
   const { username } = req.params;
 
   const result = await query(
@@ -17,10 +40,11 @@ router.get('/:username', async (req, res) => {
   );
 
   if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'User not found' });
+    res.status(404).json({ error: 'User not found' });
+    return;
   }
 
-  const user = result.rows[0];
+  const user = result.rows[0] as User;
 
   // Get repos count
   const reposResult = await query(
@@ -41,8 +65,8 @@ router.get('/:username', async (req, res) => {
 
   res.json({
     ...user,
-    public_repos: parseInt(reposResult.rows[0].count),
-    starred_count: parseInt(starsResult.rows[0].count),
+    public_repos: parseInt(reposResult.rows[0].count as string),
+    starred_count: parseInt(starsResult.rows[0].count as string),
     organizations: orgsResult.rows,
   });
 });
@@ -50,11 +74,18 @@ router.get('/:username', async (req, res) => {
 /**
  * Update current user profile
  */
-router.patch('/me', requireAuth, async (req, res) => {
-  const { displayName, bio, location, company, website, avatarUrl } = req.body;
+router.patch('/me', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const { displayName, bio, location, company, website, avatarUrl } = req.body as {
+    displayName?: string;
+    bio?: string;
+    location?: string;
+    company?: string;
+    website?: string;
+    avatarUrl?: string;
+  };
 
-  const updates = [];
-  const params = [];
+  const updates: string[] = [];
+  const params: unknown[] = [];
 
   if (displayName !== undefined) {
     params.push(displayName);
@@ -82,13 +113,14 @@ router.patch('/me', requireAuth, async (req, res) => {
   }
 
   if (updates.length === 0) {
-    return res.json(req.user);
+    res.json(req.user);
+    return;
   }
 
   params.push(new Date());
   updates.push(`updated_at = $${params.length}`);
 
-  params.push(req.user.id);
+  params.push(req.user!.id);
 
   const result = await query(
     `UPDATE users SET ${updates.join(', ')} WHERE id = $${params.length}
@@ -102,17 +134,18 @@ router.patch('/me', requireAuth, async (req, res) => {
 /**
  * Get user's repositories
  */
-router.get('/:username/repos', async (req, res) => {
+router.get('/:username/repos', async (req: Request, res: Response): Promise<void> => {
   const { username } = req.params;
-  const { page = 1, limit = 20, sort = 'updated_at' } = req.query;
+  const { page = '1', limit = '20', sort = 'updated_at' } = req.query as { page?: string; limit?: string; sort?: string };
 
   const userResult = await query('SELECT id FROM users WHERE username = $1', [username]);
 
   if (userResult.rows.length === 0) {
-    return res.status(404).json({ error: 'User not found' });
+    res.status(404).json({ error: 'User not found' });
+    return;
   }
 
-  const userId = userResult.rows[0].id;
+  const userId = userResult.rows[0].id as number;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   const sortColumn = ['updated_at', 'created_at', 'stars_count', 'name'].includes(sort)
@@ -135,17 +168,18 @@ router.get('/:username/repos', async (req, res) => {
 /**
  * Get user's starred repos
  */
-router.get('/:username/starred', async (req, res) => {
+router.get('/:username/starred', async (req: Request, res: Response): Promise<void> => {
   const { username } = req.params;
-  const { page = 1, limit = 20 } = req.query;
+  const { page = '1', limit = '20' } = req.query as { page?: string; limit?: string };
 
   const userResult = await query('SELECT id FROM users WHERE username = $1', [username]);
 
   if (userResult.rows.length === 0) {
-    return res.status(404).json({ error: 'User not found' });
+    res.status(404).json({ error: 'User not found' });
+    return;
   }
 
-  const userId = userResult.rows[0].id;
+  const userId = userResult.rows[0].id as number;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   const result = await query(
@@ -165,8 +199,8 @@ router.get('/:username/starred', async (req, res) => {
 /**
  * Get organizations
  */
-router.get('/orgs', async (req, res) => {
-  const { page = 1, limit = 20 } = req.query;
+router.get('/orgs', async (req: Request, res: Response): Promise<void> => {
+  const { page = '1', limit = '20' } = req.query as { page?: string; limit?: string };
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   const result = await query(
@@ -185,7 +219,7 @@ router.get('/orgs', async (req, res) => {
 /**
  * Get single organization
  */
-router.get('/orgs/:name', async (req, res) => {
+router.get('/orgs/:name', async (req: Request, res: Response): Promise<void> => {
   const { name } = req.params;
 
   const result = await query(
@@ -196,10 +230,11 @@ router.get('/orgs/:name', async (req, res) => {
   );
 
   if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'Organization not found' });
+    res.status(404).json({ error: 'Organization not found' });
+    return;
   }
 
-  const org = result.rows[0];
+  const org = result.rows[0] as Organization;
 
   // Get members
   const members = await query(
@@ -219,33 +254,35 @@ router.get('/orgs/:name', async (req, res) => {
 /**
  * Create organization
  */
-router.post('/orgs', requireAuth, async (req, res) => {
-  const { name, displayName, description } = req.body;
+router.post('/orgs', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const { name, displayName, description } = req.body as { name?: string; displayName?: string; description?: string };
 
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
-    return res.status(400).json({ error: 'Invalid organization name' });
+    res.status(400).json({ error: 'Invalid organization name' });
+    return;
   }
 
   // Check if name exists
   const existing = await query('SELECT id FROM organizations WHERE name = $1', [name]);
 
   if (existing.rows.length > 0) {
-    return res.status(409).json({ error: 'Organization name already exists' });
+    res.status(409).json({ error: 'Organization name already exists' });
+    return;
   }
 
   const result = await query(
     `INSERT INTO organizations (name, display_name, description, created_by)
      VALUES ($1, $2, $3, $4)
      RETURNING *`,
-    [name, displayName || name, description || null, req.user.id]
+    [name, displayName || name, description || null, req.user!.id]
   );
 
-  const org = result.rows[0];
+  const org = result.rows[0] as Organization;
 
   // Add creator as owner
   await query(
     'INSERT INTO organization_members (org_id, user_id, role) VALUES ($1, $2, $3)',
-    [org.id, req.user.id, 'owner']
+    [org.id, req.user!.id, 'owner']
   );
 
   res.status(201).json(org);
@@ -254,17 +291,18 @@ router.post('/orgs', requireAuth, async (req, res) => {
 /**
  * Get org repositories
  */
-router.get('/orgs/:name/repos', async (req, res) => {
+router.get('/orgs/:name/repos', async (req: Request, res: Response): Promise<void> => {
   const { name } = req.params;
-  const { page = 1, limit = 20 } = req.query;
+  const { page = '1', limit = '20' } = req.query as { page?: string; limit?: string };
 
   const orgResult = await query('SELECT id FROM organizations WHERE name = $1', [name]);
 
   if (orgResult.rows.length === 0) {
-    return res.status(404).json({ error: 'Organization not found' });
+    res.status(404).json({ error: 'Organization not found' });
+    return;
   }
 
-  const orgId = orgResult.rows[0].id;
+  const orgId = orgResult.rows[0].id as number;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   const result = await query(

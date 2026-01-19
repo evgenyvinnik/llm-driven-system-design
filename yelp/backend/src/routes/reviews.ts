@@ -1,7 +1,7 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../utils/db.js';
 import { cache } from '../utils/redis.js';
-import { authenticate, optionalAuth } from '../middleware/auth.js';
+import { authenticate, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { publishBusinessIndexUpdate } from '../utils/queue.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -19,86 +19,144 @@ import {
 
 const router = Router();
 
+// Review interfaces
+interface ReviewRow {
+  id: string;
+  business_id: string;
+  user_id: string;
+  rating: number;
+  text: string;
+  helpful_count: number;
+  funny_count: number;
+  cool_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ReviewWithDetails extends ReviewRow {
+  user_name: string;
+  user_avatar: string | null;
+  user_review_count: number;
+  business_name: string;
+  business_slug: string;
+  response_text?: string | null;
+  response_created_at?: string | null;
+  photos?: string[] | null;
+}
+
+interface BusinessRatingRow {
+  rating: string;
+  review_count: string;
+}
+
+interface ReviewCheckRow {
+  user_id: string;
+  business_id: string;
+  old_rating?: number;
+}
+
+interface ReviewOwnerCheckRow {
+  owner_id: string;
+}
+
 // ============================================================================
 // Create a Review
 // With idempotency protection and rate limiting
 // ============================================================================
 router.post(
   '/',
-  authenticate,
-  reviewRateLimit,
-  idempotencyMiddleware({ required: false }),
-  async (req, res) => {
+  authenticate as any,
+  reviewRateLimit as any,
+  idempotencyMiddleware({ required: false }) as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
     try {
-      const { business_id, rating, text } = req.body;
+      const { business_id, rating, text } = req.body as {
+        business_id?: string;
+        rating?: number;
+        text?: string;
+      };
 
       // Validate required fields
       if (!business_id || !rating || !text) {
         recordReviewRejected('missing_fields');
         return res.status(400).json({
-          error: { message: 'Business ID, rating, and text are required' }
+          error: { message: 'Business ID, rating, and text are required' },
         });
       }
 
       // Validate rating range
       if (rating < 1 || rating > 5) {
         recordReviewRejected('invalid_rating');
-        return res.status(400).json({ error: { message: 'Rating must be between 1 and 5' } });
+        return res
+          .status(400)
+          .json({ error: { message: 'Rating must be between 1 and 5' } });
       }
 
       // Validate text length
       if (text.length < 10) {
         recordReviewRejected('text_too_short');
-        return res.status(400).json({ error: { message: 'Review text must be at least 10 characters' } });
+        return res.status(400).json({
+          error: { message: 'Review text must be at least 10 characters' },
+        });
       }
 
       if (text.length > 5000) {
         recordReviewRejected('text_too_long');
-        return res.status(400).json({ error: { message: 'Review text must not exceed 5000 characters' } });
+        return res.status(400).json({
+          error: { message: 'Review text must not exceed 5000 characters' },
+        });
       }
 
       // Check if business exists
-      const businessCheck = await pool.query('SELECT id FROM businesses WHERE id = $1', [business_id]);
+      const businessCheck = await pool.query<{ id: string }>(
+        'SELECT id FROM businesses WHERE id = $1',
+        [business_id]
+      );
       if (businessCheck.rows.length === 0) {
         recordReviewRejected('business_not_found');
         return res.status(404).json({ error: { message: 'Business not found' } });
       }
 
       // Check rate limit for this specific business
-      const businessRateCheck = await canReviewBusiness(req.user.id, business_id);
+      const businessRateCheck = await canReviewBusiness(
+        req.user!.id,
+        business_id
+      );
       if (!businessRateCheck.allowed) {
         recordReviewRejected('rate_limited_business');
-        return res.status(429).json({ error: { message: businessRateCheck.message } });
+        return res
+          .status(429)
+          .json({ error: { message: businessRateCheck.message } });
       }
 
       // Check if user already reviewed this business
-      const existingReview = await pool.query(
+      const existingReview = await pool.query<{ id: string }>(
         'SELECT id FROM reviews WHERE business_id = $1 AND user_id = $2',
-        [business_id, req.user.id]
+        [business_id, req.user!.id]
       );
 
       if (existingReview.rows.length > 0) {
         recordReviewRejected('duplicate');
         return res.status(409).json({
-          error: { message: 'You have already reviewed this business' }
+          error: { message: 'You have already reviewed this business' },
         });
       }
 
       // Create review (trigger will update business rating)
-      const result = await pool.query(
+      const result = await pool.query<ReviewRow>(
         `INSERT INTO reviews (business_id, user_id, rating, text)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
-        [business_id, req.user.id, rating, text]
+        [business_id, req.user!.id, rating, text]
       );
 
       const review = result.rows[0];
 
       // Record the review action for rate limiting
-      await recordReviewAction(req.user.id, business_id);
+      await recordReviewAction(req.user!.id, business_id);
 
       // Get updated business rating for ES update
-      const businessResult = await pool.query(
+      const businessResult = await pool.query<BusinessRatingRow>(
         'SELECT rating, review_count FROM businesses WHERE id = $1',
         [business_id]
       );
@@ -106,7 +164,7 @@ router.post(
       // Update Elasticsearch asynchronously via queue
       publishBusinessIndexUpdate(business_id, {
         rating: parseFloat(businessResult.rows[0].rating),
-        review_count: parseInt(businessResult.rows[0].review_count)
+        review_count: parseInt(businessResult.rows[0].review_count, 10),
       });
 
       // Clear caches
@@ -116,23 +174,29 @@ router.post(
       // Record metrics
       recordReviewCreated(rating);
 
-      logger.info({
-        component: 'review',
-        userId: req.user.id,
-        businessId: business_id,
-        reviewId: review.id,
-        rating,
-      }, 'Review created');
+      logger.info(
+        {
+          component: 'review',
+          userId: req.user!.id,
+          businessId: business_id,
+          reviewId: review.id,
+          rating,
+        },
+        'Review created'
+      );
 
       res.status(201).json({
         review: {
           ...review,
-          user_name: req.user.name,
-          user_avatar: req.user.avatar_url
-        }
+          user_name: req.user!.name,
+          user_avatar: req.user!.avatar_url,
+        },
       });
     } catch (error) {
-      logger.error({ component: 'review', error: error.message }, 'Create review error');
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Create review error'
+      );
       res.status(500).json({ error: { message: 'Failed to create review' } });
     }
   }
@@ -141,18 +205,18 @@ router.post(
 // ============================================================================
 // Get a Specific Review
 // ============================================================================
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req: Request, res: Response): Promise<void | Response> => {
   try {
     const { id } = req.params;
 
     // Try cache first
     const cacheKey = `review:${id}`;
-    const cached = await cache.get(cacheKey);
+    const cached = await cache.get<ReviewWithDetails>(cacheKey);
     if (cached) {
       return res.json({ review: cached });
     }
 
-    const result = await pool.query(
+    const result = await pool.query<ReviewWithDetails>(
       `SELECT r.*,
               u.name as user_name, u.avatar_url as user_avatar, u.review_count as user_review_count,
               b.name as business_name, b.slug as business_slug,
@@ -179,7 +243,10 @@ router.get('/:id', async (req, res) => {
 
     res.json({ review });
   } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Get review error');
+    logger.error(
+      { component: 'review', error: (error as Error).message },
+      'Get review error'
+    );
     res.status(500).json({ error: { message: 'Failed to fetch review' } });
   }
 });
@@ -187,328 +254,406 @@ router.get('/:id', async (req, res) => {
 // ============================================================================
 // Update a Review
 // ============================================================================
-router.patch('/:id', authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { rating, text } = req.body;
+router.patch(
+  '/:id',
+  authenticate as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
+    try {
+      const { id } = req.params;
+      const { rating, text } = req.body as { rating?: number; text?: string };
 
-    // Check ownership
-    const reviewCheck = await pool.query(
-      'SELECT user_id, business_id, rating as old_rating FROM reviews WHERE id = $1',
-      [id]
-    );
+      // Check ownership
+      const reviewCheck = await pool.query<ReviewCheckRow>(
+        'SELECT user_id, business_id, rating as old_rating FROM reviews WHERE id = $1',
+        [id]
+      );
 
-    if (reviewCheck.rows.length === 0) {
-      return res.status(404).json({ error: { message: 'Review not found' } });
-    }
-
-    if (reviewCheck.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: { message: 'Not authorized to update this review' } });
-    }
-
-    const updates = [];
-    const values = [];
-    let paramIndex = 1;
-
-    if (rating !== undefined) {
-      if (rating < 1 || rating > 5) {
-        return res.status(400).json({ error: { message: 'Rating must be between 1 and 5' } });
+      if (reviewCheck.rows.length === 0) {
+        return res.status(404).json({ error: { message: 'Review not found' } });
       }
-      updates.push(`rating = $${paramIndex++}`);
-      values.push(rating);
-    }
 
-    if (text !== undefined) {
-      if (text.length < 10 || text.length > 5000) {
-        return res.status(400).json({
-          error: { message: 'Review text must be between 10 and 5000 characters' }
+      if (
+        reviewCheck.rows[0].user_id !== req.user!.id &&
+        req.user!.role !== 'admin'
+      ) {
+        return res.status(403).json({
+          error: { message: 'Not authorized to update this review' },
         });
       }
-      updates.push(`text = $${paramIndex++}`);
-      values.push(text);
-    }
 
-    if (updates.length === 0) {
-      return res.status(400).json({ error: { message: 'No updates provided' } });
-    }
+      const updates: string[] = [];
+      const values: unknown[] = [];
+      let paramIndex = 1;
 
-    values.push(id);
+      if (rating !== undefined) {
+        if (rating < 1 || rating > 5) {
+          return res
+            .status(400)
+            .json({ error: { message: 'Rating must be between 1 and 5' } });
+        }
+        updates.push(`rating = $${paramIndex++}`);
+        values.push(rating);
+      }
 
-    const result = await pool.query(
-      `UPDATE reviews SET ${updates.join(', ')}, updated_at = NOW()
+      if (text !== undefined) {
+        if (text.length < 10 || text.length > 5000) {
+          return res.status(400).json({
+            error: {
+              message: 'Review text must be between 10 and 5000 characters',
+            },
+          });
+        }
+        updates.push(`text = $${paramIndex++}`);
+        values.push(text);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: { message: 'No updates provided' } });
+      }
+
+      values.push(id);
+
+      const result = await pool.query<ReviewRow>(
+        `UPDATE reviews SET ${updates.join(', ')}, updated_at = NOW()
        WHERE id = $${paramIndex}
        RETURNING *`,
-      values
-    );
+        values
+      );
 
-    // Get updated business rating for ES update
-    const businessId = reviewCheck.rows[0].business_id;
-    const businessResult = await pool.query(
-      'SELECT rating, review_count FROM businesses WHERE id = $1',
-      [businessId]
-    );
+      // Get updated business rating for ES update
+      const businessId = reviewCheck.rows[0].business_id;
+      const businessResult = await pool.query<BusinessRatingRow>(
+        'SELECT rating, review_count FROM businesses WHERE id = $1',
+        [businessId]
+      );
 
-    // Update Elasticsearch asynchronously via queue
-    publishBusinessIndexUpdate(businessId, {
-      rating: parseFloat(businessResult.rows[0].rating),
-      review_count: parseInt(businessResult.rows[0].review_count)
-    });
+      // Update Elasticsearch asynchronously via queue
+      publishBusinessIndexUpdate(businessId, {
+        rating: parseFloat(businessResult.rows[0].rating),
+        review_count: parseInt(businessResult.rows[0].review_count, 10),
+      });
 
-    // Clear caches
-    await cache.delPattern(`business:${businessId}*`);
-    await cache.del(`review:${id}`);
+      // Clear caches
+      await cache.delPattern(`business:${businessId}*`);
+      await cache.del(`review:${id}`);
 
-    logger.info({
-      component: 'review',
-      userId: req.user.id,
-      reviewId: id,
-      updates: Object.keys(req.body),
-    }, 'Review updated');
+      logger.info(
+        {
+          component: 'review',
+          userId: req.user!.id,
+          reviewId: id,
+          updates: Object.keys(req.body),
+        },
+        'Review updated'
+      );
 
-    res.json({ review: result.rows[0] });
-  } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Update review error');
-    res.status(500).json({ error: { message: 'Failed to update review' } });
+      res.json({ review: result.rows[0] });
+    } catch (error) {
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Update review error'
+      );
+      res.status(500).json({ error: { message: 'Failed to update review' } });
+    }
   }
-});
+);
 
 // ============================================================================
 // Delete a Review
 // ============================================================================
-router.delete('/:id', authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
+router.delete(
+  '/:id',
+  authenticate as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
+    try {
+      const { id } = req.params;
 
-    // Check ownership
-    const reviewCheck = await pool.query(
-      'SELECT user_id, business_id FROM reviews WHERE id = $1',
-      [id]
-    );
+      // Check ownership
+      const reviewCheck = await pool.query<ReviewCheckRow>(
+        'SELECT user_id, business_id FROM reviews WHERE id = $1',
+        [id]
+      );
 
-    if (reviewCheck.rows.length === 0) {
-      return res.status(404).json({ error: { message: 'Review not found' } });
+      if (reviewCheck.rows.length === 0) {
+        return res.status(404).json({ error: { message: 'Review not found' } });
+      }
+
+      if (
+        reviewCheck.rows[0].user_id !== req.user!.id &&
+        req.user!.role !== 'admin'
+      ) {
+        return res.status(403).json({
+          error: { message: 'Not authorized to delete this review' },
+        });
+      }
+
+      const businessId = reviewCheck.rows[0].business_id;
+
+      // Delete review (trigger will update business rating)
+      await pool.query('DELETE FROM reviews WHERE id = $1', [id]);
+
+      // Get updated business rating for ES update
+      const businessResult = await pool.query<BusinessRatingRow>(
+        'SELECT rating, review_count FROM businesses WHERE id = $1',
+        [businessId]
+      );
+
+      // Update Elasticsearch asynchronously via queue
+      publishBusinessIndexUpdate(businessId, {
+        rating: parseFloat(businessResult.rows[0].rating) || 0,
+        review_count: parseInt(businessResult.rows[0].review_count, 10) || 0,
+      });
+
+      // Clear caches
+      await cache.delPattern(`business:${businessId}*`);
+      await cache.del(`review:${id}`);
+
+      logger.info(
+        {
+          component: 'review',
+          userId: req.user!.id,
+          reviewId: id,
+          businessId,
+        },
+        'Review deleted'
+      );
+
+      res.json({ message: 'Review deleted successfully' });
+    } catch (error) {
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Delete review error'
+      );
+      res.status(500).json({ error: { message: 'Failed to delete review' } });
     }
-
-    if (reviewCheck.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: { message: 'Not authorized to delete this review' } });
-    }
-
-    const businessId = reviewCheck.rows[0].business_id;
-
-    // Delete review (trigger will update business rating)
-    await pool.query('DELETE FROM reviews WHERE id = $1', [id]);
-
-    // Get updated business rating for ES update
-    const businessResult = await pool.query(
-      'SELECT rating, review_count FROM businesses WHERE id = $1',
-      [businessId]
-    );
-
-    // Update Elasticsearch asynchronously via queue
-    publishBusinessIndexUpdate(businessId, {
-      rating: parseFloat(businessResult.rows[0].rating) || 0,
-      review_count: parseInt(businessResult.rows[0].review_count) || 0
-    });
-
-    // Clear caches
-    await cache.delPattern(`business:${businessId}*`);
-    await cache.del(`review:${id}`);
-
-    logger.info({
-      component: 'review',
-      userId: req.user.id,
-      reviewId: id,
-      businessId,
-    }, 'Review deleted');
-
-    res.json({ message: 'Review deleted successfully' });
-  } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Delete review error');
-    res.status(500).json({ error: { message: 'Failed to delete review' } });
   }
-});
+);
 
 // ============================================================================
 // Vote on a Review (helpful/funny/cool)
 // With rate limiting
 // ============================================================================
-router.post('/:id/vote', authenticate, voteRateLimit, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { vote_type } = req.body;
+router.post(
+  '/:id/vote',
+  authenticate as any,
+  voteRateLimit as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
+    try {
+      const { id } = req.params;
+      const { vote_type } = req.body as { vote_type?: string };
 
-    if (!['helpful', 'funny', 'cool'].includes(vote_type)) {
-      return res.status(400).json({
-        error: { message: 'Vote type must be helpful, funny, or cool' }
-      });
-    }
+      if (!vote_type || !['helpful', 'funny', 'cool'].includes(vote_type)) {
+        return res.status(400).json({
+          error: { message: 'Vote type must be helpful, funny, or cool' },
+        });
+      }
 
-    // Check if review exists
-    const reviewCheck = await pool.query('SELECT id FROM reviews WHERE id = $1', [id]);
-    if (reviewCheck.rows.length === 0) {
-      return res.status(404).json({ error: { message: 'Review not found' } });
-    }
-
-    // Check if already voted
-    const existingVote = await pool.query(
-      'SELECT id FROM review_votes WHERE review_id = $1 AND user_id = $2 AND vote_type = $3',
-      [id, req.user.id, vote_type]
-    );
-
-    if (existingVote.rows.length > 0) {
-      // Remove vote
-      await pool.query(
-        'DELETE FROM review_votes WHERE review_id = $1 AND user_id = $2 AND vote_type = $3',
-        [id, req.user.id, vote_type]
-      );
-
-      await pool.query(
-        `UPDATE reviews SET ${vote_type}_count = ${vote_type}_count - 1 WHERE id = $1`,
+      // Check if review exists
+      const reviewCheck = await pool.query<{ id: string }>(
+        'SELECT id FROM reviews WHERE id = $1',
         [id]
       );
+      if (reviewCheck.rows.length === 0) {
+        return res.status(404).json({ error: { message: 'Review not found' } });
+      }
 
-      // Clear review cache
-      await cache.del(`review:${id}`);
-
-      res.json({ message: 'Vote removed', voted: false });
-    } else {
-      // Add vote
-      await pool.query(
-        'INSERT INTO review_votes (review_id, user_id, vote_type) VALUES ($1, $2, $3)',
-        [id, req.user.id, vote_type]
+      // Check if already voted
+      const existingVote = await pool.query<{ id: string }>(
+        'SELECT id FROM review_votes WHERE review_id = $1 AND user_id = $2 AND vote_type = $3',
+        [id, req.user!.id, vote_type]
       );
 
-      await pool.query(
-        `UPDATE reviews SET ${vote_type}_count = ${vote_type}_count + 1 WHERE id = $1`,
-        [id]
+      if (existingVote.rows.length > 0) {
+        // Remove vote
+        await pool.query(
+          'DELETE FROM review_votes WHERE review_id = $1 AND user_id = $2 AND vote_type = $3',
+          [id, req.user!.id, vote_type]
+        );
+
+        await pool.query(
+          `UPDATE reviews SET ${vote_type}_count = ${vote_type}_count - 1 WHERE id = $1`,
+          [id]
+        );
+
+        // Clear review cache
+        await cache.del(`review:${id}`);
+
+        res.json({ message: 'Vote removed', voted: false });
+      } else {
+        // Add vote
+        await pool.query(
+          'INSERT INTO review_votes (review_id, user_id, vote_type) VALUES ($1, $2, $3)',
+          [id, req.user!.id, vote_type]
+        );
+
+        await pool.query(
+          `UPDATE reviews SET ${vote_type}_count = ${vote_type}_count + 1 WHERE id = $1`,
+          [id]
+        );
+
+        // Record metric
+        reviewVotesTotal.inc({ vote_type });
+
+        // Clear review cache
+        await cache.del(`review:${id}`);
+
+        res.json({ message: 'Vote added', voted: true });
+      }
+    } catch (error) {
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Vote error'
       );
-
-      // Record metric
-      reviewVotesTotal.inc({ vote_type });
-
-      // Clear review cache
-      await cache.del(`review:${id}`);
-
-      res.json({ message: 'Vote added', voted: true });
+      res.status(500).json({ error: { message: 'Failed to vote' } });
     }
-  } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Vote error');
-    res.status(500).json({ error: { message: 'Failed to vote' } });
   }
-});
+);
 
 // ============================================================================
 // Add Photos to a Review
 // ============================================================================
-router.post('/:id/photos', authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { url, caption } = req.body;
+router.post(
+  '/:id/photos',
+  authenticate as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
+    try {
+      const { id } = req.params;
+      const { url, caption } = req.body as { url?: string; caption?: string };
 
-    if (!url) {
-      return res.status(400).json({ error: { message: 'Photo URL is required' } });
+      if (!url) {
+        return res
+          .status(400)
+          .json({ error: { message: 'Photo URL is required' } });
+      }
+
+      // Check ownership
+      const reviewCheck = await pool.query<{ user_id: string }>(
+        'SELECT user_id FROM reviews WHERE id = $1',
+        [id]
+      );
+
+      if (reviewCheck.rows.length === 0) {
+        return res.status(404).json({ error: { message: 'Review not found' } });
+      }
+
+      if (reviewCheck.rows[0].user_id !== req.user!.id) {
+        return res.status(403).json({ error: { message: 'Not authorized' } });
+      }
+
+      const result = await pool.query(
+        'INSERT INTO review_photos (review_id, url, caption) VALUES ($1, $2, $3) RETURNING *',
+        [id, url, caption]
+      );
+
+      // Clear review cache
+      await cache.del(`review:${id}`);
+
+      res.status(201).json({ photo: result.rows[0] });
+    } catch (error) {
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Add photo error'
+      );
+      res.status(500).json({ error: { message: 'Failed to add photo' } });
     }
-
-    // Check ownership
-    const reviewCheck = await pool.query(
-      'SELECT user_id FROM reviews WHERE id = $1',
-      [id]
-    );
-
-    if (reviewCheck.rows.length === 0) {
-      return res.status(404).json({ error: { message: 'Review not found' } });
-    }
-
-    if (reviewCheck.rows[0].user_id !== req.user.id) {
-      return res.status(403).json({ error: { message: 'Not authorized' } });
-    }
-
-    const result = await pool.query(
-      'INSERT INTO review_photos (review_id, url, caption) VALUES ($1, $2, $3) RETURNING *',
-      [id, url, caption]
-    );
-
-    // Clear review cache
-    await cache.del(`review:${id}`);
-
-    res.status(201).json({ photo: result.rows[0] });
-  } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Add photo error');
-    res.status(500).json({ error: { message: 'Failed to add photo' } });
   }
-});
+);
 
 // ============================================================================
 // Business Owner Respond to Review
 // ============================================================================
-router.post('/:id/respond', authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { text } = req.body;
+router.post(
+  '/:id/respond',
+  authenticate as any,
+  async (req: AuthenticatedRequest, res: Response): Promise<void | Response> => {
+    try {
+      const { id } = req.params;
+      const { text } = req.body as { text?: string };
 
-    if (!text) {
-      return res.status(400).json({ error: { message: 'Response text is required' } });
-    }
+      if (!text) {
+        return res
+          .status(400)
+          .json({ error: { message: 'Response text is required' } });
+      }
 
-    if (text.length > 2000) {
-      return res.status(400).json({ error: { message: 'Response text must not exceed 2000 characters' } });
-    }
+      if (text.length > 2000) {
+        return res.status(400).json({
+          error: { message: 'Response text must not exceed 2000 characters' },
+        });
+      }
 
-    // Get review and check business ownership
-    const reviewCheck = await pool.query(
-      `SELECT r.business_id, b.owner_id
+      // Get review and check business ownership
+      const reviewCheck = await pool.query<{
+        business_id: string;
+        owner_id: string;
+      }>(
+        `SELECT r.business_id, b.owner_id
        FROM reviews r
        JOIN businesses b ON r.business_id = b.id
        WHERE r.id = $1`,
-      [id]
-    );
+        [id]
+      );
 
-    if (reviewCheck.rows.length === 0) {
-      return res.status(404).json({ error: { message: 'Review not found' } });
-    }
+      if (reviewCheck.rows.length === 0) {
+        return res.status(404).json({ error: { message: 'Review not found' } });
+      }
 
-    if (reviewCheck.rows[0].owner_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: { message: 'Not authorized to respond to this review' } });
-    }
+      if (
+        reviewCheck.rows[0].owner_id !== req.user!.id &&
+        req.user!.role !== 'admin'
+      ) {
+        return res.status(403).json({
+          error: { message: 'Not authorized to respond to this review' },
+        });
+      }
 
-    // Check if response already exists
-    const existingResponse = await pool.query(
-      'SELECT id FROM review_responses WHERE review_id = $1',
-      [id]
-    );
+      // Check if response already exists
+      const existingResponse = await pool.query<{ id: string }>(
+        'SELECT id FROM review_responses WHERE review_id = $1',
+        [id]
+      );
 
-    let result;
-    if (existingResponse.rows.length > 0) {
-      result = await pool.query(
-        `UPDATE review_responses SET text = $1, updated_at = NOW()
+      let result;
+      if (existingResponse.rows.length > 0) {
+        result = await pool.query(
+          `UPDATE review_responses SET text = $1, updated_at = NOW()
          WHERE review_id = $2
          RETURNING *`,
-        [text, id]
-      );
-    } else {
-      result = await pool.query(
-        `INSERT INTO review_responses (review_id, business_id, text)
+          [text, id]
+        );
+      } else {
+        result = await pool.query(
+          `INSERT INTO review_responses (review_id, business_id, text)
          VALUES ($1, $2, $3)
          RETURNING *`,
-        [id, reviewCheck.rows[0].business_id, text]
+          [id, reviewCheck.rows[0].business_id, text]
+        );
+      }
+
+      // Clear review cache
+      await cache.del(`review:${id}`);
+
+      logger.info(
+        {
+          component: 'review',
+          userId: req.user!.id,
+          reviewId: id,
+          businessId: reviewCheck.rows[0].business_id,
+        },
+        'Review response added'
       );
+
+      res.json({ response: result.rows[0] });
+    } catch (error) {
+      logger.error(
+        { component: 'review', error: (error as Error).message },
+        'Respond to review error'
+      );
+      res
+        .status(500)
+        .json({ error: { message: 'Failed to respond to review' } });
     }
-
-    // Clear review cache
-    await cache.del(`review:${id}`);
-
-    logger.info({
-      component: 'review',
-      userId: req.user.id,
-      reviewId: id,
-      businessId: reviewCheck.rows[0].business_id,
-    }, 'Review response added');
-
-    res.json({ response: result.rows[0] });
-  } catch (error) {
-    logger.error({ component: 'review', error: error.message }, 'Respond to review error');
-    res.status(500).json({ error: { message: 'Failed to respond to review' } });
   }
-});
+);
 
 export default router;
