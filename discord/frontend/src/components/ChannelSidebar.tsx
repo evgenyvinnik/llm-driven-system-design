@@ -7,6 +7,7 @@
  * logged-in user's nickname and a disconnect button.
  */
 
+import { useNavigate, Link } from '@tanstack/react-router';
 import { useChatStore } from '../stores/chatStore';
 
 /**
@@ -18,8 +19,23 @@ import { useChatStore } from '../stores/chatStore';
  */
 export function ChannelSidebar() {
   const { session, currentRoom, rooms, leaveRoom, disconnect } = useChatStore();
+  const navigate = useNavigate();
 
   const currentRoomData = rooms.find((r) => r.name === currentRoom);
+
+  const handleLeaveRoom = async () => {
+    await leaveRoom();
+    navigate({ to: '/channels/@me' });
+  };
+
+  const handleDisconnect = async () => {
+    await disconnect();
+    navigate({ to: '/login' });
+  };
+
+  const handleRoomClick = (roomName: string) => {
+    navigate({ to: '/channels/$roomId', params: { roomId: roomName } });
+  };
 
   return (
     <div className="w-60 bg-discord-sidebar flex flex-col">
@@ -45,7 +61,7 @@ export function ChannelSidebar() {
               {currentRoomData?.memberCount || 0} members
             </p>
             <button
-              onClick={leaveRoom}
+              onClick={handleLeaveRoom}
               className="w-full mt-4 px-2 py-1.5 text-sm text-red-400 hover:text-red-300
                        hover:bg-discord-hover rounded transition-colors"
             >
@@ -68,7 +84,7 @@ export function ChannelSidebar() {
           {rooms.map((room) => (
             <button
               key={room.name}
-              onClick={() => useChatStore.getState().joinRoom(room.name)}
+              onClick={() => handleRoomClick(room.name)}
               className={`w-full flex items-center px-2 py-1.5 rounded text-sm
                        transition-colors ${
                          currentRoom === room.name
@@ -102,7 +118,7 @@ export function ChannelSidebar() {
           </div>
         </div>
         <button
-          onClick={disconnect}
+          onClick={handleDisconnect}
           className="p-2 text-discord-muted hover:text-white transition-colors"
           title="Disconnect"
         >

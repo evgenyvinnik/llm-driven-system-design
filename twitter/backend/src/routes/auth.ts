@@ -1,37 +1,39 @@
-import express from 'express';
+import express, { Request, Response, NextFunction, Router } from 'express';
 import bcrypt from 'bcrypt';
 import pool from '../db/pool.js';
 
-const router = express.Router();
+const router: Router = express.Router();
 
-// POST /api/auth/register - Register a new user
-router.post('/register', async (req, res, next) => {
+// POST /api/auth/register
+router.post('/register', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { username, email, password, displayName } = req.body;
 
     if (!username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+      res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
     }
 
     if (username.length < 3 || username.length > 50) {
-      return res.status(400).json({ error: 'Username must be between 3 and 50 characters' });
+      res.status(400).json({ error: 'Username must be between 3 and 50 characters' });
+      return;
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      res.status(400).json({ error: 'Password must be at least 6 characters' });
+      return;
     }
 
-    // Check if username or email already exists
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE username = $1 OR email = $2',
       [username.toLowerCase(), email.toLowerCase()]
     );
 
     if (existingUser.rows.length > 0) {
-      return res.status(409).json({ error: 'Username or email already exists' });
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
     }
 
-    // Hash password and create user
     const passwordHash = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
@@ -43,9 +45,7 @@ router.post('/register', async (req, res, next) => {
 
     const user = result.rows[0];
 
-    // Set session
     req.session.userId = user.id;
-    req.session.username = user.username;
     req.session.role = 'user';
 
     res.status(201).json({
@@ -67,13 +67,14 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
-// POST /api/auth/login - Login
-router.post('/login', async (req, res, next) => {
+// POST /api/auth/login
+router.post('/login', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { username, password } = req.body;
 
     if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
+      res.status(400).json({ error: 'Username and password are required' });
+      return;
     }
 
     const result = await pool.query(
@@ -84,19 +85,19 @@ router.post('/login', async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      res.status(401).json({ error: 'Invalid username or password' });
+      return;
     }
 
     const user = result.rows[0];
     const validPassword = await bcrypt.compare(password, user.password_hash);
 
     if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      res.status(401).json({ error: 'Invalid username or password' });
+      return;
     }
 
-    // Set session
     req.session.userId = user.id;
-    req.session.username = user.username;
     req.session.role = user.role;
 
     res.json({
@@ -119,22 +120,24 @@ router.post('/login', async (req, res, next) => {
   }
 });
 
-// POST /api/auth/logout - Logout
-router.post('/logout', (req, res) => {
+// POST /api/auth/logout
+router.post('/logout', (req: Request, res: Response) => {
   req.session.destroy((err) => {
     if (err) {
-      return res.status(500).json({ error: 'Failed to logout' });
+      res.status(500).json({ error: 'Failed to logout' });
+      return;
     }
     res.clearCookie('connect.sid');
     res.json({ message: 'Logged out successfully' });
   });
 });
 
-// GET /api/auth/me - Get current user
-router.get('/me', async (req, res, next) => {
+// GET /api/auth/me
+router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.session || !req.session.userId) {
-      return res.status(401).json({ error: 'Not authenticated' });
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
     }
 
     const result = await pool.query(
@@ -145,8 +148,9 @@ router.get('/me', async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      req.session.destroy();
-      return res.status(401).json({ error: 'User not found' });
+      req.session.destroy(() => {});
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
     const user = result.rows[0];

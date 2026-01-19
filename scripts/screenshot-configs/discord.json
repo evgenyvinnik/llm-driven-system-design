@@ -6,26 +6,26 @@
   "dbUser": "discord",
   "auth": {
     "enabled": true,
-    "loginUrl": "/",
+    "loginUrl": "/login",
     "credentials": {
       "username": "alice"
     },
-    "usernameSelector": "input#nickname, input[type='text']",
+    "usernameSelector": "input#nickname, input[name='nickname'], input[type='text']",
     "submitSelector": "button[type='submit']",
-    "successIndicator": "[data-testid='chat'], .server-list, aside, .bg-discord-channel"
+    "successIndicator": ".bg-discord-darker, .bg-discord-channel, aside"
   },
   "screens": [
     {
       "name": "01-login",
-      "path": "/",
+      "path": "/login",
       "waitFor": "form",
       "skipAuth": true,
       "delay": 500
     },
     {
-      "name": "02-chat",
-      "path": "/",
-      "waitFor": "main, aside",
+      "name": "02-home",
+      "path": "/channels/@me",
+      "waitFor": "aside, main",
       "delay": 1500
     }
   ],

@@ -1304,6 +1304,146 @@ redis.on('message', (channel, data) => {
 
 ---
 
+## Frontend Architecture
+
+### Technology Stack
+
+- **React 19** - Component-based UI library
+- **TypeScript** - Type-safe development
+- **TanStack Router** - File-based routing with type safety
+- **Zustand** - Lightweight state management with persistence
+- **Tailwind CSS** - Utility-first styling matching Discord's aesthetic
+- **Vite** - Fast development server and build tool
+
+### Routing Architecture
+
+The frontend uses TanStack Router with file-based routing for clear URL structure:
+
+```
+URL Structure:
+/                    → Redirect to /login or /channels/@me
+/login               → Login form (unauthenticated users)
+/channels/@me        → Home view (authenticated, no room selected)
+/channels/:roomId    → Chat room view (e.g., /channels/general)
+```
+
+**Route Files:**
+```
+src/routes/
+├── __root.tsx           # Root layout with devtools
+├── index.tsx            # Auth redirect logic
+├── login.tsx            # Login form route
+├── channels.tsx         # Channels layout (sidebar + outlet)
+└── channels/
+    ├── @me.tsx          # Home/welcome view
+    └── $roomId.tsx      # Dynamic room view
+```
+
+**Route Protection:**
+- Routes use `beforeLoad` guards to check authentication
+- Unauthenticated users are redirected to `/login`
+- Authenticated users accessing `/login` are redirected to `/channels/@me`
+
+### State Management
+
+**Zustand Store Structure:**
+```typescript
+interface ChatState {
+  // Session (persisted to localStorage)
+  session: Session | null;
+
+  // Room state (ephemeral)
+  rooms: Room[];
+  currentRoom: string | null;
+  messages: Message[];
+
+  // Real-time connection
+  eventSource: EventSource | null;
+
+  // Actions
+  connect(nickname: string): Promise<void>;
+  disconnect(): Promise<void>;
+  joinRoom(name: string): Promise<void>;
+  leaveRoom(): Promise<void>;
+  sendMessage(content: string): Promise<void>;
+}
+```
+
+**Persistence Strategy:**
+- Only `session` is persisted to localStorage
+- Rooms and messages are fetched fresh on page load
+- Enables session survival across browser refreshes
+
+### Real-Time Updates
+
+**Server-Sent Events (SSE):**
+- Browser establishes SSE connection when joining a room
+- Messages pushed from server in real-time
+- Auto-reconnect handled by native EventSource API
+
+```typescript
+// SSE connection per room
+const eventSource = new EventSource(`/api/messages/${roomId}?sessionId=${sessionId}`);
+
+eventSource.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  addMessage(message);
+};
+```
+
+### Navigation Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    User Flow                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  New User:                                                   │
+│  / → (no session) → /login → enter nickname → /channels/@me │
+│                                                              │
+│  Returning User:                                             │
+│  / → (has session) → /channels/@me → click room → /channels/general │
+│                                                              │
+│  Disconnect:                                                 │
+│  /channels/* → click disconnect → /login                     │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Component Hierarchy
+
+```
+RouterProvider
+└── __root (TanStack Router)
+    ├── /login
+    │   └── LoginPage (form with nickname input)
+    │
+    └── /channels (ChannelsLayout)
+        ├── ServerList (room icons sidebar)
+        ├── ChannelSidebar (room details, user panel)
+        └── Outlet
+            ├── /@me → HomeView (welcome message)
+            └── /$roomId → RoomView
+                ├── ChannelHeader
+                ├── MessageList
+                └── MessageInput
+```
+
+### Why TanStack Router?
+
+**Benefits over React Router:**
+- Full TypeScript type safety for routes and params
+- File-based routing reduces boilerplate
+- Built-in data loading with loaders (future use)
+- Developer tools for debugging
+
+**Trade-offs:**
+- Newer library, smaller community
+- Learning curve for file-based conventions
+- Generated route tree file (must be committed)
+
+---
+
 ## Monitoring and Observability
 
 ### Metrics to Track

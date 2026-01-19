@@ -8,6 +8,7 @@
  */
 
 import { useEffect } from 'react';
+import { useNavigate, Link } from '@tanstack/react-router';
 import { useChatStore } from '../stores/chatStore';
 
 /**
@@ -18,8 +19,9 @@ import { useChatStore } from '../stores/chatStore';
  * @returns Vertical sidebar with room navigation
  */
 export function ServerList() {
-  const { rooms, currentRoom, refreshRooms, joinRoom, isLoadingRooms } =
+  const { rooms, currentRoom, refreshRooms, isLoadingRooms, createRoom } =
     useChatStore();
+  const navigate = useNavigate();
 
   useEffect(() => {
     refreshRooms();
@@ -28,10 +30,24 @@ export function ServerList() {
     return () => clearInterval(interval);
   }, [refreshRooms]);
 
+  const handleRoomClick = (roomName: string) => {
+    navigate({ to: '/channels/$roomId', params: { roomId: roomName } });
+  };
+
+  const handleCreateRoom = async () => {
+    const name = prompt('Enter room name:');
+    if (name) {
+      const roomName = name.toLowerCase().replace(/\s+/g, '-');
+      await createRoom(roomName);
+      navigate({ to: '/channels/$roomId', params: { roomId: roomName } });
+    }
+  };
+
   return (
     <div className="w-16 bg-discord-darker flex flex-col items-center py-3 gap-2">
       {/* Home button */}
-      <button
+      <Link
+        to="/channels/@me"
         className="w-12 h-12 bg-discord-channel rounded-full flex items-center justify-center
                  hover:rounded-2xl hover:bg-indigo-600 transition-all duration-200"
         title="Home"
@@ -43,7 +59,7 @@ export function ServerList() {
         >
           <path d="M12 2L2 12h3v9h6v-6h2v6h6v-9h3L12 2z" />
         </svg>
-      </button>
+      </Link>
 
       <div className="w-8 h-0.5 bg-discord-sidebar rounded-full my-1" />
 
@@ -54,7 +70,7 @@ export function ServerList() {
         rooms.map((room) => (
           <button
             key={room.name}
-            onClick={() => joinRoom(room.name)}
+            onClick={() => handleRoomClick(room.name)}
             className={`w-12 h-12 rounded-full flex items-center justify-center
                      transition-all duration-200 relative group
                      ${
@@ -93,12 +109,7 @@ export function ServerList() {
         className="w-12 h-12 bg-discord-channel rounded-full flex items-center justify-center
                  hover:rounded-2xl hover:bg-green-600 transition-all duration-200 group"
         title="Create Room"
-        onClick={() => {
-          const name = prompt('Enter room name:');
-          if (name) {
-            useChatStore.getState().createRoom(name.toLowerCase());
-          }
-        }}
+        onClick={handleCreateRoom}
       >
         <svg
           className="w-6 h-6 text-green-500 group-hover:text-white transition-colors"

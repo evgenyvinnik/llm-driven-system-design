@@ -1,12 +1,16 @@
-import express from 'express';
+import express, { Request, Response, NextFunction, Router } from 'express';
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { requireAuth } from '../middleware/auth.js';
 
-const router = express.Router();
+const router: Router = express.Router();
 
-// GET /api/users/:username - Get user profile
-router.get('/:username', async (req, res, next) => {
+interface FollowStatus {
+  [key: number]: boolean;
+}
+
+// GET /api/users/:username
+router.get('/:username', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { username } = req.params;
 
@@ -18,13 +22,13 @@ router.get('/:username', async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
     const user = result.rows[0];
     let isFollowing = false;
 
-    // Check if current user is following this user
     if (req.session && req.session.userId && req.session.userId !== user.id) {
       const followCheck = await pool.query(
         'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
@@ -53,39 +57,38 @@ router.get('/:username', async (req, res, next) => {
   }
 });
 
-// POST /api/users/:id/follow - Follow a user
-router.post('/:id/follow', requireAuth, async (req, res, next) => {
+// POST /api/users/:id/follow
+router.post('/:id/follow', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const followingId = parseInt(req.params.id);
-    const followerId = req.session.userId;
+    const followerId = req.session.userId!;
 
     if (followingId === followerId) {
-      return res.status(400).json({ error: 'Cannot follow yourself' });
+      res.status(400).json({ error: 'Cannot follow yourself' });
+      return;
     }
 
-    // Check if user exists
     const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [followingId]);
     if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found' });
+      return;
     }
 
-    // Check if already following
     const existingFollow = await pool.query(
       'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
       [followerId, followingId]
     );
 
     if (existingFollow.rows.length > 0) {
-      return res.status(409).json({ error: 'Already following this user' });
+      res.status(409).json({ error: 'Already following this user' });
+      return;
     }
 
-    // Create follow relationship
     await pool.query(
       'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)',
       [followerId, followingId]
     );
 
-    // Update Redis cache for social graph
     await redis.sadd(`following:${followerId}`, followingId.toString());
     await redis.sadd(`followers:${followingId}`, followerId.toString());
 
@@ -95,23 +98,22 @@ router.post('/:id/follow', requireAuth, async (req, res, next) => {
   }
 });
 
-// DELETE /api/users/:id/follow - Unfollow a user
-router.delete('/:id/follow', requireAuth, async (req, res, next) => {
+// DELETE /api/users/:id/follow
+router.delete('/:id/follow', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const followingId = parseInt(req.params.id);
-    const followerId = req.session.userId;
+    const followerId = req.session.userId!;
 
-    // Delete follow relationship
     const result = await pool.query(
       'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2 RETURNING *',
       [followerId, followingId]
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Not following this user' });
+      res.status(404).json({ error: 'Not following this user' });
+      return;
     }
 
-    // Update Redis cache
     await redis.srem(`following:${followerId}`, followingId.toString());
     await redis.srem(`followers:${followingId}`, followerId.toString());
 
@@ -121,12 +123,12 @@ router.delete('/:id/follow', requireAuth, async (req, res, next) => {
   }
 });
 
-// GET /api/users/:id/followers - Get user's followers
-router.get('/:id/followers', async (req, res, next) => {
+// GET /api/users/:id/followers
+router.get('/:id/followers', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = parseInt(req.params.id);
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const offset = parseInt(req.query.offset as string) || 0;
 
     const result = await pool.query(
       `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url,
@@ -139,23 +141,30 @@ router.get('/:id/followers', async (req, res, next) => {
       [userId, limit, offset]
     );
 
-    // Get follow status for each user if logged in
-    let followStatus = {};
+    const followStatus: FollowStatus = {};
     if (req.session && req.session.userId) {
-      const followingIds = result.rows.map(u => u.id);
+      const followingIds = result.rows.map((u: { id: number }) => u.id);
       if (followingIds.length > 0) {
         const followCheck = await pool.query(
           'SELECT following_id FROM follows WHERE follower_id = $1 AND following_id = ANY($2)',
           [req.session.userId, followingIds]
         );
-        followCheck.rows.forEach(row => {
+        followCheck.rows.forEach((row: { following_id: number }) => {
           followStatus[row.following_id] = true;
         });
       }
     }
 
     res.json({
-      users: result.rows.map(user => ({
+      users: result.rows.map((user: {
+        id: number;
+        username: string;
+        display_name: string;
+        bio: string;
+        avatar_url: string;
+        follower_count: number;
+        following_count: number;
+      }) => ({
         id: user.id,
         username: user.username,
         displayName: user.display_name,
@@ -171,12 +180,12 @@ router.get('/:id/followers', async (req, res, next) => {
   }
 });
 
-// GET /api/users/:id/following - Get users that a user follows
-router.get('/:id/following', async (req, res, next) => {
+// GET /api/users/:id/following
+router.get('/:id/following', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = parseInt(req.params.id);
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const offset = parseInt(req.query.offset as string) || 0;
 
     const result = await pool.query(
       `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url,
@@ -189,23 +198,30 @@ router.get('/:id/following', async (req, res, next) => {
       [userId, limit, offset]
     );
 
-    // Get follow status for each user if logged in
-    let followStatus = {};
+    const followStatus: FollowStatus = {};
     if (req.session && req.session.userId) {
-      const followingIds = result.rows.map(u => u.id);
+      const followingIds = result.rows.map((u: { id: number }) => u.id);
       if (followingIds.length > 0) {
         const followCheck = await pool.query(
           'SELECT following_id FROM follows WHERE follower_id = $1 AND following_id = ANY($2)',
           [req.session.userId, followingIds]
         );
-        followCheck.rows.forEach(row => {
+        followCheck.rows.forEach((row: { following_id: number }) => {
           followStatus[row.following_id] = true;
         });
       }
     }
 
     res.json({
-      users: result.rows.map(user => ({
+      users: result.rows.map((user: {
+        id: number;
+        username: string;
+        display_name: string;
+        bio: string;
+        avatar_url: string;
+        follower_count: number;
+        following_count: number;
+      }) => ({
         id: user.id,
         username: user.username,
         displayName: user.display_name,
@@ -221,14 +237,15 @@ router.get('/:id/following', async (req, res, next) => {
   }
 });
 
-// GET /api/users/search - Search users
-router.get('/', async (req, res, next) => {
+// GET /api/users - Search users
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const query = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const query = req.query.q as string;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
 
     if (!query) {
-      return res.status(400).json({ error: 'Search query is required' });
+      res.status(400).json({ error: 'Search query is required' });
+      return;
     }
 
     const result = await pool.query(
@@ -242,7 +259,15 @@ router.get('/', async (req, res, next) => {
     );
 
     res.json({
-      users: result.rows.map(user => ({
+      users: result.rows.map((user: {
+        id: number;
+        username: string;
+        display_name: string;
+        bio: string;
+        avatar_url: string;
+        follower_count: number;
+        following_count: number;
+      }) => ({
         id: user.id,
         username: user.username,
         displayName: user.display_name,
