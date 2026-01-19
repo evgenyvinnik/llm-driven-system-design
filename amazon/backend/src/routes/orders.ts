@@ -208,6 +208,10 @@ router.get('/:id', requireAuth, async (req: Request, res: Response, next: NextFu
     }
 
     const order = result.rows[0];
+    if (!order) {
+      res.status(404).json({ error: 'Order not found' });
+      return;
+    }
 
     // Get order items
     const itemsResult = await query<OrderItemRow>(
@@ -318,6 +322,11 @@ router.post('/', requireAuth, async (req: ExtendedRequest, res: Response, next: 
         );
 
         const order = orderResult.rows[0];
+        if (!order) {
+          const error: AppError = new Error('Failed to create order');
+          error.status = 500;
+          throw error;
+        }
 
         // Create order items and update inventory
         for (const item of cartItems) {
@@ -442,6 +451,11 @@ router.post('/:id/cancel', requireAuth, async (req: ExtendedRequest, res: Respon
       }
 
       const order = orderResult.rows[0];
+      if (!order) {
+        const error: AppError = new Error('Order not found or cannot be cancelled');
+        error.status = 400;
+        throw error;
+      }
 
       // Get order items
       const itemsResult = await client.query<{ product_id: number; quantity: number }>(
@@ -489,21 +503,22 @@ router.put('/:id/status', requireAdmin, async (req: ExtendedRequest, res: Respon
 
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const status = req.body.status as string;
 
     const validStatuses = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded'];
-    if (!validStatuses.includes(status)) {
+    if (!status || !validStatuses.includes(status)) {
       res.status(400).json({ error: 'Invalid status' });
       return;
     }
 
     // Get current status for audit
     const currentResult = await query<{ status: string }>('SELECT status FROM orders WHERE id = $1', [id]);
-    if (currentResult.rows.length === 0) {
+    const currentRow = currentResult.rows[0];
+    if (!currentRow) {
       res.status(404).json({ error: 'Order not found' });
       return;
     }
-    const oldStatus = currentResult.rows[0].status;
+    const oldStatus = currentRow.status;
 
     const result = await query<OrderRow>(
       `UPDATE orders

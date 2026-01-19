@@ -32,6 +32,7 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.17.0",
     "@types/amqplib": "^0.10.5",
     "@types/compression": "^1.7.5",
     "@types/cors": "^2.8.17",
@@ -43,9 +44,11 @@
     "@typescript-eslint/parser": "^8.18.2",
     "concurrently": "^8.2.2",
     "eslint": "^8.56.0",
+    "globals": "^15.14.0",
     "prettier": "^3.1.1",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "typescript-eslint": "^8.18.2"
   },
   "engines": {
     "node": ">=18.0.0"

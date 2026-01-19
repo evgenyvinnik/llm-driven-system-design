@@ -30,6 +30,7 @@
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.17.0",
     "@types/amqplib": "^0.10.8",
     "@types/bcryptjs": "^2.4.6",
     "@types/cookie": "^0.6.0",
@@ -44,8 +45,10 @@
     "@typescript-eslint/eslint-plugin": "^6.18.1",
     "@typescript-eslint/parser": "^6.18.1",
     "eslint": "^8.56.0",
+    "globals": "^15.14.0",
     "prettier": "^3.4.2",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "typescript-eslint": "^8.18.2"
   }
 }

@@ -37,7 +37,7 @@ interface RecommendationRow {
   images?: string[];
   rating?: string;
   score?: number;
-  product_id?: number;
+  product_id: number;
 }
 
 interface SellerRow {
@@ -141,6 +141,10 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
       }
 
       product = result.rows[0];
+      if (!product) {
+        res.status(404).json({ error: 'Product not found' });
+        return;
+      }
       await cacheSet(cacheKey, product, 300); // Cache for 5 minutes
     }
 
@@ -210,8 +214,9 @@ router.post('/', requireSeller, async (req: Request, res: Response, next: NextFu
     );
 
     let sellerId: number | null = null;
-    if (sellerResult.rows.length > 0) {
-      sellerId = sellerResult.rows[0].id;
+    const sellerRow = sellerResult.rows[0];
+    if (sellerRow) {
+      sellerId = sellerRow.id;
     } else if (req.user!.role === 'admin') {
       // Admin can create without being a seller
       sellerId = null;
@@ -229,6 +234,9 @@ router.post('/', requireSeller, async (req: Request, res: Response, next: NextFu
       );
 
       const product = productResult.rows[0];
+      if (!product) {
+        throw new Error('Failed to create product');
+      }
 
       // Add initial inventory
       if (initialStock && initialStock > 0) {
@@ -286,11 +294,16 @@ router.put('/:id', requireSeller, async (req: Request, res: Response, next: Next
 
     // Update Elasticsearch index
     const product = result.rows[0];
+    if (!product) {
+      res.status(404).json({ error: 'Product not found' });
+      return;
+    }
     await indexProduct({
       ...product,
       id: product.id,
       title: product.title,
-      price: product.price
+      price: product.price,
+      stock_quantity: product.stock_quantity ? parseInt(product.stock_quantity) : undefined
     });
 
     res.json({ product });
@@ -302,7 +315,7 @@ router.put('/:id', requireSeller, async (req: Request, res: Response, next: Next
 // Delete product
 router.delete('/:id', requireAdmin, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
 
     await query('DELETE FROM products WHERE id = $1', [id]);
     await deleteProductFromIndex(id);

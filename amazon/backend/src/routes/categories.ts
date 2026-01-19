@@ -95,6 +95,10 @@ router.get('/:slug', async (req: Request, res: Response, next: NextFunction): Pr
     }
 
     const category = result.rows[0];
+    if (!category) {
+      res.status(404).json({ error: 'Category not found' });
+      return;
+    }
 
     // Get subcategories
     const subcategories = await query<CategoryRow>(
@@ -119,7 +123,7 @@ router.get('/:slug', async (req: Request, res: Response, next: NextFunction): Pr
           'SELECT id, name, slug, parent_id FROM categories WHERE id = $1',
           [current.parent_id]
         );
-        current = parent.rows[0] || null;
+        current = parent.rows[0] ?? null;
       } else {
         current = null;
       }

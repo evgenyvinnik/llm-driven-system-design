@@ -20,6 +20,7 @@
     "zustand": "^4.5.4"
   },
   "devDependencies": {
+    "@eslint/js": "^9.17.0",
     "@tanstack/router-devtools": "^1.45.0",
     "@tanstack/router-vite-plugin": "^1.45.0",
     "@types/react": "^18.3.3",
@@ -29,12 +30,14 @@
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
     "eslint": "^9.9.1",
-    "prettier": "^3.4.2",
     "eslint-plugin-react-hooks": "^5.1.0",
     "eslint-plugin-react-refresh": "^0.4.11",
+    "globals": "^15.14.0",
     "postcss": "^8.4.41",
+    "prettier": "^3.4.2",
     "tailwindcss": "^3.4.10",
     "typescript": "^5.5.4",
+    "typescript-eslint": "^8.18.2",
     "vite": "^5.4.2"
   }
 }
