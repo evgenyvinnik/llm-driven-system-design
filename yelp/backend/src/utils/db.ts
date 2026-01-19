@@ -1,12 +1,15 @@
-import pg from 'pg';
-const { Pool } = pg;
+import pg, { Pool, PoolClient } from 'pg';
 
-export const pool = new Pool({
+const { Pool: PgPool } = pg;
+
+export const pool: Pool = new PgPool({
   connectionString: process.env.DATABASE_URL,
 });
 
 // Helper function for transactions
-export async function withTransaction(callback) {
+export async function withTransaction<T>(
+  callback: (client: PoolClient) => Promise<T>
+): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -22,9 +25,12 @@ export async function withTransaction(callback) {
 }
 
 // Helper for parameterized queries with named parameters
-export function buildQuery(template, params) {
+export function buildQuery(
+  template: string,
+  params: Record<string, unknown>
+): { text: string; values: unknown[] } {
   let query = template;
-  let values = [];
+  const values: unknown[] = [];
   let paramIndex = 1;
 
   for (const [key, value] of Object.entries(params)) {
@@ -37,3 +43,5 @@ export function buildQuery(template, params) {
 
   return { text: query, values };
 }
+
+export default pool;

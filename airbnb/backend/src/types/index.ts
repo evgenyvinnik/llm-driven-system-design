@@ -22,9 +22,9 @@ export interface UserPublic {
   id: number;
   email: string;
   name: string;
-  bio?: string;
-  phone?: string;
-  avatar_url?: string;
+  bio?: string | null;
+  phone?: string | null;
+  avatar_url?: string | null;
   is_host: boolean;
   is_verified: boolean;
   role: 'user' | 'admin';

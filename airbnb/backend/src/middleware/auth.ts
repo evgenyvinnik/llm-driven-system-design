@@ -1,11 +1,28 @@
+import type { Request, Response, NextFunction } from 'express';
 import { getSession } from '../services/auth.js';
 import { query } from '../db.js';
+import type { UserPublic } from '../types/index.js';
 
-export const authenticate = async (req, res, next) => {
+interface UserRow {
+  id: number;
+  email: string;
+  name: string;
+  avatar_url: string | null;
+  is_host: boolean;
+  is_verified: boolean;
+  role: 'user' | 'admin';
+}
+
+export const authenticate = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
-    return res.status(401).json({ error: 'Not authenticated' });
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
   }
 
   try {
@@ -13,17 +30,19 @@ export const authenticate = async (req, res, next) => {
 
     if (!session) {
       res.clearCookie('session');
-      return res.status(401).json({ error: 'Session expired' });
+      res.status(401).json({ error: 'Session expired' });
+      return;
     }
 
     // Get user from database
-    const result = await query(
+    const result = await query<UserRow>(
       'SELECT id, email, name, avatar_url, is_host, is_verified, role FROM users WHERE id = $1',
       [session.userId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'User not found' });
+      res.status(401).json({ error: 'User not found' });
+      return;
     }
 
     req.user = result.rows[0];
@@ -34,18 +53,23 @@ export const authenticate = async (req, res, next) => {
   }
 };
 
-export const optionalAuth = async (req, res, next) => {
+export const optionalAuth = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
-    return next();
+    next();
+    return;
   }
 
   try {
     const session = await getSession(sessionId);
 
     if (session) {
-      const result = await query(
+      const result = await query<UserRow>(
         'SELECT id, email, name, avatar_url, is_host, is_verified, role FROM users WHERE id = $1',
         [session.userId]
       );
@@ -61,16 +85,26 @@ export const optionalAuth = async (req, res, next) => {
   next();
 };
 
-export const requireHost = (req, res, next) => {
+export const requireHost = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
   if (!req.user?.is_host) {
-    return res.status(403).json({ error: 'Must be a host to access this resource' });
+    res.status(403).json({ error: 'Must be a host to access this resource' });
+    return;
   }
   next();
 };
 
-export const requireAdmin = (req, res, next) => {
+export const requireAdmin = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
   if (req.user?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 };

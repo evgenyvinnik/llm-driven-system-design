@@ -2,16 +2,17 @@
   "name": "docusign-backend",
   "version": "1.0.0",
   "description": "DocuSign-like electronic signature platform backend",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "PORT=3001 node --watch src/index.js",
-    "dev:server1": "PORT=3001 node --watch src/index.js",
-    "dev:server2": "PORT=3002 node --watch src/index.js",
-    "dev:server3": "PORT=3003 node --watch src/index.js",
-    "start": "node src/index.js",
+    "dev": "PORT=3001 tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
     "lint": "eslint src/",
-    "format": "prettier --write src/"
+    "format": "prettier --write src/",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "amqplib": "^0.10.9",
@@ -32,7 +33,17 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/bcrypt": "^5.0.2",
+    "@types/cookie-parser": "^1.4.7",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.8",
     "eslint": "^8.56.0",
-    "prettier": "^3.2.4"
+    "prettier": "^3.2.4",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
   }
 }

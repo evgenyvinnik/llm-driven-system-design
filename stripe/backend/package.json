@@ -2,16 +2,16 @@
   "name": "stripe-backend",
   "version": "1.0.0",
   "description": "Stripe-like payment processing backend",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "NODE_ENV=development node --watch src/index.js",
+    "dev": "NODE_ENV=development tsx watch src/index.ts",
     "dev:server1": "PORT=3001 npm run dev",
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
-    "start": "NODE_ENV=production node src/index.js",
-    "db:init": "node src/db/migrate.js",
-    "db:seed": "node src/db/seed.js"
+    "start": "NODE_ENV=production tsx src/index.ts",
+    "db:init": "tsx src/db/migrate.ts",
+    "db:seed": "tsx src/db/seed.ts"
   },
   "keywords": [
     "stripe",
@@ -34,6 +34,12 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.9",
+    "@types/uuid": "^9.0.7",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
   }
 }

@@ -3,16 +3,16 @@
   "version": "1.0.0",
   "description": "Reddit-like community platform backend",
   "type": "module",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "dev:server1": "PORT=3001 nodemon src/index.js",
-    "dev:server2": "PORT=3002 nodemon src/index.js",
-    "dev:server3": "PORT=3003 nodemon src/index.js",
-    "dev:worker": "nodemon src/workers/voteAggregator.js",
-    "dev:ranking": "nodemon src/workers/rankingCalculator.js",
-    "start": "node src/index.js",
-    "db:seed": "node src/db/seed.js"
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "dev:worker": "tsx watch src/workers/voteAggregator.ts",
+    "dev:ranking": "tsx watch src/workers/rankingCalculator.ts",
+    "start": "tsx src/index.ts",
+    "db:seed": "tsx src/db/seed.ts"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
@@ -28,6 +28,14 @@
     "uuid": "^10.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "@types/bcrypt": "^5.0.2",
+    "@types/cookie-parser": "^1.4.7",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
   }
 }

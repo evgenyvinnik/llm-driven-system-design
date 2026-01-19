@@ -2,19 +2,21 @@
   "name": "youtube-backend",
   "version": "1.0.0",
   "description": "YouTube-like video platform backend",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "dev:server1": "PORT=3001 node --watch src/index.js",
-    "dev:server2": "PORT=3002 node --watch src/index.js",
-    "dev:server3": "PORT=3003 node --watch src/index.js",
-    "dev:worker": "node --watch src/workers/transcode-worker.js",
-    "dev:worker1": "WORKER_ID=1 node --watch src/workers/transcode-worker.js",
-    "dev:worker2": "WORKER_ID=2 node --watch src/workers/transcode-worker.js",
-    "start": "node src/index.js",
-    "start:worker": "node src/workers/transcode-worker.js",
-    "migrate": "node migrations/run.js"
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "dev:worker": "tsx watch src/workers/transcode-worker.ts",
+    "dev:worker1": "WORKER_ID=1 tsx watch src/workers/transcode-worker.ts",
+    "dev:worker2": "WORKER_ID=2 tsx watch src/workers/transcode-worker.ts",
+    "start": "tsx src/index.ts",
+    "start:worker": "tsx src/workers/transcode-worker.ts",
+    "migrate": "tsx migrations/run.ts",
+    "build": "tsc",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.700.0",
@@ -36,6 +38,16 @@
     "uuid": "^10.0.0"
   },
   "devDependencies": {
-    "eslint": "^9.15.0"
+    "@types/amqplib": "^0.10.5",
+    "@types/cookie-parser": "^1.4.7",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
   }
 }

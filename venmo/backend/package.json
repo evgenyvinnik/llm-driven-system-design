@@ -2,15 +2,17 @@
   "name": "venmo-backend",
   "version": "1.0.0",
   "description": "Venmo P2P Payment Platform Backend",
-  "main": "src/index.js",
+  "type": "module",
+  "main": "src/index.ts",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "dev:server1": "PORT=3001 nodemon src/index.js",
-    "dev:server2": "PORT=3002 nodemon src/index.js",
-    "dev:server3": "PORT=3003 nodemon src/index.js",
-    "start": "node src/index.js",
-    "migrate": "node src/db/migrate.js",
-    "seed": "node src/db/seed.js"
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx src/db/seed.ts",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -24,6 +26,13 @@
     "uuid": "^10.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
   }
 }

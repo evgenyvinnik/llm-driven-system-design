@@ -2,15 +2,18 @@
   "name": "hotel-booking-backend",
   "version": "1.0.0",
   "description": "Hotel booking system backend API",
-  "main": "src/index.js",
+  "type": "module",
+  "main": "src/index.ts",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "dev:server1": "PORT=3001 nodemon src/index.js",
-    "dev:server2": "PORT=3002 nodemon src/index.js",
-    "dev:server3": "PORT=3003 nodemon src/index.js",
-    "start": "node src/index.js",
-    "seed": "node scripts/seed.js",
-    "setup-es": "node scripts/setup-elasticsearch.js"
+    "dev": "tsx watch src/index.ts",
+    "dev:server1": "PORT=3001 tsx watch src/index.ts",
+    "dev:server2": "PORT=3002 tsx watch src/index.ts",
+    "dev:server3": "PORT=3003 tsx watch src/index.ts",
+    "start": "node --import tsx src/index.ts",
+    "build": "tsc",
+    "seed": "tsx scripts/seed.ts",
+    "setup-es": "tsx scripts/setup-elasticsearch.ts",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.11.0",
@@ -27,6 +30,12 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.7",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
   }
 }
