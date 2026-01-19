@@ -1,4 +1,4 @@
-import amqp, { Connection, Channel, ConsumeMessage } from 'amqplib';
+import amqp, { type Channel, type ChannelModel, type ConsumeMessage } from 'amqplib';
 import config from '../config/index.js';
 import logger from './logger.js';
 
@@ -21,13 +21,13 @@ type TranscodeJobHandler = (job: TranscodeJob) => Promise<void>;
 
 // ============ Module State ============
 
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 
 /**
  * Connect to RabbitMQ and setup channel
  */
-export const connectQueue = async (): Promise<{ connection: Connection; channel: Channel }> => {
+export const connectQueue = async (): Promise<{ connection: ChannelModel; channel: Channel }> => {
   if (connection && channel) {
     return { connection, channel };
   }

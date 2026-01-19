@@ -283,7 +283,7 @@ router.get('/', requireAuth, feedRateLimiter, async (req: AuthenticatedRequest, 
   const startTime = Date.now();
 
   try {
-    const userId = req.session.userId;
+    const userId = req.session.userId!;
     const { cursor, limit = '20' } = req.query as { cursor?: string; limit?: string };
     const offset = cursor ? parseInt(cursor) : 0;
     const parsedLimit = parseInt(limit);

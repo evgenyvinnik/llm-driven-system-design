@@ -1,4 +1,4 @@
-import IORedis from 'ioredis';
+import Redis from 'ioredis';
 import config from '../config/index.js';
 
 // ============ Type Definitions ============
@@ -15,7 +15,7 @@ export interface SessionData {
 
 // ============ Redis Client Setup ============
 
-const redis = new IORedis({
+const redis = new Redis.default({
   host: config.redis.host,
   port: config.redis.port,
   retryStrategy: (times: number): number => {

@@ -145,11 +145,10 @@ export const createCircuitBreaker = <T extends unknown[], R>(
 /**
  * Fallback function that returns a cached/default value
  */
-export const fallbackWithDefault = <T>(defaultValue: T): ((error?: Error) => T) => {
-  return (error?: Error): T => {
+export const fallbackWithDefault = <T>(defaultValue: T): (() => T) => {
+  return (): T => {
     logger.warn(
       {
-        error: error?.message,
         fallback: 'default_value',
       },
       'Using fallback default value'
@@ -161,11 +160,10 @@ export const fallbackWithDefault = <T>(defaultValue: T): ((error?: Error) => T) 
 /**
  * Fallback function that throws a user-friendly error
  */
-export const fallbackWithError = (message: string): ((error?: Error) => never) => {
-  return (error?: Error): never => {
+export const fallbackWithError = (message: string): (() => never) => {
+  return (): never => {
     logger.error(
       {
-        originalError: error?.message,
         fallback: 'error',
       },
       `Circuit breaker fallback: ${message}`

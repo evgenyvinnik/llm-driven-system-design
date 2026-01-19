@@ -27,9 +27,6 @@ interface AuthenticatedRequest extends Request {
     role?: string;
   };
   log?: Logger;
-  connection?: {
-    remoteAddress?: string;
-  };
 }
 
 type RateLimiter = RateLimiterRedis | RateLimiterMemory;
@@ -139,7 +136,7 @@ function getRateLimitKey(req: AuthenticatedRequest): string {
   if (req.user?.id) {
     return `user:${req.user.id}`;
   }
-  return `ip:${req.ip || req.connection?.remoteAddress || 'unknown'}`;
+  return `ip:${req.ip || 'unknown'}`;
 }
 
 /**

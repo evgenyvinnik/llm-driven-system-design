@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
+import { PoolClient } from 'pg';
 import { query, transaction } from '../utils/db.js';
 import {
-  uploadObject,
   createMultipartUpload,
   uploadPart,
   completeMultipartUpload,
@@ -12,8 +12,68 @@ import { generateVideoId } from '../utils/helpers.js';
 import config from '../config/index.js';
 import { queueTranscodingJob } from './transcoding.js';
 
+// ============ Type Definitions ============
+
+interface UploadSessionRow {
+  id: string;
+  user_id: string;
+  filename: string;
+  file_size: number;
+  content_type: string;
+  total_chunks: number;
+  uploaded_chunks: number;
+  minio_upload_id: string;
+  status: string;
+  created_at: string;
+}
+
+interface ChunkTracking {
+  uploaded: number[];
+  etags: (string | undefined)[];
+}
+
+interface InitUploadResult {
+  uploadId: string;
+  totalChunks: number;
+  chunkSize: number;
+  rawVideoKey: string;
+}
+
+interface UploadChunkResult {
+  chunkNumber: number;
+  uploadedChunks: number;
+  totalChunks: number;
+  complete: boolean;
+}
+
+interface CompleteUploadResult {
+  videoId: string;
+  status: string;
+  message: string;
+}
+
+interface UploadStatusResult {
+  uploadId: string;
+  filename: string;
+  fileSize: number;
+  status: string;
+  uploadedChunks: number;
+  totalChunks: number;
+  progress: number;
+  createdAt: string;
+}
+
+interface CancelUploadResult {
+  message: string;
+}
+
 // Initialize a new upload session
-export const initUpload = async (userId, filename, fileSize, contentType) => {
+export const initUpload = async (
+  userId: string,
+  filename: string,
+  fileSize: number,
+  contentType: string
+): Promise<InitUploadResult> => {
   // Validate file type
   if (!config.upload.allowedMimeTypes.includes(contentType)) {
     throw new Error(`Invalid file type. Allowed: ${config.upload.allowedMimeTypes.join(', ')}`);
@@ -21,7 +81,9 @@ export const initUpload = async (userId, filename, fileSize, contentType) => {
 
   // Validate file size
   if (fileSize > config.upload.maxFileSize) {
-    throw new Error(`File too large. Maximum size: ${config.upload.maxFileSize / 1024 / 1024}MB`);
+    throw new Error(
+      `File too large. Maximum size: ${config.upload.maxFileSize / 1024 / 1024}MB`
+    );
   }
 
   const sessionId = uuidv4();
@@ -36,7 +98,7 @@ export const initUpload = async (userId, filename, fileSize, contentType) => {
   );
 
   // Store upload session in database
-  const result = await query(
+  await query(
     `INSERT INTO upload_sessions (id, user_id, filename, file_size, content_type, total_chunks, minio_upload_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING *`,
@@ -55,9 +117,13 @@ export const initUpload = async (userId, filename, fileSize, contentType) => {
 };
 
 // Upload a single chunk
-export const uploadChunk = async (uploadId, chunkNumber, chunkData) => {
+export const uploadChunk = async (
+  uploadId: string,
+  chunkNumber: number,
+  chunkData: Buffer
+): Promise<UploadChunkResult> => {
   // Get upload session
-  const sessionResult = await query(
+  const sessionResult = await query<UploadSessionRow>(
     'SELECT * FROM upload_sessions WHERE id = $1 AND status = $2',
     [uploadId, 'active']
   );
@@ -84,17 +150,18 @@ export const uploadChunk = async (uploadId, chunkNumber, chunkData) => {
   );
 
   // Update chunk tracking in cache
-  const chunkTracking = await cacheGet(`upload:${uploadId}:chunks`) || { uploaded: [], etags: [] };
+  const chunkTracking =
+    (await cacheGet<ChunkTracking>(`upload:${uploadId}:chunks`)) || { uploaded: [], etags: [] };
   if (!chunkTracking.uploaded.includes(chunkNumber)) {
     chunkTracking.uploaded.push(chunkNumber);
     chunkTracking.etags[chunkNumber] = etag;
     await cacheSet(`upload:${uploadId}:chunks`, chunkTracking, 86400);
 
     // Update database
-    await query(
-      'UPDATE upload_sessions SET uploaded_chunks = $1 WHERE id = $2',
-      [chunkTracking.uploaded.length, uploadId]
-    );
+    await query('UPDATE upload_sessions SET uploaded_chunks = $1 WHERE id = $2', [
+      chunkTracking.uploaded.length,
+      uploadId,
+    ]);
   }
 
   return {
@@ -106,9 +173,16 @@ export const uploadChunk = async (uploadId, chunkNumber, chunkData) => {
 };
 
 // Complete upload and start transcoding
-export const completeUpload = async (uploadId, userId, title, description = '', categories = [], tags = []) => {
+export const completeUpload = async (
+  uploadId: string,
+  userId: string,
+  title: string,
+  description: string = '',
+  categories: string[] = [],
+  tags: string[] = []
+): Promise<CompleteUploadResult> => {
   // Get upload session
-  const sessionResult = await query(
+  const sessionResult = await query<UploadSessionRow>(
     'SELECT * FROM upload_sessions WHERE id = $1 AND user_id = $2 AND status = $3',
     [uploadId, userId, 'active']
   );
@@ -120,7 +194,7 @@ export const completeUpload = async (uploadId, userId, title, description = '', 
   const session = sessionResult.rows[0];
 
   // Verify all chunks uploaded
-  const chunkTracking = await cacheGet(`upload:${uploadId}:chunks`);
+  const chunkTracking = await cacheGet<ChunkTracking>(`upload:${uploadId}:chunks`);
   if (!chunkTracking || chunkTracking.uploaded.length !== session.total_chunks) {
     throw new Error('Not all chunks have been uploaded');
   }
@@ -139,7 +213,7 @@ export const completeUpload = async (uploadId, userId, title, description = '', 
   const videoId = generateVideoId();
 
   // Create video record and update session in transaction
-  await transaction(async (client) => {
+  await transaction(async (client: PoolClient) => {
     // Create video record
     await client.query(
       `INSERT INTO videos (id, channel_id, title, description, status, categories, tags, raw_video_key)
@@ -148,10 +222,10 @@ export const completeUpload = async (uploadId, userId, title, description = '', 
     );
 
     // Update upload session
-    await client.query(
-      'UPDATE upload_sessions SET status = $1 WHERE id = $2',
-      ['completed', uploadId]
-    );
+    await client.query('UPDATE upload_sessions SET status = $1 WHERE id = $2', [
+      'completed',
+      uploadId,
+    ]);
   });
 
   // Clean up cache
@@ -168,8 +242,11 @@ export const completeUpload = async (uploadId, userId, title, description = '', 
 };
 
 // Cancel upload
-export const cancelUpload = async (uploadId, userId) => {
-  const sessionResult = await query(
+export const cancelUpload = async (
+  uploadId: string,
+  userId: string
+): Promise<CancelUploadResult> => {
+  const sessionResult = await query<UploadSessionRow>(
     'SELECT * FROM upload_sessions WHERE id = $1 AND user_id = $2 AND status = $3',
     [uploadId, userId, 'active']
   );
@@ -183,20 +260,13 @@ export const cancelUpload = async (uploadId, userId) => {
 
   // Abort multipart upload in MinIO
   try {
-    await abortMultipartUpload(
-      config.minio.buckets.raw,
-      rawVideoKey,
-      session.minio_upload_id
-    );
+    await abortMultipartUpload(config.minio.buckets.raw, rawVideoKey, session.minio_upload_id);
   } catch (error) {
     console.error('Failed to abort multipart upload:', error);
   }
 
   // Update session status
-  await query(
-    'UPDATE upload_sessions SET status = $1 WHERE id = $2',
-    ['cancelled', uploadId]
-  );
+  await query('UPDATE upload_sessions SET status = $1 WHERE id = $2', ['cancelled', uploadId]);
 
   // Clean up cache
   await cacheDelete(`upload:${uploadId}:chunks`);
@@ -205,8 +275,11 @@ export const cancelUpload = async (uploadId, userId) => {
 };
 
 // Get upload status
-export const getUploadStatus = async (uploadId, userId) => {
-  const sessionResult = await query(
+export const getUploadStatus = async (
+  uploadId: string,
+  userId: string
+): Promise<UploadStatusResult> => {
+  const sessionResult = await query<UploadSessionRow>(
     'SELECT * FROM upload_sessions WHERE id = $1 AND user_id = $2',
     [uploadId, userId]
   );
