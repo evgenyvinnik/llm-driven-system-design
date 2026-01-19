@@ -133,6 +133,9 @@ export const uploadChunk = async (
   }
 
   const session = sessionResult.rows[0];
+  if (!session) {
+    throw new Error('Upload session not found or expired');
+  }
 
   if (chunkNumber < 0 || chunkNumber >= session.total_chunks) {
     throw new Error('Invalid chunk number');
@@ -289,6 +292,9 @@ export const getUploadStatus = async (
   }
 
   const session = sessionResult.rows[0];
+  if (!session) {
+    throw new Error('Upload session not found');
+  }
 
   return {
     uploadId: session.id,

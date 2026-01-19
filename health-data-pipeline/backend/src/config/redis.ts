@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { config } from './index.js';
 
 export const redis: Redis = new Redis(config.redis.url);

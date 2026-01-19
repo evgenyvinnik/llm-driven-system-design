@@ -179,7 +179,12 @@ export const getVideo = async (videoId: string): Promise<VideoResponse | null> =
     return null;
   }
 
-  const video = formatVideoResponse(result.rows[0]);
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  const video = formatVideoResponse(row);
 
   // Cache for 5 minutes
   await cacheSet(`video:${videoId}`, video, 300);
@@ -244,7 +249,8 @@ export const getVideos = async (
     params
   );
 
-  const total = parseInt(countResult.rows[0].count, 10);
+  const countRow = countResult.rows[0];
+  const total = countRow ? parseInt(countRow.count, 10) : 0;
 
   params.push(limit, offset);
 
@@ -293,11 +299,16 @@ export const updateVideo = async (
     return null;
   }
 
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
   // Invalidate cache
   await cacheDelete(`video:${videoId}`);
   await cacheDelete(`stream:${videoId}`);
 
-  return formatVideoResponse(result.rows[0]);
+  return formatVideoResponse(row);
 };
 
 // Delete video
@@ -340,7 +351,12 @@ export const getChannel = async (identifier: string): Promise<ChannelResponse | 
     return null;
   }
 
-  const channel = formatChannelResponse(result.rows[0]);
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  const channel = formatChannelResponse(row);
 
   // Get video count
   const videoCountResult = await query<{ count: string }>(
@@ -348,7 +364,8 @@ export const getChannel = async (identifier: string): Promise<ChannelResponse | 
     [channel.id]
   );
 
-  channel.videoCount = parseInt(videoCountResult.rows[0].count, 10);
+  const videoCountRow = videoCountResult.rows[0];
+  channel.videoCount = videoCountRow ? parseInt(videoCountRow.count, 10) : 0;
 
   // Cache for 5 minutes
   await cacheSet(`channel:${identifier}`, channel, 300);
@@ -377,10 +394,15 @@ export const updateChannel = async (
     return null;
   }
 
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
   // Invalidate cache
   await cacheDelete(`channel:${userId}`);
 
-  return formatChannelResponse(result.rows[0]);
+  return formatChannelResponse(row);
 };
 
 // ============ Subscription Operations ============
@@ -453,7 +475,8 @@ export const getSubscriptions = async (
     [userId]
   );
 
-  const total = parseInt(countResult.rows[0].count, 10);
+  const countRow = countResult.rows[0];
+  const total = countRow ? parseInt(countRow.count, 10) : 0;
 
   const result = await query<ChannelRow>(
     `SELECT u.id, u.username, u.channel_name, u.avatar_url, u.subscriber_count
@@ -495,8 +518,9 @@ export const reactToVideo = async (
       [userId, videoId]
     );
 
-    if (existing.rows.length > 0) {
-      const oldReaction = existing.rows[0].reaction_type;
+    const existingRow = existing.rows[0];
+    if (existingRow) {
+      const oldReaction = existingRow.reaction_type;
 
       if (oldReaction === reactionType) {
         // Remove reaction
@@ -635,7 +659,8 @@ export const getComments = async (
     params
   );
 
-  const total = parseInt(countResult.rows[0].count, 10);
+  const countRow = countResult.rows[0];
+  const total = countRow ? parseInt(countRow.count, 10) : 0;
 
   params.push(limit, offset);
 

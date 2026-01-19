@@ -11,8 +11,8 @@
     {
       "name": "01-document-list",
       "path": "/",
-      "waitFor": "main, .documents, button",
-      "delay": 1500
+      "waitFor": "h1, h2, select, button",
+      "delay": 2000
     }
   ],
   "viewport": {

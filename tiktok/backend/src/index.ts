@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction, Application } from 'express';
 import cors from 'cors';
 import session from 'express-session';
-import RedisStore from 'connect-redis';
+import { RedisStore } from 'connect-redis';
 import dotenv from 'dotenv';
 import { Server } from 'http';
 import { RedisClientType } from 'redis';

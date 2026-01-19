@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
-import RedisStore from 'connect-redis';
+import { RedisStore } from 'connect-redis';
 import pinoHttp from 'pino-http';
 import { redis } from '../shared/cache.js';
 import { logger } from '../shared/logger.js';

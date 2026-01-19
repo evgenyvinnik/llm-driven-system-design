@@ -3,10 +3,12 @@ import { Request, Response, NextFunction } from 'express';
 
 // ============ Type Definitions ============
 
-interface RouteRequest extends Request {
+interface RouteRequest {
+  method: string;
   route?: {
     path?: string;
   };
+  path: string;
 }
 
 // ============ Registry Setup ============

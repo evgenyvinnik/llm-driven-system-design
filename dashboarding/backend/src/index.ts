@@ -62,9 +62,8 @@ app.use(pinoHttp({
   },
 }));
 
-// Session middleware with Redis store
-app.use(session({
-  store: new RedisStore({ client: redis }),
+// Session middleware with Redis store (or memory store fallback)
+const sessionConfig: session.SessionOptions = {
   secret: process.env.SESSION_SECRET || 'dashboarding-secret-key-change-in-production',
   resave: false,
   saveUninitialized: false,
@@ -75,7 +74,14 @@ app.use(session({
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
     sameSite: 'lax',
   },
-}));
+};
+
+// Use Redis store unless explicitly disabled (useful for development without Redis)
+if (process.env.DISABLE_REDIS !== 'true') {
+  sessionConfig.store = new RedisStore({ client: redis });
+}
+
+app.use(session(sessionConfig));
 
 // =============================================================================
 // Database Connection Pool Metrics

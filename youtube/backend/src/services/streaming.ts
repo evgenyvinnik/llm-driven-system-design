@@ -86,6 +86,9 @@ export const getStreamingInfo = async (videoId: string): Promise<StreamingInfo |
   }
 
   const video = videoResult.rows[0];
+  if (!video) {
+    return null;
+  }
 
   const resolutionsResult = await query<ResolutionRow>(
     'SELECT * FROM video_resolutions WHERE video_id = $1 ORDER BY bitrate DESC',
@@ -151,10 +154,12 @@ export const getVideoUrl = async (
       return null;
     }
 
-    return fallbackResult.rows[0].video_url;
+    const fallbackRow = fallbackResult.rows[0];
+    return fallbackRow ? fallbackRow.video_url : null;
   }
 
-  return result.rows[0].video_url;
+  const row = result.rows[0];
+  return row ? row.video_url : null;
 };
 
 // Record a video view
@@ -226,9 +231,14 @@ export const getWatchProgress = async (
     return null;
   }
 
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
   return {
-    position: result.rows[0].last_position_seconds,
-    percentage: result.rows[0].watch_percentage,
+    position: row.last_position_seconds,
+    percentage: row.watch_percentage,
   };
 };
 

@@ -5,9 +5,6 @@ import { Request, Response, NextFunction } from 'express';
 
 interface RequestWithLog extends Request {
   log: Logger;
-  connection?: {
-    remoteAddress?: string;
-  };
 }
 
 interface LogEventData {
@@ -98,7 +95,7 @@ export const requestLogger = (
     requestId,
     method: req.method,
     path: req.path,
-    ip: req.ip || reqWithLog.connection?.remoteAddress,
+    ip: req.ip,
   });
 
   // Set response header for tracing
