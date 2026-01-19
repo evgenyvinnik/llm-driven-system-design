@@ -56,10 +56,21 @@ interface NodeRequestResult {
   success: boolean;
   data?: {
     keys?: string[];
+    value?: unknown;
+    ttl?: number;
   };
 }
 
-type NodeRequestFn = (node: string, path: string) => Promise<NodeRequestResult>;
+interface NodeRequestOptions {
+  method?: string;
+  body?: string;
+}
+
+type NodeRequestFn = (
+  node: string,
+  path: string,
+  options?: NodeRequestOptions
+) => Promise<NodeRequestResult>;
 
 export class RebalanceManager {
   private ring: HashRing;
@@ -188,7 +199,7 @@ export class RebalanceManager {
           } catch (error) {
             keysFailed++;
             rebalanceLogger.debug(
-              { key, error: error.message },
+              { key, error: (error as Error).message },
               'key_migration_failed'
             );
           }
@@ -327,7 +338,7 @@ export class RebalanceManager {
           } catch (error) {
             keysFailed++;
             rebalanceLogger.debug(
-              { key, error: error.message },
+              { key, error: (error as Error).message },
               'key_migration_failed'
             );
           }

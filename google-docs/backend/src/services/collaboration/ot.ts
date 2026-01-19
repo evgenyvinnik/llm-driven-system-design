@@ -9,7 +9,7 @@ import type { WebSocket } from 'ws';
 import type { ClientConnection } from './types.js';
 import type { WSMessage } from '../../types/index.js';
 import { transformOperations } from '../ot.js';
-import logger as _logger, { createChildLogger } from '../../shared/logger.js';
+import _logger, { createChildLogger } from '../../shared/logger.js';
 import {
   syncLatencyHistogram,
   operationsCounter,

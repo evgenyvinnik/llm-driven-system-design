@@ -16,7 +16,7 @@
  */
 
 import { query } from '../db.js';
-import logger as _logger, { createModuleLogger } from './logger.js';
+import { logger as _logger, createModuleLogger } from './logger.js';
 import type { Request } from 'express';
 
 const log = createModuleLogger('audit');

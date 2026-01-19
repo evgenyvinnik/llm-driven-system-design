@@ -25,8 +25,14 @@ export const logger = pino({
   }),
 });
 
+import { Request, Response, NextFunction } from 'express';
+
 // Request logging middleware
-export function requestLogger(req, res, next) {
+export function requestLogger(
+  req: Request & { requestId?: string; log?: ReturnType<typeof logger.child> },
+  res: Response,
+  next: NextFunction
+): void {
   const requestId = req.headers['x-request-id'] || crypto.randomUUID();
   const startTime = Date.now();
 

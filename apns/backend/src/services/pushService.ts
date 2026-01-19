@@ -1,5 +1,5 @@
 import db from "../db/index.js";
-import redis as _redis, {
+import _redis, {
   enqueueNotification,
   getDeviceServer,
   publishNotification,

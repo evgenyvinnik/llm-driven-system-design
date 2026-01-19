@@ -3,7 +3,7 @@ import { query } from '../db/index.js';
 import { requireAuth } from '../middleware/auth.js';
 
 // Import shared modules
-import logger as _logger from '../shared/logger.js';
+import logger from '../shared/logger.js';
 import { auditLog, AUDITED_ACTIONS } from '../shared/audit.js';
 import { getIdempotencyKey, withIdempotencyTransaction } from '../shared/idempotency.js';
 import { issuesCreated, issuesClosed } from '../shared/metrics.js';

@@ -14,7 +14,7 @@
 
 import amqp, { ChannelModel, Channel, ConsumeMessage } from 'amqplib';
 import { v4 as uuidv4 } from 'uuid';
-import logger as _logger, { createModuleLogger } from './logger.js';
+import _logger, { createModuleLogger } from './logger.js';
 import { metrics } from './metrics.js';
 import redisClient from '../redis.js';
 

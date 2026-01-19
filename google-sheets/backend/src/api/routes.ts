@@ -14,7 +14,7 @@
 import express from 'express';
 import { pool } from '../shared/db.js';
 import { v4 as uuidv4 } from 'uuid';
-import logger as _logger, { createChildLogger } from '../shared/logger.js';
+import _logger, { createChildLogger } from '../shared/logger.js';
 import { dbQueryDuration, errorsTotal } from '../shared/metrics.js';
 import {
   getCachedSpreadsheet,

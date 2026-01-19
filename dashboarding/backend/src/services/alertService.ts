@@ -9,7 +9,7 @@
  */
 
 import pool from '../db/pool.js';
-import redis as _redis from '../db/redis.js';
+import _redis from '../db/redis.js';
 import { queryMetrics } from './queryService.js';
 import logger from '../shared/logger.js';
 import { alertsFiring as _alertsFiring, alertEvaluationsTotal } from '../shared/metrics.js';

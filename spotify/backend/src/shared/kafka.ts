@@ -1,4 +1,4 @@
-import { Kafka, logLevel } from 'kafkajs';
+import { Kafka, logLevel, Producer, Consumer } from 'kafkajs';
 import { logger } from './logger.js';
 
 const PLAYBACK_EVENTS_TOPIC = 'playback-events';
@@ -17,11 +17,11 @@ const kafka = new Kafka({
 });
 
 // Producer singleton
-let producer = null;
+let producer: Producer | null = null;
 let producerReady = false;
 
 // Consumer for the analytics worker
-let consumer = null;
+let consumer: Consumer | null = null;
 
 /**
  * Initialize and connect the Kafka producer
@@ -147,7 +147,7 @@ export async function consumePlaybackEvents(handler, groupId = 'analytics-worker
       } catch (error) {
         logger.error(
           {
-            error: error.message,
+            error: (error as Error).message,
             topic,
             partition,
             offset: message.offset,

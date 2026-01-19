@@ -12,7 +12,7 @@
  * Exposes metrics at /metrics endpoint in Prometheus text format.
  */
 
-import client as _client, {
+import _client, {
   Registry,
   Counter,
   Histogram,

@@ -7,7 +7,7 @@
 
 import type { WebSocket } from 'ws';
 import type { ClientConnection, DocumentState } from './types.js';
-import logger as _logger, { createChildLogger } from '../../shared/logger.js';
+import _logger, { createChildLogger } from '../../shared/logger.js';
 import { documents, updateDocumentsMetric } from './state.js';
 import { handleLeaveDocument, addUserToDocument } from './presence.js';
 import { checkDocumentPermission, hasAccess, getEffectivePermission } from './permissions.js';

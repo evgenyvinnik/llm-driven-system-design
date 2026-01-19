@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { query } from '../db/pool.js';
 import { Queue, Worker, Job } from 'bullmq';
-import redis as _redis from '../db/redis.js';
+import _redis from '../db/redis.js';
 
 // Interfaces
 export interface WebhookEvent {
