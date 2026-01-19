@@ -4,7 +4,7 @@ import * as gitService from '../services/git.js';
 import { requireAuth } from '../middleware/auth.js';
 
 // Import shared modules
-import logger from '../shared/logger.js';
+import logger as _logger from '../shared/logger.js';
 import { auditLog, AUDITED_ACTIONS } from '../shared/audit.js';
 import { getPRDiffFromCache, setPRDiffInCache, invalidatePRDiffCache, invalidateRepoCaches } from '../shared/cache.js';
 import { withCircuitBreaker } from '../shared/circuitBreaker.js';

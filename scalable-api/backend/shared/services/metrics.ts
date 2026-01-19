@@ -1,5 +1,5 @@
 import { normalizePath, percentile } from '../utils/index.js';
-import config from '../config/index.js';
+import config as _config from '../config/index.js';
 
 /**
  * Metrics service for collecting and exposing Prometheus-compatible metrics
