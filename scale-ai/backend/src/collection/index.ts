@@ -17,8 +17,8 @@ import { ensureBuckets } from '../shared/storage.js'
 import { logger } from '../shared/logger.js'
 import { startCleanupScheduler } from '../shared/cleanup.js'
 
-/** Port for the collection service (default: 3000) */
-const PORT = parseInt(process.env.PORT || '3000')
+/** Port for the collection service (default: 3001) */
+const PORT = parseInt(process.env.PORT || '3001')
 
 /** Cleanup scheduler interval ID for graceful shutdown */
 let cleanupInterval: NodeJS.Timeout | undefined

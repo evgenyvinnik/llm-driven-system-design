@@ -1,167 +1,145 @@
-# Claude Collaboration Notes - Scale AI
+# CLAUDE.md
 
-This document tracks the LLM-assisted development process for this project.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Genesis
+## Project Overview
 
-**Initial Request:** Build a data labeling platform similar to Scale AI, focused on collecting drawing data from thousands of users to train ML models.
+A crowdsourced data labeling platform where users draw shapes through a game interface, administrators manage datasets and training, and implementors test trained models for inference. Three microservices power the backend: Collection (port 3001), Admin (port 3002), and Inference (port 3003).
 
-**Three Portals Identified:**
-1. Drawing Game - Simple shape drawing (line, heart, circle, square, triangle)
-2. Admin Dashboard - Data management and model training
-3. Implementor Portal - Model inference and testing
+## Common Commands
 
-## Key Design Discussions
+### Backend
 
-### Drawing Data Storage
+```bash
+cd backend
+npm install
+npm run db:seed-admin          # Seed admin user (admin@scaleai.local / admin123)
+npm run dev                    # Run all services (collection, admin, inference)
+npm run dev:collection         # Collection service only (port 3001)
+npm run dev:admin              # Admin service only (port 3002)
+npm run dev:inference          # Inference service only (port 3003)
+npm run test                   # Run tests once
+npm run test:watch             # Run tests in watch mode
+npm run test -- src/collection/app.test.ts  # Run single test file
+npm run lint                   # ESLint
+npm run format                 # Prettier
+```
 
-**Question:** Should we store drawings as images or stroke data?
+### Frontend
 
-**Analysis:**
-- Images are simpler for ML but lose temporal/pressure information
-- Stroke data (JSON) is compact, preserves all info, can be converted to images
-- Future use cases (stroke-based models, animation) benefit from raw data
+```bash
+cd frontend
+npm install
+npm run dev                    # Start dev server (port 5173)
+npm run build                  # Build (runs tsc first)
+npm run lint                   # ESLint
+npm run type-check             # TypeScript check (tsc --noEmit)
+```
 
-**Decision:** Store as stroke data, convert to images at training time.
+### Infrastructure
 
-### Real-time vs Batch Collection
+```bash
+docker-compose up -d           # Start PostgreSQL, Redis, MinIO, RabbitMQ
+docker-compose down            # Stop services
+docker-compose down -v         # Stop and remove volumes
+```
 
-**Question:** Should drawings stream in real-time or submit on completion?
+### Training Worker (Python)
 
-**Analysis:**
-- Real-time (WebSocket) enables live feedback, partial saves
-- Batch (REST) is simpler, lower server load, easier error handling
-- Most users complete drawings in 2-5 seconds
+```bash
+cd training
+pip install -r requirements.txt
+python worker.py               # Consumes jobs from RabbitMQ
+```
 
-**Decision:** Start with batch submission, add WebSocket later if needed.
+## Architecture
 
-### ML Framework Choice
+### Backend Microservices
 
-**Question:** TensorFlow vs PyTorch for training?
+Three Express services under `backend/src/`:
 
-**Analysis:**
-- Both work well for simple CNNs
-- PyTorch more popular in research, better debugging
-- TensorFlow.js enables browser inference
-- Training worker can use either
+- **collection/** - Drawing submission API for end users. Saves stroke data to MinIO, metadata to PostgreSQL.
+- **admin/** - Dashboard API with session-based auth. Manages drawings, triggers training jobs via RabbitMQ.
+- **inference/** - Model loading and classification API for implementors.
 
-**Decision:** PyTorch for training worker, TensorFlow.js for optional browser inference.
+### Shared Modules
 
-### UI Design Direction: Skeuomorphic Post-It Notes
+All services import from `backend/src/shared/`:
 
-**Request:** Create a tactile, nostalgic experience for the drawing game.
+| Module | Purpose |
+|--------|---------|
+| `db.ts` | PostgreSQL pool + `withTransaction()` helper |
+| `cache.ts` | Redis client + cache helpers with key patterns |
+| `storage.ts` | MinIO client for object storage |
+| `queue.ts` | RabbitMQ connection for training jobs |
+| `auth.ts` | Session middleware for admin routes |
+| `circuitBreaker.ts` | Resilience patterns for external services |
+| `retry.ts` | Retry with exponential backoff |
+| `metrics.ts` | Prometheus metrics collection |
+| `healthCheck.ts` | Liveness/readiness endpoints |
 
-**Design Concept:**
-- Users draw on realistic yellow post-it notes
-- Black marker strokes with ink bleeding effect
-- Cork board background with wood frame
-- Pink instruction post-it with pushpin
-- Decorative Sharpie marker prop
+### Database
 
-**Why Skeuomorphism?**
-- Makes drawing feel natural and familiar (like doodling at your desk)
-- Post-it metaphor implies quick, casual sketches (lowers pressure)
-- Tactile design encourages engagement and playfulness
-- Memorable aesthetic differentiates from clinical data collection tools
+Schema in `backend/src/db/init.sql`. Key tables: `users`, `shapes`, `drawings`, `admin_users`, `training_jobs`, `models`.
 
-**Implementation Details:**
-- Multi-pass canvas rendering for marker ink effect
-- CSS-only paper textures and shadows (no images)
-- Caveat font for handwritten feel
-- Touch-action: none to prevent scroll interference
-- Responsive design for mobile drawing
+### Frontend Routes
 
-## Architecture Evolution
+Hash-based routing in `frontend/src/App.tsx`:
+- `/` - Drawing game (PostItCanvas component)
+- `#admin` - Admin dashboard (login required)
+- `#implement` - Model tester portal
 
-### Version 1 (Initial)
-- Single monolithic backend
-- PostgreSQL for everything (including drawing data as BYTEA)
-- Simple image upload
+## Key Conventions
 
-### Version 2 (Current)
-- Microservices: Collection, Admin, Inference, Training Worker
-- Object storage (MinIO) for drawing data
-- Message queue (RabbitMQ) for training jobs
-- Separate model registry
+### ESM Imports
 
-**Rationale for split:**
-- Collection needs to scale independently (high write throughput)
-- Training is async, benefits from queue-based architecture
-- Inference has different latency requirements
+Backend uses ES modules. Always use `.js` extension in TypeScript imports:
+```typescript
+import { pool } from '../shared/db.js'
+import { redis } from '../shared/cache.js'
+```
 
-## Implementation Phases
+### Testing Pattern
 
-### Phase 1: Core Drawing Game (Completed)
-- [x] Canvas component with mouse/touch support
-- [x] Stroke data capture and formatting
-- [x] Shape prompts and visual feedback
-- [x] Submit to collection API
-- [x] Skeuomorphic post-it note UI design
-- [x] Sound effects using Web Audio API
-- [x] Gamification (streaks, levels, milestones)
+Tests mock shared modules before importing the app:
+```typescript
+vi.mock('../shared/db.js', () => ({
+  pool: { query: vi.fn() },
+}))
+vi.mock('../shared/storage.js', () => ({
+  uploadDrawing: vi.fn().mockResolvedValue('path/to/file'),
+}))
 
-### Phase 2: Data Pipeline (Completed)
-- [x] Collection service with MinIO integration
-- [x] PostgreSQL schema and migrations
-- [x] Basic data validation
-- [x] Redis added for session storage and caching
-- [x] Docker Compose with all services
+import { app } from './app.js'
+```
 
-### Phase 3: Admin Dashboard (Completed)
-- [x] Statistics aggregation
-- [x] Drawing browser with filters
-- [x] Flag/unflag functionality
-- [x] Training job management UI
-- [x] Stroke thumbnail rendering
-- [x] Session-based authentication
+### Drawing Data Format
 
-### Phase 4: Training Pipeline (Completed)
-- [x] Training worker with RabbitMQ consumer
-- [x] Stroke-to-image preprocessing
-- [x] Simple CNN model (DoodleNet)
-- [x] Model saving to registry
+Drawings stored as JSON stroke data (not images) in MinIO:
+```json
+{
+  "shape": "circle",
+  "canvas": { "width": 400, "height": 400 },
+  "strokes": [{ "points": [...], "color": "#000000", "width": 3 }],
+  "duration_ms": 2500,
+  "device": "mouse"
+}
+```
 
-### Phase 5: Inference Service (Completed)
-- [x] Model loading and caching
-- [x] Classification API
-- [x] Implementor portal UI
-- [x] Heuristic-based demo classification
+## Environment Variables
 
-### Phase 6: Polish (Completed)
-- [x] Gamification (streaks, levels, milestones, sound effects)
-- [x] Unit tests for backend API endpoints
-- [x] Redis caching for performance optimization
-- [x] Session-based admin authentication
-- [ ] Model comparison in admin (optional)
-- [ ] Load testing (optional)
+Defaults work for local development with Docker Compose:
 
-## Technical Challenges Encountered
+```
+DB_HOST=localhost DB_PORT=5432 DB_NAME=scaleai DB_USER=scaleai DB_PASSWORD=scaleai123
+REDIS_URL=redis://localhost:6379
+MINIO_ENDPOINT=localhost MINIO_PORT=9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin
+RABBITMQ_URL=amqp://scaleai:scaleai123@localhost:5672
+```
 
-### Canvas Touch Support
-- Need to prevent default touch behavior (scrolling)
-- Pressure sensitivity varies by device
-- Consider pointer events API for unified handling
+## Design Decisions
 
-### Stroke Simplification
-- Raw stroke data can be very large (1000+ points per drawing)
-- Ramer-Douglas-Peucker algorithm for simplification
-- Balance between data size and quality
-
-### Training Data Quality
-- Some users draw poorly or spam
-- Need quality scoring (automated or manual)
-- Consider active learning to request specific shapes
-
-## Questions for Future Exploration
-
-1. **Federated Learning:** Could we train on-device to preserve privacy?
-2. **Generative Models:** Can we train a model to generate shapes, not just recognize?
-3. **Transfer Learning:** Use pretrained model (Quick, Draw! dataset) as starting point?
-4. **Real-time Collaboration:** Multiple users drawing the same shape simultaneously?
-
-## Resources & References
-
-- [Quick, Draw! Dataset](https://quickdraw.withgoogle.com/data) - Google's 50M drawing dataset
-- [Ramer-Douglas-Peucker Algorithm](https://en.wikipedia.org/wiki/Ramer%E2%80%93Douglas%E2%80%93Peucker_algorithm) - Stroke simplification
-- [Pointer Events API](https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events) - Unified input handling
-- [MobileNet](https://arxiv.org/abs/1704.04861) - Efficient CNN architecture
+- **Stroke data over images**: Preserves temporal/pressure info, converts to images at training time
+- **Batch submission**: REST on completion rather than WebSocket streaming for simplicity
+- **PyTorch for training**: Worker processes jobs from RabbitMQ, saves models to MinIO
+- **Session-based admin auth**: Redis-backed sessions, avoids JWT complexity

@@ -16,9 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 # Install Python dependencies
-# Using CPU-only PyTorch to keep image smaller (~1GB vs ~4GB with CUDA)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements.txt
+# PyTorch from PyPI automatically selects the appropriate CPU/GPU variant for the platform
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy training code
 COPY . .
