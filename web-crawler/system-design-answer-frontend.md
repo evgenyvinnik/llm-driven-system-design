@@ -47,132 +47,132 @@ The main challenge is balancing real-time updates with performance when dealing 
 ### Dashboard Layout Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Crawler Dashboard UI                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                    Navigation Bar                                │    │
-│  │    Logo  │  Dashboard  │  Frontier  │  Domains  │  Workers      │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  ┌──────────────────────────┐  ┌──────────────────────────────────┐     │
-│  │    Live Statistics       │  │      Throughput Chart            │     │
-│  │  ┌──────┐ ┌──────┐      │  │                                   │     │
-│  │  │URLs/s│ │Queue │      │  │    ━━━━━━━━━━━━━━━━━━━━━━━━━━    │     │
-│  │  │10.2K │ │ 2.5M │      │  │   Pages/second over time          │     │
-│  │  └──────┘ └──────┘      │  │                                   │     │
-│  │  ┌──────┐ ┌──────┐      │  └──────────────────────────────────┘     │
-│  │  │Active│ │Failed│      │                                           │
-│  │  │  8   │ │ 124  │      │  ┌──────────────────────────────────┐     │
-│  │  └──────┘ └──────┘      │  │      Domain Distribution          │     │
-│  └──────────────────────────┘  │         [Pie Chart]              │     │
-│                                └──────────────────────────────────┘     │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                    URL Frontier Table                            │    │
-│  │  ┌─────────────────────────────────────────────────────────┐    │    │
-│  │  │ Status │   URL                    │ Priority │ Domain   │    │    │
-│  │  ├─────────────────────────────────────────────────────────┤    │    │
-│  │  │ ● Crawl │ https://example.com/... │   High   │example   │    │    │
-│  │  │ ○ Pend  │ https://other.com/page  │   Med    │other     │    │    │
-│  │  │ ✓ Done  │ https://blog.io/post    │   Low    │blog      │    │    │
-│  │  │  ...virtualized rows (only visible rendered)...         │    │    │
-│  │  └─────────────────────────────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|                        Crawler Dashboard UI                            |
++-----------------------------------------------------------------------+
+|  +---------------------------------------------------------------+    |
+|  |                    Navigation Bar                              |    |
+|  |    Logo  |  Dashboard  |  Frontier  |  Domains  |  Workers    |    |
+|  +---------------------------------------------------------------+    |
+|                                                                        |
+|  +------------------------+   +--------------------------------+       |
+|  |    Live Statistics     |   |      Throughput Chart          |       |
+|  |  +------+  +------+    |   |                                |       |
+|  |  |URLs/s|  |Queue |    |   |    ~~~~~~~~~~~~~~~~~~~~~~~~    |       |
+|  |  |10.2K |  | 2.5M |    |   |   Pages/second over time       |       |
+|  |  +------+  +------+    |   |                                |       |
+|  |  +------+  +------+    |   +--------------------------------+       |
+|  |  |Active|  |Failed|    |                                            |
+|  |  |  8   |  | 124  |    |   +--------------------------------+       |
+|  |  +------+  +------+    |   |      Domain Distribution       |       |
+|  +------------------------+   |         [Pie Chart]            |       |
+|                               +--------------------------------+       |
+|                                                                        |
+|  +---------------------------------------------------------------+    |
+|  |                    URL Frontier Table                          |    |
+|  |  +-----------------------------------------------------------+ |    |
+|  |  | Status |   URL                  | Priority | Domain       | |    |
+|  |  |---------+------------------------+----------+-------------| |    |
+|  |  | * Crawl | https://example.com/  |   High   | example.com  | |    |
+|  |  | o Pend  | https://other.com/pg  |   Med    | other.com    | |    |
+|  |  | + Done  | https://blog.io/post  |   Low    | blog.io      | |    |
+|  |  |   ...virtualized rows (only visible rendered)...          | |    |
+|  |  +-----------------------------------------------------------+ |    |
+|  +---------------------------------------------------------------+    |
+|                                                                        |
++-----------------------------------------------------------------------+
 ```
-
-### Component Organization
-
-| Directory | Purpose | Key Files |
-|-----------|---------|-----------|
-| routes/ | Page-level components | Dashboard, Frontier, Domains, Workers |
-| components/dashboard/ | Live stats display | StatsGrid, ThroughputChart, DomainPieChart |
-| components/frontier/ | URL table & filters | URLTable, URLFilters, SeedURLModal |
-| components/domains/ | Domain management | DomainTable, RobotsViewer, RateLimitSlider |
-| components/workers/ | Worker monitoring | WorkerGrid, WorkerCard |
-| stores/ | State management | statsStore, frontierStore, domainStore |
-| services/ | API client | api.ts with endpoints for all operations |
 
 ### Route Structure
 
 | Route | View | Description |
 |-------|------|-------------|
-| `/` | Dashboard | Overview with live stats and charts |
-| `/frontier` | Frontier | Virtualized URL table with filters |
-| `/domains` | Domain List | All domains with status |
-| `/domains/:domain` | Domain Detail | Rate limits, robots.txt, statistics |
-| `/workers` | Workers | Grid of worker cards with health |
+| / | Dashboard | Overview with live stats and charts |
+| /frontier | Frontier | Virtualized URL table with filters |
+| /domains | Domain List | All domains with status |
+| /domains/:domain | Domain Detail | Rate limits, robots.txt, statistics |
+| /workers | Workers | Grid of worker cards with health |
 
 ---
 
 ## 🔍 Deep Dive: Real-Time Statistics Dashboard (10 minutes)
 
-### WebSocket-Based Live Updates
+### Why WebSocket over Polling?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **WebSocket** | True real-time (~50ms latency), lower server load (push model), efficient for high-frequency updates | Connection management complexity, must handle reconnection |
+| Polling | Simple HTTP, automatic error handling, universal support | 1-2s latency minimum, constant server requests, not true real-time |
+| Server-Sent Events | Simpler than WebSocket, auto-reconnect | One-way only, less browser support |
+
+**Decision: WebSocket**
+
+"For a crawl dashboard showing 10K URLs/second, operators need to see changes immediately. Polling at 1-second intervals would miss transient issues. WebSocket gives us true real-time visibility with lower overhead since the server pushes only when data changes."
+
+### WebSocket Statistics Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    WebSocket Statistics Flow                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│    ┌─────────┐        ┌──────────────┐        ┌─────────────┐   │
-│    │ Backend │───────>│  WebSocket   │───────>│ Stats Store │   │
-│    │ Server  │        │  Connection  │        │  (Zustand)  │   │
-│    └─────────┘        └──────────────┘        └─────────────┘   │
-│                              │                       │           │
-│                              │                       ▼           │
-│                    Auto-reconnect           ┌─────────────┐     │
-│                    on disconnect            │  Components │     │
-│                       (3s delay)            │  Subscribe  │     │
-│                              │              └─────────────┘     │
-│                              ▼                       │           │
-│                    ┌──────────────┐                  ▼           │
-│                    │ Reconnection │          ┌─────────────┐     │
-│                    │   Handler    │          │  Re-render  │     │
-│                    └──────────────┘          │  UI Cards   │     │
-│                                              └─────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|                    WebSocket Statistics Flow                           |
++-----------------------------------------------------------------------+
+|                                                                        |
+|    +---------+        +--------------+        +-------------+          |
+|    | Backend |------->|  WebSocket   |------->| Stats Store |          |
+|    | Server  |        |  Connection  |        |  (Zustand)  |          |
+|    +---------+        +--------------+        +-------------+          |
+|                             |                       |                  |
+|                             |                       v                  |
+|                    Auto-reconnect           +-------------+            |
+|                    on disconnect            |  Components |            |
+|                       (3s delay)            |  Subscribe  |            |
+|                             |               +-------------+            |
+|                             v                       |                  |
+|                    +--------------+                 v                  |
+|                    | Reconnection |         +-------------+            |
+|                    |   Handler    |         |  Re-render  |            |
+|                    +--------------+         |  UI Cards   |            |
+|                                             +-------------+            |
+|                                                                        |
++-----------------------------------------------------------------------+
 ```
 
-### Statistics Store State
+### Why Zustand over Redux or Context?
 
-| Field | Type | Description |
-|-------|------|-------------|
-| urlsPerSecond | number | Current crawl throughput |
-| queueDepth | number | Total URLs waiting in frontier |
-| activeWorkers | number | Workers currently processing |
-| failedToday | number | URLs that failed in last 24h |
-| totalCrawled | number | All-time crawled count |
-| byPriority.high/medium/low | number | Queue breakdown by priority |
-| throughputHistory | array | Last 60 data points for chart |
-| isConnected | boolean | WebSocket connection status |
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Zustand** | Minimal boilerplate, simple selectors prevent re-renders, built-in subscribe for WebSocket | Smaller ecosystem than Redux |
+| Redux Toolkit | Mature ecosystem, Redux DevTools, middleware | More boilerplate, overkill for dashboard |
+| React Context | Built-in, no dependencies | Re-renders all consumers on any change |
+| TanStack Query | Great for REST APIs, caching, deduplication | Designed for request/response, not WebSocket streams |
 
-### Live Statistics Grid Layout
+**Decision: Zustand**
+
+"The dashboard has a single WebSocket pushing updates every second. Zustand's selector pattern means only the component displaying 'URLs/second' re-renders when that value changes, not the entire dashboard. With Redux, we'd write 3x more code for the same result."
+
+### Live Statistics Grid Design
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                     Statistics Cards Grid                          │
-├───────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────┐ │
-│   │   URLs/s    │  │ Queue Depth │  │   Active    │  │  Failed  │ │
-│   │             │  │             │  │   Workers   │  │  Today   │ │
-│   │   10.2K     │  │    2.5M     │  │      8      │  │   124 ↓  │ │
-│   │             │  │             │  │             │  │          │ │
-│   │  ● Live     │  │  (compact)  │  │   (count)   │  │  (trend) │ │
-│   └─────────────┘  └─────────────┘  └─────────────┘  └──────────┘ │
-│                                                                     │
-│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐   │
-│   │   High Priority │  │  Medium Priority │  │   Low Priority  │   │
-│   │   ┌─────────┐   │  │   ┌─────────┐   │  │   ┌─────────┐   │   │
-│   │   │  125K   │   │  │   │  890K   │   │  │   │  1.5M   │   │   │
-│   │   └─────────┘   │  │   └─────────┘   │  │   └─────────┘   │   │
-│   │   (red accent)  │  │  (yellow accent) │  │  (green accent) │   │
-│   └─────────────────┘  └─────────────────┘  └─────────────────┘   │
-│                                                                     │
-└───────────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------------+
+|                     Statistics Cards Grid                            |
++---------------------------------------------------------------------+
+|                                                                      |
+|   +-----------+  +-----------+  +-----------+  +----------+          |
+|   |   URLs/s  |  |Queue Depth|  |   Active  |  |  Failed  |          |
+|   |           |  |           |  |  Workers  |  |  Today   |          |
+|   |   10.2K   |  |    2.5M   |  |     8     |  |   124    |          |
+|   |           |  |           |  |           |  |          |          |
+|   |  * Live   |  | (compact) |  |  (count)  |  | (trend)  |          |
+|   +-----------+  +-----------+  +-----------+  +----------+          |
+|                                                                      |
+|   +---------------+  +---------------+  +---------------+            |
+|   | High Priority |  |Medium Priority|  |  Low Priority |            |
+|   |    +-----+    |  |    +-----+    |  |    +-----+    |            |
+|   |    | 125K|    |  |    | 890K|    |  |    | 1.5M|    |            |
+|   |    +-----+    |  |    +-----+    |  |    +-----+    |            |
+|   |  (red accent) |  |(yellow accent)|  |(green accent) |            |
+|   +---------------+  +---------------+  +---------------+            |
+|                                                                      |
++---------------------------------------------------------------------+
 ```
 
 ### Number Formatting for Compact Display
@@ -184,87 +184,72 @@ The main challenge is balancing real-time updates with performance when dealing 
 | >= 1K | X.XK | 10.2K |
 | < 1K | raw number | 892 |
 
-### Throughput Chart Design
+### Why Recharts over D3.js?
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Throughput Area Chart                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│   URLs/s                                                          │
-│    15K ┤                                                          │
-│        │                    ╭───╮                                 │
-│    10K ┤              ╭────╯   ╰────╮      ╭────╮                │
-│        │         ╭───╯              ╰─────╯    ╰───────         │
-│     5K ┤    ╭───╯                                                │
-│        ├───╯                                                      │
-│      0 └─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────          │
-│            10:00  10:01  10:02  10:03  10:04  10:05  10:06        │
-│                                                                   │
-│   Features:                                                       │
-│   • Gradient fill from blue to transparent                        │
-│   • Rolling 60-second window                                      │
-│   • Animations disabled for real-time performance                 │
-│   • Y-axis auto-scales with 10% headroom                          │
-│   • Tooltip shows exact value on hover                            │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Recharts** | React-native, declarative, built-in responsive | Less customizable than raw D3 |
+| D3.js | Ultimate flexibility, any visualization possible | Imperative, fights React's model, steep learning curve |
+| Chart.js | Simple API, good defaults | Canvas-based (harder to style), less React-friendly |
+| Visx | D3 primitives as React components | More code than Recharts for common charts |
 
-### Connection Status Indicator
+**Decision: Recharts**
 
-```
-┌──────────────────────────────────────┐
-│     Connection Status Widget          │
-├──────────────────────────────────────┤
-│                                        │
-│   Connected:    ● Live (green pulse)   │
-│                                        │
-│   Disconnected: ● Disconnected (red)   │
-│                 Auto-reconnecting...   │
-│                                        │
-└──────────────────────────────────────┘
-```
+"For a throughput line chart, we don't need D3's full power. Recharts gives us responsive, animated charts with 10 lines of JSX. D3 would take 100+ lines and require manual lifecycle management."
 
 ---
 
 ## 🔍 Deep Dive: Virtualized URL Frontier Table (10 minutes)
 
-### Why Virtualization is Essential
+### Why Virtual Scrolling is Essential
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                 Virtual Scrolling Concept                           │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   Without Virtualization:              With Virtualization:          │
-│   ┌─────────────────┐                  ┌─────────────────┐          │
-│   │ Row 1 (in DOM)  │                  │                 │          │
-│   │ Row 2 (in DOM)  │                  │   Empty space   │          │
-│   │ Row 3 (in DOM)  │                  │  (no DOM nodes) │          │
-│   │      ...        │                  │                 │          │
-│   │ Row 10000       │                  ├─────────────────┤          │
-│   │ (ALL in DOM!)   │                  │ Row 50 (visible)│◄─Viewport│
-│   │      ...        │                  │ Row 51 (visible)│          │
-│   │ Row 1000000     │                  │ Row 52 (visible)│          │
-│   └─────────────────┘                  │ Row 53 (visible)│          │
-│                                        │ Row 54 (visible)│          │
-│   Problem:                             ├─────────────────┤          │
-│   1M rows × 48px = 48M pixels          │                 │          │
-│   1M DOM nodes = browser crash         │   Empty space   │          │
-│                                        │  (no DOM nodes) │          │
-│   Solution:                            └─────────────────┘          │
-│   Only render ~20 visible rows                                       │
-│   Use CSS transform for positioning    Only ~25 DOM nodes total      │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
++----------------------------------------------------------------------+
+|                 Virtual Scrolling Concept                             |
++----------------------------------------------------------------------+
+|                                                                       |
+|   Without Virtualization:              With Virtualization:           |
+|   +-----------------+                  +-----------------+            |
+|   | Row 1 (in DOM)  |                  |                 |            |
+|   | Row 2 (in DOM)  |                  |   Empty space   |            |
+|   | Row 3 (in DOM)  |                  |  (no DOM nodes) |            |
+|   |      ...        |                  |                 |            |
+|   | Row 10000       |                  +-----------------+            |
+|   | (ALL in DOM!)   |                  | Row 50 (visible)|<--Viewport |
+|   |      ...        |                  | Row 51 (visible)|            |
+|   | Row 1000000     |                  | Row 52 (visible)|            |
+|   +-----------------+                  | Row 53 (visible)|            |
+|                                        | Row 54 (visible)|            |
+|   Problem:                             +-----------------+            |
+|   1M rows x 48px = 48M pixels          |                 |            |
+|   1M DOM nodes = browser crash         |   Empty space   |            |
+|                                        |  (no DOM nodes) |            |
+|   Solution:                            +-----------------+            |
+|   Only render ~20 visible rows                                        |
+|   Use CSS transform for positioning    Only ~25 DOM nodes total       |
+|                                                                       |
++----------------------------------------------------------------------+
 ```
 
-### URL Table Structure
+### Why @tanstack/react-virtual over Alternatives?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **@tanstack/react-virtual** | Headless (style however), dynamic heights, great TypeScript | Must build your own table UI |
+| react-window | Battle-tested, simple API | Fixed item sizes only, less maintained |
+| react-virtuoso | Built-in infinite scroll, grouped lists | Larger bundle, opinionated styling |
+| AG Grid | Full-featured data grid, sorting/filtering built-in | License cost ($$$), heavy bundle |
+| Native DOM | No dependencies | Browser crashes at 10K+ rows |
+
+**Decision: @tanstack/react-virtual**
+
+"With potentially millions of URLs in the frontier, we can't render them all. Virtual scrolling gives infinite scroll UX while only rendering ~20 DOM nodes regardless of data size. TanStack gives us full control over styling while handling the hard math of what's visible."
+
+### URL Table Columns
 
 | Column | Width | Content | Notes |
 |--------|-------|---------|-------|
-| Status | 1/12 | Colored dot | ● Blue=processing, ○ Gray=pending, ✓ Green=done, ✗ Red=failed |
+| Status | 1/12 | Colored dot | Blue=processing, Gray=pending, Green=done, Red=failed |
 | URL | 5/12 | Full URL | Truncated with tooltip, monospace font |
 | Domain | 2/12 | Extracted domain | Links to domain detail page |
 | Priority | 1/12 | Badge | Red=high, Yellow=medium, Green=low |
@@ -274,39 +259,39 @@ The main challenge is balancing real-time updates with performance when dealing 
 ### Infinite Scroll Detection Flow
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                    Infinite Scroll Logic                            │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌─────────────┐                                                   │
-│   │ User scrolls│                                                   │
-│   │    down     │                                                   │
-│   └──────┬──────┘                                                   │
-│          │                                                           │
-│          ▼                                                           │
-│   ┌─────────────────────────────────────────────┐                   │
-│   │ Calculate distance from bottom:              │                   │
-│   │ distanceFromBottom = scrollHeight            │                   │
-│   │                    - scrollTop               │                   │
-│   │                    - clientHeight            │                   │
-│   └──────────────────────┬──────────────────────┘                   │
-│                          │                                           │
-│                          ▼                                           │
-│   ┌──────────────────────────────────────────┐                      │
-│   │ distanceFromBottom < 500px?               │                      │
-│   └───────────┬───────────────────┬──────────┘                      │
-│               │ Yes               │ No                               │
-│               ▼                   ▼                                  │
-│   ┌───────────────────┐   ┌───────────────────┐                     │
-│   │ hasNextPage &&    │   │   Do nothing      │                     │
-│   │ !isLoading?       │   │   (wait for       │                     │
-│   │       │           │   │    more scroll)   │                     │
-│   │       ▼           │   └───────────────────┘                     │
-│   │ fetchNextPage()   │                                              │
-│   │ Load next 100 URLs│                                              │
-│   └───────────────────┘                                              │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
++----------------------------------------------------------------------+
+|                    Infinite Scroll Logic                              |
++----------------------------------------------------------------------+
+|                                                                       |
+|   +-------------+                                                     |
+|   | User scrolls|                                                     |
+|   |    down     |                                                     |
+|   +------+------+                                                     |
+|          |                                                            |
+|          v                                                            |
+|   +---------------------------------------------+                     |
+|   | Calculate distance from bottom:             |                     |
+|   | distanceFromBottom = scrollHeight           |                     |
+|   |                    - scrollTop              |                     |
+|   |                    - clientHeight           |                     |
+|   +----------------------+----------------------+                     |
+|                          |                                            |
+|                          v                                            |
+|   +------------------------------------------+                        |
+|   | distanceFromBottom < 500px?              |                        |
+|   +-----------+-------------------+----------+                        |
+|               | Yes               | No                                |
+|               v                   v                                   |
+|   +-------------------+   +-------------------+                       |
+|   | hasNextPage &&    |   |   Do nothing      |                       |
+|   | !isLoading?       |   |   (wait for       |                       |
+|   |       |           |   |    more scroll)   |                       |
+|   |       v           |   +-------------------+                       |
+|   | fetchNextPage()   |                                               |
+|   | Load next 100 URLs|                                               |
+|   +-------------------+                                               |
+|                                                                       |
++----------------------------------------------------------------------+
 ```
 
 ### Virtualization Configuration
@@ -317,37 +302,17 @@ The main challenge is balancing real-time updates with performance when dealing 
 | overscan | 10 | Extra rows above/below viewport |
 | getScrollElement | parentRef | Container with fixed height (600px) |
 
-### URL Filter Panel
+### Why Debounced Search?
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                      URL Filters Bar                                │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌────────────────────────────────┐  ┌────────────┐  ┌───────────┐ │
-│  │ 🔍 Search by URL or domain... │  │All Statuses▼│  │All Priority▼│ │
-│  └────────────────────────────────┘  └────────────┘  └───────────┘ │
-│                                                                      │
-│                                       ┌────────┐  ┌───────┐         │
-│                                       │ Search │  │ Reset │         │
-│                                       └────────┘  └───────┘         │
-│                                                                      │
-│  Status dropdown:          Priority dropdown:                        │
-│  • All Statuses            • All Priorities                         │
-│  • Pending                 • High                                   │
-│  • Processing              • Medium                                 │
-│  • Completed               • Low                                    │
-│  • Failed                                                           │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Debounce (300ms)** | Reduces API calls, waits for user to finish typing | Slight perceived delay |
+| Throttle | Guaranteed updates at interval | Still fires during typing |
+| No delay | Instant feedback | API overload, wasted requests |
 
-### Debounced Search
+**Decision: Debounce at 300ms**
 
-To avoid API overload, search input is debounced:
-- User types → 300ms delay → API call
-- Immediate visual feedback with loading indicator
-- Cancel pending request if user types again
+"Users type 'example.com' letter by letter. Without debouncing, we'd fire 11 API requests. With 300ms debounce, we wait until they pause, then fire once. The slight delay is imperceptible but reduces server load by 90%."
 
 ---
 
@@ -356,70 +321,70 @@ To avoid API overload, search input is debounced:
 ### Domain Detail Page Layout
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                     Domain Detail View                              │
-│                     example.com                                     │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌───────────────────────────────────────────┐  ┌───────────────┐ │
-│   │ example.com                               │  │ Block Domain  │ │
-│   │ 125,432 pages crawled                     │  │    (red)      │ │
-│   └───────────────────────────────────────────┘  └───────────────┘ │
-│                                                                      │
-│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐  │
-│   │   Status    │ │   Pending   │ │ Avg Response│ │  Last Crawl │  │
-│   │   Active    │ │    1,234    │ │    245ms    │ │   5m ago    │  │
-│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘  │
-│                                                                      │
-│   ┌───────────────────────────────────────────────────────────────┐│
-│   │ Crawl Rate Limit                                              ││
-│   │                                                                ││
-│   │ 500ms ─────────────●─────────────────────────────── 10000ms   ││
-│   │                    ▲                                           ││
-│   │                 2000ms                                         ││
-│   │                                                                ││
-│   │ Currently: 1 request every 2000ms                              ││
-│   └───────────────────────────────────────────────────────────────┘│
-│                                                                      │
-│   ┌───────────────────────────────────────────────────────────────┐│
-│   │ robots.txt                              Last fetched: 2h ago  ││
-│   │ ┌──────────────────────────────────────────────────────────┐ ││
-│   │ │  1  # Robots.txt for example.com     (gray - comment)    │ ││
-│   │ │  2  User-agent: *                    (blue - user-agent) │ ││
-│   │ │  3  Disallow: /private/              (red - disallow)    │ ││
-│   │ │  4  Allow: /public/                  (green - allow)     │ ││
-│   │ │  5  Crawl-delay: 2                   (yellow - delay)    │ ││
-│   │ │  6  Sitemap: /sitemap.xml            (purple - sitemap)  │ ││
-│   │ └──────────────────────────────────────────────────────────┘ ││
-│   └───────────────────────────────────────────────────────────────┘│
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
++----------------------------------------------------------------------+
+|                     Domain Detail View                                |
+|                     example.com                                       |
++----------------------------------------------------------------------+
+|                                                                       |
+|   +-------------------------------------------+  +---------------+    |
+|   | example.com                               |  | Block Domain  |    |
+|   | 125,432 pages crawled                     |  |    (red)      |    |
+|   +-------------------------------------------+  +---------------+    |
+|                                                                       |
+|   +-----------+ +-----------+ +-----------+ +-----------+             |
+|   |   Status  | |   Pending | |Avg Response| | Last Crawl|            |
+|   |   Active  | |    1,234  | |   245ms   | |   5m ago  |             |
+|   +-----------+ +-----------+ +-----------+ +-----------+             |
+|                                                                       |
+|   +-----------------------------------------------------------------+ |
+|   | Crawl Rate Limit                                                | |
+|   |                                                                 | |
+|   | 500ms ---------------*------------------------------ 10000ms   | |
+|   |                      ^                                          | |
+|   |                   2000ms                                        | |
+|   |                                                                 | |
+|   | Currently: 1 request every 2000ms                               | |
+|   +-----------------------------------------------------------------+ |
+|                                                                       |
+|   +-----------------------------------------------------------------+ |
+|   | robots.txt                              Last fetched: 2h ago    | |
+|   | +-------------------------------------------------------------+ | |
+|   | |  1  # Robots.txt for example.com     (gray - comment)       | | |
+|   | |  2  User-agent: *                    (blue - user-agent)    | | |
+|   | |  3  Disallow: /private/              (red - disallow)       | | |
+|   | |  4  Allow: /public/                  (green - allow)        | | |
+|   | |  5  Crawl-delay: 2                   (yellow - delay)       | | |
+|   | |  6  Sitemap: /sitemap.xml            (purple - sitemap)     | | |
+|   | +-------------------------------------------------------------+ | |
+|   +-----------------------------------------------------------------+ |
+|                                                                       |
++----------------------------------------------------------------------+
 ```
 
-### Domain Info State
+### Why Range Slider over Number Input for Rate Limiting?
 
-| Field | Type | Description |
-|-------|------|-------------|
-| domain | string | Domain name (e.g., "example.com") |
-| isBlocked | boolean | Whether crawling is disabled |
-| totalPages | number | Pages crawled from this domain |
-| pendingUrls | number | URLs waiting to be crawled |
-| avgResponseMs | number | Average response time |
-| lastCrawlAt | ISO date | Last successful crawl |
-| crawlDelayMs | number | Current rate limit (500-10000) |
-| robotsTxt | string or null | Content of robots.txt |
-| robotsFetchedAt | ISO date | When robots.txt was last fetched |
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Range Slider** | Visual, prevents invalid values, shows scale | Less precise |
+| Number Input | Exact values, familiar | Easy to enter invalid values, no context |
+| Preset Buttons | One-click, curated options | Not flexible enough |
+
+**Decision: Range Slider with value display**
+
+"Rate limiting ranges from 500ms to 10000ms. A slider shows the full range at a glance and prevents operators from accidentally entering 50ms (too aggressive) or 1000000ms (essentially blocked). We show the current value below for precision."
 
 ### robots.txt Syntax Highlighting
 
 | Directive | Color | Example |
 |-----------|-------|---------|
-| Comments (#) | Gray | `# This is a comment` |
-| User-agent | Blue | `User-agent: *` |
-| Disallow | Red | `Disallow: /private/` |
-| Allow | Green | `Allow: /public/` |
-| Crawl-delay | Yellow | `Crawl-delay: 2` |
-| Sitemap | Purple | `Sitemap: /sitemap.xml` |
+| Comments (#) | Gray | # This is a comment |
+| User-agent | Blue | User-agent: * |
+| Disallow | Red | Disallow: /private/ |
+| Allow | Green | Allow: /public/ |
+| Crawl-delay | Yellow | Crawl-delay: 2 |
+| Sitemap | Purple | Sitemap: /sitemap.xml |
+
+"Color-coding helps operators quickly scan robots.txt files. Red for Disallow immediately highlights what's blocked."
 
 ---
 
@@ -428,45 +393,46 @@ To avoid API overload, search input is debounced:
 ### Worker Grid Layout
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                      Worker Monitoring Grid                         │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐           │
-│  │ worker-001  ● │  │ worker-002  ● │  │ worker-003  ● │           │
-│  │ (green=active)│  │  (yellow=idle)│  │  (green)      │           │
-│  ├───────────────┤  ├───────────────┤  ├───────────────┤           │
-│  │ Status: Active│  │ Status: Idle  │  │ Status: Active│           │
-│  │ URLs: 45,231  │  │ URLs: 38,102  │  │ URLs: 51,890  │           │
-│  │ Domain: news  │  │ Domain: -     │  │ Domain: blog  │           │
-│  │ Uptime: 4h 23m│  │ Uptime: 4h 20m│  │ Uptime: 4h 25m│           │
-│  │ Heartbeat: 2s │  │ Heartbeat: 5s │  │ Heartbeat: 1s │           │
-│  └───────────────┘  └───────────────┘  └───────────────┘           │
-│                                                                      │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐           │
-│  │ worker-004  ● │  │ worker-005  ● │  │ worker-006  ● │           │
-│  │  (red=error)  │  │  (green)      │  │  (green)      │           │
-│  ├───────────────┤  ├───────────────┤  ├───────────────┤           │
-│  │ Status: Error │  │ Status: Active│  │ Status: Active│           │
-│  │ URLs: 22,150  │  │ URLs: 48,776  │  │ URLs: 43,221  │           │
-│  │ Domain: -     │  │ Domain: shop  │  │ Domain: forum │           │
-│  │ Uptime: 2h 15m│  │ Uptime: 4h 22m│  │ Uptime: 4h 24m│           │
-│  │ Heartbeat: 45s│  │ Heartbeat: 3s │  │ Heartbeat: 2s │           │
-│  └───────────────┘  └───────────────┘  └───────────────┘           │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
++----------------------------------------------------------------------+
+|                      Worker Monitoring Grid                           |
++----------------------------------------------------------------------+
+|                                                                       |
+|  +---------------+  +---------------+  +---------------+              |
+|  | worker-001  * |  | worker-002  * |  | worker-003  * |              |
+|  | (green=active)|  | (yellow=idle) |  | (green)       |              |
+|  +---------------+  +---------------+  +---------------+              |
+|  | Status: Active|  | Status: Idle  |  | Status: Active|              |
+|  | URLs: 45,231  |  | URLs: 38,102  |  | URLs: 51,890  |              |
+|  | Domain: news  |  | Domain: -     |  | Domain: blog  |              |
+|  | Uptime: 4h 23m|  | Uptime: 4h 20m|  | Uptime: 4h 25m|              |
+|  | Heartbeat: 2s |  | Heartbeat: 5s |  | Heartbeat: 1s |              |
+|  +---------------+  +---------------+  +---------------+              |
+|                                                                       |
+|  +---------------+  +---------------+  +---------------+              |
+|  | worker-004  * |  | worker-005  * |  | worker-006  * |              |
+|  | (red=error)   |  | (green)       |  | (green)       |              |
+|  +---------------+  +---------------+  +---------------+              |
+|  | Status: Error |  | Status: Active|  | Status: Active|              |
+|  | URLs: 22,150  |  | URLs: 48,776  |  | URLs: 43,221  |              |
+|  | Domain: -     |  | Domain: shop  |  | Domain: forum |              |
+|  | Uptime: 2h 15m|  | Uptime: 4h 22m|  | Uptime: 4h 24m|              |
+|  | Heartbeat: 45s|  | Heartbeat: 3s |  | Heartbeat: 2s |              |
+|  +---------------+  +---------------+  +---------------+              |
+|                                                                       |
++----------------------------------------------------------------------+
 ```
 
-### Worker Card Data
+### Why Card Grid over Data Table for Workers?
 
-| Field | Display | Notes |
-|-------|---------|-------|
-| id | Header | Worker identifier (e.g., "worker-001") |
-| status | Badge + Color | active (green), idle (yellow), error (red) |
-| urlsProcessed | Number | Total URLs crawled by this worker |
-| currentDomain | Text | Domain currently being processed, or "-" |
-| uptime | Duration | "4h 23m" format |
-| lastHeartbeat | Relative | "2s ago" - warns if > 30s |
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Card Grid** | Visual status at a glance, fits 6-12 workers well, responsive | Doesn't scale to 100+ workers |
+| Data Table | Compact, sortable, scales to many rows | Status less visible, requires scanning |
+| Heat Map | Great for 50+ workers, pattern recognition | Overkill for <20 workers |
+
+**Decision: Card Grid**
+
+"Most crawler deployments have 4-12 workers. Cards give operators immediate visual status - a red card stands out instantly. If we scaled to 50+ workers, we'd add a heat map view as an alternative."
 
 ### Status Color Meanings
 
@@ -476,85 +442,27 @@ To avoid API overload, search input is debounced:
 | idle | Yellow | Waiting for work (queue empty or rate limited) |
 | error | Red | Connection issue or crash |
 
----
+### Heartbeat Warning Threshold
 
-## ♿ Accessibility and Performance (3 minutes)
-
-### Keyboard Navigation for URL Table
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    Keyboard Navigation                              │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   Key            Action                                             │
-│   ─────────────  ───────────────────────────────────────           │
-│   ↓ Arrow Down   Move focus to next row                             │
-│   ↑ Arrow Up     Move focus to previous row                         │
-│   Enter          Select/open current row                            │
-│   Tab            Move to next interactive element                   │
-│   Escape         Close modal or deselect                            │
-│                                                                      │
-│   Focus Ring:                                                        │
-│   ┌─────────────────────────────────────────────────────────┐      │
-│   │ ● │ https://example.com/page │ High │ example │ 5m ago │ ◄────│
-│   └─────────────────────────────────────────────────────────┘      │
-│   Blue ring around focused row                                      │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-### ARIA Live Regions
-
-For real-time statistics:
-- Live region announces: "Current crawl rate: 10,200 URLs per second"
-- Screen readers get periodic updates without focus change
-- Uses `aria-live="polite"` for non-intrusive updates
-- `aria-atomic="true"` to read entire region on change
-
-### Table Accessibility
-
-| Attribute | Element | Purpose |
-|-----------|---------|---------|
-| role="grid" | Table container | Identify as data grid |
-| aria-label | Table container | "URL Frontier with X rows" |
-| role="row" | Each row | Row identification |
-| role="gridcell" | Each cell | Cell identification |
-| tabIndex="0" | Focused row | Keyboard focusable |
-
-### Performance Optimizations
-
-| Technique | When Used | Benefit |
-|-----------|-----------|---------|
-| Debounce (300ms) | Search input | Reduces API calls |
-| useMemo | Chart data transformation | Prevents recalculation |
-| Disabled animations | Real-time charts | Smoother updates |
-| Virtualization | URL table | Only render visible rows |
-| Selector functions | Zustand subscriptions | Minimize re-renders |
+"If a worker's heartbeat exceeds 30 seconds, the card border turns orange. Over 60 seconds, it turns red. This lets operators spot stalled workers before they're marked as crashed."
 
 ---
 
-## ⚖️ Trade-offs and Alternatives (2 minutes)
+## ⚖️ Trade-offs Summary (2 minutes)
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Real-time Updates | ✅ WebSocket | ❌ Polling | True real-time for live dashboard, lower latency |
-| Virtualization | ✅ TanStack Virtual | ❌ react-window | Better API, better TypeScript support |
-| Charts | ✅ Recharts | ❌ D3.js directly | Simpler React integration, sufficient for dashboard |
-| State Management | ✅ Zustand | ❌ Redux | Simpler for this scope, less boilerplate |
-| URL Table | ✅ Custom virtualized | ❌ AG Grid | Full control over UX, no license cost |
+| Real-time Updates | WebSocket | Polling | True real-time for live dashboard, operators need immediate visibility |
+| Virtualization | @tanstack/react-virtual | react-window | Dynamic row heights, better TypeScript, actively maintained |
+| Charts | Recharts | D3.js | React-native, sufficient for throughput charts, 10x less code |
+| State Management | Zustand | Redux | Simpler for dashboard scope, selector pattern prevents re-renders |
+| URL Table | Custom virtualized | AG Grid | Full UX control, no license cost, tailored to crawler needs |
+| Rate Limit Control | Range Slider | Number Input | Visual, prevents invalid values, shows full range |
+| Worker Display | Card Grid | Data Table | Visual status at a glance for 4-12 workers |
 
-### WebSocket vs Polling Trade-offs
+### Key Trade-off: Complexity vs. Features
 
-| Factor | WebSocket | Polling |
-|--------|-----------|---------|
-| Latency | ~50ms | 1-2 seconds |
-| Server load | Lower (push) | Higher (constant requests) |
-| Complexity | Higher (connection management) | Lower (simple HTTP) |
-| Browser support | Universal | Universal |
-| Reconnection | Must implement | Automatic |
-
-**Decision**: WebSocket chosen because dashboard needs true real-time updates and operators need to see changes immediately.
+"I chose simpler technologies (Zustand over Redux, Recharts over D3) because the dashboard's complexity doesn't warrant enterprise-grade tools. This keeps the codebase maintainable for a small team while delivering all required functionality."
 
 ---
 
@@ -563,10 +471,11 @@ For real-time statistics:
 With more time, I would add:
 
 1. **URL detail modal** with crawl history and linked pages
-2. **Domain health heatmap** showing status across all domains
+2. **Domain health heatmap** showing status across all domains at scale
 3. **Export functionality** for crawl reports in CSV/JSON
 4. **Dark mode** for on-call monitoring (reduces eye strain)
 5. **Mobile-responsive** layout for phone access during incidents
+6. **Keyboard shortcuts** for power users (j/k navigation, / to search)
 
 ---
 
@@ -574,10 +483,10 @@ With more time, I would add:
 
 "I've designed a web crawler dashboard with:
 
-1. **Real-time WebSocket stats** with live throughput charts and auto-reconnection
-2. **Virtualized URL table** handling millions of rows efficiently with infinite scroll
-3. **Domain management UI** with robots.txt syntax highlighting and rate limit controls
-4. **Worker monitoring grid** showing health status and throughput per worker
+1. **Real-time WebSocket stats** with live throughput charts and auto-reconnection - chose WebSocket over polling for true real-time visibility
+2. **Virtualized URL table** handling millions of rows efficiently with infinite scroll - only ~20 DOM nodes regardless of data size
+3. **Domain management UI** with robots.txt syntax highlighting and rate limit slider controls
+4. **Worker monitoring grid** showing health status and throughput per worker - card layout for quick visual scanning
 5. **Accessible keyboard navigation** and ARIA live regions for screen readers
 
-The design prioritizes real-time visibility into crawl operations while maintaining performance with large datasets. Virtualization is the key technique - rendering only visible rows allows the table to handle millions of URLs without browser slowdown."
+The design prioritizes real-time visibility into crawl operations while maintaining performance with large datasets. Virtualization is the key technique - rendering only visible rows allows the table to handle millions of URLs without browser slowdown. Technology choices favor simplicity (Zustand, Recharts) over enterprise complexity because this dashboard serves a focused use case."

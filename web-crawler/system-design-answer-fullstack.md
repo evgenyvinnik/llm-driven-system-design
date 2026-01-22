@@ -8,8 +8,8 @@
 
 1. **Backend complexity** - URL frontier, distributed workers, politeness enforcement
 2. **Real-time frontend** - Live statistics and management controls
-3. **Data flow** - URL discovery through processing to visualization
-4. **Shared contracts** - Type safety across the entire system
+3. **Data contracts** - Type safety across the entire system
+4. **Dual-write patterns** - Immediate cache updates with durable storage
 
 Let me clarify requirements first."
 
@@ -23,20 +23,20 @@ Let me clarify requirements first."
 
 1. **URL Discovery** - Extract links from pages, queue for crawling
 2. **Distributed Crawling** - Workers fetch pages while respecting politeness
-3. **Deduplication** - Avoid re-crawling duplicate URLs or content
+3. **Deduplication** - Avoid re-crawling duplicate URLs
 4. **Admin Dashboard** - Real-time stats, domain management, seed URL control
 5. **Worker Monitoring** - Health status and throughput visualization
 
-I'll focus on end-to-end data flow, API contracts, and real-time communication."
+I'll focus on end-to-end data flow and technology choices for the integration layer."
 
 ### Non-Functional Requirements
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| Scale | 10,000 pages/second | Distributed worker fleet |
-| Dashboard Latency | < 2 seconds | Real-time monitoring |
-| Worker Recovery | Graceful resume | Reliability |
-| Operator Control | Full dashboard management | Usability |
+| Requirement | Target | Implication |
+|-------------|--------|-------------|
+| Scale | 10,000 pages/second | Need efficient data propagation |
+| Dashboard Latency | < 2 seconds | Real-time protocol required |
+| Type Safety | End-to-end | Shared contracts between FE/BE |
+| Operator Control | Immediate effect | Dual-write to cache + DB |
 
 ---
 
@@ -73,276 +73,116 @@ I'll focus on end-to-end data flow, API contracts, and real-time communication."
         ▼                       ▼                       ▼
 ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
 │  PostgreSQL   │      │     Redis     │      │ Object Store  │
-│               │      │               │      │               │
-│ - URL frontier│      │ - Bloom filter│      │ - Page content│
-│ - Crawl state │      │ - Rate limits │      │ - robots.txt  │
-│ - Domain meta │      │ - Pub/Sub     │      │               │
+│ - URL frontier│      │ - Rate limits │      │ - Page content│
+│ - Domain meta │      │ - Pub/Sub     │      │ - robots.txt  │
 └───────────────┘      └───────────────┘      └───────────────┘
 ```
 
-### Key Integration Points
+---
 
-| Flow | Path | Purpose |
-|------|------|---------|
-| URL Submission | Dashboard → API → Frontier → Worker → Dashboard | Full lifecycle |
-| Stats Streaming | Worker → Redis Pub/Sub → Stats Agg → WebSocket → Dashboard | Real-time metrics |
-| Domain Control | Dashboard → API → Redis + PostgreSQL | Rate limit updates |
+## 🔍 Deep Dive: Real-Time Protocol Choice (8 minutes)
+
+### Why WebSocket Over SSE?
+
+| Factor | WebSocket | SSE | Winner |
+|--------|-----------|-----|--------|
+| Direction | Bidirectional | Server → Client only | WebSocket |
+| Protocol | Custom frames | HTTP streaming | SSE (simpler) |
+| Reconnection | Manual handling | Built-in | SSE |
+| Browser support | Universal | Universal | Tie |
+| Future extensibility | Can add commands | Read-only | WebSocket |
+
+**Decision: ✅ WebSocket**
+
+"I'm choosing WebSocket because while SSE would work for one-way stats streaming, we'll likely want bidirectional communication later - subscribing to specific domains, pausing workers from dashboard, or filtering stats. WebSocket gives us that flexibility without protocol changes."
+
+### Stats Streaming Architecture
+
+```
+Workers                   Redis                    API Server               Dashboard
+   │                        │                          │                        │
+   │  PUBLISH crawler:stats │                          │                        │
+   │────────────────────────►                          │                        │
+   │                        │                          │                        │
+   │                        │ SUBSCRIBE crawler:stats  │                        │
+   │                        │◄─────────────────────────│                        │
+   │                        │                          │                        │
+   │                        │ Message received         │                        │
+   │                        │─────────────────────────►│                        │
+   │                        │                          │                        │
+   │                        │                          │ ws.send(stats)         │
+   │                        │                          │───────────────────────►│
+   │                        │                          │                        │
+   │                        │                          │ Fallback: poll every   │
+   │                        │                          │ 2s if Pub/Sub missed   │
+   │                        │                          │───────────────────────►│
+```
+
+### Why Redis Pub/Sub for Stats Distribution?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Direct DB polling | Simple | High DB load, latency |
+| Message queue (RabbitMQ) | Durable, acknowledgments | Overkill for ephemeral stats |
+| Redis Pub/Sub | Low latency, simple | Fire-and-forget, no persistence |
+| Kafka | Replay, partitioning | Complex setup for dashboard stats |
+
+**Decision: ✅ Redis Pub/Sub**
+
+"Stats are ephemeral - if a dashboard misses one update, the next one arrives in 2 seconds. We don't need message durability. Redis Pub/Sub gives us sub-millisecond latency with minimal complexity. The API server subscribes once and broadcasts to all WebSocket clients."
 
 ---
 
-## 🔍 Deep Dive: Shared Type Definitions (6 minutes)
+## 🏗️ Deep Dive: Type Sharing Strategy (6 minutes)
 
-### API Contract Types
+### Why Shared TypeScript Types?
 
-Both frontend and backend share common type definitions for type safety.
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Shared types folder | Simple, no tooling | Must keep in sync manually |
+| OpenAPI + codegen | Auto-generated clients | Build step, version drift |
+| GraphQL | Schema is contract | Overhead for REST-like APIs |
+| JSON Schema | Language agnostic | Verbose, less TypeScript integration |
 
-**URL Frontier Entity:**
+**Decision: ✅ Shared types folder**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| id | number | Database primary key |
-| url | string | Full URL to crawl |
-| urlHash | string | SHA-256 for dedup |
-| domain | string | Extracted hostname |
-| priority | high/medium/low | Crawl priority |
-| depth | number | Hops from seed |
-| status | pending/processing/completed/failed | Current state |
-| discoveredAt | timestamp | When found |
-| scheduledAt | timestamp | When assigned |
-| workerId | string | Assigned worker |
+"For a monorepo with TypeScript on both ends, a shared folder is simplest. Both frontend and backend import from the same source. No code generation, no schema drift. If we had multiple language clients, I'd switch to OpenAPI."
 
-**Domain Entity:**
+### Type Safety at Boundaries
 
-| Field | Type | Description |
-|-------|------|-------------|
-| id | number | Primary key |
-| domain | string | Hostname |
-| robotsTxt | string | Cached robots.txt |
-| robotsFetchedAt | timestamp | Cache time |
-| crawlDelayMs | number | Rate limit (ms) |
-| lastCrawlAt | timestamp | Last fetch |
-| totalPages | number | Pages crawled |
-| avgResponseMs | number | Avg latency |
-| isBlocked | boolean | Admin blocked |
+```
+┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+│    Frontend     │       │    Shared       │       │    Backend      │
+│                 │       │                 │       │                 │
+│  API Client     │──────►│  Type Defs      │◄──────│  Route Handlers │
+│  uses types     │       │  FrontierURL    │       │  validate with  │
+│                 │       │  Domain         │       │  Zod schemas    │
+│  Zod for forms  │       │  Worker         │       │                 │
+└─────────────────┘       └─────────────────┘       └─────────────────┘
+```
 
-**Worker Entity:**
+### Why Zod for Validation?
 
-| Field | Type | Description |
-|-------|------|-------------|
-| id | string | Worker UUID |
-| status | active/idle/error | Current state |
-| urlsProcessed | number | Total count |
-| currentDomain | string | Active domain |
-| uptimeSeconds | number | Time running |
-| lastHeartbeat | timestamp | Health check |
+| Library | Pros | Cons |
+|---------|------|------|
+| ✅ Zod | Type inference, great DX | Slightly larger bundle |
+| io-ts | Functional style, precise | Steeper learning curve |
+| Yup | Popular, schema-based | Weaker TypeScript inference |
+| class-validator | Decorators, OOP | Class-based, heavier |
 
-**Real-Time Stats:**
+**Decision: ✅ Zod**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| urlsPerSecond | number | Throughput |
-| queueDepth | number | Pending URLs |
-| activeWorkers | number | Active count |
-| failedToday | number | Error count |
-| totalCrawled | number | Total pages |
-| byPriority | object | High/medium/low counts |
-
-### Validation Rules
-
-| Field | Validation | Error Code |
-|-------|-----------|------------|
-| urls (seed) | Array of valid URLs, 1-1000 items | VALIDATION_ERROR |
-| priority | Enum: high, medium, low | VALIDATION_ERROR |
-| crawlDelayMs | Number 500-60000 | VALIDATION_ERROR |
-| isBlocked | Boolean | VALIDATION_ERROR |
-| page | Number >= 1 | VALIDATION_ERROR |
-| pageSize | Number 10-100 | VALIDATION_ERROR |
+"Zod gives us runtime validation with automatic TypeScript type inference. Define the schema once, get both validation and types. The DX is excellent - error messages are clear, composition is intuitive."
 
 ---
 
-## 🏗️ Deep Dive: End-to-End URL Submission Flow (10 minutes)
+## 📊 Deep Dive: Dual-Write Pattern for Domain Control (8 minutes)
 
-### URL Submission Sequence
+### The Problem
 
-```
-┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
-│ Dashboard│     │   API    │     │  Bloom   │     │ Frontier │     │ WebSocket│
-│          │     │  Server  │     │  Filter  │     │    DB    │     │  Clients │
-└────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘
-     │                │                │                │                │
-     │ POST /urls/seed│                │                │                │
-     │ [url1, url2...]│                │                │                │
-     │───────────────►│                │                │                │
-     │                │                │                │                │
-     │                │  Validate with │                │                │
-     │                │  Zod schema    │                │                │
-     │                │────────┐       │                │                │
-     │                │        │       │                │                │
-     │                │◄───────┘       │                │                │
-     │                │                │                │                │
-     │                │ Check each URL │                │                │
-     │                │───────────────►│                │                │
-     │                │                │                │                │
-     │                │ not seen (new) │                │                │
-     │                │◄───────────────│                │                │
-     │                │                │                │                │
-     │                │                │ INSERT batch   │                │
-     │                │                │ ON CONFLICT    │                │
-     │                │─────────────────────────────────►                │
-     │                │                │                │                │
-     │                │                │ Mark URLs seen │                │
-     │                │───────────────►│                │                │
-     │                │                │                │                │
-     │                │                │                │ Broadcast      │
-     │                │                │                │ frontier-update│
-     │                │─────────────────────────────────────────────────►│
-     │                │                │                │                │
-     │ 200 OK         │                │                │                │
-     │ {added: N}     │                │                │                │
-     │◄───────────────│                │                │                │
-```
+When an operator changes a domain's crawl delay from the dashboard, workers need to see that change immediately. But we also need the change persisted.
 
-### URL Normalization Steps
-
-1. Parse URL with standard URL parser
-2. Remove hash fragments
-3. Normalize trailing slashes (remove except root)
-4. Lowercase the entire URL
-5. Compute SHA-256 hash for deduplication
-
-### Seed URL Modal Flow
-
-```
-┌─────────────────────────────────────────────┐
-│           Add Seed URLs Modal               │
-├─────────────────────────────────────────────┤
-│                                             │
-│  URLs (one per line):                       │
-│  ┌─────────────────────────────────────┐   │
-│  │ https://example.com                  │   │
-│  │ https://example.com/page             │   │
-│  │ https://other-site.com               │   │
-│  │                                      │   │
-│  │                                      │   │
-│  └─────────────────────────────────────┘   │
-│  3 URLs entered                             │
-│                                             │
-│  Priority:                                  │
-│  ○ High   ● Medium   ○ Low                 │
-│                                             │
-│  ┌─────────────────────────────────────┐   │
-│  │ ✓ Added 2 URLs (1 duplicate skipped)│   │
-│  └─────────────────────────────────────┘   │
-│                                             │
-│           [Cancel]  [Add URLs]              │
-└─────────────────────────────────────────────┘
-```
-
-### API Client Design
-
-| Endpoint | Method | Request | Response |
-|----------|--------|---------|----------|
-| /urls | GET | URLFilters | PaginatedResponse<FrontierURL> |
-| /urls/seed | POST | AddSeedURLsRequest | {added, duplicates, message} |
-| /urls/:id | DELETE | - | void |
-| /domains | GET | page, pageSize | PaginatedResponse<Domain> |
-| /domains/:domain | GET | - | Domain |
-| /domains/:domain | PATCH | UpdateDomainRequest | Domain |
-| /workers | GET | - | Worker[] |
-| /stats | GET | - | CrawlStats |
-
----
-
-## 📊 Deep Dive: Real-Time Stats with WebSocket (8 minutes)
-
-### WebSocket Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        WebSocket Server                              │
-│                                                                      │
-│  ┌─────────────┐    ┌──────────────┐    ┌────────────────────────┐ │
-│  │   Clients   │    │  Subscriber  │    │   Stats Aggregator     │ │
-│  │   (Set)     │◄───│   (Redis)    │◄───│                        │ │
-│  │             │    │              │    │ - Fetch from Redis     │ │
-│  │ - Dashboard │    │ Subscribe:   │    │ - Pipeline queries     │ │
-│  │   instances │    │ crawler:stats│    │ - Combine metrics      │ │
-│  └─────────────┘    └──────────────┘    └────────────────────────┘ │
-│         │                                          │                │
-│         │              Broadcast                   │                │
-│         │◄─────────────────────────────────────────│                │
-│         │                                                           │
-│         │         Every 2 seconds (fallback)                       │
-│         │◄──────────────────────────────────────────────────────── │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Stats Aggregation from Redis
-
-| Redis Key | Type | Description |
-|-----------|------|-------------|
-| stats:urls_per_second | STRING | Current throughput |
-| stats:queue_depth | STRING | Pending URL count |
-| workers:active | SET | Active worker IDs |
-| stats:failed_today | STRING | Daily error count |
-| stats:total_crawled | STRING | Total pages fetched |
-| stats:priority:high | STRING | High priority count |
-| stats:priority:medium | STRING | Medium priority count |
-| stats:priority:low | STRING | Low priority count |
-| stats:throughput | SORTED SET | Sliding window (60s) |
-
-### Worker Stats Publishing Flow
-
-```
-┌────────────┐                    ┌────────────┐                    ┌────────────┐
-│   Worker   │                    │   Redis    │                    │ WebSocket  │
-│            │                    │            │                    │  Clients   │
-└─────┬──────┘                    └─────┬──────┘                    └─────┬──────┘
-      │                                 │                                 │
-      │ On startup:                     │                                 │
-      │ SADD workers:active             │                                 │
-      │ HSET worker:{id} status, time   │                                 │
-      │────────────────────────────────►│                                 │
-      │                                 │                                 │
-      │ On each crawl:                  │                                 │
-      │ INCR stats:total_crawled        │                                 │
-      │ INCR stats:failed_today (if err)│                                 │
-      │ ZADD stats:throughput timestamp │                                 │
-      │────────────────────────────────►│                                 │
-      │                                 │                                 │
-      │ PUBLISH crawler:stats {...}     │                                 │
-      │────────────────────────────────►│                                 │
-      │                                 │ Broadcast to                    │
-      │                                 │ all clients                     │
-      │                                 │────────────────────────────────►│
-      │                                 │                                 │
-      │ Heartbeat every 5s:             │                                 │
-      │ Calculate URLs/sec from window  │                                 │
-      │ Update queue depth              │                                 │
-      │ EXPIRE worker:{id} 30s          │                                 │
-      │────────────────────────────────►│                                 │
-```
-
-### Frontend WebSocket Hook
-
-| State | Description |
-|-------|-------------|
-| wsRef | WebSocket instance reference |
-| reconnectTimeoutRef | Auto-reconnect timer |
-| connected | Connection status for UI |
-
-| Event | Handler |
-|-------|---------|
-| onopen | Set connected=true, clear reconnect timer |
-| onmessage | Parse JSON, update stats store |
-| onclose | Set connected=false, schedule reconnect (3s) |
-| onerror | Log error, close connection |
-
----
-
-## 🏗️ Deep Dive: Domain Management Flow (6 minutes)
-
-### Domain Update Sequence
+### Solution: Write to Both Redis and PostgreSQL
 
 ```
 Dashboard                API Server               Redis              PostgreSQL
@@ -351,127 +191,112 @@ Dashboard                API Server               Redis              PostgreSQL
     │  {crawlDelayMs: 2000}  │                      │                     │
     │───────────────────────►│                      │                     │
     │                        │                      │                     │
-    │                        │  Validate with       │                     │
-    │                        │  Zod schema          │                     │
-    │                        │                      │                     │
     │                        │  SET crawldelay:foo  │                     │
-    │                        │───────────────────►  │                     │
+    │                        │───────────────────►  │  (immediate effect) │
     │                        │                      │                     │
-    │                        │  UPDATE domains      │                     │
+    │                        │  UPDATE domains...   │                     │
     │                        │──────────────────────────────────────────► │
+    │                        │                      │  (durable storage)  │
     │                        │                      │                     │
-    │                        │  PUBLISH domain:update                     │
-    │                        │───────────────────►  │                     │
-    │                        │                      │                     │
-    │  200 OK {domain}       │                      │                     │
-    │◄───────────────────────│                      │                     │
-    │                        │                      │                     │
-    │  WebSocket: domain     │                      │                     │
-    │  update notification   │◄──────────────────── │                     │
+    │  200 OK                │                      │                     │
     │◄───────────────────────│                      │                     │
 ```
 
-### Dual-Write Strategy
+### Why Not Just PostgreSQL?
 
-Updates go to both Redis (immediate worker effect) and PostgreSQL (persistence):
+| Approach | Latency | Durability | Worker Complexity |
+|----------|---------|------------|-------------------|
+| PostgreSQL only | ~5-50ms | ✓ | Query on every URL |
+| Redis only | ~1ms | ✗ | Simple key lookup |
+| ✅ Both (dual-write) | ~1ms read | ✓ | Simple key lookup |
 
-| Update Type | Redis Action | PostgreSQL Action |
-|-------------|--------------|-------------------|
-| crawlDelayMs | SET crawldelay:{domain} | UPDATE domains SET crawl_delay |
-| isBlocked=true | SADD blocked_domains | UPDATE domains SET is_blocked |
-| isBlocked=false | SREM blocked_domains | UPDATE domains SET is_blocked |
+**Decision: ✅ Dual-write**
 
-Workers check Redis first for rate limits, ensuring immediate effect of dashboard changes.
+"Workers check rate limits on every URL fetch. Hitting PostgreSQL every time would add latency and load. Redis gives us microsecond reads. We write to both - Redis for immediate effect, PostgreSQL for durability across restarts."
 
----
+### Handling Dual-Write Failures
 
-## ⚠️ Error Handling Across the Stack (4 minutes)
+| Scenario | Handling |
+|----------|----------|
+| Redis write fails | Return error, don't update PostgreSQL |
+| PostgreSQL write fails | Redis already updated, log for reconciliation |
+| Both succeed | Ideal path |
 
-### Backend Error Response Format
-
-| Field | Type | Description |
-|-------|------|-------------|
-| error | string | Human-readable message |
-| code | string | Machine-readable error code |
-| details | object | Field-specific errors (validation) |
-| stack | string | Stack trace (dev only) |
-
-### Error Code Catalog
-
-| Code | HTTP Status | Scenario |
-|------|-------------|----------|
-| VALIDATION_ERROR | 400 | Invalid request data |
-| NOT_FOUND | 404 | Resource doesn't exist |
-| RATE_LIMITED | 429 | Too many requests |
-| INTERNAL_ERROR | 500 | Unexpected server error |
-
-### Frontend Error Handling Layers
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Application Root                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              Error Boundary (React)                        │  │
-│  │  - Catches render errors                                   │  │
-│  │  - Shows fallback UI                                       │  │
-│  │  - Logs to error tracking                                  │  │
-│  │  - Offers page reload                                      │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              Toast Notification System                     │  │
-│  │  - API error display                                       │  │
-│  │  - Auto-dismiss after 5 seconds                            │  │
-│  │  - Success/error/warning variants                          │  │
-│  │  - Queue multiple toasts                                   │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              API Client Layer                              │  │
-│  │  - Parse error responses                                   │  │
-│  │  - Throw typed errors                                      │  │
-│  │  - Handle network failures                                 │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+"We accept eventual consistency. If PostgreSQL fails after Redis succeeds, the worker has the new rate limit but it won't survive a restart. A background job can reconcile periodically."
 
 ---
 
-## ⚖️ Trade-offs and Alternatives (2 minutes)
+## ⚠️ Error Handling Philosophy (4 minutes)
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Real-time Protocol | ✅ WebSocket | ❌ SSE | Bidirectional for future extensibility |
-| Type Sharing | ✅ Shared folder | ❌ OpenAPI codegen | Simpler, no build step |
-| Validation | ✅ Zod | ❌ io-ts | Better DX, TypeScript integration |
-| State Updates | ✅ Zustand + WebSocket | ❌ React Query | More control over streaming data |
-| Error Handling | ✅ Custom classes | ❌ HTTP Problem Details | Simpler implementation |
+### Backend: Typed Error Classes
+
+| Error Type | HTTP Status | When Used |
+|------------|-------------|-----------|
+| ValidationError | 400 | Invalid input (Zod failure) |
+| NotFoundError | 404 | Domain/URL doesn't exist |
+| RateLimitError | 429 | Too many requests |
+| InternalError | 500 | Unexpected failures |
+
+### Why Custom Classes Over HTTP Problem Details?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Custom error classes | Simple, TypeScript-native | Non-standard |
+| RFC 7807 Problem Details | Standard format | More verbose |
+| Plain objects | Flexible | No structure |
+
+**Decision: ✅ Custom classes**
+
+"For an internal API, custom error classes with `code` and `message` fields are simpler. Problem Details adds value for public APIs where clients need standardization."
+
+### Frontend: Layered Error Handling
+
+```
+┌─────────────────────────────────────────┐
+│         Error Boundary (React)          │  ← Catches render crashes
+├─────────────────────────────────────────┤
+│         Toast Notifications             │  ← Shows API errors
+├─────────────────────────────────────────┤
+│         API Client Layer                │  ← Parses error responses
+└─────────────────────────────────────────┘
+```
+
+"Three layers: Error Boundary catches React crashes, Toasts show API errors to users, API client layer parses and types the errors. Each layer has a specific job."
+
+---
+
+## ⚖️ Trade-offs Summary (2 minutes)
+
+| Decision | Chosen | Rejected | Why |
+|----------|--------|----------|-----|
+| Real-time protocol | ✅ WebSocket | ❌ SSE | Bidirectional for future features |
+| Stats distribution | ✅ Redis Pub/Sub | ❌ Kafka | Ephemeral data, simplicity |
+| Type sharing | ✅ Shared folder | ❌ OpenAPI codegen | Monorepo, no build step |
+| Validation | ✅ Zod | ❌ io-ts | Better DX, type inference |
+| Domain updates | ✅ Dual-write | ❌ PostgreSQL only | Low-latency worker reads |
+| Error format | ✅ Custom classes | ❌ Problem Details | Internal API, simplicity |
 
 ---
 
 ## 🚀 Future Enhancements
 
-With more time, I would add:
+With more time:
 
-1. **OpenAPI spec generation** - Auto-generate from Zod schemas for client codegen
-2. **Optimistic updates** - Instant UI feedback for domain management
-3. **Request retries** - Exponential backoff in API client
-4. **GraphQL subscriptions** - Alternative real-time protocol
-5. **End-to-end testing** - Playwright for critical user flows
+1. **OpenAPI generation** - If we add non-TypeScript clients
+2. **Optimistic updates** - Show changes before server confirms
+3. **WebSocket commands** - Subscribe to specific domain stats
+4. **Circuit breaker** - Frontend gracefully degrades if backend fails
 
 ---
 
 ## 📝 Summary
 
-"I've designed a distributed web crawler with full-stack integration:
+"I've designed a distributed web crawler with full-stack integration focused on:
 
-1. **Shared TypeScript types** - API contract consistency across frontend and backend
-2. **End-to-end URL flow** - Dashboard submission through worker processing
-3. **Real-time WebSocket** - Streaming crawler stats with 2-second latency
-4. **Domain management** - Immediate Redis updates for worker rate limits
-5. **Consistent error handling** - Typed errors with toast notifications
+1. **WebSocket over SSE** - Bidirectional for future extensibility
+2. **Redis Pub/Sub** - Low-latency ephemeral stats, no Kafka complexity
+3. **Shared TypeScript types** - Simple monorepo approach, no codegen
+4. **Dual-write for domain control** - Immediate Redis + durable PostgreSQL
+5. **Layered error handling** - Each layer has specific responsibility
 
-The architecture prioritizes type safety and real-time visibility while maintaining clean separation between frontend and backend responsibilities."
+The key insight is matching technology to data characteristics - ephemeral stats use Pub/Sub, durable config uses dual-write, and type safety comes from shared code rather than generated clients."
