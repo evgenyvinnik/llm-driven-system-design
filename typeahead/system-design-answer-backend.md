@@ -2,727 +2,403 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Problem Statement
+---
 
-Design the backend infrastructure for a typeahead/autocomplete system that:
-- Provides instant search suggestions as users type
-- Achieves sub-50ms latency for prefix matching across billions of queries
-- Balances popularity, personalization, and trending topics in ranking
-- Handles 100K+ QPS with high availability
+## 📋 Introduction
 
-## Requirements Clarification
+"Today I'll design the backend infrastructure for a typeahead autocomplete system. This is one of the most latency-sensitive systems in any search product - users expect instant suggestions as they type, typically within 50 milliseconds. I'll walk through the core data structures, sharding strategy, ranking approach, and the real-time pipeline that keeps suggestions fresh."
+
+---
+
+## 🎯 Requirements
 
 ### Functional Requirements
-1. **Suggest**: Return top suggestions for any prefix
-2. **Rank**: Order by relevance (popularity, recency, personalization)
-3. **Personalize**: User-specific suggestion boosting
-4. **Update**: Reflect trending topics in near real-time
-5. **Filter**: Remove inappropriate or blocked content
+
+1. **Suggest** - Return top suggestions for any prefix typed by the user
+2. **Rank** - Order suggestions by relevance combining popularity, recency, and personalization
+3. **Personalize** - Boost suggestions based on user's search history
+4. **Update** - Reflect trending topics in near real-time (within 5 minutes)
+5. **Filter** - Remove inappropriate or blocked content from suggestions
 
 ### Non-Functional Requirements
-1. **Latency**: < 50ms P99
-2. **Availability**: 99.99%
-3. **Scale**: 100K+ QPS
-4. **Freshness**: Trending within 5 minutes
+
+| Requirement | Target | Rationale |
+|-------------|--------|-----------|
+| Latency | P99 < 50ms | Users expect instant feedback while typing |
+| Availability | 99.99% | Core to search experience |
+| Scale | 100K+ QPS | Peak traffic during major events |
+| Freshness | < 5 minutes | Trending topics must surface quickly |
 
 ### Scale Estimates
-- Unique queries: 1 billion
-- QPS at peak: 100,000+
+
+- Unique phrases indexed: 1 billion
+- Queries per second at peak: 100,000+
 - Suggestions per request: 5-10
-- Index update frequency: Every minute
+- Index update frequency: Every minute for trending, nightly for full rebuild
 
-## High-Level Architecture
+---
+
+## 🏗️ High-Level Design
+
+"Let me sketch the high-level architecture on the whiteboard."
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│              Search Box | Mobile App | API                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-│               (Load Balancing, Caching)                         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Suggestion Service                             │
-│         (Prefix Matching, Ranking, Personalization)             │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Trie Servers │    │Ranking Service│    │   User Data   │
-│               │    │               │    │               │
-│ - Prefix match│    │ - Score calc  │    │ - History     │
-│ - Sharded     │    │ - Trending    │    │ - Preferences │
-└───────────────┘    └───────────────┘    └───────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Aggregation Pipeline                          │
-│          Query Logs → Count → Filter → Trie Build              │
-└─────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------+
+|                        CLIENT LAYER                               |
+|              Search Box  |  Mobile App  |  API                    |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                       API GATEWAY                                 |
+|              Load Balancing  |  Rate Limiting  |  CDN             |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                   SUGGESTION SERVICE                              |
+|        Prefix Matching  |  Ranking  |  Personalization            |
++------------------------------------------------------------------+
+        |                      |                      |
+        v                      v                      v
++----------------+    +----------------+    +----------------+
+|  TRIE SERVERS  |    | RANKING SERVICE|    |   USER DATA    |
+|                |    |                |    |                |
+| - Sharded by   |    | - Score calc   |    | - History      |
+|   first char   |    | - Trending     |    | - Preferences  |
+| - In-memory    |    | - Weights      |    | - Redis cache  |
++----------------+    +----------------+    +----------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                  AGGREGATION PIPELINE                             |
+|      Query Logs --> Kafka --> Count --> Filter --> Trie Build     |
++------------------------------------------------------------------+
+        |                      |                      |
+        v                      v                      v
++----------------+    +----------------+    +----------------+
+|    KAFKA       |    |  POSTGRESQL    |    |     REDIS      |
+|                |    |                |    |                |
+| - Query stream |    | - Phrase counts|    | - Trending     |
+| - Partitioned  |    | - User history |    | - Cache layer  |
++----------------+    +----------------+    +----------------+
 ```
 
-## Deep Dive: Trie with Pre-computed Top-K
+"The key insight is separating the read path from the write path. The read path needs to be extremely fast - we serve suggestions directly from in-memory tries. The write path can be eventually consistent - we aggregate query logs through Kafka and periodically update the tries."
 
-This is the key data structure enabling sub-50ms latency.
+---
 
-### Trie Implementation
+## 🔍 Deep Dive: Trie Data Structure
 
-```javascript
-class TrieNode {
-  constructor() {
-    this.children = new Map();   // Character -> TrieNode
-    this.isEndOfWord = false;
-    this.suggestions = [];        // Pre-computed top-k at this prefix
-    this.count = 0;
-  }
-}
+"The core of this system is choosing the right data structure for prefix matching. Let me walk through the options."
 
-class Trie {
-  constructor(topK = 10) {
-    this.root = new TrieNode();
-    this.topK = topK;
-  }
+### Why Trie Over Inverted Index or Elasticsearch?
 
-  insert(phrase, count) {
-    let node = this.root;
+| Approach | Prefix Lookup | Memory | Update Cost | Fuzzy Support | Best For |
+|----------|---------------|--------|-------------|---------------|----------|
+| **Trie with Top-K** | O(prefix_len) | Higher | O(k log k) | No | Exact prefix matching |
+| Radix Trie | O(prefix_len) | Medium | O(k log k) | No | Memory-constrained prefix |
+| DAWG | O(prefix_len) | Low | Expensive rebuild | No | Static datasets |
+| Inverted Index | O(1) hash + scan | Medium | O(1) | Yes | Full-text search |
+| Elasticsearch | O(1) | High | Near real-time | Yes | Complex queries |
 
-    for (const char of phrase.toLowerCase()) {
-      if (!node.children.has(char)) {
-        node.children.set(char, new TrieNode());
-      }
-      node = node.children.get(char);
+**Decision: Trie with pre-computed top-K**
 
-      // Update top-k suggestions at each prefix node
-      this.updateSuggestions(node, phrase, count);
-    }
+"I'm choosing a trie with pre-computed top-K suggestions at each node because our primary access pattern is exact prefix matching. When a user types 'weat', I need to instantly return 'weather', 'weather forecast', 'weather today'. A trie gives me O(prefix_length) lookup - I just traverse down the tree following each character.
 
-    node.isEndOfWord = true;
-    node.count = count;
-  }
+The key optimization is storing the top-K suggestions at every node, not just at leaf nodes. When I reach the node for 'weat', I already have the top 10 suggestions pre-computed. I don't need to traverse the entire subtree to find them.
 
-  updateSuggestions(node, phrase, count) {
-    // Add or update this phrase in suggestions
-    const existing = node.suggestions.find(s => s.phrase === phrase);
-    if (existing) {
-      existing.count = count;
-    } else {
-      node.suggestions.push({ phrase, count });
-    }
+Elasticsearch would work for fuzzy matching, but it adds network latency and complexity we don't need for exact prefix matching. An inverted index is great for full-text search but doesn't handle the 'starts with' pattern efficiently."
 
-    // Sort and keep top-k
-    node.suggestions.sort((a, b) => b.count - a.count);
-    if (node.suggestions.length > this.topK) {
-      node.suggestions = node.suggestions.slice(0, this.topK);
-    }
-  }
+### Why Pre-computed Top-K Over Traversal?
 
-  getSuggestions(prefix) {
-    let node = this.root;
+| Approach | Query Time | Space | Update Cost | When to Use |
+|----------|------------|-------|-------------|-------------|
+| **Pre-computed top-K** | O(prefix_len) | Higher | O(k log k) per update | High QPS, latency-critical |
+| Traverse subtree | O(subtree size) | Lower | O(1) | Low QPS, memory-constrained |
+| Hybrid (lazy compute) | O(prefix_len) + compute | Medium | O(1) | Medium QPS |
 
-    for (const char of prefix.toLowerCase()) {
-      if (!node.children.has(char)) {
-        return []; // No matches for this prefix
-      }
-      node = node.children.get(char);
-    }
+**Decision: Pre-computed top-K at each node**
 
-    return node.suggestions;
-  }
-}
+"The trade-off here is memory versus latency. By storing top-10 suggestions at every node in the trie, I'm using significantly more memory - roughly 10x more. But at 100K QPS, I cannot afford to traverse subtrees. A popular prefix like 'the' might have millions of completions.
+
+With pre-computed top-K, my lookup is always O(prefix_length) - typically 3-10 character comparisons. I can serve suggestions in under 10 milliseconds, leaving plenty of headroom for network latency and ranking.
+
+The update cost is O(k log k) per insertion, since I need to re-sort the suggestions. But updates happen in the background aggregation pipeline, not in the request path."
+
+---
+
+## 🔍 Deep Dive: Sharding Strategy
+
+"With a billion phrases, I need to shard the trie across multiple servers. Let me discuss the options."
+
+### Why First-Character Sharding Over Consistent Hashing?
+
+| Strategy | Prefix Locality | Distribution | Routing | Hot Spots |
+|----------|-----------------|--------------|---------|-----------|
+| **First character** | Excellent | Uneven (s > x) | Simple | Yes ('s', 'a', 't') |
+| First 2 characters | Good | Better | Simple | Fewer |
+| Consistent hashing | None | Even | Hash lookup | No |
+| Range-based | Good | Configurable | Range lookup | Tunable |
+
+**Decision: First-character sharding with hot spot mitigation**
+
+"I'm choosing first-character sharding because it preserves prefix locality. When a user types 'a', then 'ap', then 'app', all these queries go to the same shard. This means I can cache effectively at the shard level, and I don't need to fan out queries to multiple shards.
+
+The downside is uneven distribution. The 's' shard will be much larger than the 'x' shard. To handle this, I use sub-sharding for hot characters:
+
+```
++------------------+     +------------------+     +------------------+
+|   SHARD 'a'      |     |   SHARD 'a'      |     |   SHARD 'a'      |
+|   (sub-shard 1)  |     |   (sub-shard 2)  |     |   (sub-shard 3)  |
+|   aa-ah          |     |   ai-ap          |     |   aq-az          |
++------------------+     +------------------+     +------------------+
 ```
 
-### Why Pre-compute Top-K?
+For the 'a' prefix, I look at the second character to pick the sub-shard. The 'x' shard might only have one server, while 's' has three. This lets me scale hot spots independently.
 
-| Approach | Query Time | Space | Update Cost |
-|----------|------------|-------|-------------|
-| Traverse subtree | O(subtree size) | Low | O(1) |
-| Pre-computed top-k | O(prefix length) | Higher | O(k log k) |
+Consistent hashing would give even distribution, but I'd need to query all shards for every prefix - that's unacceptable latency at our scale."
 
-**Trade-off**: We use more memory to store top-k at each node, but queries are O(prefix_length) instead of O(subtree). For 100K QPS, this is essential.
+---
 
-### Data Structure Alternatives
+## 🔍 Deep Dive: Ranking Algorithm
 
-| Data Structure | Prefix Lookup | Memory | Update Cost | Fuzzy Support | Best For |
-|----------------|---------------|--------|-------------|---------------|----------|
-| **Trie** | O(prefix_len) | High | O(k log k) | No | Exact prefix matching |
-| **Radix Trie** | O(prefix_len) | Medium | O(k log k) | No | Memory-constrained prefix |
-| **DAWG** | O(prefix_len) | Low | Expensive rebuild | No | Static datasets |
-| **Inverted Index** | O(1) hash + scan | Medium | O(1) | Yes | Full-text search |
-| **Elasticsearch** | O(1) | High | Near real-time | Yes | Complex queries |
+"Once I have candidate suggestions from the trie, I need to rank them. Let me walk through the ranking approach."
 
-**Decision**: Trie with pre-computed top-k provides optimal prefix lookup time.
-
-## Deep Dive: Sharding Strategy
-
-```javascript
-class TrieServer {
-  constructor(shardId, totalShards) {
-    this.shardId = shardId;
-    this.totalShards = totalShards;
-    this.trie = new Trie();
-  }
-
-  // Route by first character for prefix locality
-  static getShardForPrefix(prefix, totalShards) {
-    const firstChar = prefix.charAt(0).toLowerCase();
-    return firstChar.charCodeAt(0) % totalShards;
-  }
-}
-
-class SuggestionService {
-  async getSuggestions(prefix, options = {}) {
-    // Route to correct shard
-    const shardId = TrieServer.getShardForPrefix(prefix, this.shards.length);
-    const shardAddress = this.shards[shardId];
-
-    // Check cache first
-    const cacheKey = `suggestions:${prefix}`;
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-
-    // Query shard
-    const suggestions = await this.queryShard(shardAddress, prefix);
-
-    // Cache with short TTL (60 seconds)
-    await redis.setex(cacheKey, 60, JSON.stringify(suggestions));
-
-    return suggestions;
-  }
-}
-```
-
-### Sharding Strategy Comparison
-
-| Strategy | Locality | Distribution | Routing | Hot Spots |
-|----------|----------|--------------|---------|-----------|
-| **First character** | Excellent | Uneven (s > x) | Simple | Yes ('s', 't', 'a') |
-| **First 2 chars** | Good | Better | Simple | Fewer |
-| **Consistent hashing** | None | Even | Hash lookup | No |
-| **Range-based** | Good | Configurable | Range lookup | Tunable |
-
-**Decision**: First character sharding preserves prefix locality (queries for "app" and "apple" go to same shard).
-
-### Handling Hot Spots
-
-```javascript
-// Split hot shards into sub-shards
-const shardMap = {
-  'a': ['a-shard-1', 'a-shard-2', 'a-shard-3'],  // 'a' is hot, use 3 sub-shards
-  'b': ['b-shard-1'],
-  's': ['s-shard-1', 's-shard-2'],  // 's' is hot
-};
-
-function getShard(prefix) {
-  const firstChar = prefix.charAt(0).toLowerCase();
-  const shards = shardMap[firstChar] || ['default-shard'];
-
-  if (shards.length === 1) return shards[0];
-
-  // Use second character for sub-shard routing
-  const secondChar = prefix.charAt(1) || 'a';
-  return shards[secondChar.charCodeAt(0) % shards.length];
-}
-```
-
-## Deep Dive: Multi-Factor Ranking
-
-```javascript
-class RankingService {
-  async rank(suggestions, context) {
-    const { userId, prefix } = context;
-
-    const scored = await Promise.all(
-      suggestions.map(async suggestion => {
-        // Base popularity score (logarithmic scaling)
-        const popularityScore = Math.log10(suggestion.count + 1);
-
-        // Recency score (decay older queries)
-        const recencyScore = this.calculateRecency(suggestion.lastUpdated);
-
-        // Personalization score
-        let personalScore = 0;
-        if (userId) {
-          personalScore = await this.getPersonalScore(userId, suggestion.phrase);
-        }
-
-        // Trending boost
-        const trendingBoost = await this.getTrendingBoost(suggestion.phrase);
-
-        // Prefix match quality
-        const matchQuality = this.calculateMatchQuality(prefix, suggestion.phrase);
-
-        // Combine with weights
-        const finalScore =
-          popularityScore * 0.30 +
-          recencyScore * 0.15 +
-          personalScore * 0.25 +
-          trendingBoost * 0.20 +
-          matchQuality * 0.10;
-
-        return { ...suggestion, score: finalScore };
-      })
-    );
-
-    return scored.sort((a, b) => b.score - a.score);
-  }
-
-  calculateRecency(lastUpdated) {
-    const ageInHours = (Date.now() - lastUpdated) / (1000 * 60 * 60);
-    // Exponential decay with 1-week half-life
-    return Math.exp(-ageInHours / 168);
-  }
-
-  async getPersonalScore(userId, phrase) {
-    const userHistory = await redis.get(`user_history:${userId}`);
-    if (!userHistory) return 0;
-
-    const history = JSON.parse(userHistory);
-    const match = history.find(h => h.phrase === phrase);
-
-    if (match) {
-      // Decay personal relevance over time
-      const daysSince = (Date.now() - match.timestamp) / (1000 * 60 * 60 * 24);
-      return Math.exp(-daysSince / 30); // 30-day half-life
-    }
-
-    return 0;
-  }
-
-  async getTrendingBoost(phrase) {
-    const trending = await redis.zscore('trending_queries', phrase);
-    if (!trending) return 0;
-    return Math.min(trending / 1000, 1.0);
-  }
-}
-```
-
-### Ranking Algorithm Alternatives
+### Why Weighted Formula Over ML Ranking?
 
 | Approach | Personalization | Latency | Complexity | Explainability |
 |----------|-----------------|---------|------------|----------------|
 | **Weighted formula** | Basic | <1ms | Low | High |
-| **ML model (LTR)** | Advanced | 5-20ms | High | Low |
-| **Two-stage ranking** | Advanced | 2-10ms | Medium | Medium |
-| **Contextual bandits** | Adaptive | 1-5ms | Medium | Medium |
+| ML model (LTR) | Advanced | 5-20ms | High | Low |
+| Two-stage ranking | Advanced | 2-10ms | Medium | Medium |
+| Contextual bandits | Adaptive | 1-5ms | Medium | Medium |
 
-**Decision**: Weighted formula for simplicity and explainability. ML can be added later.
+**Decision: Weighted formula with tunable weights**
 
-## Deep Dive: Real-Time Aggregation Pipeline
+"I'm choosing a weighted formula because it's fast, explainable, and sufficient for our needs. At sub-50ms latency requirements, I cannot afford 10-20ms for ML model inference.
 
-```javascript
-class AggregationPipeline {
-  constructor() {
-    this.buffer = new Map();  // phrase -> count
-    this.flushInterval = 60000; // 1 minute
-  }
-
-  async start() {
-    // Subscribe to query log stream
-    kafka.subscribe('query_logs', async (message) => {
-      await this.processQuery(message);
-    });
-
-    // Periodic flush to trie servers
-    setInterval(() => this.flush(), this.flushInterval);
-  }
-
-  async processQuery(message) {
-    const { query, timestamp, userId } = JSON.parse(message);
-
-    // Filter inappropriate content
-    if (await this.isInappropriate(query)) return;
-
-    // Filter low-quality queries
-    if (this.isLowQuality(query)) return;
-
-    // Increment buffer count
-    const current = this.buffer.get(query) || 0;
-    this.buffer.set(query, current + 1);
-
-    // Update trending counters
-    await this.updateTrending(query, timestamp);
-  }
-
-  isLowQuality(query) {
-    if (query.length < 2) return true;         // Too short
-    if (query.length > 100) return true;       // Too long
-    if (/^\d+$/.test(query)) return true;      // Only numbers
-    if (/^[asdfghjklqwertyuiopzxcvbnm]{10,}$/i.test(query)) return true; // Keyboard smash
-    return false;
-  }
-
-  async updateTrending(query, timestamp) {
-    // Sliding window counter (5-minute windows)
-    const windowKey = `trending_window:${Math.floor(timestamp / 300000)}`;
-
-    await redis.zincrby(windowKey, 1, query);
-    await redis.expire(windowKey, 3600); // Keep 1 hour of windows
-
-    // Periodically aggregate for trending
-    await this.aggregateTrending();
-  }
-
-  async flush() {
-    if (this.buffer.size === 0) return;
-
-    const updates = Array.from(this.buffer.entries());
-    this.buffer.clear();
-
-    // Group by shard and send updates
-    const shardUpdates = new Map();
-    for (const [phrase, count] of updates) {
-      const shardId = TrieServer.getShardForPrefix(phrase, this.shardCount);
-      if (!shardUpdates.has(shardId)) {
-        shardUpdates.set(shardId, []);
-      }
-      shardUpdates.get(shardId).push({ phrase, count });
-    }
-
-    for (const [shardId, phraseUpdates] of shardUpdates) {
-      await this.sendUpdates(shardId, phraseUpdates);
-    }
-  }
-}
-```
-
-### Trie Rebuild Strategy
-
-- **Incremental updates**: Add delta counts every minute
-- **Full rebuild**: Nightly rebuild from aggregated data
-- **A/B deployment**: Build new trie, swap atomically
-
-## Database Schema
-
-```sql
--- Phrase counts (aggregated)
-CREATE TABLE phrase_counts (
-  phrase VARCHAR(200) PRIMARY KEY,
-  count BIGINT DEFAULT 0,
-  last_updated TIMESTAMP DEFAULT NOW(),
-  is_filtered BOOLEAN DEFAULT FALSE
-);
-
-CREATE INDEX idx_phrase_count ON phrase_counts(count DESC);
-
--- Query logs (raw, for aggregation)
-CREATE TABLE query_logs (
-  id BIGSERIAL PRIMARY KEY,
-  query VARCHAR(200) NOT NULL,
-  user_id UUID,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  session_id VARCHAR(100)
-);
-
-CREATE INDEX idx_query_logs_time ON query_logs(timestamp);
-
--- User search history (for personalization)
-CREATE TABLE user_history (
-  user_id UUID NOT NULL,
-  phrase VARCHAR(200) NOT NULL,
-  count INTEGER DEFAULT 1,
-  last_searched TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (user_id, phrase)
-);
-
--- Filtered phrases (inappropriate content)
-CREATE TABLE filtered_phrases (
-  phrase VARCHAR(200) PRIMARY KEY,
-  reason VARCHAR(50),
-  added_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-## Caching Strategy
-
-### Multi-Layer Cache
+My ranking formula combines five signals:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Request: GET /api/v1/suggestions?q={prefix}             │
-└───────────────────────┬──────────────────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│  1. Check Redis cache: suggestions:{prefix}              │
-│     Hit? → Return cached data                            │
-│     Miss? → Continue                                     │
-└───────────────────────┬─────────────────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│  2. Query trie shard for prefix                          │
-│     → Get base suggestions                               │
-└───────────────────────┬─────────────────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│  3. Apply ranking (popularity + trending + personal)     │
-│     → Store in cache (TTL: 60 seconds)                   │
-│     → Return ranked suggestions                          │
-└─────────────────────────────────────────────────────────┘
++------------------------+--------+------------------------------------+
+|       Signal           | Weight |           Calculation              |
++------------------------+--------+------------------------------------+
+| Popularity             |  30%   | log10(search_count + 1)            |
+| Recency                |  15%   | Exponential decay, 1-week half-life|
+| Personalization        |  25%   | Match against user's search history|
+| Trending               |  20%   | Sliding window counter score       |
+| Match quality          |  10%   | How closely prefix matches phrase  |
++------------------------+--------+------------------------------------+
 ```
 
-### Cache Key Design
+Logarithmic scaling for popularity prevents mega-popular queries from dominating. Recency decay means suggestions stay fresh. Personalization uses the user's recent searches stored in Redis. Trending comes from sliding window counters that detect spikes in the last few minutes.
 
-```javascript
-const CACHE_KEYS = {
-  // Prefix suggestions (short TTL for freshness)
-  suggestions: (prefix) => `suggestions:${prefix}`,
+If we needed deeper personalization later, I could add a lightweight ML re-ranker as a second stage - retrieve 50 candidates with the formula, then re-rank to top 10 with ML. But I'd start simple."
 
-  // Trending queries (very short TTL)
-  trending: () => `trending_queries`,
+---
 
-  // User history (longer TTL, invalidate on search)
-  userHistory: (userId) => `user_history:${userId}`,
+## 🔍 Deep Dive: Real-Time Aggregation Pipeline
 
-  // Sliding window counters for trending
-  trendingWindow: (timestamp) => `trending_window:${Math.floor(timestamp / 300000)}`
-};
-```
+"The aggregation pipeline is what keeps our suggestions fresh. Let me explain the architecture."
 
-### Cache Invalidation Strategies
+### Why Kafka for Aggregation Over Direct DB Writes?
 
-| Strategy | Hit Rate | Staleness | Complexity |
-|----------|----------|-----------|------------|
-| **Fixed TTL** | 60-80% | TTL seconds | Low |
-| **LRU with TTL** | 70-85% | TTL seconds | Low |
-| **Write-through** | 90%+ | None | Medium |
-| **Stale-while-revalidate** | 95%+ | Seconds | Medium |
+| Approach | Throughput | Latency to Trie | Complexity | Durability |
+|----------|------------|-----------------|------------|------------|
+| **Kafka stream** | 100K+/sec | 1-5 min | Medium | High |
+| Direct DB writes | 10K/sec | Real-time | Low | High |
+| In-memory only | 500K+/sec | Immediate | Low | None |
+| Redis Streams | 50K+/sec | Seconds | Low | Medium |
 
-**Decision**: LRU with 60-second TTL + stale-while-revalidate at CDN.
+**Decision: Kafka with buffered aggregation**
 
-## Idempotency and Consistency
+"I'm using Kafka because I need to handle 100K+ queries per second reliably. Direct database writes would bottleneck at 10-20K per second, and I'd risk losing data during spikes.
 
-### Query Log Ingestion Idempotency
-
-```javascript
-class IdempotentAggregator {
-  constructor() {
-    this.processedKeys = new Set();
-    this.keyExpiry = 300000;  // 5 minutes
-  }
-
-  async processQuery(message) {
-    const { idempotencyKey } = message;
-
-    // Check in-memory first (fast path)
-    if (this.processedKeys.has(idempotencyKey)) {
-      return { status: 'duplicate', processed: false };
-    }
-
-    // Check Redis for distributed deduplication
-    const exists = await redis.setnx(`idem:${idempotencyKey}`, '1');
-    if (!exists) {
-      return { status: 'duplicate', processed: false };
-    }
-
-    await redis.expire(`idem:${idempotencyKey}`, 300);
-    this.processedKeys.add(idempotencyKey);
-    setTimeout(() => this.processedKeys.delete(idempotencyKey), this.keyExpiry);
-
-    await this.doProcessQuery(message);
-    return { status: 'processed', processed: true };
-  }
-}
-```
-
-### Write Consistency Model
-
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Query log ingestion | Eventual | High throughput matters |
-| Phrase count updates | Eventual | Aggregated counts tolerate drift |
-| Trending score updates | Eventual | Real-time approximation sufficient |
-| Filter list updates | Strong | Must block immediately |
-| User history updates | Eventual | Personalization can lag |
-
-## Circuit Breaker and Failure Handling
-
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.name = options.name || 'default';
-    this.failureThreshold = options.failureThreshold || 5;
-    this.resetTimeoutMs = options.resetTimeoutMs || 30000;
-    this.state = 'CLOSED';  // CLOSED, OPEN, HALF_OPEN
-    this.failures = 0;
-  }
-
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = 'HALF_OPEN';
-      } else {
-        throw new CircuitOpenError(`Circuit ${this.name} is OPEN`);
-      }
-    }
-
-    try {
-      const result = await operation();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-}
-```
-
-### Graceful Degradation
-
-```javascript
-async getSuggestionsWithFallbacks(prefix, userId) {
-  try {
-    return await this.primarySuggestionPath(prefix, userId);
-  } catch (error) {
-    // Fallback 1: Try stale cache
-    const staleCache = await redis.get(`suggestions:stale:${prefix}`);
-    if (staleCache) return JSON.parse(staleCache);
-
-    // Fallback 2: Return popular suggestions
-    return await this.getPopularSuggestions(prefix);
-  }
-}
-```
-
-## API Design
-
-### RESTful Endpoints
+The pipeline works like this:
 
 ```
-Suggestions:
-GET    /api/v1/suggestions?q={prefix}  Get suggestions for prefix
-POST   /api/v1/suggestions/log         Log completed search
++------------+     +------------+     +------------+     +------------+
+|   Query    |     |   Kafka    |     | Aggregator |     |   Trie     |
+|   Logs     | --> |   Topic    | --> |  Workers   | --> |  Servers   |
++------------+     +------------+     +------------+     +------------+
+                        |
+                        v
+               +----------------+
+               |  Partitioned   |
+               |  by first char |
+               +----------------+
 
-Analytics:
-GET    /api/v1/suggestions/trending    Get trending queries
-GET    /api/v1/suggestions/popular     Get popular queries
-GET    /api/v1/suggestions/history     Get user history
-
-Admin:
-GET    /api/v1/admin/trie/stats        Get trie statistics
-POST   /api/v1/admin/trie/rebuild      Rebuild trie from database
-POST   /api/v1/admin/phrases           Add/update phrase
-DELETE /api/v1/admin/phrases/:phrase   Remove phrase
-POST   /api/v1/admin/filter            Add to filter list
-POST   /api/v1/admin/cache/clear       Clear suggestion cache
+Aggregator Workers:
++-------------------------------------------------------+
+| 1. Buffer queries in memory (30-60 seconds)           |
+| 2. Filter low-quality: too short, too long, spam      |
+| 3. Filter inappropriate: blocked phrase list          |
+| 4. Aggregate counts per phrase                        |
+| 5. Flush to PostgreSQL (phrase_counts table)          |
+| 6. Update trending counters in Redis                  |
+| 7. Send delta updates to trie servers                 |
++-------------------------------------------------------+
 ```
 
-### Request/Response Examples
+I partition Kafka by first character to match my trie sharding. This means the aggregator worker for 'a' phrases only talks to the 'a' trie shard - no cross-shard coordination needed.
 
-**Get Suggestions**:
+The buffering is important. Instead of updating the trie on every query, I batch updates every 30-60 seconds. This reduces write amplification and lets me do incremental top-K updates efficiently."
 
-```http
-GET /api/v1/suggestions?q=weat&limit=5&userId=abc123
+### Why Redis for Trending Over PostgreSQL?
+
+| Storage | Read Latency | Write Throughput | Data Structure | Best For |
+|---------|--------------|------------------|----------------|----------|
+| **Redis sorted sets** | <1ms | 100K+/sec | ZINCRBY + ZRANGE | Real-time counters |
+| PostgreSQL | 5-20ms | 10K/sec | Row updates | Persistent storage |
+| ClickHouse | 10-50ms | High batch | Aggregation | Analytics queries |
+| In-memory counter | <0.1ms | Unlimited | Map | Single-node only |
+
+**Decision: Redis sorted sets with sliding windows**
+
+"For trending detection, I use Redis sorted sets because I need sub-millisecond reads and very high write throughput.
+
+I implement sliding window counters:
+
+```
++------------------+     +------------------+     +------------------+
+| Window 1         |     | Window 2         |     | Window 3         |
+| (5 min bucket)   |     | (5 min bucket)   |     | (5 min bucket)   |
+| trending:12345   |     | trending:12346   |     | trending:12347   |
++------------------+     +------------------+     +------------------+
+        |                        |                        |
+        +------------------------+------------------------+
+                                 |
+                                 v
+                    +------------------------+
+                    | Aggregate last 6 windows|
+                    | to get 30-min trending  |
+                    +------------------------+
 ```
 
-Response:
-```json
-{
-  "suggestions": [
-    { "phrase": "weather forecast", "score": 0.95 },
-    { "phrase": "weather today", "score": 0.92 },
-    { "phrase": "weather radar", "score": 0.88 },
-    { "phrase": "weather alert", "score": 0.85, "trending": true },
-    { "phrase": "weather seattle", "score": 0.82 }
-  ],
-  "cached": false,
-  "latencyMs": 12
-}
+Each 5-minute window is a Redis sorted set. The key includes the timestamp bucket. I ZINCRBY to increment counts, and ZRANGE to get top trending. Windows expire after an hour automatically.
+
+To get trending, I read the last 6 windows and merge them. A query that spiked from 100/hour to 10,000/hour gets a high trending boost. PostgreSQL could store this, but the read latency would hurt my P99."
+
+---
+
+## 📊 Data Models
+
+"Let me describe the key data entities without getting into schema details."
+
+### Phrase Counts Table
+
+The primary storage for aggregated phrase popularity. Each row represents a unique search phrase with its cumulative count, last update timestamp, and filter status. Indexed by count descending for efficient top-K queries during trie rebuilds.
+
+### Query Logs Table
+
+Raw query stream for aggregation and analytics. Stores each query with user ID, timestamp, and session ID. High-volume append-only table, partitioned by time. Retained for 30 days for analytics, then archived.
+
+### User History Table
+
+Per-user search history for personalization. Keyed by user ID and phrase, stores count and recency. Limited to last 1000 searches per user. Also cached in Redis for fast lookup during ranking.
+
+### Filtered Phrases Table
+
+Blocklist for inappropriate content. Checked during aggregation pipeline before phrases enter the trie. Managed by content moderation team through admin interface.
+
+### Redis Data Structures
+
+- **Suggestion cache**: Key-value with prefix as key, top-K suggestions as value, 60-second TTL
+- **Trending counters**: Sorted sets keyed by time bucket, phrase as member, count as score
+- **User history cache**: Hash map keyed by user ID, recent phrases with timestamps
+
+---
+
+## 🔍 Deep Dive: Caching Strategy
+
+"Caching is critical for hitting our latency targets. Let me walk through the multi-layer approach."
+
+```
++------------------------------------------------------------------+
+|                         REQUEST                                   |
+|              GET /api/v1/suggestions?q=weat                       |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                    LAYER 1: CDN EDGE                              |
+|              Popular prefixes cached at edge                      |
+|              Hit rate: 30-40% for hot prefixes                    |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                    LAYER 2: REDIS                                 |
+|              Full suggestion cache                                |
+|              Key: suggestions:{prefix}                            |
+|              TTL: 60 seconds                                      |
+|              Hit rate: 60-70% after CDN                           |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                    LAYER 3: TRIE SERVER                           |
+|              In-memory trie lookup                                |
+|              Pre-computed top-K at each node                      |
++------------------------------------------------------------------+
+                               |
+                               v
++------------------------------------------------------------------+
+|                    LAYER 4: RANKING                               |
+|              Apply personalization + trending                     |
+|              Cache result back to Redis                           |
++------------------------------------------------------------------+
 ```
 
-## Observability
+**Cache key design matters.** I use the raw prefix as the key, not a hash. This lets me do prefix-based cache warming - when I update the trie for "weather", I can invalidate all keys starting with "weat".
 
-### Key Metrics (Prometheus)
+**TTL of 60 seconds** balances freshness with hit rate. For trending events, I might reduce this to 30 seconds. For stable phrases, I could extend to 5 minutes. Adaptive TTL based on phrase volatility is a future optimization.
 
-```javascript
-// Request latency histogram
-const suggestionLatency = new promClient.Histogram({
-  name: 'typeahead_suggestion_latency_seconds',
-  help: 'Latency of suggestion requests',
-  labelNames: ['endpoint', 'cache_hit'],
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
-});
+**Stale-while-revalidate** at the CDN layer means users always get a fast response, even if slightly stale. The CDN serves the cached response while fetching a fresh one in the background.
 
-// Cache metrics
-const cacheHitRate = new promClient.Gauge({
-  name: 'typeahead_cache_hit_rate',
-  help: 'Cache hit rate (0-1)',
-  labelNames: ['cache_type']
-});
+---
 
-// Trie metrics
-const trieNodeCount = new promClient.Gauge({
-  name: 'typeahead_trie_node_count',
-  help: 'Number of nodes in trie',
-  labelNames: ['shard_id']
-});
+## ⚖️ Trade-offs Summary
 
-// Kafka lag
-const kafkaLag = new promClient.Gauge({
-  name: 'typeahead_kafka_consumer_lag',
-  help: 'Kafka consumer lag',
-  labelNames: ['partition']
-});
-```
+| Decision | Chose | Over | Rationale |
+|----------|-------|------|-----------|
+| Data structure | Trie with top-K | Elasticsearch | O(prefix_len) lookup, no network hop |
+| Query optimization | Pre-computed top-K | Subtree traversal | 100K QPS requires <10ms lookup |
+| Sharding | First character | Consistent hashing | Prefix locality enables effective caching |
+| Ranking | Weighted formula | ML ranking | Sub-1ms compute, explainable, tunable |
+| Ingestion | Kafka pipeline | Direct DB writes | Handles 100K+/sec, decouples read/write |
+| Trending | Redis sorted sets | PostgreSQL | Sub-1ms reads, native counter support |
+| Cache TTL | 60 seconds | Longer/shorter | Balance freshness vs hit rate |
 
-### Alert Thresholds
+---
 
-```yaml
-alerts:
-  - name: TypeaheadHighLatency
-    expr: histogram_quantile(0.99, rate(typeahead_suggestion_latency_seconds_bucket[5m])) > 0.05
-    severity: warning
+## 🚀 Future Enhancements
 
-  - name: TypeaheadLowCacheHitRate
-    expr: typeahead_cache_hit_rate{cache_type="redis"} < 0.7
-    severity: warning
+**Fuzzy Matching**: Add edit-distance tolerance for typo correction. Could use a secondary index mapping common misspellings to correct phrases, or BK-trees for edit distance lookup.
 
-  - name: TypeaheadKafkaLagHigh
-    expr: sum(typeahead_kafka_consumer_lag) > 50000
-    severity: warning
-```
+**ML-Based Ranking**: Once we have sufficient click-through data, train a learning-to-rank model. Use the weighted formula as a first-stage retriever (top 50), then ML for final ranking (top 10).
 
-## Scalability Considerations
+**Real-Time Streaming**: WebSocket connections for instant trending updates. When a major event happens, push new suggestions to connected clients without waiting for their next keystroke.
 
-### Read Scaling
+**Geo-Sharding**: Region-specific suggestions. "Pizza near me" should return different results in New York versus Tokyo. Separate tries per region, or geo-tagged phrases with location-aware ranking.
 
-1. **Trie Sharding**: Shard by first character across multiple servers
-2. **Read Replicas**: Multiple replicas per shard for high QPS
-3. **CDN Caching**: Edge caching for popular prefixes
+**A/B Testing Framework**: Experiment with ranking weights systematically. Run parallel ranking algorithms and measure click-through rate, time-to-click, and search success rate.
 
-### Write Scaling
+---
 
-1. **Buffered Writes**: Aggregate counts before updating trie
-2. **Kafka Partitioning**: Scale aggregation workers horizontally
-3. **Batch Updates**: Periodic trie rebuilds from aggregated data
+## 📝 Summary
 
-### Estimated Capacity
+"To summarize the typeahead system I've designed:
 
-| Component | Single Node | Scaled (4x) |
-|-----------|-------------|-------------|
-| Trie lookups | 50K/sec | 200K/sec |
-| Redis cache | 100K/sec | 100K/sec |
-| Kafka ingestion | 50K/sec | 200K/sec |
-| PostgreSQL writes | 5K/sec | 20K/sec |
+**Core architecture**: In-memory tries with pre-computed top-K suggestions, sharded by first character across multiple servers. This gives O(prefix_length) lookups regardless of how many phrases match.
 
-## Trade-offs Summary
+**Ranking**: A weighted formula combining popularity, recency, personalization, and trending. Fast enough to compute in under 1ms, and tunable based on A/B test results.
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Pre-computed top-k | O(1) lookup | Higher memory, update cost |
-| First-char sharding | Prefix locality | Uneven distribution |
-| Weighted ranking | Simple, explainable | Less personalization |
-| 60s cache TTL | Low latency | Slight staleness |
-| Kafka aggregation | Scalable ingestion | Eventual consistency |
+**Real-time pipeline**: Kafka ingests query logs at 100K+/sec, aggregator workers buffer and filter, then push delta updates to tries every minute. Redis tracks trending with sliding window counters.
 
-## Future Backend Enhancements
+**Caching**: Three-layer cache with CDN edge, Redis, and in-memory trie. Combined hit rate over 95% for popular prefixes.
 
-1. **Fuzzy Matching**: Add edit-distance for typo correction
-2. **ML-Based Ranking**: Learning-to-rank for better personalization
-3. **Real-Time Streaming**: WebSocket for instant trending updates
-4. **Geo-Sharding**: Region-specific suggestions
-5. **A/B Testing Framework**: Experiment with ranking weights
+**Key trade-offs**: I optimized for latency over memory (pre-computed top-K), simplicity over sophistication (weighted formula over ML), and locality over balance (first-character sharding over consistent hashing).
+
+The system handles 100K+ QPS at sub-50ms P99 latency while keeping suggestions fresh within 5 minutes. Questions?"
