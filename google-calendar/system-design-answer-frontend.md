@@ -10,7 +10,9 @@ Design the frontend architecture for a calendar application that allows users to
 - Visualize scheduling conflicts
 - Navigate dates efficiently
 
-## Requirements Clarification
+---
+
+## 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 1. **Three Calendar Views**: Month (grid), Week (time columns), Day (single column)
@@ -20,10 +22,10 @@ Design the frontend architecture for a calendar application that allows users to
 5. **Multi-Calendar Support**: Toggle visibility of different calendars
 
 ### Non-Functional Requirements
-1. **Responsive**: Desktop and tablet layouts
-2. **Performance**: View switches < 100ms, smooth scrolling
-3. **Accessibility**: Keyboard navigation, screen reader support
-4. **Offline Resilience**: Show cached data when offline
+1. **Responsive**: Desktop and tablet layouts (mobile as stretch goal)
+2. **Performance**: View switches < 100ms, smooth scrolling with 100+ events
+3. **Accessibility**: Keyboard navigation, screen reader support (WCAG 2.1 AA)
+4. **Offline Resilience**: Show cached events when offline, queue changes
 
 ### UI/UX Requirements
 - Consistent design language across views
@@ -31,728 +33,299 @@ Design the frontend architecture for a calendar application that allows users to
 - Conflict events highlighted with warning colors
 - Drag-and-drop event repositioning (stretch goal)
 
-## High-Level Architecture
+### Out of Scope
+- Recurring events (RRULE complexity)
+- Email/notification integration
+- Shared calendar editing
+
+---
+
+## 2. High-Level Architecture (10 minutes)
+
+### Application Structure
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          React Application                               │
+├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                        TanStack Router                               ││
-│  │    /               → Calendar View (default: Month)                  ││
-│  │    /event/:id      → Event Detail Modal (overlay)                   ││
-│  └─────────────────────────────────────────────────────────────────────┘│
+│    ┌─────────────────────────────────────────────────────────────────┐  │
+│    │                        TanStack Router                           │  │
+│    │    /               → Calendar View (default: Month)              │  │
+│    │    /event/:id      → Event Detail Modal (overlay)                │  │
+│    └─────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  ┌──────────────────────┐  ┌────────────────────────────────────────┐   │
-│  │    Sidebar           │  │          Main Calendar Area             │   │
-│  │  ┌────────────────┐  │  │  ┌──────────────────────────────────┐  │   │
-│  │  │ Mini Calendar  │  │  │  │        View Switcher             │  │   │
-│  │  └────────────────┘  │  │  │  [Month] [Week] [Day] | Today ◄► │  │   │
-│  │  ┌────────────────┐  │  │  └──────────────────────────────────┘  │   │
-│  │  │ Calendar List  │  │  │  ┌──────────────────────────────────┐  │   │
-│  │  │ ☑ Work         │  │  │  │                                  │  │   │
-│  │  │ ☑ Personal     │  │  │  │    MonthView / WeekView /        │  │   │
-│  │  │ ☐ Holidays     │  │  │  │    DayView (conditional)         │  │   │
-│  │  └────────────────┘  │  │  │                                  │  │   │
-│  └──────────────────────┘  │  └──────────────────────────────────┘  │   │
+│    ┌──────────────────────┐  ┌─────────────────────────────────────┐   │
+│    │    Sidebar           │  │       Main Calendar Area            │   │
+│    │  ┌────────────────┐  │  │  ┌───────────────────────────────┐  │   │
+│    │  │ Mini Calendar  │  │  │  │      View Switcher            │  │   │
+│    │  └────────────────┘  │  │  │  [Month] [Week] [Day] | ◄►    │  │   │
+│    │  ┌────────────────┐  │  │  └───────────────────────────────┘  │   │
+│    │  │ Calendar List  │  │  │  ┌───────────────────────────────┐  │   │
+│    │  │ ☑ Work         │  │  │  │                               │  │   │
+│    │  │ ☑ Personal     │  │  │  │  MonthView / WeekView /       │  │   │
+│    │  │ ☐ Holidays     │  │  │  │  DayView (conditional)        │  │   │
+│    │  └────────────────┘  │  │  │                               │  │   │
+│    └──────────────────────┘  │  └───────────────────────────────┘  │   │
 │                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                     Zustand Store                                    ││
-│  │  currentDate | view | events[] | calendars[] | visibleIds | modal   ││
-│  └─────────────────────────────────────────────────────────────────────┘│
+│    ┌─────────────────────────────────────────────────────────────────┐  │
+│    │                     Zustand Store                                │  │
+│    │  currentDate | view | events[] | calendars[] | visibleIds       │  │
+│    └─────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────┐
+            │           Backend Services                 │
+            │  • Calendar Service (events CRUD)         │
+            │  • Conflict Detection Service             │
+            │  • Auth Service (sessions)                │
+            └───────────────────────────────────────────┘
 ```
 
-## Deep Dive: State Management with Zustand
+### Backend Services Required (High-Level)
 
-### Store Design
+| Service | Responsibility |
+|---------|----------------|
+| **Calendar API** | Event CRUD, date range queries, calendar management |
+| **Conflict Service** | Check time overlaps when creating/editing events |
+| **Auth Service** | Session management, user authentication |
+| **Sync Service** | (Future) Real-time updates via WebSocket |
 
-```typescript
-// stores/calendarStore.ts
-import { create } from 'zustand';
-import { startOfMonth, endOfMonth, startOfWeek, endOfWeek } from 'date-fns';
+---
 
-interface CalendarState {
-  // Navigation state
-  currentDate: Date;
-  view: 'month' | 'week' | 'day';
+## 3. Component Architecture (10 minutes)
 
-  // Data
-  events: CalendarEvent[];
-  calendars: Calendar[];
-  visibleCalendarIds: Set<number>;
+### Key Components
 
-  // Modal state
-  isModalOpen: boolean;
-  modalMode: 'create' | 'edit';
-  selectedEvent: CalendarEvent | null;
-  conflicts: Conflict[];
-
-  // Actions
-  setView: (view: 'month' | 'week' | 'day') => void;
-  goToToday: () => void;
-  goToPrevious: () => void;
-  goToNext: () => void;
-  toggleCalendarVisibility: (id: number) => void;
-  openCreateModal: (date?: Date) => void;
-  openEditModal: (event: CalendarEvent) => void;
-  closeModal: () => void;
-
-  // Computed
-  getViewDateRange: () => { start: Date; end: Date };
-  getVisibleEvents: () => CalendarEvent[];
-}
-
-export const useCalendarStore = create<CalendarState>((set, get) => ({
-  currentDate: new Date(),
-  view: 'month',
-  events: [],
-  calendars: [],
-  visibleCalendarIds: new Set(),
-  isModalOpen: false,
-  modalMode: 'create',
-  selectedEvent: null,
-  conflicts: [],
-
-  setView: (view) => set({ view }),
-
-  goToToday: () => set({ currentDate: new Date() }),
-
-  goToPrevious: () => {
-    const { currentDate, view } = get();
-    const newDate = {
-      month: () => subMonths(currentDate, 1),
-      week: () => subWeeks(currentDate, 1),
-      day: () => subDays(currentDate, 1),
-    }[view]();
-    set({ currentDate: newDate });
-  },
-
-  goToNext: () => {
-    const { currentDate, view } = get();
-    const newDate = {
-      month: () => addMonths(currentDate, 1),
-      week: () => addWeeks(currentDate, 1),
-      day: () => addDays(currentDate, 1),
-    }[view]();
-    set({ currentDate: newDate });
-  },
-
-  getViewDateRange: () => {
-    const { currentDate, view } = get();
-    switch (view) {
-      case 'month':
-        // Include visible days from adjacent months
-        return {
-          start: startOfWeek(startOfMonth(currentDate)),
-          end: endOfWeek(endOfMonth(currentDate)),
-        };
-      case 'week':
-        return {
-          start: startOfWeek(currentDate),
-          end: endOfWeek(currentDate),
-        };
-      case 'day':
-        return {
-          start: startOfDay(currentDate),
-          end: endOfDay(currentDate),
-        };
-    }
-  },
-
-  getVisibleEvents: () => {
-    const { events, visibleCalendarIds } = get();
-    return events.filter(e => visibleCalendarIds.has(e.calendar_id));
-  },
-
-  // ... modal actions
-}));
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        App Shell                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────┐  ┌──────────────────────────────────────────────┐  │
+│  │         │  │             Calendar Header                  │  │
+│  │         │  │  ┌──────────────┐  ┌───────────────────────┐ │  │
+│  │ Sidebar │  │  │ DateNavigator│  │    ViewSwitcher      │ │  │
+│  │         │  │  └──────────────┘  └───────────────────────┘ │  │
+│  │         │  ├──────────────────────────────────────────────┤  │
+│  │ • Mini  │  │                                              │  │
+│  │   Cal   │  │         CalendarGrid (conditional)           │  │
+│  │         │  │  ┌────────────────────────────────────────┐  │  │
+│  │ • Cal   │  │  │ MonthView:  7×6 CSS Grid cells         │  │  │
+│  │   List  │  │  │ WeekView:   7 columns + time gutter    │  │  │
+│  │         │  │  │ DayView:    1 column + time gutter     │  │  │
+│  │         │  │  └────────────────────────────────────────┘  │  │
+│  └─────────┘  └──────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                   EventModal (overlay)                    │   │
+│  │   Title, DateTime pickers, Location, ConflictWarning     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Why Zustand Over Context?
+### State Management Design
 
-| Factor | Zustand | React Context |
-|--------|---------|---------------|
-| Boilerplate | Minimal | Significant |
-| Re-renders | Selective via selectors | All consumers |
-| Devtools | Built-in | Requires setup |
-| Persistence | Plugin available | Manual |
-| Testing | Easy to mock | Context wrapper needed |
+**Store Shape (Zustand):**
+- `currentDate`: Currently focused date for navigation
+- `view`: 'month' | 'week' | 'day'
+- `events[]`: Fetched events for current view range
+- `calendars[]`: User's calendars with colors
+- `visibleCalendarIds`: Set of toggled-on calendars
+- `modalState`: { open, mode, selectedEvent, conflicts }
 
-**Decision**: Zustand reduces boilerplate and provides better performance through selective subscriptions.
+**Computed Values:**
+- `getViewDateRange()`: Returns start/end dates for current view (used for API queries)
+- `getVisibleEvents()`: Filters events by visible calendars
 
-## Deep Dive: Calendar View Components
+### Alternatives Considered
 
-### Month View (CSS Grid)
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Zustand** | Minimal boilerplate, selective subscriptions | Extra dependency | ✓ Chosen |
+| **React Context** | No dependencies | Re-renders all consumers | Rejected |
+| **Redux Toolkit** | Mature ecosystem | Overkill for this scope | Rejected |
+| **Jotai** | Atomic updates | Learning curve | Rejected |
 
-```tsx
-// components/calendar/MonthView.tsx
-function MonthView() {
-  const { currentDate, getVisibleEvents } = useCalendarStore();
-  const events = getVisibleEvents();
+---
 
-  // Generate 6 weeks × 7 days grid
-  const monthStart = startOfMonth(currentDate);
-  const gridStart = startOfWeek(monthStart);
-  const days = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i));
+## 4. Deep Dive: Calendar View Rendering (10 minutes)
 
-  return (
-    <div className="grid grid-cols-7 border-t border-l">
-      {/* Header row */}
-      {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-        <div key={day} className="p-2 text-center font-medium border-r border-b">
-          {day}
-        </div>
-      ))}
+### Month View Layout
 
-      {/* Day cells */}
-      {days.map(day => (
-        <DayCell
-          key={day.toISOString()}
-          date={day}
-          events={getEventsForDay(events, day)}
-          isCurrentMonth={isSameMonth(day, currentDate)}
-          isToday={isToday(day)}
-        />
-      ))}
-    </div>
-  );
-}
-
-function DayCell({ date, events, isCurrentMonth, isToday }: DayCellProps) {
-  const MAX_VISIBLE = 3;
-  const visibleEvents = events.slice(0, MAX_VISIBLE);
-  const overflowCount = events.length - MAX_VISIBLE;
-
-  return (
-    <div
-      className={cn(
-        'min-h-[100px] p-1 border-r border-b cursor-pointer hover:bg-gray-50',
-        !isCurrentMonth && 'bg-gray-100 text-gray-400',
-        isToday && 'bg-blue-50'
-      )}
-      onClick={() => openCreateModal(date)}
-    >
-      <div className={cn(
-        'text-sm font-medium mb-1',
-        isToday && 'bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center'
-      )}>
-        {format(date, 'd')}
-      </div>
-
-      <div className="space-y-1">
-        {visibleEvents.map(event => (
-          <EventPill key={event.id} event={event} />
-        ))}
-
-        {overflowCount > 0 && (
-          <button className="text-xs text-blue-600 hover:underline">
-            +{overflowCount} more
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Sun   │   Mon   │   Tue   │   Wed   │   Thu   │   Fri   │  Sat │
+├────────┼─────────┼─────────┼─────────┼─────────┼─────────┼──────┤
+│   29   │   30    │    1    │    2    │    3    │    4    │   5  │
+│        │         │░░░░░░░░░│         │░░░░░░░░░│         │      │
+│        │         │ Meeting │         │ Lunch   │         │      │
+├────────┼─────────┼─────────┼─────────┼─────────┼─────────┼──────┤
+│    6   │    7    │    8    │    9    │   10    │   11    │  12  │
+│░░░░░░░░│         │         │░░░░░░░░░░░░░░░░░░░│         │      │
+│Sprint  │         │         │   All-day Event   │         │      │
+│        │         │         │░░░░░░░░░░░░░░░░░░░│         │      │
+│        │         │         │ +2 more │         │         │      │
+├────────┴─────────┴─────────┴─────────┴─────────┴─────────┴──────┤
+│                          ... more weeks ...                      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Week View (Time Grid with Absolute Positioning)
+**Implementation Strategy:**
+- CSS Grid: `grid-template-columns: repeat(7, 1fr)`
+- 6 rows × 7 columns = 42 cells (handles month overflow)
+- Event pills: Colored bars with truncated titles
+- Overflow: "+N more" button when > 3 events per day
 
-```tsx
-// components/calendar/WeekView.tsx
-function WeekView() {
-  const { currentDate, getVisibleEvents } = useCalendarStore();
-  const events = getVisibleEvents();
+### Week/Day View Layout
 
-  const weekStart = startOfWeek(currentDate);
-  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
-  const hours = Array.from({ length: 24 }, (_, i) => i);
-
-  return (
-    <div className="flex flex-1 overflow-auto">
-      {/* Time gutter */}
-      <div className="w-16 flex-shrink-0">
-        {hours.map(hour => (
-          <div key={hour} className="h-[60px] text-xs text-gray-500 text-right pr-2">
-            {format(setHours(new Date(), hour), 'h a')}
-          </div>
-        ))}
-      </div>
-
-      {/* Day columns */}
-      <div className="flex-1 grid grid-cols-7">
-        {days.map(day => (
-          <DayColumn
-            key={day.toISOString()}
-            date={day}
-            events={getEventsForDay(events, day)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DayColumn({ date, events }: DayColumnProps) {
-  const dayStart = startOfDay(date);
-
-  return (
-    <div className="relative border-r">
-      {/* Hour lines */}
-      {Array.from({ length: 24 }, (_, i) => (
-        <div key={i} className="h-[60px] border-b border-gray-200" />
-      ))}
-
-      {/* Event overlays */}
-      {events.map(event => {
-        const position = calculateEventPosition(event, dayStart);
-        return (
-          <div
-            key={event.id}
-            className="absolute left-1 right-1 rounded px-1 text-xs overflow-hidden"
-            style={{
-              top: `${position.top}%`,
-              height: `${position.height}%`,
-              backgroundColor: event.color || '#3B82F6',
-              minHeight: '20px',
-            }}
-          >
-            <div className="font-medium truncate text-white">
-              {event.title}
-            </div>
-            <div className="text-white/80 truncate">
-              {format(new Date(event.start_time), 'h:mm a')}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+```
+        │   Mon 5   │   Tue 6   │   Wed 7   │  ...
+────────┼───────────┼───────────┼───────────┼──────
+ 8:00   │           │░░░░░░░░░░░│           │
+        │           │░ Standup ░│           │
+ 9:00   │░░░░░░░░░░░│░░░░░░░░░░░│           │
+        │░ Design  ░│           │           │
+10:00   │░ Review  ░│           │░░░░░░░░░░░│
+        │░░░░░░░░░░░│           │░ Sprint  ░│
+11:00   │           │           │░ Planning░│
+        │           │           │░░░░░░░░░░░│
+12:00   │───────────│───────────│───────────│
 ```
 
-### Event Position Calculation
+**Event Positioning:**
+- Time gutter column (fixed width ~60px)
+- Events absolutely positioned within day column
+- Top/height calculated as percentage: `(startMinutes / 1440) * 100%`
+- Width: 95% of column (leaves gap for overlaps)
 
-```typescript
-// utils/dateUtils.ts
-export function calculateEventPosition(
-  event: CalendarEvent,
-  dayStart: Date
-): { top: number; height: number } {
-  const MINUTES_IN_DAY = 24 * 60;
+### Alternatives for Event Positioning
 
-  const startMinutes = differenceInMinutes(
-    new Date(event.start_time),
-    dayStart
-  );
-  const endMinutes = differenceInMinutes(
-    new Date(event.end_time),
-    dayStart
-  );
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Percentage-based** | Responsive, no DOM measurement | Requires fixed container height | ✓ Chosen |
+| **Pixel-based** | Precise control | Needs resize observers | Rejected |
+| **CSS Grid subgrid** | Native layout | Limited browser support | Future option |
 
-  // Clamp to day boundaries
-  const clampedStart = Math.max(0, startMinutes);
-  const clampedEnd = Math.min(MINUTES_IN_DAY, endMinutes);
+---
 
-  return {
-    top: (clampedStart / MINUTES_IN_DAY) * 100,
-    height: ((clampedEnd - clampedStart) / MINUTES_IN_DAY) * 100,
-  };
-}
+## 5. Deep Dive: Event Modal & Conflict Detection (5 minutes)
+
+### Modal Flow
+
+```
+┌─────────────────────────────────────────┐
+│         Create/Edit Event               │
+├─────────────────────────────────────────┤
+│  Title: [________________________]      │
+│                                         │
+│  Start: [MM/DD/YYYY] [HH:MM ▼]         │
+│  End:   [MM/DD/YYYY] [HH:MM ▼]         │
+│                                         │
+│  ┌───────────────────────────────────┐  │
+│  │ ⚠️ Scheduling Conflict            │  │
+│  │ • Team Standup (9:00 - 9:30)      │  │
+│  └───────────────────────────────────┘  │
+│                                         │
+│  Location: [______________________]     │
+│  Calendar: [Work ▼]                     │
+│                                         │
+│         [Cancel]  [Save Event]          │
+└─────────────────────────────────────────┘
 ```
 
-### Why Percentage-Based Positioning?
+**Conflict Detection Flow:**
+1. User changes start/end time
+2. Debounce 500ms to avoid excessive API calls
+3. Call `GET /api/events/conflicts?start=&end=`
+4. Display warning (non-blocking - user can still save)
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Percentage** | Responsive, no measurements | Requires fixed container |
-| Pixel-based | Precise control | Needs resize handlers |
-| Virtual scrolling | Handles many events | Complex implementation |
+**Why Non-Blocking?**
+- Users may intentionally double-book (e.g., optional meetings)
+- Provides information without friction
+- Alternative: Blocking mode could be a user preference
 
-**Decision**: Percentage positioning is simpler and responsive. The container height is fixed (24 hours × 60px = 1440px), making percentage calculations reliable.
+---
 
-## Deep Dive: Event Modal with Conflict Detection
+## 6. Performance Considerations (3 minutes)
 
-### Modal Component
+### Optimizations
 
-```tsx
-// components/calendar/EventModal.tsx
-function EventModal() {
-  const {
-    isModalOpen,
-    modalMode,
-    selectedEvent,
-    conflicts,
-    closeModal,
-  } = useCalendarStore();
+| Technique | Purpose |
+|-----------|---------|
+| **Selective Zustand subscriptions** | Components only re-render when their subscribed slice changes |
+| **Memoized event filtering** | `useMemo` for `getVisibleEvents()` - recalculates only when dependencies change |
+| **Date range fetching** | API queries only for visible date range, not all events |
+| **AbortController** | Cancel in-flight requests when user navigates quickly |
+| **Virtual scrolling** | For future: month view with many events could virtualize |
 
-  const [formData, setFormData] = useState<EventFormData>({
-    title: '',
-    start_time: '',
-    end_time: '',
-    description: '',
-    location: '',
-    calendar_id: 0,
-    all_day: false,
-  });
+### Caching Strategy
 
-  // Initialize form when modal opens
-  useEffect(() => {
-    if (selectedEvent && modalMode === 'edit') {
-      setFormData({
-        title: selectedEvent.title,
-        start_time: formatDateTimeLocal(selectedEvent.start_time),
-        end_time: formatDateTimeLocal(selectedEvent.end_time),
-        description: selectedEvent.description || '',
-        location: selectedEvent.location || '',
-        calendar_id: selectedEvent.calendar_id,
-        all_day: selectedEvent.all_day,
-      });
-    }
-  }, [selectedEvent, modalMode]);
-
-  // Check conflicts when times change (debounced)
-  useEffect(() => {
-    if (!formData.start_time || !formData.end_time) return;
-
-    const timer = setTimeout(async () => {
-      const conflicts = await api.checkConflicts({
-        start_time: formData.start_time,
-        end_time: formData.end_time,
-        exclude_id: selectedEvent?.id,
-      });
-      setConflicts(conflicts);
-    }, 500);
-
-    return () => clearTimeout(timer);
-  }, [formData.start_time, formData.end_time]);
-
-  if (!isModalOpen) return null;
-
-  return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
-        <div className="p-4 border-b flex justify-between items-center">
-          <h2 className="text-lg font-semibold">
-            {modalMode === 'create' ? 'Create Event' : 'Edit Event'}
-          </h2>
-          <button onClick={closeModal}>×</button>
-        </div>
-
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          <input
-            type="text"
-            placeholder="Add title"
-            value={formData.title}
-            onChange={e => setFormData(f => ({ ...f, title: e.target.value }))}
-            className="w-full text-xl font-medium border-0 border-b-2 focus:border-blue-500 outline-none"
-            autoFocus
-          />
-
-          {/* Date/Time inputs */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm text-gray-600 mb-1">Start</label>
-              <input
-                type="datetime-local"
-                value={formData.start_time}
-                onChange={e => setFormData(f => ({ ...f, start_time: e.target.value }))}
-                className="w-full p-2 border rounded"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-600 mb-1">End</label>
-              <input
-                type="datetime-local"
-                value={formData.end_time}
-                onChange={e => setFormData(f => ({ ...f, end_time: e.target.value }))}
-                className="w-full p-2 border rounded"
-              />
-            </div>
-          </div>
-
-          {/* Conflict Warning */}
-          {conflicts.length > 0 && (
-            <ConflictWarning conflicts={conflicts} />
-          )}
-
-          {/* Other fields... */}
-
-          <div className="flex justify-end gap-2 pt-4">
-            <button
-              type="button"
-              onClick={closeModal}
-              className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-            >
-              Save
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Frontend Cache Layers                        │
+├─────────────────────────────────────────────────────────────────┤
+│  Zustand Store                                                   │
+│  └── events[] (current view)                                    │
+│                                                                  │
+│  API Layer Cache                                                 │
+│  └── Map<dateRangeKey, events[]>  (cache adjacent weeks/months)│
+│                                                                  │
+│  Service Worker (future)                                         │
+│  └── IndexedDB for offline access                               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Conflict Warning Component
+---
 
-```tsx
-function ConflictWarning({ conflicts }: { conflicts: Conflict[] }) {
-  return (
-    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-      <div className="flex items-center gap-2 text-amber-800 font-medium mb-2">
-        <AlertTriangle className="w-4 h-4" />
-        Scheduling Conflict
-      </div>
-      <ul className="text-sm text-amber-700 space-y-1">
-        {conflicts.map(conflict => (
-          <li key={conflict.id} className="flex items-center gap-2">
-            <span
-              className="w-2 h-2 rounded-full"
-              style={{ backgroundColor: conflict.color }}
-            />
-            <span className="font-medium">{conflict.title}</span>
-            <span className="text-amber-600">
-              {formatTimeRange(conflict.start_time, conflict.end_time)}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-```
+## 7. Accessibility (2 minutes)
 
-## Deep Dive: Date Navigation
+### Key Considerations
 
-### Navigation Controls
+- **Semantic HTML**: `role="grid"` for month view, `role="gridcell"` for day cells
+- **Keyboard Navigation**: Arrow keys for date movement, Enter to select/open
+- **Screen Reader Announcements**: "January 21, 3 events. Press Enter to view."
+- **Focus Management**: Return focus to trigger after modal closes
+- **Color Contrast**: 4.5:1 ratio for text, don't rely on color alone for meaning
 
-```tsx
-function DateNavigator() {
-  const { currentDate, view, goToToday, goToPrevious, goToNext } = useCalendarStore();
+### Alternatives for Calendar Navigation
 
-  const getHeaderText = () => {
-    switch (view) {
-      case 'month':
-        return format(currentDate, 'MMMM yyyy');
-      case 'week':
-        const weekStart = startOfWeek(currentDate);
-        const weekEnd = endOfWeek(currentDate);
-        return isSameMonth(weekStart, weekEnd)
-          ? format(weekStart, 'MMMM yyyy')
-          : `${format(weekStart, 'MMM')} - ${format(weekEnd, 'MMM yyyy')}`;
-      case 'day':
-        return format(currentDate, 'EEEE, MMMM d, yyyy');
-    }
-  };
+| Approach | Accessibility | Complexity |
+|----------|---------------|------------|
+| **Roving tabindex** | Excellent | Moderate |
+| **All cells focusable** | Good but verbose | Simple |
+| **aria-activedescendant** | Excellent | Complex |
 
-  return (
-    <div className="flex items-center gap-4">
-      <button
-        onClick={goToToday}
-        className="px-3 py-1 border rounded hover:bg-gray-50"
-      >
-        Today
-      </button>
+---
 
-      <div className="flex items-center">
-        <button
-          onClick={goToPrevious}
-          className="p-1 hover:bg-gray-100 rounded"
-          aria-label="Previous"
-        >
-          <ChevronLeft className="w-5 h-5" />
-        </button>
-        <button
-          onClick={goToNext}
-          className="p-1 hover:bg-gray-100 rounded"
-          aria-label="Next"
-        >
-          <ChevronRight className="w-5 h-5" />
-        </button>
-      </div>
+## 8. Trade-offs Summary
 
-      <h2 className="text-xl font-semibold">
-        {getHeaderText()}
-      </h2>
-    </div>
-  );
-}
-```
+| Decision | Trade-off |
+|----------|-----------|
+| **Zustand over Redux** | Simpler API vs. smaller ecosystem |
+| **Percentage positioning** | Responsive vs. requires fixed height container |
+| **Client-side event filtering** | Instant toggle vs. more memory usage |
+| **Debounced conflict check** | Fewer API calls vs. slight delay |
+| **Non-blocking conflicts** | Better UX vs. user might miss warnings |
 
-### Keyboard Navigation
+---
 
-```tsx
-// hooks/useKeyboardNavigation.ts
-function useKeyboardNavigation() {
-  const { view, goToPrevious, goToNext, goToToday, setView } = useCalendarStore();
-
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      // Ignore if typing in input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        return;
-      }
-
-      switch (e.key) {
-        case 'ArrowLeft':
-          goToPrevious();
-          break;
-        case 'ArrowRight':
-          goToNext();
-          break;
-        case 't':
-          goToToday();
-          break;
-        case 'm':
-          setView('month');
-          break;
-        case 'w':
-          setView('week');
-          break;
-        case 'd':
-          setView('day');
-          break;
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
-}
-```
-
-## Performance Optimizations
-
-### 1. Event Filtering Memoization
-
-```tsx
-// Only recompute when dependencies change
-const visibleEvents = useMemo(() => {
-  const { start, end } = getViewDateRange();
-  return events.filter(event =>
-    visibleCalendarIds.has(event.calendar_id) &&
-    eventOverlapsRange(event, start, end)
-  );
-}, [events, visibleCalendarIds, currentDate, view]);
-```
-
-### 2. Selective Store Subscriptions
-
-```tsx
-// Subscribe only to needed state slices
-function ViewSwitcher() {
-  // Only re-renders when view changes, not on every state change
-  const view = useCalendarStore(state => state.view);
-  const setView = useCalendarStore(state => state.setView);
-
-  return (
-    <div className="flex rounded-lg border">
-      {['month', 'week', 'day'].map(v => (
-        <button
-          key={v}
-          onClick={() => setView(v as View)}
-          className={cn(
-            'px-4 py-2 capitalize',
-            view === v ? 'bg-blue-500 text-white' : 'hover:bg-gray-50'
-          )}
-        >
-          {v}
-        </button>
-      ))}
-    </div>
-  );
-}
-```
-
-### 3. Event Data Fetching Strategy
-
-```tsx
-// Fetch events when view date range changes
-function useEventSync() {
-  const { getViewDateRange } = useCalendarStore();
-  const { start, end } = getViewDateRange();
-
-  useEffect(() => {
-    const controller = new AbortController();
-
-    api.getEvents({
-      start: start.toISOString(),
-      end: end.toISOString(),
-    }, { signal: controller.signal })
-      .then(events => useCalendarStore.setState({ events }))
-      .catch(err => {
-        if (err.name !== 'AbortError') console.error(err);
-      });
-
-    return () => controller.abort();
-  }, [start.toISOString(), end.toISOString()]);
-}
-```
-
-## Accessibility (a11y)
-
-### Semantic Structure
-
-```tsx
-<main role="application" aria-label="Calendar">
-  <nav aria-label="Calendar navigation">
-    {/* Date navigator */}
-  </nav>
-
-  <div role="grid" aria-label="Month view">
-    <div role="row" aria-label="Days of week">
-      {/* Day headers */}
-    </div>
-    <div role="row">
-      <div role="gridcell" aria-label="January 21, 3 events">
-        {/* Day cell content */}
-      </div>
-    </div>
-  </div>
-</main>
-```
-
-### Focus Management
-
-```tsx
-// Return focus to trigger after modal closes
-function EventModal() {
-  const triggerRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    if (isModalOpen) {
-      triggerRef.current = document.activeElement as HTMLElement;
-    } else {
-      triggerRef.current?.focus();
-    }
-  }, [isModalOpen]);
-
-  // Trap focus inside modal
-  // ...
-}
-```
-
-## Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| Zustand over Context | Less boilerplate, better perf | Additional dependency |
-| CSS Grid for Month | Native, responsive | Limited IE support |
-| Absolute positioning for events | Simple calculation | Overlapping events stack |
-| Debounced conflict check | Reduces API calls | Slight delay in feedback |
-| Client-side filtering | Instant visibility toggle | More data in memory |
-
-## Future Frontend Enhancements
+## 9. Future Enhancements
 
 1. **Drag & Drop Events**: React DnD for moving events between time slots
 2. **Event Resize**: Drag event edges to change duration
-3. **Virtual Scrolling**: For views with many events
-4. **Offline Support**: Service worker + IndexedDB for offline-first
-5. **Mobile Touch Gestures**: Swipe for navigation, long-press for create
+3. **Recurring Events**: RRULE parsing with expansion for display
+4. **Offline-First**: Service Worker + IndexedDB for offline editing
+5. **Real-time Sync**: WebSocket for multi-user calendars
+6. **Mobile Touch**: Swipe gestures for navigation
+
+---
+
+## Questions I Would Ask
+
+1. Do we need to support recurring events in this iteration?
+2. What's the expected max number of events per day/week?
+3. Is real-time collaboration required (multiple users editing)?
+4. Mobile-first or desktop-first?
+5. Should conflicts block event creation or just warn?
