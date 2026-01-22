@@ -2,749 +2,417 @@
 
 *45-minute system design interview format - Frontend Engineer Position*
 
-## Problem Statement
+---
 
-Design the frontend architecture for a web search engine that:
-- Delivers instant search results with minimal perceived latency
-- Provides autocomplete suggestions as users type
-- Renders search result pages with snippets and highlights
-- Supports advanced search syntax with visual feedback
+## 📋 Introduction
 
-## Requirements Clarification
+"Today I'll walk through the frontend architecture for a web search engine. The key challenge is delivering instant search results with minimal perceived latency while providing autocomplete suggestions, rendering results with highlighted snippets, and supporting advanced search syntax. I'll focus on the critical frontend decisions that impact user experience and performance."
+
+---
+
+## 🎯 Requirements
 
 ### Functional Requirements
-1. **Search Box**: Autocomplete with query suggestions
-2. **Results Page**: Display ranked results with titles, URLs, snippets
-3. **Query Highlighting**: Bold matched terms in snippets
+
+1. **Search Box**: Autocomplete with query suggestions as users type
+2. **Results Page**: Display ranked results with titles, URLs, and snippets
+3. **Query Highlighting**: Bold matched terms in titles and snippets
 4. **Advanced Search**: Support for phrases, exclusions, site filters
-5. **Pagination**: Navigate through result pages
+5. **Pagination**: Navigate through result pages efficiently
 
 ### Non-Functional Requirements
+
 1. **Perceived Performance**: Results visible within 500ms of query submission
 2. **Responsiveness**: Desktop, tablet, and mobile layouts
-3. **Accessibility**: Screen reader support, keyboard navigation
-4. **Offline Resilience**: Show cached results when offline
+3. **Accessibility**: Screen reader support, full keyboard navigation
+4. **Offline Resilience**: Show cached results when connectivity is poor
 
 ### UI/UX Requirements
+
 - Clean, distraction-free interface
 - Instant feedback on user actions
 - Clear visual hierarchy for results
-- Error states for failed searches
+- Meaningful error states for failed searches
 
-## High-Level Architecture
+---
+
+## 🏗️ High-Level Design
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        React Application                                 │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                      TanStack Router                               │  │
-│  │    /                → Home (Search Box)                           │  │
-│  │    /search?q=       → Search Results                              │  │
-│  │    /advanced        → Advanced Search Form                        │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │                    Components                                     │   │
-│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐  │   │
-│  │  │  SearchBox     │  │  ResultsList   │  │  Pagination        │  │   │
-│  │  │  - Input       │  │  - ResultCard  │  │  - PageNumbers     │  │   │
-│  │  │  - Suggestions │  │  - Snippet     │  │  - Prev/Next       │  │   │
-│  │  │  - History     │  │  - HighlightedText │                   │  │   │
-│  │  └────────────────┘  └────────────────┘  └────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                     Zustand Store                                  │  │
-│  │  query | results[] | suggestions[] | isLoading | page | error     │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------+
+|                      BROWSER                                      |
+|                                                                   |
+|  +-------------------------------------------------------------+  |
+|  |                    TANSTACK ROUTER                          |  |
+|  |   /           ---->  Home Page (Search Box)                 |  |
+|  |   /search?q= ---->  Search Results Page                     |  |
+|  |   /advanced  ---->  Advanced Search Form                    |  |
+|  +-------------------------------------------------------------+  |
+|                              |                                    |
+|                              v                                    |
+|  +-------------------------------------------------------------+  |
+|  |                    VIEW LAYER                               |  |
+|  |  +---------------+  +---------------+  +---------------+    |  |
+|  |  |  Search Box   |  | Results List  |  |  Pagination   |    |  |
+|  |  |  + Input      |  | + Result Card |  |  + Page Nav   |    |  |
+|  |  |  + Dropdown   |  | + Snippet     |  |  + Prefetch   |    |  |
+|  |  |  + History    |  | + Highlights  |  |               |    |  |
+|  |  +---------------+  +---------------+  +---------------+    |  |
+|  +-------------------------------------------------------------+  |
+|                              |                                    |
+|                              v                                    |
+|  +-------------------------------------------------------------+  |
+|  |                    ZUSTAND STORE                            |  |
+|  |  query | results[] | suggestions[] | isLoading | error      |  |
+|  +-------------------------------------------------------------+  |
+|                              |                                    |
+|                              v                                    |
+|  +-------------------------------------------------------------+  |
+|  |                    API LAYER                                |  |
+|  |  + Debounced fetching    + Request deduplication            |  |
+|  |  + Response caching      + Error handling                   |  |
+|  +-------------------------------------------------------------+  |
+|                              |                                    |
++------------------------------------------------------------------+
+                               |
+                               v
+                    +--------------------+
+                    |   SEARCH BACKEND   |
+                    |   /api/search      |
+                    |   /api/suggest     |
+                    +--------------------+
 ```
 
-## Deep Dive: Search Box with Autocomplete
+---
 
-### Component Architecture
+## 🔍 Deep Dive: Search Box with Autocomplete
 
-```tsx
-// components/SearchBox.tsx
-function SearchBox() {
-  const [inputValue, setInputValue] = useState('')
-  const [suggestions, setSuggestions] = useState<string[]>([])
-  const [selectedIndex, setSelectedIndex] = useState(-1)
-  const [isOpen, setIsOpen] = useState(false)
+### Interaction Flow
 
-  const inputRef = useRef<HTMLInputElement>(null)
-  const navigate = useNavigate()
-
-  // Debounced suggestion fetching
-  const debouncedFetch = useMemo(
-    () => debounce(async (query: string) => {
-      if (query.length < 2) {
-        setSuggestions([])
-        return
-      }
-
-      try {
-        const results = await api.getSuggestions(query)
-        setSuggestions(results)
-        setIsOpen(true)
-      } catch (error) {
-        console.error('Failed to fetch suggestions:', error)
-      }
-    }, 150),
-    []
-  )
-
-  useEffect(() => {
-    debouncedFetch(inputValue)
-    return () => debouncedFetch.cancel()
-  }, [inputValue, debouncedFetch])
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault()
-        setSelectedIndex(i => Math.min(i + 1, suggestions.length - 1))
-        break
-      case 'ArrowUp':
-        e.preventDefault()
-        setSelectedIndex(i => Math.max(i - 1, -1))
-        break
-      case 'Enter':
-        e.preventDefault()
-        const query = selectedIndex >= 0
-          ? suggestions[selectedIndex]
-          : inputValue
-        if (query.trim()) {
-          navigate({ to: '/search', search: { q: query } })
-        }
-        break
-      case 'Escape':
-        setIsOpen(false)
-        setSelectedIndex(-1)
-        break
-    }
-  }
-
-  return (
-    <div className="relative w-full max-w-2xl">
-      <div className="relative">
-        <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-        <input
-          ref={inputRef}
-          type="text"
-          value={inputValue}
-          onChange={e => setInputValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onFocus={() => suggestions.length > 0 && setIsOpen(true)}
-          onBlur={() => setTimeout(() => setIsOpen(false), 200)}
-          className="w-full pl-12 pr-4 py-3 text-lg border rounded-full
-                     shadow-sm hover:shadow-md focus:shadow-md
-                     focus:outline-none focus:ring-2 focus:ring-blue-500"
-          placeholder="Search the web..."
-          role="combobox"
-          aria-expanded={isOpen}
-          aria-controls="suggestions-list"
-          aria-activedescendant={
-            selectedIndex >= 0 ? `suggestion-${selectedIndex}` : undefined
-          }
-        />
-      </div>
-
-      {/* Suggestions dropdown */}
-      {isOpen && suggestions.length > 0 && (
-        <ul
-          id="suggestions-list"
-          role="listbox"
-          className="absolute top-full left-0 right-0 mt-1 bg-white
-                     border rounded-lg shadow-lg overflow-hidden z-50"
-        >
-          {suggestions.map((suggestion, index) => (
-            <li
-              key={suggestion}
-              id={`suggestion-${index}`}
-              role="option"
-              aria-selected={index === selectedIndex}
-              className={cn(
-                'px-4 py-2 cursor-pointer flex items-center gap-3',
-                index === selectedIndex ? 'bg-gray-100' : 'hover:bg-gray-50'
-              )}
-              onClick={() => {
-                navigate({ to: '/search', search: { q: suggestion } })
-              }}
-            >
-              <SearchIcon className="w-4 h-4 text-gray-400" />
-              <HighlightMatch text={suggestion} query={inputValue} />
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  )
-}
+```
+USER TYPES                    FRONTEND                        BACKEND
+    |                            |                               |
+    | keystroke                  |                               |
+    +--------------------------->|                               |
+    |                            |                               |
+    |          [150ms debounce window]                           |
+    |                            |                               |
+    |                            | GET /api/suggest?q=...        |
+    |                            +------------------------------>|
+    |                            |                               |
+    |                            |       suggestions[]           |
+    |                            |<------------------------------+
+    |     dropdown appears       |                               |
+    |<---------------------------+                               |
+    |                            |                               |
+    | arrow down / up            |                               |
+    +--------------------------->|                               |
+    |     highlight moves        |                               |
+    |<---------------------------+                               |
+    |                            |                               |
+    | Enter key                  |                               |
+    +--------------------------->|                               |
+    |                            | navigate to /search?q=...     |
+    |                            +------------------------------>|
 ```
 
-### Debouncing Strategy
+### Trade-off 1: Debounce Timing
 
-```typescript
-// hooks/useDebounce.ts
-export function useDebounce<T>(value: T, delay: number): T {
-  const [debouncedValue, setDebouncedValue] = useState(value)
+| Approach | Request Volume | User Experience | Network Load |
+|----------|---------------|-----------------|--------------|
+| ❌ 50ms debounce | Very High | Feels instant | Excessive API calls |
+| ✅ **150ms debounce** | Moderate | Responsive feel | ~80% fewer calls |
+| ❌ 300ms debounce | Low | Noticeable lag | Minimal load |
 
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedValue(value)
-    }, delay)
+**"I'm choosing 150ms because it hits the sweet spot. At 50ms, we're making an API call for nearly every keystroke, which wastes bandwidth and server resources. At 300ms, users notice the delay and the interface feels sluggish. 150ms reduces API calls by roughly 80% compared to no debouncing while still feeling responsive. Users typically type at 200-300ms between characters, so 150ms captures most complete keystrokes."**
 
-    return () => clearTimeout(timer)
-  }, [value, delay])
+### Trade-off 2: State Management Library
 
-  return debouncedValue
-}
+| Approach | Bundle Size | Boilerplate | DevTools | Async Handling |
+|----------|------------|-------------|----------|----------------|
+| ❌ Redux + RTK | ~12KB | High | Excellent | Built-in RTK Query |
+| ✅ **Zustand** | ~2KB | Minimal | Good | Manual but simple |
+| ❌ React Context | 0KB | Medium | Limited | Manual |
 
-// Alternative: debounce function
-export function debounce<T extends (...args: any[]) => any>(
-  fn: T,
-  delay: number
-): T & { cancel: () => void } {
-  let timeoutId: ReturnType<typeof setTimeout>
+**"I'm choosing Zustand over Redux because for a search application, we don't need Redux's elaborate action/reducer pattern. Our state shape is simple: query, results, loading, error. Zustand gives us a 2KB bundle versus Redux's 12KB, and the API is much simpler. Context would work but causes unnecessary re-renders when any part of state changes. Zustand's selector pattern prevents this."**
 
-  const debounced = ((...args: Parameters<T>) => {
-    clearTimeout(timeoutId)
-    timeoutId = setTimeout(() => fn(...args), delay)
-  }) as T & { cancel: () => void }
+---
 
-  debounced.cancel = () => clearTimeout(timeoutId)
+## 🔍 Deep Dive: Search Results Rendering
 
-  return debounced
-}
+### Component Hierarchy
+
+```
++----------------------------------------------------------+
+|                    RESULTS PAGE                           |
+|                                                           |
+|  +-----------------------------------------------------+  |
+|  |  SEARCH HEADER (sticky)                             |  |
+|  |  [Logo]  [================Search Box==============] |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  +-----------------------------------------------------+  |
+|  |  RESULTS METADATA                                   |  |
+|  |  "About 1,230,000 results (0.42 seconds)"           |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  +-----------------------------------------------------+  |
+|  |  RESULT CARD #1                                     |  |
+|  |  [favicon] example.com > path > page                |  |
+|  |  Title with **highlighted** terms                   |  |
+|  |  Snippet text with **matched** words in bold...     |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  +-----------------------------------------------------+  |
+|  |  RESULT CARD #2                                     |  |
+|  |  ...                                                |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  +-----------------------------------------------------+  |
+|  |  PAGINATION                                         |  |
+|  |  [< Prev]  Page 1 of 100  [Next >]                  |  |
+|  +-----------------------------------------------------+  |
++----------------------------------------------------------+
 ```
 
-### Why 150ms Debounce?
+### Trade-off 3: URL-Driven vs Component State
 
-| Delay | Pros | Cons |
-|-------|------|------|
-| 50ms | Feels instant | Too many API calls |
-| **150ms** | Good balance | Slight delay |
-| 300ms | Fewer API calls | Noticeable lag |
+| Approach | Shareability | Back Button | Complexity | SSR Ready |
+|----------|--------------|-------------|------------|-----------|
+| ✅ **URL-driven state** | Full | Native | Higher | Yes |
+| ❌ Component state | None | Broken | Lower | No |
 
-**Decision**: 150ms provides responsive feel while reducing API calls by ~80% compared to no debouncing.
+**"I'm choosing URL-driven search state because search results must be shareable. When a user finds what they need, they should be able to copy the URL and send it to someone else. This also means the browser back button works correctly, which users expect. The trade-off is slightly more complex state synchronization between the URL and our store, but TanStack Router handles this elegantly with its search param validation."**
 
-## Deep Dive: Search Results Rendering
+### Trade-off 4: Client-Side vs Server-Side Highlighting
 
-### Results List Component
+| Approach | Latency | Consistency | Flexibility |
+|----------|---------|-------------|-------------|
+| ❌ Server-only | Higher | Guaranteed | Limited |
+| ✅ **Client-side highlighting** | Lower | May differ slightly | High |
+| ❌ Hybrid | Medium | Good | Medium |
 
-```tsx
-// components/ResultsList.tsx
-function ResultsList() {
-  const { results, isLoading, error, query } = useSearchStore()
+**"I'm choosing client-side highlighting because it reduces the payload size and rendering latency. The server returns plain text snippets, and the client highlights based on the query terms. This could theoretically differ from what the server would highlight, but in practice the difference is negligible. The flexibility gain is significant: we can change highlight styles without backend changes, and we can highlight dynamically as users refine their query."**
 
-  if (isLoading) {
-    return <ResultsSkeleton count={10} />
-  }
+---
 
-  if (error) {
-    return <SearchError error={error} query={query} />
-  }
+## 🔍 Deep Dive: Loading States
 
-  if (results.length === 0) {
-    return <NoResults query={query} />
-  }
+### Trade-off 5: Skeleton Loading vs Spinner
 
-  return (
-    <div className="space-y-6">
-      <p className="text-sm text-gray-600">
-        About {formatNumber(results.total)} results
-        ({results.latencyMs / 1000} seconds)
-      </p>
+| Approach | Perceived Performance | Implementation | Layout Shift |
+|----------|----------------------|----------------|--------------|
+| ✅ **Skeleton screens** | Excellent | More complex | None |
+| ❌ Spinner | Poor | Simple | Significant |
+| ❌ No indicator | Worst | None | Jarring |
 
-      <ol className="space-y-8" aria-label="Search results">
-        {results.items.map((result, index) => (
-          <ResultCard
-            key={result.id}
-            result={result}
-            query={query}
-            position={index + 1}
-          />
-        ))}
-      </ol>
-    </div>
-  )
-}
+**"I'm choosing skeleton loading because it dramatically improves perceived performance. Studies show users perceive skeleton screens as 10-20% faster than spinners showing the same actual load time. The skeleton mimics the shape of the final content: a gray rectangle where the title will be, shorter rectangles for the snippet lines. This eliminates layout shift when results arrive, which is critical for Core Web Vitals. The trade-off is more UI code, but it's worth it for search where speed perception is everything."**
 
-function ResultCard({ result, query, position }: ResultCardProps) {
-  return (
-    <li className="max-w-2xl">
-      {/* URL breadcrumb */}
-      <div className="flex items-center gap-2 text-sm text-gray-600 mb-1">
-        <img
-          src={`https://www.google.com/s2/favicons?domain=${result.host}`}
-          alt=""
-          className="w-4 h-4"
-          loading="lazy"
-        />
-        <span className="truncate">{result.displayUrl}</span>
-      </div>
+### Skeleton Structure
 
-      {/* Title link */}
-      <h3 className="text-xl">
-        <a
-          href={result.url}
-          className="text-blue-700 hover:underline visited:text-purple-700"
-          onClick={() => trackClick(result.id, query, position)}
-        >
-          <HighlightedText text={result.title} terms={query.split(' ')} />
-        </a>
-      </h3>
-
-      {/* Snippet */}
-      <p className="text-sm text-gray-700 mt-1 line-clamp-2">
-        <HighlightedText text={result.snippet} terms={query.split(' ')} />
-      </p>
-    </li>
-  )
-}
+```
+LOADING STATE:
++----------------------------------------------------+
+|  [====]  [================]                         |  <-- favicon + breadcrumb
+|  [================================]                 |  <-- title
+|  [==========================================]       |  <-- snippet line 1
+|  [============================]                     |  <-- snippet line 2
++----------------------------------------------------+
+           |
+           | results arrive
+           v
+LOADED STATE:
++----------------------------------------------------+
+|  [G]  example.com > docs > api                      |
+|  Getting Started with the API                       |
+|  Learn how to integrate with our **API** using...   |
++----------------------------------------------------+
 ```
 
-### Snippet Highlighting
+---
 
-```tsx
-// components/HighlightedText.tsx
-interface HighlightedTextProps {
-  text: string
-  terms: string[]
-}
+## 🔍 Deep Dive: Search History
 
-function HighlightedText({ text, terms }: HighlightedTextProps) {
-  if (!terms.length) return <>{text}</>
+### Trade-off 6: localStorage vs Server-Side Storage
 
-  // Build regex from terms (escape special chars)
-  const pattern = terms
-    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('|')
+| Approach | Privacy | Cross-Device | Persistence | Implementation |
+|----------|---------|--------------|-------------|----------------|
+| ✅ **localStorage** | High | None | Per-browser | Simple |
+| ❌ Server-side | Lower | Yes | Account-tied | Complex |
+| ❌ sessionStorage | Highest | None | Tab only | Simplest |
 
-  const regex = new RegExp(`(${pattern})`, 'gi')
-  const parts = text.split(regex)
+**"I'm choosing localStorage for search history because privacy matters in search. Users may not want their searches stored on a server, especially for sensitive queries. localStorage keeps data on their device under their control. The trade-off is no cross-device sync, but that's actually a feature for privacy-conscious users. We limit history to 10 items and provide a clear 'Clear History' button. If we later add user accounts, server-side sync can be opt-in."**
 
-  return (
-    <>
-      {parts.map((part, i) => {
-        const isMatch = terms.some(
-          t => t.toLowerCase() === part.toLowerCase()
-        )
-        return isMatch ? (
-          <mark key={i} className="bg-transparent font-semibold">
-            {part}
-          </mark>
-        ) : (
-          <span key={i}>{part}</span>
-        )
-      })}
-    </>
-  )
-}
+---
+
+## 🔍 Deep Dive: Performance Optimizations
+
+### Trade-off 7: Virtualized List vs Simple Pagination
+
+| Approach | Memory Usage | Scroll UX | DOM Nodes | Use Case |
+|----------|-------------|-----------|-----------|----------|
+| ✅ **Virtualized list** | Constant | Smooth infinite | ~20-30 | Image search, long lists |
+| ❌ Pagination only | Per-page | Page jumps | 10-20 | Standard web results |
+| ❌ Load all | High | Janky | 100s+ | Never for search |
+
+**"I'm choosing virtualization for image search and infinite scroll scenarios, but keeping traditional pagination for standard web results. For 10 results per page, virtualization is overkill. But for image search where users might scroll through hundreds of thumbnails, virtualization is essential. It keeps only 20-30 DOM nodes regardless of result count, maintaining smooth 60fps scrolling. We use TanStack Virtual with an overscan of 5 items to prevent flashing during fast scrolls."**
+
+### Virtualization Concept
+
+```
+VIEWPORT (what user sees):
++----------------------------------+
+|  Result 47                       |  <-- rendered
+|  Result 48                       |  <-- rendered
+|  Result 49                       |  <-- rendered (overscan)
++----------------------------------+
+     ^
+     | Only these ~20-30 items exist in DOM
+     | Results 1-44 and 52+ are not rendered
+     v
+VIRTUAL LIST (logical):
+  Result 1    (not in DOM)
+  Result 2    (not in DOM)
+  ...
+  Result 45   (not in DOM)
+  Result 46   (overscan, in DOM)
+  Result 47   (visible, in DOM)
+  Result 48   (visible, in DOM)
+  Result 49   (visible, in DOM)
+  Result 50   (overscan, in DOM)
+  Result 51   (not in DOM)
+  ...
 ```
 
-### Loading Skeleton
+### Trade-off 8: Prefetching Strategy
 
-```tsx
-function ResultsSkeleton({ count }: { count: number }) {
-  return (
-    <div className="space-y-8 animate-pulse" aria-busy="true">
-      {Array.from({ length: count }, (_, i) => (
-        <div key={i} className="max-w-2xl space-y-2">
-          <div className="h-4 bg-gray-200 rounded w-48" />
-          <div className="h-6 bg-gray-200 rounded w-96" />
-          <div className="h-4 bg-gray-200 rounded w-full" />
-          <div className="h-4 bg-gray-200 rounded w-3/4" />
-        </div>
-      ))}
-    </div>
-  )
-}
+| Approach | Network Usage | Latency | Wasted Requests |
+|----------|--------------|---------|-----------------|
+| ✅ **Prefetch on hover** | Moderate | Very low | Some |
+| ❌ Prefetch always | High | Lowest | Many |
+| ❌ On-demand only | Minimal | Higher | None |
+
+**"I'm choosing to prefetch the next page when users hover over the 'Next' button. This gives us near-instant page transitions without prefetching pages the user will never visit. The hover event gives us 200-400ms of warning before the click, which is enough time to start the request. Some requests will be wasted if users hover but don't click, but that's an acceptable trade-off for the dramatic improvement in perceived speed when they do click."**
+
+### Prefetch Flow
+
+```
+USER                           FRONTEND                      CACHE
+  |                                |                           |
+  | mouse enters "Next" button     |                           |
+  +------------------------------->|                           |
+  |                                |                           |
+  |                                | prefetch page 2           |
+  |                                +-------------------------->|
+  |                                |                           |
+  |         (user reads results)   |     page 2 cached         |
+  |                                |<--------------------------+
+  |                                |                           |
+  | clicks "Next" button           |                           |
+  +------------------------------->|                           |
+  |                                | check cache               |
+  |                                +-------------------------->|
+  |                                |                           |
+  |                                |  CACHE HIT! instant       |
+  |      page 2 appears instantly  |<--------------------------+
+  |<-------------------------------+                           |
 ```
 
-## Deep Dive: State Management
+---
 
-### Search Store
+## 📊 Data Flow
 
-```typescript
-// stores/searchStore.ts
-import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+### Complete Search Flow
 
-interface SearchState {
-  query: string
-  results: SearchResults | null
-  isLoading: boolean
-  error: Error | null
-  page: number
-  searchHistory: string[]
-
-  // Actions
-  setQuery: (query: string) => void
-  search: (query: string, page?: number) => Promise<void>
-  clearResults: () => void
-  addToHistory: (query: string) => void
-  clearHistory: () => void
-}
-
-export const useSearchStore = create<SearchState>()(
-  persist(
-    (set, get) => ({
-      query: '',
-      results: null,
-      isLoading: false,
-      error: null,
-      page: 1,
-      searchHistory: [],
-
-      setQuery: (query) => set({ query }),
-
-      search: async (query, page = 1) => {
-        set({ isLoading: true, error: null, query, page })
-
-        try {
-          const results = await api.search({ q: query, page })
-          set({ results, isLoading: false })
-
-          // Add to history
-          get().addToHistory(query)
-        } catch (error) {
-          set({
-            error: error as Error,
-            isLoading: false,
-            results: null
-          })
-        }
-      },
-
-      clearResults: () => set({ results: null, query: '' }),
-
-      addToHistory: (query) => {
-        const history = get().searchHistory
-        const filtered = history.filter(h => h !== query)
-        set({
-          searchHistory: [query, ...filtered].slice(0, 10)
-        })
-      },
-
-      clearHistory: () => set({ searchHistory: [] }),
-    }),
-    {
-      name: 'search-history',
-      partialize: (state) => ({ searchHistory: state.searchHistory }),
-    }
-  )
-)
+```
++-------+     +------------+     +----------+     +---------+     +--------+
+| User  |     | SearchBox  |     |  Router  |     |  Store  |     |  API   |
++---+---+     +-----+------+     +----+-----+     +----+----+     +---+----+
+    |               |                 |                |              |
+    | types query   |                 |                |              |
+    +-------------->|                 |                |              |
+    |               |                 |                |              |
+    |        [debounce 150ms]         |                |              |
+    |               |                 |                |              |
+    |               | update URL      |                |              |
+    |               +---------------->|                |              |
+    |               |                 |                |              |
+    |               |                 | sync to store  |              |
+    |               |                 +--------------->|              |
+    |               |                 |                |              |
+    |               |                 |                | search()     |
+    |               |                 |                +------------->|
+    |               |                 |                |              |
+    |               |                 |                |   results    |
+    |               |                 |                |<-------------+
+    |               |                 |                |              |
+    |               |                 |   re-render    |              |
+    |               |<----------------+----------------+              |
+    |               |                 |                |              |
+    | sees results  |                 |                |              |
+    |<--------------+                 |                |              |
 ```
 
-### URL-Driven Search
+### Request Deduplication
 
-```tsx
-// routes/search.tsx
-import { createFileRoute, useSearch } from '@tanstack/react-router'
+```
+WITHOUT DEDUPLICATION:                WITH DEDUPLICATION:
 
-interface SearchParams {
-  q: string
-  page?: number
-}
+Request 1: /api/search?q=react        Request 1: /api/search?q=react
+Request 2: /api/search?q=react            |
+Request 3: /api/search?q=react            +---> Server (single request)
+    |           |           |             |
+    v           v           v             v
+  Server     Server     Server        Request 2: returns same promise
+  (3 requests, wasted resources)      Request 3: returns same promise
 
-export const Route = createFileRoute('/search')({
-  validateSearch: (search: Record<string, unknown>): SearchParams => ({
-    q: (search.q as string) || '',
-    page: Number(search.page) || 1,
-  }),
-  component: SearchPage,
-})
-
-function SearchPage() {
-  const { q, page } = useSearch({ from: '/search' })
-  const { search, results, isLoading } = useSearchStore()
-
-  // Trigger search when URL params change
-  useEffect(() => {
-    if (q) {
-      search(q, page)
-    }
-  }, [q, page, search])
-
-  return (
-    <div className="min-h-screen">
-      <SearchHeader />
-      <main className="max-w-4xl mx-auto px-4 py-6">
-        <ResultsList />
-        {results && <Pagination totalPages={results.totalPages} />}
-      </main>
-    </div>
-  )
-}
+                                      (1 request, 3 consumers)
 ```
 
-## Deep Dive: Performance Optimizations
+---
 
-### 1. Virtualized Results (Long Lists)
+## ⚖️ Trade-offs Summary
 
-```tsx
-// For very long result lists (image search, infinite scroll)
-import { useVirtualizer } from '@tanstack/react-virtual'
+| Decision | Chosen Approach | Alternative | Why This Choice |
+|----------|----------------|-------------|-----------------|
+| Debounce timing | 150ms | 50ms or 300ms | Balance between responsiveness and API efficiency |
+| State management | Zustand (2KB) | Redux (12KB) | Simpler API, smaller bundle for our use case |
+| Search state location | URL params | Component state | Shareable links, working back button |
+| Text highlighting | Client-side | Server-side | Lower latency, more flexible styling |
+| Loading indicator | Skeleton screens | Spinner | Better perceived performance, no layout shift |
+| Search history | localStorage | Server storage | Privacy-first, user-controlled |
+| Long lists | Virtualization | Simple pagination | Constant memory, smooth scrolling for image search |
+| Page prefetch | On hover | On demand or always | Good balance of speed vs wasted requests |
 
-function VirtualizedResults() {
-  const { results } = useSearchStore()
-  const parentRef = useRef<HTMLDivElement>(null)
+---
 
-  const virtualizer = useVirtualizer({
-    count: results?.items.length || 0,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 120, // Estimated height per result
-    overscan: 5,
-  })
+## 🚀 Future Enhancements
 
-  return (
-    <div ref={parentRef} className="h-[80vh] overflow-auto">
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          position: 'relative',
-        }}
-      >
-        {virtualizer.getVirtualItems().map(virtualRow => {
-          const result = results!.items[virtualRow.index]
-          return (
-            <div
-              key={result.id}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                transform: `translateY(${virtualRow.start}px)`,
-              }}
-            >
-              <ResultCard result={result} />
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-```
+1. **Voice Search**: Integrate Web Speech API for hands-free voice input with visual feedback during recognition
 
-### 2. Prefetching Next Page
+2. **Image Search**: Add drag-and-drop image upload with preview, using reverse image search backend
 
-```tsx
-function Pagination({ totalPages }: { totalPages: number }) {
-  const { page } = useSearch({ from: '/search' })
-  const navigate = useNavigate()
+3. **Instant Answers**: Render rich cards for calculations, definitions, weather, and other structured data
 
-  // Prefetch next page on hover
-  const prefetchNextPage = () => {
-    if (page < totalPages) {
-      const nextPageQuery = new URLSearchParams(window.location.search)
-      nextPageQuery.set('page', String(page + 1))
-      // Trigger prefetch via router or custom logic
-      api.prefetchSearch(nextPageQuery.toString())
-    }
-  }
+4. **Dark Mode**: Add theme toggle with system preference detection and smooth transitions
 
-  return (
-    <nav aria-label="Search results pagination" className="flex justify-center gap-2 mt-8">
-      <button
-        onClick={() => navigate({ search: { page: page - 1 } })}
-        disabled={page === 1}
-        className="px-4 py-2 border rounded disabled:opacity-50"
-      >
-        Previous
-      </button>
+5. **Offline Mode**: Implement service worker caching for recent searches and results
 
-      <span className="px-4 py-2">
-        Page {page} of {totalPages}
-      </span>
+6. **Personalization**: Optional logged-in experience with search history sync and personalized results
 
-      <button
-        onClick={() => navigate({ search: { page: page + 1 } })}
-        onMouseEnter={prefetchNextPage}
-        disabled={page === totalPages}
-        className="px-4 py-2 border rounded disabled:opacity-50"
-      >
-        Next
-      </button>
-    </nav>
-  )
-}
-```
+---
 
-### 3. Request Deduplication
+## 📝 Summary
 
-```typescript
-// services/api.ts
-const inflightRequests = new Map<string, Promise<any>>()
+"In this design, I've focused on the critical frontend decisions that make search feel instant and responsive. The key takeaways are:
 
-async function fetchWithDedup<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
-  if (inflightRequests.has(key)) {
-    return inflightRequests.get(key)!
-  }
+1. **Debouncing at 150ms** reduces API load by 80% while maintaining responsive feel
+2. **URL-driven state** ensures shareability and proper browser navigation
+3. **Skeleton loading** improves perceived performance without layout shift
+4. **Zustand** provides lightweight state management without Redux overhead
+5. **Client-side highlighting** reduces payload size and allows flexible styling
+6. **localStorage for history** prioritizes user privacy
+7. **Virtualization** handles image search and infinite scroll efficiently
+8. **Hover prefetching** gives near-instant page transitions
 
-  const promise = fetcher().finally(() => {
-    inflightRequests.delete(key)
-  })
-
-  inflightRequests.set(key, promise)
-  return promise
-}
-
-export const api = {
-  search: async (params: SearchParams) => {
-    const key = `search:${JSON.stringify(params)}`
-    return fetchWithDedup(key, () =>
-      fetch(`/api/search?${new URLSearchParams(params as any)}`)
-        .then(res => res.json())
-    )
-  },
-
-  getSuggestions: async (query: string) => {
-    const key = `suggest:${query}`
-    return fetchWithDedup(key, () =>
-      fetch(`/api/suggest?q=${encodeURIComponent(query)}`)
-        .then(res => res.json())
-    )
-  },
-}
-```
-
-## Accessibility (a11y)
-
-### ARIA Labels and Roles
-
-```tsx
-function SearchPage() {
-  return (
-    <div>
-      <header role="banner">
-        <SearchBox />
-      </header>
-
-      <main role="main" aria-live="polite">
-        {isLoading && (
-          <div role="status" aria-label="Loading search results">
-            <ResultsSkeleton />
-          </div>
-        )}
-
-        {results && (
-          <section aria-label="Search results">
-            <h1 className="sr-only">
-              Search results for "{query}"
-            </h1>
-            <ResultsList />
-          </section>
-        )}
-      </main>
-
-      <nav aria-label="Pagination">
-        <Pagination />
-      </nav>
-    </div>
-  )
-}
-```
-
-### Keyboard Navigation
-
-```tsx
-function useSearchKeyboardShortcuts() {
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      // Focus search box with /
-      if (e.key === '/' && !isInputFocused()) {
-        e.preventDefault()
-        document.querySelector<HTMLInputElement>('[role="combobox"]')?.focus()
-      }
-
-      // Navigate results with j/k
-      if (e.key === 'j') {
-        focusNextResult()
-      }
-      if (e.key === 'k') {
-        focusPrevResult()
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [])
-}
-```
-
-## Responsive Design
-
-### Mobile-First Layout
-
-```tsx
-function SearchHeader() {
-  return (
-    <header className="sticky top-0 bg-white border-b z-40">
-      <div className="flex items-center gap-4 px-4 py-3
-                      md:px-6 lg:px-8">
-        {/* Logo - hidden on mobile during search */}
-        <a href="/" className="hidden md:block">
-          <Logo className="h-8" />
-        </a>
-
-        {/* Search box - full width on mobile */}
-        <div className="flex-1 max-w-2xl">
-          <SearchBox compact />
-        </div>
-
-        {/* Settings - icon only on mobile */}
-        <button className="p-2 md:px-4 md:py-2">
-          <SettingsIcon className="w-5 h-5 md:hidden" />
-          <span className="hidden md:inline">Settings</span>
-        </button>
-      </div>
-    </header>
-  )
-}
-```
-
-### Breakpoint Strategy
-
-```css
-/* tailwind.config.js */
-module.exports = {
-  theme: {
-    screens: {
-      'sm': '640px',   /* Mobile landscape */
-      'md': '768px',   /* Tablet */
-      'lg': '1024px',  /* Desktop */
-      'xl': '1280px',  /* Wide desktop */
-    }
-  }
-}
-```
-
-| Breakpoint | Layout Changes |
-|------------|----------------|
-| < 640px | Full-width search, stacked results |
-| 640-768px | Side padding, compact header |
-| 768-1024px | Fixed-width results, sidebar |
-| > 1024px | Full desktop layout |
-
-## Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| 150ms debounce | Reduces API calls | Slight typing lag |
-| URL-driven search | Shareable links, back button | More complex state sync |
-| Client-side highlighting | Fast rendering | May differ from server |
-| History in localStorage | Persists across sessions | Privacy considerations |
-| Skeleton loading | Better perceived perf | Extra UI complexity |
-
-## Future Frontend Enhancements
-
-1. **Voice Search**: Web Speech API for voice input
-2. **Image Search**: Drag-and-drop image upload with preview
-3. **Instant Answers**: Rich cards for calculations, definitions
-4. **Dark Mode**: Theme toggle with system preference detection
-5. **Offline Mode**: Service worker caching for recent searches
+The architecture supports both simple web search and more complex scenarios like image search, all while maintaining sub-500ms perceived latency and excellent accessibility through proper ARIA attributes and keyboard navigation."
