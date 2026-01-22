@@ -2,13 +2,17 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Opening Statement (1 minute)
+---
+
+## 📋 Opening Statement (1 minute)
 
 "I'll design a health data pipeline like Apple Health, which collects metrics from multiple devices, deduplicates overlapping data, and generates actionable health insights while maintaining strict privacy. The key challenges are handling data from diverse sources with different formats, accurately deduplicating overlapping measurements from multiple devices, and protecting highly sensitive health information.
 
 From a backend perspective, the core technical challenges are building a priority-based deduplication algorithm that handles overlapping time ranges, implementing efficient time-series storage with TimescaleDB hypertables, designing idempotent ingestion for unreliable mobile networks, and ensuring HIPAA-compliant data retention policies."
 
-## Requirements Clarification (3 minutes)
+---
+
+## 🎯 Requirements Clarification (3 minutes)
 
 ### Functional Requirements
 - **Ingest**: Collect data from multiple devices (Apple Watch, iPhone, third-party)
@@ -30,24 +34,26 @@ From a backend perspective, the core technical challenges are building a priorit
 - Years of historical data per user
 - Write-heavy workload: 90% writes, 10% reads
 
-## High-Level Architecture (5 minutes)
+---
+
+## 🏗️ High-Level Architecture (5 minutes)
 
 ```
 +----------------------------------------------------------+
-|                      Data Sources                          |
-|   Apple Watch | iPhone | Third-Party (scales, BP, etc.)   |
+|                      Data Sources                         |
+|   Apple Watch | iPhone | Third-Party (scales, BP, etc.)  |
 +----------------------------------------------------------+
                            |
                            v
 +----------------------------------------------------------+
-|                  Ingestion Service (REST API)              |
-|    Validation | Normalization | Idempotency Check          |
+|                  Ingestion Service (REST API)             |
+|    Validation | Normalization | Idempotency Check         |
 +----------------------------------------------------------+
                            |
                            v
 +----------------------------------------------------------+
-|              Message Queue (RabbitMQ)                      |
-|      health-aggregation | health-insights queues           |
+|              Message Queue (RabbitMQ)                     |
+|      health-aggregation | health-insights queues          |
 +----------------------------------------------------------+
                            |
           +----------------+----------------+
@@ -60,590 +66,500 @@ From a backend perspective, the core technical challenges are building a priorit
           |                                 |
           v                                 v
 +----------------------------------------------------------+
-|                     Storage Layer                          |
-|    TimescaleDB (hypertables) | Valkey (cache, sessions)    |
-|              MinIO (exports, archives)                     |
+|                     Storage Layer                         |
+|    TimescaleDB (hypertables) | Valkey (cache, sessions)   |
+|              MinIO (exports, archives)                    |
 +----------------------------------------------------------+
 ```
 
 ### Core Backend Components
-1. **Ingestion Service** - Validates, normalizes, and inserts samples with idempotency
-2. **Aggregation Worker** - Consumes queue, deduplicates, and computes aggregates
-3. **Insights Worker** - Analyzes aggregates for trends and alerts
-4. **Query API** - Serves samples, aggregates, and summaries with caching
 
-## Deep Dive: Database Schema (8 minutes)
+| Component | Responsibility |
+|-----------|----------------|
+| Ingestion Service | Validates, normalizes, and inserts samples with idempotency |
+| Aggregation Worker | Consumes queue, deduplicates, and computes aggregates |
+| Insights Worker | Analyzes aggregates for trends and alerts |
+| Query API | Serves samples, aggregates, and summaries with caching |
+
+---
+
+## 📊 Deep Dive: Database Schema (8 minutes)
 
 ### TimescaleDB Hypertables
 
 TimescaleDB provides automatic time-based partitioning for efficient range queries on health data.
 
-```sql
--- Enable extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-
--- Users table
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  name VARCHAR(100),
-  role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Device registry with priority ranking
-CREATE TABLE user_devices (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  device_type VARCHAR(50) NOT NULL,
-  device_name VARCHAR(100),
-  device_identifier VARCHAR(255),
-  priority INTEGER DEFAULT 50,  -- Higher = preferred for deduplication
-  last_sync TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(user_id, device_identifier)
-);
-
--- Priority values: apple_watch=100, iphone=80, ipad=70,
--- third_party_wearable=50, third_party_scale=40, manual_entry=10
-
--- Raw health samples (converted to hypertable)
-CREATE TABLE health_samples (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(50) NOT NULL,
-  value DOUBLE PRECISION,
-  unit VARCHAR(20),
-  start_date TIMESTAMP NOT NULL,
-  end_date TIMESTAMP NOT NULL,
-  source_device VARCHAR(50),
-  source_device_id UUID REFERENCES user_devices(id),
-  source_app VARCHAR(100),
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Convert to hypertable for time-series optimization
-SELECT create_hypertable('health_samples', 'start_date', if_not_exists => TRUE);
-
--- Indexes for common query patterns
-CREATE INDEX idx_samples_user_type ON health_samples(user_id, type, start_date DESC);
-CREATE INDEX idx_samples_device ON health_samples(source_device_id);
-CREATE INDEX idx_samples_type_date ON health_samples(type, start_date DESC);
 ```
++------------------+       +-------------------+       +------------------+
+|      users       |       |   user_devices    |       | health_samples   |
++------------------+       +-------------------+       +------------------+
+| id (PK, UUID)    |<------| user_id (FK)      |       | id (PK, UUID)    |
+| email            |       | device_type       |------>| user_id (FK)     |
+| password_hash    |       | device_name       |       | type             |
+| name             |       | device_identifier |       | value            |
+| role             |       | priority          |       | unit             |
+| created_at       |       | last_sync         |       | start_date       |
++------------------+       +-------------------+       | end_date         |
+                                                       | source_device    |
+                                                       | source_device_id |
+                                                       | metadata (JSONB) |
+                                                       +------------------+
+                                                              |
+                                            (hypertable, partitioned by start_date)
+```
+
+### Device Priority Ranking
+
+Higher priority = more trusted sensors for deduplication:
+
+| Device Type | Priority | Rationale |
+|-------------|----------|-----------|
+| Apple Watch | 100 | Direct skin contact, medical-grade sensors |
+| iPhone | 80 | Motion sensors, CoreMotion integration |
+| iPad | 70 | Similar to iPhone but less commonly carried |
+| Third-party wearable | 50 | Variable sensor quality |
+| Third-party scale | 40 | Single-purpose, less frequent |
+| Manual entry | 10 | Prone to user error |
 
 ### Pre-Computed Aggregates
 
-```sql
--- Aggregated data (also a hypertable)
-CREATE TABLE health_aggregates (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(50) NOT NULL,
-  period VARCHAR(10) NOT NULL,  -- 'hour', 'day', 'week', 'month'
-  period_start TIMESTAMP NOT NULL,
-  value DOUBLE PRECISION NOT NULL,
-  min_value DOUBLE PRECISION,
-  max_value DOUBLE PRECISION,
-  sample_count INTEGER DEFAULT 1,
-  updated_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(user_id, type, period, period_start)
-);
-
-SELECT create_hypertable('health_aggregates', 'period_start', if_not_exists => TRUE);
-CREATE INDEX idx_aggregates_user_type ON health_aggregates(user_id, type, period, period_start DESC);
-
--- Insights generated from aggregates
-CREATE TABLE health_insights (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(50) NOT NULL,
-  severity VARCHAR(20),
-  direction VARCHAR(20),
-  message TEXT,
-  recommendation TEXT,
-  data JSONB,
-  acknowledged BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_insights_user ON health_insights(user_id, created_at DESC);
-CREATE INDEX idx_insights_unread ON health_insights(user_id, acknowledged)
-  WHERE acknowledged = false;
 ```
++----------------------+       +-------------------+
+|  health_aggregates   |       |  health_insights  |
++----------------------+       +-------------------+
+| id (PK)              |       | id (PK)           |
+| user_id (FK)         |       | user_id (FK)      |
+| type                 |       | type              |
+| period (hour/day/wk) |       | severity          |
+| period_start         |       | direction         |
+| value                |       | message           |
+| min_value            |       | recommendation    |
+| max_value            |       | data (JSONB)      |
+| sample_count         |       | acknowledged      |
++----------------------+       | created_at        |
+       |                       +-------------------+
+(hypertable, partitioned by period_start)
+```
+
+### Indexes for Query Patterns
+
+| Index | Columns | Purpose |
+|-------|---------|---------|
+| idx_samples_user_type | (user_id, type, start_date DESC) | Dashboard queries |
+| idx_samples_device | (source_device_id) | Device-specific filtering |
+| idx_aggregates_user_type | (user_id, type, period, period_start DESC) | Chart data |
+| idx_insights_unread | (user_id, acknowledged) WHERE acknowledged = false | Unread alerts |
 
 ### Compression Policy
 
-```sql
--- Compress chunks older than 90 days (TimescaleDB feature)
-SELECT add_compression_policy('health_samples', INTERVAL '90 days');
-SELECT add_compression_policy('health_aggregates', INTERVAL '90 days');
-
--- Compression ratio: ~10:1 for numeric health data
--- Query latency increases from ~5ms to ~50ms for compressed chunks
+```
+                     Data Age Lifecycle
+    +----------------+----------------+----------------+
+    |    0-90 days   |  90 days-2 yr  |    2-7 years   |
+    |      HOT       |      WARM      |      COLD      |
+    +----------------+----------------+----------------+
+    | Uncompressed   | Compressed     | MinIO Archive  |
+    | ~5ms queries   | ~50ms queries  | Minutes to     |
+    | Full updates   | Read-only      | restore        |
+    +----------------+----------------+----------------+
+                         |
+            Compression ratio: ~10:1 for numeric health data
 ```
 
-## Deep Dive: Ingestion with Idempotency (8 minutes)
+---
 
-### Device Sync Endpoint
+## 🔄 Deep Dive: Ingestion with Idempotency (8 minutes)
 
-```javascript
-// POST /api/v1/devices/:deviceId/sync
-router.post('/devices/:deviceId/sync', async (req, res) => {
-  const { deviceId } = req.params;
-  const { samples } = req.body;
-  const userId = req.session.userId;
+### Device Sync Flow
 
-  // Check idempotency key (from header or generate from content)
-  const idempotencyKey = req.headers['x-idempotency-key'] ||
-    generateIdempotencyKey(userId, deviceId, samples);
-
-  const cached = await checkIdempotencyKey(idempotencyKey);
-  if (cached) {
-    return res.json(cached.response);
-  }
-
-  // Process sync
-  const result = await deviceSyncService.syncFromDevice(userId, deviceId, samples);
-
-  // Cache response for 24 hours
-  await storeIdempotencyResponse(idempotencyKey, userId, result);
-
-  res.json(result);
-});
-
-function generateIdempotencyKey(userId, deviceId, samples) {
-  const hash = crypto.createHash('sha256');
-  hash.update(userId + deviceId + JSON.stringify(samples));
-  return hash.digest('hex');
-}
 ```
++--------+     POST /api/devices/:id/sync     +------------+
+| Device |---------------------------------->| Ingestion  |
+|        |     { samples: [...] }            | Service    |
++--------+     X-Idempotency-Key: abc123     +------------+
+                                                   |
+                   +-------------------------------+
+                   |
+                   v
+        +-------------------+
+        | Check Idempotency |
+        | Key in Cache      |
+        +-------------------+
+               |
+      +--------+--------+
+      |                 |
+   (cache hit)     (cache miss)
+      |                 |
+      v                 v
++-------------+   +---------------+
+| Return      |   | Process Sync  |
+| Cached      |   | - Validate    |
+| Response    |   | - Normalize   |
++-------------+   | - Batch Insert|
+                  +---------------+
+                         |
+                         v
+                  +---------------+
+                  | Store Response|
+                  | in Cache      |
+                  | (24h TTL)     |
+                  +---------------+
+                         |
+                         v
+                  +---------------+
+                  | Queue for     |
+                  | Aggregation   |
+                  +---------------+
+```
+
+### Idempotency Key Generation
+
+When client doesn't provide a key, generate from content:
+
+```
+Idempotency Key = SHA256(userId + deviceId + JSON(samples))
+```
+
+This ensures identical sync payloads produce the same key, preventing duplicate processing on retries.
 
 ### Batch Insert with UPSERT
 
-```javascript
-class DeviceSyncService {
-  async syncFromDevice(userId, deviceId, samples) {
-    const validSamples = [];
-    const errors = [];
-
-    // Validate and normalize each sample
-    for (const sample of samples) {
-      try {
-        const healthSample = new HealthSample({
-          ...sample,
-          userId,
-          sourceDevice: deviceId
-        });
-        healthSample.validate();
-        validSamples.push(healthSample);
-      } catch (error) {
-        errors.push({ sample, error: error.message });
-      }
-    }
-
-    // Batch insert with conflict handling
-    if (validSamples.length > 0) {
-      await this.batchInsert(validSamples);
-    }
-
-    // Queue for aggregation processing
-    await this.queue.publish('health-aggregation', {
-      userId,
-      sampleTypes: [...new Set(validSamples.map(s => s.type))],
-      dateRange: this.getDateRange(validSamples)
-    });
-
-    return {
-      synced: validSamples.length,
-      errors: errors.length,
-      errorDetails: errors
-    };
-  }
-
-  async batchInsert(samples) {
-    const values = samples.map(s => [
-      s.id, s.userId, s.type, s.value, s.unit,
-      s.startDate, s.endDate, s.sourceDevice, s.sourceApp,
-      JSON.stringify(s.metadata)
-    ]);
-
-    // UPSERT handles duplicate sample IDs from retries
-    await db.query(`
-      INSERT INTO health_samples
-        (id, user_id, type, value, unit, start_date, end_date,
-         source_device, source_app, metadata)
-      VALUES ${this.buildPlaceholders(values)}
-      ON CONFLICT (id) DO NOTHING
-    `, values.flat());
-  }
-}
+```
+         Batch Insert Flow
++--------------------------------+
+|     Incoming Samples (N)       |
++--------------------------------+
+               |
+               v
++--------------------------------+
+|   Validate Each Sample         |
+|   - Type exists               |
+|   - Value in valid range      |
+|   - Dates are valid           |
++--------------------------------+
+        |              |
+   (valid)        (invalid)
+        |              |
+        v              v
++---------------+  +-------------+
+| Valid Samples |  | Error List  |
+| Array         |  | with reason |
++---------------+  +-------------+
+        |
+        v
++--------------------------------+
+| Bulk INSERT with               |
+| ON CONFLICT (id) DO NOTHING    |
++--------------------------------+
+        |
+        v
++--------------------------------+
+| Return: { synced: X,          |
+|           errors: Y }          |
++--------------------------------+
 ```
 
-### Idempotency Key Table
+### Idempotency Key Storage
 
-```sql
-CREATE TABLE idempotency_keys (
-  key VARCHAR(255) PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  request_hash VARCHAR(64) NOT NULL,
-  response JSONB,
-  created_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP NOT NULL
-);
+| Column | Type | Description |
+|--------|------|-------------|
+| key | VARCHAR(255) PK | SHA256 hash |
+| user_id | UUID FK | Owner of the request |
+| request_hash | VARCHAR(64) | Original payload hash |
+| response | JSONB | Cached response |
+| created_at | TIMESTAMP | When created |
+| expires_at | TIMESTAMP | When to delete (24h) |
 
-CREATE INDEX idx_idempotency_user ON idempotency_keys(user_id);
-CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+Daily cleanup job removes expired keys.
 
--- Cleanup job runs daily
-DELETE FROM idempotency_keys WHERE expires_at < NOW();
-```
+---
 
-## Deep Dive: Deduplication Algorithm (8 minutes)
+## 🔀 Deep Dive: Deduplication Algorithm (8 minutes)
 
 ### Priority-Based Overlap Resolution
 
 When the same metric comes from multiple devices (steps from Apple Watch and iPhone), we must deduplicate to avoid double-counting.
 
-```javascript
-class AggregationPipeline {
-  constructor() {
-    // Device priority (higher = more trusted sensors)
-    this.devicePriority = {
-      'apple_watch': 100,
-      'iphone': 80,
-      'ipad': 70,
-      'third_party_wearable': 50,
-      'third_party_scale': 40,
-      'manual_entry': 10
-    };
-  }
+```
+           Deduplication Algorithm
++----------------------------------------+
+|    Raw Samples for Time Window         |
+|    (e.g., 9:00 AM - 10:00 AM)          |
++----------------------------------------+
+                    |
+                    v
++----------------------------------------+
+| Sort by Device Priority (DESC)         |
+| Apple Watch (100) first                |
++----------------------------------------+
+                    |
+                    v
++----------------------------------------+
+| Initialize: covered_ranges = []        |
+| Initialize: result = []                |
++----------------------------------------+
+                    |
+                    v
+        +------------------------+
+        | For each sample:       |
+        +------------------------+
+                    |
+                    v
++----------------------------------------+
+| Check overlap with covered_ranges      |
++----------------------------------------+
+        |           |           |
+   (no overlap)  (partial)  (full overlap)
+        |           |           |
+        v           v           v
++----------+  +------------+  +--------+
+| Include  |  | Adjust for |  | Skip   |
+| full     |  | non-overlap|  | sample |
+| sample   |  | portion    |  |        |
++----------+  +------------+  +--------+
+        |           |
+        v           v
++----------------------------------------+
+| Add time range to covered_ranges       |
++----------------------------------------+
+```
 
-  async deduplicateSamples(samples, type) {
-    // Sort by priority (highest first)
-    const sorted = samples.sort((a, b) =>
-      this.getDevicePriority(b.sourceDevice) -
-      this.getDevicePriority(a.sourceDevice)
-    );
+### Overlap Types
 
-    const result = [];
-    const coveredRanges = [];  // Already accounted time ranges
+```
+Case 1: No Overlap
+Apple Watch: |-------|
+iPhone:                   |-------|
+Result: Include both samples
 
-    for (const sample of sorted) {
-      const overlap = this.findOverlap(
-        sample.startDate,
-        sample.endDate,
-        coveredRanges
-      );
+Case 2: Partial Overlap
+Apple Watch: |---------|
+iPhone:           |---------|
+Result: Include Watch fully, iPhone only for non-overlapping portion
 
-      if (!overlap) {
-        // No overlap - include full sample
-        result.push(sample);
-        coveredRanges.push({ start: sample.startDate, end: sample.endDate });
-      } else if (overlap.partial) {
-        // Partial overlap - adjust sample proportionally
-        const adjusted = this.adjustForOverlap(sample, overlap, type);
-        if (adjusted) {
-          result.push(adjusted);
-          coveredRanges.push({ start: adjusted.startDate, end: adjusted.endDate });
-        }
-      }
-      // Full overlap: skip (higher priority already covers this time)
-    }
+Case 3: Full Overlap (iPhone completely covered)
+Apple Watch: |-------------|
+iPhone:         |-------|
+Result: Include Watch only, skip iPhone entirely
+```
 
-    return result;
-  }
+### Value Adjustment for Partial Overlap
 
-  findOverlap(start, end, coveredRanges) {
-    for (const range of coveredRanges) {
-      if (start < range.end && end > range.start) {
-        const overlapStart = Math.max(start, range.start);
-        const overlapEnd = Math.min(end, range.end);
+For sum-based metrics (steps, calories), adjust proportionally:
 
-        if (overlapStart === start && overlapEnd === end) {
-          return { full: true };  // Completely covered
-        }
+```
+Original iPhone sample:
+  Time: 9:30-10:30, Value: 2000 steps
 
-        return {
-          partial: true,
-          overlapStart,
-          overlapEnd
-        };
-      }
-    }
-    return null;
-  }
+Apple Watch covers 9:30-10:00 (50% overlap)
 
-  adjustForOverlap(sample, overlap, type) {
-    const config = HealthDataTypes[type];
-    const totalDuration = sample.endDate - sample.startDate;
-    const overlapDuration = overlap.overlapEnd - overlap.overlapStart;
-    const remainingDuration = totalDuration - overlapDuration;
-
-    if (remainingDuration <= 0) return null;
-
-    // For sum-based metrics (steps, calories), adjust value proportionally
-    if (config.aggregation === 'sum') {
-      const ratio = remainingDuration / totalDuration;
-      return {
-        ...sample,
-        value: sample.value * ratio,
-        startDate: overlap.overlapEnd > sample.startDate
-          ? sample.startDate : overlap.overlapEnd,
-        endDate: overlap.overlapStart < sample.endDate
-          ? sample.endDate : overlap.overlapStart
-      };
-    }
-
-    return sample;  // For averages, keep full value
-  }
-}
+Adjusted iPhone sample:
+  Time: 10:00-10:30, Value: 1000 steps (50% of original)
 ```
 
 ### Aggregation Strategies by Metric Type
 
-```javascript
-// Configuration for each health data type
-const HealthDataTypes = {
-  STEPS: { unit: 'count', aggregation: 'sum' },
-  DISTANCE: { unit: 'meters', aggregation: 'sum' },
-  HEART_RATE: { unit: 'bpm', aggregation: 'average' },
-  RESTING_HEART_RATE: { unit: 'bpm', aggregation: 'average' },
-  WEIGHT: { unit: 'kg', aggregation: 'latest' },
-  BODY_FAT: { unit: 'percent', aggregation: 'latest' },
-  SLEEP_ANALYSIS: { unit: 'minutes', aggregation: 'sum' },
-  ACTIVE_ENERGY: { unit: 'kcal', aggregation: 'sum' },
-  BLOOD_GLUCOSE: { unit: 'mg/dL', aggregation: 'average' },
-  OXYGEN_SATURATION: { unit: 'percent', aggregation: 'average' }
-};
-
-function aggregate(values, type) {
-  switch (type) {
-    case 'sum':
-      return values.reduce((a, b) => a + b, 0);
-    case 'average':
-      return values.reduce((a, b) => a + b, 0) / values.length;
-    case 'min':
-      return Math.min(...values);
-    case 'max':
-      return Math.max(...values);
-    case 'latest':
-      return values[values.length - 1];
-    default:
-      return values[0];
-  }
-}
-```
+| Metric Type | Strategy | Example |
+|-------------|----------|---------|
+| Steps | sum | Total steps for the day |
+| Distance | sum | Total distance walked |
+| Heart Rate | average | Average BPM for the hour |
+| Resting Heart Rate | average | Average resting BPM |
+| Weight | latest | Most recent measurement |
+| Body Fat | latest | Most recent measurement |
+| Sleep | sum | Total minutes asleep |
+| Active Energy | sum | Total calories burned |
+| Blood Glucose | average | Average reading |
+| Oxygen Saturation | average | Average SpO2 |
 
 ### Store Aggregates with UPSERT
 
-```javascript
-async storeAggregates(userId, type, aggregates, period) {
-  for (const agg of aggregates) {
-    await db.query(`
-      INSERT INTO health_aggregates
-        (user_id, type, period, period_start, value, min_value, max_value, sample_count)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      ON CONFLICT (user_id, type, period, period_start)
-      DO UPDATE SET
-        value = EXCLUDED.value,
-        min_value = EXCLUDED.min_value,
-        max_value = EXCLUDED.max_value,
-        sample_count = EXCLUDED.sample_count,
-        updated_at = NOW()
-    `, [
-      userId, type, period, agg.periodStart,
-      agg.value, agg.minValue, agg.maxValue, agg.sampleCount
-    ]);
-  }
-}
+Aggregates are stored/updated using UPSERT to handle reprocessing:
+
+```
+INSERT ... ON CONFLICT (user_id, type, period, period_start)
+DO UPDATE SET
+  value = EXCLUDED.value,
+  min_value = EXCLUDED.min_value,
+  max_value = EXCLUDED.max_value,
+  sample_count = EXCLUDED.sample_count,
+  updated_at = NOW()
 ```
 
-## Deep Dive: Insights Engine (5 minutes)
+---
+
+## 💡 Deep Dive: Insights Engine (5 minutes)
 
 ### Trend Detection with Linear Regression
 
-```javascript
-class InsightsEngine {
-  async analyzeHeartRate(userId) {
-    // Get 30 days of resting heart rate
-    const data = await db.query(`
-      SELECT period_start, value
-      FROM health_aggregates
-      WHERE user_id = $1
-        AND type = 'RESTING_HEART_RATE'
-        AND period = 'day'
-        AND period_start >= NOW() - INTERVAL '30 days'
-      ORDER BY period_start
-    `, [userId]);
-
-    if (data.rows.length < 7) return null;
-
-    const values = data.rows.map(r => r.value);
-    const trend = this.calculateTrend(values);
-
-    if (Math.abs(trend.slope) > 0.5) {
-      return {
-        type: 'HEART_RATE_TREND',
-        direction: trend.slope > 0 ? 'increasing' : 'decreasing',
-        magnitude: Math.abs(trend.slope),
-        message: trend.slope > 0
-          ? 'Your resting heart rate has increased over the past month'
-          : 'Your resting heart rate has decreased over the past month',
-        data: {
-          startValue: values[0],
-          endValue: values[values.length - 1],
-          change: values[values.length - 1] - values[0]
-        }
-      };
-    }
-
-    return null;
-  }
-
-  // Linear regression for trend detection
-  calculateTrend(values) {
-    const n = values.length;
-    const sumX = (n * (n - 1)) / 2;
-    const sumY = values.reduce((a, b) => a + b, 0);
-    const sumXY = values.reduce((sum, val, i) => sum + i * val, 0);
-    const sumX2 = (n * (n - 1) * (2 * n - 1)) / 6;
-
-    const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-    const intercept = (sumY - slope * sumX) / n;
-
-    return { slope, intercept };
-  }
-}
+```
+         Insights Generation Pipeline
++------------------------------------------+
+|    Aggregation Worker publishes to       |
+|    health-insights queue                 |
++------------------------------------------+
+                     |
+                     v
++------------------------------------------+
+|    Insights Worker consumes message      |
+|    { userId, types: [...], dateRange }   |
++------------------------------------------+
+                     |
+    +----------------+----------------+
+    |                |                |
+    v                v                v
++--------+     +----------+     +--------+
+| Heart  |     | Activity |     | Sleep  |
+| Rate   |     | Analysis |     | Deficit|
+| Trend  |     |          |     | Check  |
++--------+     +----------+     +--------+
+    |                |                |
+    +----------------+----------------+
+                     |
+                     v
++------------------------------------------+
+|    Store insights in health_insights     |
+|    table (if threshold exceeded)         |
++------------------------------------------+
 ```
 
-### Activity Comparison Query
+### Heart Rate Trend Detection
 
-```sql
--- Compare this week to 4-week average
-WITH this_week AS (
-  SELECT COALESCE(SUM(value), 0) as total
-  FROM health_aggregates
-  WHERE user_id = $1
-    AND type = 'STEPS'
-    AND period = 'day'
-    AND period_start >= DATE_TRUNC('week', NOW())
-),
-monthly_avg AS (
-  SELECT COALESCE(AVG(weekly_total), 0) as avg
-  FROM (
-    SELECT DATE_TRUNC('week', period_start) as week,
-           SUM(value) as weekly_total
-    FROM health_aggregates
-    WHERE user_id = $1
-      AND type = 'STEPS'
-      AND period = 'day'
-      AND period_start >= NOW() - INTERVAL '4 weeks'
-      AND period_start < DATE_TRUNC('week', NOW())
-    GROUP BY week
-  ) weekly
-)
-SELECT
-  this_week.total as current_week,
-  monthly_avg.avg as monthly_average,
-  ((this_week.total - monthly_avg.avg) / NULLIF(monthly_avg.avg, 0)) * 100 as percent_change
-FROM this_week, monthly_avg;
+Uses linear regression over 30 days of resting heart rate:
+
+```
+Linear Regression Formula:
+slope = (n * ΣXY - ΣX * ΣY) / (n * ΣX² - (ΣX)²)
+
+Where:
+  X = day index (0, 1, 2, ... 29)
+  Y = resting heart rate value
+  n = number of data points
+
+Alert triggered if |slope| > 0.5 BPM/day
 ```
 
-## Deep Dive: Share Token System (3 minutes)
+### Activity Comparison Logic
 
-```sql
--- Share tokens for controlled data sharing
-CREATE TABLE share_tokens (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  recipient_email VARCHAR(255),
-  recipient_id UUID REFERENCES users(id),
-  data_types TEXT[] NOT NULL,
-  date_start DATE,
-  date_end DATE,
-  expires_at TIMESTAMP NOT NULL,
-  access_code VARCHAR(64) UNIQUE,
-  created_at TIMESTAMP DEFAULT NOW(),
-  revoked_at TIMESTAMP
-);
-
-CREATE INDEX idx_shares_code ON share_tokens(access_code) WHERE revoked_at IS NULL;
+```
++--------------------------------+
+| Calculate this week's steps    |
+| (SUM of daily aggregates)      |
++--------------------------------+
+              |
+              v
++--------------------------------+
+| Calculate 4-week average       |
+| (AVG of weekly totals)         |
++--------------------------------+
+              |
+              v
++--------------------------------+
+| Percent change =               |
+| (current - average) / average  |
++--------------------------------+
+              |
+      +-------+-------+
+      |               |
+   (> +20%)       (< -20%)
+      |               |
+      v               v
++------------+  +-------------+
+| "Great job |  | "Activity   |
+| - X% more  |  | down - X%   |
+| active!"   |  | this week"  |
++------------+  +-------------+
 ```
 
-```javascript
-async getSharedData(tokenId, recipientId) {
-  // Validate share token
-  const token = await db.query(`
-    SELECT * FROM share_tokens
-    WHERE id = $1 AND recipient_id = $2
-      AND expires_at > NOW() AND revoked_at IS NULL
-  `, [tokenId, recipientId]);
+### Insight Types
 
-  if (token.rows.length === 0) {
-    throw new Error('Invalid or expired share token');
-  }
+| Insight | Trigger Condition | Severity |
+|---------|-------------------|----------|
+| Heart Rate Trend | slope > 0.5 BPM/day for 30 days | medium |
+| Sleep Deficit | avg < 6 hours for 14 days | high |
+| Activity Change | > 20% change from 4-week avg | low |
+| Weight Change | > 3% change over 30 days | medium |
 
-  const shareInfo = token.rows[0];
+---
 
-  // Fetch only authorized data types in authorized date range
-  const data = await db.query(`
-    SELECT type, period_start, value
-    FROM health_aggregates
-    WHERE user_id = $1
-      AND type = ANY($2)
-      AND period_start >= $3
-      AND period_start <= $4
-      AND period = 'day'
-    ORDER BY type, period_start
-  `, [
-    shareInfo.user_id,
-    shareInfo.data_types,
-    shareInfo.date_start,
-    shareInfo.date_end
-  ]);
+## 🔒 Deep Dive: Share Token System (3 minutes)
 
-  return data.rows;
-}
+```
++------------------+       +-------------------+
+|   share_tokens   |       |  Shared Data      |
++------------------+       |  Access Flow      |
+| id (PK)          |       +-------------------+
+| user_id (FK)     |              |
+| recipient_email  |              v
+| recipient_id     |       +-------------------+
+| data_types[]     |       | 1. Validate token |
+| date_start       |       |    - Not expired  |
+| date_end         |       |    - Not revoked  |
+| expires_at       |       |    - Recipient OK |
+| access_code      |       +-------------------+
+| revoked_at       |              |
++------------------+              v
+                           +-------------------+
+                           | 2. Query only:    |
+                           |    - Allowed types|
+                           |    - Date range   |
+                           |    - User's data  |
+                           +-------------------+
+                                  |
+                                  v
+                           +-------------------+
+                           | 3. Return daily   |
+                           |    aggregates     |
+                           +-------------------+
 ```
 
-## Trade-offs and Alternatives (5 minutes)
+### Share Token Fields
+
+| Field | Purpose |
+|-------|---------|
+| data_types[] | Only these metric types accessible (e.g., ['HEART_RATE', 'WEIGHT']) |
+| date_start/end | Only data within this range accessible |
+| expires_at | Token becomes invalid after this time |
+| access_code | Random 64-char string for URL sharing |
+| revoked_at | If set, token is immediately invalid |
+
+---
+
+## ⚖️ Trade-offs and Alternatives (5 minutes)
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Time-series DB | TimescaleDB | InfluxDB | SQL compatibility, PostgreSQL ecosystem, familiar query language |
-| Aggregation | Pre-computed | On-demand | Query performance for dashboards (O(1) vs O(n)), write-heavy workload absorbs compute |
-| Deduplication | Priority-based | Time-based (latest wins) | Apple Watch sensors more accurate than iPhone; consistent, predictable behavior |
-| Sync | Batch with idempotency | Real-time streaming | Battery efficiency on mobile, network reliability, simpler recovery |
-| Encryption | Per-user keys | Single system key | HIPAA compliance, selective sharing, breach isolation |
-| Queue | RabbitMQ | Kafka | Simpler for single-consumer patterns, built-in retry/DLQ |
+| Time-series DB | ✅ TimescaleDB | ❌ InfluxDB | SQL compatibility, PostgreSQL ecosystem, familiar query language |
+| Aggregation | ✅ Pre-computed | ❌ On-demand | Query performance for dashboards (O(1) vs O(n)), write-heavy workload absorbs compute |
+| Deduplication | ✅ Priority-based | ❌ Time-based (latest wins) | Apple Watch sensors more accurate than iPhone; consistent, predictable behavior |
+| Sync | ✅ Batch with idempotency | ❌ Real-time streaming | Battery efficiency on mobile, network reliability, simpler recovery |
+| Encryption | ✅ Per-user keys | ❌ Single system key | HIPAA compliance, selective sharing, breach isolation |
+| Queue | ✅ RabbitMQ | ❌ Kafka | Simpler for single-consumer patterns, built-in retry/DLQ |
 
 ### Storage Tiering Trade-offs
 
-**Hot Storage (90 days uncompressed)**
-- Pro: Fast queries (~5ms)
-- Con: More storage (~5MB per user per 90 days)
-
-**Warm Storage (compressed chunks)**
-- Pro: 10:1 compression ratio
-- Con: Slower queries (~50ms), cannot update compressed chunks
-
-**Cold Storage (MinIO archive)**
-- Pro: Cheapest storage
-- Con: Minutes to restore
+| Tier | Pros | Cons |
+|------|------|------|
+| Hot (90 days uncompressed) | Fast queries (~5ms) | More storage (~5MB per user per 90 days) |
+| Warm (compressed chunks) | 10:1 compression ratio | Slower queries (~50ms), read-only |
+| Cold (MinIO archive) | Cheapest storage | Minutes to restore |
 
 ### Pre-computation vs On-demand
 
 **Chose: Pre-computed aggregates**
-- Dashboards refresh frequently (every page load)
-- Aggregation logic is stable (sum, avg, latest)
-- Background workers absorb compute cost
-- Storage is cheap; user wait time is expensive
 
-## Data Retention and HIPAA Compliance (2 minutes)
+| Factor | Pre-computed | On-demand |
+|--------|--------------|-----------|
+| Dashboard load | O(1) - single row lookup | O(n) - scan all samples |
+| Storage cost | Higher (store aggregates) | Lower |
+| Write complexity | Higher (background workers) | Lower |
+| User experience | Instant | Potentially slow |
+
+Decision: Storage is cheap; user wait time is expensive.
+
+---
+
+## 📅 Data Retention and HIPAA Compliance (2 minutes)
 
 | Data Type | Hot | Warm | Delete After |
 |-----------|-----|------|--------------|
@@ -653,16 +569,38 @@ async getSharedData(tokenId, recipientId) {
 | Insights | 90 days | N/A | 2 years |
 | Share tokens | Until expiry | N/A | 30 days after expiry |
 
-```sql
--- Daily retention job
-DELETE FROM health_samples WHERE start_date < NOW() - INTERVAL '7 years';
-DELETE FROM health_aggregates
-  WHERE period = 'hour' AND period_start < NOW() - INTERVAL '2 years';
-DELETE FROM health_insights WHERE created_at < NOW() - INTERVAL '2 years';
-DELETE FROM share_tokens WHERE expires_at < NOW() - INTERVAL '30 days';
+### Daily Retention Job
+
+```
+Retention Cleanup (runs daily at 3 AM)
++----------------------------------------+
+| DELETE health_samples                  |
+| WHERE start_date < NOW() - 7 years     |
++----------------------------------------+
+                |
+                v
++----------------------------------------+
+| DELETE health_aggregates               |
+| WHERE period = 'hour'                  |
+| AND period_start < NOW() - 2 years     |
++----------------------------------------+
+                |
+                v
++----------------------------------------+
+| DELETE health_insights                 |
+| WHERE created_at < NOW() - 2 years     |
++----------------------------------------+
+                |
+                v
++----------------------------------------+
+| DELETE share_tokens                    |
+| WHERE expires_at < NOW() - 30 days     |
++----------------------------------------+
 ```
 
-## Closing Summary (1 minute)
+---
+
+## 🚀 Closing Summary (1 minute)
 
 "The health data pipeline backend is built around three key principles:
 
