@@ -36,896 +36,604 @@ This answer covers the end-to-end architecture, emphasizing integration between 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Browser (React Dashboard)                                 │
-│  ┌───────────────────────────────────────────────────────────────────────┐   │
-│  │  Views: Login | Transactions | Analytics | Webhooks | Settings         │   │
-│  │  State: Zustand stores for transactions, auth, filters                 │   │
-│  └───────────────────────────┬───────────────────────────────────────────┘   │
-│  ┌───────────────────────────┴───────────────────────────────────────────┐   │
-│  │  API Service: fetch wrapper with auth, retry, error handling           │   │
-│  └───────────────────────────┬───────────────────────────────────────────┘   │
-└──────────────────────────────┼───────────────────────────────────────────────┘
-                               │ REST API (JSON)
-                               ▼
+│                     Browser (React Dashboard)                                │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Views: Login │ Transactions │ Analytics │ Webhooks │ Settings        │  │
+│  │  State: Zustand stores for transactions, auth, filters                │  │
+│  └───────────────────────────────┬───────────────────────────────────────┘  │
+│  ┌───────────────────────────────┴───────────────────────────────────────┐  │
+│  │  API Service: fetch wrapper with auth, retry, error handling          │  │
+│  └───────────────────────────────┬───────────────────────────────────────┘  │
+└──────────────────────────────────┼──────────────────────────────────────────┘
+                                   │ REST API (JSON)
+                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Express API Server                                     │
-│  ┌───────────────────────────────────────────────────────────────────────┐   │
-│  │  Middleware: cors, session, apiKeyAuth, rateLimit, errorHandler        │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐  │
-│  │  auth.ts        │  │  payments.ts    │  │  webhooks.ts                │  │
-│  │  - login        │  │  - create       │  │  - register endpoint        │  │
-│  │  - logout       │  │  - capture      │  │  - list deliveries          │  │
-│  │  - me           │  │  - refund       │  │  - test webhook             │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────────┐   │
-│  │  Services: FraudService, LedgerService, WebhookService                 │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────┬───────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  PostgreSQL   │    │    Valkey     │    │   RabbitMQ    │
-│  Transactions │    │  Idempotency  │    │   Webhooks    │
-│  Ledger       │    │  Rate limits  │    │   Settlement  │
-│  Merchants    │    │  Sessions     │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
+│                        Express API Server                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Middleware: cors, session, apiKeyAuth, rateLimit, errorHandler       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐ │
+│  │  auth.ts        │  │  payments.ts    │  │  webhooks.ts                │ │
+│  │  - login        │  │  - create       │  │  - register endpoint        │ │
+│  │  - logout       │  │  - capture      │  │  - list deliveries          │ │
+│  │  - me           │  │  - refund       │  │  - test webhook             │ │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────────────┘ │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Services: FraudService, LedgerService, WebhookService                │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────┬───────────────────────────────────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────┐
+        ▼                         ▼                     ▼
+┌───────────────┐        ┌───────────────┐     ┌───────────────┐
+│  PostgreSQL   │        │    Valkey     │     │   RabbitMQ    │
+│  Transactions │        │  Idempotency  │     │   Webhooks    │
+│  Ledger       │        │  Rate limits  │     │   Settlement  │
+│  Merchants    │        │  Sessions     │     │               │
+└───────────────┘        └───────────────┘     └───────────────┘
 ```
 
 ## Data Model
 
 ### Database Schema
 
-```sql
--- Merchants (payment system customers)
-CREATE TABLE merchants (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,  -- For dashboard login
-    api_key_hash VARCHAR(64) NOT NULL,    -- For API auth
-    webhook_url TEXT,
-    webhook_secret VARCHAR(64),
-    default_currency VARCHAR(3) DEFAULT 'USD',
-    status VARCHAR(20) DEFAULT 'active',
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+The schema includes three core tables:
 
--- Transactions with idempotency
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    merchant_id UUID NOT NULL REFERENCES merchants(id),
-    idempotency_key VARCHAR(255),
-    amount BIGINT NOT NULL,           -- Cents
-    currency VARCHAR(3) NOT NULL,
-    captured_amount BIGINT DEFAULT 0,
-    refunded_amount BIGINT DEFAULT 0,
-    status VARCHAR(20) NOT NULL,      -- pending, authorized, captured, refunded, failed
-    fraud_score INTEGER,
-    fraud_flags JSONB DEFAULT '[]',
-    processor_ref VARCHAR(255),
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(merchant_id, idempotency_key)
-);
+**Merchants Table** - Payment system customers with dashboard access:
+- id (UUID, primary key)
+- name, email (unique), password_hash for dashboard login
+- api_key_hash for API authentication
+- webhook_url, webhook_secret for event delivery
+- default_currency, status, created_at
 
--- Double-entry ledger
-CREATE TABLE ledger_entries (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transaction_id UUID NOT NULL REFERENCES transactions(id),
-    entry_type VARCHAR(10) NOT NULL,  -- debit, credit
-    account_type VARCHAR(30) NOT NULL,
-    amount BIGINT NOT NULL,
-    currency VARCHAR(3) NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+**Transactions Table** - Payment records with idempotency:
+- id (UUID, primary key)
+- merchant_id (foreign key to merchants)
+- idempotency_key (unique per merchant)
+- amount (BIGINT, in cents), currency (3-char code)
+- captured_amount, refunded_amount (partial captures/refunds)
+- status: pending, authorized, captured, refunded, failed
+- fraud_score (INTEGER 0-100), fraud_flags (JSONB array)
+- processor_ref, metadata, timestamps
 
-CREATE INDEX idx_transactions_merchant_time ON transactions(merchant_id, created_at DESC);
-CREATE INDEX idx_ledger_transaction ON ledger_entries(transaction_id);
-```
+**Ledger Entries Table** - Double-entry accounting:
+- id (UUID, primary key)
+- transaction_id (foreign key)
+- entry_type: debit or credit
+- account_type: merchant_pending, merchant_settled, etc.
+- amount, currency, created_at
 
-### TypeScript Interfaces (Shared Types)
+Indexes on (merchant_id, created_at DESC) for efficient dashboard queries.
 
-```typescript
-// shared/types.ts - Used by frontend and backend
+### Shared TypeScript Interfaces
 
-interface Merchant {
-    id: string;
-    name: string;
-    email: string;
-    default_currency: string;
-    webhook_url?: string;
-}
+Types used by both frontend and backend include:
 
-interface Transaction {
-    id: string;
-    merchant_id: string;
-    amount: number;
-    currency: string;
-    captured_amount: number;
-    refunded_amount: number;
-    status: 'pending' | 'authorized' | 'captured' | 'refunded' | 'failed';
-    fraud_score?: number;
-    fraud_flags: string[];
-    processor_ref?: string;
-    metadata: Record<string, unknown>;
-    created_at: string;
-    updated_at: string;
-}
-
-interface TransactionFilters {
-    status?: string;
-    currency?: string;
-    dateRange?: { start: string; end: string };
-    amountRange?: { min: number; max: number };
-    search?: string;
-}
-
-interface PaymentRequest {
-    amount: number;
-    currency: string;
-    payment_method_id: string;
-    capture?: boolean;
-    metadata?: Record<string, unknown>;
-}
-
-interface PaymentResponse {
-    transaction: Transaction;
-    fraud_score: number;
-    warnings?: string[];
-}
-```
+- **Merchant**: id, name, email, default_currency, webhook_url
+- **Transaction**: All payment fields including status, fraud_score, fraud_flags
+- **TransactionFilters**: status, currency, dateRange, amountRange, search
+- **PaymentRequest**: amount, currency, payment_method_id, capture flag, metadata
+- **PaymentResponse**: transaction object, fraud_score, optional warnings
 
 ## Deep Dive: API Design
 
 ### RESTful Endpoints
 
 ```
-Authentication (Session-based for dashboard):
-POST   /api/auth/login         Login with email/password
-POST   /api/auth/logout        Destroy session
-GET    /api/auth/me            Get current merchant
-
-Payments (API key auth):
-POST   /v1/payments             Create payment (Idempotency-Key header)
-POST   /v1/payments/:id/capture Capture authorized payment
-POST   /v1/payments/:id/refund  Refund captured payment
-GET    /v1/payments/:id         Get payment details
-GET    /v1/payments             List payments (paginated, filterable)
-
-Webhooks:
-PUT    /api/webhooks/endpoint   Update webhook URL
-GET    /api/webhooks/deliveries List delivery attempts
-POST   /api/webhooks/test       Send test webhook
-
-Analytics:
-GET    /api/analytics/revenue   Revenue by day/week/month
-GET    /api/analytics/summary   Dashboard summary stats
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           API Endpoint Structure                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Authentication (Session-based for dashboard):                               │
+│  ├── POST   /api/auth/login         ──▶ Login with email/password           │
+│  ├── POST   /api/auth/logout        ──▶ Destroy session                     │
+│  └── GET    /api/auth/me            ──▶ Get current merchant                │
+│                                                                              │
+│  Payments (API key auth via Idempotency-Key header):                        │
+│  ├── POST   /v1/payments            ──▶ Create payment                      │
+│  ├── POST   /v1/payments/:id/capture──▶ Capture authorized payment          │
+│  ├── POST   /v1/payments/:id/refund ──▶ Refund captured payment             │
+│  ├── GET    /v1/payments/:id        ──▶ Get payment details                 │
+│  └── GET    /v1/payments            ──▶ List payments (paginated)           │
+│                                                                              │
+│  Webhooks:                                                                   │
+│  ├── PUT    /api/webhooks/endpoint  ──▶ Update webhook URL                  │
+│  ├── GET    /api/webhooks/deliveries──▶ List delivery attempts              │
+│  └── POST   /api/webhooks/test      ──▶ Send test webhook                   │
+│                                                                              │
+│  Analytics:                                                                  │
+│  ├── GET    /api/analytics/revenue  ──▶ Revenue by day/week/month           │
+│  └── GET    /api/analytics/summary  ──▶ Dashboard summary stats             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### API Integration Pattern
+### Payment Creation Flow
 
-```typescript
-// Frontend: services/api.ts
-const api = {
-    async login(email: string, password: string): Promise<Merchant> {
-        const res = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ email, password })
-        });
-        if (!res.ok) throw new ApiError(res);
-        return res.json();
-    },
+The payment creation endpoint handles idempotency and fraud scoring:
 
-    async getTransactions(params: TransactionFilters & Pagination): Promise<PaginatedResponse<Transaction>> {
-        const qs = new URLSearchParams();
-        if (params.status) qs.set('status', params.status);
-        if (params.search) qs.set('search', params.search);
-        if (params.page) qs.set('page', String(params.page));
-
-        const res = await fetch(`/v1/payments?${qs}`, {
-            credentials: 'include'
-        });
-        if (!res.ok) throw new ApiError(res);
-        return res.json();
-    },
-
-    async refundTransaction(id: string, amount?: number): Promise<Transaction> {
-        const res = await fetch(`/v1/payments/${id}/refund`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ amount })
-        });
-        if (!res.ok) throw new ApiError(res);
-        return res.json();
-    }
-};
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        POST /v1/payments Flow                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Request ──▶ Extract merchant from API key                                  │
+│          ──▶ Extract Idempotency-Key header                                 │
+│          ──▶ Parse amount, currency, payment_method_id, capture flag        │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 1: Check Idempotency Cache                                    │    │
+│  │  Cache key: idempotency:{merchantId}:{idempotencyKey}               │    │
+│  │  If cached ──▶ Return cached response (prevents double-charge)      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼ (not cached)                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 2: Acquire Distributed Lock                                   │    │
+│  │  Lock key: lock:idempotency:{merchantId}:{idempotencyKey}           │    │
+│  │  SET NX EX 30 (30-second expiry)                                    │    │
+│  │  If lock fails ──▶ Return 409 "Request in progress"                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼ (lock acquired)                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 3: Fraud Evaluation                                           │    │
+│  │  fraudService.evaluate({amount, currency, ip, merchant_id})         │    │
+│  │  Returns score 0-100 and risk flags                                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 4: Database Transaction                                       │    │
+│  │  INSERT transaction with status = capture ? 'captured' : 'authorized'│    │
+│  │  If capture: Create ledger entries via ledgerService                │    │
+│  │  RETURNING full transaction record                                  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 5: Cache Response                                             │    │
+│  │  SETEX cache key with 86400s TTL (24 hours)                         │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 6: Queue Webhook                                              │    │
+│  │  Publish to RabbitMQ: webhook.delivery queue                        │    │
+│  │  Event type: payment.captured or payment.authorized                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Step 7: Release Lock and Respond                                   │    │
+│  │  DEL lock key (in finally block)                                    │    │
+│  │  Return 201 with {transaction, fraud_score}                         │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-```typescript
-// Backend: routes/payments.ts
-router.post('/', async (req, res) => {
-    const merchantId = req.merchant.id;  // From API key auth
-    const idempotencyKey = req.headers['idempotency-key'];
-    const { amount, currency, payment_method_id, capture } = req.body;
-
-    // Check idempotency
-    const cacheKey = `idempotency:${merchantId}:${idempotencyKey}`;
-    const cached = await valkey.get(cacheKey);
-    if (cached) {
-        return res.json(JSON.parse(cached));
-    }
-
-    // Acquire distributed lock
-    const lockKey = `lock:${cacheKey}`;
-    const locked = await valkey.set(lockKey, '1', 'NX', 'EX', 30);
-    if (!locked) {
-        return res.status(409).json({ error: 'Request in progress' });
-    }
-
-    try {
-        // Calculate fraud score
-        const fraudScore = await fraudService.evaluate({
-            amount, currency, payment_method_id,
-            ip: req.ip,
-            merchant_id: merchantId
-        });
-
-        // Process in transaction
-        const result = await db.transaction(async (tx) => {
-            const txn = await tx.insert(transactions).values({
-                merchant_id: merchantId,
-                idempotency_key: idempotencyKey,
-                amount,
-                currency,
-                status: capture ? 'captured' : 'authorized',
-                captured_amount: capture ? amount : 0,
-                fraud_score: fraudScore
-            }).returning();
-
-            // Create ledger entries
-            if (capture) {
-                await ledgerService.recordCapture(tx, txn[0]);
-            }
-
-            return txn[0];
-        });
-
-        // Cache response
-        const response = { transaction: result, fraud_score: fraudScore };
-        await valkey.setex(cacheKey, 86400, JSON.stringify(response));
-
-        // Queue webhook
-        await rabbitmq.publish('webhook.delivery', {
-            merchant_id: merchantId,
-            event_type: capture ? 'payment.captured' : 'payment.authorized',
-            payload: result
-        });
-
-        res.status(201).json(response);
-    } finally {
-        await valkey.del(lockKey);
-    }
-});
-```
+"The idempotency flow is critical for payment systems. Network issues can cause duplicate requests - without idempotency, customers get charged twice. The distributed lock prevents race conditions when the same request arrives on multiple servers simultaneously."
 
 ## Deep Dive: Transaction Dashboard (Full Stack Flow)
 
 ### Frontend: Transaction List Component
 
-```tsx
-// components/transactions/TransactionList.tsx
-function TransactionList() {
-    const { transactions, isLoading, filters, setFilters, page, setPage, totalCount } =
-        useTransactionStore();
+The dashboard displays transactions with filters and pagination:
 
-    useEffect(() => {
-        useTransactionStore.getState().fetchTransactions();
-    }, [filters, page]);
-
-    return (
-        <div className="flex flex-col h-full">
-            {/* Filters */}
-            <TransactionFilters
-                filters={filters}
-                onChange={setFilters}
-            />
-
-            {/* Table */}
-            <div className="flex-1 overflow-auto">
-                {isLoading ? (
-                    <TransactionSkeleton />
-                ) : (
-                    <table className="w-full">
-                        <thead className="bg-gray-50 sticky top-0">
-                            <tr>
-                                <th className="px-4 py-3 text-left">ID</th>
-                                <th className="px-4 py-3 text-left">Amount</th>
-                                <th className="px-4 py-3 text-left">Status</th>
-                                <th className="px-4 py-3 text-left">Date</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {transactions.map(txn => (
-                                <TransactionRow key={txn.id} transaction={txn} />
-                            ))}
-                        </tbody>
-                    </table>
-                )}
-            </div>
-
-            {/* Pagination */}
-            <Pagination
-                page={page}
-                total={totalCount}
-                pageSize={25}
-                onChange={setPage}
-            />
-        </div>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Transaction List UI Structure                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  TransactionFilters                                                   │  │
+│  │  ├── Status dropdown (All, Authorized, Captured, Refunded, Failed)   │  │
+│  │  ├── Date range picker                                                │  │
+│  │  └── Search input (debounced)                                         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Table Header (sticky)                                                │  │
+│  │  │ Transaction ID │ Amount │ Status │ Customer │ Date │               │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Table Body (scrollable)                                              │  │
+│  │  ├── TransactionRow (clickable, navigates to details)                │  │
+│  │  ├── TransactionRow                                                   │  │
+│  │  ├── TransactionRow                                                   │  │
+│  │  └── ... (loading skeleton when fetching)                            │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Pagination                                                           │  │
+│  │  Page 1 of 42  │  [<] [1] [2] [3] ... [42] [>]                       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  State Management (Zustand):                                                 │
+│  ├── transactions: Transaction[]                                            │
+│  ├── totalCount: number                                                     │
+│  ├── page, pageSize: pagination state                                       │
+│  ├── filters: TransactionFilters                                            │
+│  ├── isLoading: boolean                                                     │
+│  └── Actions: setFilters, setPage, fetchTransactions                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: List Transactions with Filters
 
-```typescript
-// routes/payments.ts
-router.get('/', async (req, res) => {
-    const merchantId = req.merchant?.id || req.session?.merchantId;
-    const { status, search, start_date, end_date, page = 1, limit = 25 } = req.query;
+The API endpoint supports filtering and pagination:
 
-    let query = db
-        .select()
-        .from(transactions)
-        .where(eq(transactions.merchant_id, merchantId))
-        .orderBy(desc(transactions.created_at))
-        .limit(Number(limit))
-        .offset((Number(page) - 1) * Number(limit));
-
-    // Apply filters
-    if (status) {
-        query = query.where(eq(transactions.status, status));
-    }
-    if (search) {
-        query = query.where(
-            or(
-                ilike(transactions.id, `%${search}%`),
-                ilike(transactions.processor_ref, `%${search}%`)
-            )
-        );
-    }
-    if (start_date && end_date) {
-        query = query.where(
-            and(
-                gte(transactions.created_at, new Date(start_date)),
-                lte(transactions.created_at, new Date(end_date))
-            )
-        );
-    }
-
-    // Get total count for pagination
-    const countResult = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(transactions)
-        .where(eq(transactions.merchant_id, merchantId));
-
-    const results = await query;
-
-    res.json({
-        data: results,
-        total: Number(countResult[0].count),
-        page: Number(page),
-        limit: Number(limit)
-    });
-});
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     GET /v1/payments Query Building                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Query Parameters:                                                           │
+│  ├── status       ──▶ Filter by transaction status                         │
+│  ├── search       ──▶ Search ID or processor_ref (ILIKE %search%)          │
+│  ├── start_date   ──▶ Filter created_at >= date                            │
+│  ├── end_date     ──▶ Filter created_at <= date                            │
+│  ├── page         ──▶ Page number (default 1)                              │
+│  └── limit        ──▶ Page size (default 25)                               │
+│                                                                              │
+│  Query Construction:                                                         │
+│  1. Base query: SELECT FROM transactions WHERE merchant_id = :merchantId    │
+│  2. Apply filters conditionally (status, search, date range)                │
+│  3. ORDER BY created_at DESC                                                │
+│  4. LIMIT :limit OFFSET (:page - 1) * :limit                                │
+│                                                                              │
+│  Parallel count query for pagination:                                        │
+│  SELECT count(*) FROM transactions WHERE merchant_id = :merchantId          │
+│                                                                              │
+│  Response: { data: Transaction[], total, page, limit }                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Refund Flow (Full Stack)
 
 ### Frontend: Refund Modal
 
-```tsx
-// components/transactions/RefundDialog.tsx
-function RefundDialog({ transaction, open, onClose }: RefundDialogProps) {
-    const { refundTransaction } = useTransactionStore();
-    const [amount, setAmount] = useState(transaction.amount - transaction.refunded_amount);
-    const [isFullRefund, setIsFullRefund] = useState(true);
-    const [isProcessing, setIsProcessing] = useState(false);
+The refund dialog supports full and partial refunds:
 
-    const maxRefundable = transaction.amount - transaction.refunded_amount;
-
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setIsProcessing(true);
-
-        try {
-            await refundTransaction(transaction.id, isFullRefund ? undefined : amount);
-            toast.success('Refund processed successfully');
-            onClose();
-        } catch (error) {
-            toast.error(error instanceof Error ? error.message : 'Refund failed');
-        } finally {
-            setIsProcessing(false);
-        }
-    };
-
-    return (
-        <Dialog open={open} onOpenChange={onClose}>
-            <DialogContent>
-                <DialogHeader>
-                    <DialogTitle>Refund Transaction</DialogTitle>
-                </DialogHeader>
-
-                <form onSubmit={handleSubmit} className="space-y-4">
-                    <div className="flex gap-4">
-                        <label className="flex items-center gap-2">
-                            <input
-                                type="radio"
-                                checked={isFullRefund}
-                                onChange={() => setIsFullRefund(true)}
-                            />
-                            Full refund ({formatCurrency(maxRefundable, transaction.currency)})
-                        </label>
-                        <label className="flex items-center gap-2">
-                            <input
-                                type="radio"
-                                checked={!isFullRefund}
-                                onChange={() => setIsFullRefund(false)}
-                            />
-                            Partial refund
-                        </label>
-                    </div>
-
-                    {!isFullRefund && (
-                        <CurrencyInput
-                            value={amount}
-                            max={maxRefundable}
-                            currency={transaction.currency}
-                            onChange={setAmount}
-                        />
-                    )}
-
-                    <DialogFooter>
-                        <Button variant="outline" onClick={onClose}>Cancel</Button>
-                        <Button type="submit" disabled={isProcessing}>
-                            {isProcessing ? 'Processing...' : 'Refund'}
-                        </Button>
-                    </DialogFooter>
-                </form>
-            </DialogContent>
-        </Dialog>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Refund Dialog Layout                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Dialog Header                                                        │  │
+│  │  "Refund Transaction"                                                 │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Refund Type Selection                                                │  │
+│  │  ( ) Full refund ($150.00)                                           │  │
+│  │  ( ) Partial refund                                                   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Amount Input (shown when partial selected)                           │  │
+│  │  Max refundable: $150.00                                              │  │
+│  │  [ $ ][ 75.00                    ]                                    │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Error Display (red background when error occurs)                     │  │
+│  │  "Refund amount exceeds available balance"                            │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Dialog Footer                                                        │  │
+│  │  [ Cancel ]                              [ Process Refund ]           │  │
+│  │  (outline)                               (primary, shows spinner)     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Component State:                                                            │
+│  ├── amount: number (initialized to max refundable)                         │
+│  ├── isFullRefund: boolean (default true)                                   │
+│  ├── isProcessing: boolean                                                  │
+│  └── error: string | null                                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Refund Endpoint
 
-```typescript
-// routes/payments.ts
-router.post('/:id/refund', async (req, res) => {
-    const merchantId = req.merchant?.id || req.session?.merchantId;
-    const { id } = req.params;
-    const { amount } = req.body;
+The refund endpoint validates and processes the refund:
 
-    // Verify ownership and status
-    const txn = await db.select().from(transactions)
-        .where(and(
-            eq(transactions.id, id),
-            eq(transactions.merchant_id, merchantId)
-        ))
-        .limit(1);
-
-    if (!txn.length) {
-        return res.status(404).json({ error: 'Transaction not found' });
-    }
-
-    if (txn[0].status !== 'captured') {
-        return res.status(400).json({ error: 'Transaction cannot be refunded' });
-    }
-
-    const refundAmount = amount || (txn[0].amount - txn[0].refunded_amount);
-    const maxRefundable = txn[0].amount - txn[0].refunded_amount;
-
-    if (refundAmount > maxRefundable) {
-        return res.status(400).json({ error: 'Refund amount exceeds available' });
-    }
-
-    // Process refund in transaction
-    const updated = await db.transaction(async (tx) => {
-        const newRefundedAmount = txn[0].refunded_amount + refundAmount;
-        const newStatus = newRefundedAmount >= txn[0].amount ? 'refunded' : 'captured';
-
-        await tx.update(transactions)
-            .set({
-                refunded_amount: newRefundedAmount,
-                status: newStatus,
-                updated_at: new Date()
-            })
-            .where(eq(transactions.id, id));
-
-        // Create ledger entries for refund
-        await ledgerService.recordRefund(tx, txn[0], refundAmount);
-
-        // Create audit log
-        await tx.insert(auditLog).values({
-            entity_type: 'transaction',
-            entity_id: id,
-            action: 'refunded',
-            changes: { refund_amount: refundAmount },
-            actor_id: merchantId
-        });
-
-        return tx.select().from(transactions).where(eq(transactions.id, id));
-    });
-
-    // Queue webhook
-    await rabbitmq.publish('webhook.delivery', {
-        merchant_id: merchantId,
-        event_type: 'refund.created',
-        payload: { transaction: updated[0], refund_amount: refundAmount }
-    });
-
-    res.json(updated[0]);
-});
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    POST /v1/payments/:id/refund Flow                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Verify Ownership                                                         │
+│     SELECT FROM transactions WHERE id = :id AND merchant_id = :merchantId   │
+│     If not found ──▶ 404 "Transaction not found"                            │
+│                                                                              │
+│  2. Validate Status                                                          │
+│     If status != 'captured' ──▶ 400 "Transaction cannot be refunded"        │
+│                                                                              │
+│  3. Calculate Refund Amount                                                  │
+│     refundAmount = request.amount || (amount - refunded_amount)             │
+│     maxRefundable = amount - refunded_amount                                │
+│     If refundAmount > maxRefundable ──▶ 400 "Exceeds available"             │
+│                                                                              │
+│  4. Database Transaction:                                                    │
+│     ├── UPDATE transactions SET                                             │
+│     │   refunded_amount = refunded_amount + :refundAmount                   │
+│     │   status = (refunded_amount >= amount) ? 'refunded' : 'captured'      │
+│     │   updated_at = NOW()                                                  │
+│     │                                                                        │
+│     ├── ledgerService.recordRefund(tx, transaction, refundAmount)           │
+│     │   (Creates credit/debit entries for refund accounting)                │
+│     │                                                                        │
+│     └── INSERT INTO audit_log (entity_type, entity_id, action, changes)     │
+│                                                                              │
+│  5. Queue Webhook                                                            │
+│     Publish 'refund.created' event to RabbitMQ                              │
+│                                                                              │
+│  6. Return updated transaction                                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Fraud Score Display
 
 ### Frontend: Risk Assessment Component
 
-```tsx
-// components/transactions/FraudScoreDisplay.tsx
-function FraudScoreDisplay({ score, flags }: { score: number; flags: string[] }) {
-    const getRiskLevel = (score: number) => {
-        if (score < 30) return { label: 'Low Risk', color: 'green' };
-        if (score < 70) return { label: 'Medium Risk', color: 'yellow' };
-        return { label: 'High Risk', color: 'red' };
-    };
+The fraud score display uses a gauge visualization:
 
-    const { label, color } = getRiskLevel(score);
-
-    return (
-        <div className="space-y-4">
-            {/* Score gauge */}
-            <div className="flex items-center gap-4">
-                <div className="relative w-32 h-16">
-                    <svg viewBox="0 0 100 50" className="w-full h-full">
-                        {/* Background arc */}
-                        <path
-                            d="M 10 50 A 40 40 0 0 1 90 50"
-                            fill="none"
-                            stroke="#e5e7eb"
-                            strokeWidth="8"
-                        />
-                        {/* Score arc */}
-                        <path
-                            d="M 10 50 A 40 40 0 0 1 90 50"
-                            fill="none"
-                            stroke={color === 'green' ? '#22c55e' : color === 'yellow' ? '#eab308' : '#ef4444'}
-                            strokeWidth="8"
-                            strokeDasharray={`${score * 1.26} 126`}
-                        />
-                    </svg>
-                    <div className="absolute inset-0 flex items-end justify-center pb-1">
-                        <span className="text-2xl font-bold">{score}</span>
-                    </div>
-                </div>
-                <div>
-                    <span className={cn(
-                        'px-2 py-1 rounded text-sm font-medium',
-                        color === 'green' && 'bg-green-100 text-green-800',
-                        color === 'yellow' && 'bg-yellow-100 text-yellow-800',
-                        color === 'red' && 'bg-red-100 text-red-800'
-                    )}>
-                        {label}
-                    </span>
-                </div>
-            </div>
-
-            {/* Risk flags */}
-            {flags.length > 0 && (
-                <div className="space-y-2">
-                    <h4 className="text-sm font-medium text-gray-700">Risk Factors</h4>
-                    <ul className="space-y-1">
-                        {flags.map((flag, i) => (
-                            <li key={i} className="flex items-center gap-2 text-sm text-gray-600">
-                                <AlertTriangle className="w-4 h-4 text-yellow-500" />
-                                {flag}
-                            </li>
-                        ))}
-                    </ul>
-                </div>
-            )}
-        </div>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Fraud Score Display Layout                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Score Gauge (SVG arc)                                                │  │
+│  │                                                                       │  │
+│  │      ┌─────────────────────────┐                                     │  │
+│  │      │     ( ══════ )          │  Score: 45                          │  │
+│  │      │         45              │  [ Medium Risk ] (yellow badge)     │  │
+│  │      └─────────────────────────┘                                     │  │
+│  │                                                                       │  │
+│  │  Arc colors by score:                                                │  │
+│  │  ├── 0-29   ──▶ Green  (#22c55e) "Low Risk"                          │  │
+│  │  ├── 30-69  ──▶ Yellow (#eab308) "Medium Risk"                       │  │
+│  │  └── 70-100 ──▶ Red    (#ef4444) "High Risk"                         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Risk Factors (when flags.length > 0)                                │  │
+│  │                                                                       │  │
+│  │  Risk Factors:                                                        │  │
+│  │  ├── ⚠️ High transaction velocity                                    │  │
+│  │  ├── ⚠️ Amount significantly above average                           │  │
+│  │  └── ⚠️ New geographic location                                      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Fraud Service
 
-```typescript
-// services/fraudService.ts
-interface FraudEvaluationResult {
-    score: number;
-    flags: string[];
-}
+The fraud evaluation service checks multiple signals:
 
-export async function evaluate(params: {
-    amount: number;
-    currency: string;
-    payment_method_id: string;
-    ip: string;
-    merchant_id: string;
-}): Promise<FraudEvaluationResult> {
-    const flags: string[] = [];
-    let score = 0;
-
-    // Velocity check
-    const velocityKey = `velocity:${params.payment_method_id}`;
-    const recentCount = await valkey.zcard(velocityKey);
-    if (recentCount > 10) {
-        score += 30;
-        flags.push('High transaction velocity');
-    } else if (recentCount > 5) {
-        score += 15;
-        flags.push('Elevated transaction velocity');
-    }
-
-    // Amount anomaly check
-    const avgAmount = await getAverageAmount(params.payment_method_id);
-    if (params.amount > avgAmount * 3) {
-        score += 20;
-        flags.push('Amount significantly above average');
-    }
-
-    // Geo check (simplified)
-    const isNewLocation = await checkNewLocation(params.ip, params.payment_method_id);
-    if (isNewLocation) {
-        score += 15;
-        flags.push('New geographic location');
-    }
-
-    // Track this transaction
-    await valkey.zadd(velocityKey, Date.now(), `${Date.now()}`);
-    await valkey.expire(velocityKey, 3600);
-
-    return { score: Math.min(score, 100), flags };
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Fraud Evaluation Algorithm                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Input: { amount, currency, payment_method_id, ip, merchant_id }            │
+│  Output: { score: 0-100, flags: string[] }                                  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Check 1: Velocity (transactions per hour)                            │  │
+│  │  Key: velocity:{payment_method_id}                                    │  │
+│  │  Count recent transactions in sorted set                              │  │
+│  │  ├── > 10 transactions ──▶ +30 points, "High transaction velocity"   │  │
+│  │  └── > 5 transactions  ──▶ +15 points, "Elevated velocity"           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Check 2: Amount Anomaly                                              │  │
+│  │  Compare to average amount for this payment method                    │  │
+│  │  If amount > 3x average ──▶ +20 points, "Amount above average"       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Check 3: Geographic Location                                         │  │
+│  │  Compare IP location to previous transaction locations                │  │
+│  │  If new location ──▶ +15 points, "New geographic location"           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Track this transaction:                                                     │
+│  ZADD velocity:{payment_method_id} {timestamp} {timestamp}                  │
+│  EXPIRE velocity:{payment_method_id} 3600                                   │
+│                                                                              │
+│  Return: { score: min(total, 100), flags }                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Session Management
 
 ### Backend: Session Configuration
 
-```typescript
-// app.ts
-import session from 'express-session';
-import RedisStore from 'connect-redis';
-import { valkey } from './shared/valkey';
+Sessions are stored in Valkey/Redis for scalability:
 
-app.use(session({
-    store: new RedisStore({ client: valkey }),
-    secret: process.env.SESSION_SECRET!,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        maxAge: 24 * 60 * 60 * 1000,  // 24 hours
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax'
-    }
-}));
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Session Architecture                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Session Store: RedisStore (connect-redis)                                   │
+│  ├── client: Valkey connection                                              │
+│  ├── prefix: "sess:"                                                        │
+│  └── ttl: 24 hours                                                          │
+│                                                                              │
+│  Cookie Configuration:                                                       │
+│  ├── maxAge: 24 hours                                                       │
+│  ├── httpOnly: true (prevents XSS access)                                   │
+│  ├── secure: true in production (HTTPS only)                                │
+│  └── sameSite: 'lax' (CSRF protection)                                      │
+│                                                                              │
+│  Session Data:                                                               │
+│  ├── merchantId: string (UUID)                                              │
+│  ├── email: string                                                          │
+│  └── role: 'merchant' | 'admin'                                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: Auth State
 
-```typescript
-// stores/authStore.ts
-interface AuthState {
-    merchant: Merchant | null;
-    isAuthenticated: boolean;
-    isLoading: boolean;
+The auth store manages login state and session checking:
 
-    login: (email: string, password: string) => Promise<void>;
-    logout: () => Promise<void>;
-    checkAuth: () => Promise<void>;
-}
-
-export const useAuthStore = create<AuthState>((set) => ({
-    merchant: null,
-    isAuthenticated: false,
-    isLoading: true,
-
-    checkAuth: async () => {
-        try {
-            const merchant = await api.getCurrentMerchant();
-            set({ merchant, isAuthenticated: true, isLoading: false });
-        } catch {
-            set({ merchant: null, isAuthenticated: false, isLoading: false });
-        }
-    },
-
-    login: async (email, password) => {
-        const merchant = await api.login(email, password);
-        set({ merchant, isAuthenticated: true });
-    },
-
-    logout: async () => {
-        await api.logout();
-        set({ merchant: null, isAuthenticated: false });
-    }
-}));
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Auth Store (Zustand)                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  State:                                                                      │
+│  ├── merchant: Merchant | null                                              │
+│  ├── isAuthenticated: boolean                                               │
+│  └── isLoading: boolean (true on initial load)                              │
+│                                                                              │
+│  Actions:                                                                    │
+│  ├── checkAuth()    ──▶ GET /api/auth/me                                    │
+│  │   ├── Success: Set merchant, isAuthenticated = true                      │
+│  │   └── Failure: Clear state, isAuthenticated = false                      │
+│  │                                                                           │
+│  ├── login(email, password) ──▶ POST /api/auth/login                        │
+│  │   └── Set merchant and isAuthenticated on success                        │
+│  │                                                                           │
+│  └── logout() ──▶ POST /api/auth/logout                                     │
+│      └── Clear merchant and isAuthenticated                                 │
+│                                                                              │
+│  App Bootstrap:                                                              │
+│  1. Root layout calls checkAuth() on mount                                  │
+│  2. Shows loading spinner while isLoading = true                            │
+│  3. Redirects to /login if not authenticated                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Optimistic Updates
 
 ### Refund with Rollback
 
-```typescript
-// stores/transactionStore.ts
-refundTransaction: async (id, amount) => {
-    const { transactions, selectedTransaction } = get();
+Optimistic updates provide instant feedback with rollback on failure:
 
-    // Save original state for rollback
-    const originalTransaction = selectedTransaction;
-    const originalList = [...transactions];
-
-    // Optimistic update
-    set((state) => {
-        if (state.selectedTransaction?.id === id) {
-            state.selectedTransaction = {
-                ...state.selectedTransaction,
-                status: 'refunding' as any  // Temporary UI state
-            };
-        }
-    });
-
-    try {
-        const updated = await api.refundTransaction(id, amount);
-
-        // Apply actual result
-        set((state) => {
-            state.selectedTransaction = updated;
-            const idx = state.transactions.findIndex(t => t.id === id);
-            if (idx !== -1) {
-                state.transactions[idx] = updated;
-            }
-        });
-    } catch (error) {
-        // Rollback on failure
-        set({
-            selectedTransaction: originalTransaction,
-            transactions: originalList
-        });
-        throw error;
-    }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Optimistic Refund Flow                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  User clicks "Refund"                                                        │
+│         │                                                                    │
+│         ▼                                                                    │
+│  1. Save Original State                                                      │
+│     originalTransaction = selectedTransaction                               │
+│     originalList = [...transactions]                                        │
+│         │                                                                    │
+│         ▼                                                                    │
+│  2. Optimistic Update (immediate UI feedback)                                │
+│     selectedTransaction.status = 'refunding' (temporary state)              │
+│     UI shows processing indicator                                           │
+│         │                                                                    │
+│         ▼                                                                    │
+│  3. API Call                                                                 │
+│     await api.refundTransaction(id, amount)                                 │
+│         │                                                                    │
+│    ┌────┴────┐                                                              │
+│    ▼         ▼                                                              │
+│  Success   Failure                                                          │
+│    │         │                                                              │
+│    ▼         ▼                                                              │
+│  Apply     Rollback                                                         │
+│  actual    selectedTransaction = originalTransaction                        │
+│  result    transactions = originalList                                      │
+│            throw error (show toast)                                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Webhook Configuration Flow
 
 ### Frontend: Webhook Settings
 
-```tsx
-// routes/webhooks.tsx
-function WebhookSettings() {
-    const { endpoint, updateEndpoint, testWebhook, deliveries } = useWebhookStore();
-    const [url, setUrl] = useState(endpoint?.url || '');
-    const [isTesting, setIsTesting] = useState(false);
+The webhook settings page allows merchants to configure and test webhooks:
 
-    const handleSave = async () => {
-        await updateEndpoint(url);
-        toast.success('Webhook endpoint updated');
-    };
-
-    const handleTest = async () => {
-        setIsTesting(true);
-        try {
-            const result = await testWebhook();
-            if (result.success) {
-                toast.success('Test webhook delivered successfully');
-            } else {
-                toast.error(`Test failed: ${result.error}`);
-            }
-        } finally {
-            setIsTesting(false);
-        }
-    };
-
-    return (
-        <div className="space-y-8">
-            <Card>
-                <CardHeader>
-                    <CardTitle>Webhook Endpoint</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                    <div>
-                        <label className="block text-sm font-medium mb-1">URL</label>
-                        <input
-                            type="url"
-                            value={url}
-                            onChange={(e) => setUrl(e.target.value)}
-                            placeholder="https://your-site.com/webhooks"
-                            className="w-full p-2 border rounded"
-                        />
-                    </div>
-                    <div className="flex gap-2">
-                        <Button onClick={handleSave}>Save</Button>
-                        <Button variant="outline" onClick={handleTest} disabled={isTesting}>
-                            {isTesting ? 'Testing...' : 'Send Test'}
-                        </Button>
-                    </div>
-                </CardContent>
-            </Card>
-
-            <Card>
-                <CardHeader>
-                    <CardTitle>Recent Deliveries</CardTitle>
-                </CardHeader>
-                <CardContent>
-                    <WebhookDeliveryList deliveries={deliveries} />
-                </CardContent>
-            </Card>
-        </div>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Webhook Settings Layout                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Card: Webhook Endpoint                                               │  │
+│  │                                                                       │  │
+│  │  URL:                                                                 │  │
+│  │  [ https://your-site.com/webhooks                              ]     │  │
+│  │                                                                       │  │
+│  │  [ Save ]  [ Send Test ]                                             │  │
+│  │  (primary)  (outline, shows "Testing..." during request)            │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Card: Recent Deliveries                                              │  │
+│  │                                                                       │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ Event: payment.captured     Status: 200 OK      12:34 PM       │ │  │
+│  │  │ Event: refund.created       Status: 200 OK      12:30 PM       │ │  │
+│  │  │ Event: payment.captured     Status: 500 Error   12:25 PM       │ │  │
+│  │  │ (shows retry count and next retry time for failures)           │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Webhook Test Endpoint
 
-```typescript
-// routes/webhooks.ts
-router.post('/test', async (req, res) => {
-    const merchantId = req.session.merchantId;
+The test endpoint sends a signed test webhook:
 
-    const merchant = await db.select().from(merchants)
-        .where(eq(merchants.id, merchantId))
-        .limit(1);
-
-    if (!merchant[0].webhook_url) {
-        return res.status(400).json({ error: 'No webhook URL configured' });
-    }
-
-    const testPayload = {
-        id: `test_${Date.now()}`,
-        type: 'test',
-        created_at: new Date().toISOString(),
-        data: { message: 'This is a test webhook' }
-    };
-
-    const signature = crypto
-        .createHmac('sha256', merchant[0].webhook_secret)
-        .update(JSON.stringify(testPayload))
-        .digest('hex');
-
-    try {
-        const response = await fetch(merchant[0].webhook_url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Webhook-Signature': `sha256=${signature}`
-            },
-            body: JSON.stringify(testPayload),
-            signal: AbortSignal.timeout(10000)
-        });
-
-        res.json({
-            success: response.ok,
-            status_code: response.status,
-            response_time_ms: Date.now() - parseInt(testPayload.id.split('_')[1])
-        });
-    } catch (error) {
-        res.json({
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error'
-        });
-    }
-});
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     POST /api/webhooks/test Flow                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Get merchant webhook configuration                                       │
+│     SELECT webhook_url, webhook_secret FROM merchants WHERE id = :id        │
+│     If no webhook_url ──▶ 400 "No webhook URL configured"                   │
+│                                                                              │
+│  2. Build test payload                                                       │
+│     {                                                                        │
+│       id: "test_{timestamp}",                                               │
+│       type: "test",                                                         │
+│       created_at: ISO timestamp,                                            │
+│       data: { message: "This is a test webhook" }                           │
+│     }                                                                        │
+│                                                                              │
+│  3. Generate signature                                                       │
+│     HMAC-SHA256(JSON.stringify(payload), webhook_secret)                    │
+│     Header: X-Webhook-Signature: sha256={signature}                         │
+│                                                                              │
+│  4. Send request with 10s timeout                                            │
+│     POST to webhook_url with payload and signature                          │
+│                                                                              │
+│  5. Return result                                                            │
+│     {                                                                        │
+│       success: boolean (response.ok),                                       │
+│       status_code: number,                                                  │
+│       response_time_ms: number,                                             │
+│       error?: string (if request failed)                                    │
+│     }                                                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Trade-offs Summary
@@ -944,17 +652,28 @@ router.post('/test', async (req, res) => {
 ### Current: Single Server
 
 ```
-Browser → Express (Node.js) → PostgreSQL + Valkey
+┌──────────┐     ┌──────────────────┐     ┌──────────────────────────────┐
+│ Browser  │────▶│ Express (Node.js)│────▶│ PostgreSQL + Valkey          │
+└──────────┘     └──────────────────┘     └──────────────────────────────┘
 ```
 
 ### Future: Scaled
 
 ```
-Browser → CDN → Load Balancer → Express (5 nodes) → Read Replicas
-                                       ↓
-                                 Valkey Cluster
-                                       ↓
-                                 PostgreSQL Primary
+┌──────────┐     ┌─────┐     ┌──────────────┐     ┌──────────────────────┐
+│ Browser  │────▶│ CDN │────▶│Load Balancer │────▶│ Express (5 nodes)    │
+└──────────┘     └─────┘     └──────────────┘     └──────────┬───────────┘
+                                                             │
+                                                             ▼
+                                                  ┌──────────────────────┐
+                                                  │   Valkey Cluster     │
+                                                  └──────────┬───────────┘
+                                                             │
+                                                             ▼
+                                                  ┌──────────────────────┐
+                                                  │ PostgreSQL Primary   │
+                                                  │ + Read Replicas      │
+                                                  └──────────────────────┘
 ```
 
 1. **Stateless API servers**: Sessions in Valkey enable horizontal scaling

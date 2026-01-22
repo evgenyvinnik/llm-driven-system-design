@@ -97,186 +97,56 @@ Storage:
 
 Each Gateway server handles 100,000 concurrent WebSocket connections. The key is efficient connection management and message fanout.
 
-```typescript
-interface GatewaySession {
-  userId: string;
-  socket: WebSocket;
-  subscribedChannels: Set<string>;
-  currentGuildId: string | null;
-  lastHeartbeat: Date;
-}
+**Gateway Session Structure:**
 
-class GatewayServer {
-  private sessions: Map<string, GatewaySession> = new Map();
-  private channelSubscribers: Map<string, Set<string>> = new Map();
-  private redis: Redis;
-  private kafka: Kafka;
+| Field | Type | Purpose |
+|-------|------|---------|
+| userId | string | User identifier |
+| socket | WebSocket | Connection handle |
+| subscribedChannels | Set<string> | Channels user is monitoring |
+| currentGuildId | string or null | Active server |
+| lastHeartbeat | Date | Connection liveness |
 
-  constructor() {
-    this.redis = new Redis(process.env.REDIS_URL);
-    this.kafka = new Kafka({ brokers: [process.env.KAFKA_BROKER] });
-  }
+**Gateway Responsibilities:**
+1. Accept WebSocket connections and authenticate users
+2. Register sessions in Redis for cross-gateway routing
+3. Handle message types: SEND_MESSAGE, SUBSCRIBE_CHANNEL, UNSUBSCRIBE_CHANNEL, HEARTBEAT
+4. Validate permissions and rate limits before publishing to Kafka
+5. Monitor heartbeats and disconnect dead connections (60s timeout)
 
-  async handleConnection(socket: WebSocket, userId: string): Promise<void> {
-    const sessionId = generateSessionId();
-    const session: GatewaySession = {
-      userId,
-      socket,
-      subscribedChannels: new Set(),
-      currentGuildId: null,
-      lastHeartbeat: new Date(),
-    };
-
-    this.sessions.set(sessionId, session);
-
-    // Register in Redis for cross-gateway routing
-    await this.redis.sadd(`user:${userId}:sessions`, `${this.gatewayId}:${sessionId}`);
-    await this.redis.setex(`session:${sessionId}`, 3600, JSON.stringify({
-      gatewayId: this.gatewayId,
-      userId,
-    }));
-
-    // Set up message handlers
-    socket.on('message', (data) => this.handleMessage(sessionId, data));
-    socket.on('close', () => this.handleDisconnect(sessionId));
-    socket.on('pong', () => this.updateHeartbeat(sessionId));
-
-    // Start heartbeat monitoring
-    this.startHeartbeatMonitor(sessionId);
-  }
-
-  async handleMessage(sessionId: string, data: Buffer): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const payload = JSON.parse(data.toString());
-
-    switch (payload.type) {
-      case 'SEND_MESSAGE':
-        await this.handleSendMessage(session, payload);
-        break;
-      case 'SUBSCRIBE_CHANNEL':
-        await this.handleSubscribe(sessionId, payload.channelId);
-        break;
-      case 'UNSUBSCRIBE_CHANNEL':
-        await this.handleUnsubscribe(sessionId, payload.channelId);
-        break;
-      case 'HEARTBEAT':
-        this.updateHeartbeat(sessionId);
-        break;
-    }
-  }
-
-  private async handleSendMessage(
-    session: GatewaySession,
-    payload: { channelId: string; content: string }
-  ): Promise<void> {
-    // Validate permissions
-    const canSend = await this.checkPermissions(session.userId, payload.channelId);
-    if (!canSend) {
-      session.socket.send(JSON.stringify({ type: 'ERROR', message: 'Permission denied' }));
-      return;
-    }
-
-    // Rate limiting
-    const isRateLimited = await this.checkRateLimit(session.userId, 'message');
-    if (isRateLimited) {
-      session.socket.send(JSON.stringify({ type: 'ERROR', message: 'Rate limited' }));
-      return;
-    }
-
-    // Publish to Kafka for processing
-    await this.kafka.producer.send({
-      topic: 'messages',
-      messages: [{
-        key: payload.channelId,
-        value: JSON.stringify({
-          messageId: generateTimeUUID(),
-          channelId: payload.channelId,
-          authorId: session.userId,
-          content: payload.content,
-          timestamp: Date.now(),
-        }),
-      }],
-    });
-  }
-
-  private startHeartbeatMonitor(sessionId: string): void {
-    const interval = setInterval(async () => {
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        clearInterval(interval);
-        return;
-      }
-
-      const timeSinceHeartbeat = Date.now() - session.lastHeartbeat.getTime();
-      if (timeSinceHeartbeat > 60000) {
-        // Connection is dead
-        await this.handleDisconnect(sessionId);
-        clearInterval(interval);
-      } else {
-        // Send ping
-        session.socket.ping();
-      }
-    }, 30000);
-  }
-}
+**Message Flow (Send):**
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Client  │───▶│ Gateway  │───▶│  Kafka   │───▶│  Chat    │
+│          │    │  Server  │    │ (Topic:  │    │ Service  │
+│          │    │          │    │ messages)│    │          │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+     │                                               │
+     │              ┌────────────────────────────────┘
+     │              ▼
+     │         ┌──────────┐    ┌──────────┐
+     │         │Cassandra │    │  Redis   │
+     │         │ (persist)│    │ (pub/sub)│
+     │         └──────────┘    └──────────┘
+     │                              │
+     └──────────────────────────────┘
+           (receive via pub/sub)
 ```
 
 ### Cross-Gateway Message Routing
 
 When a user on Gateway 1 sends a message, users on Gateway 5 need to receive it:
 
-```typescript
-class MessageRouter {
-  private redis: Redis;
-  private pubsub: Redis;
-  private channelSubscriptions: Map<string, Set<string>> = new Map();
+**Redis Pub/Sub Pattern:**
+1. Each gateway subscribes to Redis channels for rooms it has users in
+2. When message is persisted, Chat Service publishes to Redis channel
+3. All gateways with subscribers receive and fan out to local clients
 
-  constructor() {
-    this.redis = new Redis(process.env.REDIS_URL);
-    this.pubsub = new Redis(process.env.REDIS_URL);
-
-    // Subscribe to all channels this gateway has users for
-    this.pubsub.on('message', (channel, data) => {
-      this.handlePubSubMessage(channel, data);
-    });
-  }
-
-  async subscribeToChannel(channelId: string, sessionId: string): Promise<void> {
-    if (!this.channelSubscriptions.has(channelId)) {
-      this.channelSubscriptions.set(channelId, new Set());
-      await this.pubsub.subscribe(`channel:${channelId}`);
-    }
-    this.channelSubscriptions.get(channelId)!.add(sessionId);
-  }
-
-  async publishMessage(channelId: string, message: Message): Promise<void> {
-    // Publish to Redis for all gateways
-    await this.redis.publish(`channel:${channelId}`, JSON.stringify(message));
-  }
-
-  private handlePubSubMessage(channel: string, data: string): void {
-    const channelId = channel.replace('channel:', '');
-    const subscribers = this.channelSubscriptions.get(channelId);
-
-    if (!subscribers) return;
-
-    const message = JSON.parse(data);
-
-    // Fan out to all local subscribers
-    for (const sessionId of subscribers) {
-      const session = this.sessions.get(sessionId);
-      if (session?.socket.readyState === WebSocket.OPEN) {
-        session.socket.send(JSON.stringify({
-          type: 'MESSAGE',
-          ...message,
-        }));
-      }
-    }
-  }
-}
-```
+**Channel Subscription Management:**
+- Track channelId -> Set of sessionIds locally
+- Subscribe to Redis pub/sub when first user joins channel
+- Unsubscribe when last user leaves channel
+- Fan out received messages to all local subscribers
 
 ---
 
@@ -286,172 +156,52 @@ class MessageRouter {
 
 Cassandra is ideal for message storage due to its write-heavy optimization and time-series nature of chat data.
 
-```cql
--- Messages partitioned by channel, clustered by time (descending)
-CREATE TABLE messages (
-    channel_id UUID,
-    bucket TEXT,  -- Daily bucket for partition management: '2024-01-15'
-    message_id TIMEUUID,
-    author_id UUID,
-    content TEXT,
-    attachments LIST<FROZEN<attachment>>,
-    edited_at TIMESTAMP,
-    deleted BOOLEAN,
-    PRIMARY KEY ((channel_id, bucket), message_id)
-) WITH CLUSTERING ORDER BY (message_id DESC)
-  AND compaction = {'class': 'TimeWindowCompactionStrategy',
-                    'compaction_window_size': '1',
-                    'compaction_window_unit': 'DAYS'};
+**Messages Table:**
 
-CREATE TYPE attachment (
-    url TEXT,
-    filename TEXT,
-    content_type TEXT,
-    size INT
-);
+| Column | Type | Purpose |
+|--------|------|---------|
+| channel_id | UUID | Partition key (with bucket) |
+| bucket | TEXT | Daily bucket: '2024-01-15' |
+| message_id | TIMEUUID | Clustering key (DESC) |
+| author_id | UUID | Message author |
+| content | TEXT | Message body |
+| attachments | LIST | File attachments |
+| edited_at | TIMESTAMP | Edit timestamp |
+| deleted | BOOLEAN | Soft delete flag |
 
--- Reactions stored separately for efficient updates
-CREATE TABLE message_reactions (
-    channel_id UUID,
-    message_id TIMEUUID,
-    emoji TEXT,
-    user_ids SET<UUID>,
-    PRIMARY KEY ((channel_id, message_id), emoji)
-);
+**Primary Key:** ((channel_id, bucket), message_id)
+- Partition by channel + day for bounded partition sizes
+- Cluster by message_id DESC for chronological reads
 
--- User DM channels for quick lookup
-CREATE TABLE user_dm_channels (
-    user_id UUID,
-    other_user_id UUID,
-    channel_id UUID,
-    last_message_at TIMESTAMP,
-    PRIMARY KEY (user_id, last_message_at)
-) WITH CLUSTERING ORDER BY (last_message_at DESC);
-```
+**Compaction Strategy:** TimeWindowCompactionStrategy
+- Window: 1 day
+- Optimized for time-series append workloads
+
+**Supporting Tables:**
+
+| Table | Partition Key | Purpose |
+|-------|---------------|---------|
+| message_reactions | (channel_id, message_id) | Emoji reactions per message |
+| user_dm_channels | user_id | Quick lookup of DM conversations |
 
 ### Chat Service Implementation
 
-```typescript
-class ChatService {
-  private cassandra: CassandraClient;
-  private kafka: KafkaConsumer;
-  private redis: Redis;
+**Message Processing Pipeline:**
+1. Consume from Kafka "messages" topic
+2. Calculate bucket from timestamp (YYYY-MM-DD format)
+3. Write to Cassandra with prepared statement
+4. Publish to Redis for real-time delivery
+5. Update channel's last_message timestamp in Redis sorted set
 
-  constructor() {
-    this.cassandra = new CassandraClient({
-      contactPoints: process.env.CASSANDRA_HOSTS.split(','),
-      localDataCenter: process.env.CASSANDRA_DC,
-      keyspace: 'discord',
-    });
+**Get Messages Query Pattern:**
+- Iterate through recent buckets (last 7 days)
+- Query each bucket until limit reached
+- Support cursor-based pagination with "before" message_id
 
-    this.kafka = new KafkaConsumer({
-      topics: ['messages'],
-      groupId: 'chat-service',
-    });
-
-    this.kafka.on('message', (message) => this.processMessage(message));
-  }
-
-  private async processMessage(kafkaMessage: KafkaMessage): Promise<void> {
-    const message = JSON.parse(kafkaMessage.value.toString());
-    const bucket = this.getBucket(message.timestamp);
-
-    // Write to Cassandra
-    await this.cassandra.execute(
-      `INSERT INTO messages (channel_id, bucket, message_id, author_id, content, deleted)
-       VALUES (?, ?, ?, ?, ?, false)`,
-      [message.channelId, bucket, message.messageId, message.authorId, message.content],
-      { prepare: true }
-    );
-
-    // Publish to Redis for real-time delivery
-    await this.redis.publish(`channel:${message.channelId}`, JSON.stringify(message));
-
-    // Update channel's last message timestamp (for sorting in UI)
-    await this.redis.zadd(
-      `guild:${message.guildId}:channels`,
-      message.timestamp,
-      message.channelId
-    );
-  }
-
-  private getBucket(timestamp: number): string {
-    const date = new Date(timestamp);
-    return date.toISOString().split('T')[0]; // '2024-01-15'
-  }
-
-  async getMessages(
-    channelId: string,
-    before?: string,
-    limit: number = 50
-  ): Promise<Message[]> {
-    const buckets = this.getRecentBuckets(7); // Last 7 days
-    const messages: Message[] = [];
-
-    for (const bucket of buckets) {
-      if (messages.length >= limit) break;
-
-      let query = `SELECT * FROM messages
-                   WHERE channel_id = ? AND bucket = ?`;
-      const params: any[] = [channelId, bucket];
-
-      if (before) {
-        query += ` AND message_id < ?`;
-        params.push(before);
-      }
-
-      query += ` LIMIT ?`;
-      params.push(limit - messages.length);
-
-      const result = await this.cassandra.execute(query, params, { prepare: true });
-      messages.push(...result.rows);
-    }
-
-    return messages;
-  }
-
-  async deleteMessage(channelId: string, messageId: string, userId: string): Promise<boolean> {
-    // Verify ownership
-    const bucket = this.getBucketFromMessageId(messageId);
-    const result = await this.cassandra.execute(
-      `SELECT author_id FROM messages WHERE channel_id = ? AND bucket = ? AND message_id = ?`,
-      [channelId, bucket, messageId],
-      { prepare: true }
-    );
-
-    if (result.rows.length === 0 || result.rows[0].author_id !== userId) {
-      return false;
-    }
-
-    // Soft delete for audit trail
-    await this.cassandra.execute(
-      `UPDATE messages SET deleted = true WHERE channel_id = ? AND bucket = ? AND message_id = ?`,
-      [channelId, bucket, messageId],
-      { prepare: true }
-    );
-
-    // Notify clients
-    await this.redis.publish(`channel:${channelId}`, JSON.stringify({
-      type: 'MESSAGE_DELETE',
-      messageId,
-    }));
-
-    return true;
-  }
-
-  private getRecentBuckets(days: number): string[] {
-    const buckets: string[] = [];
-    const now = new Date();
-
-    for (let i = 0; i < days; i++) {
-      const date = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
-      buckets.push(date.toISOString().split('T')[0]);
-    }
-
-    return buckets;
-  }
-}
-```
+**Delete Message Flow:**
+1. Verify ownership (query author_id)
+2. Soft delete (set deleted = true)
+3. Publish MESSAGE_DELETE event via Redis
 
 ---
 
@@ -461,126 +211,67 @@ class ChatService {
 
 Redis is perfect for presence due to its TTL-based expiration and pub/sub capabilities.
 
-```typescript
-class PresenceService {
-  private redis: Redis;
-  private pubsub: Redis;
+**Redis Key Patterns:**
 
-  constructor() {
-    this.redis = new Redis(process.env.REDIS_URL);
-    this.pubsub = new Redis(process.env.REDIS_URL);
-  }
+| Key Pattern | TTL | Value | Purpose |
+|-------------|-----|-------|---------|
+| presence:{userId} | 60s | status string | Current presence |
+| user:{userId}:sessions | 60s | Set of sessionIds | Active sessions |
+| user:{userId}:status | - | Hash with text | Custom status |
+| user:{userId}:guilds | - | Set of guildIds | User's servers |
 
-  async setPresence(userId: string, status: 'online' | 'idle' | 'dnd' | 'offline'): Promise<void> {
-    const key = `presence:${userId}`;
+**Presence States:** online, idle, dnd (do not disturb), offline
 
-    // Set with expiry for auto-offline
-    await this.redis.setex(key, 60, status);
+**Heartbeat Flow:**
+1. Client sends heartbeat every 30s
+2. Gateway refreshes presence TTL to 60s
+3. Gateway refreshes session set TTL
+4. If heartbeat missed for 60s, key expires = offline
 
-    // Store custom status if any
-    const customStatus = await this.redis.hget(`user:${userId}:status`, 'text');
-
-    // Publish presence update
-    await this.publishPresenceUpdate(userId, status, customStatus);
-  }
-
-  async heartbeat(userId: string, sessionId: string): Promise<void> {
-    // Refresh TTL
-    await this.redis.expire(`presence:${userId}`, 60);
-
-    // Track active sessions
-    await this.redis.sadd(`user:${userId}:sessions`, sessionId);
-    await this.redis.expire(`user:${userId}:sessions`, 60);
-  }
-
-  async getPresence(userId: string): Promise<string> {
-    const status = await this.redis.get(`presence:${userId}`);
-    return status || 'offline';
-  }
-
-  async getBulkPresence(userIds: string[]): Promise<Map<string, string>> {
-    const pipeline = this.redis.pipeline();
-
-    for (const userId of userIds) {
-      pipeline.get(`presence:${userId}`);
-    }
-
-    const results = await pipeline.exec();
-    const presenceMap = new Map<string, string>();
-
-    userIds.forEach((userId, index) => {
-      presenceMap.set(userId, results[index][1] || 'offline');
-    });
-
-    return presenceMap;
-  }
-
-  private async publishPresenceUpdate(
-    userId: string,
-    status: string,
-    customStatus?: string
-  ): Promise<void> {
-    // Get user's guilds and friends for targeted updates
-    const guilds = await this.redis.smembers(`user:${userId}:guilds`);
-
-    const update = {
-      userId,
-      status,
-      customStatus,
-      timestamp: Date.now(),
-    };
-
-    // Publish to each guild's presence channel
-    for (const guildId of guilds) {
-      await this.redis.publish(`presence:guild:${guildId}`, JSON.stringify(update));
-    }
-  }
-}
-```
+**Publishing Presence Updates:**
+1. Get user's guilds from Redis set
+2. Publish to each guild's presence channel
+3. Only subscribers (users viewing that guild) receive updates
 
 ### Lazy Presence Subscription
 
 To avoid the N*M fanout problem (N users with M friends), we use lazy subscriptions:
 
-```typescript
-class PresenceSubscriptionManager {
-  private redis: Redis;
-  private subscriptions: Map<string, Set<string>> = new Map(); // channelId -> sessionIds
-
-  async subscribeToChannelPresence(sessionId: string, channelId: string): Promise<void> {
-    // Get channel members
-    const members = await this.redis.smembers(`channel:${channelId}:members`);
-
-    // Get their current presence
-    const presenceMap = await this.presenceService.getBulkPresence(members);
-
-    // Send initial presence state to client
-    const session = this.sessions.get(sessionId);
-    session?.socket.send(JSON.stringify({
-      type: 'PRESENCE_UPDATE_BATCH',
-      presences: Object.fromEntries(presenceMap),
-    }));
-
-    // Subscribe to presence updates for this channel
-    if (!this.subscriptions.has(channelId)) {
-      this.subscriptions.set(channelId, new Set());
-      await this.pubsub.subscribe(`presence:channel:${channelId}`);
-    }
-    this.subscriptions.get(channelId)!.add(sessionId);
-  }
-
-  async unsubscribeFromChannelPresence(sessionId: string, channelId: string): Promise<void> {
-    const subs = this.subscriptions.get(channelId);
-    if (subs) {
-      subs.delete(sessionId);
-      if (subs.size === 0) {
-        await this.pubsub.unsubscribe(`presence:channel:${channelId}`);
-        this.subscriptions.delete(channelId);
-      }
-    }
-  }
-}
+**Lazy Subscription Pattern:**
 ```
+┌─────────────────────────────────────────────────────────────┐
+│  User opens channel                                          │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌─────────────────┐                                        │
+│  │ Get channel     │                                        │
+│  │ members list    │                                        │
+│  └────────┬────────┘                                        │
+│           ▼                                                  │
+│  ┌─────────────────┐    ┌─────────────────┐                 │
+│  │ Bulk get        │───▶│ Send initial    │                 │
+│  │ presence state  │    │ PRESENCE_BATCH  │                 │
+│  └────────┬────────┘    └─────────────────┘                 │
+│           ▼                                                  │
+│  ┌─────────────────┐                                        │
+│  │ Subscribe to    │                                        │
+│  │ channel presence│                                        │
+│  └─────────────────┘                                        │
+│                                                              │
+│  User leaves channel                                         │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌─────────────────┐                                        │
+│  │ Unsubscribe     │                                        │
+│  │ if last user    │                                        │
+│  └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- Only fetch presence for visible users
+- Only subscribe to updates for active channels
+- Unsubscribe on navigation away
 
 ---
 
@@ -588,120 +279,48 @@ class PresenceSubscriptionManager {
 
 ### Kafka for Ordered Processing
 
-```typescript
-class MessageProcessor {
-  private kafka: Kafka;
-  private consumer: Consumer;
+**Kafka Configuration:**
+- Topic: "messages"
+- Partition key: channel_id
+- Result: All messages for a channel go to same partition = ordered
 
-  constructor() {
-    this.kafka = new Kafka({
-      clientId: 'chat-service',
-      brokers: process.env.KAFKA_BROKERS.split(','),
-    });
+**Consumer Group:** chat-service
+- Single consumer per partition
+- Guarantees in-order processing per channel
 
-    this.consumer = this.kafka.consumer({ groupId: 'chat-service' });
-  }
-
-  async start(): Promise<void> {
-    await this.consumer.connect();
-    await this.consumer.subscribe({ topic: 'messages', fromBeginning: false });
-
-    await this.consumer.run({
-      eachMessage: async ({ topic, partition, message }) => {
-        // Messages with same channel_id go to same partition
-        // This ensures ordering per channel
-        await this.processMessage(message);
-      },
-    });
-  }
-
-  private async processMessage(message: KafkaMessage): Promise<void> {
-    const data = JSON.parse(message.value!.toString());
-
-    try {
-      // Write to Cassandra
-      await this.chatService.persistMessage(data);
-
-      // Publish to Redis for real-time delivery
-      await this.redis.publish(`channel:${data.channelId}`, JSON.stringify(data));
-
-    } catch (error) {
-      // Send to dead letter queue for manual review
-      await this.producer.send({
-        topic: 'messages-dlq',
-        messages: [{ value: message.value }],
-      });
-    }
-  }
-}
-```
+**Error Handling:**
+- On failure: Send to "messages-dlq" (dead letter queue)
+- Manual review and replay for failed messages
 
 ### Message ID with TIMEUUID
 
-```typescript
-function generateTimeUUID(): string {
-  // TIMEUUID format: timestamp + random
-  // Provides:
-  // 1. Natural time ordering
-  // 2. Uniqueness even at same millisecond
-  // 3. Extractable timestamp
-  const timestamp = Date.now();
-  const random = crypto.randomBytes(8).toString('hex');
-  return `${timestamp.toString(16).padStart(12, '0')}-${random}`;
-}
+**TIMEUUID Properties:**
+1. Natural time ordering
+2. Uniqueness even at same millisecond (random component)
+3. Extractable timestamp
 
-function extractTimestamp(messageId: string): number {
-  const [timestampHex] = messageId.split('-');
-  return parseInt(timestampHex, 16);
-}
-```
+**Format:** {timestamp_hex}-{random_hex}
+- Timestamp: 12 hex chars (milliseconds since epoch)
+- Random: 16 hex chars (collision avoidance)
 
 ---
 
 ## Step 8: Rate Limiting
 
-```typescript
-class RateLimiter {
-  private redis: Redis;
+**Rate Limits by Action:**
 
-  private limits: Record<string, { count: number; windowSeconds: number }> = {
-    message: { count: 5, windowSeconds: 5 },
-    reaction: { count: 10, windowSeconds: 1 },
-    channel_create: { count: 10, windowSeconds: 60 },
-    dm_create: { count: 10, windowSeconds: 60 },
-  };
+| Action | Limit | Window | Purpose |
+|--------|-------|--------|---------|
+| message | 5 | 5 seconds | Prevent spam |
+| reaction | 10 | 1 second | Prevent reaction spam |
+| channel_create | 10 | 60 seconds | Prevent channel flooding |
+| dm_create | 10 | 60 seconds | Prevent DM spam |
 
-  async checkLimit(userId: string, action: string): Promise<{ allowed: boolean; retryAfter?: number }> {
-    const limit = this.limits[action];
-    if (!limit) return { allowed: true };
-
-    const key = `ratelimit:${action}:${userId}`;
-
-    const multi = this.redis.multi();
-    multi.incr(key);
-    multi.ttl(key);
-    const [[, count], [, ttl]] = await multi.exec();
-
-    if (ttl === -1) {
-      await this.redis.expire(key, limit.windowSeconds);
-    }
-
-    if (count > limit.count) {
-      return {
-        allowed: false,
-        retryAfter: ttl > 0 ? ttl : limit.windowSeconds
-      };
-    }
-
-    return { allowed: true };
-  }
-
-  async resetLimit(userId: string, action: string): Promise<void> {
-    const key = `ratelimit:${action}:${userId}`;
-    await this.redis.del(key);
-  }
-}
-```
+**Implementation (Redis Sliding Window):**
+1. Increment key: ratelimit:{action}:{userId}
+2. Set TTL on first increment
+3. Check count against limit
+4. Return retryAfter if exceeded
 
 ---
 
@@ -709,83 +328,29 @@ class RateLimiter {
 
 ### Elasticsearch Index
 
-```typescript
-class SearchService {
-  private elasticsearch: Client;
-  private kafka: KafkaConsumer;
+**Index Mapping (messages):**
 
-  constructor() {
-    this.elasticsearch = new Client({
-      node: process.env.ELASTICSEARCH_URL,
-    });
+| Field | Type | Purpose |
+|-------|------|---------|
+| channel_id | keyword | Filter by channel |
+| guild_id | keyword | Scope to server |
+| author_id | keyword | Filter by author |
+| content | text | Full-text search |
+| timestamp | date | Sort and filter |
+| has_attachment | boolean | Filter attachments |
 
-    // Consume messages from Kafka for indexing
-    this.kafka = new KafkaConsumer({
-      topics: ['messages'],
-      groupId: 'search-indexer',
-    });
+**Indexing Pipeline:**
+1. Consume from Kafka "messages" topic (separate consumer group: search-indexer)
+2. Index document to Elasticsearch
+3. Async - doesn't block message delivery
 
-    this.kafka.on('message', (message) => this.indexMessage(message));
-  }
-
-  private async indexMessage(kafkaMessage: KafkaMessage): Promise<void> {
-    const message = JSON.parse(kafkaMessage.value.toString());
-
-    await this.elasticsearch.index({
-      index: 'messages',
-      id: message.messageId,
-      body: {
-        channel_id: message.channelId,
-        guild_id: message.guildId,
-        author_id: message.authorId,
-        content: message.content,
-        timestamp: message.timestamp,
-        has_attachment: message.attachments?.length > 0,
-      },
-    });
-  }
-
-  async search(
-    guildId: string,
-    query: string,
-    filters?: { channelId?: string; authorId?: string; fromDate?: Date }
-  ): Promise<SearchResult[]> {
-    const must: any[] = [
-      { match: { guild_id: guildId } },
-      { match: { content: query } },
-    ];
-
-    if (filters?.channelId) {
-      must.push({ match: { channel_id: filters.channelId } });
-    }
-    if (filters?.authorId) {
-      must.push({ match: { author_id: filters.authorId } });
-    }
-    if (filters?.fromDate) {
-      must.push({ range: { timestamp: { gte: filters.fromDate.getTime() } } });
-    }
-
-    const result = await this.elasticsearch.search({
-      index: 'messages',
-      body: {
-        query: { bool: { must } },
-        highlight: { fields: { content: {} } },
-        sort: [{ timestamp: 'desc' }],
-        size: 25,
-      },
-    });
-
-    return result.hits.hits.map((hit) => ({
-      messageId: hit._id,
-      content: hit._source.content,
-      highlight: hit.highlight?.content?.[0],
-      channelId: hit._source.channel_id,
-      authorId: hit._source.author_id,
-      timestamp: hit._source.timestamp,
-    }));
-  }
-}
-```
+**Search Query Building:**
+- Must match: guild_id (security)
+- Should match: content (relevance)
+- Optional filters: channel_id, author_id, fromDate
+- Highlight: content field
+- Sort: timestamp DESC
+- Size: 25 results
 
 ---
 
@@ -825,85 +390,35 @@ class SearchService {
 
 ### Gateway Failure
 
-```typescript
-class GatewayHealthMonitor {
-  async checkHealth(): Promise<HealthStatus> {
-    const checks = await Promise.all([
-      this.checkRedisConnection(),
-      this.checkKafkaConnection(),
-      this.checkConnectionCount(),
-    ]);
+**Health Check Components:**
+1. Redis connection status
+2. Kafka connection status
+3. Active connection count
 
-    return {
-      status: checks.every(c => c.healthy) ? 'healthy' : 'unhealthy',
-      connections: this.sessions.size,
-      redis: checks[0],
-      kafka: checks[1],
-    };
-  }
-
-  async gracefulShutdown(): Promise<void> {
-    // Stop accepting new connections
-    this.server.close();
-
-    // Notify clients to reconnect elsewhere
-    for (const session of this.sessions.values()) {
-      session.socket.send(JSON.stringify({
-        type: 'RECONNECT',
-        reason: 'Gateway shutting down',
-      }));
-    }
-
-    // Wait for clients to disconnect
-    await this.waitForDrain(30000);
-
-    // Cleanup Redis subscriptions
-    await this.cleanupSubscriptions();
-  }
-}
-```
+**Graceful Shutdown Sequence:**
+1. Stop accepting new connections
+2. Send RECONNECT event to all clients (reason: "Gateway shutting down")
+3. Wait for clients to disconnect (30s drain period)
+4. Cleanup Redis subscriptions
+5. Exit
 
 ### Circuit Breaker for External Services
 
-```typescript
-import CircuitBreaker from 'opossum';
+**Circuit Breaker Configuration:**
 
-class ResilientChatService {
-  private cassandraBreaker: CircuitBreaker;
-  private redisBreaker: CircuitBreaker;
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| Cassandra | 5000ms | 50% | 30s |
+| Redis | 1000ms | 50% | 10s |
 
-  constructor() {
-    this.cassandraBreaker = new CircuitBreaker(
-      (query, params) => this.cassandra.execute(query, params),
-      {
-        timeout: 5000,
-        errorThresholdPercentage: 50,
-        resetTimeout: 30000,
-      }
-    );
+**States:**
+- CLOSED: Normal operation
+- OPEN: Fast-fail all requests
+- HALF-OPEN: Allow test requests
 
-    this.cassandraBreaker.on('open', () => {
-      logger.error('Cassandra circuit breaker opened');
-      metrics.circuitBreakerOpen.inc({ service: 'cassandra' });
-    });
-  }
-
-  async persistMessage(message: Message): Promise<void> {
-    try {
-      await this.cassandraBreaker.fire(
-        `INSERT INTO messages (...) VALUES (...)`,
-        [message.channelId, message.bucket, message.messageId, message.content]
-      );
-    } catch (error) {
-      if (error.name === 'CircuitBreakerOpenError') {
-        // Queue message for retry
-        await this.retryQueue.push(message);
-      }
-      throw error;
-    }
-  }
-}
-```
+**Fallback on Cassandra Open:**
+- Queue message for retry
+- Return error to client with retry hint
 
 ---
 
@@ -911,52 +426,18 @@ class ResilientChatService {
 
 ### Prometheus Metrics
 
-```typescript
-import { Counter, Histogram, Gauge, Registry } from 'prom-client';
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| discord_messages_sent_total | Counter | guild_id | Message volume |
+| discord_message_latency_seconds | Histogram | - | Delivery latency |
+| discord_active_connections | Gauge | gateway_id | Connection count |
+| discord_cassandra_query_seconds | Histogram | query_type | DB performance |
 
-const registry = new Registry();
+**Histogram Buckets (latency):** [0.01, 0.05, 0.1, 0.25, 0.5, 1] seconds
 
-const messagesSent = new Counter({
-  name: 'discord_messages_sent_total',
-  help: 'Total messages sent',
-  labelNames: ['guild_id'],
-  registers: [registry],
-});
-
-const messageLatency = new Histogram({
-  name: 'discord_message_latency_seconds',
-  help: 'Message delivery latency',
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1],
-  registers: [registry],
-});
-
-const activeConnections = new Gauge({
-  name: 'discord_active_connections',
-  help: 'Number of active WebSocket connections',
-  labelNames: ['gateway_id'],
-  registers: [registry],
-});
-
-const cassandraQueryLatency = new Histogram({
-  name: 'discord_cassandra_query_seconds',
-  help: 'Cassandra query latency',
-  labelNames: ['query_type'],
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
-  registers: [registry],
-});
-
-// Health check endpoint
-app.get('/health', async (req, res) => {
-  const health = await healthMonitor.checkHealth();
-  res.status(health.status === 'healthy' ? 200 : 503).json(health);
-});
-
-// Metrics endpoint
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', registry.contentType);
-  res.send(await registry.metrics());
-});
-```
+**Endpoints:**
+- /health: Health check (200 = healthy, 503 = unhealthy)
+- /metrics: Prometheus scrape endpoint
 
 ---
 

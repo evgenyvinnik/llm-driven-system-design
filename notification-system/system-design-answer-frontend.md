@@ -34,259 +34,92 @@ From a frontend perspective, I'll focus on preference management UI, notificatio
 
 ## Deep Dive: Preference Management UI (10 minutes)
 
-### Channel Preferences Component
+### Preferences Panel Layout
 
-```tsx
-interface ChannelPreference {
-  channel: 'push' | 'email' | 'sms' | 'in_app';
-  enabled: boolean;
-  categories: Record<string, boolean>;
-}
-
-interface PreferencesState {
-  channels: ChannelPreference[];
-  quietHours: {
-    enabled: boolean;
-    start: string; // "22:00"
-    end: string;   // "07:00"
-  };
-  timezone: string;
-  loading: boolean;
-  saving: boolean;
-}
-
-function PreferencesPanel() {
-  const { preferences, updatePreferences, saving } = usePreferences();
-
-  return (
-    <div className="space-y-8">
-      <section aria-labelledby="channels-heading">
-        <h2 id="channels-heading" className="text-lg font-semibold mb-4">
-          Notification Channels
-        </h2>
-        <div className="space-y-4">
-          {preferences.channels.map(channel => (
-            <ChannelToggle
-              key={channel.channel}
-              channel={channel}
-              onToggle={(enabled) => updatePreferences({
-                channels: preferences.channels.map(c =>
-                  c.channel === channel.channel ? { ...c, enabled } : c
-                )
-              })}
-              disabled={saving}
-            />
-          ))}
-        </div>
-      </section>
-
-      <section aria-labelledby="quiet-hours-heading">
-        <h2 id="quiet-hours-heading" className="text-lg font-semibold mb-4">
-          Quiet Hours
-        </h2>
-        <QuietHoursSettings
-          settings={preferences.quietHours}
-          timezone={preferences.timezone}
-          onChange={(quietHours) => updatePreferences({ quietHours })}
-          disabled={saving}
-        />
-      </section>
-
-      <section aria-labelledby="categories-heading">
-        <h2 id="categories-heading" className="text-lg font-semibold mb-4">
-          Notification Categories
-        </h2>
-        <CategoryPreferences
-          channels={preferences.channels}
-          onChange={(categories) => updatePreferences({ categories })}
-          disabled={saving}
-        />
-      </section>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Preferences Panel                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  NOTIFICATION CHANNELS                                                   │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  [Bell Icon]  Push Notifications                    [====Toggle]  │  │
+│  │               Receive alerts on your mobile device                │  │
+│  │               ┌─────────────────────────────────────┐            │  │
+│  │               │ Category Quick Settings (expanded)  │            │  │
+│  │               │ [x] Security  [x] Orders  [ ] Marketing         │  │
+│  │               └─────────────────────────────────────┘            │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  [Envelope]   Email                                 [====Toggle]  │  │
+│  │               Get notifications in your inbox                     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  [Phone Icon] SMS Text Messages                     [    Toggle]  │  │
+│  │               Receive text messages for urgent alerts             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  [Device]     In-App Notifications                  [====Toggle]  │  │
+│  │               See notifications within the app                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  QUIET HOURS                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Enable Quiet Hours                                 [====Toggle]  │  │
+│  │  Pause non-critical notifications during specified hours         │  │
+│  │                                                                   │  │
+│  │  │  Start Time        End Time                                   │  │
+│  │  │  [22:00    ]       [07:00    ]                               │  │
+│  │  │                                                               │  │
+│  │  │  Timezone                                                     │  │
+│  │  │  [America/New_York              v]                           │  │
+│  │  │                                                               │  │
+│  │  │  ┌─────────────────────────────────────────┐                 │  │
+│  │  │  │ [Moon Icon] Quiet hours are currently   │  amber bg      │  │
+│  │  │  │             active                       │                 │  │
+│  │  │  └─────────────────────────────────────────┘                 │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  NOTIFICATION CATEGORIES                                                 │
+│  [Expandable category preferences per channel]                           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Channel Toggle with Status
+### Channel Toggle Component Structure
 
-```tsx
-interface ChannelToggleProps {
-  channel: ChannelPreference;
-  onToggle: (enabled: boolean) => void;
-  disabled?: boolean;
-}
-
-function ChannelToggle({ channel, onToggle, disabled }: ChannelToggleProps) {
-  const icons: Record<string, React.ReactNode> = {
-    push: <BellIcon className="w-5 h-5" />,
-    email: <EnvelopeIcon className="w-5 h-5" />,
-    sms: <PhoneIcon className="w-5 h-5" />,
-    in_app: <DevicePhoneMobileIcon className="w-5 h-5" />
-  };
-
-  const labels: Record<string, string> = {
-    push: 'Push Notifications',
-    email: 'Email',
-    sms: 'SMS Text Messages',
-    in_app: 'In-App Notifications'
-  };
-
-  const descriptions: Record<string, string> = {
-    push: 'Receive alerts on your mobile device',
-    email: 'Get notifications in your inbox',
-    sms: 'Receive text messages for urgent alerts',
-    in_app: 'See notifications within the app'
-  };
-
-  return (
-    <div className="flex items-start gap-4 p-4 bg-white rounded-lg border border-gray-200">
-      <div className="flex-shrink-0 p-2 bg-gray-100 rounded-lg">
-        {icons[channel.channel]}
-      </div>
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between">
-          <label
-            htmlFor={`channel-${channel.channel}`}
-            className="font-medium text-gray-900"
-          >
-            {labels[channel.channel]}
-          </label>
-          <Switch
-            id={`channel-${channel.channel}`}
-            checked={channel.enabled}
-            onChange={onToggle}
-            disabled={disabled}
-            aria-describedby={`channel-${channel.channel}-description`}
-          />
-        </div>
-        <p
-          id={`channel-${channel.channel}-description`}
-          className="mt-1 text-sm text-gray-500"
-        >
-          {descriptions[channel.channel]}
-        </p>
-
-        {channel.enabled && (
-          <div className="mt-3 pt-3 border-t border-gray-100">
-            <CategoryQuickSettings
-              channel={channel.channel}
-              categories={channel.categories}
-              onChange={(categories) => onToggle({ ...channel, categories })}
-            />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ChannelToggle Component                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Props:                                                                  │
+│  ├── channel: ChannelPreference                                         │
+│  ├── onToggle: (enabled: boolean) => void                               │
+│  └── disabled?: boolean                                                 │
+│                                                                          │
+│  Layout:                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  ┌──────────┐  ┌──────────────────────────────────┐  ┌────────┐  │  │
+│  │  │  Icon    │  │  Label (for="channel-{id}")      │  │ Switch │  │  │
+│  │  │  Box     │  │  Description (aria-describedby)  │  │        │  │  │
+│  │  │ bg-gray  │  │                                  │  │        │  │  │
+│  │  └──────────┘  └──────────────────────────────────┘  └────────┘  │  │
+│  │                                                                   │  │
+│  │  {channel.enabled && (                                            │  │
+│  │    <CategoryQuickSettings>  // Nested category toggles            │  │
+│  │  )}                                                               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Icons by channel:                                                       │
+│  ├── push    ──▶ BellIcon                                               │
+│  ├── email   ──▶ EnvelopeIcon                                           │
+│  ├── sms     ──▶ PhoneIcon                                              │
+│  └── in_app  ──▶ DevicePhoneMobileIcon                                  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Quiet Hours Time Picker
-
-```tsx
-function QuietHoursSettings({ settings, timezone, onChange, disabled }) {
-  const timezones = Intl.supportedValuesOf('timeZone');
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <span className="font-medium">Enable Quiet Hours</span>
-          <p className="text-sm text-gray-500">
-            Pause non-critical notifications during specified hours
-          </p>
-        </div>
-        <Switch
-          checked={settings.enabled}
-          onChange={(enabled) => onChange({ ...settings, enabled })}
-          disabled={disabled}
-          aria-label="Enable quiet hours"
-        />
-      </div>
-
-      {settings.enabled && (
-        <div className="pl-4 border-l-2 border-gray-200 space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Start Time
-              </label>
-              <TimeInput
-                value={settings.start}
-                onChange={(start) => onChange({ ...settings, start })}
-                disabled={disabled}
-                aria-label="Quiet hours start time"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                End Time
-              </label>
-              <TimeInput
-                value={settings.end}
-                onChange={(end) => onChange({ ...settings, end })}
-                disabled={disabled}
-                aria-label="Quiet hours end time"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Timezone
-            </label>
-            <select
-              value={timezone}
-              onChange={(e) => onChange({ ...settings, timezone: e.target.value })}
-              disabled={disabled}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md"
-            >
-              {timezones.map(tz => (
-                <option key={tz} value={tz}>{tz.replace(/_/g, ' ')}</option>
-              ))}
-            </select>
-          </div>
-
-          <QuietHoursPreview start={settings.start} end={settings.end} timezone={timezone} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function QuietHoursPreview({ start, end, timezone }) {
-  const currentTime = new Date().toLocaleTimeString('en-US', {
-    timeZone: timezone,
-    hour: '2-digit',
-    minute: '2-digit'
-  });
-
-  const isActive = isWithinQuietHours(currentTime, start, end);
-
-  return (
-    <div className={`p-3 rounded-lg ${isActive ? 'bg-amber-50' : 'bg-gray-50'}`}>
-      <div className="flex items-center gap-2">
-        {isActive ? (
-          <>
-            <MoonIcon className="w-4 h-4 text-amber-600" />
-            <span className="text-sm text-amber-800">
-              Quiet hours are currently active
-            </span>
-          </>
-        ) : (
-          <>
-            <SunIcon className="w-4 h-4 text-gray-600" />
-            <span className="text-sm text-gray-700">
-              Quiet hours will start at {start}
-            </span>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-```
+> "I chose to show category settings inline when a channel is enabled rather than in a separate section. This creates a clear visual hierarchy - toggle the channel, then fine-tune categories - and reduces the cognitive load of navigating to a separate settings area."
 
 ---
 
@@ -294,719 +127,393 @@ function QuietHoursPreview({ start, end, timezone }) {
 
 ### Notification Center Layout
 
-```tsx
-function NotificationCenter() {
-  const { notifications, unreadCount, markAsRead, markAllAsRead, loading } = useNotifications();
-  const [filter, setFilter] = useState<'all' | 'unread'>('all');
-  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
-
-  const filteredNotifications = useMemo(() => {
-    return notifications.filter(n => {
-      if (filter === 'unread' && n.readAt) return false;
-      if (categoryFilter && n.category !== categoryFilter) return false;
-      return true;
-    });
-  }, [notifications, filter, categoryFilter]);
-
-  return (
-    <div className="flex flex-col h-full">
-      <header className="flex items-center justify-between px-4 py-3 border-b">
-        <div className="flex items-center gap-3">
-          <h1 className="text-lg font-semibold">Notifications</h1>
-          {unreadCount > 0 && (
-            <span className="px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 rounded-full">
-              {unreadCount} new
-            </span>
-          )}
-        </div>
-
-        {unreadCount > 0 && (
-          <button
-            onClick={markAllAsRead}
-            className="text-sm text-blue-600 hover:text-blue-800"
-          >
-            Mark all as read
-          </button>
-        )}
-      </header>
-
-      <div className="flex items-center gap-2 px-4 py-2 border-b bg-gray-50">
-        <FilterPills
-          options={[
-            { value: 'all', label: 'All' },
-            { value: 'unread', label: 'Unread' }
-          ]}
-          selected={filter}
-          onChange={setFilter}
-        />
-
-        <div className="w-px h-4 bg-gray-300" />
-
-        <CategoryFilter
-          selected={categoryFilter}
-          onChange={setCategoryFilter}
-        />
-      </div>
-
-      <div className="flex-1 overflow-y-auto">
-        {loading ? (
-          <NotificationListSkeleton count={5} />
-        ) : filteredNotifications.length === 0 ? (
-          <EmptyState
-            icon={<BellSlashIcon className="w-12 h-12" />}
-            title="No notifications"
-            description={filter === 'unread'
-              ? "You're all caught up!"
-              : "You haven't received any notifications yet"
-            }
-          />
-        ) : (
-          <VirtualizedNotificationList
-            notifications={filteredNotifications}
-            onMarkAsRead={markAsRead}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Notification Center                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Notifications                 [12 new]      "Mark all as read"   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  [All] [Unread]    |    [Category Filter v]                       │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Notification List (virtualized):                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ [Blue dot]                                                        │  │
+│  │  [ShieldIcon]  Security Alert                           2m ago   │  │
+│  │  red           New login detected from Chrome on Windows          │  │
+│  │                [push: Delivered] [email: Sent]            [X]     │  │
+│  ├───────────────────────────────────────────────────────────────────┤  │
+│  │  [ShoppingBag] Order Shipped                            1h ago   │  │
+│  │  green         Your order #12345 is on its way                   │  │
+│  │                [push: Delivered] [sms: Delivered]                 │  │
+│  ├───────────────────────────────────────────────────────────────────┤  │
+│  │  [UserGroup]   New Follower                             3h ago   │  │
+│  │  blue          @johndoe started following you                     │  │
+│  │                [in_app: Delivered]                                │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Empty State:                                                            │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │            [BellSlashIcon]                                        │  │
+│  │            "No notifications"                                     │  │
+│  │            "You're all caught up!" (if unread filter)             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Individual Notification Card
+### Notification Card Component
 
-```tsx
-interface NotificationCardProps {
-  notification: Notification;
-  onMarkAsRead: (id: string) => void;
-  onDismiss: (id: string) => void;
-}
-
-function NotificationCard({ notification, onMarkAsRead, onDismiss }: NotificationCardProps) {
-  const categoryIcons: Record<string, React.ReactNode> = {
-    security: <ShieldCheckIcon className="w-5 h-5 text-red-500" />,
-    order: <ShoppingBagIcon className="w-5 h-5 text-green-500" />,
-    social: <UserGroupIcon className="w-5 h-5 text-blue-500" />,
-    marketing: <MegaphoneIcon className="w-5 h-5 text-purple-500" />,
-    system: <CogIcon className="w-5 h-5 text-gray-500" />
-  };
-
-  const handleClick = () => {
-    if (!notification.readAt) {
-      onMarkAsRead(notification.id);
-    }
-    if (notification.actionUrl) {
-      window.location.href = notification.actionUrl;
-    }
-  };
-
-  return (
-    <article
-      className={`
-        relative p-4 border-b cursor-pointer transition-colors
-        ${notification.readAt ? 'bg-white' : 'bg-blue-50'}
-        hover:bg-gray-50
-      `}
-      onClick={handleClick}
-      role="button"
-      tabIndex={0}
-      aria-label={`${notification.readAt ? '' : 'Unread: '}${notification.title}`}
-    >
-      <div className="flex gap-3">
-        <div className="flex-shrink-0 mt-1">
-          {categoryIcons[notification.category] || categoryIcons.system}
-        </div>
-
-        <div className="flex-1 min-w-0">
-          <div className="flex items-start justify-between gap-2">
-            <h3 className={`text-sm ${notification.readAt ? 'font-normal' : 'font-semibold'}`}>
-              {notification.title}
-            </h3>
-            <time
-              className="flex-shrink-0 text-xs text-gray-500"
-              dateTime={notification.createdAt}
-              title={new Date(notification.createdAt).toLocaleString()}
-            >
-              {formatRelativeTime(notification.createdAt)}
-            </time>
-          </div>
-
-          <p className="mt-1 text-sm text-gray-600 line-clamp-2">
-            {notification.body}
-          </p>
-
-          {notification.channels && (
-            <div className="mt-2 flex gap-1">
-              {notification.channels.map(channel => (
-                <ChannelBadge
-                  key={channel.name}
-                  channel={channel.name}
-                  status={channel.status}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-
-        {!notification.readAt && (
-          <div
-            className="absolute left-1 top-1/2 -translate-y-1/2 w-2 h-2 bg-blue-500 rounded-full"
-            aria-label="Unread indicator"
-          />
-        )}
-      </div>
-
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onDismiss(notification.id);
-        }}
-        className="absolute top-2 right-2 p-1 text-gray-400 hover:text-gray-600 opacity-0 group-hover:opacity-100"
-        aria-label="Dismiss notification"
-      >
-        <XMarkIcon className="w-4 h-4" />
-      </button>
-    </article>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   NotificationCard Component                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Structure:                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  <article>                                                        │  │
+│  │    role="button"                                                  │  │
+│  │    tabIndex={0}                                                   │  │
+│  │    aria-label="{Unread: }{title}"                                │  │
+│  │    className={readAt ? 'bg-white' : 'bg-blue-50'}                │  │
+│  │                                                                   │  │
+│  │    ┌─────────┐ ┌─────────────────────────────────────┐ ┌──────┐  │  │
+│  │    │Category │ │ Title (font-semibold if unread)     │ │ Time │  │  │
+│  │    │  Icon   │ │ Body (line-clamp-2)                 │ │      │  │  │
+│  │    └─────────┘ │ [ChannelBadge] [ChannelBadge]       │ └──────┘  │  │
+│  │                └─────────────────────────────────────┘           │  │
+│  │                                                                   │  │
+│  │    {!readAt && <BlueDotIndicator />}                             │  │
+│  │    <DismissButton onClick={onDismiss} />                         │  │
+│  │  </article>                                                       │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Category Icons:                                                         │
+│  ├── security  ──▶ ShieldCheckIcon (red)                                │
+│  ├── order     ──▶ ShoppingBagIcon (green)                              │
+│  ├── social    ──▶ UserGroupIcon (blue)                                 │
+│  ├── marketing ──▶ MegaphoneIcon (purple)                               │
+│  └── system    ──▶ CogIcon (gray)                                       │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Channel Delivery Status Badge
 
-```tsx
-function ChannelBadge({ channel, status }: { channel: string; status: DeliveryStatus }) {
-  const icons: Record<string, React.ReactNode> = {
-    push: <DevicePhoneMobileIcon className="w-3 h-3" />,
-    email: <EnvelopeIcon className="w-3 h-3" />,
-    sms: <ChatBubbleLeftIcon className="w-3 h-3" />,
-    in_app: <BellIcon className="w-3 h-3" />
-  };
-
-  const statusStyles: Record<DeliveryStatus, string> = {
-    sent: 'bg-green-100 text-green-800',
-    delivered: 'bg-green-100 text-green-800',
-    pending: 'bg-yellow-100 text-yellow-800',
-    failed: 'bg-red-100 text-red-800',
-    suppressed: 'bg-gray-100 text-gray-600'
-  };
-
-  const statusLabels: Record<DeliveryStatus, string> = {
-    sent: 'Sent',
-    delivered: 'Delivered',
-    pending: 'Pending',
-    failed: 'Failed',
-    suppressed: 'Suppressed'
-  };
-
-  return (
-    <span
-      className={`
-        inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium
-        ${statusStyles[status]}
-      `}
-      title={`${channel}: ${statusLabels[status]}`}
-    >
-      {icons[channel]}
-      <span className="capitalize">{channel}</span>
-      {status === 'failed' && <ExclamationCircleIcon className="w-3 h-3" />}
-    </span>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     ChannelBadge Component                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Visual: [ChannelIcon] [Channel Name] [Status Icon if failed]           │
+│                                                                          │
+│  Status Styles:                                                          │
+│  ├── sent / delivered  ──▶ bg-green-100 text-green-800                  │
+│  ├── pending           ──▶ bg-yellow-100 text-yellow-800                │
+│  ├── failed            ──▶ bg-red-100 text-red-800 + ExclamationIcon    │
+│  └── suppressed        ──▶ bg-gray-100 text-gray-600                    │
+│                                                                          │
+│  Example badges:                                                         │
+│  ┌────────────────┐ ┌─────────────────┐ ┌───────────────────┐           │
+│  │ [Phone] Push   │ │ [Envelope] Email│ │ [!] SMS Failed    │           │
+│  │ green          │ │ green           │ │ red               │           │
+│  └────────────────┘ └─────────────────┘ └───────────────────┘           │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Deep Dive: Real-Time Notifications (8 minutes)
 
-### In-App Notification Toast
+### Toast Notification System
 
-```tsx
-function NotificationToastProvider({ children }: { children: React.ReactNode }) {
-  const [toasts, setToasts] = useState<NotificationToast[]>([]);
-
-  useEffect(() => {
-    const ws = new WebSocket(getWebSocketUrl());
-
-    ws.onmessage = (event) => {
-      const notification = JSON.parse(event.data);
-
-      if (notification.type === 'NEW_NOTIFICATION') {
-        const toast: NotificationToast = {
-          id: notification.id,
-          title: notification.title,
-          body: notification.body,
-          category: notification.category,
-          actionUrl: notification.actionUrl,
-          createdAt: Date.now()
-        };
-
-        setToasts(prev => [...prev, toast]);
-
-        // Auto-dismiss after 5 seconds
-        setTimeout(() => {
-          setToasts(prev => prev.filter(t => t.id !== toast.id));
-        }, 5000);
-      }
-    };
-
-    return () => ws.close();
-  }, []);
-
-  const dismissToast = (id: string) => {
-    setToasts(prev => prev.filter(t => t.id !== id));
-  };
-
-  return (
-    <>
-      {children}
-
-      <div
-        className="fixed bottom-4 right-4 z-50 space-y-2 max-w-sm"
-        role="region"
-        aria-label="Notifications"
-        aria-live="polite"
-      >
-        <AnimatePresence>
-          {toasts.map(toast => (
-            <motion.div
-              key={toast.id}
-              initial={{ opacity: 0, y: 20, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.1 } }}
-            >
-              <ToastNotification
-                toast={toast}
-                onDismiss={() => dismissToast(toast.id)}
-              />
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
-    </>
-  );
-}
-
-function ToastNotification({ toast, onDismiss }: { toast: NotificationToast; onDismiss: () => void }) {
-  return (
-    <div
-      className="bg-white rounded-lg shadow-lg border p-4 cursor-pointer hover:shadow-xl transition-shadow"
-      onClick={() => {
-        if (toast.actionUrl) {
-          window.location.href = toast.actionUrl;
-        }
-        onDismiss();
-      }}
-      role="alert"
-    >
-      <div className="flex items-start gap-3">
-        <CategoryIcon category={toast.category} className="w-5 h-5 flex-shrink-0" />
-
-        <div className="flex-1 min-w-0">
-          <h4 className="text-sm font-medium text-gray-900">{toast.title}</h4>
-          <p className="mt-1 text-sm text-gray-500 line-clamp-2">{toast.body}</p>
-        </div>
-
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDismiss();
-          }}
-          className="flex-shrink-0 p-1 text-gray-400 hover:text-gray-600"
-          aria-label="Dismiss"
-        >
-          <XMarkIcon className="w-4 h-4" />
-        </button>
-      </div>
-
-      <div className="mt-2 h-1 bg-gray-200 rounded-full overflow-hidden">
-        <motion.div
-          className="h-full bg-blue-500"
-          initial={{ width: '100%' }}
-          animate={{ width: '0%' }}
-          transition={{ duration: 5, ease: 'linear' }}
-        />
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  NotificationToastProvider                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Architecture:                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  WebSocket Connection                                            │    │
+│  │    │                                                             │    │
+│  │    └── onmessage ──▶ if type === 'NEW_NOTIFICATION':            │    │
+│  │                        ├── Create toast object                   │    │
+│  │                        ├── Add to toasts[]                       │    │
+│  │                        └── setTimeout(dismiss, 5000)             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Toast Container (fixed bottom-right, z-50):                             │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  <div role="region" aria-label="Notifications" aria-live="polite">│  │
+│  │                                                                   │  │
+│  │    <AnimatePresence>  (Framer Motion)                            │  │
+│  │      {toasts.map(toast => (                                      │  │
+│  │        <motion.div                                                │  │
+│  │          initial={{ opacity: 0, y: 20, scale: 0.95 }}            │  │
+│  │          animate={{ opacity: 1, y: 0, scale: 1 }}                │  │
+│  │          exit={{ opacity: 0, scale: 0.95 }}                      │  │
+│  │        >                                                          │  │
+│  │          <ToastNotification toast={toast} />                     │  │
+│  │        </motion.div>                                              │  │
+│  │      ))}                                                          │  │
+│  │    </AnimatePresence>                                             │  │
+│  │                                                                   │  │
+│  │  </div>                                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Notification Badge with Animation
+### Toast Component
 
-```tsx
-function NotificationBellButton() {
-  const { unreadCount } = useNotifications();
-  const [isOpen, setIsOpen] = useState(false);
-  const [animate, setAnimate] = useState(false);
-  const prevCount = useRef(unreadCount);
-
-  // Animate badge when count increases
-  useEffect(() => {
-    if (unreadCount > prevCount.current) {
-      setAnimate(true);
-      const timeout = setTimeout(() => setAnimate(false), 500);
-      return () => clearTimeout(timeout);
-    }
-    prevCount.current = unreadCount;
-  }, [unreadCount]);
-
-  return (
-    <Popover className="relative">
-      <Popover.Button
-        className="relative p-2 text-gray-600 hover:text-gray-900"
-        aria-label={`Notifications${unreadCount > 0 ? `, ${unreadCount} unread` : ''}`}
-      >
-        <BellIcon className="w-6 h-6" />
-
-        {unreadCount > 0 && (
-          <motion.span
-            className={`
-              absolute -top-1 -right-1 flex items-center justify-center
-              min-w-[20px] h-5 px-1.5 text-xs font-bold
-              bg-red-500 text-white rounded-full
-            `}
-            animate={animate ? { scale: [1, 1.3, 1] } : {}}
-          >
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </motion.span>
-        )}
-      </Popover.Button>
-
-      <Popover.Panel className="absolute right-0 z-10 mt-2 w-96 origin-top-right">
-        <div className="rounded-lg shadow-lg ring-1 ring-black ring-opacity-5 bg-white overflow-hidden">
-          <NotificationCenter />
-        </div>
-      </Popover.Panel>
-    </Popover>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ToastNotification Component                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  <div role="alert">                                               │  │
+│  │                                                                   │  │
+│  │    ┌─────────┐ ┌───────────────────────────────┐ ┌─────────┐     │  │
+│  │    │Category │ │ Title (font-medium)           │ │ Dismiss │     │  │
+│  │    │  Icon   │ │ Body (line-clamp-2)           │ │   [X]   │     │  │
+│  │    └─────────┘ └───────────────────────────────┘ └─────────┘     │  │
+│  │                                                                   │  │
+│  │    Progress Bar (auto-dismiss timer):                             │  │
+│  │    ┌─────────────────────────────────────────────────────────┐   │  │
+│  │    │ [==================================                     ]│   │  │
+│  │    │  bg-blue-500, animates from 100% to 0% over 5 seconds   │   │  │
+│  │    └─────────────────────────────────────────────────────────┘   │  │
+│  │                                                                   │  │
+│  │  </div>                                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Interactions:                                                           │
+│  ├── Click toast ──▶ Navigate to actionUrl (if present), dismiss       │
+│  ├── Click [X]   ──▶ Dismiss immediately                                │
+│  └── Hover       ──▶ Pause auto-dismiss timer (optional enhancement)   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Notification Bell Button
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   NotificationBellButton                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Normal State:                                                           │
+│  ┌─────────┐                                                            │
+│  │  [Bell] │  aria-label="Notifications"                                │
+│  └─────────┘                                                            │
+│                                                                          │
+│  With Unread Count:                                                      │
+│  ┌─────────┐                                                            │
+│  │  [Bell] │  aria-label="Notifications, 12 unread"                     │
+│  │    [12] │  ──▶ Badge: min-w-20px, bg-red-500, rounded-full           │
+│  └─────────┘      animate: { scale: [1, 1.3, 1] } when count increases  │
+│                                                                          │
+│  Popover Panel (on click):                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  [Popover.Panel className="w-96"]                                │    │
+│  │    ├── origin-top-right                                          │    │
+│  │    ├── ring-1 ring-black/5                                       │    │
+│  │    └── <NotificationCenter />  (embedded)                        │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Badge Animation Logic:                                                  │
+│  ├── Track previous count with useRef                                   │
+│  ├── On count increase: trigger bounce animation                        │
+│  └── Clear animation after 500ms                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+> "The animated badge is a small detail that makes notifications feel more alive. When a new notification arrives, the badge bounces to draw attention without being disruptive. This is especially important when users are focused on other tasks."
 
 ---
 
 ## Deep Dive: State Management (7 minutes)
 
-### Zustand Stores
+### Notification Store (Zustand)
 
-```typescript
-// Notification store
-interface NotificationState {
-  notifications: Notification[];
-  unreadCount: number;
-  loading: boolean;
-  error: Error | null;
-
-  fetchNotifications: () => Promise<void>;
-  markAsRead: (id: string) => Promise<void>;
-  markAllAsRead: () => Promise<void>;
-  addNotification: (notification: Notification) => void;
-  dismissNotification: (id: string) => void;
-}
-
-export const useNotificationStore = create<NotificationState>((set, get) => ({
-  notifications: [],
-  unreadCount: 0,
-  loading: false,
-  error: null,
-
-  fetchNotifications: async () => {
-    set({ loading: true, error: null });
-    try {
-      const response = await api.get('/notifications');
-      set({
-        notifications: response.data.notifications,
-        unreadCount: response.data.unreadCount,
-        loading: false
-      });
-    } catch (error) {
-      set({ error: error as Error, loading: false });
-    }
-  },
-
-  markAsRead: async (id) => {
-    // Optimistic update
-    set(state => ({
-      notifications: state.notifications.map(n =>
-        n.id === id ? { ...n, readAt: new Date().toISOString() } : n
-      ),
-      unreadCount: Math.max(0, state.unreadCount - 1)
-    }));
-
-    try {
-      await api.post(`/notifications/${id}/read`);
-    } catch (error) {
-      // Revert on failure
-      get().fetchNotifications();
-    }
-  },
-
-  markAllAsRead: async () => {
-    set(state => ({
-      notifications: state.notifications.map(n => ({
-        ...n,
-        readAt: n.readAt || new Date().toISOString()
-      })),
-      unreadCount: 0
-    }));
-
-    try {
-      await api.post('/notifications/read-all');
-    } catch (error) {
-      get().fetchNotifications();
-    }
-  },
-
-  addNotification: (notification) => {
-    set(state => ({
-      notifications: [notification, ...state.notifications],
-      unreadCount: state.unreadCount + 1
-    }));
-  },
-
-  dismissNotification: (id) => {
-    set(state => ({
-      notifications: state.notifications.filter(n => n.id !== id)
-    }));
-  }
-}));
-
-// Preferences store with persistence
-interface PreferencesState {
-  preferences: UserPreferences | null;
-  loading: boolean;
-  saving: boolean;
-  error: Error | null;
-  pendingChanges: Partial<UserPreferences>;
-
-  fetchPreferences: () => Promise<void>;
-  updatePreferences: (updates: Partial<UserPreferences>) => void;
-  savePreferences: () => Promise<void>;
-  discardChanges: () => void;
-}
-
-export const usePreferencesStore = create<PreferencesState>()(
-  persist(
-    (set, get) => ({
-      preferences: null,
-      loading: false,
-      saving: false,
-      error: null,
-      pendingChanges: {},
-
-      fetchPreferences: async () => {
-        set({ loading: true, error: null });
-        try {
-          const response = await api.get('/preferences');
-          set({ preferences: response.data, loading: false, pendingChanges: {} });
-        } catch (error) {
-          set({ error: error as Error, loading: false });
-        }
-      },
-
-      updatePreferences: (updates) => {
-        set(state => ({
-          preferences: state.preferences ? { ...state.preferences, ...updates } : null,
-          pendingChanges: { ...state.pendingChanges, ...updates }
-        }));
-
-        // Debounced auto-save
-        get().debouncedSave();
-      },
-
-      savePreferences: async () => {
-        const { pendingChanges, preferences } = get();
-        if (Object.keys(pendingChanges).length === 0) return;
-
-        set({ saving: true });
-        try {
-          await api.put('/preferences', pendingChanges);
-          set({ saving: false, pendingChanges: {} });
-        } catch (error) {
-          set({ saving: false, error: error as Error });
-          // Keep pending changes for retry
-        }
-      },
-
-      discardChanges: () => {
-        get().fetchPreferences();
-      }
-    }),
-    {
-      name: 'notification-preferences',
-      partialize: (state) => ({ preferences: state.preferences })
-    }
-  )
-);
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     NotificationStore                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                  │
+│  ├── notifications: Notification[]                                      │
+│  ├── unreadCount: number                                                │
+│  ├── loading: boolean                                                   │
+│  └── error: Error | null                                                │
+│                                                                          │
+│  Actions:                                                                │
+│  ├── fetchNotifications() ──▶ GET /notifications                        │
+│  │                            set { notifications, unreadCount }        │
+│  │                                                                      │
+│  ├── markAsRead(id) ──▶ Optimistic update:                              │
+│  │                      ├── Update notification.readAt locally          │
+│  │                      ├── Decrement unreadCount                       │
+│  │                      ├── POST /notifications/{id}/read              │
+│  │                      └── On error: refetch to revert                 │
+│  │                                                                      │
+│  ├── markAllAsRead() ──▶ Optimistic update:                             │
+│  │                       ├── Set all readAt timestamps                  │
+│  │                       ├── Set unreadCount = 0                        │
+│  │                       └── POST /notifications/read-all              │
+│  │                                                                      │
+│  ├── addNotification(n) ──▶ Prepend to list, increment unreadCount     │
+│  │                                                                      │
+│  └── dismissNotification(id) ──▶ Filter from list                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Preferences Store with Persistence
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     PreferencesStore                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                  │
+│  ├── preferences: UserPreferences | null                                │
+│  ├── loading: boolean                                                   │
+│  ├── saving: boolean                                                    │
+│  ├── error: Error | null                                                │
+│  └── pendingChanges: Partial<UserPreferences>                          │
+│                                                                          │
+│  Actions:                                                                │
+│  ├── fetchPreferences() ──▶ GET /preferences                            │
+│  │                          set { preferences }, clear pendingChanges   │
+│  │                                                                      │
+│  ├── updatePreferences(updates) ──▶                                     │
+│  │     ├── Merge into preferences (immediate UI update)                 │
+│  │     ├── Merge into pendingChanges                                    │
+│  │     └── Trigger debounced auto-save                                  │
+│  │                                                                      │
+│  ├── savePreferences() ──▶                                              │
+│  │     ├── PUT /preferences with pendingChanges                         │
+│  │     └── Clear pendingChanges on success                              │
+│  │                                                                      │
+│  └── discardChanges() ──▶ Refetch to revert                             │
+│                                                                          │
+│  Persistence (Zustand persist middleware):                               │
+│  ├── name: 'notification-preferences'                                   │
+│  └── partialize: only persist { preferences }                           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+> "I use debounced auto-save rather than explicit save buttons. When a user toggles a preference, it updates immediately in the UI (optimistic), queues the change, and auto-saves after 500ms of inactivity. This feels more responsive while still being efficient with API calls."
 
 ### Offline Support Hook
 
-```typescript
-function useOfflineSync() {
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
-  const [pendingActions, setPendingActions] = useState<Action[]>([]);
-
-  useEffect(() => {
-    const handleOnline = () => {
-      setIsOnline(true);
-      syncPendingActions();
-    };
-
-    const handleOffline = () => {
-      setIsOnline(false);
-    };
-
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, []);
-
-  const queueAction = (action: Action) => {
-    if (isOnline) {
-      return executeAction(action);
-    }
-
-    setPendingActions(prev => [...prev, { ...action, queuedAt: Date.now() }]);
-    return Promise.resolve();
-  };
-
-  const syncPendingActions = async () => {
-    const actions = [...pendingActions];
-    setPendingActions([]);
-
-    for (const action of actions) {
-      try {
-        await executeAction(action);
-      } catch (error) {
-        // Re-queue failed actions
-        setPendingActions(prev => [...prev, action]);
-      }
-    }
-  };
-
-  return { isOnline, queueAction, pendingCount: pendingActions.length };
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     useOfflineSync Hook                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                  │
+│  ├── isOnline: navigator.onLine (updates via event listeners)           │
+│  └── pendingActions: Action[] (queued when offline)                     │
+│                                                                          │
+│  Behavior:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  User Action                                                     │    │
+│  │       │                                                          │    │
+│  │       ▼                                                          │    │
+│  │  isOnline?                                                       │    │
+│  │    ├── Yes ──▶ Execute immediately                               │    │
+│  │    └── No  ──▶ Queue action with timestamp                       │    │
+│  │                                                                  │    │
+│  │  On 'online' event:                                              │    │
+│  │    ├── Process all pending actions                               │    │
+│  │    └── Re-queue any that fail                                    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Return:                                                                 │
+│  ├── isOnline: boolean                                                  │
+│  ├── queueAction: (action) => Promise<void>                            │
+│  └── pendingCount: number                                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Deep Dive: Admin Dashboard (5 minutes)
 
-### Delivery Metrics Dashboard
+### Delivery Dashboard Layout
 
-```tsx
-function DeliveryDashboard() {
-  const { metrics, loading } = useDeliveryMetrics();
-  const [timeRange, setTimeRange] = useState<'1h' | '24h' | '7d'>('24h');
-
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Delivery Dashboard</h1>
-        <TimeRangeSelector value={timeRange} onChange={setTimeRange} />
-      </div>
-
-      <div className="grid grid-cols-4 gap-4">
-        <MetricCard
-          title="Total Sent"
-          value={metrics.totalSent}
-          trend={metrics.sentTrend}
-          icon={<PaperAirplaneIcon />}
-        />
-        <MetricCard
-          title="Delivered"
-          value={metrics.delivered}
-          percentage={(metrics.delivered / metrics.totalSent * 100).toFixed(1)}
-          icon={<CheckCircleIcon />}
-          variant="success"
-        />
-        <MetricCard
-          title="Failed"
-          value={metrics.failed}
-          percentage={(metrics.failed / metrics.totalSent * 100).toFixed(1)}
-          icon={<XCircleIcon />}
-          variant="danger"
-        />
-        <MetricCard
-          title="Queue Depth"
-          value={metrics.queueDepth}
-          icon={<QueueListIcon />}
-          variant={metrics.queueDepth > 10000 ? 'warning' : 'default'}
-        />
-      </div>
-
-      <div className="grid grid-cols-2 gap-6">
-        <Card>
-          <CardHeader title="Throughput (per minute)" />
-          <ThroughputChart data={metrics.throughput} timeRange={timeRange} />
-        </Card>
-
-        <Card>
-          <CardHeader title="Success Rate by Channel" />
-          <ChannelSuccessChart data={metrics.channelStats} />
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader title="Circuit Breaker Status" />
-        <CircuitBreakerPanel breakers={metrics.circuitBreakers} />
-      </Card>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Delivery Dashboard                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Delivery Dashboard                        [1h] [24h] [7d]        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Metric Cards (grid-cols-4):                                             │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │
+│  │ Total Sent   │ │ Delivered    │ │ Failed       │ │ Queue Depth  │   │
+│  │ [Plane Icon] │ │ [Check Icon] │ │ [X Icon]     │ │ [Queue Icon] │   │
+│  │              │ │              │ │              │ │              │   │
+│  │   125,432    │ │   123,891    │ │     541      │ │    1,847     │   │
+│  │   +12%       │ │   98.7%      │ │   0.4%       │ │  (warning    │   │
+│  │              │ │  (success)   │ │  (danger)    │ │   if >10K)   │   │
+│  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘   │
+│                                                                          │
+│  Charts (grid-cols-2):                                                   │
+│  ┌────────────────────────────────┐ ┌────────────────────────────────┐  │
+│  │  Throughput (per minute)       │ │  Success Rate by Channel       │  │
+│  │  ┌──────────────────────────┐  │ │  ┌──────────────────────────┐  │  │
+│  │  │        ____/\            │  │ │  │  Push   [========] 99%  │  │  │
+│  │  │   ___/       \___        │  │ │  │  Email  [=======] 97%   │  │  │
+│  │  │  /               \_      │  │ │  │  SMS    [======] 94%    │  │  │
+│  │  └──────────────────────────┘  │ │  │  InApp  [=========] 100%│  │  │
+│  └────────────────────────────────┘ └──────────────────────────────────┘│
+│                                                                          │
+│  Circuit Breaker Status:                                                 │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐              │ │
+│  │  │  Push    │ │  Email   │ │  SMS     │ │  In-App  │              │ │
+│  │  │ [CLOSED] │ │ [CLOSED] │ │ [OPEN]   │ │ [CLOSED] │              │ │
+│  │  │  green   │ │  green   │ │  red     │ │  green   │              │ │
+│  │  │          │ │          │ │Fail: 15  │ │          │              │ │
+│  │  │          │ │          │ │[Reset]   │ │          │              │ │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘              │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Circuit Breaker Status Panel
+### Circuit Breaker Panel
 
-```tsx
-function CircuitBreakerPanel({ breakers }: { breakers: CircuitBreakerStatus[] }) {
-  const stateColors: Record<string, string> = {
-    CLOSED: 'bg-green-100 text-green-800',
-    OPEN: 'bg-red-100 text-red-800',
-    HALF_OPEN: 'bg-yellow-100 text-yellow-800'
-  };
-
-  return (
-    <div className="grid grid-cols-4 gap-4">
-      {breakers.map(breaker => (
-        <div
-          key={breaker.channel}
-          className={`
-            p-4 rounded-lg border
-            ${breaker.state === 'OPEN' ? 'border-red-200 bg-red-50' : 'border-gray-200'}
-          `}
-        >
-          <div className="flex items-center justify-between">
-            <span className="font-medium capitalize">{breaker.channel}</span>
-            <span className={`px-2 py-1 rounded text-xs font-medium ${stateColors[breaker.state]}`}>
-              {breaker.state}
-            </span>
-          </div>
-
-          <div className="mt-2 text-sm text-gray-500">
-            <div>Failures: {breaker.failures}</div>
-            {breaker.lastFailure && (
-              <div>Last failure: {formatRelativeTime(breaker.lastFailure)}</div>
-            )}
-          </div>
-
-          {breaker.state === 'OPEN' && (
-            <button
-              onClick={() => resetCircuitBreaker(breaker.channel)}
-              className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-            >
-              Force Reset
-            </button>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   CircuitBreakerPanel                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State Badge Styles:                                                     │
+│  ├── CLOSED    ──▶ bg-green-100 text-green-800  "Healthy"               │
+│  ├── OPEN      ──▶ bg-red-100 text-red-800      "Circuit Open"          │
+│  └── HALF_OPEN ──▶ bg-yellow-100 text-yellow-800 "Testing"              │
+│                                                                          │
+│  Card Structure (for OPEN state):                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  border-red-200 bg-red-50                                         │  │
+│  │                                                                   │  │
+│  │  SMS                                            [OPEN]            │  │
+│  │                                                  red badge        │  │
+│  │  Failures: 15                                                     │  │
+│  │  Last failure: 2 minutes ago                                      │  │
+│  │                                                                   │  │
+│  │  [Force Reset]  (blue link, calls resetCircuitBreaker(channel))  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+> "The circuit breaker panel is critical for ops visibility. When a channel is unhealthy, admins need to see it immediately and have the ability to force a reset. The red styling and 'Force Reset' button make this actionable at a glance."
 
 ---
 
@@ -1026,9 +533,9 @@ function CircuitBreakerPanel({ breakers }: { breakers: CircuitBreakerStatus[] })
 
 ## Future Enhancements
 
-1. **Push Notification Permission Flow**: Native browser notification permission request
-2. **Notification Grouping**: Group similar notifications to reduce noise
-3. **Snooze Functionality**: Allow users to snooze individual notifications
+1. **Push Notification Permission Flow**: Native browser notification permission request with fallback guidance
+2. **Notification Grouping**: Group similar notifications (e.g., "5 new followers") to reduce noise
+3. **Snooze Functionality**: Allow users to snooze individual notifications for 1h, 1d, 1w
 4. **Rich Media Notifications**: Support images and action buttons in toasts
 5. **Notification Scheduling Preview**: Show when scheduled notifications will arrive
-6. **Analytics Dashboard**: Open/click rate tracking for admin users
+6. **Analytics Dashboard**: Open/click rate tracking for admin users with A/B test support

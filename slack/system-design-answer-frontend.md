@@ -32,155 +32,95 @@ Design the frontend architecture for a team messaging platform that allows users
 - Typing indicators when others are composing
 - Visual distinction between own messages and others
 
+---
+
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          React Application                               │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                        TanStack Router                               ││
-│  │    /workspace/:id          → Workspace Layout                        ││
-│  │    /workspace/:id/channel/:channelId → Channel View                 ││
-│  │    /workspace/:id/dm/:dmId → Direct Message View                    ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  ┌────────────────┐  ┌─────────────────────┐  ┌────────────────────┐   │
-│  │    Sidebar     │  │    Message Area     │  │   Thread Panel     │   │
-│  │  ┌──────────┐  │  │  ┌───────────────┐  │  │  ┌──────────────┐  │   │
-│  │  │ Workspace│  │  │  │ Channel Header│  │  │  │ Parent Msg   │  │   │
-│  │  │ Switcher │  │  │  └───────────────┘  │  │  └──────────────┘  │   │
-│  │  └──────────┘  │  │  ┌───────────────┐  │  │  ┌──────────────┐  │   │
-│  │  ┌──────────┐  │  │  │  MessageList  │  │  │  │  Replies     │  │   │
-│  │  │ Channels │  │  │  │ (virtualized) │  │  │  │  (scrollable)│  │   │
-│  │  └──────────┘  │  │  └───────────────┘  │  │  └──────────────┘  │   │
-│  │  ┌──────────┐  │  │  ┌───────────────┐  │  │  ┌──────────────┐  │   │
-│  │  │   DMs    │  │  │  │  Composer     │  │  │  │  Composer    │  │   │
-│  │  └──────────┘  │  │  └───────────────┘  │  │  └──────────────┘  │   │
-│  └────────────────┘  └─────────────────────┘  └────────────────────┘   │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                     Zustand Store                                    ││
-│  │  workspaces | channels | messages | threads | presence | typing     ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                     WebSocket Connection                             ││
-│  │  Real-time: messages, presence, typing, reactions                   ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           React Application                                  │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                          TanStack Router                                │ │
+│  │    /workspace/:id           ──▶ Workspace Layout                        │ │
+│  │    /workspace/:id/channel/:channelId ──▶ Channel View                   │ │
+│  │    /workspace/:id/dm/:dmId  ──▶ Direct Message View                     │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌─────────────────┐  ┌──────────────────────┐  ┌─────────────────────┐    │
+│  │    Sidebar      │  │     Message Area     │  │    Thread Panel     │    │
+│  │ ┌─────────────┐ │  │ ┌──────────────────┐ │  │ ┌─────────────────┐ │    │
+│  │ │  Workspace  │ │  │ │  Channel Header  │ │  │ │   Parent Msg    │ │    │
+│  │ │  Switcher   │ │  │ └──────────────────┘ │  │ └─────────────────┘ │    │
+│  │ └─────────────┘ │  │ ┌──────────────────┐ │  │ ┌─────────────────┐ │    │
+│  │ ┌─────────────┐ │  │ │   MessageList    │ │  │ │     Replies     │ │    │
+│  │ │  Channels   │ │  │ │  (virtualized)   │ │  │ │   (scrollable)  │ │    │
+│  │ └─────────────┘ │  │ └──────────────────┘ │  │ └─────────────────┘ │    │
+│  │ ┌─────────────┐ │  │ ┌──────────────────┐ │  │ ┌─────────────────┐ │    │
+│  │ │    DMs      │ │  │ │    Composer      │ │  │ │    Composer     │ │    │
+│  │ └─────────────┘ │  │ └──────────────────┘ │  │ └─────────────────┘ │    │
+│  └─────────────────┘  └──────────────────────┘  └─────────────────────┘    │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                         Zustand Store                                   │ │
+│  │   workspaces │ channels │ messages │ threads │ presence │ typing       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                       WebSocket Connection                              │ │
+│  │   Real-time: messages, presence, typing, reactions                     │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Deep Dive: State Management with Zustand
 
 ### Store Design
 
-```typescript
-// stores/slackStore.ts
-import { create } from 'zustand';
+The Zustand store manages all client-side state for the Slack application:
 
-interface SlackState {
-  // Workspace state
-  currentWorkspaceId: string | null;
-  workspaces: Workspace[];
-
-  // Channel state
-  currentChannelId: string | null;
-  channels: Channel[];
-  unreadCounts: Record<string, number>;
-
-  // Message state
-  messages: Record<string, Message[]>;  // channelId -> messages
-  isLoadingMessages: boolean;
-  hasMoreMessages: Record<string, boolean>;
-
-  // Thread state
-  activeThreadId: string | null;
-  threadMessages: Record<string, Message[]>;  // parentId -> replies
-
-  // Presence & typing
-  onlineUsers: Set<string>;
-  typingUsers: Record<string, string[]>;  // channelId -> userIds
-
-  // Actions
-  setCurrentWorkspace: (id: string) => void;
-  setCurrentChannel: (id: string) => void;
-  addMessage: (channelId: string, message: Message) => void;
-  loadMoreMessages: (channelId: string) => Promise<void>;
-  openThread: (messageId: string) => void;
-  closeThread: () => void;
-  setTyping: (channelId: string, userId: string) => void;
-  clearTyping: (channelId: string, userId: string) => void;
-}
-
-export const useSlackStore = create<SlackState>((set, get) => ({
-  currentWorkspaceId: null,
-  workspaces: [],
-  currentChannelId: null,
-  channels: [],
-  unreadCounts: {},
-  messages: {},
-  isLoadingMessages: false,
-  hasMoreMessages: {},
-  activeThreadId: null,
-  threadMessages: {},
-  onlineUsers: new Set(),
-  typingUsers: {},
-
-  setCurrentChannel: (channelId) => {
-    set({ currentChannelId: channelId });
-    // Load messages if not already loaded
-    const { messages, loadMoreMessages } = get();
-    if (!messages[channelId]) {
-      loadMoreMessages(channelId);
-    }
-  },
-
-  addMessage: (channelId, message) => {
-    set((state) => ({
-      messages: {
-        ...state.messages,
-        [channelId]: [...(state.messages[channelId] || []), message],
-      },
-    }));
-  },
-
-  loadMoreMessages: async (channelId) => {
-    const { messages, isLoadingMessages } = get();
-    if (isLoadingMessages) return;
-
-    set({ isLoadingMessages: true });
-
-    const existingMessages = messages[channelId] || [];
-    const oldestMessage = existingMessages[0];
-    const cursor = oldestMessage?.created_at;
-
-    try {
-      const response = await api.getMessages(channelId, { before: cursor });
-      set((state) => ({
-        messages: {
-          ...state.messages,
-          [channelId]: [...response.messages, ...existingMessages],
-        },
-        hasMoreMessages: {
-          ...state.hasMoreMessages,
-          [channelId]: response.hasMore,
-        },
-      }));
-    } finally {
-      set({ isLoadingMessages: false });
-    }
-  },
-
-  openThread: (messageId) => {
-    set({ activeThreadId: messageId });
-  },
-
-  closeThread: () => {
-    set({ activeThreadId: null });
-  },
-}));
 ```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            SlackState Store                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  WORKSPACE STATE                                                              │
+│  ├── currentWorkspaceId: string │ null                                       │
+│  └── workspaces: Workspace[]                                                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  CHANNEL STATE                                                                │
+│  ├── currentChannelId: string │ null                                         │
+│  ├── channels: Channel[]                                                     │
+│  └── unreadCounts: Record<string, number>                                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  MESSAGE STATE                                                                │
+│  ├── messages: Record<channelId, Message[]>                                  │
+│  ├── isLoadingMessages: boolean                                              │
+│  └── hasMoreMessages: Record<channelId, boolean>                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  THREAD STATE                                                                 │
+│  ├── activeThreadId: string │ null                                           │
+│  └── threadMessages: Record<parentId, Message[]>                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  PRESENCE & TYPING                                                            │
+│  ├── onlineUsers: Set<string>                                                │
+│  └── typingUsers: Record<channelId, userId[]>                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  ACTIONS                                                                      │
+│  ├── setCurrentWorkspace(id)    ├── openThread(messageId)                    │
+│  ├── setCurrentChannel(id)      ├── closeThread()                            │
+│  ├── addMessage(channelId, msg) ├── setTyping(channelId, userId)             │
+│  └── loadMoreMessages(channelId)└── clearTyping(channelId, userId)           │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implementation Details:**
+
+- **setCurrentChannel**: Automatically triggers message loading if not cached
+- **addMessage**: Appends to the channel's message array, updates unread counts
+- **loadMoreMessages**: Fetches older messages using cursor-based pagination
+- **openThread/closeThread**: Manages the slide-out thread panel state
 
 ### Why Zustand Over Redux?
 
@@ -192,7 +132,9 @@ export const useSlackStore = create<SlackState>((set, get) => ({
 | DevTools | Supported | Excellent |
 | Selective subscriptions | Built-in | Requires selectors |
 
-**Decision**: Zustand provides the power we need with less ceremony. Real-time apps benefit from its simple subscription model.
+> "Zustand provides the power we need with less ceremony. Real-time apps benefit from its simple subscription model."
+
+---
 
 ## Deep Dive: Virtualized Message List
 
@@ -202,681 +144,404 @@ A busy channel can have 10,000+ messages. Rendering all of them would be extreme
 
 ### Solution: @tanstack/react-virtual
 
-```tsx
-// components/MessageList.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
-
-function MessageList({ channelId }: { channelId: string }) {
-  const parentRef = useRef<HTMLDivElement>(null);
-  const messages = useSlackStore((state) => state.messages[channelId] || []);
-  const hasMore = useSlackStore((state) => state.hasMoreMessages[channelId]);
-  const loadMore = useSlackStore((state) => state.loadMoreMessages);
-
-  const virtualizer = useVirtualizer({
-    count: messages.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 80,  // Estimated message height
-    overscan: 10,
-    measureElement: (el) => el.getBoundingClientRect().height,
-  });
-
-  // Load more when scrolling to top
-  const handleScroll = useCallback(() => {
-    const { scrollTop } = parentRef.current!;
-    if (scrollTop < 100 && hasMore) {
-      loadMore(channelId);
-    }
-  }, [channelId, hasMore, loadMore]);
-
-  // Scroll to bottom on new messages
-  useEffect(() => {
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage?.user_id === currentUserId) {
-      virtualizer.scrollToIndex(messages.length - 1);
-    }
-  }, [messages.length]);
-
-  return (
-    <div
-      ref={parentRef}
-      onScroll={handleScroll}
-      className="flex-1 overflow-auto"
-    >
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          width: '100%',
-          position: 'relative',
-        }}
-      >
-        {virtualizer.getVirtualItems().map((virtualRow) => {
-          const message = messages[virtualRow.index];
-          return (
-            <div
-              key={message.id}
-              ref={virtualizer.measureElement}
-              data-index={virtualRow.index}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                transform: `translateY(${virtualRow.start}px)`,
-              }}
-            >
-              <MessageItem message={message} />
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Virtualized Message List                     │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ▲ Load more trigger (scrollTop < 100px)                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ [Not Rendered - Above Viewport]                          │   │
+│  │ Messages 0-47 (estimateSize: 80px each)                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ [Overscan Buffer - 10 items]                             │   │
+│  │ Messages 48-57                                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                            │                                    │
+│                            ▼                                    │
+│  ╔═════════════════════════════════════════════════════════╗   │
+│  ║ [VISIBLE VIEWPORT]                                      ║   │
+│  ║                                                         ║   │
+│  ║  ┌───────────────────────────────────────────────────┐  ║   │
+│  ║  │ Avatar │ Username    │ 10:30 AM                   │  ║   │
+│  ║  │        │ Message content with dynamic height...   │  ║   │
+│  ║  │        │ [Thread: 5 replies] [Reactions: +3]      │  ║   │
+│  ║  └───────────────────────────────────────────────────┘  ║   │
+│  ║                                                         ║   │
+│  ║  Messages 58-72 (measured with measureElement)          ║   │
+│  ╚═════════════════════════════════════════════════════════╝   │
+│                            │                                    │
+│                            ▼                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ [Overscan Buffer - 10 items]                             │   │
+│  │ Messages 73-82                                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ [Not Rendered - Below Viewport]                          │   │
+│  │ Messages 83-9999                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### Message Item Component
+**Virtualizer Configuration:**
+- count: messages.length
+- estimateSize: 80px (average message height)
+- overscan: 10 (extra items above/below viewport)
+- measureElement: Dynamic height measurement via getBoundingClientRect
 
-```tsx
-// components/MessageItem.tsx
-function MessageItem({ message }: { message: Message }) {
-  const openThread = useSlackStore((state) => state.openThread);
-  const user = useUser(message.user_id);
+**Key Behaviors:**
+- **Load More**: Triggered when scrollTop < 100px, fetches older messages
+- **Scroll to Bottom**: Auto-scrolls when user sends their own message
+- **Dynamic Heights**: Messages measured individually for accurate positioning
 
-  return (
-    <div className="flex gap-3 px-4 py-2 hover:bg-gray-50 group">
-      <img
-        src={user?.avatar_url}
-        alt={user?.display_name}
-        className="w-9 h-9 rounded"
-      />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-baseline gap-2">
-          <span className="font-bold text-sm">{user?.display_name}</span>
-          <span className="text-xs text-gray-500">
-            {formatTime(message.created_at)}
-          </span>
-        </div>
-        <div className="text-sm text-gray-900 whitespace-pre-wrap">
-          {message.content}
-        </div>
+### Message Item Structure
 
-        {/* Thread indicator */}
-        {message.reply_count > 0 && (
-          <button
-            onClick={() => openThread(message.id)}
-            className="flex items-center gap-1 text-xs text-blue-600 mt-1 hover:underline"
-          >
-            <ThreadIcon className="w-4 h-4" />
-            {message.reply_count} {message.reply_count === 1 ? 'reply' : 'replies'}
-          </button>
-        )}
-
-        {/* Reactions */}
-        {message.reactions?.length > 0 && (
-          <ReactionList reactions={message.reactions} messageId={message.id} />
-        )}
-      </div>
-
-      {/* Action buttons (show on hover) */}
-      <div className="opacity-0 group-hover:opacity-100 flex gap-1">
-        <button className="p-1 hover:bg-gray-200 rounded">
-          <EmojiIcon className="w-4 h-4" />
-        </button>
-        <button className="p-1 hover:bg-gray-200 rounded">
-          <ThreadIcon className="w-4 h-4" />
-        </button>
-      </div>
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│ Message Item (hover to show actions)                             │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌───────┐                                                       │
+│  │       │  Username              10:30 AM                       │
+│  │ Avatar│  ──────────────────────────────                       │
+│  │  36px │  Message content goes here with                       │
+│  │       │  whitespace preserved (pre-wrap)                      │
+│  └───────┘                                                       │
+│                                                                  │
+│  ┌──────────────────────────────────────────┐                    │
+│  │ Thread Icon │ 5 replies (clickable)      │                    │
+│  └──────────────────────────────────────────┘                    │
+│                                                                  │
+│  ┌──────────────────────────────────────────┐    ┌─────────────┐│
+│  │ Reactions: [+2] [thumbsup] [heart]       │    │ Hover Menu  ││
+│  └──────────────────────────────────────────┘    │ [emoji][rply││
+│                                                   └─────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: WebSocket Integration
 
 ### Connection Manager
 
-```tsx
-// hooks/useWebSocket.ts
-function useWebSocket() {
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<number>();
-
-  useEffect(() => {
-    function connect() {
-      const ws = new WebSocket(`wss://api.slack.local/ws`);
-
-      ws.onopen = () => {
-        console.log('WebSocket connected');
-        // Send auth token
-        ws.send(JSON.stringify({
-          type: 'auth',
-          token: getAuthToken(),
-        }));
-      };
-
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        handleMessage(data);
-      };
-
-      ws.onclose = () => {
-        console.log('WebSocket disconnected, reconnecting...');
-        reconnectTimeoutRef.current = setTimeout(connect, 3000);
-      };
-
-      wsRef.current = ws;
-    }
-
-    connect();
-
-    return () => {
-      clearTimeout(reconnectTimeoutRef.current);
-      wsRef.current?.close();
-    };
-  }, []);
-
-  return wsRef;
-}
-
-function handleMessage(data: WebSocketMessage) {
-  switch (data.type) {
-    case 'message':
-      useSlackStore.getState().addMessage(data.channel_id, data.message);
-      break;
-
-    case 'presence':
-      useSlackStore.setState((state) => {
-        const onlineUsers = new Set(state.onlineUsers);
-        if (data.status === 'online') {
-          onlineUsers.add(data.user_id);
-        } else {
-          onlineUsers.delete(data.user_id);
-        }
-        return { onlineUsers };
-      });
-      break;
-
-    case 'typing':
-      useSlackStore.getState().setTyping(data.channel_id, data.user_id);
-      break;
-
-    case 'reaction_added':
-      // Update message reactions
-      break;
-  }
-}
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    WebSocket Connection Flow                        │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────┐     ┌──────────────────┐     ┌──────────────────┐    │
+│  │  Client  │────▶│    Connect       │────▶│   Authenticate   │    │
+│  │  Init    │     │  wss://api/ws    │     │   Send token     │    │
+│  └──────────┘     └──────────────────┘     └──────────────────┘    │
+│                                                     │               │
+│                                                     ▼               │
+│                                            ┌──────────────────┐    │
+│                                            │   Listen for     │    │
+│                                            │   Messages       │    │
+│                                            └──────────────────┘    │
+│                                                     │               │
+│       ┌─────────────────────────────────────────────┼───────────┐  │
+│       │                                             │           │  │
+│       ▼                                             ▼           ▼  │
+│  ┌──────────┐                              ┌──────────┐ ┌────────┐ │
+│  │ onclose  │                              │ message  │ │presence│ │
+│  │ ──────── │                              │ ──────── │ │reaction│ │
+│  │ Reconnect│                              │ addMsg() │ │ typing │ │
+│  │ (3s wait)│                              │ to store │ │ update │ │
+│  └──────────┘                              └──────────┘ └────────┘ │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-### Typing Indicator
+**Message Type Handling:**
 
-```tsx
-// components/TypingIndicator.tsx
-function TypingIndicator({ channelId }: { channelId: string }) {
-  const typingUsers = useSlackStore(
-    (state) => state.typingUsers[channelId] || []
-  );
+| Message Type | Handler Action |
+|--------------|----------------|
+| message | addMessage to Zustand store |
+| presence | Add/remove from onlineUsers Set |
+| typing | setTyping with channel and user |
+| reaction_added | Update message reactions |
 
-  if (typingUsers.length === 0) return null;
+**Reconnection Strategy:**
+- onclose triggers setTimeout(connect, 3000)
+- Reconnect timeout cleared on unmount
+- Auth token resent on each connection
 
-  const text = typingUsers.length === 1
-    ? `${typingUsers[0]} is typing...`
-    : typingUsers.length === 2
-    ? `${typingUsers[0]} and ${typingUsers[1]} are typing...`
-    : `${typingUsers.length} people are typing...`;
+### Typing Indicator Component
 
-  return (
-    <div className="px-4 py-1 text-xs text-gray-500 flex items-center gap-2">
-      <TypingDots />
-      {text}
-    </div>
-  );
-}
-
-function TypingDots() {
-  return (
-    <div className="flex gap-0.5">
-      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Typing Indicator                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────┐  ┌──────┐  ┌──────┐                                   │
+│  │  ●   │  │  ●   │  │  ●   │   "{user} is typing..."           │
+│  │ 0ms  │  │150ms │  │300ms │                                   │
+│  │bounce│  │delay │  │delay │   or "{user1} and {user2}..."     │
+│  └──────┘  └──────┘  └──────┘   or "3 people are typing..."     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Message Composer
 
-### Rich Text Composer
+### Rich Text Composer Flow
 
-```tsx
-// components/MessageComposer.tsx
-function MessageComposer({ channelId }: { channelId: string }) {
-  const [content, setContent] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const ws = useWebSocket();
-
-  // Send typing indicator (debounced)
-  const sendTyping = useMemo(
-    () =>
-      debounce(() => {
-        ws.current?.send(
-          JSON.stringify({ type: 'typing', channel_id: channelId })
-        );
-      }, 1000),
-    [channelId]
-  );
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!content.trim() || isSubmitting) return;
-
-    setIsSubmitting(true);
-
-    // Optimistic update
-    const tempId = `temp-${Date.now()}`;
-    const optimisticMessage: Message = {
-      id: tempId,
-      channel_id: channelId,
-      user_id: currentUserId,
-      content: content.trim(),
-      created_at: new Date().toISOString(),
-      pending: true,
-    };
-
-    useSlackStore.getState().addMessage(channelId, optimisticMessage);
-    setContent('');
-
-    try {
-      const realMessage = await api.sendMessage(channelId, content.trim());
-      // Replace optimistic message with real one
-      useSlackStore.setState((state) => ({
-        messages: {
-          ...state.messages,
-          [channelId]: state.messages[channelId].map((m) =>
-            m.id === tempId ? realMessage : m
-          ),
-        },
-      }));
-    } catch (error) {
-      // Mark message as failed
-      useSlackStore.setState((state) => ({
-        messages: {
-          ...state.messages,
-          [channelId]: state.messages[channelId].map((m) =>
-            m.id === tempId ? { ...m, failed: true, pending: false } : m
-          ),
-        },
-      }));
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  // Auto-resize textarea
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-      textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
-    }
-  }, [content]);
-
-  return (
-    <form onSubmit={handleSubmit} className="border-t p-4">
-      <div className="flex items-end gap-2 bg-gray-100 rounded-lg p-2">
-        <button type="button" className="p-2 hover:bg-gray-200 rounded">
-          <PlusIcon className="w-5 h-5" />
-        </button>
-
-        <textarea
-          ref={textareaRef}
-          value={content}
-          onChange={(e) => {
-            setContent(e.target.value);
-            sendTyping();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              handleSubmit(e);
-            }
-          }}
-          placeholder={`Message #${channelName}`}
-          rows={1}
-          className="flex-1 bg-transparent resize-none outline-none text-sm"
-        />
-
-        <button type="button" className="p-2 hover:bg-gray-200 rounded">
-          <EmojiIcon className="w-5 h-5" />
-        </button>
-
-        <button
-          type="submit"
-          disabled={!content.trim() || isSubmitting}
-          className="p-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50"
-        >
-          <SendIcon className="w-5 h-5" />
-        </button>
-      </div>
-    </form>
-  );
-}
 ```
+┌────────────────────────────────────────────────────────────────────┐
+│                      Message Composer                               │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ [+]  │  Message input (auto-resize textarea)  │ [emoji][send]│   │
+│  │      │  ────────────────────────────────────  │              │   │
+│  │ Add  │  Placeholder: "Message #channel-name"  │   Submit     │   │
+│  │ File │  Max height: 200px                     │   Button     │   │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Optimistic Update Flow
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                   Optimistic Message Send                           │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  User Types ──▶ Content State ──▶ Debounced Typing (1s)            │
+│       │                                   │                         │
+│       │                                   ▼                         │
+│       │                         Send "typing" via WS                │
+│       │                                                             │
+│       ▼                                                             │
+│  Submit (Enter)                                                     │
+│       │                                                             │
+│       ├────────────────────────────────────────────────────────┐   │
+│       │                                                        │   │
+│       ▼                                                        ▼   │
+│  ┌──────────────────┐                              ┌───────────────┐
+│  │ Create Optimistic│                              │  API Request  │
+│  │ Message          │                              │  sendMessage  │
+│  │ ─────────────────│                              │  ─────────────│
+│  │ id: temp-{ts}    │                              │  POST /msg    │
+│  │ pending: true    │                              │               │
+│  │ Add to store     │                              │               │
+│  │ Clear input      │                              │               │
+│  └──────────────────┘                              └───────────────┘
+│                                                            │
+│                              ┌──────────────────────────────┤
+│                              │                              │
+│                              ▼                              ▼
+│                    ┌──────────────────┐          ┌──────────────────┐
+│                    │    Success       │          │    Failure       │
+│                    │    ────────      │          │    ────────      │
+│                    │ Replace temp msg │          │ Mark as failed   │
+│                    │ with real msg    │          │ pending: false   │
+│                    │                  │          │ failed: true     │
+│                    └──────────────────┘          └──────────────────┘
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Keyboard Handling:**
+- Enter (no shift): Submit message
+- Shift+Enter: New line in textarea
+- Auto-resize: Textarea grows up to 200px max
+
+---
 
 ## Deep Dive: Thread Panel
 
 ### Slide-Out Thread View
 
-```tsx
-// components/ThreadPanel.tsx
-function ThreadPanel() {
-  const activeThreadId = useSlackStore((state) => state.activeThreadId);
-  const closeThread = useSlackStore((state) => state.closeThread);
-  const parentMessage = useMessage(activeThreadId);
-  const replies = useSlackStore(
-    (state) => state.threadMessages[activeThreadId!] || []
-  );
-
-  if (!activeThreadId) return null;
-
-  return (
-    <div className="w-96 border-l flex flex-col bg-white">
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b">
-        <h3 className="font-bold">Thread</h3>
-        <button
-          onClick={closeThread}
-          className="p-1 hover:bg-gray-100 rounded"
-        >
-          <CloseIcon className="w-5 h-5" />
-        </button>
-      </div>
-
-      {/* Parent message */}
-      <div className="border-b">
-        <MessageItem message={parentMessage!} isThreadParent />
-      </div>
-
-      {/* Reply count */}
-      <div className="px-4 py-2 text-xs text-gray-500 border-b">
-        {replies.length} {replies.length === 1 ? 'reply' : 'replies'}
-      </div>
-
-      {/* Replies */}
-      <div className="flex-1 overflow-auto">
-        {replies.map((reply) => (
-          <MessageItem key={reply.id} message={reply} />
-        ))}
-      </div>
-
-      {/* Composer */}
-      <ThreadComposer parentId={activeThreadId} />
-    </div>
-  );
-}
 ```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Main View                                          │ Thread Panel (w-96)     │
+├────────────────────────────────────────────────────┼─────────────────────────┤
+│                                                    │ ┌─────────────────────┐ │
+│                                                    │ │ Thread    [X Close] │ │
+│                                                    │ └─────────────────────┘ │
+│ ┌────────────────────────────────────────────────┐ │ ┌─────────────────────┐ │
+│ │                                                │ │ │ Parent Message      │ │
+│ │  Channel Messages                              │ │ │ ─────────────────   │ │
+│ │  (virtualized list)                            │ │ │ Avatar │ Original   │ │
+│ │                                                │ │ │        │ content    │ │
+│ │  ┌────────────────────────────────────────┐   │ │ └─────────────────────┘ │
+│ │  │ Message with [5 replies] ──────────────┼───┼─┼──▶ Opens thread panel  │
+│ │  └────────────────────────────────────────┘   │ │ ┌─────────────────────┐ │
+│ │                                                │ │ │ 5 replies           │ │
+│ │                                                │ │ └─────────────────────┘ │
+│ │                                                │ │ ┌─────────────────────┐ │
+│ │                                                │ │ │ Reply 1             │ │
+│ │                                                │ │ │ Reply 2             │ │
+│ │                                                │ │ │ Reply 3             │ │
+│ │                                                │ │ │ (scrollable)        │ │
+│ │                                                │ │ └─────────────────────┘ │
+│ └────────────────────────────────────────────────┘ │ ┌─────────────────────┐ │
+│                                                    │ │ Thread Composer     │ │
+│ ┌────────────────────────────────────────────────┐ │ │ [Reply to thread]   │ │
+│ │ Message Composer                               │ │ └─────────────────────┘ │
+│ └────────────────────────────────────────────────┘ │                         │
+└────────────────────────────────────────────────────┴─────────────────────────┘
+```
+
+**Thread Panel Behavior:**
+- Opens when clicking thread indicator on a message
+- Displays parent message at top (isThreadParent variant)
+- Shows reply count with proper pluralization
+- Scrollable reply list (flex-1 overflow-auto)
+- Separate composer for thread replies
+- Close button returns activeThreadId to null
+
+---
 
 ## Deep Dive: Channel Sidebar
 
 ### Channel List with Unread Indicators
 
-```tsx
-// components/ChannelSidebar.tsx
-function ChannelSidebar() {
-  const channels = useSlackStore((state) => state.channels);
-  const currentChannelId = useSlackStore((state) => state.currentChannelId);
-  const unreadCounts = useSlackStore((state) => state.unreadCounts);
-  const setCurrentChannel = useSlackStore((state) => state.setCurrentChannel);
-
-  const publicChannels = channels.filter((c) => !c.is_private && !c.is_dm);
-  const privateChannels = channels.filter((c) => c.is_private && !c.is_dm);
-  const directMessages = channels.filter((c) => c.is_dm);
-
-  return (
-    <aside className="w-64 bg-purple-900 text-white flex flex-col">
-      {/* Workspace header */}
-      <WorkspaceHeader />
-
-      {/* Search */}
-      <div className="px-3 py-2">
-        <button className="w-full px-3 py-1 bg-white/10 rounded text-sm text-left text-white/70">
-          Search...
-        </button>
-      </div>
-
-      {/* Channel sections */}
-      <div className="flex-1 overflow-auto">
-        <ChannelSection
-          title="Channels"
-          channels={publicChannels}
-          currentId={currentChannelId}
-          unreadCounts={unreadCounts}
-          onSelect={setCurrentChannel}
-        />
-
-        <ChannelSection
-          title="Private"
-          channels={privateChannels}
-          currentId={currentChannelId}
-          unreadCounts={unreadCounts}
-          onSelect={setCurrentChannel}
-        />
-
-        <ChannelSection
-          title="Direct Messages"
-          channels={directMessages}
-          currentId={currentChannelId}
-          unreadCounts={unreadCounts}
-          onSelect={setCurrentChannel}
-          showPresence
-        />
-      </div>
-    </aside>
-  );
-}
-
-function ChannelSection({
-  title,
-  channels,
-  currentId,
-  unreadCounts,
-  onSelect,
-  showPresence,
-}: ChannelSectionProps) {
-  const [isExpanded, setIsExpanded] = useState(true);
-
-  return (
-    <div className="mb-4">
-      <button
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="flex items-center gap-1 px-3 py-1 text-sm font-medium text-white/70 hover:text-white w-full"
-      >
-        <ChevronIcon
-          className={cn('w-3 h-3 transition-transform', !isExpanded && '-rotate-90')}
-        />
-        {title}
-      </button>
-
-      {isExpanded && (
-        <ul>
-          {channels.map((channel) => (
-            <ChannelItem
-              key={channel.id}
-              channel={channel}
-              isActive={channel.id === currentId}
-              unreadCount={unreadCounts[channel.id] || 0}
-              onClick={() => onSelect(channel.id)}
-              showPresence={showPresence}
-            />
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-function ChannelItem({
-  channel,
-  isActive,
-  unreadCount,
-  onClick,
-  showPresence,
-}: ChannelItemProps) {
-  const onlineUsers = useSlackStore((state) => state.onlineUsers);
-  const isOnline = showPresence && onlineUsers.has(channel.other_user_id);
-
-  return (
-    <li>
-      <button
-        onClick={onClick}
-        className={cn(
-          'w-full px-3 py-1 text-sm text-left flex items-center gap-2',
-          isActive ? 'bg-blue-600' : 'hover:bg-white/10',
-          unreadCount > 0 && 'font-bold'
-        )}
-      >
-        {showPresence ? (
-          <PresenceIndicator online={isOnline} />
-        ) : channel.is_private ? (
-          <LockIcon className="w-4 h-4" />
-        ) : (
-          <HashIcon className="w-4 h-4" />
-        )}
-
-        <span className="truncate flex-1">
-          {channel.name}
-        </span>
-
-        {unreadCount > 0 && (
-          <span className="bg-red-500 text-white text-xs px-1.5 rounded-full">
-            {unreadCount}
-          </span>
-        )}
-      </button>
-    </li>
-  );
-}
 ```
+┌───────────────────────────────────┐
+│ ┌───────────────────────────────┐ │
+│ │ Workspace Header              │ │
+│ │ [Team Name] [dropdown]        │ │
+│ └───────────────────────────────┘ │
+│ ┌───────────────────────────────┐ │
+│ │ [Search...]                   │ │
+│ └───────────────────────────────┘ │
+│                                   │
+│ ▼ Channels                        │
+│   # general                       │
+│   # engineering        [3]  ◀── Unread badge
+│   # random                        │
+│                                   │
+│ ▼ Private                         │
+│   🔒 leadership                   │
+│   🔒 hiring           [12]        │
+│                                   │
+│ ▼ Direct Messages                 │
+│   ● Alice             [5]   ◀── Online indicator
+│   ○ Bob                     ◀── Offline indicator
+│   ● Carol, Dave                   │
+│                                   │
+└───────────────────────────────────┘
+```
+
+**Channel Section Component:**
+
+| Element | Behavior |
+|---------|----------|
+| Chevron | Toggles section expansion |
+| # icon | Public channel |
+| Lock icon | Private channel |
+| Presence dot | Online (green) / Offline (hollow) |
+| Unread badge | Red pill with count |
+| Active state | Blue background when selected |
+| Bold text | Indicates unread messages |
+
+---
 
 ## Performance Optimizations
 
 ### 1. Selective Store Subscriptions
 
-```tsx
-// Only re-render when specific state changes
-function ChannelHeader() {
-  // Only subscribes to current channel, not all messages
-  const currentChannelId = useSlackStore((state) => state.currentChannelId);
-  const channel = useSlackStore(
-    (state) => state.channels.find((c) => c.id === state.currentChannelId)
-  );
+> "Only subscribe to the exact state slice needed. A ChannelHeader only needs currentChannelId and the matching channel object, not the entire messages map."
 
-  return (
-    <header className="border-b p-4">
-      <h2 className="font-bold">#{channel?.name}</h2>
-    </header>
-  );
-}
+```
+┌────────────────────────────────────────────────────────────────┐
+│                  Selective Subscription                         │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Component: ChannelHeader                                       │
+│                                                                 │
+│  ┌─────────────────────┐     ┌─────────────────────────────┐   │
+│  │ Zustand Store       │     │ Subscribed State            │   │
+│  │ ─────────────────── │     │ ──────────────────────────  │   │
+│  │ currentWorkspaceId  │     │ currentChannelId ✓          │   │
+│  │ workspaces          │     │ channel (filtered) ✓        │   │
+│  │ currentChannelId ───┼────▶│                             │   │
+│  │ channels ───────────┼────▶│ Re-render: only when        │   │
+│  │ unreadCounts        │     │ channel changes             │   │
+│  │ messages ✗          │     │                             │   │
+│  │ threadMessages ✗    │     │                             │   │
+│  │ onlineUsers ✗       │     │                             │   │
+│  └─────────────────────┘     └─────────────────────────────┘   │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2. Memoized Message Rendering
 
-```tsx
-// Memoize individual messages to prevent unnecessary re-renders
-const MessageItem = memo(function MessageItem({ message }: { message: Message }) {
-  // Component implementation
-}, (prev, next) => prev.message.id === next.message.id);
-```
+Messages are wrapped in React.memo with custom comparison:
+- Only re-renders if message.id changes
+- Prevents cascade re-renders when new messages arrive
 
 ### 3. Debounced Typing Indicator
 
-```tsx
-// Only send typing events every 1 second
-const sendTyping = useMemo(
-  () => debounce(() => {
-    ws.send(JSON.stringify({ type: 'typing', channel_id: channelId }));
-  }, 1000),
-  [channelId]
-);
-```
+- Typing events throttled to 1 event per second
+- Reduces WebSocket traffic significantly
+- Uses useMemo with debounce wrapper
 
-### 4. Optimistic Updates
+### 4. Optimistic Updates Summary
 
-```tsx
-// Show message immediately, sync with server in background
-function sendMessage(content: string) {
-  const tempMessage = { id: `temp-${Date.now()}`, content, pending: true };
-  addMessage(channelId, tempMessage);
+| Action | Optimistic | Server Sync |
+|--------|------------|-------------|
+| Send message | Show immediately with pending state | Replace temp ID with real ID |
+| React to message | Update reactions array | Confirm or rollback |
+| Mark as read | Clear unread count | Background sync |
 
-  api.sendMessage(channelId, content)
-    .then((realMessage) => replaceMessage(tempMessage.id, realMessage))
-    .catch(() => markMessageFailed(tempMessage.id));
-}
-```
+---
 
 ## Accessibility (a11y)
 
 ### Keyboard Navigation
 
-```tsx
-// hooks/useKeyboardNavigation.ts
-function useKeyboardNavigation() {
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      // Skip if typing in input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        return;
-      }
+| Shortcut | Action |
+|----------|--------|
+| Alt + Arrow Up | Previous channel |
+| Alt + Arrow Down | Next channel |
+| Escape | Close thread panel |
+| Cmd/Ctrl + K | Open search |
+| Enter | Send message |
+| Shift + Enter | New line |
 
-      switch (e.key) {
-        case 'ArrowUp':
-          if (e.altKey) {
-            // Previous channel
-            navigateToPreviousChannel();
-          }
-          break;
-        case 'ArrowDown':
-          if (e.altKey) {
-            // Next channel
-            navigateToNextChannel();
-          }
-          break;
-        case 'Escape':
-          // Close thread panel
-          closeThread();
-          break;
-        case 'k':
-          if (e.metaKey || e.ctrlKey) {
-            // Open search
-            e.preventDefault();
-            openSearch();
-          }
-          break;
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
-}
-```
+**Implementation Notes:**
+- Skip keyboard handlers if target is input/textarea
+- Focus management for thread panel open/close
+- Trap focus within modals
 
 ### ARIA Labels
 
-```tsx
-<aside role="navigation" aria-label="Channel list">
-  <ul role="list" aria-label="Channels">
-    <li role="listitem">
-      <button
-        aria-current={isActive ? 'page' : undefined}
-        aria-label={`${channel.name}, ${unreadCount} unread messages`}
-      >
-        #{channel.name}
-      </button>
-    </li>
-  </ul>
-</aside>
 ```
+┌────────────────────────────────────────────────────────────────┐
+│                    ARIA Structure                               │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  <aside role="navigation" aria-label="Channel list">           │
+│    <ul role="list" aria-label="Channels">                      │
+│      <li role="listitem">                                      │
+│        <button                                                 │
+│          aria-current="page" (if active)                       │
+│          aria-label="#general, 5 unread messages">             │
+│          #general                                              │
+│        </button>                                                │
+│      </li>                                                     │
+│    </ul>                                                       │
+│  </aside>                                                      │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Trade-offs Summary
 
@@ -887,6 +552,8 @@ function useKeyboardNavigation() {
 | Optimistic updates | Instant feedback | Rollback complexity |
 | WebSocket in React | Real-time updates | Reconnection handling |
 | Debounced typing | Reduces network traffic | Slight delay in indicator |
+
+---
 
 ## Future Frontend Enhancements
 

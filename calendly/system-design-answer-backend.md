@@ -64,105 +64,72 @@
 
 ### Core Tables
 
-```sql
--- Users with time zone preference
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  name VARCHAR(255) NOT NULL,
-  time_zone VARCHAR(50) NOT NULL DEFAULT 'UTC',
-  role VARCHAR(20) NOT NULL DEFAULT 'user',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        users                                │
+├─────────────────────────────────────────────────────────────┤
+│ id (UUID PK)                                                │
+│ email (VARCHAR UNIQUE NOT NULL)                             │
+│ password_hash, name, time_zone (default 'UTC')              │
+│ role (default 'user'), created_at, updated_at               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+           ┌──────────────────┼──────────────────┐
+           ▼                  ▼                  ▼
+┌─────────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│   meeting_types     │ │availability_    │ │    bookings     │
+├─────────────────────┤ │    rules        │ ├─────────────────┤
+│ id (UUID PK)        │ ├─────────────────┤ │ id (UUID PK)    │
+│ user_id (FK)        │ │ id (UUID PK)    │ │ meeting_type_id │
+│ name, slug (UNIQUE  │ │ user_id (FK)    │ │ host_user_id FK │
+│   with user_id)     │ │ day_of_week 0-6 │ │ invitee_name    │
+│ duration_minutes    │ │ start_time TIME │ │ invitee_email   │
+│ buffer_before/after │ │ end_time TIME   │ │ start_time TZ   │
+│ max_bookings_per_day│ │ is_active       │ │ end_time TZ     │
+│ color, is_active    │ └─────────────────┘ │ status, version │
+└─────────────────────┘                     │ idempotency_key │
+                                            └─────────────────┘
+```
 
--- Meeting type templates
-CREATE TABLE meeting_types (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name VARCHAR(255) NOT NULL,
-  slug VARCHAR(255) NOT NULL,
-  description TEXT,
-  duration_minutes INTEGER NOT NULL DEFAULT 30,
-  buffer_before_minutes INTEGER NOT NULL DEFAULT 0,
-  buffer_after_minutes INTEGER NOT NULL DEFAULT 0,
-  max_bookings_per_day INTEGER,
-  color VARCHAR(7) DEFAULT '#3B82F6',
-  is_active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(user_id, slug)
-);
+### Critical Indexes for Double-Booking Prevention
 
--- Weekly availability rules
-CREATE TABLE availability_rules (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
-  start_time TIME NOT NULL,
-  end_time TIME NOT NULL CHECK (end_time > start_time),
-  is_active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Bookings with multi-layer conflict prevention
-CREATE TABLE bookings (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  meeting_type_id UUID NOT NULL REFERENCES meeting_types(id) ON DELETE CASCADE,
-  host_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  invitee_name VARCHAR(255) NOT NULL,
-  invitee_email VARCHAR(255) NOT NULL,
-  start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-  end_time TIMESTAMP WITH TIME ZONE NOT NULL CHECK (end_time > start_time),
-  invitee_timezone VARCHAR(50) NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT 'confirmed',
-  cancellation_reason TEXT,
-  notes TEXT,
-  version INTEGER DEFAULT 1,
-  idempotency_key VARCHAR(255),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Critical indexes for double-booking prevention
-CREATE UNIQUE INDEX idx_bookings_no_double
-  ON bookings(host_user_id, start_time)
-  WHERE status = 'confirmed';
-
-CREATE UNIQUE INDEX idx_bookings_idempotency_key
-  ON bookings(idempotency_key)
-  WHERE idempotency_key IS NOT NULL;
-
-CREATE INDEX idx_bookings_host_time
-  ON bookings(host_user_id, start_time, end_time);
-
-CREATE INDEX idx_availability_user_day
-  ON availability_rules(user_id, day_of_week, is_active);
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     Index Strategy                              │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  idx_bookings_no_double (UNIQUE PARTIAL)                       │
+│  ──────────────────────────────────────                        │
+│  ON bookings(host_user_id, start_time)                         │
+│  WHERE status = 'confirmed'                                    │
+│                                                                │
+│  idx_bookings_idempotency_key (UNIQUE PARTIAL)                 │
+│  ─────────────────────────────────────────────                 │
+│  ON bookings(idempotency_key)                                  │
+│  WHERE idempotency_key IS NOT NULL                             │
+│                                                                │
+│  idx_bookings_host_time                                        │
+│  ──────────────────────                                        │
+│  ON bookings(host_user_id, start_time, end_time)               │
+│                                                                │
+│  idx_availability_user_day                                     │
+│  ─────────────────────────                                     │
+│  ON availability_rules(user_id, day_of_week, is_active)        │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Archive Table for Data Lifecycle
 
-```sql
--- Separate archive table for old bookings (no foreign keys)
-CREATE TABLE bookings_archive (
-  id UUID PRIMARY KEY,
-  meeting_type_id UUID NOT NULL,
-  host_user_id UUID NOT NULL,
-  invitee_name VARCHAR(255) NOT NULL,
-  invitee_email VARCHAR(255) NOT NULL,
-  start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-  end_time TIMESTAMP WITH TIME ZONE NOT NULL,
-  invitee_timezone VARCHAR(50) NOT NULL,
-  status VARCHAR(20) NOT NULL,
-  cancellation_reason TEXT,
-  notes TEXT,
-  version INTEGER DEFAULT 1,
-  idempotency_key VARCHAR(255),
-  created_at TIMESTAMP WITH TIME ZONE,
-  updated_at TIMESTAMP WITH TIME ZONE,
-  archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   bookings_archive                           │
+├──────────────────────────────────────────────────────────────┤
+│ Same columns as bookings (no foreign keys)                   │
+│ archived_at TIMESTAMP                                        │
+│                                                              │
+│ Purpose: Move completed bookings to reduce active table size │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -173,107 +140,71 @@ CREATE TABLE bookings_archive (
 
 "The booking race condition is the hardest problem. Two invitees clicking 'Book' at the same moment must never both succeed for the same slot."
 
-```typescript
-// backend/src/services/bookingService.ts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    FIVE-LAYER BOOKING PROTECTION                        │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface BookingRequest {
-  meetingTypeId: string;
-  hostUserId: string;
-  startTime: Date;
-  endTime: Date;
-  inviteeName: string;
-  inviteeEmail: string;
-  inviteeTimezone: string;
-  idempotencyKey?: string;
-}
+  Invitee A ──▶ ┌─────────────────────────────────────────────────────────┐
+                │ Layer 1: Idempotency Check                              │
+  Invitee B ──▶ │ ────────────────────────                                │
+                │ Check cache for idempotency_key                         │
+                │ If exists ──▶ Return cached booking result              │
+                └────────────────────────┬────────────────────────────────┘
+                                         ▼
+                ┌─────────────────────────────────────────────────────────┐
+                │ Layer 2: Distributed Lock (Valkey/Redis)                │
+                │ ─────────────────────────────────────                   │
+                │ Key: booking_lock:{host_user_id}                        │
+                │ TTL: 5 seconds                                          │
+                │ If lock fails ──▶ Return "Booking in progress, retry"   │
+                └────────────────────────┬────────────────────────────────┘
+                                         ▼
+                ┌─────────────────────────────────────────────────────────┐
+                │ Layer 3: Row-Level Lock (PostgreSQL Transaction)        │
+                │ ───────────────────────────────────────────             │
+                │ SELECT id FROM users WHERE id = host_id FOR UPDATE      │
+                │ Serializes all bookings for same host                   │
+                └────────────────────────┬────────────────────────────────┘
+                                         ▼
+                ┌─────────────────────────────────────────────────────────┐
+                │ Layer 4: Overlap Query Check                            │
+                │ ─────────────────────────                               │
+                │ SELECT id FROM bookings                                 │
+                │ WHERE host_user_id = ? AND status = 'confirmed'         │
+                │   AND start_time < new_end AND end_time > new_start     │
+                │ If rows found ──▶ Throw ConflictError                   │
+                └────────────────────────┬────────────────────────────────┘
+                                         ▼
+                ┌─────────────────────────────────────────────────────────┐
+                │ Layer 5: Unique Partial Index (Database Constraint)     │
+                │ ──────────────────────────────────────────────          │
+                │ INSERT INTO bookings (...) VALUES (...)                 │
+                │ If duplicate key error ──▶ Throw ConflictError          │
+                │ SUCCESS ──▶ Cache idempotency result, invalidate cache  │
+                └─────────────────────────────────────────────────────────┘
+```
 
-export class BookingService {
-  private pool: Pool;
-  private cache: CacheService;
-  private idempotencyService: IdempotencyService;
+### Post-Booking Actions
 
-  async createBooking(request: BookingRequest): Promise<Booking> {
-    // Layer 1: Idempotency check (prevents duplicate submissions)
-    const idempotencyKey = request.idempotencyKey ||
-      this.generateIdempotencyKey(request);
-
-    const cachedResult = await this.idempotencyService.getResult(idempotencyKey);
-    if (cachedResult) {
-      return cachedResult;
-    }
-
-    // Layer 2: Acquire distributed lock for this host's calendar
-    const lockKey = `booking_lock:${request.hostUserId}`;
-    const lock = await this.cache.acquireLock(lockKey, 5000);
-
-    if (!lock) {
-      throw new ConflictError('Booking in progress, please retry');
-    }
-
-    try {
-      return await this.pool.transaction(async (tx) => {
-        // Layer 3: Row-level lock on host (serializes concurrent bookings)
-        await tx.query(
-          'SELECT id FROM users WHERE id = $1 FOR UPDATE',
-          [request.hostUserId]
-        );
-
-        // Layer 4: Check for overlapping confirmed bookings
-        const conflicts = await tx.query(`
-          SELECT id FROM bookings
-          WHERE host_user_id = $1
-            AND status = 'confirmed'
-            AND start_time < $2
-            AND end_time > $3
-        `, [request.hostUserId, request.endTime, request.startTime]);
-
-        if (conflicts.rows.length > 0) {
-          throw new ConflictError('Slot is no longer available');
-        }
-
-        // Layer 5: Insert with unique partial index as final guard
-        const result = await tx.query(`
-          INSERT INTO bookings (
-            meeting_type_id, host_user_id, invitee_name, invitee_email,
-            start_time, end_time, invitee_timezone, status, idempotency_key
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed', $8)
-          RETURNING *
-        `, [
-          request.meetingTypeId,
-          request.hostUserId,
-          request.inviteeName,
-          request.inviteeEmail,
-          request.startTime,
-          request.endTime,
-          request.inviteeTimezone,
-          idempotencyKey
-        ]);
-
-        const booking = result.rows[0];
-
-        // Cache idempotency result for 1 hour
-        await this.idempotencyService.storeResult(idempotencyKey, booking);
-
-        // Invalidate availability cache
-        await this.cache.invalidatePattern(
-          `availability:${request.hostUserId}:*`
-        );
-
-        // Queue email notification (async, non-blocking)
-        await this.queueConfirmationEmail(booking);
-
-        return booking;
-      });
-    } finally {
-      await this.cache.releaseLock(lockKey);
-    }
-  }
-
-  private generateIdempotencyKey(request: BookingRequest): string {
-    const data = `${request.meetingTypeId}:${request.startTime.toISOString()}:${request.inviteeEmail}`;
-    return crypto.createHash('sha256').update(data).digest('hex');
-  }
-}
+```
+┌───────────────────────────────────────────────────────────────┐
+│                   After Successful Booking                     │
+├───────────────────────────────────────────────────────────────┤
+│                                                               │
+│  1. Store idempotency result (1 hour TTL)                     │
+│     └──▶ Prevents duplicate bookings from network retries     │
+│                                                               │
+│  2. Invalidate availability cache                             │
+│     └──▶ Pattern: availability:{host_user_id}:*               │
+│                                                               │
+│  3. Queue confirmation email (async, non-blocking)            │
+│     └──▶ RabbitMQ: notifications queue                        │
+│                                                               │
+│  4. Release distributed lock                                  │
+│     └──▶ Always in finally block                              │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Five Layers?
@@ -290,367 +221,203 @@ export class BookingService {
 
 ## Step 5: Deep Dive - Availability Calculation
 
-### Algorithm
+### Algorithm Flow
 
-```typescript
-// backend/src/services/availabilityService.ts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     AVAILABILITY CALCULATION                            │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface TimeSlot {
-  startTime: Date;
-  endTime: Date;
-}
+ Request: getAvailableSlots(meetingTypeId, date, timezone)
+                              │
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 1: Check Cache (5-min TTL)      │
+           │ Key: availability:{typeId}:{date}    │
+           ├──────────────────────────────────────┤
+           │ Cache hit? ──▶ Convert timezone      │
+           │             ──▶ Return slots         │
+           └──────────────────┬───────────────────┘
+                              │ Cache miss
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 2: Get Availability Rules       │
+           │ Query: availability_rules            │
+           │ WHERE user_id=? AND day_of_week=?    │
+           │       AND is_active=true             │
+           ├──────────────────────────────────────┤
+           │ No rules? ──▶ Return empty []        │
+           └──────────────────┬───────────────────┘
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 3: Get Existing Bookings        │
+           │ Query: bookings WHERE host_user_id=? │
+           │        AND status='confirmed'        │
+           │        AND start_time in day range   │
+           └──────────────────┬───────────────────┘
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 4: Get External Calendar Events │
+           │ CalendarIntegrationService.getEvents │
+           │ (from cache or API)                  │
+           └──────────────────┬───────────────────┘
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 5: Merge Busy Periods           │
+           │ Sort by start time                   │
+           │ Merge overlapping intervals          │
+           └──────────────────┬───────────────────┘
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 6: Generate Available Slots     │
+           │ For each rule window:                │
+           │   Generate 15-min interval slots     │
+           │   Check each against busy periods    │
+           │   Account for buffer before/after    │
+           └──────────────────┬───────────────────┘
+                              ▼
+           ┌──────────────────────────────────────┐
+           │ Step 7: Cache and Return             │
+           │ Cache result (5-min TTL)             │
+           │ Convert to requested timezone        │
+           └──────────────────────────────────────┘
+```
 
-interface BusyPeriod {
-  start: Date;
-  end: Date;
-}
+### Busy Period Merge Algorithm
 
-export class AvailabilityService {
-  private pool: Pool;
-  private cache: CacheService;
-  private calendarService: CalendarIntegrationService;
-
-  async getAvailableSlots(
-    meetingTypeId: string,
-    date: Date,
-    timezone: string
-  ): Promise<TimeSlot[]> {
-    // Check cache first (5-minute TTL)
-    const cacheKey = `availability:${meetingTypeId}:${date.toISOString().split('T')[0]}`;
-    const cached = await this.cache.get(cacheKey);
-    if (cached) {
-      return this.convertTimezone(cached, timezone);
-    }
-
-    // Fetch meeting type with user info
-    const meetingType = await this.getMeetingType(meetingTypeId);
-    const dayOfWeek = date.getDay();
-
-    // Step 1: Get availability rules for this day
-    const rules = await this.pool.query(`
-      SELECT start_time, end_time FROM availability_rules
-      WHERE user_id = $1 AND day_of_week = $2 AND is_active = true
-    `, [meetingType.userId, dayOfWeek]);
-
-    if (rules.rows.length === 0) {
-      return []; // No availability on this day
-    }
-
-    // Step 2: Get existing bookings
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
-
-    const bookings = await this.pool.query(`
-      SELECT start_time, end_time FROM bookings
-      WHERE host_user_id = $1
-        AND status = 'confirmed'
-        AND start_time >= $2
-        AND start_time < $3
-    `, [meetingType.userId, dayStart, dayEnd]);
-
-    // Step 3: Get external calendar events (from cache or API)
-    const calendarEvents = await this.calendarService.getEvents(
-      meetingType.userId,
-      dayStart,
-      dayEnd
-    );
-
-    // Step 4: Merge all busy periods
-    const busyPeriods = this.mergeBusyPeriods([
-      ...bookings.rows.map(b => ({
-        start: new Date(b.start_time),
-        end: new Date(b.end_time)
-      })),
-      ...calendarEvents.map(e => ({
-        start: e.start,
-        end: e.end
-      }))
-    ]);
-
-    // Step 5: Generate available slots
-    const slots = this.findAvailableSlots(
-      rules.rows,
-      busyPeriods,
-      meetingType.durationMinutes,
-      meetingType.bufferBeforeMinutes,
-      meetingType.bufferAfterMinutes,
-      date
-    );
-
-    // Cache result (5 min TTL)
-    await this.cache.set(cacheKey, slots, 300);
-
-    return this.convertTimezone(slots, timezone);
-  }
-
-  private mergeBusyPeriods(periods: BusyPeriod[]): BusyPeriod[] {
-    if (periods.length === 0) return [];
-
-    // Sort by start time
-    const sorted = [...periods].sort(
-      (a, b) => a.start.getTime() - b.start.getTime()
-    );
-
-    const merged: BusyPeriod[] = [sorted[0]];
-
-    for (let i = 1; i < sorted.length; i++) {
-      const current = sorted[i];
-      const last = merged[merged.length - 1];
-
-      if (current.start.getTime() <= last.end.getTime()) {
-        // Overlapping - extend the end
-        last.end = new Date(Math.max(last.end.getTime(), current.end.getTime()));
-      } else {
-        merged.push(current);
-      }
-    }
-
-    return merged;
-  }
-
-  private findAvailableSlots(
-    rules: { start_time: string; end_time: string }[],
-    busyPeriods: BusyPeriod[],
-    duration: number,
-    bufferBefore: number,
-    bufferAfter: number,
-    date: Date
-  ): TimeSlot[] {
-    const slots: TimeSlot[] = [];
-    const totalDuration = bufferBefore + duration + bufferAfter;
-
-    for (const rule of rules) {
-      // Convert TIME to Date for this specific date
-      const windowStart = this.timeToDate(date, rule.start_time);
-      const windowEnd = this.timeToDate(date, rule.end_time);
-
-      // Generate slots at 15-minute intervals
-      let current = windowStart;
-      while (current.getTime() + totalDuration * 60000 <= windowEnd.getTime()) {
-        const slotStart = new Date(current.getTime() + bufferBefore * 60000);
-        const slotEnd = new Date(slotStart.getTime() + duration * 60000);
-
-        // Check if slot conflicts with any busy period
-        const hasConflict = busyPeriods.some(busy =>
-          slotStart < busy.end && slotEnd > busy.start
-        );
-
-        if (!hasConflict) {
-          slots.push({ startTime: slotStart, endTime: slotEnd });
-        }
-
-        current = new Date(current.getTime() + 15 * 60000); // 15-min increments
-      }
-    }
-
-    return slots;
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   INTERVAL MERGING                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Input (sorted by start):                                           │
+│  ┌─────┐  ┌─────────┐    ┌───┐ ┌───────┐                            │
+│  │ 9-10│  │ 9:30-11 │    │2-3│ │3:30-5 │                            │
+│  └─────┘  └─────────┘    └───┘ └───────┘                            │
+│                                                                     │
+│  Algorithm:                                                         │
+│  1. Sort by start time                                              │
+│  2. For each period:                                                │
+│     - If overlaps with last merged ──▶ Extend end time              │
+│     - Else ──▶ Add as new period                                    │
+│                                                                     │
+│  Output:                                                            │
+│  ┌──────────────┐      ┌───┐ ┌───────┐                              │
+│  │    9-11      │      │2-3│ │3:30-5 │                              │
+│  └──────────────┘      └───┘ └───────┘                              │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Cache Invalidation Strategy
 
-```typescript
-// backend/src/services/cacheService.ts
-
-export class CacheService {
-  private redis: Redis;
-
-  async invalidateAvailability(hostUserId: string, date?: Date): Promise<void> {
-    if (date) {
-      // Invalidate specific date
-      const key = `availability:${hostUserId}:${date.toISOString().split('T')[0]}`;
-      await this.redis.del(key);
-    } else {
-      // Invalidate all dates for this host
-      const pattern = `availability:${hostUserId}:*`;
-      const keys = await this.redis.keys(pattern);
-      if (keys.length > 0) {
-        await this.redis.del(...keys);
-      }
-    }
-  }
-
-  // Called after: booking creation, cancellation, calendar sync
-  async onBookingChange(booking: Booking): Promise<void> {
-    await this.invalidateAvailability(booking.hostUserId);
-  }
-}
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                 CACHE INVALIDATION TRIGGERS                        │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Trigger                    │  Action                             │
+│  ─────────────────────────  │  ─────────────────────              │
+│  Booking created/cancelled  │  Invalidate all dates for host     │
+│  Calendar sync completed    │  Invalidate all dates for host     │
+│  Availability rules changed │  Invalidate all dates for host     │
+│                                                                   │
+│  Pattern-based deletion: availability:{host_user_id}:*           │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Step 6: Deep Dive - Calendar Integration
 
-### OAuth Token Management
+### OAuth Token Management Flow
 
-```typescript
-// backend/src/services/calendarIntegrationService.ts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   OAUTH TOKEN LIFECYCLE                                 │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface CalendarTokens {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: Date;
-}
+        getValidToken(integrationId)
+                    │
+                    ▼
+    ┌───────────────────────────────────┐
+    │ Query calendar_integrations       │
+    │ WHERE id = ? AND is_active = true │
+    └──────────────────┬────────────────┘
+                       ▼
+    ┌───────────────────────────────────┐
+    │ Token expires_at > now + 5min?    │
+    ├───────────────────────────────────┤
+    │ Yes ──▶ Return access_token       │
+    │ No  ──▶ Refresh token flow        │
+    └──────────────────┬────────────────┘
+                       │ Needs refresh
+                       ▼
+    ┌───────────────────────────────────┐
+    │ Call provider refresh endpoint    │
+    │ (Google OAuth2 / Microsoft Graph) │
+    └──────────────────┬────────────────┘
+                       ▼
+    ┌───────────────────────────────────┐
+    │ Update DB with new access_token   │
+    │ and expires_at timestamp          │
+    └──────────────────┬────────────────┘
+                       ▼
+    ┌───────────────────────────────────┐
+    │ Return new access_token           │
+    └───────────────────────────────────┘
+```
 
-export class CalendarIntegrationService {
-  private pool: Pool;
-  private cache: CacheService;
+### Calendar Sync Error Handling
 
-  async getValidToken(integrationId: string): Promise<string> {
-    const integration = await this.pool.query(`
-      SELECT access_token, refresh_token, token_expires_at
-      FROM calendar_integrations
-      WHERE id = $1 AND is_active = true
-    `, [integrationId]);
-
-    if (integration.rows.length === 0) {
-      throw new NotFoundError('Calendar integration not found');
-    }
-
-    const { access_token, refresh_token, token_expires_at } = integration.rows[0];
-
-    // Token still valid (with 5-min buffer)
-    if (new Date(token_expires_at).getTime() > Date.now() + 5 * 60000) {
-      return access_token;
-    }
-
-    // Refresh the token
-    const newTokens = await this.refreshGoogleToken(refresh_token);
-
-    await this.pool.query(`
-      UPDATE calendar_integrations
-      SET access_token = $1, token_expires_at = $2, updated_at = NOW()
-      WHERE id = $3
-    `, [newTokens.accessToken, newTokens.expiresAt, integrationId]);
-
-    return newTokens.accessToken;
-  }
-
-  async syncCalendar(userId: string): Promise<void> {
-    const integrations = await this.pool.query(`
-      SELECT id, provider, calendar_id FROM calendar_integrations
-      WHERE user_id = $1 AND is_active = true
-    `, [userId]);
-
-    for (const integration of integrations.rows) {
-      try {
-        const token = await this.getValidToken(integration.id);
-        const events = await this.fetchCalendarEvents(
-          integration.provider,
-          token,
-          integration.calendar_id
-        );
-
-        // Cache events for 10 minutes
-        const cacheKey = `calendar_events:${integration.id}`;
-        await this.cache.set(cacheKey, events, 600);
-
-      } catch (error) {
-        if (error instanceof RateLimitError) {
-          // Schedule retry with exponential backoff
-          await this.scheduleRetry(integration.id, 60);
-        } else if (error instanceof TokenExpiredError) {
-          // Mark integration as needing reauthorization
-          await this.markAsExpired(integration.id);
-        } else {
-          throw error;
-        }
-      }
-    }
-  }
-
-  async getEvents(
-    userId: string,
-    startDate: Date,
-    endDate: Date
-  ): Promise<CalendarEvent[]> {
-    // Try cache first
-    const integrations = await this.pool.query(`
-      SELECT id FROM calendar_integrations
-      WHERE user_id = $1 AND is_active = true
-    `, [userId]);
-
-    const allEvents: CalendarEvent[] = [];
-
-    for (const integration of integrations.rows) {
-      const cacheKey = `calendar_events:${integration.id}`;
-      let events = await this.cache.get<CalendarEvent[]>(cacheKey);
-
-      if (!events) {
-        // Cache miss - sync calendar
-        await this.syncCalendar(userId);
-        events = await this.cache.get<CalendarEvent[]>(cacheKey);
-      }
-
-      if (events) {
-        // Filter to requested date range
-        const filtered = events.filter(e =>
-          e.start >= startDate && e.end <= endDate
-        );
-        allEvents.push(...filtered);
-      }
-    }
-
-    return allEvents;
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ERROR HANDLING MATRIX                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Error Type              │  Action                                  │
+│  ──────────────────────  │  ─────────────────────────────────────   │
+│  RateLimitError          │  Schedule retry with exponential backoff │
+│                          │  (start at 60 seconds)                   │
+│                                                                     │
+│  TokenExpiredError       │  Mark integration as needing             │
+│                          │  reauthorization, notify user            │
+│                                                                     │
+│  NetworkError            │  Use cached data, retry in background    │
+│                                                                     │
+│  ProviderDown            │  Fallback to last cached events          │
+│                          │  Continue with local bookings only       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Hybrid Sync Strategy
 
-```typescript
-// backend/src/workers/calendarSyncWorker.ts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   CALENDAR SYNC STRATEGY                                │
+└─────────────────────────────────────────────────────────────────────────┘
 
-export class CalendarSyncWorker {
-  private calendarService: CalendarIntegrationService;
+  ┌─────────────────────┐      ┌─────────────────────┐
+  │ PUSH (Webhooks)     │      │ PULL (Polling)      │
+  │ ─────────────────── │      │ ───────────────────  │
+  │ Google Calendar     │      │ Every 10 minutes    │
+  │ sends notification  │      │ for stale records   │
+  │ to our endpoint     │      │ or webhook failures │
+  └──────────┬──────────┘      └──────────┬──────────┘
+             │                            │
+             ▼                            ▼
+  ┌───────────────────────────────────────────────────┐
+  │              Sync Handler                          │
+  │ 1. Fetch events from provider                     │
+  │ 2. Cache events (10-min TTL)                      │
+  │ 3. Invalidate availability cache                  │
+  └───────────────────────────────────────────────────┘
 
-  async start(): Promise<void> {
-    // Webhook handler for push notifications (Google Calendar)
-    this.registerWebhookHandler();
-
-    // Fallback polling every 10 minutes
-    setInterval(() => this.pollAllCalendars(), 10 * 60 * 1000);
-  }
-
-  private async registerWebhookHandler(): Promise<void> {
-    // POST /api/webhooks/google-calendar
-    router.post('/webhooks/google-calendar', async (req, res) => {
-      const channelId = req.headers['x-goog-channel-id'];
-      const resourceState = req.headers['x-goog-resource-state'];
-
-      if (resourceState === 'sync' || resourceState === 'exists') {
-        // Calendar was updated - trigger refresh
-        const integration = await this.findIntegrationByChannel(channelId);
-        if (integration) {
-          await this.calendarService.syncCalendar(integration.userId);
-        }
-      }
-
-      res.sendStatus(200);
-    });
-  }
-
-  private async pollAllCalendars(): Promise<void> {
-    // Fetch all active integrations that need sync
-    const staleIntegrations = await this.pool.query(`
-      SELECT DISTINCT user_id FROM calendar_integrations
-      WHERE is_active = true
-        AND (last_synced_at IS NULL OR last_synced_at < NOW() - INTERVAL '10 minutes')
-      LIMIT 100
-    `);
-
-    for (const row of staleIntegrations.rows) {
-      try {
-        await this.calendarService.syncCalendar(row.user_id);
-      } catch (error) {
-        console.error(`Calendar sync failed for user ${row.user_id}:`, error);
-      }
-    }
-  }
-}
+  Webhook Endpoint: POST /api/webhooks/google-calendar
+  Headers: x-goog-channel-id, x-goog-resource-state
+  States: 'sync' or 'exists' ──▶ Trigger calendar refresh
 ```
 
 ---
@@ -659,104 +426,74 @@ export class CalendarSyncWorker {
 
 ### Queue-Based Architecture
 
-```typescript
-// backend/src/services/notificationService.ts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   NOTIFICATION FLOW                                     │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface NotificationPayload {
-  type: 'confirmation' | 'reminder' | 'cancellation' | 'reschedule';
-  bookingId: string;
-  recipientEmail: string;
-  recipientName: string;
-}
+  Booking Created
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    NotificationService                               │
+  │                                                                     │
+  │  queueConfirmation(booking)                                         │
+  │  ┌─────────────────────────────────────────────────────────────┐    │
+  │  │ Publish to 'notifications' queue:                           │    │
+  │  │                                                             │    │
+  │  │   ┌──────────────┐  ┌──────────────┐                        │    │
+  │  │   │ To: Invitee  │  │ To: Host     │                        │    │
+  │  │   │ Type: confirm│  │ Type: confirm│                        │    │
+  │  │   │ bookingId    │  │ bookingId    │                        │    │
+  │  │   └──────────────┘  └──────────────┘                        │    │
+  │  └─────────────────────────────────────────────────────────────┘    │
+  │                                                                     │
+  │  scheduleReminders(booking)                                         │
+  │  ┌─────────────────────────────────────────────────────────────┐    │
+  │  │ Publish delayed messages:                                   │    │
+  │  │                                                             │    │
+  │  │   ┌──────────────────┐  ┌──────────────────┐                │    │
+  │  │   │ 24h before       │  │ 1h before        │                │    │
+  │  │   │ Type: reminder   │  │ Type: reminder   │                │    │
+  │  │   └──────────────────┘  └──────────────────┘                │    │
+  │  └─────────────────────────────────────────────────────────────┘    │
+  └─────────────────────────────────────────────────────────────────────┘
+```
 
-export class NotificationService {
-  private queue: RabbitMQClient;
-  private pool: Pool;
+### Notification Worker
 
-  async queueConfirmation(booking: Booking): Promise<void> {
-    // Queue emails for both host and invitee
-    await this.queue.publish('notifications', {
-      type: 'confirmation',
-      bookingId: booking.id,
-      recipientEmail: booking.inviteeEmail,
-      recipientName: booking.inviteeName
-    });
-
-    const host = await this.getHost(booking.hostUserId);
-    await this.queue.publish('notifications', {
-      type: 'confirmation',
-      bookingId: booking.id,
-      recipientEmail: host.email,
-      recipientName: host.name
-    });
-  }
-
-  async scheduleReminders(booking: Booking): Promise<void> {
-    const startTime = new Date(booking.startTime);
-
-    // 24 hours before
-    const reminder24h = new Date(startTime.getTime() - 24 * 60 * 60 * 1000);
-    if (reminder24h > new Date()) {
-      await this.queue.publishDelayed('notifications', {
-        type: 'reminder',
-        bookingId: booking.id,
-        recipientEmail: booking.inviteeEmail,
-        recipientName: booking.inviteeName
-      }, reminder24h);
-    }
-
-    // 1 hour before
-    const reminder1h = new Date(startTime.getTime() - 60 * 60 * 1000);
-    if (reminder1h > new Date()) {
-      await this.queue.publishDelayed('notifications', {
-        type: 'reminder',
-        bookingId: booking.id,
-        recipientEmail: booking.inviteeEmail,
-        recipientName: booking.inviteeName
-      }, reminder1h);
-    }
-  }
-}
-
-// backend/src/workers/notificationWorker.ts
-
-export class NotificationWorker {
-  async start(): Promise<void> {
-    await this.queue.consume('notifications', async (message) => {
-      const payload = message as NotificationPayload;
-
-      try {
-        const booking = await this.getBooking(payload.bookingId);
-
-        // Booking might have been cancelled
-        if (!booking || booking.status === 'cancelled') {
-          return; // Acknowledge and skip
-        }
-
-        const emailContent = await this.generateEmail(payload.type, booking);
-        await this.sendEmail(payload.recipientEmail, emailContent);
-
-        // Log notification for audit
-        await this.pool.query(`
-          INSERT INTO email_notifications
-          (booking_id, recipient_email, notification_type, subject, body, status)
-          VALUES ($1, $2, $3, $4, $5, 'sent')
-        `, [
-          booking.id,
-          payload.recipientEmail,
-          payload.type,
-          emailContent.subject,
-          emailContent.body
-        ]);
-
-      } catch (error) {
-        console.error('Notification failed:', error);
-        // Retry with exponential backoff (RabbitMQ handles this)
-        throw error;
-      }
-    });
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   NOTIFICATION WORKER                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  consume('notifications', async (message) => {                          │
+│                                                                         │
+│    ┌────────────────────────────────────────────────────────────────┐   │
+│    │ 1. Fetch booking by ID                                         │   │
+│    │    If cancelled ──▶ Acknowledge and skip                       │   │
+│    └────────────────────────────┬───────────────────────────────────┘   │
+│                                 ▼                                       │
+│    ┌────────────────────────────────────────────────────────────────┐   │
+│    │ 2. Generate email content based on type                        │   │
+│    │    - confirmation: Meeting details + calendar link             │   │
+│    │    - reminder: Time until meeting + join details               │   │
+│    │    - cancellation: Reason + rebooking link                     │   │
+│    └────────────────────────────┬───────────────────────────────────┘   │
+│                                 ▼                                       │
+│    ┌────────────────────────────────────────────────────────────────┐   │
+│    │ 3. Send email via SMTP/SendGrid                                │   │
+│    └────────────────────────────┬───────────────────────────────────┘   │
+│                                 ▼                                       │
+│    ┌────────────────────────────────────────────────────────────────┐   │
+│    │ 4. Log to email_notifications table for audit                  │   │
+│    │    (booking_id, recipient, type, subject, body, status='sent') │   │
+│    └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│    On error: Throw to trigger RabbitMQ retry with exponential backoff   │
+│  })                                                                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -765,72 +502,61 @@ export class NotificationWorker {
 
 ### Table Partitioning
 
-```sql
--- Partition bookings by month for efficient queries and archival
-CREATE TABLE bookings (
-    id UUID,
-    host_user_id UUID NOT NULL,
-    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    -- ... other columns
-    PRIMARY KEY (id, start_time)
-) PARTITION BY RANGE (start_time);
-
--- Create monthly partitions
-CREATE TABLE bookings_2024_01 PARTITION OF bookings
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE bookings_2024_02 PARTITION OF bookings
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
--- ... etc
-
--- Auto-create future partitions
-CREATE OR REPLACE FUNCTION create_monthly_partition()
-RETURNS void AS $$
-DECLARE
-    partition_date DATE;
-    partition_name TEXT;
-BEGIN
-    partition_date := DATE_TRUNC('month', NOW() + INTERVAL '1 month');
-    partition_name := 'bookings_' || TO_CHAR(partition_date, 'YYYY_MM');
-
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF bookings
-         FOR VALUES FROM (%L) TO (%L)',
-        partition_name,
-        partition_date,
-        partition_date + INTERVAL '1 month'
-    );
-END;
-$$ LANGUAGE plpgsql;
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   MONTHLY PARTITIONING                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  bookings (parent table)                                                │
+│  PARTITION BY RANGE (start_time)                                        │
+│      │                                                                  │
+│      ├──▶ bookings_2024_01 (Jan 1 - Feb 1)                              │
+│      ├──▶ bookings_2024_02 (Feb 1 - Mar 1)                              │
+│      ├──▶ bookings_2024_03 (Mar 1 - Apr 1)                              │
+│      └──▶ ...                                                           │
+│                                                                         │
+│  Benefits:                                                              │
+│  - Query performance: Only scan relevant partitions                     │
+│  - Easy archival: DETACH old partitions, move to cold storage           │
+│  - Maintenance: VACUUM/ANALYZE on smaller tables                        │
+│                                                                         │
+│  Auto-partition creation:                                               │
+│  - Scheduled job creates next month's partition                         │
+│  - create_monthly_partition() function                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Read Replica Configuration
 
-```typescript
-// backend/src/shared/db.ts
-
-import { Pool } from 'pg';
-
-// Primary pool for writes
-export const primaryPool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-});
-
-// Replica pool for reads
-export const replicaPool = new Pool({
-  connectionString: process.env.DATABASE_REPLICA_URL || process.env.DATABASE_URL,
-  max: 50, // Higher limit for read-heavy availability queries
-});
-
-// Route read queries to replica
-export function getReadPool(): Pool {
-  return process.env.DATABASE_REPLICA_URL ? replicaPool : primaryPool;
-}
-
-// Always use primary for writes
-export function getWritePool(): Pool {
-  return primaryPool;
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   READ/WRITE SPLITTING                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│                      ┌─────────────────┐                                │
+│                      │  Application    │                                │
+│                      └────────┬────────┘                                │
+│                               │                                         │
+│             ┌─────────────────┴─────────────────┐                       │
+│             ▼                                   ▼                       │
+│  ┌─────────────────────┐             ┌─────────────────────┐            │
+│  │   Primary Pool      │             │   Replica Pool      │            │
+│  │   (max: 20 conn)    │             │   (max: 50 conn)    │            │
+│  │                     │             │                     │            │
+│  │  Used for:          │             │  Used for:          │            │
+│  │  - Booking create   │             │  - Availability     │            │
+│  │  - Cancellation     │             │  - Meeting types    │            │
+│  │  - Status updates   │             │  - User profiles    │            │
+│  │  - Any INSERT/UPDATE│             │  - All SELECT       │            │
+│  └─────────────────────┘             └─────────────────────┘            │
+│             │                                   │                       │
+│             ▼                                   ▼                       │
+│  ┌─────────────────────┐             ┌─────────────────────┐            │
+│  │ PostgreSQL Primary  │ ──repl──▶   │ PostgreSQL Replica  │            │
+│  └─────────────────────┘             └─────────────────────┘            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -853,50 +579,36 @@ export function getWritePool(): Pool {
 
 ### Key Backend Metrics
 
-```typescript
-// backend/src/shared/metrics.ts
-
-import { Counter, Histogram, Gauge } from 'prom-client';
-
-// Booking metrics
-export const bookingOperations = new Counter({
-  name: 'calendly_booking_operations_total',
-  help: 'Total booking operations',
-  labelNames: ['operation', 'status']
-});
-
-export const bookingLatency = new Histogram({
-  name: 'calendly_booking_creation_duration_seconds',
-  help: 'Booking creation latency',
-  labelNames: ['status'],
-  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5]
-});
-
-export const doubleBookingPrevented = new Counter({
-  name: 'calendly_double_booking_prevented_total',
-  help: 'Count of prevented double bookings'
-});
-
-// Availability metrics
-export const availabilityChecks = new Counter({
-  name: 'calendly_availability_checks_total',
-  help: 'Availability check requests',
-  labelNames: ['cache_hit']
-});
-
-export const availabilityLatency = new Histogram({
-  name: 'calendly_availability_calculation_duration_seconds',
-  help: 'Availability calculation latency',
-  labelNames: ['cache_hit'],
-  buckets: [0.05, 0.1, 0.2, 0.5, 1]
-});
-
-// Calendar sync metrics
-export const calendarSyncLag = new Gauge({
-  name: 'calendly_calendar_sync_lag_seconds',
-  help: 'Time since last successful calendar sync',
-  labelNames: ['provider']
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   PROMETHEUS METRICS                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Booking Metrics                                                        │
+│  ───────────────                                                        │
+│  calendly_booking_operations_total                                      │
+│    Labels: operation (create/cancel), status (success/failure)          │
+│                                                                         │
+│  calendly_booking_creation_duration_seconds                             │
+│    Buckets: 0.1, 0.25, 0.5, 1, 2.5, 5                                   │
+│                                                                         │
+│  calendly_double_booking_prevented_total                                │
+│    Count of race conditions caught                                      │
+│                                                                         │
+│  Availability Metrics                                                   │
+│  ────────────────────                                                   │
+│  calendly_availability_checks_total                                     │
+│    Labels: cache_hit (true/false)                                       │
+│                                                                         │
+│  calendly_availability_calculation_duration_seconds                     │
+│    Buckets: 0.05, 0.1, 0.2, 0.5, 1                                      │
+│                                                                         │
+│  Calendar Sync Metrics                                                  │
+│  ─────────────────────                                                  │
+│  calendly_calendar_sync_lag_seconds                                     │
+│    Labels: provider (google/outlook)                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Alert Thresholds

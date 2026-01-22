@@ -54,110 +54,94 @@
 - 10M articles clustered into ~1M unique stories/day
 - 90% of articles are duplicates/similar coverage
 
-**Key insight**: This is a content processing pipeline. Crawling, deduplication, and categorization happen offline; feed generation is the hot path.
+**Key insight**: "This is a content processing pipeline. Crawling, deduplication, and categorization happen offline; feed generation is the hot path."
 
 ---
 
 ## Step 3: High-Level Architecture (10 minutes)
 
 ```
-                                        ┌─────────────────────────────────┐
-                                        │          Client Apps            │
-                                        │      (Web, Mobile, API)         │
-                                        └───────────────┬─────────────────┘
-                                                        │
-                                                        ▼
-                                        ┌─────────────────────────────────┐
-                                        │          API Gateway            │
-                                        └───────────────┬─────────────────┘
-                                                        │
-                    ┌───────────────────────────────────┼───────────────────────────────────┐
-                    │                                   │                                   │
-          ┌─────────▼─────────┐              ┌─────────▼─────────┐              ┌─────────▼─────────┐
-          │   Feed Service    │              │  Search Service   │              │   User Service    │
-          │                   │              │                   │              │                   │
-          │ - Personalization │              │ - Full-text       │              │ - Preferences     │
-          │ - Ranking         │              │ - Filters         │              │ - History         │
-          └─────────┬─────────┘              └─────────┬─────────┘              └───────────────────┘
-                    │                                   │
-                    │                                   │
-          ┌─────────▼─────────────────────────────────▼─────────┐
-          │                     Elasticsearch                     │
-          │              (Articles, Stories, Topics)              │
-          └───────────────────────────────────────────────────────┘
-                                        │
-                                        │
-          ┌─────────────────────────────┼─────────────────────────────┐
-          │                             │                             │
-┌─────────▼─────────┐        ┌─────────▼─────────┐        ┌─────────▼─────────┐
-│   Story Service   │        │ Category Service  │        │  Trending Service │
-│                   │        │                   │        │                   │
-│ - Deduplication   │        │ - Classification  │        │ - Breaking news   │
-│ - Clustering      │        │ - Topic tagging   │        │ - Viral detection │
-└─────────┬─────────┘        └─────────┬─────────┘        └─────────┬─────────┘
-          │                             │                             │
-          └─────────────────────────────┼─────────────────────────────┘
-                                        │
-                                        ▼
-                              ┌─────────────────────┐
-                              │       Kafka         │
-                              │  (Article Stream)   │
-                              └─────────┬───────────┘
-                                        │
-          ┌─────────────────────────────┼─────────────────────────────┐
-          │                             │                             │
-┌─────────▼─────────┐        ┌─────────▼─────────┐        ┌─────────▼─────────┐
-│  Content Parser   │        │ Image Processor   │        │   NLP Pipeline    │
-│                   │        │                   │        │                   │
-│ - HTML parsing    │        │ - Thumbnails      │        │ - NER             │
-│ - Text extraction │        │ - CDN upload      │        │ - Summarization   │
-└─────────┬─────────┘        └───────────────────┘        └───────────────────┘
-          │
-          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Crawler Service                                 │
-│                                                                             │
+│                              Client Apps                                     │
+│                          (Web, Mobile, API)                                  │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             API Gateway                                      │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────────┐
+          │                         │                             │
+          ▼                         ▼                             ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│    Feed Service     │   │   Search Service    │   │    User Service     │
+│                     │   │                     │   │                     │
+│  Personalization    │   │   Full-text         │   │   Preferences       │
+│  Ranking            │   │   Filters           │   │   History           │
+└──────────┬──────────┘   └──────────┬──────────┘   └─────────────────────┘
+           │                         │
+           └────────────┬────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Elasticsearch                                      │
+│                    (Articles, Stories, Topics)                               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────────┐
+          │                         │                             │
+          ▼                         ▼                             ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│   Story Service     │   │  Category Service   │   │  Trending Service   │
+│                     │   │                     │   │                     │
+│   Deduplication     │   │   Classification    │   │   Breaking news     │
+│   Clustering        │   │   Topic tagging     │   │   Viral detection   │
+└──────────┬──────────┘   └──────────┬──────────┘   └──────────┬──────────┘
+           │                         │                         │
+           └─────────────────────────┼─────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                               Kafka                                          │
+│                          (Article Stream)                                    │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────────┐
+          │                         │                             │
+          ▼                         ▼                             ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│   Content Parser    │   │   Image Processor   │   │    NLP Pipeline     │
+│                     │   │                     │   │                     │
+│   HTML parsing      │   │   Thumbnails        │   │   NER               │
+│   Text extraction   │   │   CDN upload        │   │   Summarization     │
+└──────────┬──────────┘   └─────────────────────┘   └─────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Crawler Service                                   │
+│                                                                              │
 │   ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐            │
 │   │ Crawler 1 │   │ Crawler 2 │   │ Crawler 3 │   │ Crawler N │            │
 │   └───────────┘   └───────────┘   └───────────┘   └───────────┘            │
-│                                                                             │
-│   - RSS/Atom feeds                                                          │
-│   - Web scraping                                                            │
-│   - Rate limiting per domain                                                │
+│                                                                              │
+│   RSS/Atom feeds    │    Web scraping    │    Rate limiting per domain      │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Components
 
-1. **Crawler Service**
-   - Fetches content from news sources
-   - Respects robots.txt and rate limits
-   - Supports RSS feeds and web scraping
+1. **Crawler Service** - Fetches content from news sources, respects robots.txt and rate limits, supports RSS feeds and web scraping
 
-2. **Content Parser**
-   - Extracts article text from HTML
-   - Handles diverse page layouts
-   - Cleans and normalizes content
+2. **Content Parser** - Extracts article text from HTML, handles diverse page layouts, cleans and normalizes content
 
-3. **NLP Pipeline**
-   - Named Entity Recognition (people, places, organizations)
-   - Topic classification
-   - Summarization for snippets
+3. **NLP Pipeline** - Named Entity Recognition (people, places, organizations), topic classification, summarization for snippets
 
-4. **Story Service**
-   - Groups articles about the same event
-   - Creates story clusters
-   - Selects representative article per source
+4. **Story Service** - Groups articles about the same event, creates story clusters, selects representative article per source
 
-5. **Feed Service**
-   - Generates personalized feeds
-   - Applies ranking algorithms
-   - Ensures diversity
+5. **Feed Service** - Generates personalized feeds, applies ranking algorithms, ensures diversity
 
-6. **Trending Service**
-   - Detects breaking news
-   - Identifies viral stories
-   - Real-time velocity tracking
+6. **Trending Service** - Detects breaking news, identifies viral stories, real-time velocity tracking
 
 ---
 
@@ -166,140 +150,72 @@
 ### Crawl Architecture
 
 ```
-                        ┌─────────────────┐
-                        │  Crawl Schedule │
-                        │    Database     │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │   Scheduler     │
-                        │   Service       │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │    Kafka        │
-                        │  (Crawl Queue)  │
-                        └────────┬────────┘
-                                 │
-        ┌────────────────────────┼────────────────────────┐
-        │                        │                        │
-┌───────▼───────┐       ┌───────▼───────┐       ┌───────▼───────┐
-│   Crawler 1   │       │   Crawler 2   │       │   Crawler N   │
-│   (Domain A)  │       │   (Domain B)  │       │   (Domain X)  │
-└───────────────┘       └───────────────┘       └───────────────┘
-```
-
-### Crawl Scheduling
-
-```typescript
-interface CrawlSchedule {
-  source_id: string;
-  url: string;
-  crawl_frequency: number;  // minutes
-  last_crawl: Date;
-  next_crawl: Date;
-  priority: number;  // Higher for major sources
-}
-
-async function scheduleCrawls() {
-  // Get sources due for crawling
-  const dueSources = await db.query(`
-    SELECT * FROM crawl_schedule
-    WHERE next_crawl <= NOW()
-    ORDER BY priority DESC, next_crawl ASC
-    LIMIT 1000
-  `);
-
-  for (const source of dueSources) {
-    await kafka.send('crawl_queue', {
-      source_id: source.source_id,
-      url: source.url,
-      priority: source.priority
-    });
-
-    // Update next crawl time
-    await db.update('crawl_schedule', source.source_id, {
-      next_crawl: new Date(Date.now() + source.crawl_frequency * 60000)
-    });
-  }
-}
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Crawl Scheduling Flow                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────────────┐                                                   │
+│   │  Crawl Schedule DB  │                                                   │
+│   │                     │                                                   │
+│   │  source_id          │                                                   │
+│   │  url                │                                                   │
+│   │  crawl_frequency    │                                                   │
+│   │  last_crawl         │                                                   │
+│   │  next_crawl         │                                                   │
+│   │  priority           │                                                   │
+│   └──────────┬──────────┘                                                   │
+│              │                                                               │
+│              ▼                                                               │
+│   ┌─────────────────────┐                                                   │
+│   │     Scheduler       │──▶ Query sources WHERE next_crawl <= NOW()        │
+│   │     Service         │    ORDER BY priority DESC, next_crawl ASC         │
+│   └──────────┬──────────┘                                                   │
+│              │                                                               │
+│              ▼                                                               │
+│   ┌─────────────────────┐                                                   │
+│   │       Kafka         │                                                   │
+│   │   (Crawl Queue)     │                                                   │
+│   └──────────┬──────────┘                                                   │
+│              │                                                               │
+│     ┌────────┼────────┬────────┐                                            │
+│     ▼        ▼        ▼        ▼                                            │
+│ ┌────────┐┌────────┐┌────────┐┌────────┐                                   │
+│ │Crawler1││Crawler2││Crawler3││CrawlerN│                                   │
+│ │DomainA ││DomainB ││DomainC ││DomainX │                                   │
+│ └────────┘└────────┘└────────┘└────────┘                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Politeness and Rate Limiting
 
-```typescript
-class PoliteCrawler {
-  private domainLimits: Map<string, RateLimiter> = new Map();
-  private robotsCache: Map<string, RobotsParser> = new Map();
-
-  async crawl(url: string): Promise<CrawlResult> {
-    const domain = new URL(url).hostname;
-
-    // Check robots.txt
-    const robots = await this.getRobots(domain);
-    if (!robots.isAllowed(url, 'NewsAggregator')) {
-      return { status: 'blocked_by_robots' };
-    }
-
-    // Rate limit per domain
-    const limiter = this.getLimiter(domain);
-    await limiter.waitForToken();
-
-    // Fetch with timeout
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'NewsAggregator/1.0' },
-      timeout: 30000
-    });
-
-    // Respect Crawl-Delay
-    const delay = robots.getCrawlDelay() || 1;
-    await sleep(delay * 1000);
-
-    return {
-      status: 'success',
-      content: await response.text(),
-      headers: response.headers
-    };
-  }
-
-  private getLimiter(domain: string): RateLimiter {
-    if (!this.domainLimits.has(domain)) {
-      // Default: 1 request per second per domain
-      this.domainLimits.set(domain, new RateLimiter(1, 1000));
-    }
-    return this.domainLimits.get(domain)!;
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Polite Crawler Flow                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                   │
+│   │   Check     │────▶│   Rate      │────▶│   Fetch     │                   │
+│   │ robots.txt  │     │   Limiter   │     │    URL      │                   │
+│   └─────────────┘     └─────────────┘     └─────────────┘                   │
+│          │                   │                   │                          │
+│          ▼                   ▼                   ▼                          │
+│   Disallowed?         Wait for token      30s timeout                       │
+│   Return blocked      (1 req/sec/domain)  User-Agent: NewsAggregator/1.0    │
+│                                                                              │
+│   After fetch: Respect Crawl-Delay from robots.txt                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### RSS vs Web Scraping
 
-```typescript
-async function fetchSource(source: Source): Promise<Article[]> {
-  if (source.feed_url) {
-    // Prefer RSS/Atom feeds - structured data
-    return fetchRSSFeed(source.feed_url);
-  } else {
-    // Fall back to web scraping
-    return scrapeWebPage(source.homepage_url, source.scrape_config);
-  }
-}
+| Method | Pros | Cons |
+|--------|------|------|
+| **RSS/Atom (preferred)** | Structured data, reliable | Not all sources offer |
+| Web Scraping | Universal | Layout changes break parsing |
 
-async function fetchRSSFeed(url: string): Promise<Article[]> {
-  const response = await fetch(url);
-  const feed = await parseRSS(response.text());
-
-  return feed.items.map(item => ({
-    title: item.title,
-    url: item.link,
-    published_at: item.pubDate,
-    summary: item.description,
-    source_id: extractSourceId(url)
-  }));
-}
-```
+"I prefer RSS feeds when available for structured data. Fall back to web scraping with configurable selectors per source."
 
 ---
 
@@ -332,159 +248,96 @@ These are all about the same event but have different text. We need to:
 
 SimHash creates a fingerprint that's similar for similar documents:
 
-```typescript
-function computeSimHash(text: string): bigint {
-  // 1. Tokenize and hash each word
-  const tokens = tokenize(text);
-  const hashes = tokens.map(t => hash64(t));
-
-  // 2. Create weighted bit vector
-  const vector = new Array(64).fill(0);
-
-  for (const h of hashes) {
-    for (let i = 0; i < 64; i++) {
-      if ((h >> BigInt(i)) & 1n) {
-        vector[i]++;
-      } else {
-        vector[i]--;
-      }
-    }
-  }
-
-  // 3. Convert to fingerprint
-  let fingerprint = 0n;
-  for (let i = 0; i < 64; i++) {
-    if (vector[i] > 0) {
-      fingerprint |= (1n << BigInt(i));
-    }
-  }
-
-  return fingerprint;
-}
-
-function hammingDistance(a: bigint, b: bigint): number {
-  let xor = a ^ b;
-  let count = 0;
-  while (xor) {
-    count += Number(xor & 1n);
-    xor >>= 1n;
-  }
-  return count;
-}
-
-// Two articles are similar if Hamming distance < 3
-function areSimilar(fp1: bigint, fp2: bigint): boolean {
-  return hammingDistance(fp1, fp2) < 3;
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          SimHash Algorithm                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Input: "President signs climate bill into law"                            │
+│                                                                              │
+│   1. Tokenize ──▶ ["president", "signs", "climate", "bill", "into", "law"]  │
+│                                                                              │
+│   2. Hash each token to 64-bit value                                        │
+│      hash64("president") = 0x3a7f...                                        │
+│      hash64("signs") = 0x8b2c...                                            │
+│                                                                              │
+│   3. Create weighted bit vector (64 dimensions)                             │
+│      For each bit position i in each hash:                                  │
+│        bit = 1? vector[i]++                                                 │
+│        bit = 0? vector[i]--                                                 │
+│                                                                              │
+│   4. Convert to fingerprint                                                 │
+│      vector[i] > 0? fingerprint bit = 1                                     │
+│      vector[i] <= 0? fingerprint bit = 0                                    │
+│                                                                              │
+│   Output: 64-bit fingerprint                                                │
+│                                                                              │
+│   Similarity: Hamming distance < 3 ──▶ Same story                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Approach 2: MinHash + LSH (For efficiency at scale)
 
-```typescript
-class MinHashLSH {
-  private numHashFunctions = 100;
-  private bands = 20;
-  private rowsPerBand = 5;
-  private buckets: Map<string, Set<string>> = new Map();
-
-  // Generate MinHash signature
-  getSignature(text: string): number[] {
-    const shingles = this.getShingles(text, 3);
-    const signature: number[] = [];
-
-    for (let i = 0; i < this.numHashFunctions; i++) {
-      let minHash = Infinity;
-      for (const shingle of shingles) {
-        const hash = this.hashWithSeed(shingle, i);
-        minHash = Math.min(minHash, hash);
-      }
-      signature.push(minHash);
-    }
-
-    return signature;
-  }
-
-  // Add to LSH index
-  index(articleId: string, signature: number[]): void {
-    for (let band = 0; band < this.bands; band++) {
-      const start = band * this.rowsPerBand;
-      const bandSignature = signature.slice(start, start + this.rowsPerBand);
-      const bucketKey = `${band}:${bandSignature.join(',')}`;
-
-      if (!this.buckets.has(bucketKey)) {
-        this.buckets.set(bucketKey, new Set());
-      }
-      this.buckets.get(bucketKey)!.add(articleId);
-    }
-  }
-
-  // Find candidates for similarity
-  findCandidates(signature: number[]): Set<string> {
-    const candidates = new Set<string>();
-
-    for (let band = 0; band < this.bands; band++) {
-      const start = band * this.rowsPerBand;
-      const bandSignature = signature.slice(start, start + this.rowsPerBand);
-      const bucketKey = `${band}:${bandSignature.join(',')}`;
-
-      const bucket = this.buckets.get(bucketKey);
-      if (bucket) {
-        bucket.forEach(id => candidates.add(id));
-      }
-    }
-
-    return candidates;
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          MinHash + LSH                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   MinHash Signature (100 hash functions):                                   │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  1. Extract 3-character shingles from text                          │   │
+│   │  2. For each of 100 hash functions:                                 │   │
+│   │     Find minimum hash value across all shingles                     │   │
+│   │  3. Result: 100-dimensional signature                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   LSH Indexing (20 bands, 5 rows each):                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  For each band:                                                     │   │
+│   │    bucketKey = hash(signature[band * 5 : band * 5 + 5])            │   │
+│   │    buckets[bucketKey].add(articleId)                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Candidate Retrieval:                                                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Find all articles sharing at least one bucket                      │   │
+│   │  These are similarity candidates (O(1) lookup)                      │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Story Clustering
 
-```typescript
-interface Story {
-  id: string;
-  title: string;  // Generated representative title
-  summary: string;
-  articles: ArticleRef[];  // All articles about this story
-  created_at: Date;
-  updated_at: Date;
-  velocity: number;  // How fast it's getting coverage
-}
-
-async function assignToStory(article: Article): Promise<Story> {
-  const fingerprint = computeSimHash(article.title + ' ' + article.body);
-
-  // Find recent stories with similar fingerprints
-  const candidates = await findSimilarStories(fingerprint, {
-    max_age_hours: 48,
-    max_hamming_distance: 3
-  });
-
-  if (candidates.length > 0) {
-    // Add to existing story
-    const bestMatch = candidates[0];
-    await addArticleToStory(bestMatch.id, article);
-    return bestMatch;
-  } else {
-    // Create new story
-    return createStory(article);
-  }
-}
-
-async function findSimilarStories(
-  fingerprint: bigint,
-  options: { max_age_hours: number; max_hamming_distance: number }
-): Promise<Story[]> {
-  // Use LSH buckets for fast candidate retrieval
-  const candidateIds = await lshIndex.findCandidates(fingerprint);
-
-  // Verify with actual fingerprint comparison
-  const candidates = await getStoriesByIds(candidateIds);
-
-  return candidates.filter(story =>
-    hammingDistance(story.fingerprint, fingerprint) < options.max_hamming_distance
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Story Assignment Flow                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   New article arrives                                                        │
+│          │                                                                   │
+│          ▼                                                                   │
+│   ┌─────────────────┐                                                       │
+│   │ Compute SimHash │──▶ fingerprint = simhash(title + body)                │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Find candidates │──▶ LSH buckets OR recent stories (48h window)         │
+│   └────────┬────────┘    Hamming distance < 3                               │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Candidates found?                                                  │   │
+│   │     ├── Yes ──▶ Add article to best matching story                  │   │
+│   │     │          Update story: article_count++, velocity++            │   │
+│   │     │                                                               │   │
+│   │     └── No ──▶ Create new story                                     │   │
+│   │               { id, title: article.title, fingerprint }             │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -493,181 +346,122 @@ async function findSimilarStories(
 
 ### User Interest Model
 
-```typescript
-interface UserProfile {
-  user_id: string;
-  topic_weights: Map<string, number>;  // e.g., "technology": 0.8
-  source_preferences: Map<string, number>;  // e.g., "nytimes": 0.9
-  reading_history: ArticleRef[];
-  click_history: ClickEvent[];
-  dwell_times: Map<string, number>;  // Article ID → seconds spent
-}
-
-async function buildUserProfile(userId: string): Promise<UserProfile> {
-  const history = await getReadingHistory(userId, { days: 30 });
-
-  // Calculate topic weights from reading history
-  const topicCounts = new Map<string, number>();
-  for (const article of history) {
-    for (const topic of article.topics) {
-      topicCounts.set(topic, (topicCounts.get(topic) || 0) + 1);
-    }
-  }
-
-  // Normalize weights
-  const total = Array.from(topicCounts.values()).reduce((a, b) => a + b, 0);
-  const topicWeights = new Map<string, number>();
-  topicCounts.forEach((count, topic) => {
-    topicWeights.set(topic, count / total);
-  });
-
-  // Factor in dwell time (longer = more interested)
-  const dwellData = await getDwellTimes(userId, { days: 30 });
-  for (const [articleId, dwellTime] of dwellData) {
-    const article = await getArticle(articleId);
-    if (dwellTime > 60) {  // Spent > 1 minute
-      for (const topic of article.topics) {
-        const current = topicWeights.get(topic) || 0;
-        topicWeights.set(topic, current * 1.2);  // Boost
-      }
-    }
-  }
-
-  return {
-    user_id: userId,
-    topic_weights: topicWeights,
-    source_preferences: await getSourcePreferences(userId),
-    reading_history: history,
-    click_history: await getClickHistory(userId),
-    dwell_times: dwellData
-  };
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           User Profile                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   user_id: "abc123"                                                         │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  topic_weights (from 30-day reading history)                        │   │
+│   │                                                                     │   │
+│   │    technology: 0.35                                                 │   │
+│   │    politics: 0.25                                                   │   │
+│   │    sports: 0.15                                                     │   │
+│   │    ...                                                              │   │
+│   │                                                                     │   │
+│   │  Boosted by dwell time > 60 seconds (1.2x multiplier)              │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  source_preferences                                                 │   │
+│   │                                                                     │   │
+│   │    nytimes: 0.9                                                     │   │
+│   │    bbc: 0.8                                                         │   │
+│   │    ...                                                              │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   reading_history[]  │  click_history[]  │  dwell_times{}                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Ranking Algorithm
+### Ranking Signals
 
-```typescript
-interface RankingSignals {
-  relevance: number;      // Topic match with user interests
-  freshness: number;      // How recent
-  quality: number;        // Source reputation, engagement
-  diversity: number;      // Avoid repetition
-  trending: number;       // Current velocity
-}
-
-function calculateStoryScore(
-  story: Story,
-  userProfile: UserProfile,
-  feedContext: FeedContext
-): number {
-  const signals: RankingSignals = {
-    relevance: calculateRelevance(story, userProfile),
-    freshness: calculateFreshness(story),
-    quality: calculateQuality(story),
-    diversity: calculateDiversity(story, feedContext),
-    trending: story.velocity
-  };
-
-  // Weighted combination
-  return (
-    signals.relevance * 0.35 +
-    signals.freshness * 0.25 +
-    signals.quality * 0.20 +
-    signals.diversity * 0.10 +
-    signals.trending * 0.10
-  );
-}
-
-function calculateRelevance(story: Story, profile: UserProfile): number {
-  let score = 0;
-
-  // Topic match
-  for (const topic of story.topics) {
-    score += profile.topic_weights.get(topic) || 0;
-  }
-
-  // Entity match (people, companies user follows)
-  const userEntities = profile.followed_entities || [];
-  for (const entity of story.entities) {
-    if (userEntities.includes(entity)) {
-      score += 0.3;
-    }
-  }
-
-  // Negative signal: already read
-  if (profile.reading_history.some(a => a.story_id === story.id)) {
-    score *= 0.1;  // Heavy penalty
-  }
-
-  return Math.min(score, 1);
-}
-
-function calculateFreshness(story: Story): number {
-  const ageHours = (Date.now() - story.created_at.getTime()) / 3600000;
-
-  // Exponential decay
-  // Half-life of 6 hours
-  return Math.exp(-ageHours / 6);
-}
-
-function calculateDiversity(story: Story, context: FeedContext): number {
-  // Penalize if similar stories already in feed
-  for (const existing of context.stories_so_far) {
-    if (storiesAreSimilar(story, existing)) {
-      return 0.3;  // Heavy penalty
-    }
-    if (hasSamePrimaryTopic(story, existing)) {
-      return 0.7;  // Moderate penalty
-    }
-  }
-  return 1.0;
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Story Ranking Score                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Final Score = Relevance * 0.35                                            │
+│               + Freshness * 0.25                                            │
+│               + Quality * 0.20                                              │
+│               + Diversity * 0.10                                            │
+│               + Trending * 0.10                                             │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   RELEVANCE (35%)                                                           │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  + Sum of user topic weights for matching story topics              │   │
+│   │  + 0.3 bonus for each followed entity (person, company)            │   │
+│   │  * 0.1 penalty if story already read                               │   │
+│   │  Cap at 1.0                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   FRESHNESS (25%)                                                           │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Exponential decay: e^(-age_hours / 6)                              │   │
+│   │  Half-life: 6 hours                                                 │   │
+│   │  12h old = 0.25, 24h old = 0.06                                    │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   QUALITY (20%)                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Based on source diversity in story cluster                        │   │
+│   │  More sources = higher credibility                                  │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   DIVERSITY (10%)                                                           │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Similar story already in feed? 0.3 score                          │   │
+│   │  Same primary topic in feed? 0.7 score                             │   │
+│   │  Unique topic? 1.0 score                                            │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   TRENDING (10%)                                                            │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  story.velocity (articles per minute)                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Feed Generation
+### Feed Generation Flow
 
-```typescript
-async function generateFeed(
-  userId: string,
-  cursor: string | null,
-  limit: number = 20
-): Promise<FeedResponse> {
-  const userProfile = await getUserProfile(userId);
-
-  // Get candidate stories
-  const candidates = await getCandidateStories({
-    max_age_hours: 48,
-    topics: userProfile.top_topics,
-    limit: 200
-  });
-
-  // Score and rank
-  const feedContext: FeedContext = { stories_so_far: [] };
-  const scored: ScoredStory[] = [];
-
-  for (const story of candidates) {
-    const score = calculateStoryScore(story, userProfile, feedContext);
-    scored.push({ story, score });
-
-    // Update context for diversity
-    if (score > 0.5) {
-      feedContext.stories_so_far.push(story);
-    }
-  }
-
-  // Sort by score
-  scored.sort((a, b) => b.score - a.score);
-
-  // Apply pagination
-  const startIndex = cursor ? parseInt(cursor) : 0;
-  const results = scored.slice(startIndex, startIndex + limit);
-
-  return {
-    stories: results.map(s => enrichStory(s.story)),
-    next_cursor: String(startIndex + limit),
-    has_more: startIndex + limit < scored.length
-  };
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Feed Generation Flow                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   GET /api/v1/feed?cursor=...&limit=20                                      │
+│          │                                                                   │
+│          ▼                                                                   │
+│   ┌─────────────────┐                                                       │
+│   │ Load user       │──▶ topic_weights, source_preferences, history         │
+│   │ profile         │                                                       │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Get candidate   │──▶ 200 stories from last 48 hours                     │
+│   │ stories         │    filtered by user's top topics                      │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Score each      │──▶ calculateStoryScore(story, profile, context)       │
+│   │ story           │    Update context.stories_so_far for diversity        │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Sort by score   │──▶ Return top 20 with next_cursor                     │
+│   │ Apply cursor    │                                                       │
+│   └─────────────────┘                                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -676,63 +470,55 @@ async function generateFeed(
 
 ### Velocity Tracking
 
-```typescript
-interface StoryVelocity {
-  story_id: string;
-  article_count: number;
-  source_count: number;
-  time_window_minutes: number;
-  velocity: number;  // Articles per minute
-}
-
-async function trackVelocity(story: Story): Promise<void> {
-  const now = Date.now();
-  const windowMinutes = 30;
-
-  // Count articles in sliding window
-  const recentArticles = story.articles.filter(
-    a => now - a.published_at.getTime() < windowMinutes * 60000
-  );
-
-  const velocity = recentArticles.length / windowMinutes;
-
-  // Update story velocity
-  await updateStoryVelocity(story.id, velocity);
-
-  // Check for breaking news threshold
-  if (velocity > 2 && recentArticles.length > 10) {
-    // 10+ articles in 30 minutes from different sources
-    const uniqueSources = new Set(recentArticles.map(a => a.source_id)).size;
-    if (uniqueSources > 5) {
-      await markAsBreakingNews(story);
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Velocity Calculation                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Sliding window: 30 minutes                                                │
+│                                                                              │
+│   velocity = count(articles in window) / window_minutes                     │
+│                                                                              │
+│   Breaking news threshold:                                                   │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  velocity > 2 articles/minute                                       │   │
+│   │  AND article_count > 10 in 30 minutes                              │   │
+│   │  AND unique_sources > 5                                             │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   If all conditions met ──▶ markAsBreakingNews(story)                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Breaking News Alert
+### Breaking News Alert Flow
 
-```typescript
-async function markAsBreakingNews(story: Story): Promise<void> {
-  // Update story status
-  await db.update('stories', story.id, {
-    is_breaking: true,
-    breaking_started_at: new Date()
-  });
-
-  // Notify users interested in this topic
-  const interestedUsers = await getUsersInterestedIn(story.topics);
-
-  for (const userId of interestedUsers) {
-    if (await shouldNotify(userId, story)) {
-      await sendPushNotification(userId, {
-        title: 'Breaking News',
-        body: story.title,
-        data: { story_id: story.id }
-      });
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Breaking News Flow                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Story flagged as breaking                                                  │
+│          │                                                                   │
+│          ▼                                                                   │
+│   ┌─────────────────┐                                                       │
+│   │ Update story    │──▶ is_breaking: true                                  │
+│   │                 │    breaking_started_at: now                           │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Find interested │──▶ Users with matching topic preferences              │
+│   │ users           │                                                       │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────┐                                                       │
+│   │ Send push       │──▶ "Breaking News: {story.title}"                     │
+│   │ notifications   │    Only if user notification settings allow           │
+│   └─────────────────┘                                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -741,128 +527,114 @@ async function markAsBreakingNews(story: Story): Promise<void> {
 
 ### PostgreSQL Schema
 
-```sql
--- Sources
-CREATE TABLE sources (
-  id UUID PRIMARY KEY,
-  name VARCHAR(255),
-  domain VARCHAR(255) UNIQUE,
-  feed_url VARCHAR(500),
-  category VARCHAR(50),
-  credibility_score DECIMAL(3, 2),
-  crawl_frequency_minutes INTEGER DEFAULT 15,
-  created_at TIMESTAMP
-);
-
--- Articles
-CREATE TABLE articles (
-  id UUID PRIMARY KEY,
-  source_id UUID REFERENCES sources(id),
-  story_id UUID REFERENCES stories(id),
-  url VARCHAR(1000) UNIQUE,
-  title VARCHAR(500),
-  summary TEXT,
-  body TEXT,
-  image_url VARCHAR(500),
-  published_at TIMESTAMP,
-  crawled_at TIMESTAMP,
-  fingerprint BIGINT,  -- SimHash
-  topics TEXT[],
-  entities JSONB,  -- Named entities
-  created_at TIMESTAMP
-);
-
--- Stories (clustered articles)
-CREATE TABLE stories (
-  id UUID PRIMARY KEY,
-  title VARCHAR(500),
-  summary TEXT,
-  primary_topic VARCHAR(50),
-  topics TEXT[],
-  entities JSONB,
-  fingerprint BIGINT,
-  article_count INTEGER DEFAULT 1,
-  source_count INTEGER DEFAULT 1,
-  velocity DECIMAL(10, 4) DEFAULT 0,
-  is_breaking BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP,
-  updated_at TIMESTAMP
-);
-
--- User reading history
-CREATE TABLE user_reading_history (
-  user_id UUID REFERENCES users(id),
-  article_id UUID REFERENCES articles(id),
-  story_id UUID REFERENCES stories(id),
-  read_at TIMESTAMP,
-  dwell_time_seconds INTEGER,
-  PRIMARY KEY (user_id, article_id)
-);
-
--- Indexes
-CREATE INDEX idx_articles_story ON articles(story_id);
-CREATE INDEX idx_articles_published ON articles(published_at DESC);
-CREATE INDEX idx_stories_topics ON stories USING GIN(topics);
-CREATE INDEX idx_stories_velocity ON stories(velocity DESC) WHERE velocity > 0;
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Database Schema                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   SOURCES                            ARTICLES                               │
+│   ┌───────────────────────┐          ┌───────────────────────────────────┐  │
+│   │ id UUID PK            │          │ id UUID PK                        │  │
+│   │ name VARCHAR(255)     │          │ source_id UUID FK                 │  │
+│   │ domain VARCHAR(255)   │◀────────▶│ story_id UUID FK                  │  │
+│   │ feed_url VARCHAR(500) │          │ url VARCHAR(1000) UNIQUE          │  │
+│   │ category VARCHAR(50)  │          │ title VARCHAR(500)                │  │
+│   │ credibility_score     │          │ summary TEXT                      │  │
+│   │ crawl_frequency_mins  │          │ body TEXT                         │  │
+│   │ created_at TIMESTAMP  │          │ image_url VARCHAR(500)            │  │
+│   └───────────────────────┘          │ published_at TIMESTAMP            │  │
+│                                      │ fingerprint BIGINT (SimHash)      │  │
+│                                      │ topics TEXT[]                     │  │
+│   STORIES                            │ entities JSONB                    │  │
+│   ┌───────────────────────┐          │ created_at TIMESTAMP              │  │
+│   │ id UUID PK            │          └───────────────────────────────────┘  │
+│   │ title VARCHAR(500)    │                                                 │
+│   │ summary TEXT          │◀─────────────────────────────────────────────── │
+│   │ primary_topic         │                                                 │
+│   │ topics TEXT[]         │          USER_READING_HISTORY                   │
+│   │ entities JSONB        │          ┌───────────────────────────────────┐  │
+│   │ fingerprint BIGINT    │          │ user_id UUID FK                   │  │
+│   │ article_count INT     │          │ article_id UUID FK                │  │
+│   │ source_count INT      │          │ story_id UUID FK                  │  │
+│   │ velocity DECIMAL      │          │ read_at TIMESTAMP                 │  │
+│   │ is_breaking BOOLEAN   │          │ dwell_time_seconds INT            │  │
+│   │ created_at TIMESTAMP  │          │ PRIMARY KEY (user_id, article_id) │  │
+│   │ updated_at TIMESTAMP  │          └───────────────────────────────────┘  │
+│   └───────────────────────┘                                                 │
+│                                                                              │
+│   KEY INDEXES:                                                               │
+│   - articles(story_id)                                                       │
+│   - articles(published_at DESC)                                             │
+│   - stories(topics) using GIN                                               │
+│   - stories(velocity DESC) WHERE velocity > 0                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Elasticsearch Mapping
 
-```json
-{
-  "mappings": {
-    "properties": {
-      "title": { "type": "text", "analyzer": "english" },
-      "body": { "type": "text", "analyzer": "english" },
-      "topics": { "type": "keyword" },
-      "entities": {
-        "type": "nested",
-        "properties": {
-          "name": { "type": "keyword" },
-          "type": { "type": "keyword" }
-        }
-      },
-      "published_at": { "type": "date" },
-      "source_id": { "type": "keyword" },
-      "story_id": { "type": "keyword" },
-      "velocity": { "type": "float" }
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Elasticsearch Index                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Index: articles                                                           │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  title          │ text      │ analyzer: english                    │   │
+│   │  body           │ text      │ analyzer: english                    │   │
+│   │  topics         │ keyword   │ (array)                              │   │
+│   │  entities.name  │ keyword   │ (nested)                             │   │
+│   │  entities.type  │ keyword   │ (nested)                             │   │
+│   │  published_at   │ date      │                                      │   │
+│   │  source_id      │ keyword   │                                      │   │
+│   │  story_id       │ keyword   │                                      │   │
+│   │  velocity       │ float     │                                      │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Step 9: API Design (2 minutes)
 
-### REST API
+### REST API Endpoints
 
 ```
-# Feed
-GET /api/v1/feed?cursor=...&limit=20
-Response: { stories: [...], next_cursor: "..." }
-
-GET /api/v1/feed/topic/{topic}
-GET /api/v1/feed/for-you
-
-# Stories
-GET /api/v1/stories/{id}
-GET /api/v1/stories/{id}/articles  # All articles about story
-
-# Search
-GET /api/v1/search?q=climate+change&topic=politics&date_from=...
-
-# Trending
-GET /api/v1/trending
-GET /api/v1/breaking
-
-# User preferences
-GET /api/v1/user/preferences
-PUT /api/v1/user/preferences
-Body: { topics: [...], sources: [...] }
-
-POST /api/v1/user/reading-history
-Body: { article_id, dwell_time_seconds }
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              REST API                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   FEED                                                                       │
+│   ─────────────────────────────────────────────────────                     │
+│   GET  /api/v1/feed?cursor=...&limit=20                                     │
+│   GET  /api/v1/feed/topic/{topic}                                           │
+│   GET  /api/v1/feed/for-you                                                 │
+│                                                                              │
+│   STORIES                                                                    │
+│   ─────────────────────────────────────────────────────                     │
+│   GET  /api/v1/stories/{id}                                                 │
+│   GET  /api/v1/stories/{id}/articles                                        │
+│                                                                              │
+│   SEARCH                                                                     │
+│   ─────────────────────────────────────────────────────                     │
+│   GET  /api/v1/search?q=climate+change&topic=politics&date_from=...         │
+│                                                                              │
+│   TRENDING                                                                   │
+│   ─────────────────────────────────────────────────────                     │
+│   GET  /api/v1/trending                                                     │
+│   GET  /api/v1/breaking                                                     │
+│                                                                              │
+│   USER                                                                       │
+│   ─────────────────────────────────────────────────────                     │
+│   GET  /api/v1/user/preferences                                             │
+│   PUT  /api/v1/user/preferences                                             │
+│        Body: { topics: [...], sources: [...] }                              │
+│   POST /api/v1/user/reading-history                                         │
+│        Body: { article_id, dwell_time_seconds }                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -871,9 +643,9 @@ Body: { article_id, dwell_time_seconds }
 
 ### Crawling at Scale
 
-- Distribute crawlers by domain
-- Use consistent hashing for domain assignment
-- Queue-based work distribution
+- Distribute crawlers by domain (consistent hashing)
+- Queue-based work distribution via Kafka
+- Per-domain rate limiting
 
 ### Deduplication at Scale
 
@@ -908,20 +680,11 @@ Body: { article_id, dwell_time_seconds }
 
 ### Alternatives Considered
 
-1. **Semantic embeddings for dedup**
-   - Better for paraphrased content
-   - More compute intensive
-   - Could use as secondary signal
+1. **Semantic embeddings for dedup** - Better for paraphrased content, more compute intensive, could use as secondary signal
 
-2. **Real-time feed generation**
-   - Always fresh
-   - Higher latency, more compute
-   - Use for active users
+2. **Real-time feed generation** - Always fresh, higher latency, use for active users
 
-3. **Collaborative filtering for personalization**
-   - "Users like you read..."
-   - Cold start problem
-   - Hybrid approach possible
+3. **Collaborative filtering for personalization** - "Users like you read...", cold start problem, hybrid approach possible
 
 ---
 
@@ -940,17 +703,8 @@ The key insight is that this is a content processing pipeline. Most work (crawli
 
 ## Potential Follow-up Questions
 
-1. **How would you handle fake news detection?**
-   - Cross-reference claims across sources
-   - Source credibility scoring
-   - Fact-checking partnerships
+1. **How would you handle fake news detection?** - Cross-reference claims across sources, source credibility scoring, fact-checking partnerships
 
-2. **How would you handle a source that changes its layout?**
-   - Monitor extraction success rates
-   - Automatic layout learning
-   - Fallback to RSS if available
+2. **How would you handle a source that changes its layout?** - Monitor extraction success rates, automatic layout learning, fallback to RSS if available
 
-3. **How would you personalize for new users?**
-   - Onboarding topic selection
-   - Location-based defaults
-   - Popular/trending until profile builds
+3. **How would you personalize for new users?** - Onboarding topic selection, location-based defaults, popular/trending until profile builds

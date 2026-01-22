@@ -33,6 +33,8 @@ Design the backend infrastructure for an AI-powered command-line coding assistan
 - Session history: Thousands of messages across sessions
 - Tool execution cache: 500 entries per session
 
+---
+
 ## High-Level Architecture
 
 ```
@@ -72,317 +74,227 @@ Design the backend infrastructure for an AI-powered command-line coding assistan
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
 ## Deep Dive: LLM Provider Abstraction
 
-### Provider Interface
+### Provider Interface Design
 
-```typescript
-interface LLMProvider {
-  name: string;
+"I would design a provider abstraction layer that normalizes the differences between LLM APIs. Each provider implements a common interface with methods for streaming completion, token counting, and tool formatting."
 
-  complete(request: CompletionRequest): Promise<CompletionResponse>;
-  stream(request: CompletionRequest): AsyncIterable<StreamChunk>;
-  countTokens(text: string): number;
-}
-
-interface CompletionRequest {
-  messages: Message[];
-  tools?: ToolDefinition[];
-  maxTokens?: number;
-  temperature?: number;
-  stopSequences?: string[];
-}
-
-interface StreamChunk {
-  type: 'text' | 'tool_call_start' | 'tool_call_delta' | 'tool_call_end';
-  content?: string;
-  toolCall?: Partial<ToolCall>;
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      LLM Provider Layer                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────────┐                                             │
+│  │  LLMProvider   │◀──── Interface                              │
+│  │   Interface    │                                             │
+│  ├────────────────┤                                             │
+│  │ complete()     │                                             │
+│  │ stream()       │                                             │
+│  │ countTokens()  │                                             │
+│  └───────┬────────┘                                             │
+│          │                                                       │
+│          ├──────────────────┬──────────────────┐                │
+│          ▼                  ▼                  ▼                │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐        │
+│  │  Anthropic   │   │   OpenAI     │   │    Local     │        │
+│  │   Provider   │   │   Provider   │   │   Provider   │        │
+│  └──────────────┘   └──────────────┘   └──────────────┘        │
+│          │                  │                  │                 │
+│          ▼                  ▼                  ▼                 │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐        │
+│  │ Claude API   │   │ GPT-4 API    │   │ Ollama/LMStudio       │
+│  └──────────────┘   └──────────────┘   └──────────────┘        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Anthropic Implementation
-
-```typescript
-class AnthropicProvider implements LLMProvider {
-  private client: Anthropic;
-
-  async *stream(request: CompletionRequest): AsyncIterable<StreamChunk> {
-    const stream = await this.client.messages.stream({
-      model: 'claude-sonnet-4-20250514',
-      messages: this.formatMessages(request.messages),
-      tools: this.formatTools(request.tools),
-      max_tokens: request.maxTokens || 4096
-    });
-
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta') {
-        if (event.delta.type === 'text_delta') {
-          yield { type: 'text', content: event.delta.text };
-        } else if (event.delta.type === 'input_json_delta') {
-          yield { type: 'tool_call_delta', content: event.delta.partial_json };
-        }
-      }
-    }
-  }
-}
-```
-
-### OpenAI Implementation
-
-```typescript
-class OpenAIProvider implements LLMProvider {
-  private client: OpenAI;
-
-  async *stream(request: CompletionRequest): AsyncIterable<StreamChunk> {
-    const stream = await this.client.chat.completions.create({
-      model: 'gpt-4-turbo',
-      messages: this.formatMessages(request.messages),
-      tools: this.formatTools(request.tools),
-      stream: true
-    });
-
-    for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta;
-      if (delta?.content) {
-        yield { type: 'text', content: delta.content };
-      }
-      if (delta?.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          yield { type: 'tool_call_delta', toolCall: tc };
-        }
-      }
-    }
-  }
-}
-```
+**Key Provider Responsibilities:**
+- **complete()**: Non-streaming completion returning full response
+- **stream()**: Async iterable yielding text chunks and tool calls
+- **countTokens()**: Estimate token count for context budgeting
+- **formatMessages()**: Convert internal format to provider-specific format
+- **formatTools()**: Convert tool definitions to provider schema
 
 ### Retry Configuration
 
-```typescript
-const retryConfig = {
-  maxRetries: 3,
-  initialDelayMs: 1000,
-  maxDelayMs: 10000,
-  backoffMultiplier: 2,
-  retryableErrors: [
-    'rate_limit_exceeded',
-    'overloaded',
-    'timeout',
-    'connection_error'
-  ]
-};
-```
+| Config Parameter | Value | Rationale |
+|-----------------|-------|-----------|
+| maxRetries | 3 | Balance reliability vs latency |
+| initialDelayMs | 1000 | Allow transient issues to resolve |
+| maxDelayMs | 10000 | Cap wait time for user experience |
+| backoffMultiplier | 2 | Exponential backoff for rate limits |
+| retryableErrors | rate_limit, overloaded, timeout | Only retry recoverable errors |
+
+---
 
 ## Deep Dive: Context Window Management
 
 ### The Problem
 
-- LLM context windows are large but finite (128K-200K tokens)
-- Long coding sessions easily exceed limits
-- Tool outputs (file contents) can be huge
+"LLM context windows are large but finite (128K-200K tokens). Long coding sessions easily exceed limits, and tool outputs like file contents can be huge. We need a multi-strategy approach to stay within budget while preserving conversation intent."
 
 ### Token Budgeting
 
 ```
-Total: 128K tokens
-
-System prompt:     2K (fixed)
-Recent messages:  30K (last 10 turns)
-Tool definitions:  5K (fixed)
-Context summary:  10K (compressed history)
-File cache:       40K (recently read files)
-Response buffer:  40K (for LLM output)
-```
-
-### Multi-Strategy Compression
-
-```typescript
-class ContextManager {
-  private maxTokens: number;
-  private tokenizer: Tokenizer;
-  private summarizer: Summarizer;
-
-  constructor(maxTokens: number = 128000) {
-    this.maxTokens = maxTokens;
-  }
-
-  async addMessage(message: Message): Promise<void> {
-    const tokens = this.tokenizer.count(message.content);
-
-    // Check if we need to compress
-    if (this.currentTokens + tokens > this.maxTokens * 0.9) {
-      await this.compressContext();
-    }
-
-    this.messages.push(message);
-  }
-
-  private async compressContext(): Promise<void> {
-    // Strategy 1: Summarize old messages
-    const oldMessages = this.messages.slice(0, -10);
-    const recentMessages = this.messages.slice(-10);
-
-    if (oldMessages.length > 0) {
-      const summary = await this.summarizer.summarize(oldMessages);
-      this.messages = [
-        { role: 'system', content: `Previous context summary:\n${summary}` },
-        ...recentMessages
-      ];
-    }
-
-    // Strategy 2: Truncate large tool outputs
-    for (const msg of this.messages) {
-      if (msg.role === 'tool' && msg.content.length > 10000) {
-        msg.content = msg.content.slice(0, 5000) +
-          '\n... [truncated] ...\n' +
-          msg.content.slice(-2000);
-      }
-    }
-  }
-
-  getMessages(): Message[] {
-    return [
-      { role: 'system', content: this.systemPrompt },
-      ...this.messages
-    ];
-  }
-}
+┌─────────────────────────────────────────────────────────────────┐
+│                 Token Budget (128K Total)                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ System Prompt                                    2K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Tool Definitions                                 5K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Context Summary (compressed history)            10K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Recent Messages (last 10 turns)                 30K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ File Cache (recently read files)                40K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Response Buffer (for LLM output)                40K tokens │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Compression Strategies
 
-1. **Summarization** - Compress old conversation into summary
-2. **Truncation** - Cut long tool outputs
-3. **Selective retention** - Keep recent messages, system prompt
-4. **Rolling window** - Fixed number of recent turns
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Context Compression Flow                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │ New Message  │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐    No     ┌──────────────┐                   │
+│  │ Over 90%     │──────────▶│ Add Message  │                   │
+│  │ Capacity?    │           │ to Context   │                   │
+│  └──────┬───────┘           └──────────────┘                   │
+│         │ Yes                                                    │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                 Compression Pipeline                      │  │
+│  ├──────────────────────────────────────────────────────────┤  │
+│  │ 1. Summarize old messages ──▶ Keep last 10 turns         │  │
+│  │ 2. Truncate large tool outputs ──▶ Head + tail only      │  │
+│  │ 3. Remove duplicate file reads ──▶ Keep latest version   │  │
+│  │ 4. Compress file diffs ──▶ Summary of changes            │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │ Add Message  │                                               │
+│  └──────────────┘                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Strategy Details:**
+1. **Summarization**: Use LLM to compress old conversation into a summary
+2. **Truncation**: Keep first 5K + last 2K chars of large tool outputs
+3. **Selective Retention**: Always preserve system prompt and recent turns
+4. **Rolling Window**: Fixed number of recent messages (typically 10)
+
+---
 
 ## Deep Dive: Tool Execution and Idempotency
 
-### Tool Interface
+### Tool System Architecture
 
-```typescript
-interface Tool {
-  name: string;
-  description: string;
-  parameters: JSONSchema;
-  requiresApproval: boolean | ((params: unknown) => boolean);
+"Each tool receives a unique ID from the LLM. This enables idempotent execution - if we retry a request, we can return cached results instead of re-executing potentially destructive operations."
 
-  execute(params: unknown, context: ToolContext): Promise<ToolResult>;
-}
-
-interface ToolContext {
-  workingDirectory: string;
-  permissions: PermissionSet;
-  abortSignal: AbortSignal;
-}
-
-interface ToolResult {
-  success: boolean;
-  output?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-}
 ```
-
-### Idempotent Tool Executor
-
-Each tool call receives a unique ID from the LLM. This ID is used to prevent duplicate execution on retry, cache results for replay, and track execution history.
-
-```typescript
-interface IdempotentToolExecutor {
-  private executionCache: Map<string, ToolResult>;
-  private cacheFile: string;
-
-  async execute(toolCall: ToolCall): Promise<ToolResult> {
-    const idempotencyKey = toolCall.id; // UUID from LLM
-
-    // Check if already executed
-    if (this.executionCache.has(idempotencyKey)) {
-      console.log(`[Replay] Using cached result for ${toolCall.name}`);
-      return this.executionCache.get(idempotencyKey)!;
-    }
-
-    // Execute and cache
-    const result = await this.tools.get(toolCall.name)!.execute(
-      toolCall.params,
-      this.context
-    );
-
-    this.executionCache.set(idempotencyKey, result);
-    await this.persistCache(); // Survive process restarts
-
-    return result;
-  }
-
-  // Expire old entries (older than current session)
-  async cleanupCache(): Promise<void> {
-    const sessionStart = this.session.startedAt.getTime();
-    for (const [key, result] of this.executionCache) {
-      if (result.timestamp < sessionStart) {
-        this.executionCache.delete(key);
-      }
-    }
-  }
-}
+┌─────────────────────────────────────────────────────────────────┐
+│                      Tool Execution Flow                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │  Tool Call   │                                               │
+│  │  from LLM    │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐    Yes    ┌──────────────┐                   │
+│  │ In Cache?    │──────────▶│ Return       │                   │
+│  │ (by call ID) │           │ Cached Result│                   │
+│  └──────┬───────┘           └──────────────┘                   │
+│         │ No                                                     │
+│         ▼                                                        │
+│  ┌──────────────┐    Denied  ┌──────────────┐                  │
+│  │ Check        │───────────▶│ Return Error │                  │
+│  │ Permissions  │            │ "Not Allowed"│                  │
+│  └──────┬───────┘            └──────────────┘                  │
+│         │ Granted                                                │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │ Execute Tool │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │ Cache Result │                                               │
+│  │ Persist      │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────┐                                               │
+│  │ Return Result│                                               │
+│  └──────────────┘                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### File Edit Conflict Resolution
 
-```typescript
-interface EditOperation {
-  filePath: string;
-  oldString: string;
-  newString: string;
-  expectedChecksum?: string; // SHA256 of file at read time
-}
-
-class ConflictAwareEditor {
-  async edit(operation: EditOperation): Promise<EditResult> {
-    const currentContent = await fs.readFile(operation.filePath, 'utf-8');
-    const currentChecksum = this.checksum(currentContent);
-
-    // Detect if file changed since last read
-    if (operation.expectedChecksum &&
-        operation.expectedChecksum !== currentChecksum) {
-      return {
-        success: false,
-        error: 'File modified since last read. Please read again.',
-        conflictType: 'stale_read',
-        suggestion: 'Use Read tool to get current content'
-      };
-    }
-
-    // Check uniqueness of old_string
-    const occurrences = currentContent.split(operation.oldString).length - 1;
-
-    if (occurrences === 0) {
-      return {
-        success: false,
-        error: 'String not found - may have been edited',
-        conflictType: 'missing_target'
-      };
-    }
-
-    if (occurrences > 1 && !operation.replaceAll) {
-      return {
-        success: false,
-        error: `Ambiguous: found ${occurrences} occurrences`,
-        conflictType: 'ambiguous_target',
-        suggestion: 'Provide more context or use replace_all'
-      };
-    }
-
-    // Perform edit with atomic write
-    const newContent = currentContent.replace(operation.oldString, operation.newString);
-    await this.atomicWriter.write(operation.filePath, newContent);
-
-    return { success: true, newChecksum: this.checksum(newContent) };
-  }
-
-  private checksum(content: string): string {
-    return crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Edit Conflict Detection                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │ Edit Request │                                               │
+│  │ old_string   │                                               │
+│  │ new_string   │                                               │
+│  │ checksum     │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. Read current file content                               │ │
+│  │ 2. Compute current checksum (SHA256)                       │ │
+│  │ 3. Compare with expected checksum                          │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│         │                                                        │
+│    ┌────┴────┐                                                   │
+│    ▼         ▼                                                   │
+│  Match    Mismatch ──▶ "File modified since last read"         │
+│    │                                                             │
+│    ▼                                                             │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Count occurrences of old_string                            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│         │                                                        │
+│    ┌────┼────────┐                                               │
+│    ▼    ▼        ▼                                               │
+│   0     1       >1                                               │
+│   │     │        │                                               │
+│   ▼     ▼        ▼                                               │
+│ "Not  Apply   "Ambiguous:                                       │
+│ found" edit    use more context                                 │
+│                or replace_all"                                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Retry Semantics
@@ -394,6 +306,8 @@ class ConflictAwareEditor {
 | File Edit | Conflict detection | Fails if file changed |
 | Bash Command | Not automatically retried | User must approve re-execution |
 | LLM API Call | Automatic retry with backoff | 3 attempts, exponential delay |
+
+---
 
 ## Deep Dive: Caching Strategy
 
@@ -412,90 +326,46 @@ class ConflictAwareEditor {
 │       ▼                    ▼                    ▼               │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │                    Cache Usage                            │  │
-│  │  • File content checksums (5 min TTL)                    │  │
-│  │  • LLM response cache for identical prompts (10 min)     │  │
-│  │  • Tool execution results by idempotency key             │  │
-│  │  • Session state (persisted on change)                   │  │
+│  │  - File content checksums (5 min TTL)                    │  │
+│  │  - LLM response cache for identical prompts (10 min)     │  │
+│  │  - Tool execution results by idempotency key             │  │
+│  │  - Session state (persisted on change)                   │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Cache-Aside Pattern
+### Cache Patterns
 
-```typescript
-class CacheAside<T> {
-  private cache: LRUCache<string, CacheEntry<T>>;
-
-  constructor(options: { maxSize: number; defaultTtlMs: number }) {
-    this.cache = new LRUCache({
-      max: options.maxSize,
-      ttl: options.defaultTtlMs
-    });
-  }
-
-  async get(key: string, loader: () => Promise<T>): Promise<T> {
-    // Check cache first
-    const cached = this.cache.get(key);
-    if (cached && !this.isExpired(cached)) {
-      return cached.value;
-    }
-
-    // Cache miss - load from source
-    const value = await loader();
-
-    // Store in cache
-    this.cache.set(key, {
-      value,
-      timestamp: Date.now()
-    });
-
-    return value;
-  }
-
-  invalidate(key: string): void {
-    this.cache.delete(key);
-  }
-
-  invalidatePattern(pattern: RegExp): void {
-    for (const key of this.cache.keys()) {
-      if (pattern.test(key)) {
-        this.cache.delete(key);
-      }
-    }
-  }
-}
 ```
-
-### Write-Through for Critical State
-
-```typescript
-class WriteThrough<T> {
-  private cache: Map<string, T>;
-  private storage: Storage;
-
-  async set(key: string, value: T): Promise<void> {
-    // Write to storage first (source of truth)
-    await this.storage.write(key, value);
-
-    // Then update cache
-    this.cache.set(key, value);
-  }
-
-  async get(key: string): Promise<T | undefined> {
-    // Always check cache first (it's in sync due to write-through)
-    if (this.cache.has(key)) {
-      return this.cache.get(key);
-    }
-
-    // Cold start - load from storage
-    const value = await this.storage.read(key);
-    if (value) {
-      this.cache.set(key, value);
-    }
-    return value;
-  }
-}
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cache-Aside Pattern                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Application ──▶ Cache ──▶ Hit? ──▶ Yes ──▶ Return cached      │
+│                              │                                   │
+│                              ▼ No                                │
+│                           Load from source                       │
+│                              │                                   │
+│                              ▼                                   │
+│                           Store in cache                         │
+│                              │                                   │
+│                              ▼                                   │
+│                           Return value                           │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                   Write-Through Pattern                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Application ──▶ Write to storage (source of truth)             │
+│                              │                                   │
+│                              ▼                                   │
+│                           Update cache                           │
+│                              │                                   │
+│                              ▼                                   │
+│                           Return success                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Cache Configuration
@@ -508,205 +378,143 @@ class WriteThrough<T> {
 | Session state | Write-through | Persistent | N/A | Never (explicit save) |
 | Glob results | Cache-aside | 30 sec | 200 entries | On any file change |
 
-### File Watcher for Cache Invalidation
+### File Watcher Integration
 
-```typescript
-class CacheInvalidator {
-  private watcher: FSWatcher;
-  private caches: Map<string, CacheAside<unknown>>;
-
-  constructor(workingDir: string) {
-    this.watcher = chokidar.watch(workingDir, {
-      ignoreInitial: true,
-      ignored: ['node_modules', '.git']
-    });
-
-    this.watcher.on('all', (event, path) => {
-      this.handleFileChange(event, path);
-    });
-  }
-
-  private handleFileChange(event: string, filePath: string): void {
-    // Invalidate file checksum cache
-    this.caches.get('fileChecksums')?.invalidate(filePath);
-
-    // Invalidate glob caches that might include this file
-    this.caches.get('globResults')?.invalidatePattern(
-      new RegExp(path.dirname(filePath))
-    );
-
-    // Invalidate grep results
-    this.caches.get('grepResults')?.invalidatePattern(/./);
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Cache Invalidation Flow                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │ File System  │                                               │
+│  │   Watcher    │                                               │
+│  └──────┬───────┘                                               │
+│         │ File changed event                                     │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Invalidation Dispatcher                      │  │
+│  ├──────────────────────────────────────────────────────────┤  │
+│  │ 1. Invalidate file checksum cache ──▶ exact path        │  │
+│  │ 2. Invalidate glob caches ──▶ matching directories       │  │
+│  │ 3. Invalidate grep results ──▶ all (content changed)     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Ignored paths: node_modules, .git                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Session Persistence
 
-### Session Structure
+### Session Data Structure
 
-```typescript
-interface Session {
-  id: string;
-  workingDirectory: string;
-  startedAt: Date;
-  messages: Message[];
-  permissions: Permission[];
-  settings: SessionSettings;
-}
-
-class SessionManager {
-  private sessionDir: string;
-
-  constructor() {
-    this.sessionDir = path.join(os.homedir(), '.ai-assistant', 'sessions');
-  }
-
-  async create(workingDir: string): Promise<Session> {
-    const session: Session = {
-      id: crypto.randomUUID(),
-      workingDirectory: workingDir,
-      startedAt: new Date(),
-      messages: [],
-      permissions: [],
-      settings: this.loadDefaultSettings()
-    };
-
-    await this.save(session);
-    return session;
-  }
-
-  async resume(sessionId: string): Promise<Session | null> {
-    const sessionPath = path.join(this.sessionDir, `${sessionId}.json`);
-
-    if (await fs.pathExists(sessionPath)) {
-      const data = await fs.readJson(sessionPath);
-      return data as Session;
-    }
-
-    return null;
-  }
-
-  async save(session: Session): Promise<void> {
-    const sessionPath = path.join(this.sessionDir, `${session.id}.json`);
-    await fs.ensureDir(this.sessionDir);
-    await fs.writeJson(sessionPath, session, { spaces: 2 });
-  }
-
-  async list(): Promise<SessionSummary[]> {
-    const files = await fs.readdir(this.sessionDir);
-    const sessions: SessionSummary[] = [];
-
-    for (const file of files) {
-      if (file.endsWith('.json')) {
-        const session = await fs.readJson(path.join(this.sessionDir, file));
-        sessions.push({
-          id: session.id,
-          workingDirectory: session.workingDirectory,
-          startedAt: session.startedAt,
-          messageCount: session.messages.length
-        });
-      }
-    }
-
-    return sessions.sort((a, b) =>
-      new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
-    );
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Session Structure                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Session                                                         │
+│  ├── id: UUID                                                   │
+│  ├── workingDirectory: string                                   │
+│  ├── startedAt: Date                                            │
+│  ├── messages: Message[]                                        │
+│  │   ├── role: "user" | "assistant" | "tool"                   │
+│  │   ├── content: string                                        │
+│  │   └── toolCalls?: ToolCall[]                                │
+│  ├── permissions: Permission[]                                  │
+│  │   ├── pattern: string                                        │
+│  │   ├── action: "allow" | "deny"                              │
+│  │   └── scope: "session" | "always"                           │
+│  └── settings: SessionSettings                                  │
+│      ├── model: string                                          │
+│      ├── maxTokens: number                                      │
+│      └── temperature: number                                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Atomic File Write Pattern
 
-```typescript
-class AtomicFileWriter {
-  async write(filePath: string, content: string): Promise<void> {
-    const tempPath = `${filePath}.tmp.${Date.now()}`;
+"Session data must survive crashes. I use the atomic write pattern: write to temp file, sync to disk, then rename. This ensures we never have partial writes."
 
-    try {
-      // Write to temp file
-      await fs.writeFile(tempPath, content, 'utf-8');
-
-      // Sync to disk before rename
-      const fd = await fs.open(tempPath, 'r');
-      await fd.sync();
-      await fd.close();
-
-      // Atomic rename
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      // Clean up temp file on failure
-      await fs.unlink(tempPath).catch(() => {});
-      throw error;
-    }
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Atomic Write Flow                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                                               │
+│  │ Write Data   │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ 1. Create temp file: session.json.tmp.{timestamp}        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ 2. Write content to temp file                            │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ 3. fsync() - ensure data is on disk                      │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ 4. Atomic rename: temp → session.json                    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                                                        │
+│    ┌────┴────┐                                                   │
+│    ▼         ▼                                                   │
+│ Success   Failure                                                │
+│    │         │                                                   │
+│    ▼         ▼                                                   │
+│  Done     Cleanup temp file                                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Session Storage Location
+
+Sessions are stored in the user's home directory under `.ai-assistant/sessions/`:
+- Each session is a JSON file named by UUID
+- Sessions can be listed, resumed, or deleted
+- Automatic cleanup of sessions older than 30 days (configurable)
+
+---
 
 ## Deep Dive: Observability
 
-### Metrics Collection
+### Metrics Categories
 
-```typescript
-interface Metrics {
-  // Counters
-  toolExecutionCount: Counter;
-  llmApiCalls: Counter;
-  permissionDenials: Counter;
-  cacheHits: Counter;
-  cacheMisses: Counter;
-  errors: Counter;
-
-  // Histograms
-  toolExecutionDuration: Histogram;
-  llmResponseTime: Histogram;
-  contextTokenCount: Histogram;
-
-  // Gauges
-  activeContextTokens: Gauge;
-  cachedEntries: Gauge;
-  sessionMessageCount: Gauge;
-}
-
-class MetricsCollector {
-  private metrics: Map<string, number[]> = new Map();
-  private counters: Map<string, number> = new Map();
-  private gauges: Map<string, number> = new Map();
-
-  // Counter operations
-  increment(name: string, labels?: Record<string, string>): void {
-    const key = this.labeledKey(name, labels);
-    this.counters.set(key, (this.counters.get(key) || 0) + 1);
-  }
-
-  // Histogram operations
-  observe(name: string, value: number, labels?: Record<string, string>): void {
-    const key = this.labeledKey(name, labels);
-    const values = this.metrics.get(key) || [];
-    values.push(value);
-    this.metrics.set(key, values);
-  }
-
-  // Gauge operations
-  set(name: string, value: number): void {
-    this.gauges.set(name, value);
-  }
-
-  // Export in Prometheus format
-  toPrometheusFormat(): string {
-    const lines: string[] = [];
-
-    for (const [key, value] of this.counters) {
-      lines.push(`${key}_total ${value}`);
-    }
-
-    for (const [key, value] of this.gauges) {
-      lines.push(`${key} ${value}`);
-    }
-
-    return lines.join('\n');
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Metrics System                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Counters                                                        │
+│  ├── tool_execution_count{tool, status}                        │
+│  ├── llm_api_calls{provider, model}                            │
+│  ├── permission_denials{tool, pattern}                         │
+│  ├── cache_hits{cache_type}                                    │
+│  ├── cache_misses{cache_type}                                  │
+│  └── errors{type, source}                                       │
+│                                                                  │
+│  Histograms                                                      │
+│  ├── tool_execution_duration_seconds{tool}                     │
+│  ├── llm_response_time_seconds{provider}                       │
+│  └── context_token_count{phase}                                │
+│                                                                  │
+│  Gauges                                                          │
+│  ├── active_context_tokens                                      │
+│  ├── cached_entries{cache_type}                                │
+│  └── session_message_count                                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Metrics and SLIs
@@ -722,79 +530,38 @@ class MetricsCollector {
 
 ### Structured Logging
 
-```typescript
-interface LogEntry {
-  timestamp: string;
-  level: 'debug' | 'info' | 'warn' | 'error';
-  message: string;
-  context: {
-    sessionId?: string;
-    toolName?: string;
-    traceId?: string;
-    spanId?: string;
-  };
-  metadata?: Record<string, unknown>;
-}
-
-class StructuredLogger {
-  private logFile: WriteStream;
-  private level: LogLevel;
-
-  log(level: LogLevel, message: string, context?: Partial<LogEntry['context']>): void {
-    if (this.shouldLog(level)) {
-      const entry: LogEntry = {
-        timestamp: new Date().toISOString(),
-        level,
-        message,
-        context: {
-          sessionId: this.currentSessionId,
-          traceId: this.currentTraceId,
-          ...context
-        }
-      };
-
-      // Console output (human-readable)
-      this.writeConsole(entry);
-
-      // File output (JSON for parsing)
-      this.writeFile(entry);
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Log Entry Structure                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  LogEntry                                                        │
+│  ├── timestamp: ISO 8601                                        │
+│  ├── level: debug | info | warn | error                        │
+│  ├── message: string                                            │
+│  ├── context                                                    │
+│  │   ├── sessionId: UUID                                       │
+│  │   ├── toolName: string (optional)                           │
+│  │   ├── traceId: UUID (for request correlation)              │
+│  │   └── spanId: UUID (for operation tracking)                │
+│  └── metadata: key-value pairs                                  │
+│                                                                  │
+│  Output Destinations                                             │
+│  ├── Console: Human-readable colored output                    │
+│  └── File: JSON lines for parsing and aggregation              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Alert Rules
+### Alert Rules Summary
 
-```yaml
-groups:
-  - name: evylcode-alerts
-    rules:
-      - alert: HighLLMLatency
-        expr: histogram_quantile(0.95, rate(llm_response_time_seconds_bucket[5m])) > 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "LLM API response time is high"
-          description: "p95 latency is {{ $value }}s (threshold: 10s)"
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| HighLLMLatency | p95 latency > 10s for 5m | Warning |
+| LLMAPIErrors | Error rate > 0.1/s for 2m | Critical |
+| ContextWindowNearLimit | Usage > 90% for 1m | Warning |
 
-      - alert: LLMAPIErrors
-        expr: rate(llm_api_errors_total[5m]) > 0.1
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "LLM API errors detected"
-          description: "Error rate: {{ $value }}/s"
-
-      - alert: ContextWindowNearLimit
-        expr: context_tokens_used / context_tokens_max > 0.9
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Context window nearly full"
-```
+---
 
 ## Trade-offs Summary
 
@@ -806,6 +573,8 @@ groups:
 | Idempotent tool execution | Reliable retry, replay capability | Memory/storage overhead for cache |
 | Atomic file writes | Prevents corruption | Requires temp files, slight overhead |
 | Summarization compression | Preserves context intent | Information loss, LLM cost |
+
+---
 
 ## Future Backend Enhancements
 

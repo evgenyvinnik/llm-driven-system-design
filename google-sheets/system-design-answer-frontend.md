@@ -30,38 +30,39 @@
 ## 2. Frontend Architecture Overview (5 minutes)
 
 ```
-+------------------------------------------------------------------+
-|                        SpreadsheetApp                              |
-|  +-------------------------------------------------------------+  |
-|  |                         Toolbar                              |  |
-|  |  [FormatButtons] [FormulaBar] [ShareButton] [UndoRedo]      |  |
-|  +-------------------------------------------------------------+  |
-|  +-------------------------------------------------------------+  |
-|  |                      SheetTabs                               |  |
-|  |  [ Sheet1 ] [ Sheet2 ] [ + ]                                 |  |
-|  +-------------------------------------------------------------+  |
-|  +-------------------------------------------------------------+  |
-|  |                    SpreadsheetGrid                           |  |
-|  |  +----------+----------------------------------------+       |  |
-|  |  | Corner   |         ColumnHeaders                  |       |  |
-|  |  +----------+----------------------------------------+       |  |
-|  |  |  Row     |                                        |       |  |
-|  |  | Headers  |        VirtualizedCells               |       |  |
-|  |  |          |   +---------+---------+---------+      |       |  |
-|  |  |   1      |   |   A1    |   B1    |   C1    |      |       |  |
-|  |  |   2      |   |   A2    |   B2    |   C2    |      |       |  |
-|  |  |   3      |   |   A3    |   B3    |   C3    |      |       |  |
-|  |  |          |   +---------+---------+---------+      |       |  |
-|  |  +----------+----------------------------------------+       |  |
-|  |                                                              |  |
-|  |  +-------------------+  +-------------------------+          |  |
-|  |  | SelectionOverlay  |  | CollaboratorCursors    |          |  |
-|  |  +-------------------+  +-------------------------+          |  |
-|  +-------------------------------------------------------------+  |
-|  +-------------------------------------------------------------+  |
-|  |                       StatusBar                              |  |
-|  +-------------------------------------------------------------+  |
-+------------------------------------------------------------------+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              SpreadsheetApp                                   │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                              Toolbar                                    │  │
+│  │   [FormatButtons]  [FormulaBar]  [ShareButton]  [UndoRedo]             │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                             SheetTabs                                   │  │
+│  │   [ Sheet1 ]  [ Sheet2 ]  [ + ]                                        │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                          SpreadsheetGrid                                │  │
+│  │  ┌──────────┬───────────────────────────────────────────────────────┐  │  │
+│  │  │  Corner  │                  ColumnHeaders                         │  │  │
+│  │  ├──────────┼───────────────────────────────────────────────────────┤  │  │
+│  │  │   Row    │                                                        │  │  │
+│  │  │ Headers  │              VirtualizedCells                          │  │  │
+│  │  │          │   ┌─────────┬─────────┬─────────┬─────────┐           │  │  │
+│  │  │    1     │   │   A1    │   B1    │   C1    │   D1    │           │  │  │
+│  │  │    2     │   ├─────────┼─────────┼─────────┼─────────┤           │  │  │
+│  │  │    3     │   │   A2    │   B2    │   C2    │   D2    │           │  │  │
+│  │  │    4     │   ├─────────┼─────────┼─────────┼─────────┤           │  │  │
+│  │  │          │   │   A3    │   B3    │   C3    │   D3    │           │  │  │
+│  │  └──────────┴───┴─────────┴─────────┴─────────┴─────────┘           │  │  │
+│  │                                                                      │  │  │
+│  │  ┌─────────────────────┐   ┌──────────────────────────────┐         │  │  │
+│  │  │  SelectionOverlay   │   │    CollaboratorCursors       │         │  │  │
+│  │  └─────────────────────┘   └──────────────────────────────┘         │  │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                             StatusBar                                   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Responsibilities
@@ -90,120 +91,53 @@ Rendering millions of cells is impossible:
 
 ### Solution: Dual-Axis Virtualization
 
-```typescript
-import { useVirtualizer } from '@tanstack/react-virtual';
+"I chose dual-axis virtualization because spreadsheets require independent row and column virtualization. Unlike a simple list, both dimensions can be massive."
 
-function SpreadsheetGrid() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { columnWidths, rowHeights } = useSpreadsheetStore();
-
-  // Vertical virtualization (rows)
-  const rowVirtualizer = useVirtualizer({
-    count: 1_000_000,  // Logical row count
-    getScrollElement: () => containerRef.current,
-    estimateSize: (index) => rowHeights.get(index) ?? 32,
-    overscan: 10,  // Render 10 extra rows above/below
-  });
-
-  // Horizontal virtualization (columns)
-  const colVirtualizer = useVirtualizer({
-    horizontal: true,
-    count: 16_384,  // Excel column count
-    getScrollElement: () => containerRef.current,
-    estimateSize: (index) => columnWidths.get(index) ?? 100,
-    overscan: 5,
-  });
-
-  const visibleRows = rowVirtualizer.getVirtualItems();
-  const visibleCols = colVirtualizer.getVirtualItems();
-
-  return (
-    <div
-      ref={containerRef}
-      className="overflow-auto relative"
-      style={{ height: '100%', width: '100%' }}
-    >
-      {/* Virtual grid content */}
-      <div
-        style={{
-          height: rowVirtualizer.getTotalSize(),
-          width: colVirtualizer.getTotalSize(),
-          position: 'relative',
-        }}
-      >
-        {visibleRows.map((virtualRow) =>
-          visibleCols.map((virtualCol) => (
-            <Cell
-              key={`${virtualRow.index}-${virtualCol.index}`}
-              row={virtualRow.index}
-              col={virtualCol.index}
-              style={{
-                position: 'absolute',
-                top: virtualRow.start,
-                left: virtualCol.start,
-                height: virtualRow.size,
-                width: virtualCol.size,
-              }}
-            />
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Virtualization Concept                             │
+│                                                                              │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │                     Logical Grid (1M x 16K)                            │ │
+│   │   ┌─────────────────────────────────────────────────────────────────┐ │ │
+│   │   │                                                                  │ │ │
+│   │   │                                                                  │ │ │
+│   │   │       ┌────────────────────────────────┐                        │ │ │
+│   │   │       │   Visible Viewport             │                        │ │ │
+│   │   │       │   (only ~600 cells rendered)   │                        │ │ │
+│   │   │       │                                │                        │ │ │
+│   │   │       │   overscan: 10 rows above/below│                        │ │ │
+│   │   │       │   overscan: 5 cols left/right  │                        │ │ │
+│   │   │       └────────────────────────────────┘                        │ │ │
+│   │   │                                                                  │ │ │
+│   │   │                                                                  │ │ │
+│   │   └─────────────────────────────────────────────────────────────────┘ │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Row Virtualizer Configuration:**
+- count: 1,000,000 logical rows
+- estimateSize: returns row height from Map or default (32px)
+- overscan: 10 extra rows above/below viewport
+
+**Column Virtualizer Configuration:**
+- horizontal: true
+- count: 16,384 columns
+- estimateSize: returns column width from Map or default (100px)
+- overscan: 5 extra columns left/right
 
 ### Variable Row/Column Sizes
 
-```typescript
-interface DimensionStore {
-  columnWidths: Map<number, number>;  // Sparse: only non-default
-  rowHeights: Map<number, number>;
+Dimension data stored in sparse Maps:
+- columnWidths: Map<number, number> - only stores non-default widths
+- rowHeights: Map<number, number> - only stores non-default heights
 
-  setColumnWidth: (col: number, width: number) => void;
-  setRowHeight: (row: number, height: number) => void;
-
-  getColumnWidth: (col: number) => number;
-  getRowHeight: (row: number) => number;
-}
-
-const DEFAULT_COLUMN_WIDTH = 100;
-const DEFAULT_ROW_HEIGHT = 32;
-
-// Resize handle implementation
-function ColumnResizeHandle({ col }: { col: number }) {
-  const { setColumnWidth, getColumnWidth } = useSpreadsheetStore();
-  const startX = useRef(0);
-  const startWidth = useRef(0);
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    startX.current = e.clientX;
-    startWidth.current = getColumnWidth(col);
-
-    const handleMouseMove = (e: MouseEvent) => {
-      const delta = e.clientX - startX.current;
-      const newWidth = Math.max(50, startWidth.current + delta);
-      setColumnWidth(col, newWidth);
-    };
-
-    const handleMouseUp = () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-  };
-
-  return (
-    <div
-      className="absolute right-0 top-0 w-1 h-full cursor-col-resize
-                 hover:bg-blue-400 active:bg-blue-600"
-      onMouseDown={handleMouseDown}
-    />
-  );
-}
-```
+**Resize Handle Pattern:**
+- Mouse down captures start position and current width
+- Mouse move calculates delta and updates store
+- Mouse up removes listeners
+- Minimum width enforced (50px)
 
 ### Memory Efficiency
 
@@ -218,148 +152,79 @@ function ColumnResizeHandle({ col }: { col: number }) {
 
 ### Store Structure
 
-```typescript
-interface SpreadsheetStore {
-  // Document state
-  spreadsheetId: string;
-  sheets: Sheet[];
-  activeSheetId: string;
-
-  // Sparse cell data
-  cells: Map<string, CellData>;  // Key: "sheetId-row-col"
-
-  // Selection state
-  activeCell: { row: number; col: number } | null;
-  selection: CellRange | null;
-  isEditing: boolean;
-  editValue: string;
-
-  // Collaborators
-  collaborators: Map<string, Collaborator>;
-
-  // Dimensions (sparse)
-  columnWidths: Map<number, number>;
-  rowHeights: Map<number, number>;
-
-  // History
-  undoStack: Operation[];
-  redoStack: Operation[];
-  canUndo: boolean;
-  canRedo: boolean;
-
-  // Actions
-  setCell: (row: number, col: number, value: string) => void;
-  setActiveCell: (row: number, col: number) => void;
-  setSelection: (range: CellRange | null) => void;
-  startEditing: (initialValue?: string) => void;
-  commitEdit: () => void;
-  cancelEdit: () => void;
-
-  // Collaboration
-  updateCollaborator: (collaborator: Collaborator) => void;
-  removeCollaborator: (userId: string) => void;
-
-  // History
-  undo: () => void;
-  redo: () => void;
-  pushHistory: (operation: Operation) => void;
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SpreadsheetStore                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Document State                                                              │
+│  ├── spreadsheetId: string                                                   │
+│  ├── sheets: Sheet[]                                                         │
+│  └── activeSheetId: string                                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Sparse Cell Data                                                            │
+│  └── cells: Map<string, CellData>    Key format: "sheetId-row-col"          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Selection State                                                             │
+│  ├── activeCell: { row, col } | null                                         │
+│  ├── selection: CellRange | null                                             │
+│  ├── isEditing: boolean                                                      │
+│  └── editValue: string                                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Collaborators                                                               │
+│  └── collaborators: Map<string, Collaborator>                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Dimensions (sparse)                                                         │
+│  ├── columnWidths: Map<number, number>                                       │
+│  └── rowHeights: Map<number, number>                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  History                                                                     │
+│  ├── undoStack: Operation[]                                                  │
+│  ├── redoStack: Operation[]                                                  │
+│  ├── canUndo: boolean                                                        │
+│  └── canRedo: boolean                                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Actions                                                                     │
+│  ├── setCell(row, col, value)                                                │
+│  ├── setActiveCell(row, col)                                                 │
+│  ├── startEditing(initialValue?)                                             │
+│  ├── commitEdit()                                                            │
+│  ├── cancelEdit()                                                            │
+│  ├── undo() / redo()                                                         │
+│  └── updateCollaborator() / removeCollaborator()                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Sparse Cell Data Pattern
 
-```typescript
-// Only store non-empty cells for efficiency
-interface CellData {
-  rawValue: string | null;
-  computedValue: any;
-  format?: CellFormat;
-  error?: string;
-}
+"I use sparse storage because most spreadsheet cells are empty. Storing only non-empty cells reduces memory from O(rows * cols) to O(filled cells)."
 
-// Cell key generation
-function cellKey(sheetId: string, row: number, col: number): string {
-  return `${sheetId}-${row}-${col}`;
-}
+**CellData Structure:**
+- rawValue: string | null (what user typed, e.g., "=SUM(A1:A10)")
+- computedValue: any (calculated result, e.g., 42)
+- format?: CellFormat (bold, color, alignment)
+- error?: string (formula errors like "#REF!")
 
-// Zustand store implementation
-const useSpreadsheetStore = create<SpreadsheetStore>((set, get) => ({
-  cells: new Map(),
+**Cell Key Generation:**
+- Format: `${sheetId}-${row}-${col}`
+- Enables O(1) lookup for any cell
+- Empty cells return null (not stored)
 
-  setCell: (row, col, value) => {
-    const { activeSheetId, cells } = get();
-    const key = cellKey(activeSheetId, row, col);
-
-    set((state) => {
-      const newCells = new Map(state.cells);
-
-      if (value === '' || value === null) {
-        // Remove empty cells from sparse storage
-        newCells.delete(key);
-      } else {
-        newCells.set(key, {
-          rawValue: value,
-          computedValue: value.startsWith('=') ? null : value,
-        });
-      }
-
-      return { cells: newCells };
-    });
-
-    // Send to server via WebSocket
-    wsService.sendCellEdit(activeSheetId, row, col, value);
-  },
-
-  getCell: (row, col) => {
-    const { activeSheetId, cells } = get();
-    const key = cellKey(activeSheetId, row, col);
-    return cells.get(key) || null;
-  },
-}));
-```
+**setCell Logic:**
+1. Generate key from sheetId, row, col
+2. If value is empty/null, delete from Map (sparse)
+3. Otherwise, set value with rawValue and initial computedValue
+4. Send to server via WebSocket for sync
 
 ### Selector Optimization
 
-```typescript
-// Fine-grained selectors prevent unnecessary re-renders
-const Cell = memo(function Cell({ row, col, style }: CellProps) {
-  // Only re-render when THIS cell's data changes
-  const cellData = useSpreadsheetStore(
-    useCallback(
-      (state) => state.cells.get(cellKey(state.activeSheetId, row, col)),
-      [row, col]
-    )
-  );
+"Fine-grained selectors prevent unnecessary re-renders. Each cell subscribes only to its own data slice."
 
-  const isActive = useSpreadsheetStore(
-    useCallback(
-      (state) =>
-        state.activeCell?.row === row && state.activeCell?.col === col,
-      [row, col]
-    )
-  );
+**Cell Component Subscriptions:**
+- cellData: subscribes to cells.get(key) for this specific cell
+- isActive: subscribes to activeCell comparison with row/col
+- isSelected: subscribes to selection range check
 
-  const isSelected = useSpreadsheetStore(
-    useCallback(
-      (state) => isInRange(state.selection, row, col),
-      [row, col]
-    )
-  );
-
-  return (
-    <div
-      style={style}
-      className={cn(
-        'border-r border-b border-gray-200 px-2 py-1 truncate',
-        isActive && 'ring-2 ring-blue-500 ring-inset',
-        isSelected && !isActive && 'bg-blue-50'
-      )}
-    >
-      {cellData?.computedValue ?? cellData?.rawValue ?? ''}
-    </div>
-  );
-});
-```
+Each selector uses useCallback with [row, col] dependencies to maintain referential stability.
 
 ---
 
@@ -367,177 +232,80 @@ const Cell = memo(function Cell({ row, col, style }: CellProps) {
 
 ### Memoized Cell Rendering
 
-```typescript
-interface CellProps {
-  row: number;
-  col: number;
-  style: React.CSSProperties;
-}
-
-const Cell = memo(function Cell({ row, col, style }: CellProps) {
-  const {
-    activeSheetId,
-    activeCell,
-    isEditing,
-    editValue,
-    setActiveCell,
-    startEditing,
-    setEditValue,
-    commitEdit,
-    cancelEdit,
-  } = useSpreadsheetStore();
-
-  const cellData = useSpreadsheetStore(
-    (state) => state.cells.get(cellKey(state.activeSheetId, row, col))
-  );
-
-  const isActive = activeCell?.row === row && activeCell?.col === col;
-  const isEditingThis = isActive && isEditing;
-
-  // Handle cell click
-  const handleClick = useCallback(() => {
-    setActiveCell(row, col);
-  }, [row, col, setActiveCell]);
-
-  // Handle double-click to edit
-  const handleDoubleClick = useCallback(() => {
-    setActiveCell(row, col);
-    startEditing(cellData?.rawValue ?? '');
-  }, [row, col, cellData, setActiveCell, startEditing]);
-
-  // Render editing input
-  if (isEditingThis) {
-    return (
-      <div style={style} className="relative">
-        <input
-          autoFocus
-          value={editValue}
-          onChange={(e) => setEditValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              commitEdit();
-            } else if (e.key === 'Escape') {
-              cancelEdit();
-            } else if (e.key === 'Tab') {
-              e.preventDefault();
-              commitEdit();
-              // Move to next cell
-              setActiveCell(row, col + (e.shiftKey ? -1 : 1));
-            }
-          }}
-          onBlur={commitEdit}
-          className="absolute inset-0 w-full h-full px-2 py-1
-                     border-2 border-blue-500 outline-none z-10"
-        />
-      </div>
-    );
-  }
-
-  // Format display value
-  const displayValue = useMemo(() => {
-    if (cellData?.error) return cellData.error;
-    if (cellData?.computedValue !== undefined) return cellData.computedValue;
-    if (cellData?.rawValue !== undefined) return cellData.rawValue;
-    return '';
-  }, [cellData]);
-
-  return (
-    <div
-      style={style}
-      onClick={handleClick}
-      onDoubleClick={handleDoubleClick}
-      className={cn(
-        'border-r border-b border-gray-200 px-2 py-1 truncate select-none',
-        'cursor-cell',
-        isActive && 'ring-2 ring-blue-500 ring-inset z-10',
-        cellData?.format?.bold && 'font-bold',
-        cellData?.format?.italic && 'italic'
-      )}
-      style={{
-        ...style,
-        textAlign: cellData?.format?.textAlign ?? 'left',
-        color: cellData?.format?.color,
-        backgroundColor: cellData?.format?.backgroundColor,
-      }}
-    >
-      {displayValue}
-    </div>
-  );
-}, cellPropsEqual);
-
-// Custom comparison for memo
-function cellPropsEqual(prev: CellProps, next: CellProps): boolean {
-  return prev.row === next.row && prev.col === next.col;
-  // Note: Style changes trigger parent re-render, so we don't need to compare
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Cell Component Lifecycle                            │
+│                                                                              │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                   │
+│   │   Render    │────▶│   Click     │────▶│   Active    │                   │
+│   │  (display)  │     │  (select)   │     │  (focused)  │                   │
+│   └─────────────┘     └─────────────┘     └──────┬──────┘                   │
+│                                                   │                          │
+│                              Double-click or type │                          │
+│                                                   ▼                          │
+│                                           ┌─────────────┐                   │
+│                                           │   Editing   │                   │
+│                                           │  (input)    │                   │
+│                                           └──────┬──────┘                   │
+│                                                   │                          │
+│                              Enter, Tab, or blur │                          │
+│                                                   ▼                          │
+│                                           ┌─────────────┐                   │
+│                                           │   Commit    │                   │
+│                                           │  (save)     │                   │
+│                                           └─────────────┘                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Cell Props:**
+- row: number
+- col: number
+- style: React.CSSProperties (position from virtualizer)
+
+**Display Mode:**
+- Shows computedValue or rawValue or empty string
+- Applies format styling (bold, italic, color, alignment)
+- Shows ring border when active
+- Shows light blue background when selected
+
+**Edit Mode (when isEditingThis):**
+- Renders autoFocus input overlay
+- Captures keydown for Enter (commit), Escape (cancel), Tab (commit + move)
+- Commits on blur
+- Value stored in editValue state
+
+**Custom Memo Comparison:**
+Only compares row and col - style changes trigger parent re-render anyway.
 
 ### Keyboard Navigation
 
-```typescript
-function useKeyboardNavigation() {
-  const {
-    activeCell,
-    setActiveCell,
-    startEditing,
-    isEditing,
-    commitEdit,
-  } = useSpreadsheetStore();
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!activeCell || isEditing) return;
-
-      const { row, col } = activeCell;
-
-      switch (e.key) {
-        case 'ArrowUp':
-          e.preventDefault();
-          setActiveCell(Math.max(0, row - 1), col);
-          break;
-        case 'ArrowDown':
-          e.preventDefault();
-          setActiveCell(row + 1, col);
-          break;
-        case 'ArrowLeft':
-          e.preventDefault();
-          setActiveCell(row, Math.max(0, col - 1));
-          break;
-        case 'ArrowRight':
-          e.preventDefault();
-          setActiveCell(row, col + 1);
-          break;
-        case 'Enter':
-          e.preventDefault();
-          if (e.shiftKey) {
-            setActiveCell(Math.max(0, row - 1), col);
-          } else {
-            startEditing();
-          }
-          break;
-        case 'Tab':
-          e.preventDefault();
-          setActiveCell(row, e.shiftKey ? Math.max(0, col - 1) : col + 1);
-          break;
-        case 'Delete':
-        case 'Backspace':
-          e.preventDefault();
-          commitEdit(); // Clear cell
-          break;
-        default:
-          // Start editing on any printable character
-          if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-            startEditing(e.key);
-          }
-      }
-    };
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [activeCell, isEditing, setActiveCell, startEditing, commitEdit]);
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Keyboard Navigation Map                              │
+│                                                                              │
+│   Arrow Keys (when not editing):                                             │
+│   ├── ArrowUp    ──▶  Move to row - 1 (min 0)                               │
+│   ├── ArrowDown  ──▶  Move to row + 1                                       │
+│   ├── ArrowLeft  ──▶  Move to col - 1 (min 0)                               │
+│   └── ArrowRight ──▶  Move to col + 1                                       │
+│                                                                              │
+│   Entry Keys:                                                                │
+│   ├── Enter          ──▶  Start editing (or move down if editing)           │
+│   ├── Shift+Enter    ──▶  Move up                                           │
+│   ├── Tab            ──▶  Move right (commit if editing)                    │
+│   ├── Shift+Tab      ──▶  Move left (commit if editing)                     │
+│   └── Any printable  ──▶  Start editing with that character                 │
+│                                                                              │
+│   Destructive Keys:                                                          │
+│   ├── Delete         ──▶  Clear cell content                                │
+│   └── Backspace      ──▶  Clear cell content                                │
+│                                                                              │
+│   Edit Mode Only:                                                            │
+│   └── Escape         ──▶  Cancel edit, restore original value               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Navigation is handled by a custom hook that listens to document keydown events and only acts when not editing.
 
 ---
 
@@ -545,117 +313,54 @@ function useKeyboardNavigation() {
 
 ### Cursor Overlay Component
 
-```typescript
-interface CollaboratorCursor {
-  userId: string;
-  name: string;
-  color: string;
-  row: number;
-  col: number;
-}
-
-function CollaboratorCursors() {
-  const collaborators = useSpreadsheetStore((state) => state.collaborators);
-  const { columnWidths, rowHeights } = useSpreadsheetStore();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [scrollOffset, setScrollOffset] = useState({ x: 0, y: 0 });
-
-  // Track scroll position to position cursors correctly
-  useEffect(() => {
-    const container = containerRef.current?.closest('.scroll-container');
-    if (!container) return;
-
-    const handleScroll = () => {
-      setScrollOffset({
-        x: container.scrollLeft,
-        y: container.scrollTop,
-      });
-    };
-
-    container.addEventListener('scroll', handleScroll);
-    return () => container.removeEventListener('scroll', handleScroll);
-  }, []);
-
-  // Calculate pixel position from cell coordinates
-  const getCursorPosition = useCallback(
-    (row: number, col: number) => {
-      let x = 0;
-      for (let c = 0; c < col; c++) {
-        x += columnWidths.get(c) ?? 100;
-      }
-
-      let y = 0;
-      for (let r = 0; r < row; r++) {
-        y += rowHeights.get(r) ?? 32;
-      }
-
-      return { x, y };
-    },
-    [columnWidths, rowHeights]
-  );
-
-  return (
-    <div ref={containerRef} className="pointer-events-none absolute inset-0">
-      {Array.from(collaborators.values()).map((collab) => {
-        const pos = getCursorPosition(collab.row, collab.col);
-        const width = columnWidths.get(collab.col) ?? 100;
-        const height = rowHeights.get(collab.row) ?? 32;
-
-        return (
-          <div
-            key={collab.userId}
-            className="absolute transition-all duration-100 ease-out"
-            style={{
-              left: pos.x - scrollOffset.x,
-              top: pos.y - scrollOffset.y,
-              width,
-              height,
-            }}
-          >
-            {/* Cursor outline */}
-            <div
-              className="absolute inset-0 border-2"
-              style={{ borderColor: collab.color }}
-            />
-            {/* Name label */}
-            <div
-              className="absolute -top-5 left-0 px-1 text-xs text-white
-                         rounded-sm whitespace-nowrap"
-              style={{ backgroundColor: collab.color }}
-            >
-              {collab.name}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Collaborator Cursor Display                           │
+│                                                                              │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │                           Grid View                                    │ │
+│   │                                                                        │ │
+│   │      ┌─────────┬─────────┬─────────┬─────────┐                        │ │
+│   │      │   A1    │   B1    │   C1    │   D1    │                        │ │
+│   │      ├─────────┼─────────┼─────────┼─────────┤                        │ │
+│   │      │   A2    │ ┌─────┐ │   C2    │   D2    │                        │ │
+│   │      │         │ │Alice│ │         │         │   ◀── Colored border   │ │
+│   │      │         │ └─────┘ │         │         │       + name label     │ │
+│   │      ├─────────┼─────────┼─────────┼─────────┤                        │ │
+│   │      │   A3    │   B3    │ ┌─────┐ │   D3    │                        │ │
+│   │      │         │         │ │ Bob │ │         │                        │ │
+│   │      │         │         │ └─────┘ │         │                        │ │
+│   │      └─────────┴─────────┴─────────┴─────────┘                        │ │
+│   │                                                                        │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**CollaboratorCursor Data Structure:**
+- userId: string
+- name: string (display name)
+- color: string (unique per user, hex color)
+- row: number (current cell row)
+- col: number (current cell column)
+
+**Position Calculation:**
+- Sum column widths from 0 to col for X position
+- Sum row heights from 0 to row for Y position
+- Adjust for scroll offset from container
+
+**Rendering:**
+- Absolute positioned div with pointer-events: none
+- Colored border matching collaborator's assigned color
+- Name label positioned above the cell
+- Smooth transition animation (100ms ease-out)
 
 ### Presence Indicator List
 
-```typescript
-function PresenceIndicators() {
-  const collaborators = useSpreadsheetStore((state) => state.collaborators);
-
-  return (
-    <div className="flex items-center gap-1">
-      {Array.from(collaborators.values()).map((collab) => (
-        <div
-          key={collab.userId}
-          className="w-8 h-8 rounded-full flex items-center justify-center
-                     text-white text-sm font-medium"
-          style={{ backgroundColor: collab.color }}
-          title={collab.name}
-        >
-          {collab.name.charAt(0).toUpperCase()}
-        </div>
-      ))}
-    </div>
-  );
-}
-```
+Displayed in header/toolbar area:
+- Circular avatars with first letter of name
+- Background color matches cursor color
+- Tooltip shows full name on hover
+- Max display count with "+N more" overflow
 
 ---
 
@@ -663,167 +368,74 @@ function PresenceIndicators() {
 
 ### Formula Bar Component
 
-```typescript
-function FormulaBar() {
-  const {
-    activeCell,
-    isEditing,
-    editValue,
-    setEditValue,
-    startEditing,
-    commitEdit,
-    cancelEdit,
-  } = useSpreadsheetStore();
-
-  const cellData = useSpreadsheetStore((state) => {
-    if (!state.activeCell) return null;
-    const key = cellKey(
-      state.activeSheetId,
-      state.activeCell.row,
-      state.activeCell.col
-    );
-    return state.cells.get(key);
-  });
-
-  const cellRef = activeCell
-    ? `${columnIndexToLetter(activeCell.col)}${activeCell.row + 1}`
-    : '';
-
-  const displayValue = isEditing
-    ? editValue
-    : cellData?.rawValue ?? '';
-
-  return (
-    <div className="flex items-center h-8 border-b border-gray-300 bg-white">
-      {/* Cell reference */}
-      <div className="w-16 px-2 text-center font-medium border-r border-gray-300">
-        {cellRef}
-      </div>
-
-      {/* fx icon */}
-      <div className="px-2 text-gray-500 italic">fx</div>
-
-      {/* Formula input */}
-      <input
-        type="text"
-        value={displayValue}
-        onChange={(e) => setEditValue(e.target.value)}
-        onFocus={() => {
-          if (!isEditing && activeCell) {
-            startEditing(cellData?.rawValue ?? '');
-          }
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            commitEdit();
-          } else if (e.key === 'Escape') {
-            cancelEdit();
-          }
-        }}
-        className="flex-1 px-2 outline-none"
-        placeholder="Enter value or formula"
-      />
-    </div>
-  );
-}
-
-// Helper to convert column index to letter (0 -> A, 25 -> Z, 26 -> AA)
-function columnIndexToLetter(index: number): string {
-  let result = '';
-  let n = index;
-  while (n >= 0) {
-    result = String.fromCharCode((n % 26) + 65) + result;
-    n = Math.floor(n / 26) - 1;
-  }
-  return result;
-}
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Formula Bar Layout                                │
+│                                                                              │
+│   ┌──────────┬────────┬─────────────────────────────────────────────────┐   │
+│   │   A1     │   fx   │  =SUM(A1:A10)                                   │   │
+│   │ (cell    │ (icon) │  (formula/value input)                          │   │
+│   │  ref)    │        │                                                 │   │
+│   └──────────┴────────┴─────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Cell Reference: Shows current cell address (A1, B2, etc.)                  │
+│   fx Icon: Indicates formula mode                                            │
+│   Input: Shows rawValue when editing, syncs with cell edit                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**columnIndexToLetter Helper:**
+- 0 -> A, 25 -> Z, 26 -> AA, etc.
+- Uses modulo 26 and character code math
+- Handles arbitrary column numbers
+
+**FormulaBar Behavior:**
+- Displays cell reference for active cell
+- Shows rawValue (formula) not computedValue
+- Focus starts editing mode
+- Enter commits, Escape cancels
+- Syncs with inline cell editing
 
 ### Web Worker for Formula Calculation
 
-```typescript
-// formula.worker.ts
-import { HyperFormula } from 'hyperformula';
+"I offload formula calculation to a Web Worker to prevent UI blocking. Complex formulas with many dependencies could take 100ms+ to calculate."
 
-const hf = HyperFormula.buildEmpty({ licenseKey: 'gpl-v3' });
-const sheetId = hf.addSheet('Sheet1');
-
-self.onmessage = ({ data }) => {
-  switch (data.type) {
-    case 'SET_CELL': {
-      const { row, col, value } = data;
-      hf.setCellContents({ sheet: sheetId, row, col }, value);
-
-      const computed = hf.getCellValue({ sheet: sheetId, row, col });
-      const dependents = hf.getCellDependents({ sheet: sheetId, row, col });
-
-      // Calculate all dependent cells
-      const updates = dependents.map((dep) => ({
-        row: dep.row,
-        col: dep.col,
-        value: hf.getCellValue({ sheet: sheetId, row: dep.row, col: dep.col }),
-      }));
-
-      self.postMessage({
-        type: 'CELL_CALCULATED',
-        row,
-        col,
-        computed,
-        dependentUpdates: updates,
-      });
-      break;
-    }
-
-    case 'BULK_SET': {
-      const { cells } = data;
-      cells.forEach(({ row, col, value }: any) => {
-        hf.setCellContents({ sheet: sheetId, row, col }, value);
-      });
-
-      self.postMessage({ type: 'BULK_SET_COMPLETE' });
-      break;
-    }
-  }
-};
-
-// Main thread usage
-class FormulaWorkerService {
-  private worker: Worker;
-  private pendingCallbacks: Map<string, (result: any) => void> = new Map();
-
-  constructor() {
-    this.worker = new Worker(new URL('./formula.worker.ts', import.meta.url), {
-      type: 'module',
-    });
-
-    this.worker.onmessage = ({ data }) => {
-      if (data.type === 'CELL_CALCULATED') {
-        // Update store with computed value
-        useSpreadsheetStore.getState().updateComputedValue(
-          data.row,
-          data.col,
-          data.computed
-        );
-
-        // Update dependent cells
-        data.dependentUpdates.forEach((update: any) => {
-          useSpreadsheetStore.getState().updateComputedValue(
-            update.row,
-            update.col,
-            update.value
-          );
-        });
-      }
-    };
-  }
-
-  setCell(row: number, col: number, value: string) {
-    this.worker.postMessage({ type: 'SET_CELL', row, col, value });
-  }
-}
-
-export const formulaWorker = new FormulaWorkerService();
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Formula Calculation Architecture                        │
+│                                                                              │
+│   ┌─────────────────────┐                    ┌─────────────────────────┐    │
+│   │     Main Thread     │                    │      Web Worker         │    │
+│   │                     │   postMessage      │                         │    │
+│   │  User edits cell    │ ───────────────▶   │  HyperFormula engine   │    │
+│   │  with formula       │                    │                         │    │
+│   │                     │   SET_CELL         │  - Parse formula        │    │
+│   │  Update store       │ ◀───────────────── │  - Calculate result     │    │
+│   │  with computed      │   CELL_CALCULATED  │  - Find dependents      │    │
+│   │  value              │                    │  - Cascade updates      │    │
+│   │                     │                    │                         │    │
+│   │  UI remains         │                    │  Runs in separate       │    │
+│   │  responsive         │                    │  thread                 │    │
+│   └─────────────────────┘                    └─────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Worker Messages:**
+- SET_CELL: { row, col, value } -> triggers calculation
+- CELL_CALCULATED: { row, col, computed, dependentUpdates } -> results
+- BULK_SET: { cells } -> batch initialization
+
+**HyperFormula Integration:**
+- Open-source spreadsheet formula engine
+- Handles 400+ Excel functions
+- Dependency graph for cascade updates
+- Runs entirely in worker
+
+**FormulaWorkerService Pattern:**
+- Singleton service instantiates worker
+- setCell method posts message
+- onmessage handler updates store with computed values
+- Handles dependent cell cascades
 
 ---
 
@@ -868,11 +480,11 @@ export const formulaWorker = new FormulaWorkerService();
 
 ## 10. Closing Summary (1 minute)
 
-We designed a high-performance collaborative spreadsheet frontend with:
+"We designed a high-performance collaborative spreadsheet frontend with:
 - **Dual-axis virtualization** using TanStack Virtual for million-row grids
 - **Zustand state management** with sparse cell storage and fine-grained selectors
 - **Memoized Cell component** with inline editing and keyboard navigation
 - **Real-time collaboration UI** with colored cursor overlays and presence indicators
 - **Web Worker formula engine** using HyperFormula for non-blocking calculations
 
-Key frontend insight: The sparse data model (Map with string keys) mirrors the backend storage and enables efficient memory usage, while virtualization makes the grid feel instant regardless of logical size.
+Key frontend insight: The sparse data model (Map with string keys) mirrors the backend storage and enables efficient memory usage, while virtualization makes the grid feel instant regardless of logical size."

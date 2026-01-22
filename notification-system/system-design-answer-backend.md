@@ -60,60 +60,27 @@ From a backend perspective, I'll focus on priority queue design, multi-channel w
 
 ### Priority Scoring with Redis Sorted Sets
 
-```javascript
-class NotificationQueue {
-  constructor(channel) {
-    this.channel = channel;
-    this.priorities = ['critical', 'high', 'normal', 'low'];
-  }
+"I use Redis sorted sets where lower scores indicate higher priority. The score combines priority weight and timestamp for ordering within priority levels."
 
-  async enqueue(notification, priority) {
-    const score = this.calculateScore(priority, notification.queuedAt);
+**Priority Weight System:**
 
-    // Redis sorted set - lower score = higher priority
-    await redis.zadd(
-      `queue:${this.channel}`,
-      score,
-      JSON.stringify(notification)
-    );
+| Priority | Weight Range | Processing Order |
+|----------|--------------|------------------|
+| critical | 0 - 999B | First (immediate) |
+| high | 1T - 2T | After critical |
+| normal | 2T - 3T | Standard |
+| low | 3T+ | Best effort |
 
-    // Track queue metrics
-    await this.updateMetrics();
-  }
+**Score Formula:** `priorityWeight[priority] + timestamp`
 
-  calculateScore(priority, timestamp) {
-    // Priority determines the "bucket", timestamp orders within bucket
-    const priorityWeights = {
-      critical: 0,                  // 0-999B: Processed first
-      high:     1_000_000_000_000,  // 1T-2T: After critical
-      normal:   2_000_000_000_000,  // 2T-3T: Standard processing
-      low:      3_000_000_000_000   // 3T+: Best effort
-    };
+**Queue Operations:**
 
-    return priorityWeights[priority] + timestamp;
-  }
-
-  async dequeue(batchSize = 100) {
-    // Atomically pop highest priority items
-    const items = await redis.zpopmin(
-      `queue:${this.channel}`,
-      batchSize
-    );
-
-    return items.map(item => JSON.parse(item));
-  }
-
-  async getQueueDepth() {
-    return {
-      total: await redis.zcard(`queue:${this.channel}`),
-      critical: await redis.zcount(`queue:${this.channel}`, 0, 999_999_999_999),
-      high: await redis.zcount(`queue:${this.channel}`, 1_000_000_000_000, 1_999_999_999_999),
-      normal: await redis.zcount(`queue:${this.channel}`, 2_000_000_000_000, 2_999_999_999_999),
-      low: await redis.zcount(`queue:${this.channel}`, 3_000_000_000_000, Infinity)
-    };
-  }
-}
-```
+| Operation | Redis Command | Complexity |
+|-----------|---------------|------------|
+| Enqueue | ZADD queue:channel score notification | O(log N) |
+| Dequeue batch | ZPOPMIN queue:channel batchSize | O(log N) |
+| Get depth | ZCARD queue:channel | O(1) |
+| Count by priority | ZCOUNT queue:channel minScore maxScore | O(log N) |
 
 ### Why Sorted Sets Over Separate Queues?
 
@@ -123,66 +90,24 @@ class NotificationQueue {
 | Single sorted set | Atomic dequeue | Score calculation |
 | Multiple lists with polling | Simple | Priority inversion risk |
 
-Sorted sets let us atomically pop the highest-priority items in O(log N) without polling multiple queues.
+"Sorted sets let us atomically pop the highest-priority items in O(log N) without polling multiple queues."
 
-### RabbitMQ Alternative Implementation
+### RabbitMQ Alternative
 
-```javascript
-class RabbitMQPriorityQueue {
-  constructor(channel) {
-    this.channel = channel;
-    this.exchangeName = `notifications.${channel}`;
-    this.queuesByPriority = {
-      critical: `${channel}.critical`,
-      high: `${channel}.high`,
-      normal: `${channel}.normal`,
-      low: `${channel}.low`
-    };
-  }
+**Queue Configuration per Priority:**
 
-  async initialize() {
-    await this.amqpChannel.assertExchange(this.exchangeName, 'direct', { durable: true });
+| Priority | Queue Name | TTL | Dead Letter Exchange |
+|----------|------------|-----|---------------------|
+| critical | channel.critical | 1 minute | notifications.dlx |
+| high | channel.high | 5 minutes | notifications.dlx |
+| normal | channel.normal | 1 hour | notifications.dlx |
+| low | channel.low | 24 hours | notifications.dlx |
 
-    for (const [priority, queueName] of Object.entries(this.queuesByPriority)) {
-      await this.amqpChannel.assertQueue(queueName, {
-        durable: true,
-        arguments: {
-          'x-message-ttl': this.getTTL(priority),
-          'x-dead-letter-exchange': 'notifications.dlx'
-        }
-      });
-      await this.amqpChannel.bindQueue(queueName, this.exchangeName, priority);
-    }
-  }
-
-  getTTL(priority) {
-    // Critical notifications expire fastest - must be delivered quickly
-    const ttls = {
-      critical: 60_000,     // 1 minute
-      high: 300_000,        // 5 minutes
-      normal: 3_600_000,    // 1 hour
-      low: 86_400_000       // 24 hours
-    };
-    return ttls[priority];
-  }
-
-  async publish(notification, priority) {
-    const message = Buffer.from(JSON.stringify(notification));
-
-    await this.amqpChannel.publish(
-      this.exchangeName,
-      priority,
-      message,
-      {
-        persistent: true,
-        contentType: 'application/json',
-        messageId: notification.id,
-        timestamp: Date.now()
-      }
-    );
-  }
-}
-```
+**Message Properties:**
+- persistent: true (survives broker restart)
+- contentType: application/json
+- messageId: notification.id
+- timestamp: Date.now()
 
 ---
 
@@ -190,171 +115,74 @@ class RabbitMQPriorityQueue {
 
 ### Worker Architecture
 
-```javascript
-class ChannelWorker {
-  constructor(channel, options = {}) {
-    this.channel = channel;
-    this.concurrency = options.concurrency || 10;
-    this.batchSize = options.batchSize || 100;
-    this.circuitBreaker = new CircuitBreaker({
-      failureThreshold: 5,
-      resetTimeout: 30000
-    });
-  }
-
-  async start() {
-    while (this.running) {
-      const notifications = await this.queue.dequeue(this.batchSize);
-
-      if (notifications.length === 0) {
-        await this.sleep(100); // Backoff when queue empty
-        continue;
-      }
-
-      // Process batch with concurrency limit
-      await this.processBatch(notifications);
-    }
-  }
-
-  async processBatch(notifications) {
-    const chunks = this.chunk(notifications, this.concurrency);
-
-    for (const chunk of chunks) {
-      await Promise.all(
-        chunk.map(notification => this.processOne(notification))
-      );
-    }
-  }
-
-  async processOne(notification) {
-    try {
-      await this.circuitBreaker.execute(async () => {
-        await this.deliver(notification);
-      });
-
-      await this.tracker.updateStatus(notification.id, this.channel, 'sent');
-      metrics.increment('delivery_success', { channel: this.channel });
-    } catch (error) {
-      await this.handleFailure(notification, error);
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Channel Worker                          │
+├─────────────────────────────────────────────────────────────┤
+│  Configuration:                                              │
+│  - concurrency: 10 (parallel notifications)                  │
+│  - batchSize: 100 (dequeue per cycle)                       │
+│  - circuitBreaker: failureThreshold=5, resetTimeout=30s     │
+├─────────────────────────────────────────────────────────────┤
+│  Processing Loop:                                            │
+│  1. Dequeue batch from priority queue                        │
+│  2. If empty, backoff 100ms                                  │
+│  3. Process batch with concurrency limit                     │
+│  4. Each notification: circuit breaker ──▶ deliver           │
+│  5. On success: update tracker, increment metrics            │
+│  6. On failure: handleFailure (retry or dead letter)        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Push Notification Worker (APNs/FCM)
 
-```javascript
-class PushWorker extends ChannelWorker {
-  async deliver(notification) {
-    const { userId, content } = notification;
+**Delivery Flow:**
 
-    // Get user's registered devices
-    const devices = await this.deviceService.getDevices(userId);
-    if (devices.length === 0) {
-      throw new NoDevicesError('User has no registered devices');
-    }
-
-    const results = [];
-
-    for (const device of devices) {
-      try {
-        if (device.platform === 'ios') {
-          await this.sendAPNs(device.token, content);
-        } else if (device.platform === 'android') {
-          await this.sendFCM(device.token, content);
-        }
-        results.push({ deviceId: device.id, status: 'sent' });
-      } catch (error) {
-        results.push({ deviceId: device.id, status: 'failed', error: error.message });
-
-        // Handle invalid tokens (uninstalled app)
-        if (this.isInvalidToken(error)) {
-          await this.deviceService.deregister(device.id);
-        }
-      }
-    }
-
-    // Partial success if at least one device received
-    const successCount = results.filter(r => r.status === 'sent').length;
-    if (successCount === 0) {
-      throw new DeliveryError('All devices failed', results);
-    }
-
-    return results;
-  }
-
-  async sendAPNs(token, content) {
-    const notification = new apn.Notification({
-      alert: { title: content.title, body: content.body },
-      sound: content.sound || 'default',
-      badge: content.badge,
-      payload: content.data,
-      topic: this.bundleId,
-      expiry: Math.floor(Date.now() / 1000) + 3600
-    });
-
-    const result = await this.apnProvider.send(notification, token);
-    if (result.failed.length > 0) {
-      throw new APNsError(result.failed[0].response.reason);
-    }
-  }
-
-  async sendFCM(token, content) {
-    const message = {
-      token,
-      notification: { title: content.title, body: content.body },
-      data: content.data,
-      android: {
-        priority: 'high',
-        notification: {
-          sound: content.sound || 'default',
-          channelId: content.channelId || 'default'
-        }
-      }
-    };
-
-    await this.fcmClient.send(message);
-  }
-}
 ```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Get User   │────▶│ For Each    │────▶│  Platform   │
+│  Devices    │     │  Device     │     │  Dispatch   │
+└─────────────┘     └─────────────┘     └──────┬──────┘
+                                               │
+                    ┌──────────────────────────┴──────────────────────────┐
+                    ▼                                                      ▼
+           ┌─────────────┐                                        ┌─────────────┐
+           │  iOS: APNs  │                                        │ Android:FCM │
+           │  - alert    │                                        │ - title     │
+           │  - sound    │                                        │ - body      │
+           │  - badge    │                                        │ - priority  │
+           │  - topic    │                                        │ - channelId │
+           │  - expiry   │                                        └─────────────┘
+           └─────────────┘
+```
+
+**Error Handling:**
+- NoDevicesError: User has no registered devices
+- InvalidToken: Device uninstalled app, deregister token
+- Partial success: At least one device received = success
 
 ### Email Worker with Template Rendering
 
-```javascript
-class EmailWorker extends ChannelWorker {
-  async deliver(notification) {
-    const { userId, content, templateId } = notification;
+**Delivery Flow:**
 
-    const user = await this.userService.getUser(userId);
-    if (!user.email || !user.emailVerified) {
-      throw new NoEmailError('User has no verified email');
-    }
-
-    // Render template with user data
-    const emailContent = await this.templateService.render(templateId, {
-      user,
-      ...content.variables
-    });
-
-    const result = await this.emailProvider.send({
-      to: user.email,
-      from: emailContent.from || this.defaultFrom,
-      subject: emailContent.subject,
-      html: emailContent.html,
-      text: emailContent.text,
-      headers: {
-        'X-Notification-Id': notification.id,
-        'List-Unsubscribe': this.getUnsubscribeUrl(userId)
-      },
-      trackingSettings: {
-        clickTracking: { enable: true },
-        openTracking: { enable: true }
-      }
-    });
-
-    return { messageId: result.messageId };
-  }
-}
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Get User   │────▶│  Validate   │────▶│  Render     │
+│  Email      │     │  Verified   │     │  Template   │
+└─────────────┘     └─────────────┘     └──────┬──────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │  Send Email     │
+                                      │  - to: email    │
+                                      │  - subject      │
+                                      │  - html/text    │
+                                      │  - headers:     │
+                                      │    X-Notif-Id   │
+                                      │    Unsubscribe  │
+                                      │  - tracking:    │
+                                      │    click/open   │
+                                      └─────────────────┘
 ```
 
 ### Channel-Specific Rate Limits
@@ -372,106 +200,54 @@ class EmailWorker extends ChannelWorker {
 
 ### Multi-Level Rate Limiting
 
-```javascript
-class RateLimiter {
-  constructor() {
-    this.limits = {
-      // Per-user limits (prevent spam to single user)
-      user: {
-        push: { count: 50, window: 3600 },    // 50/hour
-        email: { count: 10, window: 3600 },   // 10/hour
-        sms: { count: 5, window: 3600 }       // 5/hour
-      },
-      // Global limits (protect downstream services)
-      global: {
-        push: { count: 100000, window: 60 },  // 100k/min
-        email: { count: 10000, window: 60 },  // 10k/min
-        sms: { count: 1000, window: 60 }      // 1k/min
-      },
-      // Per-service limits (prevent runaway services)
-      service: {
-        push: { count: 50000, window: 60 },
-        email: { count: 5000, window: 60 },
-        sms: { count: 500, window: 60 }
-      }
-    };
-  }
-
-  async checkLimit(userId, serviceId, channel) {
-    // Check user limit
-    const userResult = await this.checkUserLimit(userId, channel);
-    if (userResult.limited) return userResult;
-
-    // Check service limit
-    const serviceResult = await this.checkServiceLimit(serviceId, channel);
-    if (serviceResult.limited) return serviceResult;
-
-    // Check global limit
-    const globalResult = await this.checkGlobalLimit(channel);
-    if (globalResult.limited) return globalResult;
-
-    return { limited: false };
-  }
-
-  async checkUserLimit(userId, channel) {
-    const key = `ratelimit:user:${userId}:${channel}`;
-    const limit = this.limits.user[channel];
-
-    return this.checkLimit(key, limit);
-  }
-
-  async checkLimit(key, limit) {
-    const count = await redis.incr(key);
-    if (count === 1) {
-      await redis.expire(key, limit.window);
-    }
-
-    if (count > limit.count) {
-      const ttl = await redis.ttl(key);
-      return {
-        limited: true,
-        retryAfter: ttl,
-        current: count,
-        limit: limit.count
-      };
-    }
-
-    return { limited: false, current: count, limit: limit.count };
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                    Rate Limit Check Flow                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. User Limit (prevent spam to single user)                │
+│     Key: ratelimit:user:{userId}:{channel}                  │
+│     ┌────────────────────────────────────────┐              │
+│     │ push:  50/hour                          │              │
+│     │ email: 10/hour                          │              │
+│     │ sms:   5/hour                           │              │
+│     └────────────────────────────────────────┘              │
+│                           │                                  │
+│                           ▼ If allowed                       │
+│  2. Service Limit (prevent runaway services)                │
+│     Key: ratelimit:service:{serviceId}:{channel}            │
+│     ┌────────────────────────────────────────┐              │
+│     │ push:  50,000/min                       │              │
+│     │ email: 5,000/min                        │              │
+│     │ sms:   500/min                          │              │
+│     └────────────────────────────────────────┘              │
+│                           │                                  │
+│                           ▼ If allowed                       │
+│  3. Global Limit (protect downstream services)              │
+│     Key: ratelimit:global:{channel}                         │
+│     ┌────────────────────────────────────────┐              │
+│     │ push:  100,000/min                      │              │
+│     │ email: 10,000/min                       │              │
+│     │ sms:   1,000/min                        │              │
+│     └────────────────────────────────────────┘              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Redis Implementation:**
+- INCR key (atomic increment)
+- EXPIRE key window (set TTL on first increment)
+- Check count > limit (return limited: true with retryAfter from TTL)
 
 ### Sliding Window Rate Limiter
 
-```javascript
-class SlidingWindowRateLimiter {
-  async checkLimit(key, limit, windowSeconds) {
-    const now = Date.now();
-    const windowStart = now - (windowSeconds * 1000);
-    const countKey = `ratelimit:sliding:${key}`;
+"For more accurate limiting at window boundaries, use Redis sorted sets."
 
-    // Remove old entries
-    await redis.zremrangebyscore(countKey, 0, windowStart);
-
-    // Count current entries
-    const count = await redis.zcard(countKey);
-
-    if (count >= limit) {
-      // Get oldest entry to calculate retry-after
-      const oldest = await redis.zrange(countKey, 0, 0, 'WITHSCORES');
-      const retryAfter = oldest[1] ? Math.ceil((oldest[1] + windowSeconds * 1000 - now) / 1000) : windowSeconds;
-
-      return { limited: true, retryAfter, current: count };
-    }
-
-    // Add current request
-    await redis.zadd(countKey, now, `${now}:${Math.random()}`);
-    await redis.expire(countKey, windowSeconds);
-
-    return { limited: false, current: count + 1, limit };
-  }
-}
-```
+**Algorithm:**
+1. Remove entries older than window: ZREMRANGEBYSCORE key 0 windowStart
+2. Count current entries: ZCARD key
+3. If count >= limit: calculate retryAfter from oldest entry
+4. Otherwise: ZADD key timestamp randomId, EXPIRE key windowSeconds
 
 ---
 
@@ -479,337 +255,167 @@ class SlidingWindowRateLimiter {
 
 ### Exponential Backoff with Jitter
 
-```javascript
-class RetryHandler {
-  constructor(options = {}) {
-    this.maxRetries = options.maxRetries || 5;
-    this.baseDelay = options.baseDelay || 1000;
-    this.maxDelay = options.maxDelay || 300000;
-    this.jitterFactor = options.jitterFactor || 0.1;
-  }
+**Retry Configuration:**
 
-  async executeWithRetry(operation, context) {
-    let lastError;
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| maxRetries | 5 | Maximum attempts |
+| baseDelay | 1000ms | Initial wait |
+| maxDelay | 300000ms | Cap at 5 minutes |
+| jitterFactor | 0.1 | Randomization |
 
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        return await operation();
-      } catch (error) {
-        lastError = error;
+**Delay Formula:** `min(baseDelay * 2^attempt + jitter, maxDelay)`
 
-        if (!this.isRetryable(error)) {
-          await this.sendToDeadLetter(context, error);
-          throw error;
-        }
+**Example Delays:**
+- Attempt 0: ~1s
+- Attempt 1: ~2s
+- Attempt 2: ~4s
+- Attempt 3: ~8s
+- Attempt 4: ~16s
 
-        if (attempt === this.maxRetries) {
-          await this.sendToDeadLetter(context, error);
-          throw error;
-        }
+**Retryable Errors:**
+- HTTP 429, 500, 502, 503, 504
+- ECONNRESET, ETIMEDOUT, ECONNREFUSED
 
-        const delay = this.calculateDelay(attempt);
-        logger.info({
-          attempt: attempt + 1,
-          maxRetries: this.maxRetries,
-          delay,
-          error: error.message
-        }, 'Retrying notification delivery');
-
-        await this.sleep(delay);
-      }
-    }
-
-    throw lastError;
-  }
-
-  calculateDelay(attempt) {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
-    const exponentialDelay = this.baseDelay * Math.pow(2, attempt);
-
-    // Add jitter to prevent thundering herd
-    const jitter = exponentialDelay * this.jitterFactor * Math.random();
-
-    return Math.min(exponentialDelay + jitter, this.maxDelay);
-  }
-
-  isRetryable(error) {
-    // Retry on transient errors only
-    const retryableCodes = [429, 500, 502, 503, 504];
-    return retryableCodes.includes(error.statusCode) ||
-           error.code === 'ECONNRESET' ||
-           error.code === 'ETIMEDOUT' ||
-           error.code === 'ECONNREFUSED';
-  }
-}
-```
+**Non-retryable (send to dead letter):**
+- 400 Bad Request
+- 401 Unauthorized
+- 404 Not Found
 
 ### Circuit Breaker Implementation
 
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5;
-    this.resetTimeout = options.resetTimeout || 30000;
-    this.halfOpenRequests = options.halfOpenRequests || 3;
-
-    this.state = 'CLOSED';
-    this.failures = 0;
-    this.successes = 0;
-    this.lastFailure = null;
-  }
-
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailure > this.resetTimeout) {
-        this.state = 'HALF_OPEN';
-        this.successes = 0;
-        logger.info('Circuit breaker transitioning to HALF_OPEN');
-      } else {
-        throw new CircuitOpenError('Circuit breaker is OPEN');
-      }
-    }
-
-    try {
-      const result = await operation();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-
-  onSuccess() {
-    this.failures = 0;
-    if (this.state === 'HALF_OPEN') {
-      this.successes++;
-      if (this.successes >= this.halfOpenRequests) {
-        this.state = 'CLOSED';
-        logger.info('Circuit breaker CLOSED');
-        metrics.gauge('circuit_breaker_state', 0, { channel: this.channel });
-      }
-    }
-  }
-
-  onFailure() {
-    this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN';
-      logger.warn({ failures: this.failures }, 'Circuit breaker OPENED');
-      metrics.gauge('circuit_breaker_state', 1, { channel: this.channel });
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failures: this.failures,
-      lastFailure: this.lastFailure,
-      successes: this.successes
-    };
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                   Circuit Breaker States                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   ┌──────────┐                    ┌──────────┐              │
+│   │  CLOSED  │───failures >= 5───▶│   OPEN   │              │
+│   │          │                    │          │              │
+│   └────▲─────┘                    └────┬─────┘              │
+│        │                               │                     │
+│   successes >= 3                  resetTimeout (30s)        │
+│        │                               │                     │
+│   ┌────┴─────┐                         │                     │
+│   │HALF_OPEN │◀────────────────────────┘                     │
+│   │          │                                               │
+│   └──────────┘                                               │
+│                                                              │
+│  CLOSED: Normal operation, track failures                   │
+│  OPEN: Reject immediately, throw CircuitOpenError           │
+│  HALF_OPEN: Allow limited requests to probe recovery        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Configuration:**
+- failureThreshold: 5 (failures to open)
+- resetTimeout: 30000ms (time in OPEN state)
+- halfOpenRequests: 3 (successes to close)
 
 ### Dead Letter Queue Handler
 
-```javascript
-class DeadLetterHandler {
-  async sendToDeadLetter(notification, error) {
-    await db.query(`
-      INSERT INTO dead_letter_notifications
-        (notification_id, original_payload, channel, error_message, error_code, attempts, failed_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW())
-    `, [
-      notification.id,
-      JSON.stringify(notification),
-      notification.channel,
-      error.message,
-      error.code || 'UNKNOWN',
-      notification.attempts || 1
-    ]);
+**DLQ Entry Fields:**
 
-    // Alert on DLQ growth
-    const dlqCount = await this.getDLQCount();
-    if (dlqCount > 100) {
-      await this.alertOps('Dead letter queue threshold exceeded', {
-        count: dlqCount,
-        channel: notification.channel
-      });
-    }
+| Field | Type | Purpose |
+|-------|------|---------|
+| notification_id | UUID | Original notification |
+| original_payload | JSONB | Full notification data |
+| channel | VARCHAR | Delivery channel |
+| error_message | TEXT | Last error |
+| error_code | VARCHAR | Error classification |
+| attempts | INTEGER | Total attempts |
+| failed_at | TIMESTAMP | When moved to DLQ |
+| reprocessed_at | TIMESTAMP | When reprocessed |
 
-    metrics.increment('dead_letter_total', { channel: notification.channel });
-  }
+**Reprocessing Flow:**
+1. Query pending DLQ items (reprocessed_at IS NULL)
+2. Parse original_payload
+3. Reprocess through notification service
+4. On success: set reprocessed_at, status='success'
+5. On failure: increment reprocess_attempts, update last_error
 
-  async reprocessDLQ(channel, batchSize = 10) {
-    const items = await db.query(`
-      SELECT * FROM dead_letter_notifications
-      WHERE channel = $1 AND reprocessed_at IS NULL
-      ORDER BY failed_at ASC
-      LIMIT $2
-    `, [channel, batchSize]);
-
-    for (const item of items.rows) {
-      try {
-        const notification = JSON.parse(item.original_payload);
-        await notificationService.reprocess(notification);
-
-        await db.query(`
-          UPDATE dead_letter_notifications
-          SET reprocessed_at = NOW(), reprocess_status = 'success'
-          WHERE id = $1
-        `, [item.id]);
-      } catch (error) {
-        await db.query(`
-          UPDATE dead_letter_notifications
-          SET reprocess_attempts = reprocess_attempts + 1, last_error = $2
-          WHERE id = $1
-        `, [item.id, error.message]);
-      }
-    }
-  }
-}
-```
+**Alerting:** Trigger ops alert when DLQ count > 100
 
 ---
 
 ## Database Schema (5 minutes)
 
-### PostgreSQL Schema
+### PostgreSQL Tables
 
-```sql
--- Core notifications table
-CREATE TABLE notifications (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL,
-  template_id VARCHAR(100),
-  content JSONB NOT NULL,
-  channels TEXT[] NOT NULL,
-  priority VARCHAR(20) DEFAULT 'normal',
-  status VARCHAR(20) DEFAULT 'pending',
-  idempotency_key VARCHAR(255),
-  scheduled_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW(),
-  delivered_at TIMESTAMP
-);
+**notifications:**
 
-CREATE INDEX idx_notifications_user ON notifications(user_id, created_at DESC);
-CREATE INDEX idx_notifications_status ON notifications(status) WHERE status = 'pending';
-CREATE UNIQUE INDEX idx_notifications_idempotency ON notifications(idempotency_key)
-  WHERE idempotency_key IS NOT NULL;
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | UUID | PRIMARY KEY |
+| user_id | UUID | NOT NULL |
+| template_id | VARCHAR(100) | |
+| content | JSONB | NOT NULL |
+| channels | TEXT[] | NOT NULL |
+| priority | VARCHAR(20) | DEFAULT 'normal' |
+| status | VARCHAR(20) | DEFAULT 'pending' |
+| idempotency_key | VARCHAR(255) | UNIQUE (partial) |
+| scheduled_at | TIMESTAMP | |
+| created_at | TIMESTAMP | DEFAULT NOW() |
+| delivered_at | TIMESTAMP | |
 
--- Delivery status per channel
-CREATE TABLE delivery_status (
-  notification_id UUID REFERENCES notifications(id),
-  channel VARCHAR(20) NOT NULL,
-  status VARCHAR(20) NOT NULL,
-  details JSONB DEFAULT '{}',
-  attempts INTEGER DEFAULT 1,
-  last_attempt_at TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (notification_id, channel)
-);
+**delivery_status:**
 
-CREATE INDEX idx_delivery_status ON delivery_status(status, updated_at);
-CREATE INDEX idx_delivery_pending ON delivery_status(channel, status) WHERE status = 'pending';
+| Column | Type | Constraints |
+|--------|------|-------------|
+| notification_id | UUID | FK → notifications |
+| channel | VARCHAR(20) | NOT NULL |
+| status | VARCHAR(20) | NOT NULL |
+| details | JSONB | DEFAULT '{}' |
+| attempts | INTEGER | DEFAULT 1 |
+| last_attempt_at | TIMESTAMP | |
+| updated_at | TIMESTAMP | |
+| | | PK(notification_id, channel) |
 
--- User preferences with caching support
-CREATE TABLE notification_preferences (
-  user_id UUID PRIMARY KEY,
-  channels JSONB DEFAULT '{}',
-  categories JSONB DEFAULT '{}',
-  quiet_hours_start INTEGER,  -- minutes from midnight
-  quiet_hours_end INTEGER,
-  timezone VARCHAR(50) DEFAULT 'UTC',
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+**notification_preferences:**
 
--- Device tokens for push notifications
-CREATE TABLE device_tokens (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL,
-  platform VARCHAR(20) NOT NULL,  -- ios, android, web
-  token TEXT NOT NULL,
-  device_info JSONB DEFAULT '{}',
-  active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP DEFAULT NOW(),
-  last_used TIMESTAMP
-);
+| Column | Type | Purpose |
+|--------|------|---------|
+| user_id | UUID | PRIMARY KEY |
+| channels | JSONB | Per-channel enable/disable |
+| categories | JSONB | Category preferences |
+| quiet_hours_start | INTEGER | Minutes from midnight |
+| quiet_hours_end | INTEGER | Minutes from midnight |
+| timezone | VARCHAR(50) | DEFAULT 'UTC' |
 
-CREATE UNIQUE INDEX idx_device_token ON device_tokens(token);
-CREATE INDEX idx_device_user ON device_tokens(user_id) WHERE active = true;
+**device_tokens:**
 
--- Notification events (opens, clicks, dismissals)
-CREATE TABLE notification_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  notification_id UUID REFERENCES notifications(id),
-  channel VARCHAR(20),
-  event_type VARCHAR(20),
-  metadata JSONB,
-  occurred_at TIMESTAMP DEFAULT NOW()
-);
+| Column | Type | Purpose |
+|--------|------|---------|
+| id | UUID | PRIMARY KEY |
+| user_id | UUID | NOT NULL |
+| platform | VARCHAR(20) | ios, android, web |
+| token | TEXT | NOT NULL, UNIQUE |
+| device_info | JSONB | Device metadata |
+| active | BOOLEAN | DEFAULT true |
 
-CREATE INDEX idx_events_notification ON notification_events(notification_id);
-CREATE INDEX idx_events_time ON notification_events(occurred_at);
+**notification_events:**
 
--- Templates for dynamic content
-CREATE TABLE notification_templates (
-  id VARCHAR(100) PRIMARY KEY,
-  name VARCHAR(200),
-  channels JSONB NOT NULL,  -- { push: {...}, email: {...}, sms: {...} }
-  variables TEXT[],
-  active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Dead letter queue for failed notifications
-CREATE TABLE dead_letter_notifications (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  notification_id UUID,
-  original_payload JSONB NOT NULL,
-  channel VARCHAR(20),
-  error_message TEXT,
-  error_code VARCHAR(50),
-  attempts INTEGER DEFAULT 0,
-  failed_at TIMESTAMP DEFAULT NOW(),
-  reprocessed_at TIMESTAMP,
-  reprocess_status VARCHAR(20),
-  reprocess_attempts INTEGER DEFAULT 0,
-  last_error TEXT
-);
-
-CREATE INDEX idx_dlq_channel ON dead_letter_notifications(channel, failed_at);
-CREATE INDEX idx_dlq_pending ON dead_letter_notifications(channel)
-  WHERE reprocessed_at IS NULL;
-```
+| Column | Type | Purpose |
+|--------|------|---------|
+| id | UUID | PRIMARY KEY |
+| notification_id | UUID | FK → notifications |
+| channel | VARCHAR(20) | |
+| event_type | VARCHAR(20) | open, click, dismiss |
+| metadata | JSONB | Event details |
+| occurred_at | TIMESTAMP | |
 
 ### Redis Data Structures
 
-```javascript
-// User preferences cache
-const prefsCacheKey = `prefs:${userId}`;
-// TTL: 5 minutes, Value: JSON preferences object
-
-// Rate limiting
-const userRateLimitKey = `ratelimit:user:${userId}:${channel}`;
-const globalRateLimitKey = `ratelimit:global:${channel}`;
-const serviceRateLimitKey = `ratelimit:service:${serviceId}:${channel}`;
-// TTL: window duration, Value: integer count
-
-// Idempotency keys
-const idempotencyKey = `idempotency:${key}`;
-// TTL: 24 hours, Value: JSON result or "processing"
-
-// Queue (if using Redis instead of RabbitMQ)
-const queueKey = `queue:${channel}`;
-// Type: Sorted Set, Score: priority + timestamp
-
-// Circuit breaker state
-const circuitKey = `circuit:${channel}`;
-// Value: JSON state object
-```
+| Key Pattern | Type | TTL | Purpose |
+|-------------|------|-----|---------|
+| prefs:{userId} | String (JSON) | 5 min | User preferences cache |
+| ratelimit:user:{userId}:{channel} | String (int) | window | User rate limit |
+| ratelimit:global:{channel} | String (int) | window | Global rate limit |
+| ratelimit:service:{serviceId}:{channel} | String (int) | window | Service rate limit |
+| idempotency:{key} | String (JSON) | 24h | Deduplication |
+| queue:{channel} | Sorted Set | - | Priority queue |
+| circuit:{channel} | String (JSON) | - | Circuit breaker state |
 
 ---
 

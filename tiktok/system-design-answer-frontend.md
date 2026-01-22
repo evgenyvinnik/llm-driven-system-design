@@ -40,76 +40,81 @@
 ### Component Hierarchy
 
 ```
-<App>
-├── <Router>
-│   ├── <FeedPage>                    # /
-│   │   ├── <VirtualizedFeed>
-│   │   │   └── <VideoCard>           # Single video container
-│   │   │       ├── <VideoPlayer>     # HTML5 video with controls
-│   │   │       ├── <EngagementBar>   # Like, comment, share buttons
-│   │   │       └── <VideoInfo>       # Creator, description, hashtags
-│   │   └── <CommentsSheet>           # Bottom sheet overlay
-│   │
-│   ├── <DiscoverPage>                # /discover
-│   │   ├── <SearchBar>
-│   │   ├── <TrendingHashtags>
-│   │   └── <CategoryGrid>
-│   │
-│   ├── <UploadPage>                  # /upload
-│   │   ├── <VideoCapture>
-│   │   ├── <VideoTrimmer>
-│   │   ├── <EffectsPanel>
-│   │   └── <PublishForm>
-│   │
-│   ├── <ProfilePage>                 # /profile/:userId
-│   │   ├── <ProfileHeader>
-│   │   └── <VideoGrid>
-│   │
-│   └── <CreatorStudioPage>           # /creator/analytics
-│       ├── <PerformanceChart>
-│       ├── <AudienceInsights>
-│       └── <VideoAnalyticsTable>
-│
-├── <BottomNav>
-└── <ToastContainer>
+┌─────────────────────────────────────────────────────────────────┐
+│  <App>                                                          │
+│  ├── <Router>                                                   │
+│  │   ├── <FeedPage>               /                             │
+│  │   │   ├── <VirtualizedFeed>                                  │
+│  │   │   │   └── <VideoCard>      Single video container        │
+│  │   │   │       ├── <VideoPlayer>                              │
+│  │   │   │       ├── <EngagementBar>                            │
+│  │   │   │       └── <VideoInfo>                                │
+│  │   │   └── <CommentsSheet>      Bottom sheet overlay          │
+│  │   │                                                          │
+│  │   ├── <DiscoverPage>           /discover                     │
+│  │   │   ├── <SearchBar>                                        │
+│  │   │   ├── <TrendingHashtags>                                 │
+│  │   │   └── <CategoryGrid>                                     │
+│  │   │                                                          │
+│  │   ├── <UploadPage>             /upload                       │
+│  │   │   ├── <VideoCapture>                                     │
+│  │   │   ├── <VideoTrimmer>                                     │
+│  │   │   ├── <EffectsPanel>                                     │
+│  │   │   └── <PublishForm>                                      │
+│  │   │                                                          │
+│  │   ├── <ProfilePage>            /profile/:userId              │
+│  │   │   ├── <ProfileHeader>                                    │
+│  │   │   └── <VideoGrid>                                        │
+│  │   │                                                          │
+│  │   └── <CreatorStudioPage>      /creator/analytics            │
+│  │       ├── <PerformanceChart>                                 │
+│  │       ├── <AudienceInsights>                                 │
+│  │       └── <VideoAnalyticsTable>                              │
+│  │                                                              │
+│  ├── <BottomNav>                                                │
+│  └── <ToastContainer>                                           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### State Management (Zustand)
 
-```typescript
-// stores/feedStore.ts
-interface FeedState {
-  videos: Video[]
-  currentIndex: number
-  isLoading: boolean
-  hasMore: boolean
+**FeedState Store:**
 
-  // Actions
-  fetchNextPage: () => Promise<void>
-  setCurrentIndex: (index: number) => void
-  updateVideo: (id: string, updates: Partial<Video>) => void
-}
+| Field | Type | Purpose |
+|-------|------|---------|
+| videos | Video[] | Feed video list |
+| currentIndex | number | Currently visible video |
+| isLoading | boolean | Fetch state |
+| hasMore | boolean | More pages available |
 
-// stores/engagementStore.ts
-interface EngagementState {
-  pendingLikes: Set<string>       // Optimistic updates
-  pendingComments: Map<string, Comment[]>
+**FeedState Actions:**
+- `fetchNextPage()` - Load next batch of videos
+- `setCurrentIndex(index)` - Track current video for autoplay
+- `updateVideo(id, updates)` - Update video state after engagement
 
-  likeVideo: (videoId: string) => Promise<void>
-  unlikeVideo: (videoId: string) => Promise<void>
-  addComment: (videoId: string, text: string) => Promise<void>
-}
+**EngagementState Store:**
 
-// stores/userStore.ts
-interface UserState {
-  user: User | null
-  isNewUser: boolean              // Cold start flag
-  preferences: UserPreferences
-  watchHistory: WatchedVideo[]
+| Field | Type | Purpose |
+|-------|------|---------|
+| pendingLikes | Set<string> | Optimistic update tracking |
+| pendingComments | Map<string, Comment[]> | Pending comment submissions |
 
-  trackWatch: (videoId: string, duration: number) => void
-}
-```
+**EngagementState Actions:**
+- `likeVideo(videoId)` - Like with optimistic UI
+- `unlikeVideo(videoId)` - Unlike with optimistic UI
+- `addComment(videoId, text)` - Submit comment
+
+**UserState Store:**
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| user | User or null | Current user |
+| isNewUser | boolean | Cold start flag |
+| preferences | UserPreferences | Interest settings |
+| watchHistory | WatchedVideo[] | Viewed videos |
+
+**UserState Actions:**
+- `trackWatch(videoId, duration)` - Record watch time for recommendations
 
 ---
 
@@ -128,110 +133,34 @@ Without virtualization, rendering hundreds of video elements causes memory exhau
 | FPS during scroll | 20-30 fps | 60 fps |
 | Initial load | 2-3 seconds | < 500ms |
 
-**Implementation:**
+**VirtualizedFeed Component Responsibilities:**
 
-```typescript
-// components/VirtualizedFeed.tsx
-import { useVirtualizer } from '@tanstack/react-virtual'
-import { useRef, useCallback, useEffect } from 'react'
-import { useFeedStore } from '../stores/feedStore'
+1. Create container ref for scroll element
+2. Get videos, fetchNextPage, hasMore, setCurrentIndex from store
+3. Calculate container height (window.innerHeight or 800px fallback)
+4. Initialize virtualizer with count, scroll element, estimateSize, overscan: 1
+5. Effect: Trigger fetchNextPage when last item index >= videos.length - 3
+6. Effect: Track current video by finding which video's center is in view
+7. Render container with snap scrolling enabled
+8. Render total size spacer with relative positioning
+9. Map virtual items to absolutely positioned VideoCard components
+10. Pass isActive prop based on currentIndex match
 
-export function VirtualizedFeed() {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const { videos, fetchNextPage, hasMore, setCurrentIndex } = useFeedStore()
+**Virtualizer Configuration:**
 
-  // Full-screen height for each video
-  const containerHeight = typeof window !== 'undefined'
-    ? window.innerHeight
-    : 800
+| Option | Value | Rationale |
+|--------|-------|-----------|
+| count | videos.length | Total items to virtualize |
+| getScrollElement | containerRef.current | Scroll container |
+| estimateSize | () => containerHeight | Full-screen videos |
+| overscan | 1 | Minimal extra rendering |
 
-  const virtualizer = useVirtualizer({
-    count: videos.length,
-    getScrollElement: () => containerRef.current,
-    estimateSize: () => containerHeight,
-    overscan: 1, // Only 1 extra video - videos are expensive
-  })
+**Snap Scrolling Behavior:**
 
-  // Infinite scroll trigger
-  useEffect(() => {
-    const lastItem = virtualizer.getVirtualItems().at(-1)
-    if (!lastItem) return
-
-    if (lastItem.index >= videos.length - 3 && hasMore) {
-      fetchNextPage()
-    }
-  }, [virtualizer.getVirtualItems(), hasMore, fetchNextPage])
-
-  // Track current video for autoplay
-  useEffect(() => {
-    const items = virtualizer.getVirtualItems()
-    const centerY = containerHeight / 2
-
-    for (const item of items) {
-      const itemTop = item.start
-      const itemBottom = item.start + item.size
-      const scrollTop = containerRef.current?.scrollTop ?? 0
-
-      // Video is "current" when its center is in view
-      if (itemTop - scrollTop < centerY && itemBottom - scrollTop > centerY) {
-        setCurrentIndex(item.index)
-        break
-      }
-    }
-  }, [virtualizer.getVirtualItems(), setCurrentIndex])
-
-  return (
-    <div
-      ref={containerRef}
-      className="h-screen overflow-y-scroll snap-y snap-mandatory"
-      style={{ scrollSnapType: 'y mandatory' }}
-    >
-      <div
-        style={{
-          height: virtualizer.getTotalSize(),
-          position: 'relative',
-        }}
-      >
-        {virtualizer.getVirtualItems().map(virtualRow => (
-          <div
-            key={videos[virtualRow.index].id}
-            data-index={virtualRow.index}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: `${virtualRow.size}px`,
-              transform: `translateY(${virtualRow.start}px)`,
-            }}
-            className="snap-start"
-          >
-            <VideoCard
-              video={videos[virtualRow.index]}
-              isActive={virtualRow.index === useFeedStore.getState().currentIndex}
-            />
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-```
-
-**Snap Scrolling for TikTok-Style UX:**
-
-```css
-/* Full-page video snap behavior */
-.feed-container {
-  scroll-snap-type: y mandatory;
-  overscroll-behavior-y: contain; /* Prevent pull-to-refresh */
-}
-
-.video-card {
-  scroll-snap-align: start;
-  scroll-snap-stop: always; /* Force stop at each video */
-}
-```
+- Container: `scroll-snap-type: y mandatory` for forced snapping
+- Container: `overscroll-behavior-y: contain` to prevent pull-to-refresh
+- Video card: `scroll-snap-align: start` aligns top of video
+- Video card: `scroll-snap-stop: always` forces stop at each video
 
 **Why `overscan: 1`:**
 - Videos are the heaviest DOM elements (video decoder, large images)
@@ -243,170 +172,83 @@ export function VirtualizedFeed() {
 
 ### Deep Dive 2: Video Player with Preloading (10 minutes)
 
-**Video Player Component:**
+**VideoPlayer Component Props:**
 
-```typescript
-// components/VideoPlayer.tsx
-import { useRef, useEffect, useState, useCallback } from 'react'
+| Prop | Type | Purpose |
+|------|------|---------|
+| video | Video | Video data object |
+| isActive | boolean | Whether video is current |
+| onProgress | (watched, total) => void | Watch time callback |
 
-interface VideoPlayerProps {
-  video: Video
-  isActive: boolean
-  onProgress: (watched: number, total: number) => void
-}
+**VideoPlayer Internal State:**
 
-export function VideoPlayer({ video, isActive, onProgress }: VideoPlayerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const [isPlaying, setIsPlaying] = useState(false)
-  const [isMuted, setIsMuted] = useState(true) // Start muted for autoplay
-  const [showControls, setShowControls] = useState(false)
+| State | Type | Initial | Purpose |
+|-------|------|---------|---------|
+| isPlaying | boolean | false | Play/pause state |
+| isMuted | boolean | true | Start muted for autoplay |
+| showControls | boolean | false | Pause overlay visibility |
 
-  // Autoplay when video becomes active
-  useEffect(() => {
-    if (!videoRef.current) return
+**VideoPlayer Component Responsibilities:**
 
-    if (isActive) {
-      videoRef.current.currentTime = 0
-      videoRef.current.play()
-        .then(() => setIsPlaying(true))
-        .catch(() => setIsPlaying(false)) // Autoplay blocked
-    } else {
-      videoRef.current.pause()
-      setIsPlaying(false)
-    }
-  }, [isActive])
-
-  // Track watch progress
-  useEffect(() => {
-    const video = videoRef.current
-    if (!video || !isActive) return
-
-    const handleTimeUpdate = () => {
-      onProgress(video.currentTime, video.duration)
-    }
-
-    video.addEventListener('timeupdate', handleTimeUpdate)
-    return () => video.removeEventListener('timeupdate', handleTimeUpdate)
-  }, [isActive, onProgress])
-
-  // Tap to pause/play
-  const handleTap = useCallback(() => {
-    if (!videoRef.current) return
-
-    if (isPlaying) {
-      videoRef.current.pause()
-      setIsPlaying(false)
-      setShowControls(true)
-    } else {
-      videoRef.current.play()
-      setIsPlaying(true)
-      setShowControls(false)
-    }
-  }, [isPlaying])
-
-  // Double tap to like (detect via timing)
-  const lastTapRef = useRef(0)
-  const handleDoubleTap = useCallback((e: React.MouseEvent) => {
-    const now = Date.now()
-    if (now - lastTapRef.current < 300) {
-      // Double tap detected - like animation
-      e.preventDefault()
-      // Trigger heart animation at tap position
-    }
-    lastTapRef.current = now
-  }, [])
-
-  return (
-    <div
-      className="relative h-full w-full bg-black"
-      onClick={handleTap}
-      onDoubleClick={handleDoubleTap}
-    >
-      <video
-        ref={videoRef}
-        src={video.url}
-        className="h-full w-full object-contain"
-        loop
-        muted={isMuted}
-        playsInline
-        preload="metadata"
-      />
-
-      {/* Pause overlay */}
-      {showControls && !isPlaying && (
-        <div className="absolute inset-0 flex items-center justify-center">
-          <PlayIcon className="h-20 w-20 text-white/80" />
-        </div>
-      )}
-
-      {/* Progress bar */}
-      <ProgressBar
-        videoRef={videoRef}
-        className="absolute bottom-0 left-0 right-0"
-      />
-
-      {/* Sound toggle */}
-      <button
-        onClick={(e) => {
-          e.stopPropagation()
-          setIsMuted(!isMuted)
-        }}
-        className="absolute bottom-4 right-4 rounded-full bg-black/50 p-2"
-      >
-        {isMuted ? <MutedIcon /> : <SoundIcon />}
-      </button>
-    </div>
-  )
-}
-```
+1. Create video element ref
+2. Effect (isActive changes): If active, reset currentTime to 0, call play(), update isPlaying. If inactive, pause and set isPlaying false
+3. Effect (timeupdate): When active, call onProgress with currentTime and duration
+4. Handle tap: Toggle play/pause state, show/hide controls overlay
+5. Handle double-tap: Detect via timing (< 300ms between taps), trigger heart animation at tap position
+6. Render video element with loop, muted, playsInline, preload="metadata"
+7. Render pause overlay with play icon when paused and controls visible
+8. Render progress bar at bottom
+9. Render sound toggle button with muted/unmuted icon
 
 **Preloading Strategy:**
 
-```typescript
-// hooks/useVideoPreload.ts
-import { useEffect, useRef } from 'react'
-import { useFeedStore } from '../stores/feedStore'
+**useVideoPreload Hook Responsibilities:**
 
-export function useVideoPreload() {
-  const { videos, currentIndex } = useFeedStore()
-  const preloadedRef = useRef<Set<string>>(new Set())
+1. Get videos and currentIndex from feed store
+2. Maintain Set of preloaded video IDs (ref)
+3. Effect (currentIndex changes):
+   - Preload videos at currentIndex + 1 and currentIndex + 2
+   - For each video not already preloaded:
+     - Create hidden video element with preload="auto"
+     - Set src and muted
+     - On loadeddata, add to preloaded set
+     - Cleanup: clear src and remove element after 5 seconds
+   - Preload thumbnails for next 5 videos using Image objects
 
-  useEffect(() => {
-    // Preload next 2 videos
-    const preloadIndices = [currentIndex + 1, currentIndex + 2]
-
-    for (const index of preloadIndices) {
-      const video = videos[index]
-      if (!video || preloadedRef.current.has(video.id)) continue
-
-      // Create hidden video element to trigger preload
-      const preloadVideo = document.createElement('video')
-      preloadVideo.preload = 'auto'
-      preloadVideo.src = video.url
-      preloadVideo.muted = true
-
-      // Load first 3 seconds
-      preloadVideo.addEventListener('loadeddata', () => {
-        preloadedRef.current.add(video.id)
-      })
-
-      // Cleanup after preload
-      setTimeout(() => {
-        preloadVideo.src = ''
-        preloadVideo.remove()
-      }, 5000)
-    }
-
-    // Preload thumbnails for next 5 videos
-    for (let i = currentIndex + 1; i <= currentIndex + 5; i++) {
-      const video = videos[i]
-      if (!video) continue
-
-      const img = new Image()
-      img.src = video.thumbnailUrl
-    }
-  }, [currentIndex, videos])
-}
+**Preloading Flow:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Current video index changes                                  │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌─────────────────┐                                         │
+│  │ Check indices   │  currentIndex + 1, currentIndex + 2     │
+│  │ to preload      │                                         │
+│  └────────┬────────┘                                         │
+│           ▼                                                   │
+│  ┌─────────────────┐    Already       ┌─────────────────┐    │
+│  │ Already in      │───preloaded────▶│ Skip            │    │
+│  │ preloadedRef?   │                  │                 │    │
+│  └────────┬────────┘                  └─────────────────┘    │
+│           │ Not preloaded                                    │
+│           ▼                                                   │
+│  ┌─────────────────┐                                         │
+│  │ Create hidden   │  preload="auto", muted                  │
+│  │ video element   │                                         │
+│  └────────┬────────┘                                         │
+│           ▼                                                   │
+│  ┌─────────────────┐    ┌─────────────────┐                  │
+│  │ On loadeddata   │───▶│ Add to          │                  │
+│  │ event           │    │ preloadedRef    │                  │
+│  └────────┬────────┘    └─────────────────┘                  │
+│           ▼                                                   │
+│  ┌─────────────────┐                                         │
+│  │ After 5s:       │  Clear src, remove element              │
+│  │ cleanup element │                                         │
+│  └─────────────────┘                                         │
+│                                                              │
+│  Simultaneously: Preload thumbnails for next 5 videos        │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Why Preload Only 2 Videos:**
@@ -419,526 +261,266 @@ export function useVideoPreload() {
 
 ### Deep Dive 3: Engagement UI with Optimistic Updates (8 minutes)
 
-**Like Button with Animation:**
+**LikeButton Component Props:**
 
-```typescript
-// components/LikeButton.tsx
-import { useState, useCallback } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import { useEngagementStore } from '../stores/engagementStore'
+| Prop | Type | Purpose |
+|------|------|---------|
+| videoId | string | Video identifier |
+| isLiked | boolean | Server-confirmed like state |
+| likeCount | number | Server-confirmed count |
 
-interface LikeButtonProps {
-  videoId: string
-  isLiked: boolean
-  likeCount: number
-}
+**LikeButton Internal State:**
 
-export function LikeButton({ videoId, isLiked, likeCount }: LikeButtonProps) {
-  const [showBurst, setShowBurst] = useState(false)
-  const { likeVideo, unlikeVideo, pendingLikes } = useEngagementStore()
+| State | Type | Purpose |
+|-------|------|---------|
+| showBurst | boolean | Controls particle burst animation |
 
-  // Optimistic state
-  const isPending = pendingLikes.has(videoId)
-  const optimisticLiked = isPending ? !isLiked : isLiked
-  const optimisticCount = isPending
-    ? (isLiked ? likeCount - 1 : likeCount + 1)
-    : likeCount
+**Optimistic State Calculation:**
+- `isPending = pendingLikes.has(videoId)` - Check if in-flight
+- `optimisticLiked = isPending ? !isLiked : isLiked` - Invert if pending
+- `optimisticCount = isPending ? (isLiked ? count - 1 : count + 1) : count`
 
-  const handleLike = useCallback(async () => {
-    if (optimisticLiked) {
-      await unlikeVideo(videoId)
-    } else {
-      setShowBurst(true)
-      setTimeout(() => setShowBurst(false), 800)
-      await likeVideo(videoId)
-    }
-  }, [videoId, optimisticLiked, likeVideo, unlikeVideo])
+**LikeButton Component Responsibilities:**
 
-  return (
-    <button
-      onClick={handleLike}
-      className="flex flex-col items-center gap-1"
-      disabled={isPending}
-    >
-      <div className="relative">
-        <motion.div
-          animate={{
-            scale: optimisticLiked ? [1, 1.3, 1] : 1,
-          }}
-          transition={{ duration: 0.3 }}
-        >
-          <HeartIcon
-            className={`h-8 w-8 ${
-              optimisticLiked ? 'fill-red-500 text-red-500' : 'text-white'
-            }`}
-          />
-        </motion.div>
+1. Get likeVideo, unlikeVideo, pendingLikes from engagement store
+2. Calculate optimistic state based on pending status
+3. Handle click: If optimistically liked, call unlikeVideo. Otherwise, trigger burst animation (800ms), call likeVideo
+4. Render button with disabled when pending
+5. Render heart icon with scale animation on like (1 -> 1.3 -> 1, 0.3s)
+6. Render heart fill color: red when liked, white outline when not
+7. AnimatePresence for burst animation with 6 particles
+8. Each particle animates outward at 60-degree intervals
+9. Render formatted count below icon
 
-        {/* Burst animation on like */}
-        <AnimatePresence>
-          {showBurst && (
-            <motion.div
-              initial={{ scale: 0, opacity: 1 }}
-              animate={{ scale: 2, opacity: 0 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 flex items-center justify-center"
-            >
-              {[...Array(6)].map((_, i) => (
-                <motion.span
-                  key={i}
-                  className="absolute h-2 w-2 rounded-full bg-red-500"
-                  initial={{ x: 0, y: 0 }}
-                  animate={{
-                    x: Math.cos((i * 60 * Math.PI) / 180) * 30,
-                    y: Math.sin((i * 60 * Math.PI) / 180) * 30,
-                    opacity: 0,
-                  }}
-                  transition={{ duration: 0.5 }}
-                />
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
+**Count Formatting:**
+- >= 1,000,000: Show as "X.XM"
+- >= 1,000: Show as "X.XK"
+- < 1,000: Show exact number
 
-      <span className="text-xs text-white font-semibold">
-        {formatCount(optimisticCount)}
-      </span>
-    </button>
-  )
-}
+**Optimistic Update Flow (Engagement Store):**
 
-function formatCount(count: number): string {
-  if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}K`
-  return count.toString()
-}
 ```
-
-**Optimistic Update Flow:**
-
-```typescript
-// stores/engagementStore.ts
-export const useEngagementStore = create<EngagementState>((set, get) => ({
-  pendingLikes: new Set(),
-
-  likeVideo: async (videoId: string) => {
-    // Mark as pending (triggers optimistic UI)
-    set(state => ({
-      pendingLikes: new Set(state.pendingLikes).add(videoId)
-    }))
-
-    try {
-      await api.post(`/api/videos/${videoId}/like`)
-
-      // Update feed store with confirmed state
-      useFeedStore.getState().updateVideo(videoId, {
-        isLiked: true,
-        likeCount: prev => prev + 1
-      })
-    } catch (error) {
-      // Rollback on failure (UI reverts automatically)
-      console.error('Like failed:', error)
-    } finally {
-      // Remove pending state
-      set(state => {
-        const newPending = new Set(state.pendingLikes)
-        newPending.delete(videoId)
-        return { pendingLikes: newPending }
-      })
-    }
-  },
-
-  // ... unlikeVideo similar pattern
-}))
+┌──────────────────────────────────────────────────────────────┐
+│  User clicks like                                             │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌─────────────────┐                                         │
+│  │ Add videoId to  │  Triggers optimistic UI change          │
+│  │ pendingLikes    │                                         │
+│  └────────┬────────┘                                         │
+│           ▼                                                   │
+│  ┌─────────────────┐                                         │
+│  │ POST /api/      │  API call                               │
+│  │ videos/:id/like │                                         │
+│  └────────┬────────┘                                         │
+│           │                                                   │
+│     ┌─────┴─────┐                                            │
+│     ▼           ▼                                             │
+│  Success     Failure                                          │
+│     │           │                                             │
+│     ▼           ▼                                             │
+│  ┌───────┐  ┌─────────────────┐                              │
+│  │Update │  │ Rollback        │  UI reverts automatically    │
+│  │feed   │  │ (pendingLikes   │  when pending removed        │
+│  │store  │  │ removal only)   │                              │
+│  └───┬───┘  └────────┬────────┘                              │
+│      │               │                                        │
+│      └───────┬───────┘                                        │
+│              ▼                                                │
+│  ┌─────────────────┐                                         │
+│  │ Remove from     │  Always executed in finally block       │
+│  │ pendingLikes    │                                         │
+│  └─────────────────┘                                         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Double-Tap Heart Animation:**
 
-```typescript
-// components/DoubleTapHeart.tsx
-import { motion } from 'framer-motion'
-
-export function DoubleTapHeart({ x, y }: { x: number; y: number }) {
-  return (
-    <motion.div
-      className="pointer-events-none absolute z-50"
-      style={{ left: x - 50, top: y - 50 }}
-      initial={{ scale: 0, opacity: 1 }}
-      animate={{ scale: 1.5, opacity: 0 }}
-      transition={{ duration: 0.8 }}
-    >
-      <HeartIcon className="h-24 w-24 fill-white text-white drop-shadow-lg" />
-    </motion.div>
-  )
-}
-```
+**DoubleTapHeart Component:**
+- Positioned absolutely at tap coordinates (x - 50, y - 50)
+- Initial: scale(0), opacity(1)
+- Animate: scale(1.5), opacity(0) over 0.8s
+- Renders large white heart icon with drop shadow
+- pointer-events: none to avoid blocking interaction
 
 ---
 
 ### Deep Dive 4: Cold Start Onboarding UI (5 minutes)
 
-**Interest Selection for New Users:**
+**Interest Categories:**
 
-```typescript
-// components/InterestSelector.tsx
-import { useState, useCallback } from 'react'
-import { motion } from 'framer-motion'
+| ID | Label | Emoji |
+|----|-------|-------|
+| comedy | Comedy | laughing face |
+| music | Music | musical notes |
+| dance | Dance | dancer |
+| food | Food | pizza |
+| sports | Sports | soccer ball |
+| pets | Pets | dog |
+| diy | DIY | hammer |
+| beauty | Beauty | lipstick |
+| gaming | Gaming | game controller |
+| travel | Travel | airplane |
+| fitness | Fitness | flexed bicep |
+| tech | Tech | mobile phone |
 
-const INTEREST_CATEGORIES = [
-  { id: 'comedy', label: 'Comedy', emoji: '😂' },
-  { id: 'music', label: 'Music', emoji: '🎵' },
-  { id: 'dance', label: 'Dance', emoji: '💃' },
-  { id: 'food', label: 'Food', emoji: '🍕' },
-  { id: 'sports', label: 'Sports', emoji: '⚽' },
-  { id: 'pets', label: 'Pets', emoji: '🐶' },
-  { id: 'diy', label: 'DIY', emoji: '🔨' },
-  { id: 'beauty', label: 'Beauty', emoji: '💄' },
-  { id: 'gaming', label: 'Gaming', emoji: '🎮' },
-  { id: 'travel', label: 'Travel', emoji: '✈️' },
-  { id: 'fitness', label: 'Fitness', emoji: '💪' },
-  { id: 'tech', label: 'Tech', emoji: '📱' },
-]
+**InterestSelector Component Props:**
 
-export function InterestSelector({ onComplete }: { onComplete: (interests: string[]) => void }) {
-  const [selected, setSelected] = useState<Set<string>>(new Set())
+| Prop | Type | Purpose |
+|------|------|---------|
+| onComplete | (interests: string[]) => void | Callback with selected interests |
 
-  const toggleInterest = useCallback((id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }, [])
+**InterestSelector Internal State:**
+- `selected: Set<string>` - Currently selected interest IDs
 
-  const handleContinue = useCallback(() => {
-    onComplete(Array.from(selected))
-  }, [selected, onComplete])
+**InterestSelector Component Responsibilities:**
 
-  return (
-    <div className="flex flex-col h-full bg-black px-6 py-8">
-      <h1 className="text-2xl font-bold text-white mb-2">
-        What are you interested in?
-      </h1>
-      <p className="text-gray-400 mb-8">
-        Select 3 or more to personalize your feed
-      </p>
+1. Maintain Set of selected interest IDs
+2. Toggle function: Add or remove ID from Set
+3. Handle continue: Call onComplete with Array from Set
+4. Render title "What are you interested in?"
+5. Render subtitle "Select 3 or more to personalize your feed"
+6. Render 3-column grid of interest buttons
+7. Each button shows emoji and label
+8. Selected buttons: pink background, white text
+9. Unselected buttons: gray background, gray text
+10. Button tap animation: scale(0.95)
+11. Continue button: disabled when selected.size < 3
+12. Continue button: gray when disabled, pink when enabled
+13. Display "Continue (X/3 selected)" with count
 
-      <div className="flex-1 grid grid-cols-3 gap-3">
-        {INTEREST_CATEGORIES.map(category => (
-          <motion.button
-            key={category.id}
-            onClick={() => toggleInterest(category.id)}
-            whileTap={{ scale: 0.95 }}
-            className={`
-              flex flex-col items-center justify-center p-4 rounded-xl
-              transition-colors duration-200
-              ${selected.has(category.id)
-                ? 'bg-pink-500 text-white'
-                : 'bg-gray-800 text-gray-300'}
-            `}
-          >
-            <span className="text-3xl mb-2">{category.emoji}</span>
-            <span className="text-sm font-medium">{category.label}</span>
-          </motion.button>
-        ))}
-      </div>
+**Implicit Preference Learning (useWatchTracking Hook):**
 
-      <button
-        onClick={handleContinue}
-        disabled={selected.size < 3}
-        className={`
-          mt-6 w-full py-4 rounded-full font-semibold
-          transition-all duration-200
-          ${selected.size >= 3
-            ? 'bg-pink-500 text-white'
-            : 'bg-gray-700 text-gray-500 cursor-not-allowed'}
-        `}
-      >
-        Continue ({selected.size}/3 selected)
-      </button>
-    </div>
-  )
-}
-```
+**Hook Responsibilities:**
+1. Maintain ref for start time
+2. Effect (isActive changes):
+   - If becoming active: Record start time
+   - If becoming inactive: Calculate duration, call trackWatch, clear start time
 
-**Implicit Preference Learning UI:**
-
-```typescript
-// hooks/useWatchTracking.ts
-export function useWatchTracking(videoId: string, isActive: boolean) {
-  const startTimeRef = useRef<number | null>(null)
-  const { trackWatch } = useUserStore()
-
-  useEffect(() => {
-    if (isActive) {
-      startTimeRef.current = Date.now()
-    } else if (startTimeRef.current) {
-      const watchDuration = Date.now() - startTimeRef.current
-      trackWatch(videoId, watchDuration)
-      startTimeRef.current = null
-    }
-  }, [isActive, videoId, trackWatch])
-}
-
-// Visual feedback for new users
-function NewUserFeedbackOverlay({ video }: { video: Video }) {
-  const { isNewUser } = useUserStore()
-
-  if (!isNewUser) return null
-
-  return (
-    <div className="absolute top-20 left-4 right-4">
-      <div className="bg-black/70 rounded-xl p-4 text-white text-sm">
-        <p className="font-semibold mb-1">We're learning your taste!</p>
-        <p className="text-gray-300">
-          Keep scrolling - we'll personalize your feed based on what you watch.
-        </p>
-      </div>
-    </div>
-  )
-}
-```
+**NewUserFeedbackOverlay Component:**
+- Only renders when isNewUser is true
+- Positioned at top of screen
+- Dark semi-transparent background
+- Title: "We're learning your taste!"
+- Subtitle: "Keep scrolling - we'll personalize your feed based on what you watch."
 
 ---
 
 ### Deep Dive 5: Creator Analytics Dashboard (5 minutes)
 
-**Performance Chart:**
+**PerformanceChart Component Props:**
 
-```typescript
-// components/PerformanceChart.tsx
-import { useMemo } from 'react'
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-} from 'recharts'
+| Prop | Type | Purpose |
+|------|------|---------|
+| data | AnalyticsData[] | Time-series data |
+| metric | 'views' or 'likes' or 'shares' or 'comments' | Metric to display |
 
-interface PerformanceChartProps {
-  data: AnalyticsData[]
-  metric: 'views' | 'likes' | 'shares' | 'comments'
-}
+**Metric Colors:**
 
-export function PerformanceChart({ data, metric }: PerformanceChartProps) {
-  const chartData = useMemo(() => {
-    return data.map(d => ({
-      date: formatDate(d.date),
-      value: d[metric],
-    }))
-  }, [data, metric])
+| Metric | Color |
+|--------|-------|
+| views | Blue (#3B82F6) |
+| likes | Red (#EF4444) |
+| shares | Green (#10B981) |
+| comments | Amber (#F59E0B) |
 
-  const color = {
-    views: '#3B82F6',
-    likes: '#EF4444',
-    shares: '#10B981',
-    comments: '#F59E0B',
-  }[metric]
+**PerformanceChart Component Responsibilities:**
 
-  return (
-    <div className="h-64 w-full">
-      <ResponsiveContainer>
-        <LineChart data={chartData}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-          <XAxis
-            dataKey="date"
-            stroke="#9CA3AF"
-            fontSize={12}
-          />
-          <YAxis
-            stroke="#9CA3AF"
-            fontSize={12}
-            tickFormatter={formatCount}
-          />
-          <Tooltip
-            contentStyle={{
-              backgroundColor: '#1F2937',
-              border: 'none',
-              borderRadius: 8,
-            }}
-            labelStyle={{ color: '#fff' }}
-          />
-          <Line
-            type="monotone"
-            dataKey="value"
-            stroke={color}
-            strokeWidth={2}
-            dot={false}
-          />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-```
+1. Memoize chart data transformation (date formatting, metric extraction)
+2. Render ResponsiveContainer with LineChart
+3. Render CartesianGrid with dashed stroke in gray
+4. Render XAxis with date labels, gray stroke
+5. Render YAxis with formatted count, gray stroke
+6. Render Tooltip with dark background, rounded corners
+7. Render Line with monotone curve, metric color, no dots, 2px stroke
 
-**Video Analytics Table:**
+**VideoAnalyticsTable Component:**
 
-```typescript
-// components/VideoAnalyticsTable.tsx
-export function VideoAnalyticsTable({ videos }: { videos: VideoAnalytics[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm text-gray-300">
-        <thead className="text-gray-400 border-b border-gray-700">
-          <tr>
-            <th className="text-left py-3 px-4">Video</th>
-            <th className="text-right py-3 px-4">Views</th>
-            <th className="text-right py-3 px-4">Avg Watch</th>
-            <th className="text-right py-3 px-4">Completion</th>
-            <th className="text-right py-3 px-4">Likes</th>
-            <th className="text-right py-3 px-4">Shares</th>
-          </tr>
-        </thead>
-        <tbody>
-          {videos.map(video => (
-            <tr key={video.id} className="border-b border-gray-800 hover:bg-gray-800/50">
-              <td className="py-3 px-4">
-                <div className="flex items-center gap-3">
-                  <img
-                    src={video.thumbnailUrl}
-                    className="h-12 w-9 object-cover rounded"
-                    alt=""
-                  />
-                  <span className="line-clamp-2">{video.description}</span>
-                </div>
-              </td>
-              <td className="text-right py-3 px-4 font-medium">
-                {formatCount(video.views)}
-              </td>
-              <td className="text-right py-3 px-4">
-                {formatDuration(video.avgWatchTime)}
-              </td>
-              <td className="text-right py-3 px-4">
-                <CompletionBadge rate={video.completionRate} />
-              </td>
-              <td className="text-right py-3 px-4">
-                {formatCount(video.likes)}
-              </td>
-              <td className="text-right py-3 px-4">
-                {formatCount(video.shares)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
+**Table Columns:**
 
-function CompletionBadge({ rate }: { rate: number }) {
-  const color = rate > 0.7 ? 'green' : rate > 0.4 ? 'yellow' : 'red'
-  return (
-    <span className={`
-      px-2 py-1 rounded text-xs font-medium
-      ${color === 'green' && 'bg-green-500/20 text-green-400'}
-      ${color === 'yellow' && 'bg-yellow-500/20 text-yellow-400'}
-      ${color === 'red' && 'bg-red-500/20 text-red-400'}
-    `}>
-      {Math.round(rate * 100)}%
-    </span>
-  )
-}
-```
+| Column | Alignment | Content |
+|--------|-----------|---------|
+| Video | Left | Thumbnail + description |
+| Views | Right | Formatted count |
+| Avg Watch | Right | Formatted duration |
+| Completion | Right | CompletionBadge component |
+| Likes | Right | Formatted count |
+| Shares | Right | Formatted count |
+
+**VideoAnalyticsTable Component Responsibilities:**
+
+1. Render overflow-x-auto wrapper for horizontal scroll
+2. Render table with gray text
+3. Render thead with border-bottom
+4. Map videos to table rows with border-bottom and hover effect
+5. Video cell: thumbnail (12x9 rounded) + 2-line clamped description
+6. All count cells: formatted with formatCount helper
+7. Duration cell: formatted with formatDuration helper
+8. Completion cell: CompletionBadge with rate prop
+
+**CompletionBadge Component:**
+
+| Rate Range | Color | Background |
+|------------|-------|------------|
+| > 70% | Green | green-500/20 |
+| 40-70% | Yellow | yellow-500/20 |
+| < 40% | Red | red-500/20 |
+
+- Displays rate as percentage (rounded)
+- Small pill shape with colored text on tinted background
 
 ---
 
 ## Step 4: Responsive Design (3 minutes)
 
-**Mobile-First Layout:**
+**Mobile-First Layout (Base Styles):**
 
-```css
-/* Base mobile styles */
-.feed-container {
-  @apply h-screen w-screen overflow-hidden;
-}
+| Element | Styles |
+|---------|--------|
+| Feed container | Full screen height and width, overflow hidden |
+| Video card | Full height and width, relative positioning |
+| Engagement bar | Absolute right-3, bottom-24, flex column, gap-4 |
 
-.video-card {
-  @apply h-full w-full relative;
-}
+**Tablet Landscape (min-width: 768px, orientation: landscape):**
 
-.engagement-bar {
-  @apply absolute right-3 bottom-24 flex flex-col gap-4;
-}
+| Element | Change |
+|---------|--------|
+| Feed container | max-width: 2xl (672px), centered |
 
-/* Tablet landscape */
-@media (min-width: 768px) and (orientation: landscape) {
-  .feed-container {
-    @apply max-w-2xl mx-auto;
-  }
-}
+**Desktop (min-width: 1024px):**
 
-/* Desktop */
-@media (min-width: 1024px) {
-  .layout {
-    @apply flex;
-  }
-
-  .sidebar {
-    @apply w-64 flex-shrink-0;
-  }
-
-  .feed-container {
-    @apply max-w-lg mx-auto;
-  }
-
-  .engagement-bar {
-    @apply right-[-80px]; /* Move outside video */
-  }
-}
-```
+| Element | Change |
+|---------|--------|
+| Layout | Flex row |
+| Sidebar | 256px fixed width |
+| Feed container | max-width: lg (512px), centered |
+| Engagement bar | Positioned outside video (right: -80px) |
 
 ---
 
 ## Step 5: Accessibility (2 minutes)
 
-```typescript
-// Accessible video controls
-function VideoPlayer({ video, isActive }: VideoPlayerProps) {
-  return (
-    <div
-      role="region"
-      aria-label={`Video by ${video.creator.username}`}
-    >
-      <video
-        aria-describedby={`video-desc-${video.id}`}
-      />
+**Accessible Video Controls:**
 
-      {/* Hidden description for screen readers */}
-      <span id={`video-desc-${video.id}`} className="sr-only">
-        {video.description}. {video.duration} seconds long.
-        {video.likeCount} likes, {video.commentCount} comments.
-      </span>
+| ARIA Attribute | Element | Value |
+|----------------|---------|-------|
+| role="region" | Video container | Landmark for screen readers |
+| aria-label | Video container | "Video by {username}" |
+| aria-describedby | Video element | References hidden description |
+| aria-label | Captions button | "Toggle captions" |
+| aria-pressed | Captions button | Current captions state |
 
-      {/* Captions toggle */}
-      <button
-        aria-label="Toggle captions"
-        aria-pressed={captionsEnabled}
-      >
-        <CaptionsIcon />
-      </button>
-    </div>
-  )
-}
+**Hidden Description (sr-only):**
+- Video description text
+- Duration in seconds
+- Like count
+- Comment count
 
-// Reduced motion preference
-function LikeButton() {
-  const prefersReducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
+**Reduced Motion Preference:**
 
-  return (
-    <motion.div
-      animate={prefersReducedMotion ? {} : { scale: [1, 1.3, 1] }}
-    >
-      <HeartIcon />
-    </motion.div>
-  )
-}
-```
+- Query `prefers-reduced-motion: reduce` media feature
+- When true: Disable scale animations on like button
+- When true: Return empty animation object from motion components
 
 ---
 

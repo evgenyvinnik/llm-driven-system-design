@@ -31,43 +31,45 @@
 ### Component Hierarchy
 
 ```
-App
-├── Header
-│   ├── Logo
-│   ├── SearchBar (autocomplete)
-│   └── UserMenu (compose, profile, settings)
-├── Layout (3-column on desktop)
-│   ├── LeftSidebar
-│   │   ├── NavLinks (Home, Explore, Notifications, Profile)
-│   │   └── TweetButton
-│   ├── MainContent
-│   │   └── Routes
-│   │       ├── HomeTimeline
-│   │       ├── ExplorePage
-│   │       ├── ProfilePage
-│   │       └── TweetDetail
-│   └── RightSidebar
-│       ├── TrendingTopics
-│       └── WhoToFollow
-└── ComposeModal (global)
+┌─────────────────────────────────────────────────────────────────────┐
+│  App                                                                 │
+│  ├── Header                                                         │
+│  │   ├── Logo                                                       │
+│  │   ├── SearchBar (autocomplete)                                   │
+│  │   └── UserMenu (compose, profile, settings)                      │
+│  ├── Layout (3-column on desktop)                                   │
+│  │   ├── LeftSidebar                                                │
+│  │   │   ├── NavLinks (Home, Explore, Notifications, Profile)       │
+│  │   │   └── TweetButton                                            │
+│  │   ├── MainContent                                                │
+│  │   │   └── Routes                                                 │
+│  │   │       ├── HomeTimeline                                       │
+│  │   │       ├── ExplorePage                                        │
+│  │   │       ├── ProfilePage                                        │
+│  │   │       └── TweetDetail                                        │
+│  │   └── RightSidebar                                               │
+│  │       ├── TrendingTopics                                         │
+│  │       └── WhoToFollow                                            │
+│  └── ComposeModal (global)                                          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### State Management Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Zustand Stores                             │
-├─────────────────────────────────────────────────────────────────┤
-│  AuthStore           │  TimelineStore        │  UIStore         │
-│  - user              │  - tweets[]           │  - composeOpen   │
-│  - isAuthenticated   │  - hasMore            │  - activeTab     │
-│  - login/logout      │  - fetchTimeline()    │  - theme         │
-├─────────────────────────────────────────────────────────────────┤
-│  EngagementStore     │  TrendingStore        │                  │
-│  - likes: Set        │  - trends[]           │                  │
-│  - retweets: Set     │  - loading            │                  │
-│  - toggleLike()      │  - fetchTrends()      │                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Zustand Stores                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  AuthStore           │  TimelineStore        │  UIStore             │
+│  - user              │  - tweets[]           │  - composeOpen       │
+│  - isAuthenticated   │  - hasMore            │  - activeTab         │
+│  - login/logout      │  - fetchTimeline()    │  - theme             │
+├─────────────────────────────────────────────────────────────────────┤
+│  EngagementStore     │  TrendingStore                               │
+│  - likes: Set        │  - trends[]                                  │
+│  - retweets: Set     │  - loading                                   │
+│  - toggleLike()      │  - fetchTrends()                             │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -88,234 +90,117 @@ With virtualization:
 
 ### Virtualized Timeline Implementation
 
-```typescript
-// components/Timeline.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
-import { useRef, useEffect } from 'react';
-import { useTimelineStore } from '@/stores/timelineStore';
+**Timeline Component Structure:**
 
-interface TimelineProps {
-  tweets: Tweet[];
-  isLoading: boolean;
-  onLoadMore: () => void;
-  hasMore: boolean;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Timeline Props                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  tweets: Tweet[]                                                     │
+│  isLoading: boolean                                                  │
+│  onLoadMore: () => void                                              │
+│  hasMore: boolean                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-export function Timeline({ tweets, isLoading, onLoadMore, hasMore }: TimelineProps) {
-  const parentRef = useRef<HTMLDivElement>(null);
+**Virtualizer Configuration:**
 
-  const virtualizer = useVirtualizer({
-    count: tweets.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 150, // Average tweet height
-    overscan: 5, // Extra items above/below viewport
-    measureElement: (element) => element.getBoundingClientRect().height,
-  });
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  useVirtualizer({                                                    │
+│    count: tweets.length,                                             │
+│    getScrollElement: () => parentRef.current,                        │
+│    estimateSize: () => 150,  // Average tweet height                 │
+│    overscan: 5,              // Extra items above/below              │
+│    measureElement: (el) => el.getBoundingClientRect().height         │
+│  })                                                                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  // Infinite scroll trigger
-  useEffect(() => {
-    const items = virtualizer.getVirtualItems();
-    const lastItem = items[items.length - 1];
+**Infinite Scroll Trigger:**
 
-    if (!lastItem) return;
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  useEffect: Watch virtual items                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  lastItem = virtualItems[virtualItems.length - 1]                    │
+│                                                                      │
+│  IF lastItem.index >= tweets.length - 5                              │
+│     AND hasMore                                                      │
+│     AND NOT isLoading:                                               │
+│       onLoadMore()                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-    if (lastItem.index >= tweets.length - 5 && hasMore && !isLoading) {
-      onLoadMore();
-    }
-  }, [virtualizer.getVirtualItems(), hasMore, isLoading, tweets.length, onLoadMore]);
+**Virtual Container Structure:**
 
-  return (
-    <div ref={parentRef} className="timeline-scroll-container">
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          width: '100%',
-          position: 'relative',
-        }}
-      >
-        {virtualizer.getVirtualItems().map((virtualItem) => (
-          <div
-            key={virtualItem.key}
-            data-index={virtualItem.index}
-            ref={virtualizer.measureElement}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              transform: `translateY(${virtualItem.start}px)`,
-            }}
-          >
-            <Tweet tweet={tweets[virtualItem.index]} />
-          </div>
-        ))}
-      </div>
-
-      {isLoading && (
-        <div className="loading-indicator">
-          <Spinner />
-        </div>
-      )}
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  <div ref={parentRef} class="timeline-scroll-container">            │
+│    <div style={{ height: totalSize, position: relative }}>          │
+│      {virtualItems.map(item => (                                     │
+│        <div                                                          │
+│          key={item.key}                                              │
+│          data-index={item.index}                                     │
+│          ref={measureElement}                                        │
+│          style={{                                                    │
+│            position: absolute,                                       │
+│            transform: translateY(item.start)                         │
+│          }}                                                          │
+│        >                                                             │
+│          <Tweet tweet={tweets[item.index]} />                        │
+│        </div>                                                        │
+│      ))}                                                             │
+│    </div>                                                            │
+│    {isLoading && <Spinner />}                                        │
+│  </div>                                                              │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Tweet Component
 
-```typescript
-// components/Tweet.tsx
-import { memo } from 'react';
-import { formatDistanceToNow } from 'date-fns';
-import { useEngagementStore } from '@/stores/engagementStore';
+**Tweet Structure:**
 
-interface TweetProps {
-  tweet: {
-    id: string;
-    author: { username: string; displayName: string; avatarUrl: string };
-    content: string;
-    createdAt: string;
-    likeCount: number;
-    retweetCount: number;
-    replyCount: number;
-  };
-}
-
-export const Tweet = memo(function Tweet({ tweet }: TweetProps) {
-  const { likes, retweets, toggleLike, toggleRetweet } = useEngagementStore();
-
-  const isLiked = likes.has(tweet.id);
-  const isRetweeted = retweets.has(tweet.id);
-
-  return (
-    <article className="tweet">
-      <div className="tweet-avatar">
-        <img
-          src={tweet.author.avatarUrl}
-          alt={tweet.author.displayName}
-          loading="lazy"
-        />
-      </div>
-
-      <div className="tweet-content">
-        <div className="tweet-header">
-          <span className="display-name">{tweet.author.displayName}</span>
-          <span className="username">@{tweet.author.username}</span>
-          <span className="separator">·</span>
-          <time className="timestamp">
-            {formatDistanceToNow(new Date(tweet.createdAt), { addSuffix: true })}
-          </time>
-        </div>
-
-        <p className="tweet-text">
-          {parseContent(tweet.content)}
-        </p>
-
-        <div className="tweet-actions">
-          <ActionButton
-            icon={<ReplyIcon />}
-            count={tweet.replyCount}
-            label="Reply"
-          />
-
-          <ActionButton
-            icon={<RetweetIcon />}
-            count={tweet.retweetCount + (isRetweeted ? 1 : 0)}
-            active={isRetweeted}
-            activeColor="text-twitter-retweet"
-            onClick={() => toggleRetweet(tweet.id)}
-            label="Retweet"
-          />
-
-          <ActionButton
-            icon={<HeartIcon filled={isLiked} />}
-            count={tweet.likeCount + (isLiked ? 1 : 0)}
-            active={isLiked}
-            activeColor="text-twitter-like"
-            onClick={() => toggleLike(tweet.id)}
-            label="Like"
-          />
-
-          <ActionButton
-            icon={<ShareIcon />}
-            label="Share"
-          />
-        </div>
-      </div>
-    </article>
-  );
-}, (prevProps, nextProps) => prevProps.tweet.id === nextProps.tweet.id);
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Tweet (article, memo for performance)                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌──────┐  ┌──────────────────────────────────────────────────────┐ │
+│  │Avatar│  │ Header: DisplayName @username · timestamp             │ │
+│  │      │  ├──────────────────────────────────────────────────────┤ │
+│  │      │  │ Content: parsed text with #hashtags @mentions URLs   │ │
+│  │      │  ├──────────────────────────────────────────────────────┤ │
+│  │      │  │ Actions: [Reply] [Retweet] [Like] [Share]            │ │
+│  └──────┘  └──────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Memoization Strategy:**
+
+```
+memo(Tweet, (prev, next) => prev.tweet.id === next.tweet.id)
+```
+
+"I memoize Tweet by id only because engagement state comes from a separate store. When likes/retweets change, the component re-renders via the store hook, not props."
 
 ### Content Parsing with Hashtag Links
 
-```typescript
-// utils/parseContent.tsx
-import { Link } from '@tanstack/react-router';
+**parseContent() Function:**
 
-export function parseContent(content: string): React.ReactNode[] {
-  const parts: React.ReactNode[] = [];
-  const regex = /(#\w+)|(@\w+)|(https?:\/\/\S+)/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = regex.exec(content)) !== null) {
-    // Add text before match
-    if (match.index > lastIndex) {
-      parts.push(content.slice(lastIndex, match.index));
-    }
-
-    const [token] = match;
-
-    if (token.startsWith('#')) {
-      // Hashtag link
-      parts.push(
-        <Link
-          key={match.index}
-          to="/hashtag/$tag"
-          params={{ tag: token.slice(1) }}
-          className="text-twitter-blue hover:underline"
-        >
-          {token}
-        </Link>
-      );
-    } else if (token.startsWith('@')) {
-      // Mention link
-      parts.push(
-        <Link
-          key={match.index}
-          to="/profile/$username"
-          params={{ username: token.slice(1) }}
-          className="text-twitter-blue hover:underline"
-        >
-          {token}
-        </Link>
-      );
-    } else {
-      // URL link
-      parts.push(
-        <a
-          key={match.index}
-          href={token}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-twitter-blue hover:underline"
-        >
-          {truncateUrl(token)}
-        </a>
-      );
-    }
-
-    lastIndex = regex.lastIndex;
-  }
-
-  // Add remaining text
-  if (lastIndex < content.length) {
-    parts.push(content.slice(lastIndex));
-  }
-
-  return parts;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Input: "Check out #React and @dan_abramov https://react.dev"       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Regex: /(#\w+)|(@\w+)|(https?:\/\/\S+)/g                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  Output Parts:                                                       │
+│  ├── "Check out "                                                   │
+│  ├── <Link to="/hashtag/React">#React</Link>                        │
+│  ├── " and "                                                        │
+│  ├── <Link to="/profile/dan_abramov">@dan_abramov</Link>            │
+│  ├── " "                                                            │
+│  └── <a href="https://react.dev">react.dev</a>                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -324,190 +209,133 @@ export function parseContent(content: string): React.ReactNode[] {
 
 ### Engagement Store with Optimistic State
 
-```typescript
-// stores/engagementStore.ts
-import { create } from 'zustand';
-import { api } from '@/services/api';
+**EngagementStore Structure:**
 
-interface EngagementState {
-  likes: Set<string>;
-  retweets: Set<string>;
-  pendingLikes: Set<string>;
-  pendingRetweets: Set<string>;
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     EngagementState                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  Data                                                                │
+│  ├── likes: Set<string>           (tweet IDs user has liked)        │
+│  ├── retweets: Set<string>        (tweet IDs user has retweeted)    │
+│  ├── pendingLikes: Set<string>    (in-flight like requests)         │
+│  └── pendingRetweets: Set<string> (in-flight retweet requests)      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Actions                                                             │
+│  ├── toggleLike(tweetId) ──▶ optimistic like/unlike                 │
+│  ├── toggleRetweet(tweetId) ──▶ optimistic retweet/unretweet        │
+│  └── initFromServer(likedIds, retweetedIds) ──▶ hydrate from API    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  toggleLike: (tweetId: string) => Promise<void>;
-  toggleRetweet: (tweetId: string) => Promise<void>;
-  initFromServer: (likedIds: string[], retweetedIds: string[]) => void;
-}
+**toggleLike() Flow:**
 
-export const useEngagementStore = create<EngagementState>((set, get) => ({
-  likes: new Set(),
-  retweets: new Set(),
-  pendingLikes: new Set(),
-  pendingRetweets: new Set(),
-
-  toggleLike: async (tweetId: string) => {
-    const { likes, pendingLikes } = get();
-
-    // Prevent double-clicks
-    if (pendingLikes.has(tweetId)) return;
-
-    const isCurrentlyLiked = likes.has(tweetId);
-
-    // Optimistic update
-    set((state) => {
-      const newLikes = new Set(state.likes);
-      const newPending = new Set(state.pendingLikes);
-
-      if (isCurrentlyLiked) {
-        newLikes.delete(tweetId);
-      } else {
-        newLikes.add(tweetId);
-      }
-      newPending.add(tweetId);
-
-      return { likes: newLikes, pendingLikes: newPending };
-    });
-
-    try {
-      if (isCurrentlyLiked) {
-        await api.unlikeTweet(tweetId);
-      } else {
-        await api.likeTweet(tweetId);
-      }
-    } catch (error) {
-      // Rollback on failure
-      set((state) => {
-        const newLikes = new Set(state.likes);
-        if (isCurrentlyLiked) {
-          newLikes.add(tweetId);
-        } else {
-          newLikes.delete(tweetId);
-        }
-        return { likes: newLikes };
-      });
-
-      console.error('Failed to toggle like:', error);
-    } finally {
-      // Clear pending state
-      set((state) => {
-        const newPending = new Set(state.pendingLikes);
-        newPending.delete(tweetId);
-        return { pendingLikes: newPending };
-      });
-    }
-  },
-
-  toggleRetweet: async (tweetId: string) => {
-    // Similar implementation to toggleLike
-  },
-
-  initFromServer: (likedIds: string[], retweetedIds: string[]) => {
-    set({
-      likes: new Set(likedIds),
-      retweets: new Set(retweetedIds),
-    });
-  },
-}));
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  toggleLike(tweetId)                                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Check pending - if already in-flight, return                     │
+│                                                                      │
+│  2. Read current state                                               │
+│     isCurrentlyLiked = likes.has(tweetId)                            │
+│                                                                      │
+│  3. Optimistic update                                                │
+│     ┌─────────────────────────────────────────────────────────────┐ │
+│     │ IF isCurrentlyLiked: likes.delete(tweetId)                   │ │
+│     │ ELSE: likes.add(tweetId)                                     │ │
+│     │ pendingLikes.add(tweetId)                                    │ │
+│     └─────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  4. API call                                                         │
+│     try {                                                            │
+│       await api.likeTweet(tweetId) or api.unlikeTweet(tweetId)      │
+│     } catch {                                                        │
+│       // Rollback                                                    │
+│       IF isCurrentlyLiked: likes.add(tweetId)                        │
+│       ELSE: likes.delete(tweetId)                                    │
+│     } finally {                                                      │
+│       pendingLikes.delete(tweetId)                                   │
+│     }                                                                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Action Button with Animation
 
-```typescript
-// components/ActionButton.tsx
-import { useState } from 'react';
+**ActionButton Props:**
 
-interface ActionButtonProps {
-  icon: React.ReactNode;
-  count?: number;
-  active?: boolean;
-  activeColor?: string;
-  onClick?: () => void;
-  label: string;
-}
-
-export function ActionButton({
-  icon,
-  count,
-  active,
-  activeColor,
-  onClick,
-  label,
-}: ActionButtonProps) {
-  const [isAnimating, setIsAnimating] = useState(false);
-
-  const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-
-    if (onClick) {
-      setIsAnimating(true);
-      onClick();
-      setTimeout(() => setIsAnimating(false), 300);
-    }
-  };
-
-  return (
-    <button
-      onClick={handleClick}
-      className={`action-button ${active ? activeColor : 'text-twitter-gray'}`}
-      aria-label={label}
-      aria-pressed={active}
-    >
-      <span className={`icon-wrapper ${isAnimating ? 'animate-pop' : ''}`}>
-        {icon}
-      </span>
-      {count !== undefined && count > 0 && (
-        <span className="count">{formatCount(count)}</span>
-      )}
-    </button>
-  );
-}
-
-function formatCount(count: number): string {
-  if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-  return count.toString();
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ActionButtonProps                                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  icon: React.ReactNode                                               │
+│  count?: number                                                      │
+│  active?: boolean                                                    │
+│  activeColor?: string                                                │
+│  onClick?: () => void                                                │
+│  label: string                                                       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### CSS for Engagement Animations
+**Animation Behavior:**
 
-```css
-/* Like heart animation */
-@keyframes pop {
-  0% { transform: scale(1); }
-  50% { transform: scale(1.3); }
-  100% { transform: scale(1); }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  onClick Handler                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. e.stopPropagation() - prevent tweet click navigation             │
+│  2. setIsAnimating(true)                                             │
+│  3. call onClick()                                                   │
+│  4. setTimeout(() => setIsAnimating(false), 300)                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-.animate-pop {
-  animation: pop 0.3s ease-out;
-}
+**Count Formatting:**
 
-/* Heart fill animation */
-@keyframes heart-fill {
-  0% { transform: scale(0); opacity: 0; }
-  50% { transform: scale(1.2); opacity: 1; }
-  100% { transform: scale(1); opacity: 1; }
-}
+```
+formatCount(count):
+  >= 1,000,000 ──▶ "1.5M"
+  >= 1,000 ──▶ "15.2K"
+  else ──▶ "999"
+```
+
+### CSS Animations
+
+**Pop Animation (for like/retweet):**
+
+```
+@keyframes pop:
+  0%   { transform: scale(1) }
+  50%  { transform: scale(1.3) }
+  100% { transform: scale(1) }
+
+.animate-pop { animation: pop 0.3s ease-out }
+```
+
+**Heart Fill Animation:**
+
+```
+@keyframes heart-fill:
+  0%   { transform: scale(0); opacity: 0 }
+  50%  { transform: scale(1.2); opacity: 1 }
+  100% { transform: scale(1); opacity: 1 }
 
 .heart-icon.filled {
   animation: heart-fill 0.3s ease-out;
   fill: #F91880;
 }
+```
 
-/* Retweet color transition */
-.action-button {
-  transition: color 0.15s ease-out;
-}
+**Brand Colors:**
 
-.text-twitter-like {
-  color: #F91880;
-}
-
-.text-twitter-retweet {
-  color: #00BA7C;
-}
+```
+┌────────────────────────┬──────────┐
+│ --twitter-blue         │ #1DA1F2  │
+│ --twitter-dark-blue    │ #1A91DA  │
+│ --twitter-black        │ #0F1419  │
+│ --twitter-gray         │ #536471  │
+│ --twitter-like         │ #F91880  │
+│ --twitter-retweet      │ #00BA7C  │
+└────────────────────────┴──────────┘
 ```
 
 ---
@@ -516,124 +344,63 @@ function formatCount(count: number): string {
 
 ### Character Counter and Validation
 
-```typescript
-// components/ComposeTweet.tsx
-import { useState, useRef } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/services/api';
+**ComposeTweet State:**
 
-const MAX_LENGTH = 280;
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  content: string                                                     │
+│  remaining = MAX_LENGTH (280) - content.length                       │
+│  isOverLimit = remaining < 0                                         │
+│  isNearLimit = remaining <= 20 && remaining >= 0                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-export function ComposeTweet({ onSuccess }: { onSuccess?: () => void }) {
-  const [content, setContent] = useState('');
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const queryClient = useQueryClient();
+**Auto-resize Textarea:**
 
-  const remaining = MAX_LENGTH - content.length;
-  const isOverLimit = remaining < 0;
-  const isNearLimit = remaining <= 20 && remaining >= 0;
+```
+onChange Handler:
+  1. setContent(e.target.value)
+  2. textarea.style.height = 'auto'
+  3. textarea.style.height = textarea.scrollHeight + 'px'
+```
 
-  const createTweetMutation = useMutation({
-    mutationFn: (content: string) => api.createTweet(content),
-    onSuccess: () => {
-      setContent('');
-      queryClient.invalidateQueries({ queryKey: ['timeline', 'home'] });
-      onSuccess?.();
-    },
-  });
+**Submit Flow:**
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (content.trim() && !isOverLimit) {
-      createTweetMutation.mutate(content);
-    }
-  };
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  handleSubmit()                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  IF content.trim() AND NOT isOverLimit:                              │
+│    1. createTweetMutation.mutate(content)                            │
+│    2. onSuccess: setContent(''), invalidate ['timeline', 'home']    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  // Auto-resize textarea
-  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setContent(e.target.value);
+**Compose Layout:**
 
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-      textarea.style.height = `${textarea.scrollHeight}px`;
-    }
-  };
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ┌────────┐  ┌────────────────────────────────────────────────────┐ │
+│  │ Avatar │  │ <textarea placeholder="What's happening?">        │ │
+│  │        │  │                                                    │ │
+│  │        │  ├────────────────────────────────────────────────────┤ │
+│  │        │  │ [Image] [GIF] [Emoji]     [Counter] [Tweet Button]│ │
+│  └────────┘  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  return (
-    <form onSubmit={handleSubmit} className="compose-tweet">
-      <div className="compose-avatar">
-        <CurrentUserAvatar />
-      </div>
+**CharacterCounter Component:**
 
-      <div className="compose-content">
-        <textarea
-          ref={textareaRef}
-          value={content}
-          onChange={handleChange}
-          placeholder="What's happening?"
-          className="compose-textarea"
-          rows={1}
-          aria-label="Tweet text"
-        />
-
-        <div className="compose-footer">
-          <div className="compose-actions">
-            <button type="button" className="media-button" aria-label="Add photo">
-              <ImageIcon />
-            </button>
-            <button type="button" className="media-button" aria-label="Add GIF">
-              <GifIcon />
-            </button>
-            <button type="button" className="media-button" aria-label="Add emoji">
-              <EmojiIcon />
-            </button>
-          </div>
-
-          <div className="compose-submit">
-            <CharacterCounter remaining={remaining} />
-
-            <button
-              type="submit"
-              disabled={!content.trim() || isOverLimit || createTweetMutation.isPending}
-              className="tweet-button"
-            >
-              {createTweetMutation.isPending ? 'Posting...' : 'Tweet'}
-            </button>
-          </div>
-        </div>
-      </div>
-    </form>
-  );
-}
-
-function CharacterCounter({ remaining }: { remaining: number }) {
-  const isOverLimit = remaining < 0;
-  const isNearLimit = remaining <= 20 && remaining >= 0;
-
-  if (remaining > 20) return null;
-
-  return (
-    <div className={`character-counter ${isOverLimit ? 'over' : isNearLimit ? 'near' : ''}`}>
-      {isOverLimit ? (
-        <span className="text-red-500">{remaining}</span>
-      ) : (
-        <svg viewBox="0 0 20 20" className="counter-circle">
-          <circle
-            cx="10"
-            cy="10"
-            r="9"
-            fill="none"
-            stroke={isNearLimit ? '#FFD400' : '#1DA1F2'}
-            strokeWidth="2"
-            strokeDasharray={`${(remaining / 20) * 56.5} 56.5`}
-            transform="rotate(-90 10 10)"
-          />
-        </svg>
-      )}
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  IF remaining > 20: return null (don't show)                         │
+│                                                                      │
+│  IF remaining < 0:                                                   │
+│    Show red text: "-5"                                               │
+│  ELSE:                                                               │
+│    Show SVG circle with stroke-dasharray                             │
+│    Color: yellow if near limit, blue otherwise                       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -642,173 +409,49 @@ function CharacterCounter({ remaining }: { remaining: number }) {
 
 ### Trending Topics Component
 
-```typescript
-// components/TrendingSidebar.tsx
-import { useQuery } from '@tanstack/react-query';
-import { Link } from '@tanstack/react-router';
-import { api } from '@/services/api';
+**TrendingSidebar Data Fetching:**
 
-export function TrendingSidebar() {
-  const { data: trends, isLoading } = useQuery({
-    queryKey: ['trends'],
-    queryFn: () => api.getTrends(),
-    refetchInterval: 60000, // Refresh every minute
-    staleTime: 30000,
-  });
-
-  if (isLoading) {
-    return <TrendingSkeleton />;
-  }
-
-  return (
-    <aside className="trending-sidebar">
-      <h2 className="sidebar-title">Trends for you</h2>
-
-      <div className="trends-list">
-        {trends?.map((trend, index) => (
-          <Link
-            key={trend.hashtag}
-            to="/hashtag/$tag"
-            params={{ tag: trend.hashtag }}
-            className="trend-item"
-          >
-            <div className="trend-meta">
-              <span className="trend-category">Trending</span>
-              <span className="trend-rank">#{index + 1}</span>
-            </div>
-            <div className="trend-hashtag">#{trend.hashtag}</div>
-            <div className="trend-count">
-              {formatTweetCount(trend.tweetCount)} Tweets
-            </div>
-          </Link>
-        ))}
-      </div>
-
-      <Link to="/explore/trending" className="show-more">
-        Show more
-      </Link>
-    </aside>
-  );
-}
-
-function formatTweetCount(count: number): string {
-  if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-  return count.toString();
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  useQuery({                                                          │
+│    queryKey: ['trends'],                                             │
+│    queryFn: () => api.getTrends(),                                   │
+│    refetchInterval: 60000,  // Refresh every minute                  │
+│    staleTime: 30000,        // Consider fresh for 30s                │
+│  })                                                                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### CSS for Twitter Brand Styling
+**Trend Item Structure:**
 
-```css
-/* Twitter brand colors */
-:root {
-  --twitter-blue: #1DA1F2;
-  --twitter-dark-blue: #1A91DA;
-  --twitter-black: #0F1419;
-  --twitter-gray: #536471;
-  --twitter-light-gray: #EFF3F4;
-  --twitter-extra-light-gray: #F7F9FA;
-  --twitter-like: #F91880;
-  --twitter-retweet: #00BA7C;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  <Link to="/hashtag/$tag">                                           │
+│    ├── trend-meta: "Trending" #1                                    │
+│    ├── trend-hashtag: #JavaScript                                   │
+│    └── trend-count: 15.2K Tweets                                    │
+│  </Link>                                                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-/* Tweet card */
-.tweet {
-  display: flex;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--twitter-light-gray);
-  transition: background-color 0.15s;
-}
+**Sidebar Layout:**
 
-.tweet:hover {
-  background-color: var(--twitter-extra-light-gray);
-}
-
-.tweet-avatar img {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-}
-
-.tweet-content {
-  flex: 1;
-  margin-left: 12px;
-}
-
-.display-name {
-  font-weight: 700;
-  color: var(--twitter-black);
-}
-
-.username,
-.timestamp,
-.separator {
-  color: var(--twitter-gray);
-  font-size: 15px;
-}
-
-.tweet-text {
-  color: var(--twitter-black);
-  font-size: 15px;
-  line-height: 1.4;
-  margin-top: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* Tweet button */
-.tweet-button {
-  background-color: var(--twitter-blue);
-  color: white;
-  font-weight: 700;
-  padding: 12px 24px;
-  border-radius: 9999px;
-  transition: background-color 0.15s;
-}
-
-.tweet-button:hover:not(:disabled) {
-  background-color: var(--twitter-dark-blue);
-}
-
-.tweet-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-/* Trending sidebar */
-.trending-sidebar {
-  background-color: var(--twitter-extra-light-gray);
-  border-radius: 16px;
-  overflow: hidden;
-}
-
-.sidebar-title {
-  font-size: 20px;
-  font-weight: 800;
-  padding: 12px 16px;
-  color: var(--twitter-black);
-}
-
-.trend-item {
-  display: block;
-  padding: 12px 16px;
-  transition: background-color 0.15s;
-}
-
-.trend-item:hover {
-  background-color: rgba(0, 0, 0, 0.03);
-}
-
-.trend-hashtag {
-  font-weight: 700;
-  color: var(--twitter-black);
-}
-
-.trend-count {
-  font-size: 13px;
-  color: var(--twitter-gray);
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Trends for you                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Trending · #1                                                       │
+│  #JavaScript                                                         │
+│  125K Tweets                                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  Trending · #2                                                       │
+│  #TypeScript                                                         │
+│  89.5K Tweets                                                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  ... more trends                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  Show more                                                           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -817,84 +460,50 @@ function formatTweetCount(count: number): string {
 
 ### Three-Column Desktop, Single Column Mobile
 
-```typescript
-// components/Layout.tsx
-export function Layout({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="layout">
-      <LeftSidebar />
-      <main className="main-content">
-        {children}
-      </main>
-      <RightSidebar />
-    </div>
-  );
-}
+**Layout Component:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  <div class="layout">                                                │
+│    <LeftSidebar />                                                  │
+│    <main class="main-content">{children}</main>                     │
+│    <RightSidebar />                                                 │
+│  </div>                                                              │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Responsive CSS
+**Responsive Breakpoints:**
 
-```css
-/* Mobile-first layout */
-.layout {
-  min-height: 100vh;
-  max-width: 1280px;
-  margin: 0 auto;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Mobile (< 640px):                                                   │
+│  ├── layout: single column                                          │
+│  ├── left-sidebar: hidden                                           │
+│  └── right-sidebar: hidden                                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  Tablet (>= 640px):                                                  │
+│  ├── grid-template-columns: 88px 1fr                                │
+│  ├── left-sidebar: sticky, icon-only nav                            │
+│  └── right-sidebar: hidden                                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  Desktop (>= 1024px):                                                │
+│  ├── grid-template-columns: 275px 600px 350px                       │
+│  ├── left-sidebar: full nav with labels                             │
+│  └── right-sidebar: visible                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  Large Desktop (>= 1280px):                                          │
+│  ├── grid-template-columns: 275px 600px 1fr                         │
+│  └── right-sidebar: max-width 350px                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
+**Main Content Styling:**
+
+```
 .main-content {
   min-height: 100vh;
   border-left: 1px solid var(--twitter-light-gray);
   border-right: 1px solid var(--twitter-light-gray);
-}
-
-/* Hide sidebars on mobile */
-.left-sidebar,
-.right-sidebar {
-  display: none;
-}
-
-/* Tablet: Show left sidebar */
-@media (min-width: 640px) {
-  .layout {
-    display: grid;
-    grid-template-columns: 88px 1fr;
-  }
-
-  .left-sidebar {
-    display: flex;
-    flex-direction: column;
-    position: sticky;
-    top: 0;
-    height: 100vh;
-  }
-}
-
-/* Desktop: Full three-column */
-@media (min-width: 1024px) {
-  .layout {
-    grid-template-columns: 275px 600px 350px;
-  }
-
-  .left-sidebar {
-    padding: 0 12px;
-  }
-
-  .right-sidebar {
-    display: block;
-    padding: 0 16px;
-  }
-}
-
-/* Large desktop: More sidebar space */
-@media (min-width: 1280px) {
-  .layout {
-    grid-template-columns: 275px 600px 1fr;
-  }
-
-  .right-sidebar {
-    max-width: 350px;
-  }
 }
 ```
 
@@ -904,107 +513,71 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
 ### ARIA Labels and Roles
 
-```typescript
-// Accessible tweet component
-function Tweet({ tweet }: TweetProps) {
-  return (
-    <article
-      className="tweet"
-      aria-label={`Tweet by ${tweet.author.displayName}`}
-    >
-      <div className="tweet-avatar" aria-hidden="true">
-        <img src={tweet.author.avatarUrl} alt="" />
-      </div>
+**Accessible Tweet Structure:**
 
-      <div className="tweet-content">
-        <header className="tweet-header">
-          <span className="display-name">{tweet.author.displayName}</span>
-          <span className="username" aria-label={`username ${tweet.author.username}`}>
-            @{tweet.author.username}
-          </span>
-          <time
-            dateTime={tweet.createdAt}
-            title={new Date(tweet.createdAt).toLocaleString()}
-          >
-            {formatDistanceToNow(new Date(tweet.createdAt))}
-          </time>
-        </header>
-
-        <p className="tweet-text">{parseContent(tweet.content)}</p>
-
-        <footer className="tweet-actions" role="group" aria-label="Tweet actions">
-          <ActionButton
-            icon={<ReplyIcon />}
-            count={tweet.replyCount}
-            label={`Reply, ${tweet.replyCount} replies`}
-          />
-          {/* ... other actions */}
-        </footer>
-      </div>
-    </article>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  <article aria-label="Tweet by {displayName}">                       │
+│    <div aria-hidden="true">                                         │
+│      <img src={avatarUrl} alt="" />  <!-- Decorative -->            │
+│    </div>                                                            │
+│    <div>                                                             │
+│      <header>                                                        │
+│        <span>{displayName}</span>                                   │
+│        <span aria-label="username {username}">@{username}</span>    │
+│        <time dateTime={createdAt} title={fullDate}>                 │
+│          {relativeTime}                                              │
+│        </time>                                                       │
+│      </header>                                                       │
+│      <p>{content}</p>                                                │
+│      <footer role="group" aria-label="Tweet actions">               │
+│        <ActionButton label="Reply, {count} replies" />              │
+│        <ActionButton label="Retweet" aria-pressed={isRetweeted} /> │
+│        <ActionButton label="Like" aria-pressed={isLiked} />        │
+│      </footer>                                                       │
+│    </div>                                                            │
+│  </article>                                                          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Keyboard Navigation
 
-```typescript
-// Timeline keyboard navigation
-function Timeline({ tweets }: TimelineProps) {
-  const [focusedIndex, setFocusedIndex] = useState(-1);
-  const tweetRefs = useRef<(HTMLElement | null)[]>([]);
+**Timeline Keyboard Shortcuts:**
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowDown':
-      case 'j':
-        e.preventDefault();
-        setFocusedIndex((prev) => Math.min(prev + 1, tweets.length - 1));
-        break;
-      case 'ArrowUp':
-      case 'k':
-        e.preventDefault();
-        setFocusedIndex((prev) => Math.max(prev - 1, 0));
-        break;
-      case 'l':
-        // Like focused tweet
-        if (focusedIndex >= 0) {
-          toggleLike(tweets[focusedIndex].id);
-        }
-        break;
-      case 'r':
-        // Reply to focused tweet
-        if (focusedIndex >= 0) {
-          openReplyModal(tweets[focusedIndex].id);
-        }
-        break;
-    }
-  };
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Key          │ Action                                              │
+├───────────────┼─────────────────────────────────────────────────────┤
+│  ArrowDown, j │ Focus next tweet                                    │
+│  ArrowUp, k   │ Focus previous tweet                                │
+│  l            │ Like focused tweet                                  │
+│  r            │ Reply to focused tweet                              │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  useEffect(() => {
-    if (focusedIndex >= 0 && tweetRefs.current[focusedIndex]) {
-      tweetRefs.current[focusedIndex]?.focus();
-    }
-  }, [focusedIndex]);
+**Focus Management:**
 
-  return (
-    <div
-      role="feed"
-      aria-label="Timeline"
-      onKeyDown={handleKeyDown}
-      tabIndex={0}
-    >
-      {tweets.map((tweet, index) => (
-        <Tweet
-          key={tweet.id}
-          tweet={tweet}
-          ref={(el) => (tweetRefs.current[index] = el)}
-          tabIndex={index === focusedIndex ? 0 : -1}
-        />
-      ))}
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. Track focusedIndex in state                                      │
+│  2. Store refs to all tweet elements                                 │
+│  3. On key press: update focusedIndex                                │
+│  4. useEffect: tweetRefs[focusedIndex].focus()                      │
+│  5. Use tabIndex={focusedIndex === index ? 0 : -1} for roving       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Timeline Container:**
+
+```
+<div role="feed" aria-label="Timeline" onKeyDown={handleKeyDown} tabIndex={0}>
+  {tweets.map((tweet, index) => (
+    <Tweet
+      ref={el => tweetRefs.current[index] = el}
+      tabIndex={index === focusedIndex ? 0 : -1}
+    />
+  ))}
+</div>
 ```
 
 ---

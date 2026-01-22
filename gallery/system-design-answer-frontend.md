@@ -31,24 +31,46 @@
 ### Component Hierarchy
 
 ```
-App
-├── Header
-├── GalleryTabs
-│   └── TabButton × 3
-├── GalleryContent
-│   ├── SlideshowView
-│   │   ├── MainImage
-│   │   ├── NavigationArrows
-│   │   ├── PlayPauseControl
-│   │   └── ThumbnailStrip
-│   ├── MasonryView
-│   │   └── MasonryItem × n
-│   └── TilesView
-│       └── TileItem × n
-└── Lightbox (Portal)
-    ├── LightboxImage
-    ├── NavigationArrows
-    └── CloseButton
+┌─────────────────────────────────────────────────────────────────────┐
+│                              App                                     │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │                          Header                                │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  GalleryTabs                                                   │ │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐              │ │
+│  │  │ Slideshow   │ │  Masonry    │ │   Tiles     │              │ │
+│  │  └─────────────┘ └─────────────┘ └─────────────┘              │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  GalleryContent (shows one of:)                                │ │
+│  │  ┌─────────────────────────────────────────────────────────┐  │ │
+│  │  │  SlideshowView                                           │  │ │
+│  │  │  ├── MainImage                                           │  │ │
+│  │  │  ├── NavigationArrows (left/right)                       │  │ │
+│  │  │  ├── PlayPauseControl                                    │  │ │
+│  │  │  └── ThumbnailStrip                                      │  │ │
+│  │  └─────────────────────────────────────────────────────────┘  │ │
+│  │  ┌─────────────────────────────────────────────────────────┐  │ │
+│  │  │  MasonryView                                             │  │ │
+│  │  │  └── MasonryItem × n (variable heights)                  │  │ │
+│  │  └─────────────────────────────────────────────────────────┘  │ │
+│  │  ┌─────────────────────────────────────────────────────────┐  │ │
+│  │  │  TilesView                                               │  │ │
+│  │  │  └── TileItem × n (uniform squares)                      │  │ │
+│  │  └─────────────────────────────────────────────────────────┘  │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  Lightbox (Portal to document.body)                           │ │
+│  │  ├── LightboxImage                                            │ │
+│  │  ├── NavigationArrows                                         │ │
+│  │  └── CloseButton                                              │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### State Flow
@@ -66,8 +88,8 @@ App
          │                    │                  │
          ▼                    ▼                  ▼
    ┌─────────┐          ┌──────────┐       ┌─────────┐
-   │ Tabs    │          │ Gallery  │       │Lightbox │
-   │Component│          │ Views    │       │ Modal   │
+   │  Tabs   │          │ Gallery  │       │Lightbox │
+   │Component│          │  Views   │       │  Modal  │
    └─────────┘          └──────────┘       └─────────┘
 ```
 
@@ -77,327 +99,121 @@ App
 
 ### A. Slideshow Layout (Flexbox + Positioning)
 
-```typescript
-// SlideshowView.tsx
-import { useGalleryStore } from '../stores/galleryStore';
-import { useEffect, useCallback } from 'react';
+"The slideshow uses a flex column layout with the main image container using relative positioning. Navigation arrows and play/pause controls are absolutely positioned within the container."
 
-export function SlideshowView() {
-  const {
-    images,
-    slideshowIndex,
-    isPlaying,
-    nextSlide,
-    prevSlide,
-    setIsPlaying,
-  } = useGalleryStore();
-
-  // Auto-play functionality
-  useEffect(() => {
-    if (!isPlaying) return;
-
-    const interval = setInterval(() => {
-      nextSlide();
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [isPlaying, nextSlide]);
-
-  // Keyboard navigation
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case 'ArrowLeft':
-          prevSlide();
-          break;
-        case 'ArrowRight':
-          nextSlide();
-          break;
-        case ' ':
-          e.preventDefault();
-          setIsPlaying(!isPlaying);
-          break;
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [nextSlide, prevSlide, isPlaying, setIsPlaying]);
-
-  const currentImage = images[slideshowIndex];
-
-  return (
-    <div className="slideshow">
-      {/* Main Image Container */}
-      <div className="slideshow__main">
-        <img
-          src={`https://picsum.photos/id/${currentImage.id}/1200/675`}
-          alt={currentImage.alt}
-          className="slideshow__image"
-        />
-
-        {/* Navigation Arrows */}
-        <button
-          className="slideshow__nav slideshow__nav--prev"
-          onClick={prevSlide}
-          aria-label="Previous image"
-        >
-          ←
-        </button>
-        <button
-          className="slideshow__nav slideshow__nav--next"
-          onClick={nextSlide}
-          aria-label="Next image"
-        >
-          →
-        </button>
-
-        {/* Play/Pause Control */}
-        <button
-          className="slideshow__play"
-          onClick={() => setIsPlaying(!isPlaying)}
-          aria-label={isPlaying ? 'Pause slideshow' : 'Play slideshow'}
-        >
-          {isPlaying ? '⏸' : '▶'}
-        </button>
-      </div>
-
-      {/* Thumbnail Strip */}
-      <ThumbnailStrip
-        images={images}
-        activeIndex={slideshowIndex}
-      />
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      SlideshowView                                   │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  slideshow__main (relative, aspect-ratio: 16/9)               │ │
+│  │                                                               │ │
+│  │  ┌─────┐                                           ┌─────┐   │ │
+│  │  │  ←  │                                           │  →  │   │ │
+│  │  │ nav │          [Main Image]                     │ nav │   │ │
+│  │  │prev │         (object-fit: contain)             │next │   │ │
+│  │  └─────┘                                           └─────┘   │ │
+│  │                                                               │ │
+│  │                                              ┌─────────────┐ │ │
+│  │                                              │ ▶ Play/Pause│ │ │
+│  │                                              └─────────────┘ │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  ThumbnailStrip (horizontal scroll)                           │ │
+│  │  [img] [img] [img] [img] [img] [img] [img] ...               │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  Keyboard Controls:                                                 │
+│  ├── ArrowLeft: prevSlide()                                        │
+│  ├── ArrowRight: nextSlide()                                       │
+│  └── Space: toggle isPlaying                                       │
+│                                                                     │
+│  Auto-play: setInterval(nextSlide, 3000) when isPlaying=true       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**CSS Implementation:**
-
-```css
-/* Slideshow layout with Flexbox and absolute positioning */
-.slideshow {
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-  max-width: 1200px;
-  margin: 0 auto;
-}
-
-.slideshow__main {
-  position: relative;
-  aspect-ratio: 16 / 9;
-  background: #1a1a1a;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.slideshow__image {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
-.slideshow__nav {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  background: rgba(0, 0, 0, 0.5);
-  color: white;
-  border: none;
-  padding: 1rem;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.slideshow__nav:hover {
-  background: rgba(0, 0, 0, 0.8);
-}
-
-.slideshow__nav--prev { left: 1rem; }
-.slideshow__nav--next { right: 1rem; }
-
-.slideshow__play {
-  position: absolute;
-  bottom: 1rem;
-  right: 1rem;
-  background: rgba(0, 0, 0, 0.5);
-  color: white;
-  border: none;
-  padding: 0.5rem 1rem;
-  border-radius: 4px;
-  cursor: pointer;
-}
-```
+**CSS Properties:**
+- `.slideshow`: flex, column, gap: 1rem, max-width: 1200px
+- `.slideshow__main`: relative, aspect-ratio: 16/9, overflow: hidden
+- `.slideshow__nav`: absolute, top: 50%, translateY(-50%), semi-transparent background
+- `.slideshow__play`: absolute, bottom: 1rem, right: 1rem
 
 ### B. Masonry Grid (CSS Columns)
 
-```typescript
-// MasonryView.tsx
-import { useGalleryStore } from '../stores/galleryStore';
+"The masonry layout uses pure CSS columns property, avoiding JavaScript-based masonry libraries. Items flow top-to-bottom within each column, then left-to-right across columns."
 
-export function MasonryView() {
-  const { images, openLightbox } = useGalleryStore();
-
-  // Generate pseudo-random heights based on image ID
-  const getImageHeight = (id: number): number => {
-    // Heights vary between 200-400px based on ID
-    return 200 + ((id * 7) % 200);
-  };
-
-  return (
-    <div className="masonry">
-      {images.map((image) => (
-        <button
-          key={image.id}
-          className="masonry__item"
-          onClick={() => openLightbox(image.id)}
-          style={{
-            height: getImageHeight(image.id),
-          }}
-        >
-          <img
-            src={`https://picsum.photos/id/${image.id}/400/${getImageHeight(image.id)}`}
-            alt={image.alt}
-            loading="lazy"
-            className="masonry__image"
-          />
-        </button>
-      ))}
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       MasonryView                                    │
+│                                                                     │
+│  CSS: columns: 4 300px (4 columns, min 300px each)                  │
+│       column-gap: 1rem                                              │
+│                                                                     │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                    │
+│  │  img1  │  │  img2  │  │  img3  │  │  img4  │                    │
+│  │ 280px  │  │ 350px  │  │ 200px  │  │ 320px  │                    │
+│  └────────┘  └────────┘  └────────┘  └────────┘                    │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                    │
+│  │  img5  │  │  img6  │  │  img7  │  │  img8  │                    │
+│  │ 320px  │  │ 240px  │  │ 380px  │  │ 260px  │                    │
+│  └────────┘  └────────┘  └────────┘  └────────┘                    │
+│  ...                                                                │
+│                                                                     │
+│  Image heights: pseudo-random based on ID                           │
+│  getImageHeight(id) = 200 + ((id * 7) % 200)  // 200-400px         │
+│                                                                     │
+│  .masonry__item:                                                    │
+│  ├── break-inside: avoid (prevent splitting across columns)        │
+│  ├── hover: translateY(-4px), box-shadow                           │
+│  └── focus: outline: 3px solid #3b82f6                             │
+│                                                                     │
+│  Responsive breakpoints:                                            │
+│  ├── > 1200px: 4 columns                                           │
+│  ├── > 768px:  3 columns                                           │
+│  ├── > 480px:  2 columns                                           │
+│  └── mobile:   1 column                                            │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**CSS Implementation:**
-
-```css
-/* True masonry using CSS columns */
-.masonry {
-  columns: 4 300px;        /* 4 columns, min 300px each */
-  column-gap: 1rem;
-  padding: 1rem;
-}
-
-.masonry__item {
-  break-inside: avoid;     /* Prevent item from splitting across columns */
-  margin-bottom: 1rem;
-  display: block;
-  width: 100%;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  border-radius: 8px;
-  overflow: hidden;
-  transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.masonry__item:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
-}
-
-.masonry__item:focus {
-  outline: 3px solid #3b82f6;
-  outline-offset: 2px;
-}
-
-.masonry__image {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-/* Responsive column count */
-@media (max-width: 1200px) {
-  .masonry { columns: 3 250px; }
-}
-
-@media (max-width: 768px) {
-  .masonry { columns: 2 200px; }
-}
-
-@media (max-width: 480px) {
-  .masonry { columns: 1; }
-}
-```
+**CSS Properties:**
+- `.masonry`: columns: 4 300px, column-gap: 1rem
+- `.masonry__item`: break-inside: avoid, transition: transform 0.2s
+- `.masonry__image`: width: 100%, height: 100%, object-fit: cover
 
 ### C. Tiles Grid (CSS Grid)
 
-```typescript
-// TilesView.tsx
-import { useGalleryStore } from '../stores/galleryStore';
+"The tiles layout uses CSS Grid with auto-fill to create a responsive grid of equal-sized square tiles."
 
-export function TilesView() {
-  const { images, openLightbox } = useGalleryStore();
-
-  return (
-    <div className="tiles">
-      {images.map((image) => (
-        <button
-          key={image.id}
-          className="tile"
-          onClick={() => openLightbox(image.id)}
-        >
-          <img
-            src={`https://picsum.photos/id/${image.id}/300/300`}
-            alt={image.alt}
-            loading="lazy"
-            className="tile__image"
-          />
-        </button>
-      ))}
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TilesView                                     │
+│                                                                     │
+│  CSS: grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)) │
+│       gap: 1rem                                                     │
+│                                                                     │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │
+│  │  1:1    │ │  1:1    │ │  1:1    │ │  1:1    │ │  1:1    │       │
+│  │ square  │ │ square  │ │ square  │ │ square  │ │ square  │       │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘       │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │
+│  │  1:1    │ │  1:1    │ │  1:1    │ │  1:1    │ │  1:1    │       │
+│  │ square  │ │ square  │ │ square  │ │ square  │ │ square  │       │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘       │
+│  ...                                                                │
+│                                                                     │
+│  .tile:                                                             │
+│  ├── aspect-ratio: 1 (perfect squares)                             │
+│  └── hover: .tile__image scale(1.05) with overflow: hidden         │
+│                                                                     │
+│  Responsive: minmax(150px, 1fr) on tablets                          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**CSS Implementation:**
-
-```css
-/* Uniform grid with CSS Grid */
-.tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 1rem;
-  padding: 1rem;
-}
-
-.tile {
-  aspect-ratio: 1;         /* Perfect squares */
-  overflow: hidden;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  border-radius: 8px;
-  background: #f3f4f6;
-}
-
-.tile__image {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transition: transform 0.3s ease;
-}
-
-.tile:hover .tile__image {
-  transform: scale(1.05);
-}
-
-.tile:focus {
-  outline: 3px solid #3b82f6;
-  outline-offset: 2px;
-}
-
-/* Responsive tile sizes */
-@media (max-width: 768px) {
-  .tiles {
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 0.5rem;
-  }
-}
-```
+**CSS Properties:**
+- `.tiles`: display: grid, grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))
+- `.tile`: aspect-ratio: 1, overflow: hidden
+- `.tile__image`: transition: transform 0.3s, scale on hover
 
 ---
 
@@ -405,345 +221,146 @@ export function TilesView() {
 
 ### Gallery Store Implementation
 
-```typescript
-// stores/galleryStore.ts
-import { create } from 'zustand';
-import { subscribeWithSelector } from 'zustand/middleware';
-
-interface ImageData {
-  id: number;
-  alt: string;
-}
-
-type TabType = 'Slideshow' | 'Masonry' | 'Tiles';
-
-interface GalleryState {
-  // Image data
-  images: ImageData[];
-
-  // Tab navigation
-  activeTab: TabType;
-  setActiveTab: (tab: TabType) => void;
-
-  // Slideshow controls
-  slideshowIndex: number;
-  isPlaying: boolean;
-  nextSlide: () => void;
-  prevSlide: () => void;
-  goToSlide: (index: number) => void;
-  setIsPlaying: (playing: boolean) => void;
-
-  // Lightbox controls
-  lightboxImage: number | null;
-  openLightbox: (imageId: number) => void;
-  closeLightbox: () => void;
-  nextLightboxImage: () => void;
-  prevLightboxImage: () => void;
-}
-
-// Pre-selected stable image IDs (avoiding broken picsum IDs)
-const STABLE_IMAGE_IDS = Array.from({ length: 50 }, (_, i) => i + 10);
-
-export const useGalleryStore = create<GalleryState>()(
-  subscribeWithSelector((set, get) => ({
-    // Initialize with stable image IDs
-    images: STABLE_IMAGE_IDS.map((id) => ({
-      id,
-      alt: `Gallery image ${id}`,
-    })),
-
-    // Tab state
-    activeTab: 'Slideshow',
-    setActiveTab: (tab) => {
-      set({ activeTab: tab });
-      // Pause slideshow when switching away
-      if (tab !== 'Slideshow') {
-        set({ isPlaying: false });
-      }
-    },
-
-    // Slideshow state
-    slideshowIndex: 0,
-    isPlaying: false,
-
-    nextSlide: () => {
-      const { images, slideshowIndex } = get();
-      set({
-        slideshowIndex: (slideshowIndex + 1) % images.length,
-      });
-    },
-
-    prevSlide: () => {
-      const { images, slideshowIndex } = get();
-      set({
-        slideshowIndex: (slideshowIndex - 1 + images.length) % images.length,
-      });
-    },
-
-    goToSlide: (index) => set({ slideshowIndex: index }),
-
-    setIsPlaying: (playing) => set({ isPlaying: playing }),
-
-    // Lightbox state
-    lightboxImage: null,
-
-    openLightbox: (imageId) => {
-      set({ lightboxImage: imageId });
-      // Prevent body scroll when lightbox is open
-      document.body.style.overflow = 'hidden';
-    },
-
-    closeLightbox: () => {
-      set({ lightboxImage: null });
-      document.body.style.overflow = '';
-    },
-
-    nextLightboxImage: () => {
-      const { images, lightboxImage } = get();
-      if (lightboxImage === null) return;
-
-      const currentIndex = images.findIndex((img) => img.id === lightboxImage);
-      const nextIndex = (currentIndex + 1) % images.length;
-      set({ lightboxImage: images[nextIndex].id });
-    },
-
-    prevLightboxImage: () => {
-      const { images, lightboxImage } = get();
-      if (lightboxImage === null) return;
-
-      const currentIndex = images.findIndex((img) => img.id === lightboxImage);
-      const prevIndex = (currentIndex - 1 + images.length) % images.length;
-      set({ lightboxImage: images[prevIndex].id });
-    },
-  }))
-);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      useGalleryStore                                 │
+│                                                                     │
+│  State:                                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  images: ImageData[]                                         │   │
+│  │    - Pre-initialized with 50 stable picsum IDs (10-59)       │   │
+│  │    - Each: { id: number, alt: string }                       │   │
+│  │                                                              │   │
+│  │  activeTab: 'Slideshow' | 'Masonry' | 'Tiles'               │   │
+│  │  slideshowIndex: number                                      │   │
+│  │  isPlaying: boolean                                          │   │
+│  │  lightboxImage: number | null                                │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Actions:                                                           │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Tab Navigation:                                             │   │
+│  │  └── setActiveTab(tab) ──▶ Updates tab, pauses slideshow    │   │
+│  │                                                              │   │
+│  │  Slideshow Controls:                                         │   │
+│  │  ├── nextSlide() ──▶ index = (index + 1) % length           │   │
+│  │  ├── prevSlide() ──▶ index = (index - 1 + length) % length  │   │
+│  │  ├── goToSlide(i) ──▶ index = i                             │   │
+│  │  └── setIsPlaying(bool) ──▶ isPlaying = bool                │   │
+│  │                                                              │   │
+│  │  Lightbox Controls:                                          │   │
+│  │  ├── openLightbox(id) ──▶ lightboxImage = id                │   │
+│  │  │                        document.body.overflow = 'hidden'  │   │
+│  │  ├── closeLightbox() ──▶ lightboxImage = null               │   │
+│  │  │                       document.body.overflow = ''         │   │
+│  │  ├── nextLightboxImage() ──▶ Circular navigation            │   │
+│  │  └── prevLightboxImage() ──▶ Circular navigation            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### State Subscriptions for Side Effects
+### State Subscriptions Pattern
 
-```typescript
-// Subscribe to lightbox changes for keyboard handling
-useGalleryStore.subscribe(
-  (state) => state.lightboxImage,
-  (lightboxImage) => {
-    if (lightboxImage !== null) {
-      // Add keyboard listener when lightbox opens
-      const handler = (e: KeyboardEvent) => {
-        const { closeLightbox, nextLightboxImage, prevLightboxImage } =
-          useGalleryStore.getState();
+"Using Zustand's subscribeWithSelector middleware, we can subscribe to specific state changes for side effects like adding keyboard listeners when the lightbox opens."
 
-        switch (e.key) {
-          case 'Escape':
-            closeLightbox();
-            break;
-          case 'ArrowRight':
-            nextLightboxImage();
-            break;
-          case 'ArrowLeft':
-            prevLightboxImage();
-            break;
-        }
-      };
-
-      window.addEventListener('keydown', handler);
-      return () => window.removeEventListener('keydown', handler);
-    }
-  }
-);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│               Lightbox Keyboard Subscription                         │
+│                                                                     │
+│  useGalleryStore.subscribe(                                         │
+│    (state) => state.lightboxImage,  // Selector                    │
+│    (lightboxImage) => {              // Callback                   │
+│      if (lightboxImage !== null) {                                  │
+│        // Add keyboard handler                                      │
+│        handler = (e) => {                                          │
+│          switch(e.key) {                                           │
+│            case 'Escape': closeLightbox()                          │
+│            case 'ArrowRight': nextLightboxImage()                  │
+│            case 'ArrowLeft': prevLightboxImage()                   │
+│          }                                                         │
+│        }                                                           │
+│        window.addEventListener('keydown', handler)                  │
+│        return () => window.removeEventListener('keydown', handler) │
+│      }                                                              │
+│    }                                                                │
+│  )                                                                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 5. Deep Dive: Lightbox Component (8 min)
 
-### Portal-Based Modal
+### Portal-Based Modal Architecture
 
-```typescript
-// components/Lightbox.tsx
-import { createPortal } from 'react-dom';
-import { useGalleryStore } from '../stores/galleryStore';
-import { useEffect, useRef } from 'react';
+"The lightbox uses React's createPortal to render directly into document.body, avoiding z-index stacking context issues."
 
-export function Lightbox() {
-  const {
-    images,
-    lightboxImage,
-    closeLightbox,
-    nextLightboxImage,
-    prevLightboxImage,
-  } = useGalleryStore();
-
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
-
-  // Focus management - focus close button when opened
-  useEffect(() => {
-    if (lightboxImage !== null) {
-      closeButtonRef.current?.focus();
-    }
-  }, [lightboxImage]);
-
-  // Keyboard navigation
-  useEffect(() => {
-    if (lightboxImage === null) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case 'Escape':
-          closeLightbox();
-          break;
-        case 'ArrowRight':
-          nextLightboxImage();
-          break;
-        case 'ArrowLeft':
-          prevLightboxImage();
-          break;
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lightboxImage, closeLightbox, nextLightboxImage, prevLightboxImage]);
-
-  if (lightboxImage === null) return null;
-
-  const currentImage = images.find((img) => img.id === lightboxImage);
-  if (!currentImage) return null;
-
-  return createPortal(
-    <div
-      className="lightbox"
-      onClick={closeLightbox}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Image lightbox"
-    >
-      {/* Backdrop */}
-      <div className="lightbox__backdrop" />
-
-      {/* Content container - stop propagation to prevent close on image click */}
-      <div
-        className="lightbox__content"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Close button */}
-        <button
-          ref={closeButtonRef}
-          className="lightbox__close"
-          onClick={closeLightbox}
-          aria-label="Close lightbox"
-        >
-          ×
-        </button>
-
-        {/* Navigation */}
-        <button
-          className="lightbox__nav lightbox__nav--prev"
-          onClick={prevLightboxImage}
-          aria-label="Previous image"
-        >
-          ←
-        </button>
-
-        {/* Main image */}
-        <img
-          src={`https://picsum.photos/id/${currentImage.id}/1920/1080`}
-          alt={currentImage.alt}
-          className="lightbox__image"
-        />
-
-        <button
-          className="lightbox__nav lightbox__nav--next"
-          onClick={nextLightboxImage}
-          aria-label="Next image"
-        >
-          →
-        </button>
-      </div>
-    </div>,
-    document.body
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Lightbox                                     │
+│                                                                     │
+│  Renders via: createPortal(..., document.body)                      │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  .lightbox (position: fixed, inset: 0, z-index: 1000)         │ │
+│  │                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────┐ │ │
+│  │  │  .lightbox__backdrop                                     │ │ │
+│  │  │  (absolute, inset: 0, rgba(0,0,0,0.9))                  │ │ │
+│  │  │  Animation: fadeIn 0.2s                                  │ │ │
+│  │  └─────────────────────────────────────────────────────────┘ │ │
+│  │                                                               │ │
+│  │  ┌─────────────────────────────────────────────────────────┐ │ │
+│  │  │  .lightbox__content (relative, max-90vw, max-90vh)      │ │ │
+│  │  │  Animation: scaleIn 0.2s                                 │ │ │
+│  │  │                                                          │ │ │
+│  │  │          ┌───────────────────────────┐                   │ │ │
+│  │  │          │                           │ [X] Close        │ │ │
+│  │  │   [←]    │    .lightbox__image       │    (absolute     │ │ │
+│  │  │  prev    │   (max-w/h 100%/90vh)     │    top-right)    │ │ │
+│  │  │          │   object-fit: contain     │                  │ │ │
+│  │  │          │                           │    [→]           │ │ │
+│  │  │          └───────────────────────────┘    next          │ │ │
+│  │  │                                                          │ │ │
+│  │  └─────────────────────────────────────────────────────────┘ │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  Focus Management:                                                  │
+│  - useRef for close button                                         │
+│  - Focus close button on open                                      │
+│  - Return focus on close                                           │
+│                                                                     │
+│  Click Handling:                                                    │
+│  - Backdrop click: closeLightbox()                                 │
+│  - Content click: e.stopPropagation() (prevent close)              │
+│                                                                     │
+│  ARIA:                                                              │
+│  - role="dialog"                                                    │
+│  - aria-modal="true"                                               │
+│  - aria-label="Image lightbox"                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**CSS Implementation:**
+### Lightbox Animations
 
-```css
-/* Lightbox modal styles */
-.lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: 1000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.lightbox__backdrop {
-  position: absolute;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.9);
-  animation: fadeIn 0.2s ease;
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-.lightbox__content {
-  position: relative;
-  max-width: 90vw;
-  max-height: 90vh;
-  display: flex;
-  align-items: center;
-  animation: scaleIn 0.2s ease;
-}
-
-@keyframes scaleIn {
-  from { transform: scale(0.95); opacity: 0; }
-  to { transform: scale(1); opacity: 1; }
-}
-
-.lightbox__image {
-  max-width: 100%;
-  max-height: 90vh;
-  object-fit: contain;
-  border-radius: 4px;
-}
-
-.lightbox__close {
-  position: absolute;
-  top: -2rem;
-  right: -2rem;
-  background: none;
-  border: none;
-  color: white;
-  font-size: 2rem;
-  cursor: pointer;
-  padding: 0.5rem;
-  line-height: 1;
-}
-
-.lightbox__nav {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-  border: none;
-  padding: 1rem;
-  cursor: pointer;
-  font-size: 1.5rem;
-  border-radius: 50%;
-  transition: background 0.2s;
-}
-
-.lightbox__nav:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
-
-.lightbox__nav--prev { left: -4rem; }
-.lightbox__nav--next { right: -4rem; }
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     CSS Animations                                   │
+│                                                                     │
+│  @keyframes fadeIn:                                                 │
+│  ├── from: opacity: 0                                               │
+│  └── to: opacity: 1                                                 │
+│                                                                     │
+│  @keyframes scaleIn:                                                │
+│  ├── from: transform: scale(0.95), opacity: 0                       │
+│  └── to: transform: scale(1), opacity: 1                            │
+│                                                                     │
+│  Navigation buttons:                                                │
+│  - .lightbox__nav--prev: left: -4rem                               │
+│  - .lightbox__nav--next: right: -4rem                              │
+│  - hover: background: rgba(255,255,255,0.2)                        │
+│  - border-radius: 50%                                               │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -752,158 +369,94 @@ export function Lightbox() {
 
 ### Responsive Image Component
 
-```typescript
-// components/ResponsiveImage.tsx
-import { useState, useRef, useEffect } from 'react';
+"The ResponsiveImage component generates srcSet for multiple resolutions, letting the browser choose the appropriate size based on viewport."
 
-interface ResponsiveImageProps {
-  imageId: number;
-  alt: string;
-  sizes: {
-    thumbnail: { width: number; height: number };
-    medium: { width: number; height: number };
-    large: { width: number; height: number };
-  };
-  loading?: 'lazy' | 'eager';
-  className?: string;
-  onClick?: () => void;
-}
-
-export function ResponsiveImage({
-  imageId,
-  alt,
-  sizes,
-  loading = 'lazy',
-  className,
-  onClick,
-}: ResponsiveImageProps) {
-  const [isLoaded, setIsLoaded] = useState(false);
-  const [error, setError] = useState(false);
-  const imgRef = useRef<HTMLImageElement>(null);
-
-  // Generate srcSet for responsive images
-  const srcSet = [
-    `https://picsum.photos/id/${imageId}/${sizes.thumbnail.width}/${sizes.thumbnail.height} ${sizes.thumbnail.width}w`,
-    `https://picsum.photos/id/${imageId}/${sizes.medium.width}/${sizes.medium.height} ${sizes.medium.width}w`,
-    `https://picsum.photos/id/${imageId}/${sizes.large.width}/${sizes.large.height} ${sizes.large.width}w`,
-  ].join(', ');
-
-  const sizesAttr = `
-    (max-width: 480px) ${sizes.thumbnail.width}px,
-    (max-width: 1024px) ${sizes.medium.width}px,
-    ${sizes.large.width}px
-  `;
-
-  return (
-    <div className={`responsive-image ${className || ''}`}>
-      {/* Loading placeholder */}
-      {!isLoaded && !error && (
-        <div className="responsive-image__placeholder">
-          <div className="responsive-image__spinner" />
-        </div>
-      )}
-
-      {/* Error state */}
-      {error && (
-        <div className="responsive-image__error">
-          Failed to load image
-        </div>
-      )}
-
-      {/* Actual image */}
-      <img
-        ref={imgRef}
-        srcSet={srcSet}
-        sizes={sizesAttr}
-        src={`https://picsum.photos/id/${imageId}/${sizes.medium.width}/${sizes.medium.height}`}
-        alt={alt}
-        loading={loading}
-        className={`responsive-image__img ${isLoaded ? 'loaded' : ''}`}
-        onLoad={() => setIsLoaded(true)}
-        onError={() => setError(true)}
-        onClick={onClick}
-      />
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ResponsiveImage                                   │
+│                                                                     │
+│  Props:                                                             │
+│  ├── imageId: number                                                │
+│  ├── alt: string                                                    │
+│  ├── sizes: { thumbnail, medium, large }                           │
+│  ├── loading: 'lazy' | 'eager'                                     │
+│  └── onClick?: () => void                                          │
+│                                                                     │
+│  State:                                                             │
+│  ├── isLoaded: boolean (shows placeholder until loaded)            │
+│  └── error: boolean (shows error state)                            │
+│                                                                     │
+│  Generated srcSet:                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  picsum.photos/id/{id}/{thumbnail.w}/{thumbnail.h} {w}w     │   │
+│  │  picsum.photos/id/{id}/{medium.w}/{medium.h} {w}w           │   │
+│  │  picsum.photos/id/{id}/{large.w}/{large.h} {w}w             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  sizes attribute:                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  (max-width: 480px) {thumbnail.w}px,                         │   │
+│  │  (max-width: 1024px) {medium.w}px,                           │   │
+│  │  {large.w}px                                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  States:                                                            │
+│  ├── Loading: Show spinner placeholder                             │
+│  ├── Error: Show "Failed to load image" message                    │
+│  └── Loaded: Show image with 'loaded' class                        │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Intersection Observer for Custom Lazy Loading
+### Intersection Observer for Lazy Loading
 
-```typescript
-// hooks/useLazyLoad.ts
-import { useEffect, useRef, useState } from 'react';
-
-interface UseLazyLoadOptions {
-  threshold?: number;
-  rootMargin?: string;
-}
-
-export function useLazyLoad<T extends HTMLElement>({
-  threshold = 0.1,
-  rootMargin = '100px',
-}: UseLazyLoadOptions = {}) {
-  const ref = useRef<T>(null);
-  const [isVisible, setIsVisible] = useState(false);
-
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setIsVisible(true);
-          observer.disconnect(); // Stop observing once visible
-        }
-      },
-      { threshold, rootMargin }
-    );
-
-    observer.observe(element);
-
-    return () => observer.disconnect();
-  }, [threshold, rootMargin]);
-
-  return { ref, isVisible };
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      useLazyLoad Hook                                │
+│                                                                     │
+│  Options:                                                           │
+│  ├── threshold: 0.1 (10% visible triggers load)                    │
+│  └── rootMargin: '100px' (preload 100px before visible)            │
+│                                                                     │
+│  Returns:                                                           │
+│  ├── ref: RefObject<T> (attach to element)                         │
+│  └── isVisible: boolean (true once element enters viewport)        │
+│                                                                     │
+│  Behavior:                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. Create IntersectionObserver                              │   │
+│  │  2. Observe element                                          │   │
+│  │  3. On intersect: setIsVisible(true), disconnect             │   │
+│  │  4. Cleanup: disconnect on unmount                           │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Note: Once visible, never goes back to hidden (one-way)           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Image Preloading for Slideshow
+### Slideshow Image Preloading
 
-```typescript
-// hooks/useImagePreloader.ts
-import { useEffect } from 'react';
-import { useGalleryStore } from '../stores/galleryStore';
-
-export function useImagePreloader() {
-  const { images, slideshowIndex, activeTab } = useGalleryStore();
-
-  useEffect(() => {
-    if (activeTab !== 'Slideshow') return;
-
-    // Preload adjacent images
-    const preloadIndices = [
-      (slideshowIndex + 1) % images.length,
-      (slideshowIndex - 1 + images.length) % images.length,
-    ];
-
-    const preloadedImages: HTMLImageElement[] = [];
-
-    preloadIndices.forEach((index) => {
-      const img = new Image();
-      img.src = `https://picsum.photos/id/${images[index].id}/1200/675`;
-      preloadedImages.push(img);
-    });
-
-    // Cleanup (helps with memory if component unmounts)
-    return () => {
-      preloadedImages.forEach((img) => {
-        img.src = '';
-      });
-    };
-  }, [images, slideshowIndex, activeTab]);
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   useImagePreloader Hook                             │
+│                                                                     │
+│  Dependencies: images, slideshowIndex, activeTab                    │
+│                                                                     │
+│  Effect (only when activeTab === 'Slideshow'):                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. Calculate adjacent indices:                              │   │
+│  │     - next: (index + 1) % length                             │   │
+│  │     - prev: (index - 1 + length) % length                    │   │
+│  │                                                              │   │
+│  │  2. Create Image objects and set src:                        │   │
+│  │     new Image().src = picsum.photos/id/{id}/1200/675        │   │
+│  │                                                              │   │
+│  │  3. Store references for cleanup                             │   │
+│  │                                                              │   │
+│  │  4. Cleanup: Clear src on unmount (memory optimization)      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Result: Adjacent images are cached, navigation feels instant      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -914,68 +467,39 @@ export function useImagePreloader() {
 
 | Key | Context | Action |
 |-----|---------|--------|
-| `←` / `→` | Slideshow | Previous/Next image |
-| `Space` | Slideshow | Toggle play/pause |
-| `←` / `→` | Lightbox | Navigate images |
-| `Escape` | Lightbox | Close lightbox |
-| `Enter` | Grid item | Open lightbox |
-| `Tab` | Global | Navigate focusable elements |
+| ArrowLeft / ArrowRight | Slideshow | Previous/Next image |
+| Space | Slideshow | Toggle play/pause |
+| ArrowLeft / ArrowRight | Lightbox | Navigate images |
+| Escape | Lightbox | Close lightbox |
+| Enter | Grid item | Open lightbox |
+| Tab | Global | Navigate focusable elements |
 
-### Focus Management Hook
+### Focus Trap Hook
 
-```typescript
-// hooks/useFocusTrap.ts
-import { useEffect, useRef } from 'react';
-
-export function useFocusTrap<T extends HTMLElement>(isActive: boolean) {
-  const containerRef = useRef<T>(null);
-  const previousActiveElement = useRef<Element | null>(null);
-
-  useEffect(() => {
-    if (!isActive || !containerRef.current) return;
-
-    // Store currently focused element
-    previousActiveElement.current = document.activeElement;
-
-    // Find all focusable elements
-    const focusableElements = containerRef.current.querySelectorAll<HTMLElement>(
-      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    );
-
-    const firstElement = focusableElements[0];
-    const lastElement = focusableElements[focusableElements.length - 1];
-
-    // Focus first element
-    firstElement?.focus();
-
-    // Trap focus within container
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Tab') return;
-
-      if (e.shiftKey) {
-        if (document.activeElement === firstElement) {
-          e.preventDefault();
-          lastElement?.focus();
-        }
-      } else {
-        if (document.activeElement === lastElement) {
-          e.preventDefault();
-          firstElement?.focus();
-        }
-      }
-    };
-
-    document.addEventListener('keydown', handleKeyDown);
-
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown);
-      // Restore focus when modal closes
-      (previousActiveElement.current as HTMLElement)?.focus();
-    };
-  }, [isActive]);
-
-  return containerRef;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      useFocusTrap Hook                               │
+│                                                                     │
+│  Purpose: Trap keyboard focus within modal when open                │
+│                                                                     │
+│  Behavior:                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  On open:                                                    │   │
+│  │  1. Store document.activeElement (to restore later)          │   │
+│  │  2. Find all focusable elements in container                 │   │
+│  │     (button, [href], input, select, textarea, [tabindex])   │   │
+│  │  3. Focus first element                                      │   │
+│  │  4. Add keydown handler for Tab cycling:                     │   │
+│  │     - Shift+Tab on first ──▶ focus last                     │   │
+│  │     - Tab on last ──▶ focus first                           │   │
+│  │                                                              │   │
+│  │  On close:                                                   │   │
+│  │  1. Remove keydown handler                                   │   │
+│  │  2. Restore focus to previously active element               │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Returns: containerRef to attach to modal element                   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -987,42 +511,37 @@ export function useFocusTrap<T extends HTMLElement>(isActive: boolean) {
 | Technique | Implementation | Benefit |
 |-----------|----------------|---------|
 | Lazy loading | Native `loading="lazy"` | Reduces initial payload |
-| Responsive images | `srcSet` + `sizes` | Appropriate resolution |
+| Responsive images | `srcSet` + `sizes` | Appropriate resolution per device |
 | CSS-only layouts | Columns, Grid | No JS layout thrashing |
-| Memoization | `React.memo` on grid items | Prevents re-renders |
+| Memoization | `React.memo` on grid items | Prevents unnecessary re-renders |
 | Preloading | Adjacent slideshow images | Instant navigation |
-| Portal rendering | Lightbox in body | Avoids stacking context |
+| Portal rendering | Lightbox in body | Avoids stacking context issues |
 
-### Component Memoization
+### Component Memoization Pattern
 
-```typescript
-// components/MasonryItem.tsx
-import { memo } from 'react';
-
-interface MasonryItemProps {
-  imageId: number;
-  alt: string;
-  height: number;
-  onClick: () => void;
-}
-
-export const MasonryItem = memo(function MasonryItem({
-  imageId,
-  alt,
-  height,
-  onClick,
-}: MasonryItemProps) {
-  return (
-    <button className="masonry__item" onClick={onClick} style={{ height }}>
-      <img
-        src={`https://picsum.photos/id/${imageId}/400/${height}`}
-        alt={alt}
-        loading="lazy"
-        className="masonry__image"
-      />
-    </button>
-  );
-});
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MasonryItem (memoized)                            │
+│                                                                     │
+│  export const MasonryItem = memo(function MasonryItem({              │
+│    imageId,                                                         │
+│    alt,                                                             │
+│    height,                                                          │
+│    onClick,                                                         │
+│  }) {                                                               │
+│    return (                                                         │
+│      <button className="masonry__item" onClick={onClick}>           │
+│        <img                                                         │
+│          src={`picsum.photos/id/${imageId}/400/${height}`}          │
+│          alt={alt}                                                  │
+│          loading="lazy"                                             │
+│        />                                                           │
+│      </button>                                                      │
+│    );                                                               │
+│  });                                                                │
+│                                                                     │
+│  Prevents re-render when parent updates but props unchanged         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1031,11 +550,11 @@ export const MasonryItem = memo(function MasonryItem({
 
 | Decision | Pros | Cons |
 |----------|------|------|
-| CSS columns masonry | Simple, performant, native | Column-first ordering |
-| Zustand over Context | Less boilerplate, subscriptions | Additional dependency |
+| CSS columns masonry | Simple, performant, native | Column-first ordering (not row) |
+| Zustand over Context | Less boilerplate, subscriptions | Additional dependency (small) |
 | Portal for lightbox | No z-index issues | Separate DOM subtree |
 | Native lazy loading | Zero JS, browser optimized | Less control over timing |
-| Hardcoded image IDs | Predictable, no broken images | Static content |
+| Hardcoded image IDs | Predictable, no broken images | Static content only |
 
 ---
 
@@ -1048,6 +567,35 @@ export const MasonryItem = memo(function MasonryItem({
 3. **Portal-based lightbox** for proper modal layering
 4. **Keyboard-first navigation** throughout all views
 5. **Lazy loading with preloading** for optimal image delivery
+
+### Component Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Key Patterns Used                                                   │
+│                                                                     │
+│  Layout:                                                            │
+│  ├── Slideshow: Flexbox + absolute positioning                     │
+│  ├── Masonry: CSS columns (column-first flow)                      │
+│  └── Tiles: CSS Grid (auto-fill responsive)                        │
+│                                                                     │
+│  State:                                                             │
+│  ├── Zustand with subscribeWithSelector                            │
+│  └── Side effects via subscriptions                                │
+│                                                                     │
+│  Optimization:                                                      │
+│  ├── Native lazy loading                                           │
+│  ├── Responsive srcSet                                             │
+│  ├── React.memo for grid items                                     │
+│  └── Image preloading for slideshow                                │
+│                                                                     │
+│  Accessibility:                                                     │
+│  ├── Full keyboard navigation                                      │
+│  ├── Focus trap in modal                                           │
+│  ├── ARIA roles and labels                                         │
+│  └── Focus restoration on close                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ### Future Enhancements
 

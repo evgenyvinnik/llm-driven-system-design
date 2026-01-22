@@ -45,7 +45,7 @@ I'll demonstrate how frontend and backend work together to deliver a responsive,
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Frontend                                 │
+│                         FRONTEND                                 │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │ Board       │  │ Issue       │  │ Search      │              │
 │  │ Component   │  │ Detail      │  │ Component   │              │
@@ -65,7 +65,7 @@ I'll demonstrate how frontend and backend work together to deliver a responsive,
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Backend                                  │
+│                         BACKEND                                  │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │ Issue       │  │ Workflow    │  │ Search      │              │
 │  │ Service     │  │ Engine      │  │ Service     │              │
@@ -80,353 +80,114 @@ I'll demonstrate how frontend and backend work together to deliver a responsive,
 
 ### Shared Type Contracts
 
-```typescript
-// shared/types.ts - Used by both frontend and backend
+The system uses shared TypeScript interfaces between frontend and backend for type safety. Key entities include:
 
-export interface Issue {
-  id: number;
-  key: string;
-  summary: string;
-  description: string;
-  issueType: IssueType;
-  status: Status;
-  priority: Priority;
-  assignee: User | null;
-  reporter: User;
-  storyPoints: number | null;
-  customFields: Record<string, any>;
-  version: number;  // Optimistic locking
-  createdAt: string;
-  updatedAt: string;
-}
+**Issue**: Core entity with id, key, summary, description, issueType, status, priority, assignee, reporter, storyPoints, customFields, version (for optimistic locking), and timestamps.
 
-export interface Status {
-  id: number;
-  name: string;
-  category: 'todo' | 'in_progress' | 'done';
-}
+**Status**: Represents workflow states with id, name, and category (todo, in_progress, done).
 
-export interface Transition {
-  id: number;
-  name: string;
-  from: Status | null;  // null = from any
-  to: Status;
-}
+**Transition**: Defines workflow movements with from/to status and validation rules.
 
-export interface UpdateIssueRequest {
-  summary?: string;
-  description?: string;
-  assigneeId?: string | null;
-  priorityId?: number;
-  storyPoints?: number | null;
-  customFields?: Record<string, any>;
-  version: number;  // Required for optimistic locking
-}
+**UpdateIssueRequest**: Partial updates requiring version number for conflict detection.
 
-export interface TransitionRequest {
-  transitionId: number;
-  fields?: Record<string, any>;  // Fields to update during transition
-}
-
-export interface ApiError {
-  error: string;
-  message: string;
-  code?: 'CONFLICT' | 'VALIDATION_ERROR' | 'FORBIDDEN' | 'NOT_FOUND';
-  field?: string;  // For validation errors
-}
-```
+**ApiError**: Standardized error responses with codes (CONFLICT, VALIDATION_ERROR, FORBIDDEN, NOT_FOUND).
 
 ---
 
 ## Deep Dive: Workflow Transition Flow (12 minutes)
 
-### Frontend: Drag and Drop Handler
+### Drag-and-Drop Architecture
 
-```tsx
-// stores/boardStore.ts
-export const useBoardStore = create<BoardState>((set, get) => ({
-  columns: [],
-
-  moveIssue: async (issueId: number, toStatusId: number) => {
-    const { columns } = get();
-
-    // Find issue
-    let issue: Issue | undefined;
-    let fromColumn: BoardColumn | undefined;
-
-    for (const col of columns) {
-      const found = col.issues.find((i) => i.id === issueId);
-      if (found) {
-        issue = found;
-        fromColumn = col;
-        break;
-      }
-    }
-
-    if (!issue || issue.status.id === toStatusId) return;
-
-    const toColumn = columns.find((col) => col.status.id === toStatusId);
-    if (!toColumn) return;
-
-    // Store original state for rollback
-    const originalColumns = columns;
-
-    // Optimistic update
-    set({
-      columns: columns.map((col) => {
-        if (col.status.id === fromColumn!.status.id) {
-          return {
-            ...col,
-            issues: col.issues.filter((i) => i.id !== issueId),
-          };
-        }
-        if (col.status.id === toStatusId) {
-          return {
-            ...col,
-            issues: [...col.issues, { ...issue!, status: col.status }],
-          };
-        }
-        return col;
-      }),
-    });
-
-    try {
-      // Find transition to target status
-      const transitions = await api.getAvailableTransitions(issue.key);
-      const transition = transitions.find((t) => t.to.id === toStatusId);
-
-      if (!transition) {
-        throw new Error('No valid transition to target status');
-      }
-
-      await api.executeTransition(issue.id, {
-        transitionId: transition.id,
-      });
-    } catch (error: any) {
-      // Rollback on failure
-      set({ columns: originalColumns });
-
-      // Show error to user
-      if (error.code === 'CONFLICT') {
-        toast.error('Issue was modified. Refreshing board...');
-        get().fetchBoard(issue!.projectKey);
-      } else if (error.code === 'FORBIDDEN') {
-        toast.error('You cannot perform this transition');
-      } else {
-        toast.error(error.message || 'Transition failed');
-      }
-    }
-  },
-}));
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DRAG EVENT INITIATED                          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  1. OPTIMISTIC UPDATE                                            │
+│     ├── Store original columns state                             │
+│     ├── Move issue to target column in UI                        │
+│     └── User sees immediate feedback                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. FETCH AVAILABLE TRANSITIONS                                  │
+│     └── GET /api/v1/issues/{key}/transitions                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. EXECUTE TRANSITION                                           │
+│     └── POST /api/v1/issues/{id}/transitions                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│      SUCCESS         │        │       FAILURE        │
+│  Update confirmed    │        │  Rollback UI state   │
+│  Broadcast via WS    │        │  Show error toast    │
+└──────────────────────┘        └──────────────────────┘
 ```
 
-### API Client with Error Handling
+### Backend Workflow Engine
 
-```typescript
-// services/api.ts
-const BASE_URL = '/api/v1';
+The workflow engine is database-driven with three validation phases:
 
-class ApiClient {
-  private async request<T>(
-    path: string,
-    options: RequestInit = {}
-  ): Promise<T> {
-    const response = await fetch(`${BASE_URL}${path}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-      credentials: 'include',  // Include session cookie
-    });
+**Conditions** (Authorization):
+- `always` - Always allow transition
+- `user_in_role` - User must have specific project role
+- `issue_assignee` - Only assignee can transition
 
-    if (!response.ok) {
-      const error: ApiError = await response.json();
+**Validators** (Data Validation):
+- `field_required` - Field must have value
+- `field_value` - Field must match specific value
 
-      if (response.status === 409) {
-        throw { ...error, code: 'CONFLICT' };
-      }
-      if (response.status === 403) {
-        throw { ...error, code: 'FORBIDDEN' };
-      }
-      if (response.status === 400) {
-        throw { ...error, code: 'VALIDATION_ERROR' };
-      }
+**Post-Functions** (Side Effects):
+- `assign_to_current_user` - Auto-assign on transition
+- `clear_field` - Reset field value
+- `update_field` - Set field to specific value
+- `send_notification` - Trigger notifications
 
-      throw error;
-    }
+### Transaction Flow
 
-    return response.json();
-  }
-
-  async getAvailableTransitions(issueKey: string): Promise<Transition[]> {
-    return this.request(`/issues/${issueKey}/transitions`);
-  }
-
-  async executeTransition(
-    issueId: number,
-    request: TransitionRequest
-  ): Promise<Issue> {
-    return this.request(`/issues/${issueId}/transitions`, {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
-  }
-
-  async updateIssue(
-    issueKey: string,
-    updates: UpdateIssueRequest
-  ): Promise<Issue> {
-    return this.request(`/issues/${issueKey}`, {
-      method: 'PATCH',
-      body: JSON.stringify(updates),
-    });
-  }
-}
-
-export const api = new ApiClient();
 ```
-
-### Backend: Transition Endpoint
-
-```typescript
-// routes/issues.ts
-router.post('/issues/:issueId/transitions', async (req, res) => {
-  const { issueId } = req.params;
-  const { transitionId, fields = {} } = req.body as TransitionRequest;
-  const userId = req.session.userId;
-
-  try {
-    const result = await executeTransition(
-      parseInt(issueId),
-      transitionId,
-      userId,
-      fields
-    );
-
-    res.json(result);
-  } catch (error: any) {
-    if (error instanceof ConflictError) {
-      return res.status(409).json({
-        error: 'Conflict',
-        message: error.message,
-        code: 'CONFLICT',
-      });
-    }
-    if (error instanceof ForbiddenError) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: error.message,
-        code: 'FORBIDDEN',
-      });
-    }
-    if (error instanceof ValidationError) {
-      return res.status(400).json({
-        error: 'Validation Error',
-        message: error.message,
-        code: 'VALIDATION_ERROR',
-        field: error.field,
-      });
-    }
-
-    logger.error('Transition failed', { issueId, transitionId, error });
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-```
-
-### Backend: Workflow Engine
-
-```typescript
-// services/workflowEngine.ts
-export async function executeTransition(
-  issueId: number,
-  transitionId: number,
-  userId: string,
-  fields: Record<string, any> = {}
-): Promise<Issue> {
-  const issue = await db('issues').where({ id: issueId }).first();
-  if (!issue) throw new NotFoundError('Issue not found');
-
-  const workflow = await getWorkflowForProject(issue.project_id);
-  const transition = workflow.transitions.find((t) => t.id === transitionId);
-  if (!transition) throw new ValidationError('Invalid transition');
-
-  // Check source status
-  if (
-    transition.from_status_id !== null &&
-    transition.from_status_id !== issue.status_id
-  ) {
-    throw new ValidationError('Cannot transition from current status');
-  }
-
-  // Check conditions (authorization)
-  for (const condition of transition.conditions) {
-    const allowed = await checkCondition(condition, issue, userId);
-    if (!allowed) {
-      throw new ForbiddenError(`Condition failed: ${condition.type}`);
-    }
-  }
-
-  // Run validators (data validation)
-  const mergedIssue = { ...issue, ...fields };
-  for (const validator of transition.validators) {
-    const valid = await runValidator(validator, mergedIssue);
-    if (!valid) {
-      throw new ValidationError(
-        `Validation failed: ${validator.type}`,
-        validator.config.field
-      );
-    }
-  }
-
-  // Execute transition atomically
-  const updatedIssue = await db.transaction(async (trx) => {
-    const previousStatus = issue.status_id;
-
-    // Update with optimistic locking
-    const updated = await trx('issues')
-      .where({ id: issueId, version: issue.version })
-      .update({
-        status_id: transition.to_status_id,
-        ...fields,
-        version: issue.version + 1,
-        updated_at: trx.fn.now(),
-      })
-      .returning('*');
-
-    if (updated.length === 0) {
-      throw new ConflictError('Issue was modified by another user');
-    }
-
-    // Record history
-    await trx('issue_history').insert({
-      issue_id: issueId,
-      user_id: userId,
-      field: 'status',
-      old_value: previousStatus.toString(),
-      new_value: transition.to_status_id.toString(),
-    });
-
-    return updated[0];
-  });
-
-  // Run post-functions asynchronously
-  for (const postFunc of transition.post_functions) {
-    await runPostFunction(postFunc, issue, transition, userId);
-  }
-
-  // Publish event for real-time updates
-  await publishEvent('issue.transitioned', {
-    issueId,
-    fromStatus: issue.status_id,
-    toStatus: transition.to_status_id,
-    actorId: userId,
-  });
-
-  // Return full issue with relations
-  return await getIssueWithRelations(issueId);
-}
+┌─────────────┐     ┌─────────────────────────────────────────────┐
+│   Client    │     │                  Backend                     │
+└──────┬──────┘     └──────────────────────┬──────────────────────┘
+       │                                    │
+       │  POST /transitions                 │
+       │───────────────────────────────────▶│
+       │                                    │
+       │                    ┌───────────────┴───────────────┐
+       │                    │ 1. Load issue from database   │
+       │                    │ 2. Find workflow for project  │
+       │                    │ 3. Locate transition by ID    │
+       │                    │ 4. Check source status match  │
+       │                    └───────────────┬───────────────┘
+       │                                    │
+       │                    ┌───────────────┴───────────────┐
+       │                    │ 5. Run conditions (auth)      │
+       │                    │ 6. Run validators (data)      │
+       │                    └───────────────┬───────────────┘
+       │                                    │
+       │                    ┌───────────────┴───────────────┐
+       │                    │ 7. BEGIN TRANSACTION          │
+       │                    │ 8. UPDATE with version check  │
+       │                    │ 9. INSERT history record      │
+       │                    │ 10. COMMIT                    │
+       │                    └───────────────┬───────────────┘
+       │                                    │
+       │                    ┌───────────────┴───────────────┐
+       │                    │ 11. Run post-functions        │
+       │                    │ 12. Publish WebSocket event   │
+       │                    └───────────────┬───────────────┘
+       │                                    │
+       │  200 OK (updated issue)            │
+       │◀───────────────────────────────────│
+       │                                    │
 ```
 
 ---
@@ -440,156 +201,48 @@ Timeline of concurrent edits:
 
 User A reads issue (version 1)
                                     User B reads issue (version 1)
-User A updates summary (version 1 → 2)
-                                    User B updates priority (version 1 → ?)
+User A updates summary (version 1 ──▶ 2)
+                                    User B updates priority (version 1 ──▶ ?)
                                     ↓
                                     CONFLICT! Version mismatch
                                     ↓
                                     UI shows merge dialog
 ```
 
-### Frontend: Handling Conflicts
+### Conflict Detection Flow
 
-```tsx
-// hooks/useIssueDetail.ts
-export function useIssueDetail(issueKey: string) {
-  const [state, setState] = useState<IssueDetailState>({
-    issue: null,
-    conflict: null,  // Stores server version on conflict
-    // ...
-  });
-
-  const updateIssue = useCallback(async (updates: Partial<Issue>) => {
-    if (!state.issue) return;
-
-    const previousIssue = state.issue;
-
-    // Optimistic update
-    setState((prev) => ({
-      ...prev,
-      isSaving: true,
-      issue: { ...prev.issue!, ...updates },
-    }));
-
-    try {
-      const updated = await api.updateIssue(issueKey, {
-        ...updates,
-        version: state.issue.version,
-      });
-
-      setState((prev) => ({
-        ...prev,
-        isSaving: false,
-        issue: updated,
-        conflict: null,
-      }));
-    } catch (error: any) {
-      // Rollback UI
-      setState((prev) => ({
-        ...prev,
-        isSaving: false,
-        issue: previousIssue,
-      }));
-
-      if (error.code === 'CONFLICT') {
-        // Fetch server version for merge
-        const serverIssue = await api.getIssue(issueKey);
-
-        setState((prev) => ({
-          ...prev,
-          conflict: {
-            serverVersion: serverIssue,
-            localChanges: updates,
-          },
-        }));
-      } else {
-        throw error;
-      }
-    }
-  }, [issueKey, state.issue]);
-
-  const resolveConflict = useCallback(async (resolution: 'keep_mine' | 'keep_theirs' | 'merge') => {
-    if (!state.conflict) return;
-
-    if (resolution === 'keep_theirs') {
-      setState((prev) => ({
-        ...prev,
-        issue: prev.conflict!.serverVersion,
-        conflict: null,
-      }));
-    } else if (resolution === 'keep_mine') {
-      // Retry with new version
-      await updateIssue({
-        ...state.conflict.localChanges,
-        version: state.conflict.serverVersion.version,
-      });
-    }
-    // 'merge' would open a merge UI
-  }, [state.conflict, updateIssue]);
-
-  return { state, actions: { updateIssue, resolveConflict } };
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      UPDATE REQUEST                              │
+│                  (includes version: N)                           │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  UPDATE issues SET ... WHERE id = ? AND version = N             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│  rows_affected = 1   │        │  rows_affected = 0   │
+│  SUCCESS             │        │  VERSION MISMATCH    │
+│  Increment version   │        │  Return 409 Conflict │
+└──────────────────────┘        └──────────────────────┘
 ```
 
-### Conflict Resolution Dialog
+### Frontend Conflict Resolution
 
-```tsx
-// components/ConflictDialog.tsx
-interface ConflictDialogProps {
-  conflict: {
-    serverVersion: Issue;
-    localChanges: Partial<Issue>;
-  };
-  onResolve: (resolution: 'keep_mine' | 'keep_theirs') => void;
-}
+When a conflict is detected, the frontend:
 
-export function ConflictDialog({ conflict, onResolve }: ConflictDialogProps) {
-  const changedFields = Object.keys(conflict.localChanges);
+1. **Rollback UI** to previous state
+2. **Fetch server version** to get current data
+3. **Display conflict dialog** with options:
+   - "Discard My Changes" - Accept server version
+   - "Keep My Changes" - Retry with new version number
+   - "Merge" - Open merge UI (for complex cases)
 
-  return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg p-6 max-w-md w-full shadow-xl">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">
-          Conflict Detected
-        </h2>
-
-        <p className="text-gray-600 mb-4">
-          This issue was modified by another user while you were editing.
-        </p>
-
-        <div className="bg-gray-50 rounded p-4 mb-4">
-          <h3 className="text-sm font-medium text-gray-700 mb-2">
-            Your changes:
-          </h3>
-          <ul className="text-sm text-gray-600 space-y-1">
-            {changedFields.map((field) => (
-              <li key={field}>
-                <span className="font-medium">{field}:</span>{' '}
-                {String(conflict.localChanges[field])}
-              </li>
-            ))}
-          </ul>
-        </div>
-
-        <div className="flex gap-3">
-          <button
-            onClick={() => onResolve('keep_theirs')}
-            className="flex-1 px-4 py-2 border rounded hover:bg-gray-50"
-          >
-            Discard My Changes
-          </button>
-          <button
-            onClick={() => onResolve('keep_mine')}
-            className="flex-1 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-          >
-            Keep My Changes
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-```
+"I chose version-based optimistic locking over pessimistic locking because it allows multiple users to view and start editing simultaneously. Conflicts are rare in practice, and when they occur, the user has full context to make the right decision."
 
 ---
 
@@ -622,353 +275,121 @@ export function ConflictDialog({ conflict, onResolve }: ConflictDialogProps) {
 └─────────────────────────────────────────────────────┘
 ```
 
-### Backend: WebSocket Server
+### Subscription Model
 
-```typescript
-// websocket/hub.ts
-import { WebSocketServer, WebSocket } from 'ws';
-import { redis } from '../shared/cache';
-
-interface Client {
-  ws: WebSocket;
-  userId: string;
-  subscriptions: Set<string>;  // 'board:123', 'issue:PROJ-456'
-}
-
-class WebSocketHub {
-  private clients: Map<string, Client> = new Map();
-
-  constructor(wss: WebSocketServer) {
-    wss.on('connection', (ws, req) => this.handleConnection(ws, req));
-
-    // Subscribe to Redis for cross-server events
-    redis.subscribe('issue.events', (message) => {
-      this.broadcastEvent(JSON.parse(message));
-    });
-  }
-
-  private handleConnection(ws: WebSocket, req: any) {
-    const userId = req.session?.userId;
-    if (!userId) {
-      ws.close(4001, 'Unauthorized');
-      return;
-    }
-
-    const clientId = `${userId}-${Date.now()}`;
-    const client: Client = { ws, userId, subscriptions: new Set() };
-    this.clients.set(clientId, client);
-
-    ws.on('message', (data) => {
-      const message = JSON.parse(data.toString());
-      this.handleMessage(clientId, message);
-    });
-
-    ws.on('close', () => {
-      this.clients.delete(clientId);
-    });
-  }
-
-  private handleMessage(clientId: string, message: any) {
-    const client = this.clients.get(clientId);
-    if (!client) return;
-
-    switch (message.type) {
-      case 'subscribe':
-        client.subscriptions.add(message.channel);
-        break;
-
-      case 'unsubscribe':
-        client.subscriptions.delete(message.channel);
-        break;
-    }
-  }
-
-  private broadcastEvent(event: any) {
-    const channels = this.getChannelsForEvent(event);
-
-    for (const [, client] of this.clients) {
-      // Check if client is subscribed to any relevant channel
-      const isSubscribed = channels.some((ch) => client.subscriptions.has(ch));
-
-      // Don't send to actor (they have optimistic update)
-      if (isSubscribed && client.userId !== event.actorId) {
-        client.ws.send(JSON.stringify(event));
-      }
-    }
-  }
-
-  private getChannelsForEvent(event: any): string[] {
-    const channels: string[] = [];
-
-    if (event.projectId) {
-      channels.push(`board:${event.projectId}`);
-    }
-    if (event.issueKey) {
-      channels.push(`issue:${event.issueKey}`);
-    }
-
-    return channels;
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLIENT SUBSCRIPTIONS                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Channel Pattern          │  Example                             │
+├───────────────────────────┼─────────────────────────────────────┤
+│  board:{projectId}        │  board:123                          │
+│  issue:{issueKey}         │  issue:PROJ-456                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend: WebSocket Client
+### Event Flow
 
-```typescript
-// services/websocket.ts
-class WebSocketClient {
-  private ws: WebSocket | null = null;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private listeners: Map<string, Set<(event: any) => void>> = new Map();
-
-  connect() {
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
-
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      this.reconnectAttempts = 0;
-      // Resubscribe to channels
-      for (const channel of this.listeners.keys()) {
-        this.ws?.send(JSON.stringify({ type: 'subscribe', channel }));
-      }
-    };
-
-    this.ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      this.notifyListeners(data);
-    };
-
-    this.ws.onclose = () => {
-      this.attemptReconnect();
-    };
-  }
-
-  private attemptReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
-
-    const delay = Math.pow(2, this.reconnectAttempts) * 1000;
-    this.reconnectAttempts++;
-
-    setTimeout(() => this.connect(), delay);
-  }
-
-  subscribe(channel: string, callback: (event: any) => void) {
-    if (!this.listeners.has(channel)) {
-      this.listeners.set(channel, new Set());
-      this.ws?.send(JSON.stringify({ type: 'subscribe', channel }));
-    }
-
-    this.listeners.get(channel)!.add(callback);
-
-    // Return unsubscribe function
-    return () => {
-      const channelListeners = this.listeners.get(channel);
-      if (channelListeners) {
-        channelListeners.delete(callback);
-        if (channelListeners.size === 0) {
-          this.listeners.delete(channel);
-          this.ws?.send(JSON.stringify({ type: 'unsubscribe', channel }));
-        }
-      }
-    };
-  }
-
-  private notifyListeners(event: any) {
-    const channels = this.getChannelsForEvent(event);
-
-    for (const channel of channels) {
-      const listeners = this.listeners.get(channel);
-      if (listeners) {
-        for (const callback of listeners) {
-          callback(event);
-        }
-      }
-    }
-  }
-}
-
-export const wsClient = new WebSocketClient();
+```
+┌─────────────┐                    ┌─────────────┐
+│ User A      │                    │ User B      │
+│ (Actor)     │                    │ (Observer)  │
+└──────┬──────┘                    └──────┬──────┘
+       │                                  │
+       │  1. Drag issue                   │
+       │───────────────▶                  │
+       │                                  │
+       │  2. Optimistic update            │
+       │  (UI updates immediately)        │
+       │                                  │
+       │  3. Server confirms              │
+       │◀─ ─ ─ ─ ─ ─ ─ ─                  │
+       │                                  │
+       │  4. Event published              │
+       │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▶│
+       │                                  │
+       │                    5. UI updates │
+       │                    automatically │
+       │                                  │
 ```
 
-### Integrating Real-Time Updates in Board
+### Smart Event Filtering
 
-```tsx
-// components/Board.tsx
-import { useEffect } from 'react';
-import { useBoardStore } from '../stores/boardStore';
-import { wsClient } from '../services/websocket';
-
-export function Board({ projectKey }: { projectKey: string }) {
-  const { columns, fetchBoard, applyRemoteUpdate } = useBoardStore();
-
-  useEffect(() => {
-    fetchBoard(projectKey);
-
-    // Subscribe to real-time updates
-    const unsubscribe = wsClient.subscribe(`board:${projectKey}`, (event) => {
-      switch (event.type) {
-        case 'issue.transitioned':
-        case 'issue.updated':
-          applyRemoteUpdate(event);
-          break;
-
-        case 'issue.created':
-          // Add new issue to appropriate column
-          applyRemoteUpdate(event);
-          break;
-      }
-    });
-
-    return () => unsubscribe();
-  }, [projectKey]);
-
-  // ... render board
-}
-```
+"The WebSocket hub does not broadcast to the actor who initiated the change. Since they already have the optimistic update, sending them the confirmation would cause unnecessary re-renders or potential state conflicts."
 
 ---
 
 ## Deep Dive: JQL Search Integration (5 minutes)
 
-### Frontend: Search Component with Autocomplete
+### Search Architecture
 
-```tsx
-// components/SearchBar.tsx
-import { useState, useEffect, useRef } from 'react';
-import { useJQLAutocomplete } from '../hooks/useJQLAutocomplete';
-import { api } from '../services/api';
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         SEARCH FLOW                              │
+└─────────────────────────────────────────────────────────────────┘
 
-export function SearchBar() {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<Issue[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
-  const { suggestions, getSuggestions } = useJQLAutocomplete();
-  const debounceRef = useRef<NodeJS.Timeout>();
-
-  const handleInputChange = (value: string) => {
-    setQuery(value);
-
-    // Get autocomplete suggestions
-    getSuggestions(value);
-
-    // Debounce search
-    if (debounceRef.current) {
-      clearTimeout(debounceRef.current);
-    }
-
-    debounceRef.current = setTimeout(async () => {
-      if (value.trim()) {
-        setIsSearching(true);
-        try {
-          const searchResults = await api.searchIssues(value);
-          setResults(searchResults);
-        } finally {
-          setIsSearching(false);
-        }
-      } else {
-        setResults([]);
-      }
-    }, 300);
-  };
-
-  return (
-    <div className="relative w-full max-w-xl">
-      <input
-        type="text"
-        value={query}
-        onChange={(e) => handleInputChange(e.target.value)}
-        placeholder="Search issues (JQL)"
-        className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500"
-      />
-
-      {/* Autocomplete Suggestions */}
-      {suggestions.length > 0 && (
-        <ul className="absolute z-10 w-full mt-1 bg-white border rounded-lg shadow-lg">
-          {suggestions.map((suggestion, i) => (
-            <li
-              key={i}
-              onClick={() => setQuery(suggestion.text)}
-              className="px-4 py-2 hover:bg-gray-100 cursor-pointer"
-            >
-              <span className="font-mono text-sm">{suggestion.text}</span>
-              <span className="text-gray-500 ml-2">{suggestion.description}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {/* Search Results */}
-      {results.length > 0 && (
-        <div className="absolute z-10 w-full mt-1 bg-white border rounded-lg shadow-lg max-h-96 overflow-y-auto">
-          {results.map((issue) => (
-            <IssueSearchResult key={issue.id} issue={issue} />
-          ))}
-        </div>
-      )}
-
-      {isSearching && (
-        <div className="absolute right-3 top-2.5">
-          <Spinner size="sm" />
-        </div>
-      )}
-    </div>
-  );
-}
+┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐
+│   Search    │     │   JQL       │     │    Elasticsearch        │
+│   Input     │────▶│   Parser    │────▶│    Query                │
+└─────────────┘     └─────────────┘     └─────────────────────────┘
+       │                   │                        │
+       │                   │                        │
+       ▼                   ▼                        ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐
+│ Debounce    │     │ AST         │     │ Permission              │
+│ 300ms       │     │ Generation  │     │ Filtering               │
+└─────────────┘     └─────────────┘     └─────────────────────────┘
 ```
 
-### Backend: Search Endpoint
+### JQL Parsing Pipeline
 
-```typescript
-// routes/search.ts
-router.get('/search', async (req, res) => {
-  const { q: jql, limit = 50, offset = 0 } = req.query;
-  const userId = req.session.userId;
-
-  try {
-    // Parse JQL to AST
-    const parser = new JQLParser();
-    const ast = parser.parse(jql as string);
-
-    // Translate to Elasticsearch query
-    const esQuery = parser.toElasticsearch(ast, {
-      currentUser: await getUser(userId),
-    });
-
-    // Execute search
-    const result = await esClient.search({
-      index: 'issues',
-      body: {
-        query: esQuery,
-        from: parseInt(offset as string),
-        size: parseInt(limit as string),
-        sort: [{ updated_at: 'desc' }],
-      },
-    });
-
-    // Filter by permissions
-    const issues = await filterByPermissions(
-      result.hits.hits.map((hit) => hit._source),
-      userId
-    );
-
-    res.json({
-      issues,
-      total: result.hits.total.value,
-    });
-  } catch (error: any) {
-    if (error.name === 'JQLSyntaxError') {
-      return res.status(400).json({
-        error: 'Invalid JQL',
-        message: error.message,
-        position: error.position,
-      });
-    }
-    throw error;
-  }
-});
 ```
+Input: "project = DEMO AND status = 'In Progress'"
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  TOKENIZER                                                       │
+│  ├── project (FIELD)                                             │
+│  ├── = (OPERATOR)                                                │
+│  ├── DEMO (VALUE)                                                │
+│  ├── AND (BOOLEAN)                                               │
+│  ├── status (FIELD)                                              │
+│  ├── = (OPERATOR)                                                │
+│  └── 'In Progress' (VALUE)                                       │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  AST BUILDER                                                     │
+│  {                                                               │
+│    type: "AND",                                                  │
+│    left: { field: "project", op: "=", value: "DEMO" },          │
+│    right: { field: "status", op: "=", value: "In Progress" }    │
+│  }                                                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ELASTICSEARCH QUERY                                             │
+│  {                                                               │
+│    bool: {                                                       │
+│      must: [                                                     │
+│        { term: { project_key: "DEMO" } },                        │
+│        { term: { status: "In Progress" } }                       │
+│      ]                                                           │
+│    }                                                             │
+│  }                                                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Supported JQL Features
+
+| Feature | Examples |
+|---------|----------|
+| Boolean operators | AND, OR |
+| Grouping | Parentheses for precedence |
+| Comparison | =, !=, ~, >, <, >=, <=, IN, NOT IN, IS, IS NOT |
+| Functions | currentUser(), now(), startOfDay(), endOfDay() |
 
 ---
 

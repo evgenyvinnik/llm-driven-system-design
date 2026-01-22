@@ -4,7 +4,7 @@
 
 ## Problem Statement
 
-Design a multi-tenant e-commerce platform like Shopify where each merchant has an isolated store. The core challenges are multi-tenant architecture with complete data isolation, custom domain routing for millions of stores, secure checkout with payment processing, and horizontal scalability.
+"Design a multi-tenant e-commerce platform like Shopify where each merchant has an isolated store. The core challenges are multi-tenant architecture with complete data isolation, custom domain routing for millions of stores, secure checkout with payment processing, and horizontal scalability."
 
 ---
 
@@ -71,279 +71,134 @@ Design a multi-tenant e-commerce platform like Shopify where each merchant has a
 
 ### Option Analysis
 
-**Option 1: Database Per Tenant**
-```
-store_12345_db → (products, orders, customers)
-store_12346_db → (products, orders, customers)
-```
-- Pros: Complete isolation, independent scaling
-- Cons: Operational nightmare at 1M stores, connection pooling, migrations
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| Database Per Tenant | Separate DB for each store | Complete isolation, independent scaling | Operational nightmare at 1M stores, connection pooling, migrations |
+| Schema Per Tenant | Separate schema per store | Good isolation, single database | Schema migrations across 1M schemas, connection issues |
+| **Shared DB + RLS** | Single DB with row-level security | Simple operations, efficient, scales to millions | Requires careful query discipline (mitigated by RLS) |
 
-**Option 2: Schema Per Tenant**
-```sql
-CREATE SCHEMA store_12345;
-CREATE TABLE store_12345.products (...);
-```
-- Pros: Good isolation, single database
-- Cons: Schema migrations across 1M schemas, connection pooling issues
-
-**Option 3: Shared Database with RLS (Chosen)**
-```sql
-CREATE TABLE products (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  title VARCHAR(200),
-  ...
-);
-```
-- Pros: Simple operations, efficient, scales to millions of tenants
-- Cons: Requires careful query discipline (mitigated by RLS)
+"I chose shared database with PostgreSQL Row-Level Security. At 1M+ stores, managing separate databases or schemas becomes an operational nightmare. RLS provides database-level isolation, preventing bugs at the application layer from leaking data."
 
 ### Row-Level Security Implementation
 
-```sql
--- Enable RLS on all tenant-specific tables
-ALTER TABLE products ENABLE ROW LEVEL SECURITY;
-ALTER TABLE variants ENABLE ROW LEVEL SECURITY;
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
-
--- Policy enforces isolation at database level
-CREATE POLICY store_isolation ON products
-  USING (store_id = current_setting('app.current_store_id')::integer);
-
-CREATE POLICY store_isolation ON variants
-  USING (store_id = current_setting('app.current_store_id')::integer);
-
-CREATE POLICY store_isolation ON orders
-  USING (store_id = current_setting('app.current_store_id')::integer);
-
--- Application role must use RLS policies
-CREATE ROLE shopify_app NOINHERIT;
-ALTER TABLE products FORCE ROW LEVEL SECURITY;
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RLS ENFORCEMENT MODEL                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Session Variable: app.current_store_id                          │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  POLICY: store_isolation                                  │  │
+│  │  USING (store_id = current_setting('app.current_store_id')│  │
+│  │  ::integer)                                               │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Applied to tables:                                              │
+│  ├── products (store_id)                                        │
+│  ├── variants (store_id)                                        │
+│  ├── orders (store_id)                                          │
+│  ├── customers (store_id)                                       │
+│  └── order_items (store_id)                                     │
+│                                                                  │
+│  FORCE ROW LEVEL SECURITY: Ensures even table owners use RLS    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Tenant Context Middleware
 
-```typescript
-// middleware/tenant.ts
-import { Request, Response, NextFunction } from 'express';
-import { pool } from '../shared/db.js';
-import { redis } from '../shared/cache.js';
-
-interface TenantContext {
-  storeId: number;
-  subdomain: string;
-  customDomain?: string;
-  plan: 'basic' | 'professional' | 'enterprise';
-}
-
-async function resolveTenant(hostname: string): Promise<TenantContext | null> {
-  // Check subdomain pattern (store.myshopify.com)
-  if (hostname.endsWith('.myshopify.local')) {
-    const subdomain = hostname.split('.')[0];
-    const cacheKey = `tenant:subdomain:${subdomain}`;
-
-    // Check cache first
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      return JSON.parse(cached);
-    }
-
-    // Fallback to database
-    const result = await pool.query(
-      'SELECT id, subdomain, plan FROM stores WHERE subdomain = $1',
-      [subdomain]
-    );
-
-    if (result.rows.length === 0) return null;
-
-    const tenant: TenantContext = {
-      storeId: result.rows[0].id,
-      subdomain: result.rows[0].subdomain,
-      plan: result.rows[0].plan,
-    };
-
-    // Cache for 5 minutes
-    await redis.setex(cacheKey, 300, JSON.stringify(tenant));
-    return tenant;
-  }
-
-  // Check custom domain
-  const cacheKey = `tenant:domain:${hostname}`;
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  const result = await pool.query(
-    `SELECT s.id, s.subdomain, s.plan, cd.domain
-     FROM stores s
-     JOIN custom_domains cd ON s.id = cd.store_id
-     WHERE cd.domain = $1 AND cd.verified_at IS NOT NULL`,
-    [hostname]
-  );
-
-  if (result.rows.length === 0) return null;
-
-  const tenant: TenantContext = {
-    storeId: result.rows[0].id,
-    subdomain: result.rows[0].subdomain,
-    customDomain: result.rows[0].domain,
-    plan: result.rows[0].plan,
-  };
-
-  await redis.setex(cacheKey, 300, JSON.stringify(tenant));
-  return tenant;
-}
-
-export async function tenantMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction
-) {
-  const hostname = req.hostname;
-  const tenant = await resolveTenant(hostname);
-
-  if (!tenant) {
-    return res.status(404).json({ error: 'Store not found' });
-  }
-
-  // Set PostgreSQL session variable for RLS
-  await pool.query(
-    `SET app.current_store_id = ${tenant.storeId}`
-  );
-
-  // Attach to request for application use
-  req.tenant = tenant;
-
-  next();
-}
-
-declare global {
-  namespace Express {
-    interface Request {
-      tenant?: TenantContext;
-    }
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TENANT RESOLUTION FLOW                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  EXTRACT HOSTNAME                                                │
+│  └── req.hostname                                                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│  SUBDOMAIN PATTERN   │        │   CUSTOM DOMAIN      │
+│  *.myshopify.local   │        │   verified domain    │
+└──────────┬───────────┘        └──────────┬───────────┘
+           │                               │
+           ▼                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  CHECK REDIS CACHE: tenant:{type}:{identifier}                   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│     CACHE HIT        │        │     CACHE MISS       │
+│  Return tenant ctx   │        │  Query PostgreSQL    │
+└──────────────────────┘        │  Cache for 5 min     │
+                                └──────────┬───────────┘
+                                           │
+                                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SET PostgreSQL SESSION VARIABLE                                 │
+│  └── SET app.current_store_id = {storeId}                        │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ATTACH TO REQUEST: req.tenant                                   │
+│  └── { storeId, subdomain, customDomain, plan }                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Database Schema (Core Tables)
 
-```sql
--- Stores (tenants)
-CREATE TABLE stores (
-  id SERIAL PRIMARY KEY,
-  owner_id INTEGER REFERENCES users(id),
-  name VARCHAR(200) NOT NULL,
-  subdomain VARCHAR(50) UNIQUE NOT NULL,
-  theme_id INTEGER REFERENCES themes(id),
-  stripe_account_id VARCHAR(100),
-  settings JSONB DEFAULT '{}',
-  plan VARCHAR(50) DEFAULT 'basic',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+**stores** (tenants):
+- id, owner_id, name, subdomain (unique), theme_id
+- stripe_account_id, settings (JSONB), plan
+- created_at, updated_at
 
--- Custom domains
-CREATE TABLE custom_domains (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE,
-  domain VARCHAR(255) NOT NULL UNIQUE,
-  verification_token VARCHAR(100),
-  verified_at TIMESTAMP WITH TIME ZONE,
-  ssl_provisioned_at TIMESTAMP WITH TIME ZONE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+**custom_domains**:
+- id, store_id, domain (unique)
+- verification_token, verified_at, ssl_provisioned_at
 
--- Products (tenant-isolated)
-CREATE TABLE products (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  handle VARCHAR(200),
-  title VARCHAR(200) NOT NULL,
-  description TEXT,
-  status VARCHAR(20) DEFAULT 'draft',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(store_id, handle)
-);
+**products** (tenant-isolated):
+- id, store_id, handle, title, description, status
+- UNIQUE(store_id, handle)
 
--- Variants with inventory tracking
-CREATE TABLE variants (
-  id SERIAL PRIMARY KEY,
-  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  sku VARCHAR(100),
-  title VARCHAR(200),
-  price DECIMAL(10, 2) NOT NULL,
-  compare_at_price DECIMAL(10, 2),
-  inventory_quantity INTEGER DEFAULT 0,
-  inventory_policy VARCHAR(20) DEFAULT 'deny', -- deny, continue
-  options JSONB DEFAULT '{}',
-  version INTEGER DEFAULT 1, -- Optimistic locking
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(store_id, sku)
-);
+**variants** (with inventory tracking):
+- id, product_id, store_id, sku, title, price
+- compare_at_price, inventory_quantity
+- inventory_policy (deny/continue), options (JSONB)
+- version (optimistic locking)
+- UNIQUE(store_id, sku)
 
--- Orders
-CREATE TABLE orders (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  order_number VARCHAR(50) NOT NULL,
-  customer_email VARCHAR(255) NOT NULL,
-  subtotal DECIMAL(10, 2) NOT NULL,
-  shipping DECIMAL(10, 2) DEFAULT 0,
-  tax DECIMAL(10, 2) DEFAULT 0,
-  total DECIMAL(10, 2) NOT NULL,
-  payment_status VARCHAR(30) DEFAULT 'pending',
-  fulfillment_status VARCHAR(30) DEFAULT 'unfulfilled',
-  stripe_payment_intent_id VARCHAR(100),
-  shipping_address JSONB,
-  billing_address JSONB,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(store_id, order_number)
-);
+**orders**:
+- id, store_id, order_number, customer_email
+- subtotal, shipping, tax, total
+- payment_status, fulfillment_status
+- stripe_payment_intent_id
+- shipping_address (JSONB), billing_address (JSONB)
 
--- Order items
-CREATE TABLE order_items (
-  id SERIAL PRIMARY KEY,
-  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  variant_id INTEGER REFERENCES variants(id),
-  title VARCHAR(200),
-  variant_title VARCHAR(200),
-  sku VARCHAR(100),
-  quantity INTEGER NOT NULL,
-  price DECIMAL(10, 2) NOT NULL
-);
+**order_items**:
+- id, order_id, store_id, variant_id
+- title, variant_title, sku, quantity, price
 
--- Idempotency tracking for checkout
-CREATE TABLE checkout_requests (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  idempotency_key VARCHAR(64) NOT NULL,
-  cart_session_id VARCHAR(64),
-  order_id INTEGER REFERENCES orders(id),
-  status VARCHAR(20) DEFAULT 'processing',
-  error_message TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(store_id, idempotency_key)
-);
+**checkout_requests** (idempotency tracking):
+- id, store_id, idempotency_key (unique with store_id)
+- cart_session_id, order_id, status, error_message
 
--- Indexes for performance
-CREATE INDEX idx_products_store_status ON products(store_id, status);
-CREATE INDEX idx_products_handle ON products(store_id, handle);
-CREATE INDEX idx_variants_store_sku ON variants(store_id, sku);
-CREATE INDEX idx_variants_product ON variants(product_id);
-CREATE INDEX idx_orders_store_created ON orders(store_id, created_at DESC);
-CREATE INDEX idx_orders_customer ON orders(store_id, customer_email);
-CREATE INDEX idx_custom_domains_domain ON custom_domains(domain);
-CREATE INDEX idx_checkout_requests_created ON checkout_requests(created_at);
-```
+### Key Indexes
+
+| Index | Purpose |
+|-------|---------|
+| idx_products_store_status | Filter products by store and status |
+| idx_products_handle | Lookup by URL slug |
+| idx_variants_store_sku | Inventory lookups |
+| idx_orders_store_created | Order history (descending) |
+| idx_custom_domains_domain | Domain resolution |
+| idx_checkout_requests_created | Idempotency cleanup |
 
 ---
 
@@ -358,316 +213,106 @@ CREATE INDEX idx_checkout_requests_created ON checkout_requests(created_at);
       │                  │                   │              │
       │ POST /checkout   │                   │              │
       │ Idempotency-Key  │                   │              │
-      │─────────────────>│                   │              │
+      │─────────────────▶│                   │              │
       │                  │                   │              │
       │                  │ Check idempotency │              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
       │                  │ BEGIN SERIALIZABLE│              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
       │                  │ SELECT FOR UPDATE │              │
       │                  │ (inventory)       │              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
       │                  │ Update inventory  │              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
-      │                  │ Create PaymentIntent              │
-      │                  │ (with idempotency_key)           │
-      │                  │─────────────────────────────────>│
+      │                  │ Create PaymentIntent             │
+      │                  │ (with idempotency_key)          │
+      │                  │─────────────────────────────────▶│
       │                  │                   │              │
       │                  │ Insert order      │              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
       │                  │ COMMIT            │              │
-      │                  │──────────────────>│              │
+      │                  │──────────────────▶│              │
       │                  │                   │              │
-      │                  │ Publish order.created            │
-      │                  │──────────────────>│ (RabbitMQ)   │
+      │                  │ Publish order.created           │
+      │                  │──────────────────▶│ (RabbitMQ)  │
       │                  │                   │              │
       │  Order confirmed │                   │              │
-      │<─────────────────│                   │              │
-      │                  │                   │              │
+      │◀─────────────────│                   │              │
 ```
 
-### Checkout Service Implementation
+### Idempotency Pattern
 
-```typescript
-// services/checkout.ts
-import { pool, withTransaction } from '../shared/db.js';
-import { redis } from '../shared/cache.js';
-import { publishOrderCreated } from '../shared/queue.js';
-import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-
-interface CheckoutInput {
-  cartSessionId: string;
-  email: string;
-  shippingAddress: Address;
-  paymentMethodId: string;
-  idempotencyKey: string;
-}
-
-interface CheckoutResult {
-  order: Order;
-  deduplicated: boolean;
-}
-
-export async function processCheckout(
-  storeId: number,
-  input: CheckoutInput
-): Promise<CheckoutResult> {
-  // 1. Check idempotency first
-  const existing = await pool.query(`
-    SELECT id, order_id, status, error_message
-    FROM checkout_requests
-    WHERE store_id = $1 AND idempotency_key = $2
-  `, [storeId, input.idempotencyKey]);
-
-  if (existing.rows.length > 0) {
-    const request = existing.rows[0];
-
-    if (request.status === 'completed' && request.order_id) {
-      const order = await getOrder(storeId, request.order_id);
-      return { order, deduplicated: true };
-    }
-
-    if (request.status === 'processing') {
-      throw new Error('Checkout already in progress');
-    }
-
-    if (request.status === 'failed') {
-      // Allow retry after failure - delete old record
-      await pool.query(
-        'DELETE FROM checkout_requests WHERE id = $1',
-        [request.id]
-      );
-    }
-  }
-
-  // 2. Get cart from Redis
-  const cart = await getCart(input.cartSessionId);
-  if (!cart || cart.items.length === 0) {
-    throw new Error('Cart is empty');
-  }
-
-  // 3. Get store for Stripe Connect account
-  const store = await getStore(storeId);
-
-  // 4. Create idempotency record
-  await pool.query(`
-    INSERT INTO checkout_requests (store_id, idempotency_key, cart_session_id, status)
-    VALUES ($1, $2, $3, 'processing')
-  `, [storeId, input.idempotencyKey, input.cartSessionId]);
-
-  try {
-    const order = await withTransaction(async (client) => {
-      // 5. Lock and validate inventory (SERIALIZABLE + FOR UPDATE)
-      for (const item of cart.items) {
-        const variant = await client.query(`
-          SELECT id, inventory_quantity, inventory_policy, price, title
-          FROM variants
-          WHERE id = $1 AND store_id = $2
-          FOR UPDATE
-        `, [item.variantId, storeId]);
-
-        if (variant.rows.length === 0) {
-          throw new Error(`Product no longer available: ${item.title}`);
-        }
-
-        const v = variant.rows[0];
-        if (v.inventory_policy === 'deny' && v.inventory_quantity < item.quantity) {
-          throw new Error(`Not enough stock for ${item.title}`);
-        }
-
-        // Decrement inventory
-        await client.query(`
-          UPDATE variants
-          SET inventory_quantity = inventory_quantity - $1
-          WHERE id = $2
-        `, [item.quantity, item.variantId]);
-      }
-
-      // 6. Calculate totals
-      const totals = calculateTotals(cart, store);
-
-      // 7. Process payment with Stripe
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(totals.total * 100),
-        currency: store.currency || 'usd',
-        payment_method: input.paymentMethodId,
-        confirm: true,
-        on_behalf_of: store.stripeAccountId,
-        application_fee_amount: Math.round(totals.total * 0.029 * 100),
-        metadata: {
-          store_id: String(storeId),
-          cart_session_id: input.cartSessionId,
-        },
-      }, {
-        idempotencyKey: `${input.idempotencyKey}:payment`,
-      });
-
-      if (paymentIntent.status !== 'succeeded') {
-        throw new Error(`Payment failed: ${paymentIntent.status}`);
-      }
-
-      // 8. Generate order number
-      const orderNumber = await generateOrderNumber(client, storeId);
-
-      // 9. Create order
-      const orderResult = await client.query(`
-        INSERT INTO orders (
-          store_id, order_number, customer_email,
-          subtotal, shipping, tax, total,
-          payment_status, fulfillment_status,
-          stripe_payment_intent_id, shipping_address
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'paid', 'unfulfilled', $8, $9)
-        RETURNING *
-      `, [
-        storeId, orderNumber, input.email,
-        totals.subtotal, totals.shipping, totals.tax, totals.total,
-        paymentIntent.id, JSON.stringify(input.shippingAddress)
-      ]);
-
-      const order = orderResult.rows[0];
-
-      // 10. Create order items
-      for (const item of cart.items) {
-        await client.query(`
-          INSERT INTO order_items (
-            order_id, store_id, variant_id,
-            title, variant_title, sku, quantity, price
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        `, [
-          order.id, storeId, item.variantId,
-          item.title, item.variantTitle, item.sku,
-          item.quantity, item.price
-        ]);
-      }
-
-      return order;
-    }, { isolationLevel: 'SERIALIZABLE' });
-
-    // 11. Update idempotency record as completed
-    await pool.query(`
-      UPDATE checkout_requests
-      SET status = 'completed', order_id = $1, updated_at = NOW()
-      WHERE store_id = $2 AND idempotency_key = $3
-    `, [order.id, storeId, input.idempotencyKey]);
-
-    // 12. Clear cart
-    await redis.del(`cart:${input.cartSessionId}`);
-
-    // 13. Publish order created event (async)
-    await publishOrderCreated({
-      orderId: order.id,
-      storeId,
-      email: input.email,
-      total: order.total,
-    });
-
-    return { order, deduplicated: false };
-
-  } catch (error) {
-    // Update idempotency record as failed
-    await pool.query(`
-      UPDATE checkout_requests
-      SET status = 'failed', error_message = $1, updated_at = NOW()
-      WHERE store_id = $2 AND idempotency_key = $3
-    `, [(error as Error).message, storeId, input.idempotencyKey]);
-
-    throw error;
-  }
-}
-
-async function generateOrderNumber(
-  client: PoolClient,
-  storeId: number
-): Promise<string> {
-  // Use store-specific sequence
-  const result = await client.query(`
-    UPDATE stores
-    SET settings = jsonb_set(
-      COALESCE(settings, '{}'),
-      '{order_counter}',
-      to_jsonb((COALESCE((settings->>'order_counter')::int, 1000) + 1))
-    )
-    WHERE id = $1
-    RETURNING (settings->>'order_counter')::int as counter
-  `, [storeId]);
-
-  return `#${result.rows[0].counter}`;
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    IDEMPOTENCY CHECK                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SELECT FROM checkout_requests                                   │
+│  WHERE store_id = ? AND idempotency_key = ?                      │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+      ┌────────────────────┼────────────────────┐
+      ▼                    ▼                    ▼
+┌──────────────┐   ┌──────────────┐    ┌──────────────┐
+│   COMPLETED  │   │  PROCESSING  │    │    FAILED    │
+│              │   │              │    │              │
+│ Return saved │   │ Return 409   │    │ Delete old   │
+│ order result │   │ Conflict     │    │ Allow retry  │
+└──────────────┘   └──────────────┘    └──────────────┘
+```
+
+"I use idempotency keys to prevent duplicate orders. If a request fails mid-checkout, the client can safely retry with the same key. Stripe also uses this key, so we never double-charge."
+
+### Checkout Service Flow
+
+**Step 1**: Check idempotency - return cached result or reject in-progress
+
+**Step 2**: Get cart from Redis using session ID
+
+**Step 3**: Get store for Stripe Connect account
+
+**Step 4**: Create idempotency record with 'processing' status
+
+**Step 5-6**: BEGIN SERIALIZABLE transaction, lock variants FOR UPDATE
+
+**Step 7**: Validate inventory, decrement quantities
+
+**Step 8**: Create Stripe PaymentIntent (with idempotency key)
+
+**Step 9**: Generate order number using store-specific sequence
+
+**Step 10**: INSERT order and order_items
+
+**Step 11**: COMMIT transaction
+
+**Step 12**: Update idempotency record to 'completed'
+
+**Step 13**: Clear cart from Redis
+
+**Step 14**: Publish order.created event to RabbitMQ
 
 ### Inventory Locking Patterns
 
-```typescript
-// services/inventory.ts
+**Pessimistic (Checkout)**:
+- SELECT ... FOR UPDATE during transaction
+- SERIALIZABLE isolation level
+- Guarantees no overselling
 
-// Optimistic locking for admin inventory adjustments
-export async function adjustInventory(
-  storeId: number,
-  variantId: number,
-  adjustment: number,
-  expectedVersion: number
-): Promise<{ success: boolean; newQuantity: number; version: number }> {
-  const result = await pool.query(`
-    UPDATE variants
-    SET
-      inventory_quantity = inventory_quantity + $1,
-      version = version + 1,
-      updated_at = NOW()
-    WHERE id = $2
-      AND store_id = $3
-      AND version = $4
-    RETURNING inventory_quantity, version
-  `, [adjustment, variantId, storeId, expectedVersion]);
+**Optimistic (Admin Adjustments)**:
+- Version column for conflict detection
+- UPDATE WHERE version = expected_version
+- Retry on conflict with user notification
 
-  if (result.rows.length === 0) {
-    throw new Error('Inventory was modified by another process. Please refresh and try again.');
-  }
-
-  return {
-    success: true,
-    newQuantity: result.rows[0].inventory_quantity,
-    version: result.rows[0].version,
-  };
-}
-
-// Bulk inventory sync (e.g., from external system)
-export async function syncInventory(
-  storeId: number,
-  updates: Array<{ sku: string; quantity: number }>
-): Promise<{ synced: number; errors: string[] }> {
-  const errors: string[] = [];
-  let synced = 0;
-
-  for (const update of updates) {
-    try {
-      const result = await pool.query(`
-        UPDATE variants
-        SET inventory_quantity = $1, updated_at = NOW()
-        WHERE store_id = $2 AND sku = $3
-      `, [update.quantity, storeId, update.sku]);
-
-      if (result.rowCount === 0) {
-        errors.push(`SKU not found: ${update.sku}`);
-      } else {
-        synced++;
-      }
-    } catch (err) {
-      errors.push(`Failed to update ${update.sku}: ${(err as Error).message}`);
-    }
-  }
-
-  return { synced, errors };
-}
-```
+**Bulk Sync (External Systems)**:
+- Direct quantity set (no version check)
+- Report errors for missing SKUs
 
 ---
 
@@ -675,190 +320,109 @@ export async function syncInventory(
 
 ### Domain Registration Flow
 
-```typescript
-// services/domains.ts
-import { pool } from '../shared/db.js';
-import { redis } from '../shared/cache.js';
-import { resolveTxt } from 'dns/promises';
-import crypto from 'crypto';
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DOMAIN REGISTRATION                           │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  1. VALIDATE DOMAIN FORMAT                                       │
+│     └── Regex: ^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$           │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. CHECK UNIQUENESS                                             │
+│     └── SELECT store_id FROM custom_domains WHERE domain = ?     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. GENERATE VERIFICATION TOKEN                                  │
+│     └── crypto.randomBytes(16).toString('hex')                   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  4. INSERT PENDING DOMAIN                                        │
+│     └── Store with verification_token, verified_at = NULL       │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  5. RETURN INSTRUCTIONS                                          │
+│     └── "Add TXT record: _shopify-verify.{domain} = {token}"    │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-export async function registerCustomDomain(
-  storeId: number,
-  domain: string
-): Promise<{
-  success: boolean;
-  verificationToken: string;
-  instructions: string;
-}> {
-  // 1. Validate domain format
-  if (!isValidDomain(domain)) {
-    throw new Error('Invalid domain format');
-  }
+### Domain Verification Flow
 
-  // 2. Check if already registered
-  const existing = await pool.query(
-    'SELECT store_id FROM custom_domains WHERE domain = $1',
-    [domain]
-  );
-
-  if (existing.rows.length > 0) {
-    if (existing.rows[0].store_id === storeId) {
-      throw new Error('Domain already registered to this store');
-    }
-    throw new Error('Domain already registered to another store');
-  }
-
-  // 3. Generate verification token
-  const verificationToken = crypto.randomBytes(16).toString('hex');
-
-  // 4. Insert pending domain
-  await pool.query(`
-    INSERT INTO custom_domains (store_id, domain, verification_token)
-    VALUES ($1, $2, $3)
-  `, [storeId, domain, verificationToken]);
-
-  return {
-    success: true,
-    verificationToken,
-    instructions: `Add a DNS TXT record: _shopify-verify.${domain} = ${verificationToken}`,
-  };
-}
-
-export async function verifyDomain(
-  storeId: number,
-  domain: string
-): Promise<{ verified: boolean; error?: string }> {
-  // 1. Get pending domain
-  const pending = await pool.query(`
-    SELECT verification_token, verified_at
-    FROM custom_domains
-    WHERE store_id = $1 AND domain = $2
-  `, [storeId, domain]);
-
-  if (pending.rows.length === 0) {
-    return { verified: false, error: 'Domain not found' };
-  }
-
-  if (pending.rows[0].verified_at) {
-    return { verified: true };
-  }
-
-  // 2. Check DNS TXT record
-  try {
-    const records = await resolveTxt(`_shopify-verify.${domain}`);
-    const flatRecords = records.flat();
-
-    const expectedToken = pending.rows[0].verification_token;
-    const found = flatRecords.includes(expectedToken);
-
-    if (!found) {
-      return {
-        verified: false,
-        error: `TXT record not found. Expected: ${expectedToken}`,
-      };
-    }
-
-    // 3. Mark as verified
-    await pool.query(`
-      UPDATE custom_domains
-      SET verified_at = NOW()
-      WHERE store_id = $1 AND domain = $2
-    `, [storeId, domain]);
-
-    // 4. Update edge cache
-    await redis.set(`tenant:domain:${domain}`, JSON.stringify({
-      storeId,
-      subdomain: (await getStore(storeId)).subdomain,
-    }));
-
-    // 5. Trigger SSL provisioning (async)
-    await provisionSSL(domain);
-
-    return { verified: true };
-
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOTFOUND') {
-      return { verified: false, error: 'DNS TXT record not found' };
-    }
-    throw err;
-  }
-}
-
-async function provisionSSL(domain: string): Promise<void> {
-  // In production: Use ACME protocol with Let's Encrypt
-  // For local dev: Skip or use self-signed
-
-  // Simulate async provisioning
-  await pool.query(`
-    UPDATE custom_domains
-    SET ssl_provisioned_at = NOW()
-    WHERE domain = $1
-  `, [domain]);
-}
-
-function isValidDomain(domain: string): boolean {
-  const pattern = /^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$/i;
-  return pattern.test(domain) && domain.length <= 253;
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DOMAIN VERIFICATION                           │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  1. GET PENDING DOMAIN                                           │
+│     └── Check verification_token, verified_at                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. DNS TXT LOOKUP                                               │
+│     └── resolveTxt(`_shopify-verify.${domain}`)                  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│   TOKEN MATCHES      │        │   TOKEN NOT FOUND    │
+│                      │        │                      │
+│ Mark verified        │        │ Return error with    │
+│ Update Redis cache   │        │ expected token       │
+│ Trigger SSL prov     │        │                      │
+└──────────────────────┘        └──────────────────────┘
 ```
 
 ### Edge Resolution (CDN Worker)
 
-```typescript
-// edge/worker.ts (Cloudflare Workers / Lambda@Edge)
-
-interface Env {
-  DOMAIN_CACHE: KVNamespace;
-  ORIGIN: string;
-}
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const hostname = url.hostname;
-
-    // 1. Check for subdomain pattern
-    if (hostname.endsWith('.myshopify.com')) {
-      const subdomain = hostname.split('.')[0];
-      return await routeToOrigin(env, subdomain, 'subdomain', request);
-    }
-
-    // 2. Lookup custom domain in edge KV
-    const storeData = await env.DOMAIN_CACHE.get(`domain:${hostname}`);
-
-    if (!storeData) {
-      return new Response('Store not found', { status: 404 });
-    }
-
-    const { storeId, subdomain } = JSON.parse(storeData);
-    return await routeToOrigin(env, subdomain, 'custom', request, storeId);
-  },
-};
-
-async function routeToOrigin(
-  env: Env,
-  subdomain: string,
-  routeType: 'subdomain' | 'custom',
-  request: Request,
-  storeId?: number
-): Promise<Response> {
-  const originUrl = new URL(request.url);
-  originUrl.hostname = env.ORIGIN;
-
-  const headers = new Headers(request.headers);
-  headers.set('X-Shopify-Subdomain', subdomain);
-  headers.set('X-Shopify-Route-Type', routeType);
-  if (storeId) {
-    headers.set('X-Shopify-Store-Id', String(storeId));
-  }
-
-  return fetch(originUrl.toString(), {
-    method: request.method,
-    headers,
-    body: request.body,
-  });
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    EDGE WORKER FLOW                              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  EXTRACT HOSTNAME FROM REQUEST                                   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│  SUBDOMAIN PATTERN   │        │   CUSTOM DOMAIN      │
+│  *.myshopify.com     │        │                      │
+│                      │        │ KV lookup:           │
+│ Extract subdomain    │        │ domain:{hostname}    │
+│ Route to origin      │        │                      │
+└──────────────────────┘        └──────────┬───────────┘
+                                           │
+                                           ▼
+                                ┌──────────────────────┐
+                                │  ADD HEADERS         │
+                                │  X-Shopify-Subdomain │
+                                │  X-Shopify-Route-Type│
+                                │  X-Shopify-Store-Id  │
+                                └──────────────────────┘
+                                           │
+                                           ▼
+                                ┌──────────────────────┐
+                                │  FETCH ORIGIN        │
+                                └──────────────────────┘
+```
+
+"Edge KV lookup provides sub-millisecond domain resolution. The origin never queries the database for domain mapping - it trusts the headers from the edge."
 
 ---
 
@@ -866,98 +430,78 @@ async function routeToOrigin(
 
 ### Queue Topology
 
-```typescript
-// shared/queue.ts
-import amqp from 'amqplib';
-
-const EXCHANGES = {
-  orders: { name: 'orders.events', type: 'fanout' },
-  inventory: { name: 'inventory.events', type: 'topic' },
-  notifications: { name: 'notifications', type: 'direct' },
-};
-
-const QUEUES = {
-  'orders.email': {
-    exchange: 'orders.events',
-    durable: true,
-    deadLetter: 'dlx.orders',
-  },
-  'orders.webhook': {
-    exchange: 'orders.events',
-    durable: true,
-    deadLetter: 'dlx.orders',
-  },
-  'inventory.alerts': {
-    exchange: 'inventory.events',
-    routingKey: 'inventory.low.*',
-    durable: true,
-  },
-};
-
-export async function publishOrderCreated(order: OrderEvent): Promise<void> {
-  const channel = await getChannel();
-
-  channel.publish(
-    'orders.events',
-    '',
-    Buffer.from(JSON.stringify({
-      event: 'order.created',
-      timestamp: new Date().toISOString(),
-      idempotencyKey: `order_created_${order.orderId}`,
-      data: order,
-    })),
-    {
-      persistent: true,
-      messageId: `order_created_${order.orderId}`,
-    }
-  );
-}
-
-export async function publishInventoryLow(event: InventoryEvent): Promise<void> {
-  const channel = await getChannel();
-
-  channel.publish(
-    'inventory.events',
-    `inventory.low.${event.storeId}`,
-    Buffer.from(JSON.stringify(event)),
-    { persistent: true }
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RABBITMQ EXCHANGES                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  orders.events (fanout)                                   │   │
+│  │  └── All order lifecycle events                          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                   │
+│              ┌───────────────┴───────────────┐                   │
+│              ▼                               ▼                   │
+│  ┌──────────────────────┐        ┌──────────────────────┐       │
+│  │  orders.email        │        │  orders.webhook      │       │
+│  │  (confirmation mail) │        │  (merchant notify)   │       │
+│  └──────────────────────┘        └──────────────────────┘       │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  inventory.events (topic)                                 │   │
+│  │  └── Routing key: inventory.{action}.{store_id}          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  inventory.alerts                                         │   │
+│  │  └── Binding: inventory.low.*                             │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Consumer Pattern
+### Consumer Pattern with Idempotency
 
-```typescript
-// workers/email-worker.ts
-import { consumeQueue } from '../shared/queue.js';
-import { pool } from '../shared/db.js';
-
-async function processOrderEmail(msg: amqp.ConsumeMessage): Promise<void> {
-  const event = JSON.parse(msg.content.toString());
-
-  // Idempotency check
-  const processed = await pool.query(
-    'SELECT 1 FROM processed_events WHERE event_key = $1',
-    [event.idempotencyKey]
-  );
-
-  if (processed.rows.length > 0) {
-    return; // Already processed
-  }
-
-  // Send email
-  await sendOrderConfirmationEmail(event.data);
-
-  // Mark as processed
-  await pool.query(
-    'INSERT INTO processed_events (event_key) VALUES ($1)',
-    [event.idempotencyKey]
-  );
-}
-
-// Start consumer
-consumeQueue('orders.email', processOrderEmail, { prefetch: 10 });
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MESSAGE PROCESSING                            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  RECEIVE MESSAGE                                                 │
+│  └── Parse event with idempotencyKey                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  CHECK processed_events TABLE                                    │
+│  └── SELECT 1 FROM processed_events WHERE event_key = ?         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│   ALREADY PROCESSED  │        │   NOT PROCESSED      │
+│                      │        │                      │
+│ ACK message          │        │ Execute handler      │
+│ (skip processing)    │        │ INSERT event_key     │
+│                      │        │ ACK message          │
+└──────────────────────┘        └──────────────────────┘
+```
+
+### Message Publishing Pattern
+
+Messages include:
+- **event**: Event type (e.g., order.created)
+- **timestamp**: ISO timestamp
+- **idempotencyKey**: Unique identifier (e.g., order_created_{orderId})
+- **data**: Event payload
+
+Options:
+- **persistent**: true (survives broker restart)
+- **messageId**: Same as idempotencyKey
 
 ---
 

@@ -111,30 +111,13 @@
 
 ### Core Components
 
-1. **Order Service**
-   - Order lifecycle management
-   - State machine (placed → accepted → picked up → delivered)
-   - Order history and receipts
-
-2. **Location Service**
-   - Ingests driver location updates
-   - Maintains real-time geo index
-   - Supports nearby driver queries
-
-3. **Matching Service**
-   - Assigns orders to drivers
-   - Considers distance, driver rating, current load
-   - Handles driver acceptance/rejection
-
-4. **Tracking Service**
-   - Real-time location streaming to customers
-   - ETA calculations and updates
-   - WebSocket connections management
-
-5. **Routing Service**
-   - Route calculation using map APIs
-   - Multi-stop optimization
-   - Traffic-aware ETAs
+| Component | Purpose | Key Functions |
+|-----------|---------|---------------|
+| Order Service | Order lifecycle | Create, update, history, state machine |
+| Location Service | Real-time positions | Geo indexing, nearby driver queries |
+| Matching Service | Driver assignment | Scoring, availability, optimization |
+| Tracking Service | Live updates | WebSocket, Redis Pub/Sub, ETA |
+| Routing Service | Route calculation | Map APIs, multi-stop, traffic-aware |
 
 ---
 
@@ -160,72 +143,24 @@
 
 ### Geo-Indexing with Redis
 
-```typescript
-// Store driver location
-async function updateDriverLocation(
-  driverId: string,
-  lat: number,
-  lng: number
-): Promise<void> {
-  // GEOADD for spatial indexing
-  await redis.geoadd('drivers:locations', lng, lat, driverId);
+**Store Driver Location**:
+- Use GEOADD command: GEOADD 'drivers:locations' lng lat driverId
+- Store metadata in hash: lat, lng, updated_at, status
+- Publish for real-time: PUBLISH driver:{id}:location JSON
 
-  // Store timestamp and metadata
-  await redis.hset(`driver:${driverId}`, {
-    lat,
-    lng,
-    updated_at: Date.now(),
-    status: 'available'
-  });
-
-  // Publish for real-time tracking
-  await redis.publish(`driver:${driverId}:location`, JSON.stringify({ lat, lng }));
-}
-
-// Find nearby drivers
-async function findNearbyDrivers(
-  lat: number,
-  lng: number,
-  radiusKm: number,
-  limit: number = 10
-): Promise<Driver[]> {
-  // GEORADIUS query
-  const nearbyIds = await redis.georadius(
-    'drivers:locations',
-    lng, lat,
-    radiusKm, 'km',
-    'WITHDIST',
-    'ASC',
-    'COUNT', limit
-  );
-
-  // Filter by availability
-  const drivers = await Promise.all(
-    nearbyIds.map(async ([id, dist]) => {
-      const data = await redis.hgetall(`driver:${id}`);
-      return {
-        id,
-        distance: parseFloat(dist),
-        ...data,
-        isAvailable: data.status === 'available'
-      };
-    })
-  );
-
-  return drivers.filter(d => d.isAvailable);
-}
-```
+**Find Nearby Drivers**:
+- Use GEORADIUS query with distance and limit
+- Filter by availability status from driver hash
+- Return sorted by distance ascending
 
 ### Geohash Partitioning for Scale
-
-For millions of drivers, partition by geohash:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Geohash Grid                             │
 │                                                                 │
 │   ┌───────┬───────┬───────┐                                    │
-│   │ 9q8yy │ 9q8yz │ 9q8z0 │  ← Each cell is a Redis key        │
+│   │ 9q8yy │ 9q8yz │ 9q8z0 │  Each cell is a Redis key          │
 │   ├───────┼───────┼───────┤                                    │
 │   │ 9q8yv │ 9q8yw │ 9q8yx │    drivers:geo:9q8yy               │
 │   ├───────┼───────┼───────┤                                    │
@@ -237,67 +172,24 @@ For millions of drivers, partition by geohash:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-```typescript
-function getGeohashCells(lat: number, lng: number, radiusKm: number): string[] {
-  // Calculate geohash precision based on radius
-  const precision = radiusKm < 1 ? 6 : radiusKm < 10 ? 5 : 4;
+**Geohash Precision by Radius**:
+- radius < 1km: precision 6
+- radius < 10km: precision 5
+- radius >= 10km: precision 4
 
-  // Get center cell and neighbors
-  const centerHash = geohash.encode(lat, lng, precision);
-  const neighbors = geohash.neighbors(centerHash);
-
-  return [centerHash, ...neighbors];
-}
-
-async function findDriversInArea(lat: number, lng: number, radiusKm: number) {
-  const cells = getGeohashCells(lat, lng, radiusKm);
-
-  const results = await Promise.all(
-    cells.map(cell =>
-      redis.georadius(`drivers:geo:${cell}`, lng, lat, radiusKm, 'km')
-    )
-  );
-
-  return results.flat();
-}
-```
+**Query Algorithm**:
+1. Calculate center geohash at appropriate precision
+2. Get 8 neighboring cells
+3. Query GEORADIUS on each cell's Redis key
+4. Merge and deduplicate results
 
 ### Real-Time Streaming to Customers
 
-```typescript
-// WebSocket connection per active order
-class TrackingWebSocket {
-  async handleConnection(ws: WebSocket, orderId: string) {
-    const order = await getOrder(orderId);
-    const driverId = order.driver_id;
-
-    // Subscribe to driver location updates
-    const subscriber = redis.duplicate();
-    await subscriber.subscribe(`driver:${driverId}:location`);
-
-    subscriber.on('message', (channel, message) => {
-      const location = JSON.parse(message);
-
-      // Calculate ETA
-      const eta = await routingService.getETA(
-        location,
-        order.delivery_address
-      );
-
-      ws.send(JSON.stringify({
-        type: 'location_update',
-        driver_location: location,
-        eta_seconds: eta
-      }));
-    });
-
-    ws.on('close', () => {
-      subscriber.unsubscribe();
-      subscriber.quit();
-    });
-  }
-}
-```
+**WebSocket Per Active Order**:
+- Subscribe to Redis channel: driver:{driverId}:location
+- On each location message: calculate ETA to destination
+- Send combined update: location + eta_seconds
+- Clean up subscription on WebSocket close
 
 ---
 
@@ -313,72 +205,32 @@ class TrackingWebSocket {
 
 ### Matching Algorithm
 
-```typescript
-interface MatchingScore {
-  driverId: string;
-  totalScore: number;
-  factors: {
-    distance: number;
-    rating: number;
-    acceptance_rate: number;
-    current_orders: number;
-  };
-}
+**Scoring Formula**:
 
-async function findBestDriver(order: Order): Promise<Driver | null> {
-  // 1. Get nearby available drivers
-  const nearbyDrivers = await findNearbyDrivers(
-    order.merchant.lat,
-    order.merchant.lng,
-    5 // km
-  );
-
-  if (nearbyDrivers.length === 0) {
-    return null;
-  }
-
-  // 2. Score each driver
-  const scores: MatchingScore[] = await Promise.all(
-    nearbyDrivers.map(async (driver) => {
-      const driverStats = await getDriverStats(driver.id);
-
-      // Distance score (closer is better)
-      const distanceScore = Math.max(0, 1 - (driver.distance / 5));
-
-      // Rating score (normalized 0-1)
-      const ratingScore = driverStats.rating / 5;
-
-      // Acceptance rate (drivers who accept orders)
-      const acceptanceScore = driverStats.acceptance_rate;
-
-      // Load balancing (prefer drivers with fewer orders)
-      const loadScore = Math.max(0, 1 - (driverStats.current_orders / 3));
-
-      // Weighted combination
-      const totalScore =
-        distanceScore * 0.4 +
-        ratingScore * 0.25 +
-        acceptanceScore * 0.2 +
-        loadScore * 0.15;
-
-      return {
-        driverId: driver.id,
-        totalScore,
-        factors: {
-          distance: distanceScore,
-          rating: ratingScore,
-          acceptance_rate: acceptanceScore,
-          current_orders: driverStats.current_orders
-        }
-      };
-    })
-  );
-
-  // 3. Sort by score and try in order
-  scores.sort((a, b) => b.totalScore - a.totalScore);
-
-  return scores[0] ? await getDriver(scores[0].driverId) : null;
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Driver Matching Score                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Distance Score (weight: 0.4)                                    │
+│  ├─ distanceScore = max(0, 1 - (distance / maxRadius))          │
+│  ├─ Closer drivers get higher scores                            │
+│                                                                  │
+│  Rating Score (weight: 0.25)                                     │
+│  ├─ ratingScore = driverRating / 5                              │
+│  ├─ 5-star drivers score 1.0                                    │
+│                                                                  │
+│  Acceptance Rate (weight: 0.2)                                   │
+│  ├─ acceptanceScore = driver.acceptance_rate                    │
+│  ├─ Drivers who accept offers reliably                          │
+│                                                                  │
+│  Load Balance (weight: 0.15)                                     │
+│  ├─ loadScore = max(0, 1 - (current_orders / max_orders))       │
+│  ├─ Prefer drivers with fewer active orders                     │
+│                                                                  │
+│  Total = 0.4*distance + 0.25*rating + 0.2*acceptance + 0.15*load│
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Driver Offer Flow
@@ -398,87 +250,25 @@ async function findBestDriver(order: Order): Promise<Driver | null> {
                      └──────────────┘
 ```
 
-```typescript
-async function offerOrderToDrivers(order: Order): Promise<boolean> {
-  const maxAttempts = 5;
-  const offerTimeout = 30000; // 30 seconds
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const driver = await findBestDriver(order, excludeDrivers);
-
-    if (!driver) {
-      // No available drivers, wait and retry
-      await sleep(10000);
-      continue;
-    }
-
-    // Send offer to driver
-    await sendDriverOffer(driver.id, order);
-
-    // Wait for response
-    const response = await waitForDriverResponse(driver.id, order.id, offerTimeout);
-
-    if (response === 'accepted') {
-      await assignOrderToDriver(order, driver);
-      return true;
-    }
-
-    // Driver rejected or timed out, try next
-    excludeDrivers.add(driver.id);
-  }
-
-  // No driver accepted, notify customer
-  await notifyCustomer(order.id, 'no_driver_available');
-  return false;
-}
-```
+**Offer Algorithm**:
+- Max attempts: 5 drivers
+- Offer timeout: 30 seconds per driver
+- On rejection/timeout: try next highest-scoring driver
+- Track excluded drivers to avoid re-offering
+- If all attempts fail: notify customer "no driver available"
 
 ### Batching Orders (Multi-Stop)
 
-```typescript
-interface DeliveryBatch {
-  driverId: string;
-  orders: Order[];
-  route: RouteStop[];
-  totalDistance: number;
-  totalTime: number;
-}
+**Batch Criteria**:
+- Orders from same merchant or nearby merchants
+- Delivery addresses along similar route
+- Time window compatibility (freshness)
+- Maximum 2-3 orders per batch
 
-async function createBatch(
-  pendingOrders: Order[],
-  driver: Driver
-): Promise<DeliveryBatch> {
-  // Group orders by merchant proximity
-  const merchantGroups = groupByMerchant(pendingOrders);
-
-  // Find orders that can be batched (same area, time window)
-  const batchCandidates = pendingOrders.filter(order =>
-    isWithinBatchWindow(order) &&
-    isNearDriver(order.merchant, driver) &&
-    order.delivery_address.isNear(driver.currentRoute)
-  );
-
-  // Optimize route for batch
-  const optimizedRoute = await routingService.optimizeMultiStop(
-    driver.location,
-    batchCandidates.map(o => o.merchant.location),
-    batchCandidates.map(o => o.delivery_address)
-  );
-
-  // Only batch if it improves efficiency
-  if (optimizedRoute.totalTime < sumIndividualTimes(batchCandidates) * 0.8) {
-    return {
-      driverId: driver.id,
-      orders: batchCandidates,
-      route: optimizedRoute.stops,
-      totalDistance: optimizedRoute.distance,
-      totalTime: optimizedRoute.time
-    };
-  }
-
-  return null;
-}
-```
+**Batch Efficiency Check**:
+- Calculate optimized batch route time
+- Compare to sum of individual delivery times
+- Only batch if route.totalTime < individual.sum * 0.8 (20% improvement)
 
 ---
 
@@ -486,227 +276,111 @@ async function createBatch(
 
 ### ETA Calculation
 
-```typescript
-async function calculateETA(
-  origin: Location,
-  destination: Location,
-  departureTime: Date = new Date()
-): Promise<number> {
-  // Call external routing API (Google Maps, OSRM)
-  const route = await routingAPI.getDirections({
-    origin,
-    destination,
-    departure_time: departureTime,
-    traffic_model: 'best_guess'
-  });
+**Multi-Factor ETA Breakdown**:
 
-  return route.duration_in_traffic;
-}
-
-// For delivery ETA, sum multiple legs
-async function getDeliveryETA(order: Order): Promise<ETABreakdown> {
-  const driver = await getDriver(order.driver_id);
-
-  // If driver has other orders first
-  const priorStops = await getDriverPendingStops(driver.id);
-
-  let currentLocation = driver.location;
-  let totalTime = 0;
-  const legs: RouteLeg[] = [];
-
-  // Calculate time through prior stops
-  for (const stop of priorStops) {
-    const legTime = await calculateETA(currentLocation, stop.location);
-    totalTime += legTime + stop.estimated_wait_time;
-    currentLocation = stop.location;
-    legs.push({ destination: stop, time: legTime });
-  }
-
-  // Time to this order's merchant
-  const toMerchant = await calculateETA(currentLocation, order.merchant.location);
-  totalTime += toMerchant + order.estimated_prep_time;
-
-  // Time from merchant to customer
-  const toCustomer = await calculateETA(
-    order.merchant.location,
-    order.delivery_address
-  );
-  totalTime += toCustomer;
-
-  return {
-    total_seconds: totalTime,
-    pickup_eta: toMerchant,
-    delivery_eta: toMerchant + order.estimated_prep_time + toCustomer,
-    legs
-  };
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ETA Calculation                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. Time Through Prior Stops (if driver has other orders)       │
+│     ├─ For each pending stop: travel_time + wait_time           │
+│     ├─ Cumulative time from current location                    │
+│                                                                  │
+│  2. Time to Merchant                                             │
+│     ├─ Calculate ETA from current position to merchant          │
+│     ├─ Add estimated prep time                                  │
+│                                                                  │
+│  3. Time to Customer                                             │
+│     ├─ Calculate ETA from merchant to delivery address          │
+│                                                                  │
+│  Total = prior_stops_time + to_merchant + prep + to_customer    │
+│                                                                  │
+│  External API: Google Maps / OSRM with traffic_model            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Multi-Stop Route Optimization
 
-For drivers with multiple orders, solve the Traveling Salesman Problem (TSP):
+**Traveling Salesman with Constraints**:
+- Each pickup must occur before its dropoff
+- Minimize total distance/time
+- For N <= 8: use exact algorithm
+- For N > 8: use nearest neighbor heuristic
 
-```typescript
-async function optimizeRoute(
-  driverLocation: Location,
-  pickups: Location[],    // Merchant locations
-  dropoffs: Location[]    // Customer locations
-): Promise<OptimizedRoute> {
-  // Constraints:
-  // - Each pickup must happen before its corresponding dropoff
-  // - Minimize total distance/time
+**Nearest Neighbor with Constraints Algorithm**:
 
-  // For small N (< 10), use exact algorithm
-  if (pickups.length <= 8) {
-    return exactTSPWithConstraints(driverLocation, pickups, dropoffs);
-  }
-
-  // For larger N, use heuristics
-  return nearestNeighborWithConstraints(driverLocation, pickups, dropoffs);
-}
-
-function nearestNeighborWithConstraints(
-  start: Location,
-  pickups: Location[],
-  dropoffs: Location[]
-): OptimizedRoute {
-  const route: RouteStop[] = [];
-  let current = start;
-  const pickedUp = new Set<number>();
-
-  while (route.length < pickups.length + dropoffs.length) {
-    let bestNext = null;
-    let bestDistance = Infinity;
-
-    // Consider all valid next stops
-    for (let i = 0; i < pickups.length; i++) {
-      // Can pickup if not already picked up
-      if (!pickedUp.has(i)) {
-        const dist = haversineDistance(current, pickups[i]);
-        if (dist < bestDistance) {
-          bestDistance = dist;
-          bestNext = { type: 'pickup', index: i, location: pickups[i] };
-        }
-      }
-
-      // Can dropoff if already picked up
-      if (pickedUp.has(i) && !route.some(s => s.type === 'dropoff' && s.index === i)) {
-        const dist = haversineDistance(current, dropoffs[i]);
-        if (dist < bestDistance) {
-          bestDistance = dist;
-          bestNext = { type: 'dropoff', index: i, location: dropoffs[i] };
-        }
-      }
-    }
-
-    if (bestNext.type === 'pickup') {
-      pickedUp.add(bestNext.index);
-    }
-    route.push(bestNext);
-    current = bestNext.location;
-  }
-
-  return { stops: route, totalDistance: calculateTotalDistance(route) };
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Multi-Stop Route Optimization                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Input: driver_location, pickups[], dropoffs[]                  │
+│                                                                  │
+│  Initialize:                                                     │
+│  ├─ route = []                                                  │
+│  ├─ pickedUp = Set()                                            │
+│  ├─ current = driver_location                                   │
+│                                                                  │
+│  While route.length < pickups.length + dropoffs.length:         │
+│  │                                                               │
+│  │  For each order i:                                           │
+│  │  ├─ If not picked up: consider pickups[i] as candidate      │
+│  │  ├─ If picked up and not delivered: consider dropoffs[i]    │
+│  │                                                               │
+│  │  Select candidate with minimum distance from current         │
+│  │  Add to route, update current position                       │
+│  │  If pickup: add i to pickedUp                                │
+│                                                                  │
+│  Output: optimized route with stops in order                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Step 7: Data Model (3 minutes)
 
-### PostgreSQL Schema
+### PostgreSQL Tables
 
-```sql
--- Users (customers and drivers)
-CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  type VARCHAR(20),  -- 'customer', 'driver', 'merchant'
-  name VARCHAR(255),
-  email VARCHAR(255) UNIQUE,
-  phone VARCHAR(20),
-  created_at TIMESTAMP
-);
+**Core Tables**:
 
--- Drivers
-CREATE TABLE drivers (
-  id UUID PRIMARY KEY REFERENCES users(id),
-  vehicle_type VARCHAR(20),
-  license_plate VARCHAR(20),
-  status VARCHAR(20),  -- 'offline', 'available', 'busy'
-  rating DECIMAL(3, 2),
-  total_deliveries INTEGER DEFAULT 0,
-  current_lat DECIMAL(10, 8),
-  current_lng DECIMAL(11, 8),
-  location_updated_at TIMESTAMP
-);
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| users | id, type, name, email, phone | Customers and drivers |
+| drivers | id, vehicle_type, status, rating, current_lat/lng | Driver metadata |
+| merchants | id, name, address, lat/lng, avg_prep_time | Restaurant data |
+| orders | id, customer_id, merchant_id, driver_id, status, delivery_address | Order lifecycle |
+| order_items | id, order_id, name, quantity, unit_price | Line items |
 
--- Merchants
-CREATE TABLE merchants (
-  id UUID PRIMARY KEY,
-  name VARCHAR(255),
-  address TEXT,
-  lat DECIMAL(10, 8),
-  lng DECIMAL(11, 8),
-  category VARCHAR(50),
-  avg_prep_time_minutes INTEGER DEFAULT 15,
-  rating DECIMAL(3, 2)
-);
-
--- Orders
-CREATE TABLE orders (
-  id UUID PRIMARY KEY,
-  customer_id UUID REFERENCES users(id),
-  merchant_id UUID REFERENCES merchants(id),
-  driver_id UUID REFERENCES drivers(id),
-  status VARCHAR(30),
-  delivery_address TEXT,
-  delivery_lat DECIMAL(10, 8),
-  delivery_lng DECIMAL(11, 8),
-  subtotal DECIMAL(10, 2),
-  delivery_fee DECIMAL(10, 2),
-  tip DECIMAL(10, 2),
-  total DECIMAL(10, 2),
-  estimated_delivery_time TIMESTAMP,
-  actual_delivery_time TIMESTAMP,
-  created_at TIMESTAMP,
-  picked_up_at TIMESTAMP,
-  delivered_at TIMESTAMP
-);
-
--- Order items
-CREATE TABLE order_items (
-  id UUID PRIMARY KEY,
-  order_id UUID REFERENCES orders(id),
-  name VARCHAR(255),
-  quantity INTEGER,
-  unit_price DECIMAL(10, 2),
-  special_instructions TEXT
-);
-
--- Indexes
-CREATE INDEX idx_orders_status ON orders(status);
-CREATE INDEX idx_orders_driver ON orders(driver_id) WHERE status IN ('assigned', 'picked_up');
-CREATE INDEX idx_drivers_status ON drivers(status);
-```
+**Key Indexes**:
+- orders(status) - for finding active orders
+- orders(driver_id) WHERE status IN ('assigned', 'picked_up')
+- drivers(status) - for finding available drivers
 
 ### Redis Data Structures
 
 ```
-# Driver locations (geo index)
-drivers:locations          → GEOADD (lng, lat, driver_id)
-drivers:geo:{geohash}      → GEOADD (partitioned)
-
-# Driver metadata
-driver:{id}                → HASH (lat, lng, status, current_orders)
-
-# Active orders by driver
-driver:{id}:orders         → LIST [order_ids]
-
-# Order tracking subscriptions
-order:{id}:subscribers     → SET [connection_ids]
-
-# Real-time location pubsub
-driver:{id}:location       → PUBSUB channel
+┌─────────────────────────────────────────────────────────────────┐
+│                     Redis Data Structures                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Geo Index:                                                      │
+│  ├─ drivers:locations          GEOADD (lng, lat, driver_id)    │
+│  ├─ drivers:geo:{geohash}      GEOADD (partitioned by cell)    │
+│                                                                  │
+│  Driver Metadata:                                                │
+│  ├─ driver:{id}                HASH (lat, lng, status, orders) │
+│  ├─ driver:{id}:orders         LIST [order_ids]                │
+│                                                                  │
+│  Order Tracking:                                                 │
+│  ├─ order:{id}:subscribers     SET [connection_ids]            │
+│                                                                  │
+│  Real-time PubSub:                                               │
+│  ├─ driver:{id}:location       PUBSUB channel                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -715,53 +389,39 @@ driver:{id}:location       → PUBSUB channel
 
 ### Customer API
 
-```
-# Browsing
-GET  /api/v1/merchants?lat=...&lng=...&category=...
-GET  /api/v1/merchants/{id}/menu
-
-# Orders
-POST /api/v1/orders
-Body: { merchant_id, items, delivery_address, payment_method }
-
-GET  /api/v1/orders/{id}
-GET  /api/v1/orders/{id}/track  → WebSocket upgrade
-
-POST /api/v1/orders/{id}/tip
-POST /api/v1/orders/{id}/rate
-```
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | /api/v1/merchants?lat&lng&category | Browse nearby merchants |
+| GET | /api/v1/merchants/{id}/menu | Get menu items |
+| POST | /api/v1/orders | Place order |
+| GET | /api/v1/orders/{id} | Get order details |
+| WS | /api/v1/orders/{id}/track | Real-time tracking |
+| POST | /api/v1/orders/{id}/rate | Rate driver |
 
 ### Driver API
 
-```
-# Status
-POST /api/v1/driver/go-online
-POST /api/v1/driver/go-offline
-POST /api/v1/driver/location
-Body: { lat, lng, heading, speed }
-
-# Orders
-GET  /api/v1/driver/current-orders
-POST /api/v1/driver/offers/{order_id}/accept
-POST /api/v1/driver/offers/{order_id}/reject
-POST /api/v1/driver/orders/{order_id}/picked-up
-POST /api/v1/driver/orders/{order_id}/delivered
-```
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | /api/v1/driver/go-online | Start accepting orders |
+| POST | /api/v1/driver/go-offline | Stop accepting orders |
+| POST | /api/v1/driver/location | Update GPS position |
+| POST | /api/v1/driver/offers/{id}/accept | Accept order offer |
+| POST | /api/v1/driver/offers/{id}/reject | Reject order offer |
+| POST | /api/v1/driver/orders/{id}/picked-up | Mark order picked up |
+| POST | /api/v1/driver/orders/{id}/delivered | Mark order delivered |
 
 ### WebSocket Events
 
-```typescript
-// Customer receives
-{ type: 'driver_assigned', driver: {...} }
-{ type: 'location_update', lat: 37.7749, lng: -122.4194, eta: 480 }
-{ type: 'status_update', status: 'picked_up' }
-{ type: 'delivered', timestamp: '...' }
+**Customer Receives**:
+- driver_assigned: Driver info when matched
+- location_update: lat, lng, eta in seconds
+- status_update: picked_up, on_the_way, nearby
+- delivered: Completion timestamp
 
-// Driver receives
-{ type: 'new_offer', order: {...}, expires_in: 30 }
-{ type: 'offer_expired', order_id: '...' }
-{ type: 'order_cancelled', order_id: '...' }
-```
+**Driver Receives**:
+- new_offer: Order details with 30s expiration
+- offer_expired: Offer timed out
+- order_cancelled: Customer cancelled
 
 ---
 
@@ -771,19 +431,19 @@ POST /api/v1/driver/orders/{order_id}/delivered
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Regional Architecture                        │
-│                                                                 │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐      │
-│   │   US-West   │     │   US-East   │     │   Europe    │      │
-│   │   Region    │     │   Region    │     │   Region    │      │
-│   │             │     │             │     │             │      │
-│   │ - API       │     │ - API       │     │ - API       │      │
-│   │ - Redis     │     │ - Redis     │     │ - Redis     │      │
-│   │ - Workers   │     │ - Workers   │     │ - Workers   │      │
-│   │ - Postgres  │     │ - Postgres  │     │ - Postgres  │      │
-│   └─────────────┘     └─────────────┘     └─────────────┘      │
-│                                                                 │
-│   Route requests to region based on user location               │
+│                    Regional Architecture                         │
+│                                                                  │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
+│   │   US-West   │     │   US-East   │     │   Europe    │       │
+│   │   Region    │     │   Region    │     │   Region    │       │
+│   │             │     │             │     │             │       │
+│   │ - API       │     │ - API       │     │ - API       │       │
+│   │ - Redis     │     │ - Redis     │     │ - Redis     │       │
+│   │ - Workers   │     │ - Workers   │     │ - Workers   │       │
+│   │ - Postgres  │     │ - Postgres  │     │ - Postgres  │       │
+│   └─────────────┘     └─────────────┘     └─────────────┘       │
+│                                                                  │
+│   Route requests to region based on user location                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -806,29 +466,26 @@ POST /api/v1/driver/orders/{order_id}/delivered
 
 ### Key Trade-offs
 
-| Decision | Trade-off |
-|----------|-----------|
-| Redis geo-index | Fast queries, but data loss risk |
-| 3-second location updates | Accuracy vs. bandwidth/battery |
-| Sequential driver offers | Fair, but slower matching |
-| Geohash partitioning | Scalable, but edge case complexity |
+| Decision | Trade-off | Rationale |
+|----------|-----------|-----------|
+| Redis geo-index | Fast queries, but data loss risk | Speed critical for real-time matching |
+| 3-second updates | Accuracy vs. bandwidth/battery | Balance of freshness and cost |
+| Sequential offers | Fair, but slower matching | Prevents race conditions |
+| Geohash partitioning | Scalable, but edge cases | Worth complexity for scale |
 
 ### Alternatives Considered
 
-1. **PostgreSQL PostGIS for locations**
-   - More durable
-   - Slower for real-time queries
-   - Use for historical analysis
+**PostgreSQL PostGIS for locations**:
+- More durable but slower for real-time
+- Use for historical analysis instead
 
-2. **Broadcast matching (all nearby drivers)**
-   - Faster matching
-   - Race conditions, unfair
-   - Chose sequential for fairness
+**Broadcast matching (all nearby drivers)**:
+- Faster matching but creates race conditions
+- Chose sequential for fairness
 
-3. **Pre-computed ETAs**
-   - Faster response
-   - Stale during traffic changes
-   - Use for estimates, recalculate for active orders
+**Pre-computed ETAs**:
+- Faster response but stale during traffic changes
+- Use for estimates, recalculate for active orders
 
 ---
 

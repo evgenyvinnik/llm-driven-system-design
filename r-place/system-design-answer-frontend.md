@@ -38,42 +38,42 @@
 ## 2. High-Level Architecture (5 minutes)
 
 ```
-+------------------------------------------------------------------+
-|                         React Application                         |
-+------------------------------------------------------------------+
-|                                                                    |
-|  +------------------+  +------------------+  +------------------+  |
-|  |    Canvas View   |  |   Color Palette  |  |  Cooldown Timer  |  |
-|  |  - Zoom/Pan      |  |  - 16 colors     |  |  - Countdown     |  |
-|  |  - Pixel grid    |  |  - Selection     |  |  - Progress bar  |  |
-|  |  - Click handler |  |  - Hover preview |  |  - Next place    |  |
-|  +--------+---------+  +--------+---------+  +--------+---------+  |
-|           |                     |                     |            |
-|           +---------------------+---------------------+            |
-|                                 |                                  |
-|                    +------------v------------+                     |
-|                    |     Zustand Store       |                     |
-|                    |  - canvasState (Uint8)  |                     |
-|                    |  - selectedColor        |                     |
-|                    |  - cooldownEnd          |                     |
-|                    |  - viewportPosition     |                     |
-|                    |  - zoomLevel            |                     |
-|                    +------------+------------+                     |
-|                                 |                                  |
-|                    +------------v------------+                     |
-|                    |   WebSocket Manager     |                     |
-|                    |  - Connection state     |                     |
-|                    |  - Message batching     |                     |
-|                    |  - Reconnection logic   |                     |
-|                    +-------------------------+                     |
-|                                                                    |
-+------------------------------------------------------------------+
-                                 |
-                                 v
-                    +------------------------+
-                    |    Backend WebSocket   |
-                    |    /ws                 |
-                    +------------------------+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           React Application                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐           │
+│  │   Canvas View    │  │   Color Palette  │  │  Cooldown Timer  │           │
+│  │  - Zoom/Pan      │  │  - 16 colors     │  │  - Countdown     │           │
+│  │  - Pixel grid    │  │  - Selection     │  │  - Progress bar  │           │
+│  │  - Click handler │  │  - Hover preview │  │  - Next place    │           │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘           │
+│           │                     │                     │                      │
+│           └─────────────────────┼─────────────────────┘                      │
+│                                 │                                            │
+│                    ┌────────────▼────────────┐                               │
+│                    │      Zustand Store      │                               │
+│                    │  - canvasState (Uint8)  │                               │
+│                    │  - selectedColor        │                               │
+│                    │  - cooldownEnd          │                               │
+│                    │  - viewportPosition     │                               │
+│                    │  - zoomLevel            │                               │
+│                    └────────────┬────────────┘                               │
+│                                 │                                            │
+│                    ┌────────────▼────────────┐                               │
+│                    │   WebSocket Manager     │                               │
+│                    │  - Connection state     │                               │
+│                    │  - Message batching     │                               │
+│                    │  - Reconnection logic   │                               │
+│                    └─────────────────────────┘                               │
+│                                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │    Backend WebSocket    │
+                    │         /ws             │
+                    └─────────────────────────┘
 ```
 
 ---
@@ -82,473 +82,244 @@
 
 ### HTML5 Canvas Architecture
 
-```tsx
-interface CanvasViewProps {
-  width: number;   // Canvas width in pixels
-  height: number;  // Canvas height in pixels
-}
+"The core rendering uses a single HTML5 canvas element with the 2D context. The key insight is using ImageData for efficient bulk pixel updates."
 
-export function CanvasView({ width, height }: CanvasViewProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+**Canvas Setup:**
+- Disable alpha channel for performance: `getContext('2d', { alpha: false })`
+- Disable image smoothing for crisp pixel edges: `ctx.imageSmoothingEnabled = false`
+- CSS property: `image-rendering: pixelated` for sharp scaling
 
-  const { canvasData, zoomLevel, viewportX, viewportY } = useCanvasStore();
+**Canvas State:**
+- `canvasData`: Uint8Array of color indices (1 byte per pixel)
+- `canvasWidth`, `canvasHeight`: Grid dimensions (e.g., 500x500)
+- `imageDataRef`: Reusable ImageData object for rendering
 
-  // Initialize canvas context
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+**Render Flow:**
 
-    const ctx = canvas.getContext('2d', { alpha: false });
-    if (!ctx) return;
-
-    // Disable image smoothing for crisp pixels
-    ctx.imageSmoothingEnabled = false;
-    ctxRef.current = ctx;
-
-    // Initial render
-    renderCanvas();
-  }, []);
-
-  // Create ImageData once, reuse for updates
-  const imageDataRef = useRef<ImageData | null>(null);
-
-  const renderCanvas = useCallback(() => {
-    const ctx = ctxRef.current;
-    if (!ctx || !canvasData) return;
-
-    // Create or reuse ImageData
-    if (!imageDataRef.current) {
-      imageDataRef.current = ctx.createImageData(width, height);
-    }
-
-    const imageData = imageDataRef.current;
-    const pixels = imageData.data;
-
-    // Convert color indices to RGBA
-    for (let i = 0; i < canvasData.length; i++) {
-      const colorIndex = canvasData[i];
-      const color = COLOR_PALETTE[colorIndex];
-      const offset = i * 4;
-
-      pixels[offset] = color.r;
-      pixels[offset + 1] = color.g;
-      pixels[offset + 2] = color.b;
-      pixels[offset + 3] = 255;  // Alpha
-    }
-
-    // Put image data at origin
-    ctx.putImageData(imageData, 0, 0);
-  }, [canvasData, width, height]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      style={{
-        transform: `scale(${zoomLevel}) translate(${-viewportX}px, ${-viewportY}px)`,
-        transformOrigin: 'top left',
-        imageRendering: 'pixelated'
-      }}
-    />
-  );
-}
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Uint8Array     │────▶│  Convert to     │────▶│  putImageData   │
+│  (color indices)│     │  RGBA ImageData │     │  (draw to ctx)  │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
 ```
 
-### Color Palette Definition
+"For each pixel, look up the color in the palette, write RGBA values to the ImageData buffer, then call putImageData once for the entire canvas."
 
-```typescript
-// 16-color palette (Reddit's r/place palette)
-export const COLOR_PALETTE = [
-  { r: 255, g: 255, b: 255, name: 'White' },
-  { r: 228, g: 228, b: 228, name: 'Light Gray' },
-  { r: 136, g: 136, b: 136, name: 'Gray' },
-  { r: 34,  g: 34,  b: 34,  name: 'Black' },
-  { r: 255, g: 167, b: 209, name: 'Pink' },
-  { r: 229, g: 0,   b: 0,   name: 'Red' },
-  { r: 229, g: 149, b: 0,   name: 'Orange' },
-  { r: 160, g: 106, b: 66,  name: 'Brown' },
-  { r: 229, g: 217, b: 0,   name: 'Yellow' },
-  { r: 148, g: 224, b: 68,  name: 'Light Green' },
-  { r: 2,   g: 190, b: 1,   name: 'Green' },
-  { r: 0,   g: 211, b: 221, name: 'Cyan' },
-  { r: 0,   g: 131, b: 199, name: 'Light Blue' },
-  { r: 0,   g: 0,   b: 234, name: 'Blue' },
-  { r: 207, g: 110, b: 228, name: 'Light Purple' },
-  { r: 130, g: 0,   b: 128, name: 'Purple' }
-];
-```
+### Color Palette Definition (16 colors)
+
+| Index | Color | Name |
+|-------|-------|------|
+| 0 | #FFFFFF | White |
+| 1 | #E4E4E4 | Light Gray |
+| 2 | #888888 | Gray |
+| 3 | #222222 | Black |
+| 4 | #FFA7D1 | Pink |
+| 5 | #E50000 | Red |
+| 6 | #E59500 | Orange |
+| 7 | #A06A42 | Brown |
+| 8 | #E5D900 | Yellow |
+| 9 | #94E044 | Light Green |
+| 10 | #02BE01 | Green |
+| 11 | #00D3DD | Cyan |
+| 12 | #0083C7 | Light Blue |
+| 13 | #0000EA | Blue |
+| 14 | #CF6EE4 | Light Purple |
+| 15 | #820080 | Purple |
 
 ### Efficient Partial Updates
 
-```typescript
-// Only update changed pixels instead of full redraw
-function updatePixels(updates: PixelUpdate[]): void {
-  const ctx = ctxRef.current;
-  if (!ctx) return;
+"Instead of redrawing the entire canvas for each incoming pixel, I draw only the changed pixels using fillRect."
 
-  for (const { x, y, color } of updates) {
-    // Update internal state
-    canvasData[y * CANVAS_WIDTH + x] = color;
+**Incremental Update Flow:**
 
-    // Draw single pixel
-    const c = COLOR_PALETTE[color];
-    ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
-    ctx.fillRect(x, y, 1, 1);
-  }
-}
 ```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Receive batch  │────▶│  Update internal│────▶│  fillRect for   │
+│  of PixelUpdate │     │  Uint8Array     │     │  each pixel     │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+"For each update: look up color from palette, set fillStyle, call fillRect(x, y, 1, 1)."
 
 ### Zoom and Pan Implementation
 
-```tsx
-function useZoomPan() {
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [isPanning, setIsPanning] = useState(false);
-  const lastMousePos = useRef({ x: 0, y: 0 });
+**State:**
+- `zoom`: Current zoom level (0.5 to 32)
+- `pan`: { x, y } offset in pixels
+- `isPanning`: Boolean for drag state
 
-  // Mouse wheel zoom
-  const handleWheel = useCallback((e: WheelEvent) => {
-    e.preventDefault();
+**Mouse Wheel Zoom:**
+- Calculate zoom delta (0.9 for zoom out, 1.1 for zoom in)
+- Clamp to range [0.5, 32]
+- Adjust pan to keep cursor position stable during zoom
+- Formula: `newPan = cursorPos - (cursorPos - oldPan) * (newZoom / oldZoom)`
 
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    const newZoom = Math.max(0.5, Math.min(32, zoom * delta));
+**Mouse Drag Pan:**
+- Track mouse position on mousedown
+- Calculate delta on mousemove
+- Update pan by delta
+- Works with middle click, right click, or ctrl+left click
 
-    // Zoom toward cursor position
-    const rect = e.currentTarget.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+**Touch Gestures (Mobile):**
+- Two-finger pinch for zoom (track distance between touches)
+- Single finger drag for pan
+- Store initial pinch distance on touchstart with 2 touches
 
-    // Adjust pan to keep cursor position stable
-    const scale = newZoom / zoom;
-    setPan({
-      x: mouseX - (mouseX - pan.x) * scale,
-      y: mouseY - (mouseY - pan.y) * scale
-    });
+**CSS Transform Approach:**
 
-    setZoom(newZoom);
-  }, [zoom, pan]);
-
-  // Mouse drag pan
-  const handleMouseDown = (e: MouseEvent) => {
-    if (e.button === 1 || e.button === 2 || e.ctrlKey) {  // Middle/right click or ctrl
-      setIsPanning(true);
-      lastMousePos.current = { x: e.clientX, y: e.clientY };
-    }
-  };
-
-  const handleMouseMove = (e: MouseEvent) => {
-    if (!isPanning) return;
-
-    const dx = e.clientX - lastMousePos.current.x;
-    const dy = e.clientY - lastMousePos.current.y;
-
-    setPan({
-      x: pan.x + dx,
-      y: pan.y + dy
-    });
-
-    lastMousePos.current = { x: e.clientX, y: e.clientY };
-  };
-
-  // Touch gestures for mobile
-  const handleTouchStart = (e: TouchEvent) => {
-    if (e.touches.length === 2) {
-      // Pinch zoom start
-      const dist = getDistance(e.touches[0], e.touches[1]);
-      lastPinchDistance.current = dist;
-    }
-  };
-
-  return { zoom, pan, handlers: { handleWheel, handleMouseDown, handleMouseMove } };
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│  style={{                                                    │
+│    transform: `scale(${zoom}) translate(${-panX}px, ...)`,  │
+│    transformOrigin: 'top left',                              │
+│    imageRendering: 'pixelated'                               │
+│  }}                                                          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 4. Deep Dive: Zustand State Management (8 minutes)
 
-### Store Definition
+### Store Structure
 
-```typescript
-interface CanvasState {
-  // Canvas data
-  canvasData: Uint8Array | null;
-  canvasWidth: number;
-  canvasHeight: number;
+**Canvas Data:**
+- `canvasData`: Uint8Array | null (the pixel grid)
+- `canvasWidth`, `canvasHeight`: number (grid dimensions)
 
-  // User state
-  selectedColor: number;
-  cooldownEnd: number | null;
-  userId: string | null;
+**User State:**
+- `selectedColor`: number (0-15 palette index)
+- `cooldownEnd`: number | null (timestamp when user can place again)
+- `userId`: string | null
 
-  // Viewport state
-  zoom: number;
-  panX: number;
-  panY: number;
+**Viewport State:**
+- `zoom`: number (current zoom level)
+- `panX`, `panY`: number (viewport offset)
 
-  // Connection state
-  isConnected: boolean;
-  connectionError: string | null;
+**Connection State:**
+- `isConnected`: boolean
+- `connectionError`: string | null
 
-  // Actions
-  setCanvasData: (data: Uint8Array) => void;
-  updatePixel: (x: number, y: number, color: number) => void;
-  updatePixelsBatch: (updates: PixelUpdate[]) => void;
-  setSelectedColor: (color: number) => void;
-  setCooldown: (endTime: number) => void;
-  setViewport: (zoom: number, panX: number, panY: number) => void;
-  setConnectionState: (connected: boolean, error?: string) => void;
-}
+### Store Actions
 
-export const useCanvasStore = create<CanvasState>((set, get) => ({
-  // Initial state
-  canvasData: null,
-  canvasWidth: 500,
-  canvasHeight: 500,
-  selectedColor: 0,
-  cooldownEnd: null,
-  userId: null,
-  zoom: 4,
-  panX: 0,
-  panY: 0,
-  isConnected: false,
-  connectionError: null,
+**setCanvasData(data: Uint8Array):**
+- Called on initial canvas load from WebSocket
 
-  // Actions
-  setCanvasData: (data) => set({ canvasData: data }),
+**updatePixel(x, y, color):**
+- Updates single pixel in canvasData
+- Triggers re-render with new Uint8Array reference: `new Uint8Array(canvasData)`
 
-  updatePixel: (x, y, color) => {
-    const { canvasData, canvasWidth } = get();
-    if (!canvasData) return;
+**updatePixelsBatch(updates: PixelUpdate[]):**
+- Efficiently updates multiple pixels
+- Single re-render at end of batch
 
-    const offset = y * canvasWidth + x;
-    canvasData[offset] = color;
+**setSelectedColor(color):**
+- Updates palette selection
 
-    // Trigger re-render with new reference
-    set({ canvasData: new Uint8Array(canvasData) });
-  },
+**setCooldown(endTime):**
+- Sets cooldown timer end timestamp
 
-  // Batch updates for efficiency
-  updatePixelsBatch: (updates) => {
-    const { canvasData, canvasWidth } = get();
-    if (!canvasData) return;
+**setViewport(zoom, panX, panY):**
+- Updates viewport state
 
-    for (const { x, y, color } of updates) {
-      const offset = y * canvasWidth + x;
-      canvasData[offset] = color;
-    }
-
-    set({ canvasData: new Uint8Array(canvasData) });
-  },
-
-  setSelectedColor: (color) => set({ selectedColor: color }),
-
-  setCooldown: (endTime) => set({ cooldownEnd: endTime }),
-
-  setViewport: (zoom, panX, panY) => set({ zoom, panX, panY }),
-
-  setConnectionState: (connected, error) => set({
-    isConnected: connected,
-    connectionError: error ?? null
-  })
-}));
-```
+**setConnectionState(connected, error?):**
+- Tracks WebSocket connection status
 
 ### Optimistic Updates
 
-```typescript
-async function placePixel(x: number, y: number): Promise<void> {
-  const { selectedColor, cooldownEnd } = useCanvasStore.getState();
+"When the user places a pixel, I update the UI immediately before server confirmation."
 
-  // Check cooldown locally first
-  if (cooldownEnd && Date.now() < cooldownEnd) {
-    showToast('Wait for cooldown!');
-    return;
-  }
+**Optimistic Update Flow:**
 
-  // Optimistic update - show immediately
-  const previousColor = useCanvasStore.getState().canvasData![y * 500 + x];
-  useCanvasStore.getState().updatePixel(x, y, selectedColor);
-
-  try {
-    // Send to server via WebSocket
-    const result = await wsManager.placePixel(x, y, selectedColor);
-
-    // Set cooldown from server response
-    useCanvasStore.getState().setCooldown(result.nextPlacement);
-
-  } catch (error) {
-    // Rollback on failure
-    useCanvasStore.getState().updatePixel(x, y, previousColor);
-
-    if (error.code === 'RATE_LIMITED') {
-      useCanvasStore.getState().setCooldown(Date.now() + error.remainingSeconds * 1000);
-      showToast(`Wait ${error.remainingSeconds}s`);
-    } else {
-      showToast('Failed to place pixel');
-    }
-  }
-}
 ```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  User clicks    │────▶│  Check local    │────▶│  Optimistic     │
+│  to place pixel │     │  cooldown first │     │  UI update      │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+                                                         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Rollback if    │◀────│  Wait for       │◀────│  Send via       │
+│  error occurs   │     │  server response│     │  WebSocket      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+**On Success:**
+- Set cooldown from server response (nextPlacement timestamp)
+
+**On Failure (rate limited):**
+- Rollback to previous color
+- Set cooldown from error response
+- Show toast notification
 
 ---
 
 ## 5. Deep Dive: WebSocket Management (8 minutes)
 
-### WebSocket Manager Class
+### WebSocket Manager Architecture
 
-```typescript
-class WebSocketManager {
-  private ws: WebSocket | null = null;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
-  private messageQueue: PixelUpdate[] = [];
-  private batchInterval: number | null = null;
+**State:**
+- `ws`: WebSocket | null (the connection)
+- `reconnectAttempts`: number (for exponential backoff)
+- `maxReconnectAttempts`: 10
+- `messageQueue`: PixelUpdate[] (incoming updates buffer)
+- `batchInterval`: number | null (processing interval ID)
+- `pendingRequests`: Map<requestId, { resolve, reject }> (for request/response matching)
 
-  connect(): void {
-    const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+### Connection Lifecycle
 
-    this.ws = new WebSocket(url);
+**connect():**
+- Create WebSocket with dynamic protocol (wss: for https:, ws: for http:)
+- Set up event handlers (onopen, onmessage, onclose, onerror)
+- On open: reset reconnect attempts, update connection state, start batch processing
 
-    this.ws.onopen = () => {
-      console.log('WebSocket connected');
-      this.reconnectAttempts = 0;
-      useCanvasStore.getState().setConnectionState(true);
+**Reconnection with Exponential Backoff:**
 
-      // Start batch processing
-      this.batchInterval = window.setInterval(() => this.processBatch(), 50);
-    };
-
-    this.ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      this.handleMessage(msg);
-    };
-
-    this.ws.onclose = () => {
-      useCanvasStore.getState().setConnectionState(false);
-      this.scheduleReconnect();
-    };
-
-    this.ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      useCanvasStore.getState().setConnectionState(false, 'Connection error');
-    };
-  }
-
-  private handleMessage(msg: ServerMessage): void {
-    switch (msg.type) {
-      case 'canvas':
-        // Initial canvas load
-        const data = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
-        useCanvasStore.getState().setCanvasData(data);
-        break;
-
-      case 'pixels':
-        // Batch pixel updates - queue for processing
-        this.messageQueue.push(...msg.events);
-        break;
-
-      case 'welcome':
-        // Connection established, set user info
-        useCanvasStore.setState({
-          userId: msg.userId,
-          cooldownEnd: msg.cooldown > 0 ? Date.now() + msg.cooldown * 1000 : null
-        });
-        break;
-
-      case 'error':
-        this.handleError(msg);
-        break;
-    }
-  }
-
-  private processBatch(): void {
-    if (this.messageQueue.length === 0) return;
-
-    // Process all queued updates
-    const updates = [...this.messageQueue];
-    this.messageQueue = [];
-
-    useCanvasStore.getState().updatePixelsBatch(updates);
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      useCanvasStore.getState().setConnectionState(false, 'Connection lost');
-      return;
-    }
-
-    // Exponential backoff with jitter
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-    const jitter = Math.random() * 1000;
-
-    setTimeout(() => {
-      this.reconnectAttempts++;
-      this.connect();
-    }, delay + jitter);
-  }
-
-  async placePixel(x: number, y: number, color: number): Promise<PlaceResult> {
-    return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('Not connected'));
-        return;
-      }
-
-      // Generate request ID for response matching
-      const requestId = crypto.randomUUID();
-
-      // Store callback for response
-      this.pendingRequests.set(requestId, { resolve, reject });
-
-      this.ws.send(JSON.stringify({
-        type: 'place',
-        x,
-        y,
-        color,
-        requestId
-      }));
-
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        if (this.pendingRequests.has(requestId)) {
-          this.pendingRequests.delete(requestId);
-          reject(new Error('Request timeout'));
-        }
-      }, 5000);
-    });
-  }
-}
-
-export const wsManager = new WebSocketManager();
 ```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Connection     │────▶│  Calculate      │────▶│  Wait delay     │
+│  lost/closed    │     │  delay + jitter │     │  then reconnect │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+**Delay Formula:**
+- Base delay: 1000ms * 2^attempt
+- Cap at 30 seconds
+- Add random jitter (0-1000ms) to prevent thundering herd
+
+### Message Handling
+
+**Message Types from Server:**
+
+| Type | Description | Action |
+|------|-------------|--------|
+| `canvas` | Initial canvas data (base64) | Decode and set canvasData |
+| `pixels` | Batch of pixel updates | Queue for batch processing |
+| `welcome` | Connection established | Set userId, initial cooldown |
+| `error` | Server error | Handle based on error code |
+
+**Batch Processing:**
+- Every 50ms, process all queued pixel updates
+- Call `updatePixelsBatch` with accumulated updates
+- Clear queue after processing
+
+### Sending Pixel Placements
+
+**placePixel(x, y, color) -> Promise<PlaceResult>:**
+- Generate unique requestId (UUID)
+- Store resolve/reject callbacks in pendingRequests map
+- Send JSON message: `{ type: 'place', x, y, color, requestId }`
+- Set 5-second timeout, reject if no response
+- On response: match by requestId, resolve or reject accordingly
 
 ### Connection Status Indicator
 
-```tsx
-function ConnectionStatus() {
-  const { isConnected, connectionError } = useCanvasStore();
+**Visual States:**
 
-  if (isConnected) {
-    return (
-      <div className="flex items-center gap-2 text-green-600">
-        <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-        <span className="text-sm">Connected</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center gap-2 text-red-600">
-      <div className="w-2 h-2 bg-red-500 rounded-full" />
-      <span className="text-sm">{connectionError || 'Reconnecting...'}</span>
-    </div>
-  );
-}
-```
+| State | Indicator | Text |
+|-------|-----------|------|
+| Connected | Green pulsing dot | "Connected" |
+| Disconnected | Red static dot | Error message or "Reconnecting..." |
 
 ---
 
@@ -556,132 +327,54 @@ function ConnectionStatus() {
 
 ### Color Palette Component
 
-```tsx
-function ColorPalette() {
-  const { selectedColor, setSelectedColor } = useCanvasStore();
+**Layout:**
+- Flex wrap container with 1px gap
+- Dark background (gray-800) with rounded corners
+- Max width to create 4x4 grid of colors
 
-  return (
-    <div className="flex flex-wrap gap-1 p-2 bg-gray-800 rounded-lg max-w-xs">
-      {COLOR_PALETTE.map((color, index) => (
-        <button
-          key={index}
-          onClick={() => setSelectedColor(index)}
-          className={`
-            w-8 h-8 rounded border-2 transition-transform
-            ${selectedColor === index
-              ? 'border-white scale-110 shadow-lg'
-              : 'border-transparent hover:scale-105'}
-          `}
-          style={{ backgroundColor: `rgb(${color.r},${color.g},${color.b})` }}
-          title={color.name}
-          aria-label={`Select ${color.name}`}
-        />
-      ))}
-    </div>
-  );
-}
-```
+**Each Color Button:**
+- 32x32 pixel square with rounded border
+- Border: 2px white when selected, transparent otherwise
+- Transform: scale(1.1) when selected, scale(1.05) on hover
+- Shadow on selected color
+- Background: RGB from palette
+- Accessibility: title and aria-label with color name
 
 ### Cooldown Timer Component
 
-```tsx
-function CooldownTimer() {
-  const cooldownEnd = useCanvasStore((state) => state.cooldownEnd);
-  const [remaining, setRemaining] = useState(0);
+**States:**
 
-  useEffect(() => {
-    if (!cooldownEnd) {
-      setRemaining(0);
-      return;
-    }
-
-    const updateRemaining = () => {
-      const now = Date.now();
-      const diff = Math.max(0, cooldownEnd - now);
-      setRemaining(Math.ceil(diff / 1000));
-    };
-
-    updateRemaining();
-    const interval = setInterval(updateRemaining, 100);
-
-    return () => clearInterval(interval);
-  }, [cooldownEnd]);
-
-  if (remaining === 0) {
-    return (
-      <div className="flex items-center gap-2 text-green-500">
-        <CheckIcon className="w-5 h-5" />
-        <span>Ready to place!</span>
-      </div>
-    );
-  }
-
-  const progress = cooldownEnd
-    ? ((cooldownEnd - Date.now()) / (5 * 1000)) * 100
-    : 0;
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between text-sm">
-        <span className="text-gray-400">Next pixel in:</span>
-        <span className="font-mono text-lg">{remaining}s</span>
-      </div>
-      <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
-        <div
-          className="h-full bg-blue-500 transition-all duration-100"
-          style={{ width: `${100 - progress}%` }}
-        />
-      </div>
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────┐
+│  Ready State:                                                │
+│  [Green Check Icon] "Ready to place!"                       │
+├─────────────────────────────────────────────────────────────┤
+│  Cooldown State:                                             │
+│  "Next pixel in:" [Remaining Seconds]                       │
+│  [Progress Bar: fills as cooldown expires]                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Timer Logic:**
+- useEffect hook with cleanup
+- Update remaining seconds every 100ms
+- Calculate progress as percentage of 5-second cooldown
+- Clear interval when cooldownEnd is null or expired
 
 ### Pixel Info Tooltip
 
-```tsx
-function PixelInfoTooltip({ x, y, visible }: { x: number; y: number; visible: boolean }) {
-  const [pixelInfo, setPixelInfo] = useState<PixelInfo | null>(null);
+**Trigger:** Hover over canvas with delay
 
-  useEffect(() => {
-    if (!visible) return;
+**Display:**
+- Position: (x, y) coordinates
+- Color: Small square preview + color name
+- Placed by: Username (if available)
+- When: Relative time (e.g., "2 minutes ago")
 
-    // Fetch pixel info from API
-    fetch(`/api/v1/history/pixel?x=${x}&y=${y}`)
-      .then(res => res.json())
-      .then(data => setPixelInfo(data))
-      .catch(() => setPixelInfo(null));
-  }, [x, y, visible]);
-
-  if (!visible || !pixelInfo) return null;
-
-  return (
-    <div className="absolute z-50 p-3 bg-gray-900 rounded-lg shadow-xl border border-gray-700">
-      <div className="text-sm space-y-1">
-        <div className="text-gray-400">Position: ({x}, {y})</div>
-        <div className="flex items-center gap-2">
-          <span className="text-gray-400">Color:</span>
-          <div
-            className="w-4 h-4 rounded border border-gray-600"
-            style={{ backgroundColor: `rgb(${COLOR_PALETTE[pixelInfo.color].r},${COLOR_PALETTE[pixelInfo.color].g},${COLOR_PALETTE[pixelInfo.color].b})` }}
-          />
-          <span>{COLOR_PALETTE[pixelInfo.color].name}</span>
-        </div>
-        {pixelInfo.placedBy && (
-          <div className="text-gray-400">
-            Placed by: {pixelInfo.placedBy}
-          </div>
-        )}
-        {pixelInfo.placedAt && (
-          <div className="text-gray-400">
-            {formatRelativeTime(pixelInfo.placedAt)}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-```
+**Fetch Logic:**
+- API call to `/api/v1/history/pixel?x={x}&y={y}`
+- Only fetch when visible changes
+- Show loading state while fetching
 
 ---
 
@@ -689,73 +382,35 @@ function PixelInfoTooltip({ x, y, visible }: { x: number; y: number; visible: bo
 
 ### Canvas Rendering Optimizations
 
-```typescript
-// Use OffscreenCanvas for non-blocking rendering
-function useOffscreenCanvas() {
-  const workerRef = useRef<Worker | null>(null);
+**OffscreenCanvas for Non-blocking Rendering:**
+- Check for OffscreenCanvas support
+- Create Web Worker for rendering if available
+- Post canvas data to worker, receive rendered result
+- Falls back to main thread if unsupported
 
-  useEffect(() => {
-    if (typeof OffscreenCanvas !== 'undefined') {
-      workerRef.current = new Worker('/canvas-worker.js');
-    }
-  }, []);
+**Viewport Culling:**
+- Calculate visible region based on zoom and pan
+- Only process updates within visible bounds for rendering
+- Still update internal state for off-screen pixels
 
-  const render = useCallback((canvasData: Uint8Array) => {
-    if (workerRef.current) {
-      workerRef.current.postMessage({ type: 'render', data: canvasData });
-    }
-  }, []);
+**Visible Region Calculation:**
 
-  return { render };
-}
-```
+| Parameter | Formula |
+|-----------|---------|
+| startX | max(0, floor(-panX / zoom)) |
+| startY | max(0, floor(-panY / zoom)) |
+| endX | min(CANVAS_WIDTH, ceil((viewportWidth - panX) / zoom)) |
+| endY | min(CANVAS_HEIGHT, ceil((viewportHeight - panY) / zoom)) |
 
-### Viewport Culling
+### Request Animation Frame Batching
 
-```typescript
-// Only render visible portion of canvas
-function getVisibleRegion(
-  zoom: number,
-  panX: number,
-  panY: number,
-  viewportWidth: number,
-  viewportHeight: number
-): { startX: number; startY: number; endX: number; endY: number } {
-  const startX = Math.max(0, Math.floor(-panX / zoom));
-  const startY = Math.max(0, Math.floor(-panY / zoom));
-  const endX = Math.min(CANVAS_WIDTH, Math.ceil((viewportWidth - panX) / zoom));
-  const endY = Math.min(CANVAS_HEIGHT, Math.ceil((viewportHeight - panY) / zoom));
+"Batch visual updates to match display refresh rate."
 
-  return { startX, startY, endX, endY };
-}
-```
-
-### Request Animation Frame for Updates
-
-```typescript
-// Batch visual updates to match display refresh rate
-function useAnimationFrameUpdates() {
-  const pendingUpdates = useRef<PixelUpdate[]>([]);
-  const rafId = useRef<number | null>(null);
-
-  const scheduleUpdate = useCallback((update: PixelUpdate) => {
-    pendingUpdates.current.push(update);
-
-    if (rafId.current === null) {
-      rafId.current = requestAnimationFrame(() => {
-        const updates = pendingUpdates.current;
-        pendingUpdates.current = [];
-        rafId.current = null;
-
-        // Apply all pending updates
-        useCanvasStore.getState().updatePixelsBatch(updates);
-      });
-    }
-  }, []);
-
-  return scheduleUpdate;
-}
-```
+**Implementation:**
+- Maintain pendingUpdates array
+- On each update, push to array and schedule RAF if not already scheduled
+- In RAF callback: process all pending updates, clear array
+- Prevents multiple renders per frame during high-frequency updates
 
 ---
 
@@ -773,51 +428,29 @@ function useAnimationFrameUpdates() {
 
 ## 9. Accessibility Considerations
 
-```tsx
-// Keyboard navigation for canvas
-function CanvasKeyboardNav() {
-  const [cursorPos, setCursorPos] = useState({ x: 250, y: 250 });
+### Keyboard Navigation
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowUp':
-        setCursorPos(p => ({ ...p, y: Math.max(0, p.y - 1) }));
-        break;
-      case 'ArrowDown':
-        setCursorPos(p => ({ ...p, y: Math.min(499, p.y + 1) }));
-        break;
-      case 'ArrowLeft':
-        setCursorPos(p => ({ ...p, x: Math.max(0, p.x - 1) }));
-        break;
-      case 'ArrowRight':
-        setCursorPos(p => ({ ...p, x: Math.min(499, p.x + 1) }));
-        break;
-      case 'Enter':
-      case ' ':
-        placePixel(cursorPos.x, cursorPos.y);
-        break;
-    }
-  };
+**Arrow Keys:** Move cursor position by 1 pixel
 
-  return (
-    <div
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
-      aria-label={`Canvas at position ${cursorPos.x}, ${cursorPos.y}`}
-      role="application"
-    >
-      {/* Canvas content */}
-    </div>
-  );
-}
-```
+| Key | Action |
+|-----|--------|
+| ArrowUp | y = max(0, y - 1) |
+| ArrowDown | y = min(height - 1, y + 1) |
+| ArrowLeft | x = max(0, x - 1) |
+| ArrowRight | x = min(width - 1, x + 1) |
+| Enter / Space | Place pixel at cursor position |
+
+**Component Attributes:**
+- `tabIndex={0}` for focus
+- `role="application"` for proper screen reader context
+- Dynamic `aria-label` announcing current position
 
 ---
 
 ## 10. Future Enhancements
 
 1. **WebGL Renderer** - GPU-accelerated rendering for larger canvases
-2. **Viewport-Only Updates** - Request only visible region updates
+2. **Viewport-Only Updates** - Request only visible region updates from server
 3. **Touch Gestures** - Better mobile pinch-zoom and pan
 4. **Collaborative Cursor** - Show other users' cursor positions
 5. **Undo History** - Local undo for recent placements

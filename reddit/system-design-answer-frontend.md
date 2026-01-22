@@ -93,248 +93,78 @@
 
 ### Recursive Comment Component
 
-```tsx
-// components/CommentNode.tsx
-interface Comment {
-  id: number;
-  parentId: number | null;
-  path: string;
-  depth: number;
-  content: string;
-  authorName: string;
-  score: number;
-  upvotes: number;
-  downvotes: number;
-  createdAt: string;
-  children?: Comment[];
-}
+**Comment Data Structure:**
 
-interface CommentNodeProps {
-  comment: Comment;
-  onVote: (commentId: number, direction: 1 | -1 | 0) => void;
-  onReply: (parentId: number) => void;
-  maxDepth?: number;
-}
+| Field | Type | Purpose |
+|-------|------|---------|
+| id | number | Unique identifier |
+| parentId | number or null | Parent comment (null = root) |
+| path | string | Materialized path: "1.5.23.102" |
+| depth | number | Nesting level |
+| content | string | Comment body (Markdown) |
+| authorName | string | Author username |
+| score | number | Net votes |
+| upvotes | number | Total upvotes |
+| downvotes | number | Total downvotes |
+| createdAt | string | Timestamp |
+| children | Comment[] | Nested replies |
 
-export function CommentNode({
-  comment,
-  onVote,
-  onReply,
-  maxDepth = 10
-}: CommentNodeProps) {
-  const [isCollapsed, setIsCollapsed] = useState(false);
-  const [showReplyBox, setShowReplyBox] = useState(false);
+**CommentNode Component Responsibilities:**
 
-  const indentWidth = Math.min(comment.depth, maxDepth) * 16;
-  const isMaxDepth = comment.depth >= maxDepth;
+1. Render comment with proper indentation (depth * 16px)
+2. Display thread line for visual hierarchy (clickable to collapse)
+3. Show header: collapse toggle, author, score, timestamp
+4. Render content with Markdown support
+5. Display action bar: vote buttons, reply, share, report
+6. Show reply composer when reply button clicked
+7. Recursively render children
+8. Display "Continue thread" link at max depth (10)
 
-  return (
-    <div
-      className="comment-node"
-      style={{ marginLeft: `${indentWidth}px` }}
-      role="article"
-      aria-label={`Comment by ${comment.authorName}`}
-    >
-      {/* Thread line for visual hierarchy */}
-      {comment.depth > 0 && (
-        <div
-          className="thread-line"
-          style={{ left: `${indentWidth - 12}px` }}
-          onClick={() => setIsCollapsed(!isCollapsed)}
-          aria-label={isCollapsed ? 'Expand thread' : 'Collapse thread'}
-        />
-      )}
-
-      {/* Comment header */}
-      <div className="comment-header">
-        <button
-          className="collapse-toggle"
-          onClick={() => setIsCollapsed(!isCollapsed)}
-          aria-expanded={!isCollapsed}
-        >
-          [{isCollapsed ? '+' : '-'}]
-        </button>
-        <span className="author">{comment.authorName}</span>
-        <span className="score">{comment.score} points</span>
-        <span className="time">
-          <TimeAgo date={comment.createdAt} />
-        </span>
-      </div>
-
-      {!isCollapsed && (
-        <>
-          {/* Comment content */}
-          <div className="comment-content">
-            <Markdown>{comment.content}</Markdown>
-          </div>
-
-          {/* Action bar */}
-          <div className="comment-actions">
-            <VoteButtons
-              score={comment.score}
-              onUpvote={() => onVote(comment.id, 1)}
-              onDownvote={() => onVote(comment.id, -1)}
-            />
-            <button onClick={() => setShowReplyBox(true)}>Reply</button>
-            <button>Share</button>
-            <button>Report</button>
-          </div>
-
-          {/* Reply composer */}
-          {showReplyBox && (
-            <CommentComposer
-              parentId={comment.id}
-              onSubmit={(content) => {
-                onReply(comment.id);
-                setShowReplyBox(false);
-              }}
-              onCancel={() => setShowReplyBox(false)}
-            />
-          )}
-
-          {/* Render children recursively */}
-          {comment.children?.map((child) => (
-            <CommentNode
-              key={child.id}
-              comment={child}
-              onVote={onVote}
-              onReply={onReply}
-              maxDepth={maxDepth}
-            />
-          ))}
-
-          {/* Continue thread link for deep nesting */}
-          {isMaxDepth && comment.children && comment.children.length > 0 && (
-            <Link
-              to={`/comments/${comment.id}`}
-              className="continue-thread"
-            >
-              Continue this thread →
-            </Link>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
+**Thread Line Behavior:**
+```
+┌─────────────────────────────────────────────────────────┐
+│  Parent Comment                                          │
+│  │                                                       │
+│  ├── Child Comment 1                                    │
+│  │   │                                                   │
+│  │   └── Grandchild                                     │
+│  │                                                       │
+│  └── Child Comment 2                                    │
+│                                                          │
+│  [Click thread line to collapse entire subtree]          │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### Building Tree from Flat Data
 
-The backend returns comments sorted by path. We need to build a tree structure:
+The backend returns comments sorted by path. Client builds tree structure:
 
-```typescript
-// utils/buildCommentTree.ts
-export function buildCommentTree(comments: Comment[]): Comment[] {
-  const map = new Map<number, Comment>();
-  const roots: Comment[] = [];
+**Algorithm (Two-Pass):**
+1. First pass: Create map of id -> comment, initialize children arrays
+2. Second pass: For each comment, add to parent's children or roots array
+3. Handle orphaned comments (deleted parent) by treating as root
 
-  // First pass: create map and initialize children arrays
-  for (const comment of comments) {
-    map.set(comment.id, { ...comment, children: [] });
-  }
-
-  // Second pass: build tree structure
-  for (const comment of comments) {
-    const node = map.get(comment.id)!;
-
-    if (comment.parentId === null) {
-      roots.push(node);
-    } else {
-      const parent = map.get(comment.parentId);
-      if (parent) {
-        parent.children!.push(node);
-      } else {
-        // Orphaned comment (parent deleted), treat as root
-        roots.push(node);
-      }
-    }
-  }
-
-  return roots;
-}
-```
+**Time Complexity:** O(n) where n = comment count
 
 ### Virtualization for Large Threads
 
-For posts with thousands of comments, we virtualize the visible portion:
+For posts with thousands of comments, virtualize the visible portion:
 
-```tsx
-// components/VirtualizedCommentTree.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
+**Approach:**
+1. Flatten tree to array while preserving visual order (DFS)
+2. Use TanStack Virtual with dynamic height estimation
+3. Measure actual element height after render
+4. Overscan: 5 items for smooth scrolling
 
-export function VirtualizedCommentTree({ comments }: { comments: Comment[] }) {
-  const parentRef = useRef<HTMLDivElement>(null);
+**Estimate Size Function:**
+- Base height: 80px (header + actions)
+- Content height: ceil(content.length / 80) * 20px
+- Result: Good approximation, refined on measurement
 
-  // Flatten tree for virtualization while preserving order
-  const flatComments = useMemo(() =>
-    flattenTree(comments), [comments]
-  );
-
-  const virtualizer = useVirtualizer({
-    count: flatComments.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: (index) => {
-      // Estimate based on content length and depth
-      const comment = flatComments[index];
-      const baseHeight = 80;
-      const contentHeight = Math.ceil(comment.content.length / 80) * 20;
-      return baseHeight + contentHeight;
-    },
-    overscan: 5,
-    measureElement: (el) => el.getBoundingClientRect().height
-  });
-
-  return (
-    <div ref={parentRef} className="comment-container">
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          position: 'relative'
-        }}
-      >
-        {virtualizer.getVirtualItems().map((virtualItem) => {
-          const comment = flatComments[virtualItem.index];
-          return (
-            <div
-              key={comment.id}
-              ref={virtualizer.measureElement}
-              data-index={virtualItem.index}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                transform: `translateY(${virtualItem.start}px)`
-              }}
-            >
-              <CommentNode
-                comment={comment}
-                onVote={handleVote}
-                onReply={handleReply}
-              />
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// Flatten tree while maintaining visual order
-function flattenTree(
-  comments: Comment[],
-  result: Comment[] = []
-): Comment[] {
-  for (const comment of comments) {
-    result.push(comment);
-    if (comment.children && comment.children.length > 0) {
-      flattenTree(comment.children, result);
-    }
-  }
-  return result;
-}
-```
+**Why Flatten for Virtualization:**
+- Virtualizer needs linear list, not tree
+- Preserve visual order: parent before children
+- Maintain depth info for indentation
 
 ---
 
@@ -342,233 +172,80 @@ function flattenTree(
 
 ### Optimistic Voting with Zustand
 
-```typescript
-// store/voteStore.ts
-interface VoteState {
-  postVotes: Map<number, { direction: 1 | -1 | 0; score: number }>;
-  commentVotes: Map<number, { direction: 1 | -1 | 0; score: number }>;
-  pendingVotes: Set<string>; // "post:123" or "comment:456"
+**Vote State Structure:**
 
-  vote: (type: 'post' | 'comment', id: number, direction: 1 | -1 | 0) => void;
-  getVoteState: (type: 'post' | 'comment', id: number) => {
-    direction: 1 | -1 | 0;
-    score: number;
-  } | undefined;
-}
+| Field | Type | Purpose |
+|-------|------|---------|
+| postVotes | Map<id, {direction, score}> | Post vote states |
+| commentVotes | Map<id, {direction, score}> | Comment vote states |
+| pendingVotes | Set<string> | IDs currently syncing |
 
-export const useVoteStore = create<VoteState>((set, get) => ({
-  postVotes: new Map(),
-  commentVotes: new Map(),
-  pendingVotes: new Set(),
-
-  vote: async (type, id, newDirection) => {
-    const key = `${type}:${id}`;
-    const store = type === 'post' ? 'postVotes' : 'commentVotes';
-    const currentState = get()[store].get(id);
-
-    // Calculate score change
-    const oldDirection = currentState?.direction || 0;
-    const oldScore = currentState?.score || 0;
-    const scoreDelta = newDirection - oldDirection;
-    const newScore = oldScore + scoreDelta;
-
-    // Optimistic update
-    set((state) => {
-      const votes = new Map(state[store]);
-      votes.set(id, { direction: newDirection, score: newScore });
-      return {
-        [store]: votes,
-        pendingVotes: new Set([...state.pendingVotes, key])
-      };
-    });
-
-    try {
-      // Send to server
-      await api.post('/vote', {
-        type,
-        id,
-        direction: newDirection
-      });
-
-      // Mark as synced
-      set((state) => {
-        const pending = new Set(state.pendingVotes);
-        pending.delete(key);
-        return { pendingVotes: pending };
-      });
-    } catch (error) {
-      // Revert on failure
-      set((state) => {
-        const votes = new Map(state[store]);
-        if (currentState) {
-          votes.set(id, currentState);
-        } else {
-          votes.delete(id);
-        }
-        const pending = new Set(state.pendingVotes);
-        pending.delete(key);
-        return { [store]: votes, pendingVotes: pending };
-      });
-
-      // Show error toast
-      toast.error('Failed to save vote. Please try again.');
-    }
-  },
-
-  getVoteState: (type, id) => {
-    const store = type === 'post' ? 'postVotes' : 'commentVotes';
-    return get()[store].get(id);
-  }
-}));
+**Vote Action Flow:**
 ```
+┌──────────────────────────────────────────────────────────────┐
+│  User clicks vote                                             │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌─────────────────┐                                         │
+│  │ Calculate delta │  oldDirection -> newDirection           │
+│  │ and new score   │  scoreDelta = newDirection - old        │
+│  └────────┬────────┘                                         │
+│           ▼                                                   │
+│  ┌─────────────────┐                                         │
+│  │ Optimistic      │  Update store immediately               │
+│  │ update UI       │  Add to pendingVotes                    │
+│  └────────┬────────┘                                         │
+│           ▼                                                   │
+│  ┌─────────────────┐                                         │
+│  │ POST /vote      │  Send to server                         │
+│  └────────┬────────┘                                         │
+│           │                                                   │
+│     ┌─────┴─────┐                                            │
+│     ▼           ▼                                             │
+│  Success     Failure                                          │
+│     │           │                                             │
+│     ▼           ▼                                             │
+│  Remove     ┌─────────────────┐                              │
+│  pending    │ Revert to       │                              │
+│             │ previous state  │                              │
+│             │ Show error toast│                              │
+│             └─────────────────┘                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Toggle Behavior:**
+- Click same direction = remove vote (direction: 0)
+- Click opposite = switch vote
+- Score updates calculated from delta
 
 ### Vote Button Component
 
-```tsx
-// components/VoteButtons.tsx
-interface VoteButtonsProps {
-  type: 'post' | 'comment';
-  id: number;
-  initialScore: number;
-  initialDirection?: 1 | -1 | 0;
-}
+**Visual States:**
 
-export function VoteButtons({
-  type,
-  id,
-  initialScore,
-  initialDirection = 0
-}: VoteButtonsProps) {
-  const { vote, getVoteState, pendingVotes } = useVoteStore();
+| State | Upvote Style | Downvote Style | Score Style |
+|-------|--------------|----------------|-------------|
+| No vote | Gray | Gray | Default |
+| Upvoted | Orange fill | Gray | Orange |
+| Downvoted | Gray | Blue fill | Blue |
+| Pending | Opacity 60% | Opacity 60% | Opacity 60% |
 
-  // Get current state (optimistic or initial)
-  const currentState = getVoteState(type, id) || {
-    direction: initialDirection,
-    score: initialScore
-  };
+**Score Formatting:**
+- >= 10,000: Show as "10.0k"
+- < 10,000: Show exact number
 
-  const isPending = pendingVotes.has(`${type}:${id}`);
+**Accessibility:**
+- role="group" with aria-label
+- Each button has aria-label and aria-pressed
+- Score has aria-live="polite" for screen reader updates
 
-  const handleVote = (direction: 1 | -1) => {
-    // Toggle off if clicking same direction
-    const newDirection = currentState.direction === direction ? 0 : direction;
-    vote(type, id, newDirection);
-  };
+### Vote Animation CSS
 
-  return (
-    <div
-      className={`vote-buttons ${isPending ? 'pending' : ''}`}
-      role="group"
-      aria-label="Vote on this content"
-    >
-      <button
-        className={`upvote ${currentState.direction === 1 ? 'active' : ''}`}
-        onClick={() => handleVote(1)}
-        disabled={isPending}
-        aria-label="Upvote"
-        aria-pressed={currentState.direction === 1}
-      >
-        <UpvoteIcon />
-      </button>
-
-      <span
-        className={`score ${
-          currentState.direction === 1 ? 'positive' :
-          currentState.direction === -1 ? 'negative' : ''
-        }`}
-        aria-live="polite"
-      >
-        {formatScore(currentState.score)}
-      </span>
-
-      <button
-        className={`downvote ${currentState.direction === -1 ? 'active' : ''}`}
-        onClick={() => handleVote(-1)}
-        disabled={isPending}
-        aria-label="Downvote"
-        aria-pressed={currentState.direction === -1}
-      >
-        <DownvoteIcon />
-      </button>
-    </div>
-  );
-}
-
-function formatScore(score: number): string {
-  if (score >= 10000) {
-    return `${(score / 1000).toFixed(1)}k`;
-  }
-  return score.toString();
-}
-```
-
-### CSS for Vote Animation
-
-```css
-/* styles/voting.css */
-.vote-buttons {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-}
-
-.vote-buttons button {
-  background: none;
-  border: none;
-  padding: 4px;
-  cursor: pointer;
-  color: var(--text-muted);
-  transition: color 0.15s, transform 0.1s;
-}
-
-.vote-buttons button:hover {
-  color: var(--text-primary);
-}
-
-.vote-buttons button.upvote.active {
-  color: var(--upvote-orange);
-}
-
-.vote-buttons button.downvote.active {
-  color: var(--downvote-blue);
-}
-
-.vote-buttons button:active {
-  transform: scale(1.2);
-}
-
-.vote-buttons.pending {
-  opacity: 0.6;
-  pointer-events: none;
-}
-
-.score {
-  font-weight: 600;
-  font-size: 12px;
-  min-width: 24px;
-  text-align: center;
-}
-
-.score.positive {
-  color: var(--upvote-orange);
-}
-
-.score.negative {
-  color: var(--downvote-blue);
-}
-
-/* Animate score change */
-@keyframes scoreChange {
-  0% { transform: scale(1); }
-  50% { transform: scale(1.2); }
-  100% { transform: scale(1); }
-}
-
-.score.changing {
-  animation: scoreChange 0.2s ease-out;
-}
-```
+**Button Hover:** Color transition 0.15s
+**Button Active:** Scale 1.2
+**Score Change:** Keyframe animation
+- 0%: scale(1)
+- 50%: scale(1.2)
+- 100%: scale(1)
 
 ---
 
@@ -576,180 +253,67 @@ function formatScore(score: number): string {
 
 ### Infinite Scroll with Virtualization
 
-```tsx
-// components/PostFeed.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
-import { useInfiniteQuery } from '@tanstack/react-query';
-
-interface PostFeedProps {
-  subreddit: string;
-  sortBy: 'hot' | 'new' | 'top' | 'controversial';
-}
-
-export function PostFeed({ subreddit, sortBy }: PostFeedProps) {
-  const parentRef = useRef<HTMLDivElement>(null);
-
-  const {
-    data,
-    fetchNextPage,
-    hasNextPage,
-    isFetchingNextPage
-  } = useInfiniteQuery({
-    queryKey: ['posts', subreddit, sortBy],
-    queryFn: async ({ pageParam = 0 }) => {
-      const res = await api.get(`/r/${subreddit}/${sortBy}`, {
-        params: { page: pageParam, limit: 25 }
-      });
-      return res.data;
-    },
-    getNextPageParam: (lastPage, pages) =>
-      lastPage.hasMore ? pages.length : undefined
-  });
-
-  const allPosts = useMemo(() =>
-    data?.pages.flatMap(page => page.posts) || [],
-    [data]
-  );
-
-  const virtualizer = useVirtualizer({
-    count: hasNextPage ? allPosts.length + 1 : allPosts.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 150, // Average post card height
-    overscan: 3,
-    measureElement: (el) => el.getBoundingClientRect().height
-  });
-
-  // Load more when approaching end
-  useEffect(() => {
-    const lastItem = virtualizer.getVirtualItems().at(-1);
-    if (!lastItem) return;
-
-    if (
-      lastItem.index >= allPosts.length - 1 &&
-      hasNextPage &&
-      !isFetchingNextPage
-    ) {
-      fetchNextPage();
-    }
-  }, [virtualizer.getVirtualItems(), hasNextPage, isFetchingNextPage]);
-
-  return (
-    <div ref={parentRef} className="post-feed">
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          position: 'relative'
-        }}
-      >
-        {virtualizer.getVirtualItems().map((virtualItem) => {
-          const isLoader = virtualItem.index >= allPosts.length;
-          const post = allPosts[virtualItem.index];
-
-          return (
-            <div
-              key={isLoader ? 'loader' : post.id}
-              ref={virtualizer.measureElement}
-              data-index={virtualItem.index}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                transform: `translateY(${virtualItem.start}px)`
-              }}
-            >
-              {isLoader ? (
-                <LoadingSpinner />
-              ) : (
-                <PostCard post={post} />
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+**Feed Architecture:**
 ```
+┌─────────────────────────────────────────────────────────┐
+│  PostFeed Component                                      │
+│                                                          │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  useInfiniteQuery (TanStack Query)                 │  │
+│  │  - Fetch pages of posts                            │  │
+│  │  - Track hasNextPage                               │  │
+│  │  - Merge pages into allPosts                       │  │
+│  └───────────────────────────────────────────────────┘  │
+│                          │                               │
+│                          ▼                               │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  useVirtualizer                                    │  │
+│  │  - count: allPosts.length + (hasNext ? 1 : 0)     │  │
+│  │  - estimateSize: 150px                             │  │
+│  │  - overscan: 3                                     │  │
+│  │  - measureElement for dynamic heights              │  │
+│  └───────────────────────────────────────────────────┘  │
+│                          │                               │
+│                          ▼                               │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  Render virtual items                              │  │
+│  │  - Position: absolute with transform               │  │
+│  │  - Last item triggers fetchNextPage                │  │
+│  │  - Loading spinner for loader item                 │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Infinite Scroll Trigger:**
+- Check if last visible item index >= allPosts.length - 1
+- If hasNextPage and not fetching, call fetchNextPage
 
 ### Post Card Component
 
-```tsx
-// components/PostCard.tsx
-interface PostCardProps {
-  post: Post;
-}
-
-export function PostCard({ post }: PostCardProps) {
-  const navigate = useNavigate();
-
-  return (
-    <article
-      className="post-card"
-      onClick={() => navigate(`/r/${post.subredditName}/comments/${post.id}`)}
-      role="link"
-      tabIndex={0}
-    >
-      {/* Vote sidebar */}
-      <div className="post-votes" onClick={(e) => e.stopPropagation()}>
-        <VoteButtons
-          type="post"
-          id={post.id}
-          initialScore={post.score}
-        />
-      </div>
-
-      {/* Thumbnail */}
-      {post.thumbnail && (
-        <div className="post-thumbnail">
-          <img src={post.thumbnail} alt="" loading="lazy" />
-        </div>
-      )}
-
-      {/* Content */}
-      <div className="post-content">
-        <h3 className="post-title">
-          {post.title}
-          {post.url && (
-            <span className="post-domain">
-              ({new URL(post.url).hostname})
-            </span>
-          )}
-        </h3>
-
-        <div className="post-meta">
-          <Link to={`/r/${post.subredditName}`} onClick={(e) => e.stopPropagation()}>
-            r/{post.subredditName}
-          </Link>
-          <span>•</span>
-          <span>Posted by u/{post.authorName}</span>
-          <span>•</span>
-          <TimeAgo date={post.createdAt} />
-        </div>
-
-        {/* Preview for text posts */}
-        {post.content && (
-          <p className="post-preview">
-            {truncate(post.content, 200)}
-          </p>
-        )}
-
-        <div className="post-stats">
-          <span>
-            <CommentIcon /> {post.commentCount} comments
-          </span>
-          <span>
-            <ShareIcon /> Share
-          </span>
-          <span>
-            <SaveIcon /> Save
-          </span>
-        </div>
-      </div>
-    </article>
-  );
-}
+**PostCard Layout:**
 ```
+┌──────────────────────────────────────────────────────────┐
+│  ┌────┐  ┌─────────────────────────────────────────────┐ │
+│  │ ▲  │  │  Post Title (link domain)                   │ │
+│  │ 42 │  ├─────────────────────────────────────────────┤ │
+│  │ ▼  │  │  r/subreddit • Posted by u/author • 2h ago  │ │
+│  └────┘  ├─────────────────────────────────────────────┤ │
+│          │  Preview text (truncated to 200 chars)...   │ │
+│          ├─────────────────────────────────────────────┤ │
+│          │  💬 42 comments  🔗 Share  ⭐ Save           │ │
+│          └─────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Clickable Regions:**
+- Entire card: Navigate to post detail
+- Vote buttons: Prevent propagation, handle vote
+- Subreddit link: Navigate to subreddit
+- Stats buttons: Context-specific actions
+
+**Thumbnail:**
+- Lazy loading with loading="lazy"
+- Empty alt for decorative images
 
 ---
 
@@ -757,139 +321,58 @@ export function PostCard({ post }: PostCardProps) {
 
 ### Sort Tabs Component
 
-```tsx
-// components/SortTabs.tsx
-const SORT_OPTIONS = [
-  { key: 'hot', label: 'Hot', icon: FlameIcon },
-  { key: 'new', label: 'New', icon: SparkleIcon },
-  { key: 'top', label: 'Top', icon: TrophyIcon },
-  { key: 'controversial', label: 'Controversial', icon: SwordIcon }
-] as const;
+**Sort Options:**
 
-interface SortTabsProps {
-  currentSort: string;
-  onSortChange: (sort: string) => void;
-}
+| Key | Label | Icon | Algorithm |
+|-----|-------|------|-----------|
+| hot | Hot | Flame | Recency + popularity balanced |
+| new | New | Sparkle | Pure chronological |
+| top | Top | Trophy | Highest score (with time filter) |
+| controversial | Controversial | Swords | High engagement, balanced votes |
 
-export function SortTabs({ currentSort, onSortChange }: SortTabsProps) {
-  return (
-    <div className="sort-tabs" role="tablist">
-      {SORT_OPTIONS.map(({ key, label, icon: Icon }) => (
-        <button
-          key={key}
-          role="tab"
-          aria-selected={currentSort === key}
-          className={`sort-tab ${currentSort === key ? 'active' : ''}`}
-          onClick={() => onSortChange(key)}
-        >
-          <Icon className="sort-icon" />
-          {label}
-        </button>
-      ))}
+**Time Filter (for Top sort):**
 
-      {/* Time filter for top sort */}
-      {currentSort === 'top' && (
-        <select
-          className="time-filter"
-          defaultValue="day"
-          aria-label="Time period"
-        >
-          <option value="hour">Past Hour</option>
-          <option value="day">Today</option>
-          <option value="week">This Week</option>
-          <option value="month">This Month</option>
-          <option value="year">This Year</option>
-          <option value="all">All Time</option>
-        </select>
-      )}
-    </div>
-  );
-}
-```
+| Value | Label |
+|-------|-------|
+| hour | Past Hour |
+| day | Today |
+| week | This Week |
+| month | This Month |
+| year | This Year |
+| all | All Time |
+
+**Accessibility:**
+- role="tablist" on container
+- role="tab" on each button
+- aria-selected for active state
 
 ---
 
 ## 7. Zustand Store Architecture
 
-```typescript
-// store/index.ts
-interface RedditStore {
-  // User state
-  user: User | null;
-  isAuthenticated: boolean;
-  login: (credentials: Credentials) => Promise<void>;
-  logout: () => void;
+**Store Slices:**
 
-  // Subscriptions
-  subscriptions: Subreddit[];
-  subscribe: (subredditId: number) => Promise<void>;
-  unsubscribe: (subredditId: number) => Promise<void>;
+| Slice | State | Purpose |
+|-------|-------|---------|
+| User | user, isAuthenticated | Auth state |
+| Subscriptions | subscriptions[] | Joined subreddits |
+| UI | sidebarOpen, theme | Layout preferences |
 
-  // UI state
-  sidebarOpen: boolean;
-  toggleSidebar: () => void;
-  theme: 'light' | 'dark' | 'system';
-  setTheme: (theme: 'light' | 'dark' | 'system') => void;
-}
+**Persisted State:**
+- theme (light/dark/system)
+- sidebarOpen
+- Stored in localStorage via persist middleware
 
-export const useStore = create<RedditStore>()(
-  persist(
-    (set, get) => ({
-      user: null,
-      isAuthenticated: false,
-      subscriptions: [],
-      sidebarOpen: true,
-      theme: 'system',
+**Actions:**
 
-      login: async (credentials) => {
-        const response = await api.post('/auth/login', credentials);
-        set({
-          user: response.data.user,
-          isAuthenticated: true
-        });
-
-        // Load subscriptions after login
-        const subs = await api.get('/subscriptions');
-        set({ subscriptions: subs.data });
-      },
-
-      logout: () => {
-        api.post('/auth/logout');
-        set({
-          user: null,
-          isAuthenticated: false,
-          subscriptions: []
-        });
-      },
-
-      subscribe: async (subredditId) => {
-        await api.post(`/subreddits/${subredditId}/subscribe`);
-        const subreddit = await api.get(`/subreddits/${subredditId}`);
-        set((state) => ({
-          subscriptions: [...state.subscriptions, subreddit.data]
-        }));
-      },
-
-      unsubscribe: async (subredditId) => {
-        await api.delete(`/subreddits/${subredditId}/subscribe`);
-        set((state) => ({
-          subscriptions: state.subscriptions.filter(s => s.id !== subredditId)
-        }));
-      },
-
-      toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
-      setTheme: (theme) => set({ theme })
-    }),
-    {
-      name: 'reddit-store',
-      partialize: (state) => ({
-        theme: state.theme,
-        sidebarOpen: state.sidebarOpen
-      })
-    }
-  )
-);
-```
+| Action | Effect |
+|--------|--------|
+| login(credentials) | Set user, fetch subscriptions |
+| logout() | Clear user, subscriptions |
+| subscribe(subredditId) | Add to subscriptions, POST to API |
+| unsubscribe(subredditId) | Remove from subscriptions, DELETE to API |
+| toggleSidebar() | Toggle sidebarOpen |
+| setTheme(theme) | Update theme preference |
 
 ---
 
@@ -907,47 +390,32 @@ export const useStore = create<RedditStore>()(
 
 ## 9. Accessibility Considerations
 
-```tsx
-// Keyboard navigation for comments
-function useCommentNavigation(comments: Comment[]) {
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const current = document.activeElement;
-      if (!current?.closest('.comment-node')) return;
+### Keyboard Navigation
 
-      switch (e.key) {
-        case 'j': // Next sibling
-          (current.nextElementSibling as HTMLElement)?.focus();
-          break;
-        case 'k': // Previous sibling
-          (current.previousElementSibling as HTMLElement)?.focus();
-          break;
-        case 'l': // First child
-          current.querySelector('.comment-node')?.focus();
-          break;
-        case 'h': // Parent
-          current.parentElement?.closest('.comment-node')?.focus();
-          break;
-        case 'Enter': // Toggle collapse
-          current.querySelector('.collapse-toggle')?.click();
-          break;
-        case 'a': // Upvote
-          current.querySelector('.upvote')?.click();
-          break;
-        case 'z': // Downvote
-          current.querySelector('.downvote')?.click();
-          break;
-        case 'r': // Reply
-          current.querySelector('[aria-label="Reply"]')?.click();
-          break;
-      }
-    };
+**Vim-Style Shortcuts:**
 
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
-}
-```
+| Key | Action |
+|-----|--------|
+| j | Focus next sibling comment |
+| k | Focus previous sibling comment |
+| l | Focus first child comment |
+| h | Focus parent comment |
+| Enter | Toggle collapse |
+| a | Upvote |
+| z | Downvote |
+| r | Open reply box |
+
+**Implementation:**
+- Listen for keydown on document
+- Check if activeElement is within .comment-node
+- Find target element via DOM traversal
+- Focus or trigger click on target
+
+**Semantic Structure:**
+- Comments use role="article"
+- aria-label="Comment by {author}"
+- Collapse toggle has aria-expanded
+- Thread lines have aria-label for collapse action
 
 ---
 

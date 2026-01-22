@@ -31,37 +31,39 @@ Design LinkedIn, a professional social network where users build career profiles
 ## High-Level Architecture
 
 ```
-+-----------------------------------------------------------+
-|                    Frontend (React)                        |
-|  +--------+  +--------+  +--------+  +--------+           |
-|  | Profile|  |  Feed  |  | Network|  |  Jobs  |           |
-|  +--------+  +--------+  +--------+  +--------+           |
-|       |           |           |           |               |
-|       +-----+-----+-----+-----+-----+-----+               |
-|             |                                              |
-|      +-------------+                                       |
-|      | API Service |                                       |
-|      +-------------+                                       |
-+-----------------------------------------------------------+
-              |
-              v (HTTP/REST)
-+-----------------------------------------------------------+
-|                    API Gateway                             |
-+-----------------------------------------------------------+
-              |
-    +---------+---------+---------+
-    v         v         v         v
-+-------+ +-------+ +-------+ +-------+
-|Profile| |Graph  | |Feed   | |Jobs   |
-|Service| |Service| |Service| |Service|
-+-------+ +-------+ +-------+ +-------+
-    |         |         |         |
-    v         v         v         v
-+-----------------------------------------------------------+
-|  PostgreSQL  |  Valkey/Redis  |  Elasticsearch            |
-|  (Profiles,  |  (Connections, |  (Search,                 |
-|   Jobs)      |   PYMK Cache)  |   Indexing)               |
-+-----------------------------------------------------------+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Frontend (React)                                   │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
+│  │ Profile │  │  Feed   │  │ Network │  │  Jobs   │                      │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                      │
+│       │            │            │            │                            │
+│       └────────────┼────────────┼────────────┘                            │
+│                    │                                                       │
+│               ┌────┴────┐                                                  │
+│               │   API   │                                                  │
+│               │ Service │                                                  │
+│               └────┬────┘                                                  │
+└────────────────────┼───────────────────────────────────────────────────────┘
+                     │ HTTP/REST
+                     ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         API Gateway                                        │
+└────────────────────┬───────────────────────────────────────────────────────┘
+                     │
+      ┌──────────────┼──────────────┬──────────────┐
+      ▼              ▼              ▼              ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ Profile  │  │  Graph   │  │   Feed   │  │   Jobs   │
+│ Service  │  │ Service  │  │ Service  │  │ Service  │
+└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+     │             │             │             │
+     └─────────────┼─────────────┼─────────────┘
+                   ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  PostgreSQL        │  Valkey/Redis       │  Elasticsearch                 │
+│  (Profiles, Jobs)  │  (Connections,      │  (Search, Indexing)            │
+│                    │   PYMK Cache)       │                                │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dives
@@ -70,878 +72,484 @@ Design LinkedIn, a professional social network where users build career profiles
 
 **RESTful Endpoints:**
 
-```typescript
-// Connections
-GET    /api/v1/connections                    // Get user's connections
-GET    /api/v1/connections/:userId/degree     // Get connection degree to user
-GET    /api/v1/connections/:userId/mutual     // Get mutual connections
-POST   /api/v1/connections/request            // Send connection request
-PUT    /api/v1/connections/request/:id/accept // Accept request
-DELETE /api/v1/connections/:userId            // Remove connection
-
-// PYMK
-GET    /api/v1/pymk                           // Get recommendations
-GET    /api/v1/pymk/:userId/score             // Get PYMK score for user
-
-// Feed
-GET    /api/v1/feed                           // Get ranked feed
-POST   /api/v1/posts                          // Create post
-POST   /api/v1/posts/:id/like                 // Like post
-POST   /api/v1/posts/:id/comments             // Add comment
-
-// Jobs
-GET    /api/v1/jobs                           // List jobs
-GET    /api/v1/jobs/recommended               // Get matched jobs
-POST   /api/v1/jobs/:id/apply                 // Apply to job
-GET    /api/v1/jobs/:id/match-score           // Get match score
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Connection APIs                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│  GET    /api/v1/connections              ──▶ Get user's connections       │
+│  GET    /api/v1/connections/:userId/degree ──▶ Get connection degree      │
+│  GET    /api/v1/connections/:userId/mutual ──▶ Get mutual connections     │
+│  POST   /api/v1/connections/request      ──▶ Send connection request      │
+│  PUT    /api/v1/connections/request/:id/accept ──▶ Accept request         │
+│  DELETE /api/v1/connections/:userId      ──▶ Remove connection            │
+├───────────────────────────────────────────────────────────────────────────┤
+│                         PYMK APIs                                          │
+├───────────────────────────────────────────────────────────────────────────┤
+│  GET    /api/v1/pymk                     ──▶ Get recommendations          │
+│  GET    /api/v1/pymk/:userId/score       ──▶ Get PYMK score for user      │
+├───────────────────────────────────────────────────────────────────────────┤
+│                         Feed APIs                                          │
+├───────────────────────────────────────────────────────────────────────────┤
+│  GET    /api/v1/feed                     ──▶ Get ranked feed              │
+│  POST   /api/v1/posts                    ──▶ Create post                  │
+│  POST   /api/v1/posts/:id/like           ──▶ Like post                    │
+│  POST   /api/v1/posts/:id/comments       ──▶ Add comment                  │
+├───────────────────────────────────────────────────────────────────────────┤
+│                         Jobs APIs                                          │
+├───────────────────────────────────────────────────────────────────────────┤
+│  GET    /api/v1/jobs                     ──▶ List jobs                    │
+│  GET    /api/v1/jobs/recommended         ──▶ Get matched jobs             │
+│  POST   /api/v1/jobs/:id/apply           ──▶ Apply to job                 │
+│  GET    /api/v1/jobs/:id/match-score     ──▶ Get match score              │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Response Shaping for Frontend:**
 
-```typescript
-// Connection degree response includes context for UI
-interface ConnectionDegreeResponse {
-  userId: number;
-  degree: 1 | 2 | 3 | null;
-  mutualConnections?: {
-    count: number;
-    sample: User[]; // First 3 for display
-  };
-  path?: User[]; // How you're connected (for 2nd/3rd degree)
-}
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│              ConnectionDegreeResponse Structure                            │
+├───────────────────────────────────────────────────────────────────────────┤
+│  {                                                                         │
+│    userId: number,                                                         │
+│    degree: 1 | 2 | 3 | null,                                               │
+│    mutualConnections?: {                                                   │
+│      count: number,                                                        │
+│      sample: User[]   ──▶ First 3 for UI display                          │
+│    },                                                                      │
+│    path?: User[]      ──▶ Connection path for 2nd/3rd degree              │
+│  }                                                                         │
+└───────────────────────────────────────────────────────────────────────────┘
 
-// Express route handler
-app.get('/api/v1/connections/:userId/degree', requireAuth, async (req, res) => {
-  const targetUserId = parseInt(req.params.userId);
-  const currentUserId = req.session.userId;
-
-  // Check 1st degree
-  const isFirstDegree = await checkConnection(currentUserId, targetUserId);
-  if (isFirstDegree) {
-    return res.json({ userId: targetUserId, degree: 1 });
-  }
-
-  // Check 2nd degree with mutuals
-  const mutuals = await getMutualConnections(currentUserId, targetUserId);
-  if (mutuals.length > 0) {
-    return res.json({
-      userId: targetUserId,
-      degree: 2,
-      mutualConnections: {
-        count: mutuals.length,
-        sample: mutuals.slice(0, 3),
-      },
-    });
-  }
-
-  // Check 3rd degree
-  const path = await findConnectionPath(currentUserId, targetUserId, 3);
-  if (path) {
-    return res.json({
-      userId: targetUserId,
-      degree: 3,
-      path,
-    });
-  }
-
-  return res.json({ userId: targetUserId, degree: null });
-});
+┌───────────────────────────────────────────────────────────────────────────┐
+│              Connection Degree Handler Flow                                │
+├───────────────────────────────────────────────────────────────────────────┤
+│  1. Check 1st degree (direct connection)                                   │
+│     └── If connected ──▶ return { degree: 1 }                              │
+│                                                                            │
+│  2. Check 2nd degree (get mutuals)                                         │
+│     └── If mutuals exist ──▶ return { degree: 2, mutualConnections }       │
+│                                                                            │
+│  3. Check 3rd degree (find path with max depth 3)                          │
+│     └── If path found ──▶ return { degree: 3, path }                       │
+│                                                                            │
+│  4. No connection found ──▶ return { degree: null }                        │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2. Shared Type Definitions
 
-**Shared Types (types/index.ts):**
-
-```typescript
-// Used in both frontend and backend
-
-export interface User {
-  id: number;
-  email: string;
-  firstName: string;
-  lastName: string;
-  headline?: string;
-  summary?: string;
-  location?: string;
-  industry?: string;
-  profileImageUrl?: string;
-  bannerImageUrl?: string;
-  connectionCount: number;
-  role: 'user' | 'recruiter' | 'admin';
-  createdAt: string;
-}
-
-export interface Experience {
-  id: number;
-  userId: number;
-  companyId?: number;
-  companyName: string;
-  title: string;
-  location?: string;
-  startDate: string;
-  endDate?: string;
-  description?: string;
-  isCurrent: boolean;
-}
-
-export interface Skill {
-  id: number;
-  name: string;
-  endorsementCount?: number;
-}
-
-export interface Connection {
-  userId: number;
-  connectedTo: number;
-  connectedAt: string;
-}
-
-export interface Post {
-  id: number;
-  userId: number;
-  author: User;
-  content: string;
-  imageUrl?: string;
-  likeCount: number;
-  commentCount: number;
-  shareCount: number;
-  createdAt: string;
-}
-
-export interface Job {
-  id: number;
-  companyId: number;
-  company: Company;
-  title: string;
-  description: string;
-  location?: string;
-  isRemote: boolean;
-  employmentType: 'full-time' | 'part-time' | 'contract' | 'internship';
-  experienceLevel: 'entry' | 'associate' | 'mid-senior' | 'director' | 'executive';
-  yearsRequired?: number;
-  salaryMin?: number;
-  salaryMax?: number;
-  requiredSkills: Skill[];
-  status: 'active' | 'closed' | 'filled';
-  createdAt: string;
-}
-
-export interface PYMKCandidate {
-  user: User;
-  score: number;
-  mutualCount: number;
-  sharedCompanies: string[];
-  sharedSchools: string[];
-  sharedSkills: string[];
-}
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    Shared Types (Frontend + Backend)                       │
+├───────────────────────────────────────────────────────────────────────────┤
+│  User                                                                      │
+│  ├── id, email, firstName, lastName                                        │
+│  ├── headline?, summary?, location?, industry?                             │
+│  ├── profileImageUrl?, bannerImageUrl?                                     │
+│  ├── connectionCount                                                       │
+│  ├── role: 'user' | 'recruiter' | 'admin'                                  │
+│  └── createdAt                                                             │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Experience                                                                │
+│  ├── id, userId, companyId?, companyName                                   │
+│  ├── title, location?, startDate, endDate?                                 │
+│  ├── description?, isCurrent                                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Skill                                                                     │
+│  ├── id, name, endorsementCount?                                           │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Post                                                                      │
+│  ├── id, userId, author: User, content, imageUrl?                          │
+│  ├── likeCount, commentCount, shareCount, createdAt                        │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Job                                                                       │
+│  ├── id, companyId, company: Company, title, description                   │
+│  ├── location?, isRemote, employmentType, experienceLevel                  │
+│  ├── yearsRequired?, salaryMin?, salaryMax?                                │
+│  ├── requiredSkills: Skill[], status, createdAt                            │
+├───────────────────────────────────────────────────────────────────────────┤
+│  PYMKCandidate                                                             │
+│  ├── user: User, score, mutualCount                                        │
+│  ├── sharedCompanies: string[]                                             │
+│  ├── sharedSchools: string[]                                               │
+│  └── sharedSkills: string[]                                                │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3. Connection Request Flow (Full-Stack)
 
 **Backend Handler:**
 
-```typescript
-// POST /api/v1/connections/request
-app.post('/api/v1/connections/request', requireAuth, async (req, res) => {
-  const { targetUserId, message } = req.body;
-  const fromUserId = req.session.userId;
-
-  // Validate not already connected
-  const existing = await checkConnection(fromUserId, targetUserId);
-  if (existing) {
-    return res.status(400).json({ error: 'Already connected' });
-  }
-
-  // Check for existing pending request
-  const pendingRequest = await getPendingRequest(fromUserId, targetUserId);
-  if (pendingRequest) {
-    return res.status(400).json({ error: 'Request already pending' });
-  }
-
-  // Create request
-  const request = await pool.query(
-    `INSERT INTO connection_requests (from_user_id, to_user_id, message, status)
-     VALUES ($1, $2, $3, 'pending')
-     RETURNING id, from_user_id, to_user_id, message, status, created_at`,
-    [fromUserId, targetUserId, message]
-  );
-
-  // Queue notification
-  await rabbitmq.publish('notifications', {
-    type: 'connection_request',
-    userId: targetUserId,
-    fromUserId,
-    requestId: request.rows[0].id,
-  });
-
-  // Audit log
-  await auditLog('connection.request.sent', fromUserId, 'user', targetUserId);
-
-  res.status(201).json(request.rows[0]);
-});
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│              POST /api/v1/connections/request                              │
+├───────────────────────────────────────────────────────────────────────────┤
+│  INPUT: { targetUserId, message? }                                         │
+├───────────────────────────────────────────────────────────────────────────┤
+│  VALIDATIONS                                                               │
+│  ├── Check not already connected ──▶ 400 "Already connected"              │
+│  └── Check no pending request ──▶ 400 "Request already pending"           │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ACTIONS                                                                   │
+│  1. INSERT INTO connection_requests                                        │
+│     (from_user_id, to_user_id, message, status='pending')                  │
+│                                                                            │
+│  2. Queue notification via RabbitMQ                                        │
+│     { type: 'connection_request', userId: targetUserId, ... }              │
+│                                                                            │
+│  3. Audit log: 'connection.request.sent'                                   │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RESPONSE: 201 with created request                                        │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Frontend Component:**
 
-```tsx
-function ConnectButton({ targetUser }: { targetUser: User }) {
-  const { user } = useAuthStore();
-  const [connectionStatus, setConnectionStatus] = useState<
-    'none' | 'pending' | 'connected' | 'loading'
-  >('none');
-
-  useEffect(() => {
-    async function checkStatus() {
-      const degree = await connectionsApi.getConnectionDegree(targetUser.id);
-      if (degree.degree === 1) {
-        setConnectionStatus('connected');
-      } else {
-        const pending = await connectionsApi.getPendingRequest(targetUser.id);
-        setConnectionStatus(pending ? 'pending' : 'none');
-      }
-    }
-    checkStatus();
-  }, [targetUser.id]);
-
-  const handleConnect = async () => {
-    setConnectionStatus('loading');
-    try {
-      await connectionsApi.sendRequest(targetUser.id);
-      setConnectionStatus('pending');
-    } catch (error) {
-      setConnectionStatus('none');
-      console.error('Failed to send connection request:', error);
-    }
-  };
-
-  if (connectionStatus === 'connected') {
-    return (
-      <span className="px-4 py-2 text-gray-500">
-        <Check className="inline w-4 h-4 mr-1" />
-        Connected
-      </span>
-    );
-  }
-
-  if (connectionStatus === 'pending') {
-    return (
-      <span className="px-4 py-2 text-gray-500">
-        <Clock className="inline w-4 h-4 mr-1" />
-        Pending
-      </span>
-    );
-  }
-
-  return (
-    <button
-      onClick={handleConnect}
-      disabled={connectionStatus === 'loading'}
-      className="px-4 py-2 bg-linkedin-blue text-white rounded-full hover:bg-linkedin-dark disabled:opacity-50"
-    >
-      {connectionStatus === 'loading' ? 'Connecting...' : 'Connect'}
-    </button>
-  );
-}
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                      ConnectButton Component                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│  STATE: connectionStatus: 'none' | 'pending' | 'connected' | 'loading'    │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ON MOUNT (useEffect)                                                      │
+│  ├── Get connection degree                                                 │
+│  │   └── degree === 1 ──▶ setConnectionStatus('connected')                 │
+│  └── Check pending request                                                 │
+│      └── pending exists ──▶ setConnectionStatus('pending')                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RENDER                                                                    │
+│                                                                            │
+│  connectionStatus === 'connected':                                         │
+│  ├── [Check icon] "Connected" (gray text)                                  │
+│                                                                            │
+│  connectionStatus === 'pending':                                           │
+│  ├── [Clock icon] "Pending" (gray text)                                    │
+│                                                                            │
+│  connectionStatus === 'none' or 'loading':                                 │
+│  └── [Connect] button (blue, LinkedIn style)                               │
+│      └── onClick ──▶ optimistic 'loading' ──▶ API call                     │
+│          ├── Success: setConnectionStatus('pending')                       │
+│          └── Failure: setConnectionStatus('none')                          │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 4. PYMK Integration
 
 **Backend - PYMK Scoring:**
 
-```typescript
-// GET /api/v1/pymk
-app.get('/api/v1/pymk', requireAuth, async (req, res) => {
-  const userId = req.session.userId;
-  const limit = parseInt(req.query.limit as string) || 20;
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                   GET /api/v1/pymk Handler                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│  1. Try cache first                                                        │
+│     └── valkey.get(`pymk:${userId}`) ──▶ if hit, return top N              │
+│                                                                            │
+│  2. Cache miss: compute PYMK                                               │
+│     ├── Get 2nd-degree connections                                         │
+│     ├── For each candidate: computePYMKScore()                             │
+│     ├── Sort by score descending                                           │
+│     └── Take top 100                                                       │
+│                                                                            │
+│  3. Cache for 1 hour                                                       │
+│     └── valkey.setex(`pymk:${userId}`, 3600, JSON.stringify(candidates))   │
+│                                                                            │
+│  4. Return top N (from query.limit, default 20)                            │
+└───────────────────────────────────────────────────────────────────────────┘
 
-  // Try cache first
-  const cached = await valkey.get(`pymk:${userId}`);
-  if (cached) {
-    const candidates = JSON.parse(cached).slice(0, limit);
-    return res.json(candidates);
-  }
-
-  // Compute PYMK (fallback if cache miss)
-  const secondDegree = await getSecondDegreeConnections(userId);
-  const scored: PYMKCandidate[] = [];
-
-  for (const candidate of secondDegree) {
-    const score = await computePYMKScore(userId, candidate.userId);
-    scored.push({
-      user: candidate,
-      score: score.total,
-      mutualCount: score.mutualCount,
-      sharedCompanies: score.sharedCompanies,
-      sharedSchools: score.sharedSchools,
-      sharedSkills: score.sharedSkills,
-    });
-  }
-
-  // Sort by score
-  scored.sort((a, b) => b.score - a.score);
-  const topCandidates = scored.slice(0, 100);
-
-  // Cache for 1 hour
-  await valkey.setex(`pymk:${userId}`, 3600, JSON.stringify(topCandidates));
-
-  res.json(topCandidates.slice(0, limit));
-});
-
-async function computePYMKScore(userId: number, candidateId: number) {
-  const [mutuals, companies, schools, skills] = await Promise.all([
-    getMutualConnections(userId, candidateId),
-    getSharedCompanies(userId, candidateId),
-    getSharedSchools(userId, candidateId),
-    getSharedSkills(userId, candidateId),
-  ]);
-
-  return {
-    total:
-      mutuals.length * 10 +
-      companies.current * 8 +
-      companies.past * 5 +
-      schools.length * 5 +
-      skills.length * 2,
-    mutualCount: mutuals.length,
-    sharedCompanies: companies.names,
-    sharedSchools: schools.map((s) => s.name),
-    sharedSkills: skills.map((s) => s.name),
-  };
-}
+┌───────────────────────────────────────────────────────────────────────────┐
+│                   computePYMKScore Algorithm                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Parallel fetch:                                                           │
+│  ├── getMutualConnections(userId, candidateId)                             │
+│  ├── getSharedCompanies(userId, candidateId)                               │
+│  ├── getSharedSchools(userId, candidateId)                                 │
+│  └── getSharedSkills(userId, candidateId)                                  │
+├───────────────────────────────────────────────────────────────────────────┤
+│  SCORING WEIGHTS                                                           │
+│  ├── Mutual connections: 10 points each                                    │
+│  ├── Same current company: 8 points                                        │
+│  ├── Same past company: 5 points                                           │
+│  ├── Same school: 5 points each                                            │
+│  └── Shared skills: 2 points each                                          │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RETURN                                                                    │
+│  {                                                                         │
+│    total: sum of all weighted scores,                                      │
+│    mutualCount, sharedCompanies[], sharedSchools[], sharedSkills[]        │
+│  }                                                                         │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Frontend - PYMK Display:**
 
-```tsx
-function PYMKSection() {
-  const [candidates, setCandidates] = useState<PYMKCandidate[]>([]);
-  const [loading, setLoading] = useState(true);
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                       PYMKSection Component                                │
+├───────────────────────────────────────────────────────────────────────────┤
+│  STATE                                                                     │
+│  ├── candidates: PYMKCandidate[]                                           │
+│  └── loading: boolean                                                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ON MOUNT                                                                  │
+│  └── pymkApi.getRecommendations(20) ──▶ setCandidates                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  handleConnect(candidateId)                                                │
+│  ├── connectionsApi.sendRequest(candidateId)                               │
+│  └── Remove candidate from list (optimistic removal)                       │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RENDER                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  "People you may know"                                               │  │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐           │  │
+│  │  │  ┌──────────┐  │ │  ┌──────────┐  │ │  ┌──────────┐  │           │  │
+│  │  │  │  Avatar  │  │ │  │  Avatar  │  │ │  │  Avatar  │  │           │  │
+│  │  │  └──────────┘  │ │  └──────────┘  │ │  └──────────┘  │           │  │
+│  │  │  Name          │ │  Name          │ │  Name          │           │  │
+│  │  │  Headline      │ │  Headline      │ │  Headline      │           │  │
+│  │  │  "X mutual"    │ │  "Worked at X" │ │  "Attended X"  │           │  │
+│  │  │  [Connect]     │ │  [Connect]     │ │  [Connect]     │           │  │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘           │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────┘
 
-  useEffect(() => {
-    async function loadPYMK() {
-      try {
-        const data = await pymkApi.getRecommendations(20);
-        setCandidates(data);
-      } catch (error) {
-        console.error('Failed to load PYMK:', error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    loadPYMK();
-  }, []);
-
-  const handleConnect = async (candidateId: number) => {
-    try {
-      await connectionsApi.sendRequest(candidateId);
-      setCandidates((prev) =>
-        prev.filter((c) => c.user.id !== candidateId)
-      );
-    } catch (error) {
-      console.error('Failed to send request:', error);
-    }
-  };
-
-  if (loading) {
-    return <PYMKSkeleton />;
-  }
-
-  return (
-    <section className="bg-white rounded-lg shadow p-4">
-      <h2 className="text-lg font-semibold mb-4">People you may know</h2>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {candidates.map((candidate) => (
-          <PYMKCard
-            key={candidate.user.id}
-            candidate={candidate}
-            onConnect={() => handleConnect(candidate.user.id)}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function PYMKCard({
-  candidate,
-  onConnect,
-}: {
-  candidate: PYMKCandidate;
-  onConnect: () => void;
-}) {
-  const { user, mutualCount, sharedCompanies, sharedSchools } = candidate;
-
-  // Determine the best "reason" to show
-  const reason =
-    mutualCount > 0
-      ? `${mutualCount} mutual connections`
-      : sharedCompanies.length > 0
-      ? `Worked at ${sharedCompanies[0]}`
-      : sharedSchools.length > 0
-      ? `Attended ${sharedSchools[0]}`
-      : null;
-
-  return (
-    <div className="border rounded-lg p-4 text-center">
-      <Link to={`/profile/${user.id}`}>
-        <img
-          src={user.profileImageUrl || '/default-avatar.png'}
-          alt=""
-          className="w-16 h-16 rounded-full mx-auto mb-2"
-        />
-        <h3 className="font-medium hover:underline">
-          {user.firstName} {user.lastName}
-        </h3>
-      </Link>
-      <p className="text-sm text-gray-600 mb-2 line-clamp-2">
-        {user.headline}
-      </p>
-      {reason && (
-        <p className="text-xs text-gray-500 mb-3">{reason}</p>
-      )}
-      <button
-        onClick={onConnect}
-        className="w-full py-2 border border-linkedin-blue text-linkedin-blue rounded-full hover:bg-linkedin-light"
-      >
-        Connect
-      </button>
-    </div>
-  );
-}
+┌───────────────────────────────────────────────────────────────────────────┐
+│                       PYMKCard "Reason" Logic                              │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Priority order for display reason:                                        │
+│  1. mutualCount > 0 ──▶ "X mutual connections"                             │
+│  2. sharedCompanies.length > 0 ──▶ "Worked at [first company]"             │
+│  3. sharedSchools.length > 0 ──▶ "Attended [first school]"                 │
+│  4. None of above ──▶ no reason displayed                                  │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 5. Feed Ranking Integration
 
 **Backend - Feed Generation:**
 
-```typescript
-// GET /api/v1/feed
-app.get('/api/v1/feed', requireAuth, async (req, res) => {
-  const userId = req.session.userId;
-  const offset = parseInt(req.query.offset as string) || 0;
-  const limit = parseInt(req.query.limit as string) || 20;
-
-  // Get connections
-  const connections = await getConnectionIds(userId);
-
-  // Query posts with ranking
-  const result = await pool.query(
-    `WITH user_connections AS (
-      SELECT connected_to AS conn_id FROM connections WHERE user_id = $1
-      UNION
-      SELECT user_id AS conn_id FROM connections WHERE connected_to = $1
-    )
-    SELECT
-      p.*,
-      u.first_name, u.last_name, u.headline, u.profile_image_url,
-      -- Ranking score
-      (
-        p.like_count * 0.3 +
-        p.comment_count * 0.5 +
-        CASE WHEN p.user_id IN (SELECT conn_id FROM user_connections) THEN 15 ELSE 0 END +
-        (1.0 / (1 + EXTRACT(EPOCH FROM NOW() - p.created_at) / 3600)) * 10
-      ) AS rank_score
-    FROM posts p
-    JOIN users u ON p.user_id = u.id
-    WHERE p.user_id IN (SELECT conn_id FROM user_connections)
-       OR p.user_id = $1
-    ORDER BY rank_score DESC
-    LIMIT $2 OFFSET $3`,
-    [userId, limit, offset]
-  );
-
-  // Format response with author info
-  const posts = result.rows.map((row) => ({
-    id: row.id,
-    content: row.content,
-    imageUrl: row.image_url,
-    likeCount: row.like_count,
-    commentCount: row.comment_count,
-    shareCount: row.share_count,
-    createdAt: row.created_at,
-    author: {
-      id: row.user_id,
-      firstName: row.first_name,
-      lastName: row.last_name,
-      headline: row.headline,
-      profileImageUrl: row.profile_image_url,
-    },
-  }));
-
-  res.json({ posts, hasMore: posts.length === limit });
-});
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                   GET /api/v1/feed Handler                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│  QUERY PARAMS: offset (default 0), limit (default 20)                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  SQL QUERY (with CTE for connections)                                      │
+│                                                                            │
+│  WITH user_connections AS (                                                │
+│    SELECT connected_to AS conn_id FROM connections WHERE user_id = $1      │
+│    UNION                                                                   │
+│    SELECT user_id AS conn_id FROM connections WHERE connected_to = $1      │
+│  )                                                                         │
+│  SELECT p.*, u.first_name, u.last_name, ...                                │
+│                                                                            │
+│  RANKING FORMULA:                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  rank_score =                                                        │  │
+│  │    like_count * 0.3                    (engagement)                  │  │
+│  │  + comment_count * 0.5                 (engagement)                  │  │
+│  │  + (is_connection ? 15 : 0)            (relationship boost)          │  │
+│  │  + (1 / (1 + hours_since_post)) * 10   (recency decay)               │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  WHERE: posts from connections OR own posts                                │
+│  ORDER BY: rank_score DESC                                                 │
+│  LIMIT: $limit OFFSET: $offset                                             │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RESPONSE: { posts: Post[], hasMore: boolean }                             │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Frontend - Infinite Scroll Feed:**
 
-```tsx
-function FeedPage() {
-  const [posts, setPosts] = useState<Post[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const observerRef = useRef<IntersectionObserver | null>(null);
-  const loadMoreRef = useRef<HTMLDivElement>(null);
-
-  const loadPosts = useCallback(async (offset: number) => {
-    const isInitial = offset === 0;
-    if (isInitial) setLoading(true);
-    else setLoadingMore(true);
-
-    try {
-      const data = await feedApi.getFeed(offset, 20);
-      setPosts((prev) => (isInitial ? data.posts : [...prev, ...data.posts]));
-      setHasMore(data.hasMore);
-    } catch (error) {
-      console.error('Failed to load feed:', error);
-    } finally {
-      setLoading(false);
-      setLoadingMore(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadPosts(0);
-  }, [loadPosts]);
-
-  // Infinite scroll observer
-  useEffect(() => {
-    if (!hasMore || loadingMore) return;
-
-    observerRef.current = new IntersectionObserver(
-      (entries) => {
-        if (entries[0].isIntersecting) {
-          loadPosts(posts.length);
-        }
-      },
-      { threshold: 0.5 }
-    );
-
-    if (loadMoreRef.current) {
-      observerRef.current.observe(loadMoreRef.current);
-    }
-
-    return () => observerRef.current?.disconnect();
-  }, [hasMore, loadingMore, posts.length, loadPosts]);
-
-  const handleLike = async (postId: number) => {
-    // Optimistic update
-    setPosts((prev) =>
-      prev.map((post) =>
-        post.id === postId
-          ? { ...post, likeCount: post.likeCount + 1 }
-          : post
-      )
-    );
-
-    try {
-      await feedApi.likePost(postId);
-    } catch (error) {
-      // Rollback on error
-      setPosts((prev) =>
-        prev.map((post) =>
-          post.id === postId
-            ? { ...post, likeCount: post.likeCount - 1 }
-            : post
-        )
-      );
-      console.error('Failed to like post:', error);
-    }
-  };
-
-  if (loading) {
-    return <FeedSkeleton />;
-  }
-
-  return (
-    <div className="max-w-2xl mx-auto py-6 px-4 space-y-4">
-      <CreatePostCard onPostCreated={(post) => setPosts([post, ...posts])} />
-
-      {posts.map((post) => (
-        <PostCard
-          key={post.id}
-          post={post}
-          onLike={() => handleLike(post.id)}
-        />
-      ))}
-
-      {/* Infinite scroll trigger */}
-      <div ref={loadMoreRef} className="h-10 flex items-center justify-center">
-        {loadingMore && <Spinner />}
-      </div>
-    </div>
-  );
-}
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                       FeedPage Component                                   │
+├───────────────────────────────────────────────────────────────────────────┤
+│  STATE                                                                     │
+│  ├── posts: Post[]                                                         │
+│  ├── loading: boolean (initial load)                                       │
+│  ├── loadingMore: boolean (infinite scroll)                                │
+│  └── hasMore: boolean                                                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  INFINITE SCROLL (IntersectionObserver)                                    │
+│  ├── observerRef watches loadMoreRef element                               │
+│  ├── When visible & hasMore & !loadingMore ──▶ loadPosts(posts.length)    │
+│  └── Cleanup: observerRef.disconnect()                                     │
+├───────────────────────────────────────────────────────────────────────────┤
+│  handleLike (optimistic update)                                            │
+│  1. Immediate UI: increment likeCount                                      │
+│  2. API call: feedApi.likePost(postId)                                     │
+│  3. On error: decrement likeCount (rollback)                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RENDER                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  <CreatePostCard onPostCreated={(post) => prepend to posts} />       │  │
+│  │                                                                       │  │
+│  │  posts.map((post) => <PostCard post={post} onLike={handleLike} />)   │  │
+│  │                                                                       │  │
+│  │  <div ref={loadMoreRef}>                                              │  │
+│  │    {loadingMore && <Spinner />}                                       │  │
+│  │  </div>                                                               │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 6. Job Matching Integration
 
 **Backend - Job Match Score:**
 
-```typescript
-// GET /api/v1/jobs/:id/match-score
-app.get('/api/v1/jobs/:id/match-score', requireAuth, async (req, res) => {
-  const jobId = parseInt(req.params.id);
-  const userId = req.session.userId;
-
-  const [job, user] = await Promise.all([
-    getJobWithSkills(jobId),
-    getUserWithDetails(userId),
-  ]);
-
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
-  }
-
-  // Calculate match score
-  const userSkillIds = new Set(user.skills.map((s) => s.id));
-  const requiredSkills = job.skills.filter((s) => s.isRequired);
-  const matchedSkills = requiredSkills.filter((s) => userSkillIds.has(s.skillId));
-
-  const skillScore = (matchedSkills.length / requiredSkills.length) * 40;
-
-  const expDiff = Math.abs((job.yearsRequired || 0) - (user.yearsExperience || 0));
-  const expScore = Math.max(0, 25 - expDiff * 5);
-
-  const locationScore =
-    job.isRemote || user.location === job.location ? 15 : 0;
-
-  const connectionScore = (await hasConnectionAtCompany(userId, job.companyId))
-    ? 10
-    : 0;
-
-  const total = skillScore + expScore + locationScore + connectionScore;
-
-  res.json({
-    jobId,
-    matchScore: Math.round(total),
-    breakdown: {
-      skills: {
-        score: Math.round(skillScore),
-        matched: matchedSkills.map((s) => s.skillName),
-        missing: requiredSkills
-          .filter((s) => !userSkillIds.has(s.skillId))
-          .map((s) => s.skillName),
-      },
-      experience: { score: Math.round(expScore) },
-      location: { score: locationScore },
-      network: { score: connectionScore },
-    },
-  });
-});
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│              GET /api/v1/jobs/:id/match-score Handler                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Parallel fetch: [job with skills, user with details]                      │
+├───────────────────────────────────────────────────────────────────────────┤
+│  SCORING BREAKDOWN                                                         │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │ SKILL SCORE (max 40 points)                                         │   │
+│  │ (matchedSkills.length / requiredSkills.length) * 40                 │   │
+│  │                                                                      │   │
+│  │ EXPERIENCE SCORE (max 25 points)                                    │   │
+│  │ 25 - (abs(job.yearsRequired - user.yearsExperience) * 5)            │   │
+│  │                                                                      │   │
+│  │ LOCATION SCORE (15 points)                                          │   │
+│  │ job.isRemote || user.location === job.location ? 15 : 0             │   │
+│  │                                                                      │   │
+│  │ NETWORK SCORE (10 points)                                           │   │
+│  │ hasConnectionAtCompany(userId, job.companyId) ? 10 : 0              │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+│  total = skillScore + expScore + locationScore + networkScore             │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RESPONSE                                                                  │
+│  {                                                                         │
+│    jobId,                                                                  │
+│    matchScore: Math.round(total),                                          │
+│    breakdown: {                                                            │
+│      skills: { score, matched[], missing[] },                              │
+│      experience: { score },                                                │
+│      location: { score },                                                  │
+│      network: { score }                                                    │
+│    }                                                                       │
+│  }                                                                         │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Frontend - Job Card with Match Score:**
 
-```tsx
-function JobCard({ job }: { job: Job }) {
-  const [matchScore, setMatchScore] = useState<JobMatchScore | null>(null);
-
-  useEffect(() => {
-    async function loadMatchScore() {
-      try {
-        const score = await jobsApi.getMatchScore(job.id);
-        setMatchScore(score);
-      } catch (error) {
-        console.error('Failed to load match score:', error);
-      }
-    }
-    loadMatchScore();
-  }, [job.id]);
-
-  return (
-    <article className="bg-white rounded-lg shadow p-4">
-      <div className="flex gap-4">
-        <img
-          src={job.company.logoUrl || '/default-company.png'}
-          alt=""
-          className="w-16 h-16 rounded"
-        />
-        <div className="flex-1">
-          <Link
-            to={`/jobs/${job.id}`}
-            className="text-lg font-semibold text-linkedin-blue hover:underline"
-          >
-            {job.title}
-          </Link>
-          <p className="text-gray-600">{job.company.name}</p>
-          <p className="text-sm text-gray-500">
-            {job.location} {job.isRemote && '(Remote)'}
-          </p>
-        </div>
-
-        {/* Match score badge */}
-        {matchScore && (
-          <div className="text-right">
-            <div
-              className={`text-2xl font-bold ${
-                matchScore.matchScore >= 70
-                  ? 'text-green-600'
-                  : matchScore.matchScore >= 40
-                  ? 'text-yellow-600'
-                  : 'text-gray-400'
-              }`}
-            >
-              {matchScore.matchScore}%
-            </div>
-            <div className="text-xs text-gray-500">match</div>
-          </div>
-        )}
-      </div>
-
-      {/* Skills match breakdown */}
-      {matchScore && matchScore.breakdown.skills.matched.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {matchScore.breakdown.skills.matched.map((skill) => (
-            <span
-              key={skill}
-              className="px-2 py-1 text-xs bg-green-100 text-green-800 rounded"
-            >
-              {skill}
-            </span>
-          ))}
-          {matchScore.breakdown.skills.missing.slice(0, 2).map((skill) => (
-            <span
-              key={skill}
-              className="px-2 py-1 text-xs bg-gray-100 text-gray-600 rounded"
-            >
-              {skill}
-            </span>
-          ))}
-        </div>
-      )}
-
-      <div className="mt-4 flex justify-between items-center">
-        <span className="text-sm text-gray-500">
-          Posted {formatDistanceToNow(new Date(job.createdAt))} ago
-        </span>
-        <Link
-          to={`/jobs/${job.id}`}
-          className="px-4 py-2 bg-linkedin-blue text-white rounded-full hover:bg-linkedin-dark"
-        >
-          Apply
-        </Link>
-      </div>
-    </article>
-  );
-}
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                       JobCard Component                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│  STATE: matchScore: JobMatchScore | null                                   │
+│  ON MOUNT: jobsApi.getMatchScore(job.id) ──▶ setMatchScore                │
+├───────────────────────────────────────────────────────────────────────────┤
+│  RENDER                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  ┌───────┐  Job Title (LinkedIn blue, link)     ┌────────────────┐  │  │
+│  │  │ Logo  │  Company Name                        │  75%           │  │  │
+│  │  │       │  Location (Remote)                   │  match         │  │  │
+│  │  └───────┘                                      │  (color coded) │  │  │
+│  │                                                  └────────────────┘  │  │
+│  │  Skills: [React] [TypeScript] [Node.js] [GraphQL]                   │  │
+│  │          ^^^^^^^^ green ^^^^^^^^         ^^^ gray ^^^                │  │
+│  │          (matched)                       (missing)                   │  │
+│  │                                                                       │  │
+│  │  Posted 3 days ago                              [Apply]              │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  Match score colors:                                                       │
+│  ├── >= 70: text-green-600                                                 │
+│  ├── >= 40: text-yellow-600                                                │
+│  └── < 40:  text-gray-400                                                  │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 7. Session Management
 
 **Backend Middleware:**
 
-```typescript
-// Session configuration
-app.use(
-  session({
-    store: new (connectPgSimple(session))({ pool }),
-    secret: process.env.SESSION_SECRET!,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: process.env.NODE_ENV === 'production',
-      httpOnly: true,
-      sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    },
-  })
-);
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    Session Configuration                                   │
+├───────────────────────────────────────────────────────────────────────────┤
+│  express-session with connect-pg-simple                                    │
+│                                                                            │
+│  Cookie settings:                                                          │
+│  ├── secure: true (production)                                             │
+│  ├── httpOnly: true                                                        │
+│  ├── sameSite: 'strict'                                                    │
+│  └── maxAge: 7 days                                                        │
+└───────────────────────────────────────────────────────────────────────────┘
 
-// Auth middleware
-function requireAuth(req: Request, res: Response, next: NextFunction) {
-  if (!req.session.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-}
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    requireAuth Middleware                                  │
+├───────────────────────────────────────────────────────────────────────────┤
+│  if (!req.session.userId) ──▶ 401 Unauthorized                             │
+│  else ──▶ next()                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
 
-// Login endpoint
-app.post('/api/v1/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    POST /api/v1/auth/login                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│  1. Get user by email                                                      │
+│  2. Verify password with bcrypt.compare                                    │
+│  3. Failed ──▶ auditLog + 401 Invalid credentials                          │
+│  4. Success:                                                               │
+│     ├── Set session: userId, email, role                                   │
+│     ├── auditLog('auth.login.success')                                     │
+│     └── Return user object (no password hash)                              │
+└───────────────────────────────────────────────────────────────────────────┘
 
-  const user = await getUserByEmail(email);
-  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-    await auditLog('auth.login.failed', null, 'user', null, { email });
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-
-  req.session.userId = user.id;
-  req.session.email = user.email;
-  req.session.role = user.role;
-
-  await auditLog('auth.login.success', user.id, 'session', null);
-
-  res.json({
-    user: {
-      id: user.id,
-      email: user.email,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      headline: user.headline,
-      profileImageUrl: user.profileImageUrl,
-      role: user.role,
-    },
-  });
-});
-
-// Session check
-app.get('/api/v1/auth/me', requireAuth, async (req, res) => {
-  const user = await getUserById(req.session.userId);
-  if (!user) {
-    req.session.destroy(() => {});
-    return res.status(401).json({ error: 'User not found' });
-  }
-  res.json({ user });
-});
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    GET /api/v1/auth/me                                     │
+├───────────────────────────────────────────────────────────────────────────┤
+│  1. requireAuth middleware                                                 │
+│  2. Get user by session.userId                                             │
+│  3. If user not found ──▶ destroy session, 401                             │
+│  4. Return user object                                                     │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Frontend Auth Store:**
 
-```typescript
-export const useAuthStore = create<AuthState>((set) => ({
-  user: null,
-  isAuthenticated: false,
-  isLoading: true,
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    useAuthStore (Zustand)                                  │
+├───────────────────────────────────────────────────────────────────────────┤
+│  STATE                                                                     │
+│  ├── user: User | null                                                     │
+│  ├── isAuthenticated: boolean                                              │
+│  └── isLoading: boolean (default: true)                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ACTIONS                                                                   │
+│                                                                            │
+│  checkSession:                                                             │
+│  ├── api.get('/auth/me')                                                   │
+│  ├── Success ──▶ set user, isAuthenticated=true, isLoading=false           │
+│  └── Error ──▶ set user=null, isAuthenticated=false, isLoading=false       │
+│                                                                            │
+│  login(email, password):                                                   │
+│  ├── api.post('/auth/login', { email, password })                          │
+│  └── set user, isAuthenticated=true                                        │
+│                                                                            │
+│  logout:                                                                   │
+│  ├── api.post('/auth/logout')                                              │
+│  └── set user=null, isAuthenticated=false                                  │
+└───────────────────────────────────────────────────────────────────────────┘
 
-  checkSession: async () => {
-    try {
-      const response = await api.get('/auth/me');
-      set({
-        user: response.data.user,
-        isAuthenticated: true,
-        isLoading: false,
-      });
-    } catch {
-      set({ user: null, isAuthenticated: false, isLoading: false });
-    }
-  },
-
-  login: async (email, password) => {
-    const response = await api.post('/auth/login', { email, password });
-    set({ user: response.data.user, isAuthenticated: true });
-  },
-
-  logout: async () => {
-    await api.post('/auth/logout');
-    set({ user: null, isAuthenticated: false });
-  },
-}));
-
-// Root layout checks session on mount
-function RootLayout() {
-  const { checkSession, isLoading } = useAuthStore();
-
-  useEffect(() => {
-    checkSession();
-  }, [checkSession]);
-
-  if (isLoading) {
-    return <FullPageSpinner />;
-  }
-
-  return <Outlet />;
-}
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    RootLayout Component                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ON MOUNT                                                                  │
+│  └── checkSession()                                                        │
+│                                                                            │
+│  RENDER                                                                    │
+│  ├── isLoading ──▶ <FullPageSpinner />                                     │
+│  └── else ──▶ <Outlet />                                                   │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Trade-offs Summary

@@ -37,687 +37,416 @@
 ## 2. High-Level Architecture (5 minutes)
 
 ```
-+------------------------------------------------------------------+
-|                         React Application                         |
-+------------------------------------------------------------------+
-|                                                                    |
-|  +------------------+  +------------------+  +------------------+  |
-|  | Algorithm Panel  |  |  Metrics Charts  |  |  Request Tester  |  |
-|  | - Algorithm pick |  |  - Line chart    |  |  - Send requests |  |
-|  | - Configuration  |  |  - Success/deny  |  |  - View headers  |  |
-|  | - Visual demo    |  |  - Latency hist  |  |  - Batch test    |  |
-|  +--------+---------+  +--------+---------+  +--------+---------+  |
-|           |                     |                     |            |
-|           +---------------------+---------------------+            |
-|                                 |                                  |
-|                    +------------v------------+                     |
-|                    |     Zustand Store       |                     |
-|                    |  - selectedAlgorithm    |                     |
-|                    |  - config (limit, win)  |                     |
-|                    |  - metrics[]            |                     |
-|                    |  - testResults[]        |                     |
-|                    +------------+------------+                     |
-|                                 |                                  |
-|                    +------------v------------+                     |
-|                    |    API Service Layer    |                     |
-|                    |  - fetchMetrics()       |                     |
-|                    |  - testRateLimit()      |                     |
-|                    |  - batchTest()          |                     |
-|                    +-------------------------+                     |
-|                                                                    |
-+------------------------------------------------------------------+
-                                 |
-                                 v
-                    +------------------------+
-                    |    Backend API         |
-                    |    /api/ratelimit/*    |
-                    +------------------------+
+┌──────────────────────────────────────────────────────────────────────┐
+│                         React Application                             │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
+│  │ Algorithm Panel  │  │  Metrics Charts  │  │  Request Tester  │   │
+│  │ - Algorithm pick │  │  - Line chart    │  │  - Send requests │   │
+│  │ - Configuration  │  │  - Success/deny  │  │  - View headers  │   │
+│  │ - Visual demo    │  │  - Latency hist  │  │  - Batch test    │   │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘   │
+│           │                     │                     │              │
+│           └─────────────────────┼─────────────────────┘              │
+│                                 │                                     │
+│                    ┌────────────▼────────────┐                       │
+│                    │     Zustand Store       │                       │
+│                    │  - selectedAlgorithm    │                       │
+│                    │  - config (limit, win)  │                       │
+│                    │  - metrics[]            │                       │
+│                    │  - testResults[]        │                       │
+│                    └────────────┬────────────┘                       │
+│                                 │                                     │
+│                    ┌────────────▼────────────┐                       │
+│                    │    API Service Layer    │                       │
+│                    │  - fetchMetrics()       │                       │
+│                    │  - testRateLimit()      │                       │
+│                    │  - batchTest()          │                       │
+│                    └─────────────────────────┘                       │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                    ┌────────────────────────┐
+                    │    Backend API         │
+                    │    /api/ratelimit/*    │
+                    └────────────────────────┘
 ```
 
 ---
 
 ## 3. Deep Dive: Zustand State Management (8 minutes)
 
-### Store Definition
+### State Architecture
 
-```typescript
-interface Algorithm {
-  id: 'fixed' | 'sliding' | 'sliding_log' | 'token' | 'leaky';
-  name: string;
-  description: string;
-  configFields: ConfigField[];
-}
+"I chose Zustand over Redux for its simpler API, excellent TypeScript support, and minimal boilerplate. The store centralizes algorithm selection, configuration, test results, and metrics data."
 
-interface ConfigField {
-  name: string;
-  type: 'number' | 'select';
-  label: string;
-  default: number;
-  min?: number;
-  max?: number;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      RateLimiterState Store                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Algorithm Selection                                                 │
+│  ├── selectedAlgorithm: 'fixed' | 'sliding' | 'token' | 'leaky'    │
+│  └── algorithms: Algorithm[]                                        │
+│      ├── id, name, description                                      │
+│      └── configFields: ConfigField[]                                │
+│                                                                      │
+│  Configuration                                                       │
+│  └── config                                                         │
+│      ├── identifier: string (e.g., 'test-user')                    │
+│      ├── limit: number                                              │
+│      ├── windowSeconds: number                                      │
+│      ├── burstCapacity: number                                      │
+│      ├── refillRate: number                                         │
+│      └── leakRate: number                                           │
+│                                                                      │
+│  Test Results                                                        │
+│  ├── testResults: TestResult[] (max 100)                            │
+│  └── isTestRunning: boolean                                         │
+│                                                                      │
+│  Metrics                                                             │
+│  ├── metrics: MetricPoint[]                                         │
+│  └── metricsLoading: boolean                                        │
+│                                                                      │
+│  Connection                                                          │
+│  └── isConnected: boolean                                           │
+│                                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Actions                                                             │
+│  ├── setAlgorithm(id) ──▶ Update selectedAlgorithm                 │
+│  ├── updateConfig(partial) ──▶ Merge config changes                │
+│  ├── runTest() ──▶ POST /api/ratelimit/check, record result        │
+│  ├── runBatchTest(count, intervalMs) ──▶ Sequential test loop      │
+│  ├── clearResults() ──▶ Empty testResults array                    │
+│  └── fetchMetrics() ──▶ GET /api/metrics, update metrics[]         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-interface TestResult {
-  id: string;
-  timestamp: number;
-  allowed: boolean;
-  remaining: number;
-  limit: number;
-  resetAt: number;
-  latencyMs: number;
-}
+### Algorithm Definitions
 
-interface MetricPoint {
-  timestamp: number;
-  allowed: number;
-  denied: number;
-  p50Latency: number;
-  p99Latency: number;
-}
+| Algorithm | Name | Description | Config Fields |
+|-----------|------|-------------|---------------|
+| fixed | Fixed Window | Simple counter that resets at fixed intervals | limit, windowSeconds |
+| sliding | Sliding Window | Weighted average of current and previous window | limit, windowSeconds |
+| sliding_log | Sliding Log | Exact count using timestamp log | limit, windowSeconds |
+| token | Token Bucket | Tokens refill over time, requests consume tokens | burstCapacity, refillRate |
+| leaky | Leaky Bucket | Requests queue and drain at fixed rate | burstCapacity, leakRate |
 
-interface RateLimiterState {
-  // Algorithm selection
-  selectedAlgorithm: Algorithm['id'];
-  algorithms: Algorithm[];
+### Test Result Data Model
 
-  // Configuration
-  config: {
-    identifier: string;
-    limit: number;
-    windowSeconds: number;
-    burstCapacity: number;
-    refillRate: number;
-    leakRate: number;
-  };
-
-  // Test results
-  testResults: TestResult[];
-  isTestRunning: boolean;
-
-  // Metrics
-  metrics: MetricPoint[];
-  metricsLoading: boolean;
-
-  // Connection state
-  isConnected: boolean;
-
-  // Actions
-  setAlgorithm: (id: Algorithm['id']) => void;
-  updateConfig: (partial: Partial<RateLimiterState['config']>) => void;
-  runTest: () => Promise<void>;
-  runBatchTest: (count: number, intervalMs: number) => Promise<void>;
-  clearResults: () => void;
-  fetchMetrics: () => Promise<void>;
-}
-
-export const useRateLimiterStore = create<RateLimiterState>((set, get) => ({
-  // Initial state
-  selectedAlgorithm: 'sliding',
-  algorithms: [
-    {
-      id: 'fixed',
-      name: 'Fixed Window',
-      description: 'Simple counter that resets at fixed intervals',
-      configFields: [
-        { name: 'limit', type: 'number', label: 'Requests per window', default: 10, min: 1 },
-        { name: 'windowSeconds', type: 'number', label: 'Window (seconds)', default: 60, min: 1 }
-      ]
-    },
-    {
-      id: 'sliding',
-      name: 'Sliding Window',
-      description: 'Weighted average of current and previous window',
-      configFields: [
-        { name: 'limit', type: 'number', label: 'Requests per window', default: 10, min: 1 },
-        { name: 'windowSeconds', type: 'number', label: 'Window (seconds)', default: 60, min: 1 }
-      ]
-    },
-    {
-      id: 'token',
-      name: 'Token Bucket',
-      description: 'Tokens refill over time, requests consume tokens',
-      configFields: [
-        { name: 'burstCapacity', type: 'number', label: 'Bucket capacity', default: 10, min: 1 },
-        { name: 'refillRate', type: 'number', label: 'Tokens per second', default: 1, min: 0.1 }
-      ]
-    },
-    {
-      id: 'leaky',
-      name: 'Leaky Bucket',
-      description: 'Requests queue and drain at fixed rate',
-      configFields: [
-        { name: 'burstCapacity', type: 'number', label: 'Queue size', default: 10, min: 1 },
-        { name: 'leakRate', type: 'number', label: 'Requests per second', default: 1, min: 0.1 }
-      ]
-    }
-  ],
-
-  config: {
-    identifier: 'test-user',
-    limit: 10,
-    windowSeconds: 60,
-    burstCapacity: 10,
-    refillRate: 1,
-    leakRate: 1
-  },
-
-  testResults: [],
-  isTestRunning: false,
-  metrics: [],
-  metricsLoading: false,
-  isConnected: true,
-
-  // Actions
-  setAlgorithm: (id) => set({ selectedAlgorithm: id }),
-
-  updateConfig: (partial) => set((state) => ({
-    config: { ...state.config, ...partial }
-  })),
-
-  runTest: async () => {
-    const { selectedAlgorithm, config } = get();
-
-    const start = performance.now();
-    const response = await fetch('/api/ratelimit/check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        identifier: config.identifier,
-        algorithm: selectedAlgorithm,
-        ...config
-      })
-    });
-
-    const latencyMs = performance.now() - start;
-    const data = await response.json();
-
-    const result: TestResult = {
-      id: crypto.randomUUID(),
-      timestamp: Date.now(),
-      allowed: data.allowed,
-      remaining: data.remaining,
-      limit: config.limit || config.burstCapacity,
-      resetAt: data.resetAt,
-      latencyMs
-    };
-
-    set((state) => ({
-      testResults: [result, ...state.testResults].slice(0, 100)
-    }));
-  },
-
-  runBatchTest: async (count, intervalMs) => {
-    set({ isTestRunning: true });
-
-    for (let i = 0; i < count; i++) {
-      await get().runTest();
-      if (i < count - 1) {
-        await new Promise(r => setTimeout(r, intervalMs));
-      }
-    }
-
-    set({ isTestRunning: false });
-  },
-
-  clearResults: () => set({ testResults: [] }),
-
-  fetchMetrics: async () => {
-    set({ metricsLoading: true });
-    try {
-      const response = await fetch('/api/metrics');
-      const data = await response.json();
-      set({ metrics: data.points, metricsLoading: false });
-    } catch {
-      set({ metricsLoading: false });
-    }
-  }
-}));
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         TestResult                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  TestResult                                                          │
+│  ├── id: string (UUID)                                              │
+│  ├── timestamp: number (ms since epoch)                             │
+│  ├── allowed: boolean                                               │
+│  ├── remaining: number                                              │
+│  ├── limit: number                                                  │
+│  ├── resetAt: number (ms since epoch)                               │
+│  └── latencyMs: number                                              │
+│                                                                      │
+│  MetricPoint                                                         │
+│  ├── timestamp: number                                              │
+│  ├── allowed: number (count in period)                              │
+│  ├── denied: number (count in period)                               │
+│  ├── p50Latency: number                                             │
+│  └── p99Latency: number                                             │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 4. Deep Dive: Algorithm Visualization Panel (8 minutes)
 
-### Algorithm Selector Component
+### Component Structure
 
-```tsx
-function AlgorithmPanel() {
-  const { algorithms, selectedAlgorithm, setAlgorithm, config, updateConfig } =
-    useRateLimiterStore();
-
-  const currentAlgorithm = algorithms.find(a => a.id === selectedAlgorithm)!;
-
-  return (
-    <div className="space-y-6">
-      {/* Algorithm Selection */}
-      <div className="grid grid-cols-2 gap-3">
-        {algorithms.map(algo => (
-          <button
-            key={algo.id}
-            onClick={() => setAlgorithm(algo.id)}
-            className={`
-              p-4 rounded-lg border-2 text-left transition-all
-              ${selectedAlgorithm === algo.id
-                ? 'border-blue-500 bg-blue-50'
-                : 'border-gray-200 hover:border-gray-300'}
-            `}
-          >
-            <div className="font-semibold">{algo.name}</div>
-            <div className="text-sm text-gray-500">{algo.description}</div>
-          </button>
-        ))}
-      </div>
-
-      {/* Configuration Fields */}
-      <div className="space-y-4">
-        <h3 className="font-semibold">Configuration</h3>
-
-        <div className="space-y-3">
-          <div>
-            <label className="block text-sm text-gray-600 mb-1">
-              Identifier
-            </label>
-            <input
-              type="text"
-              value={config.identifier}
-              onChange={(e) => updateConfig({ identifier: e.target.value })}
-              className="w-full px-3 py-2 border rounded-lg"
-            />
-          </div>
-
-          {currentAlgorithm.configFields.map(field => (
-            <div key={field.name}>
-              <label className="block text-sm text-gray-600 mb-1">
-                {field.label}
-              </label>
-              <input
-                type="number"
-                value={config[field.name as keyof typeof config] as number}
-                onChange={(e) => updateConfig({
-                  [field.name]: parseFloat(e.target.value)
-                })}
-                min={field.min}
-                max={field.max}
-                step={field.type === 'number' && field.min === 0.1 ? 0.1 : 1}
-                className="w-full px-3 py-2 border rounded-lg"
-              />
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Algorithm Visualization */}
-      <AlgorithmVisualization algorithm={selectedAlgorithm} config={config} />
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      AlgorithmPanel Component                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Algorithm Selection Grid (2x2)                │  │
+│  │  ┌─────────────────┐  ┌─────────────────┐                     │  │
+│  │  │ Fixed Window    │  │ Sliding Window  │                     │  │
+│  │  │ [description]   │  │ [description]   │                     │  │
+│  │  └─────────────────┘  └─────────────────┘                     │  │
+│  │  ┌─────────────────┐  ┌─────────────────┐                     │  │
+│  │  │ Token Bucket    │  │ Leaky Bucket    │                     │  │
+│  │  │ [description]   │  │ [description]   │                     │  │
+│  │  └─────────────────┘  └─────────────────┘                     │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Configuration Fields                          │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │ Identifier: [test-user____________]                     │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │ {Dynamic fields based on selected algorithm}            │  │  │
+│  │  │ - Requests per window / Bucket capacity                 │  │  │
+│  │  │ - Window (seconds) / Tokens per second                  │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Algorithm Visualization                       │  │
+│  │  [Animated visual based on algorithm type]                    │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Algorithm Visualization Component
+### Algorithm Visualizations
 
-```tsx
-function AlgorithmVisualization({
-  algorithm,
-  config
-}: {
-  algorithm: Algorithm['id'];
-  config: RateLimiterState['config'];
-}) {
-  const [animationState, setAnimationState] = useState({
-    tokens: config.burstCapacity,
-    water: 0,
-    windowCount: 0
-  });
+"Each algorithm gets a unique animated visualization that helps developers understand the underlying mechanism."
 
-  // Animate token refill or water leak
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setAnimationState(prev => {
-        if (algorithm === 'token') {
-          return {
-            ...prev,
-            tokens: Math.min(config.burstCapacity, prev.tokens + config.refillRate * 0.1)
-          };
-        } else if (algorithm === 'leaky') {
-          return {
-            ...prev,
-            water: Math.max(0, prev.water - config.leakRate * 0.1)
-          };
-        }
-        return prev;
-      });
-    }, 100);
-
-    return () => clearInterval(interval);
-  }, [algorithm, config]);
-
-  if (algorithm === 'token') {
-    return (
-      <div className="p-4 bg-gray-50 rounded-lg">
-        <div className="text-sm font-medium mb-2">Token Bucket</div>
-        <div className="flex items-end gap-1 h-20">
-          {Array.from({ length: config.burstCapacity }).map((_, i) => (
-            <div
-              key={i}
-              className={`
-                flex-1 rounded-t transition-all duration-200
-                ${i < Math.floor(animationState.tokens)
-                  ? 'bg-green-500 h-full'
-                  : 'bg-gray-200 h-full'}
-              `}
-            />
-          ))}
-        </div>
-        <div className="text-center mt-2 text-sm text-gray-600">
-          {Math.floor(animationState.tokens)} / {config.burstCapacity} tokens
-        </div>
-      </div>
-    );
-  }
-
-  if (algorithm === 'leaky') {
-    const waterPercent = (animationState.water / config.burstCapacity) * 100;
-
-    return (
-      <div className="p-4 bg-gray-50 rounded-lg">
-        <div className="text-sm font-medium mb-2">Leaky Bucket</div>
-        <div className="relative h-24 w-16 mx-auto border-2 border-gray-400 rounded-b-lg overflow-hidden">
-          <div
-            className="absolute bottom-0 left-0 right-0 bg-blue-400 transition-all duration-200"
-            style={{ height: `${waterPercent}%` }}
-          />
-          {/* Leak indicator */}
-          <div className="absolute -bottom-2 left-1/2 transform -translate-x-1/2">
-            <div className="w-1 h-4 bg-blue-400 animate-pulse" />
-          </div>
-        </div>
-        <div className="text-center mt-4 text-sm text-gray-600">
-          {animationState.water.toFixed(1)} / {config.burstCapacity} queued
-        </div>
-      </div>
-    );
-  }
-
-  // Fixed/Sliding window visualization
-  return (
-    <div className="p-4 bg-gray-50 rounded-lg">
-      <div className="text-sm font-medium mb-2">
-        {algorithm === 'fixed' ? 'Fixed' : 'Sliding'} Window
-      </div>
-      <div className="relative h-8 bg-gray-200 rounded overflow-hidden">
-        <div
-          className="absolute inset-y-0 left-0 bg-blue-500 transition-all"
-          style={{ width: `${(animationState.windowCount / config.limit) * 100}%` }}
-        />
-      </div>
-      <div className="text-center mt-2 text-sm text-gray-600">
-        {animationState.windowCount} / {config.limit} requests in window
-      </div>
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│                Token Bucket Visualization                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │    Token Bucket                                               │   │
+│  │    ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌ ┐ ┌ ┐ ┌ ┐                 │   │
+│  │    │█│ │█│ │█│ │█│ │█│ │█│ │█│ │ │ │ │ │ │                 │   │
+│  │    └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └ ┘ └ ┘ └ ┘                 │   │
+│  │    filled ██████████████████████░░░░░░░░░░░ empty            │   │
+│  │                    7 / 10 tokens                              │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  Animation: Tokens refill at refillRate per second                  │
+│  On request: One token disappears (if available)                    │
+│                                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                Leaky Bucket Visualization                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │    Leaky Bucket                                               │   │
+│  │         ┌────────┐                                            │   │
+│  │         │        │                                            │   │
+│  │         │ ░░░░░░ │ ◀── Water level (queued requests)         │   │
+│  │         │ ██████ │                                            │   │
+│  │         │ ██████ │                                            │   │
+│  │         └───┬────┘                                            │   │
+│  │             │ ◀── Leak (requests drain at fixed rate)        │   │
+│  │             ▼                                                 │   │
+│  │          3.5 / 10 queued                                      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  Animation: Water level drops at leakRate per second                │
+│  On request: Water level rises (if not overflowing)                 │
+│                                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│             Fixed/Sliding Window Visualization                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │    Progress Bar                                               │   │
+│  │    ┌──────────────────────────────────────────────────────┐  │   │
+│  │    │████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│  │   │
+│  │    └──────────────────────────────────────────────────────┘  │   │
+│  │                    6 / 10 requests in window                  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  Fixed: Resets to 0 at window boundary                              │
+│  Sliding: Smoothly transitions based on time position               │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Animation Implementation
+
+"I use a useEffect hook with setInterval to animate the visualizations. Token buckets refill, leaky buckets drain, and window counters update in real-time. The animation rate is 100ms for smooth visual feedback."
 
 ---
 
 ## 5. Deep Dive: Metrics Charts (8 minutes)
 
-### Chart Component with Recharts
+### Chart Library Selection
 
-```tsx
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  AreaChart,
-  Area
-} from 'recharts';
+"I chose Recharts for its React-first design, declarative API, and responsive container support. It handles 1000+ data points smoothly with proper optimization."
 
-function MetricsDashboard() {
-  const { metrics, metricsLoading, fetchMetrics } = useRateLimiterStore();
+### Metrics Dashboard Layout
 
-  // Refresh metrics every 5 seconds
-  useEffect(() => {
-    fetchMetrics();
-    const interval = setInterval(fetchMetrics, 5000);
-    return () => clearInterval(interval);
-  }, [fetchMetrics]);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      MetricsDashboard Component                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Request Volume (AreaChart)                    │  │
+│  │                                                                │  │
+│  │  allowed ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓                                  │  │
+│  │  denied  ░░░░░░░░░                                             │  │
+│  │          ────────────────────────────────────▶ time           │  │
+│  │                                                                │  │
+│  │  Stacked area chart showing allowed (green) and denied (red)  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Latency (LineChart)                           │  │
+│  │                                                                │  │
+│  │  p99 ─────┐   ┌─────                                          │  │
+│  │           └───┘        (orange)                                │  │
+│  │  p50 ─────────────────── (blue)                               │  │
+│  │          ────────────────────────────────────▶ time           │  │
+│  │                                                                │  │
+│  │  Two lines: P50 (blue) and P99 (orange) latency in ms         │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                  Success Rate Gauge                            │  │
+│  │                                                                │  │
+│  │                      ╭───────╮                                 │  │
+│  │                    ╱    │    ╲                                │  │
+│  │                   ╱     │     ╲                               │  │
+│  │                  │    87.5%    │                               │  │
+│  │                   ╲           ╱                               │  │
+│  │                    ╲         ╱                                │  │
+│  │                      ╰─────╯                                   │  │
+│  │                                                                │  │
+│  │  Circular gauge with color coding:                            │  │
+│  │  - Green (>=90%), Yellow (70-89%), Red (<70%)                 │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  const formattedData = metrics.map(point => ({
-    ...point,
-    time: new Date(point.timestamp).toLocaleTimeString(),
-    successRate: point.allowed / (point.allowed + point.denied) * 100
-  }));
+### Real-time Update Strategy
 
-  return (
-    <div className="space-y-6">
-      {/* Request Volume Chart */}
-      <div className="bg-white p-4 rounded-lg shadow">
-        <h3 className="font-semibold mb-4">Request Volume</h3>
-        <ResponsiveContainer width="100%" height={200}>
-          <AreaChart data={formattedData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" />
-            <YAxis />
-            <Tooltip />
-            <Legend />
-            <Area
-              type="monotone"
-              dataKey="allowed"
-              stackId="1"
-              stroke="#22c55e"
-              fill="#22c55e"
-              name="Allowed"
-            />
-            <Area
-              type="monotone"
-              dataKey="denied"
-              stackId="1"
-              stroke="#ef4444"
-              fill="#ef4444"
-              name="Denied"
-            />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Latency Chart */}
-      <div className="bg-white p-4 rounded-lg shadow">
-        <h3 className="font-semibold mb-4">Latency (ms)</h3>
-        <ResponsiveContainer width="100%" height={200}>
-          <LineChart data={formattedData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" />
-            <YAxis />
-            <Tooltip />
-            <Legend />
-            <Line
-              type="monotone"
-              dataKey="p50Latency"
-              stroke="#3b82f6"
-              name="P50"
-              dot={false}
-            />
-            <Line
-              type="monotone"
-              dataKey="p99Latency"
-              stroke="#f59e0b"
-              name="P99"
-              dot={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Success Rate Gauge */}
-      <SuccessRateGauge
-        rate={formattedData.length > 0
-          ? formattedData[formattedData.length - 1].successRate
-          : 100}
-      />
-    </div>
-  );
-}
-
-function SuccessRateGauge({ rate }: { rate: number }) {
-  const color = rate >= 90 ? '#22c55e' : rate >= 70 ? '#f59e0b' : '#ef4444';
-
-  return (
-    <div className="bg-white p-4 rounded-lg shadow text-center">
-      <h3 className="font-semibold mb-4">Success Rate</h3>
-      <div className="relative w-32 h-32 mx-auto">
-        <svg className="w-full h-full transform -rotate-90">
-          {/* Background circle */}
-          <circle
-            cx="64"
-            cy="64"
-            r="56"
-            stroke="#e5e7eb"
-            strokeWidth="12"
-            fill="none"
-          />
-          {/* Progress circle */}
-          <circle
-            cx="64"
-            cy="64"
-            r="56"
-            stroke={color}
-            strokeWidth="12"
-            fill="none"
-            strokeDasharray={`${rate * 3.52} 352`}
-            strokeLinecap="round"
-            className="transition-all duration-500"
-          />
-        </svg>
-        <div className="absolute inset-0 flex items-center justify-center">
-          <span className="text-2xl font-bold">{rate.toFixed(1)}%</span>
-        </div>
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Metrics Polling Flow                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Component Mount                                                     │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────┐                                                 │
+│  │ fetchMetrics() │ ◀── Initial fetch                              │
+│  └───────┬────────┘                                                 │
+│          │                                                           │
+│          ▼                                                           │
+│  ┌────────────────┐                                                 │
+│  │ setInterval    │                                                 │
+│  │ (5 seconds)    │                                                 │
+│  └───────┬────────┘                                                 │
+│          │                                                           │
+│          ├──────────────────────────────────────────┐               │
+│          ▼                                          │               │
+│  ┌────────────────┐                                 │               │
+│  │ fetchMetrics() │ ◀── Poll every 5s              │               │
+│  └───────┬────────┘                                 │               │
+│          │                                          │               │
+│          ▼                                          │               │
+│  ┌────────────────┐                                 │               │
+│  │ Update store   │                                 │               │
+│  │ with new data  │                                 │               │
+│  └───────┬────────┘                                 │               │
+│          │                                          │               │
+│          ▼                                          ▼               │
+│  ┌────────────────┐                        Component Unmount        │
+│  │ Charts re-render│                               │                │
+│  │ with animations │                               ▼                │
+│  └─────────────────┘                       clearInterval()          │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 6. Deep Dive: Request Tester (6 minutes)
 
-### Test Interface Component
+### Test Interface Layout
 
-```tsx
-function RequestTester() {
-  const { testResults, isTestRunning, runTest, runBatchTest, clearResults } =
-    useRateLimiterStore();
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      RequestTester Component                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     Action Buttons                             │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │  │
+│  │  │ Send Request │  │ Batch Test   │  │    Clear     │        │  │
+│  │  │   (blue)     │  │   (green)    │  │   (border)   │        │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘        │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     Batch Settings                             │  │
+│  │  Count: [20____]     Interval (ms): [100___]                  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     Results List (scrollable)                  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │ ✓ Allowed                                      2.3ms    │  │  │
+│  │  │   X-RateLimit-Remaining: 8                              │  │  │
+│  │  │   X-RateLimit-Limit: 10                                 │  │  │
+│  │  │   X-RateLimit-Reset: 12:34:56                           │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │ ✗ Denied                                       1.8ms    │  │  │
+│  │  │   X-RateLimit-Remaining: 0                              │  │  │
+│  │  │   X-RateLimit-Limit: 10                                 │  │  │
+│  │  │   X-RateLimit-Reset: 12:35:00                           │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │  [... more results ...]                                       │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  const [batchCount, setBatchCount] = useState(20);
-  const [batchInterval, setBatchInterval] = useState(100);
+### Test Result Card Styling
 
-  return (
-    <div className="space-y-4">
-      {/* Action Buttons */}
-      <div className="flex gap-3">
-        <button
-          onClick={runTest}
-          disabled={isTestRunning}
-          className="px-4 py-2 bg-blue-500 text-white rounded-lg
-                     hover:bg-blue-600 disabled:opacity-50"
-        >
-          Send Request
-        </button>
+| State | Background | Border | Icon |
+|-------|------------|--------|------|
+| Allowed | Light green (green-50) | Green left border | Checkmark |
+| Denied | Light red (red-50) | Red left border | X mark |
 
-        <button
-          onClick={() => runBatchTest(batchCount, batchInterval)}
-          disabled={isTestRunning}
-          className="px-4 py-2 bg-green-500 text-white rounded-lg
-                     hover:bg-green-600 disabled:opacity-50"
-        >
-          {isTestRunning ? 'Running...' : 'Batch Test'}
-        </button>
+### Batch Test Flow
 
-        <button
-          onClick={clearResults}
-          className="px-4 py-2 border border-gray-300 rounded-lg
-                     hover:bg-gray-50"
-        >
-          Clear
-        </button>
-      </div>
-
-      {/* Batch Settings */}
-      <div className="flex gap-4 text-sm">
-        <label className="flex items-center gap-2">
-          Count:
-          <input
-            type="number"
-            value={batchCount}
-            onChange={(e) => setBatchCount(parseInt(e.target.value))}
-            className="w-20 px-2 py-1 border rounded"
-            min={1}
-            max={100}
-          />
-        </label>
-        <label className="flex items-center gap-2">
-          Interval (ms):
-          <input
-            type="number"
-            value={batchInterval}
-            onChange={(e) => setBatchInterval(parseInt(e.target.value))}
-            className="w-20 px-2 py-1 border rounded"
-            min={0}
-            max={5000}
-          />
-        </label>
-      </div>
-
-      {/* Results List */}
-      <div className="space-y-2 max-h-96 overflow-y-auto">
-        {testResults.map(result => (
-          <TestResultCard key={result.id} result={result} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TestResultCard({ result }: { result: TestResult }) {
-  return (
-    <div
-      className={`
-        p-3 rounded-lg border-l-4 transition-all
-        ${result.allowed
-          ? 'bg-green-50 border-green-500'
-          : 'bg-red-50 border-red-500'}
-      `}
-    >
-      <div className="flex justify-between items-center">
-        <div className="flex items-center gap-2">
-          {result.allowed ? (
-            <CheckIcon className="w-5 h-5 text-green-600" />
-          ) : (
-            <XIcon className="w-5 h-5 text-red-600" />
-          )}
-          <span className="font-medium">
-            {result.allowed ? 'Allowed' : 'Denied'}
-          </span>
-        </div>
-        <span className="text-sm text-gray-500">
-          {result.latencyMs.toFixed(1)}ms
-        </span>
-      </div>
-
-      <div className="mt-2 text-sm text-gray-600 font-mono">
-        <div>X-RateLimit-Remaining: {result.remaining}</div>
-        <div>X-RateLimit-Limit: {result.limit}</div>
-        <div>X-RateLimit-Reset: {new Date(result.resetAt).toLocaleTimeString()}</div>
-      </div>
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Batch Test Execution                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  User clicks "Batch Test"                                            │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────┐                                             │
+│  │ isTestRunning=true │ ──▶ Button shows "Running..."              │
+│  └─────────┬──────────┘                                             │
+│            │                                                         │
+│            ▼                                                         │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  Loop: i = 0 to count-1                                       │   │
+│  │       │                                                        │   │
+│  │       ├──▶ runTest() ──▶ POST /api/ratelimit/check           │   │
+│  │       │                      │                                 │   │
+│  │       │                      ▼                                 │   │
+│  │       │              Append to testResults                     │   │
+│  │       │              (keep max 100)                            │   │
+│  │       │                                                        │   │
+│  │       └──▶ await setTimeout(intervalMs)                       │   │
+│  │                                                                │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│            │                                                         │
+│            ▼                                                         │
+│  ┌─────────────────────┐                                            │
+│  │ isTestRunning=false │ ──▶ Button returns to normal              │
+│  └─────────────────────┘                                            │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -736,47 +465,40 @@ function TestResultCard({ result }: { result: TestResult }) {
 
 ## 8. Accessibility Considerations
 
-```tsx
-// Keyboard navigation for algorithm selection
-function AlgorithmSelector() {
-  const [focusIndex, setFocusIndex] = useState(0);
-  const algorithms = useRateLimiterStore(s => s.algorithms);
+### Keyboard Navigation
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowRight':
-        setFocusIndex((i) => (i + 1) % algorithms.length);
-        break;
-      case 'ArrowLeft':
-        setFocusIndex((i) => (i - 1 + algorithms.length) % algorithms.length);
-        break;
-      case 'Enter':
-      case ' ':
-        useRateLimiterStore.getState().setAlgorithm(algorithms[focusIndex].id);
-        break;
-    }
-  };
-
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Select rate limiting algorithm"
-      onKeyDown={handleKeyDown}
-    >
-      {algorithms.map((algo, i) => (
-        <button
-          key={algo.id}
-          role="radio"
-          aria-checked={focusIndex === i}
-          tabIndex={focusIndex === i ? 0 : -1}
-        >
-          {algo.name}
-        </button>
-      ))}
-    </div>
-  );
-}
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Algorithm Selector A11y                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ARIA Attributes                                                     │
+│  ├── role="radiogroup" on container                                 │
+│  ├── aria-label="Select rate limiting algorithm"                    │
+│  └── Each button:                                                   │
+│      ├── role="radio"                                               │
+│      ├── aria-checked={isSelected}                                  │
+│      └── tabIndex={isFocused ? 0 : -1}                             │
+│                                                                      │
+│  Keyboard Handlers                                                   │
+│  ├── ArrowRight ──▶ Focus next algorithm                           │
+│  ├── ArrowLeft ──▶ Focus previous algorithm                        │
+│  ├── Enter ──▶ Select focused algorithm                            │
+│  └── Space ──▶ Select focused algorithm                            │
+│                                                                      │
+│  Focus Management                                                    │
+│  ├── Roving tabindex pattern                                        │
+│  ├── Only focused item is tabbable                                  │
+│  └── Arrow keys move focus within group                             │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Screen Reader Support
+
+- All interactive elements have descriptive labels
+- Status changes (allowed/denied) announced via aria-live regions
+- Charts include accessible descriptions of data trends
 
 ---
 

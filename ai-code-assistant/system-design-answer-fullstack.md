@@ -80,116 +80,73 @@ This is the heart of the system - the loop that enables autonomous tool use.
 
 ```
 User Input
-    ↓
+    │
+    ▼
 ┌─────────────────────────────────────┐
 │         Add to Context              │
 └─────────────────────────────────────┘
-    ↓
+    │
+    ▼
 ┌─────────────────────────────────────┐
-│         LLM Inference               │◄──────┐
+│         LLM Inference               │◀──────┐
 │   - Generate text (stream to UI)    │       │
 │   - Decide tool calls               │       │
 └─────────────────────────────────────┘       │
-    ↓                                         │
+    │                                         │
    Has tool calls?                            │
-    ↓                                         │
+    │                                         │
    Yes                                        │
-    ↓                                         │
+    │                                         │
+    ▼                                         │
 ┌─────────────────────────────────────┐       │
 │      Check Permissions              │       │
 │   - Auto-approve reads              │       │
 │   - Prompt for writes/commands      │       │
 └─────────────────────────────────────┘       │
-    ↓                                         │
+    │                                         │
+    ▼                                         │
 ┌─────────────────────────────────────┐       │
 │      Execute Tools                  │       │
 │   - Run in parallel if independent  │       │
 │   - Collect results                 │       │
 └─────────────────────────────────────┘       │
-    ↓                                         │
+    │                                         │
+    ▼                                         │
 ┌─────────────────────────────────────┐       │
 │      Add Results to Context         │───────┘
 └─────────────────────────────────────┘
 
    No tool calls?
-    ↓
+    │
+    ▼
    Done (wait for next user input)
 ```
 
-### Agent Controller Implementation
+### Agent Controller Design
 
-```typescript
-interface AgentState {
-  conversationId: string;
-  messages: Message[];
-  toolCalls: ToolCall[];
-  pendingApprovals: Approval[];
-  context: ContextWindow;
-}
+**AgentState Structure:**
+- conversationId: unique session identifier
+- messages: array of conversation messages
+- toolCalls: pending tool invocations
+- pendingApprovals: operations awaiting user consent
+- context: managed context window
 
-class AgentController {
-  private llm: LLMProvider;
-  private tools: Map<string, Tool>;
-  private permissions: PermissionManager;
-  private context: ContextManager;
+**Run Loop Logic:**
+1. Add user message to context
+2. Enter agentic loop (while true)
+3. Get LLM response with streaming enabled
+4. Stream text content to terminal as it arrives
+5. Check for tool calls in response
+6. If no tool calls: break loop, wait for next user input
+7. Execute tools (may require user approval)
+8. Add tool results to context
+9. Continue loop for next LLM turn
 
-  async run(userInput: string): Promise<void> {
-    // Add user message to context
-    this.context.addMessage({ role: 'user', content: userInput });
-
-    // Agentic loop
-    while (true) {
-      // Get LLM response
-      const response = await this.llm.complete({
-        messages: this.context.getMessages(),
-        tools: this.getToolDefinitions(),
-        stream: true
-      });
-
-      // Stream text output to terminal
-      await this.streamTextContent(response);
-
-      // Check for tool calls
-      const toolCalls = response.getToolCalls();
-      if (toolCalls.length === 0) {
-        break; // No more tools to execute
-      }
-
-      // Execute tools (may require user approval)
-      const results = await this.executeTools(toolCalls);
-
-      // Add results to context
-      this.context.addToolResults(results);
-    }
-  }
-
-  private async executeTools(calls: ToolCall[]): Promise<ToolResult[]> {
-    const results: ToolResult[] = [];
-
-    // Group by approval requirements
-    const autoApproved = calls.filter(c => this.canAutoApprove(c));
-    const needsApproval = calls.filter(c => !this.canAutoApprove(c));
-
-    // Execute auto-approved in parallel
-    const autoResults = await Promise.all(
-      autoApproved.map(call => this.executeTool(call))
-    );
-    results.push(...autoResults);
-
-    // Request approval for others
-    for (const call of needsApproval) {
-      const approved = await this.requestApproval(call);
-      if (approved) {
-        results.push(await this.executeTool(call));
-      } else {
-        results.push({ toolId: call.id, error: 'User denied permission' });
-      }
-    }
-
-    return results;
-  }
-}
-```
+**Tool Execution Strategy:**
+- Group tool calls by approval requirements
+- Auto-approved tools (reads) execute in parallel via Promise.all
+- Tools needing approval execute sequentially with prompts
+- Denied tools return error result instead of executing
 
 ### Key Design Decisions
 
@@ -251,56 +208,18 @@ User types: "Fix the bug in auth.ts"
 
 ### Streaming Pipeline
 
-```typescript
-// LLM streaming -> Agent processing -> CLI rendering
-async function streamingPipeline(userInput: string): Promise<void> {
-  // 1. Send to LLM with streaming enabled
-  const stream = llm.stream({
-    messages: context.getMessages(),
-    tools: toolDefinitions
-  });
+**Processing stream chunks:**
 
-  // 2. Process stream chunks
-  const toolCalls: ToolCall[] = [];
-  let currentToolCall: Partial<ToolCall> | null = null;
+| Chunk Type | Action |
+|------------|--------|
+| text | Write directly to stdout via renderer |
+| tool_call_start | Store id/name, show spinner |
+| tool_call_delta | Accumulate params JSON |
+| tool_call_end | Push to toolCalls array |
 
-  for await (const chunk of stream) {
-    switch (chunk.type) {
-      case 'text':
-        // Stream text directly to terminal
-        process.stdout.write(renderer.format(chunk.content));
-        break;
-
-      case 'tool_call_start':
-        currentToolCall = { id: chunk.id, name: chunk.name, params: '' };
-        cli.showSpinner(`Preparing ${chunk.name}...`);
-        break;
-
-      case 'tool_call_delta':
-        if (currentToolCall) {
-          currentToolCall.params += chunk.content;
-        }
-        break;
-
-      case 'tool_call_end':
-        if (currentToolCall) {
-          toolCalls.push(currentToolCall as ToolCall);
-          currentToolCall = null;
-        }
-        break;
-    }
-  }
-
-  // 3. Execute collected tool calls
-  if (toolCalls.length > 0) {
-    const results = await executeTools(toolCalls);
-    context.addToolResults(results);
-
-    // Continue the loop for next LLM turn
-    await streamingPipeline(''); // Empty input triggers continuation
-  }
-}
-```
+After stream completes:
+- If toolCalls non-empty: execute them, add results to context, recurse
+- If no tool calls: return control to user
 
 ### Sequence Diagram
 
@@ -311,72 +230,53 @@ async function streamingPipeline(userInput: string): Promise<void> {
    │                  │                 │                 │
    │  "Fix auth bug"  │                 │                 │
    │─────────────────▶│                 │                 │
-   │                  │                 │                 │
    │                  │  messages[]     │                 │
    │                  │────────────────▶│                 │
-   │                  │                 │                 │
    │                  │  [Read auth.ts] │                 │
    │                  │◀────────────────│                 │
-   │                  │                 │                 │
    │                  │                 │  Read auth.ts   │
    │                  │────────────────────────────────▶│
-   │                  │                 │                 │
    │                  │                 │  file contents  │
    │                  │◀────────────────────────────────│
-   │                  │                 │                 │
    │                  │  messages[] +   │                 │
    │                  │  tool result    │                 │
    │                  │────────────────▶│                 │
-   │                  │                 │                 │
    │                  │  [Edit auth.ts] │                 │
    │                  │◀────────────────│                 │
-   │                  │                 │                 │
    │  Approve edit?   │                 │                 │
    │◀─────────────────│                 │                 │
-   │                  │                 │                 │
-   │  Yes             │                 │                 │
-   │─────────────────▶│                 │  Edit file      │
-   │                  │────────────────────────────────▶│
-   │                  │                 │                 │
+   │  Yes             │                 │  Edit file      │
+   │─────────────────▶│────────────────────────────────▶│
    │                  │                 │  success        │
    │                  │◀────────────────────────────────│
-   │                  │                 │                 │
    │                  │  messages[] +   │                 │
    │                  │  edit result    │                 │
    │                  │────────────────▶│                 │
-   │                  │                 │                 │
    │                  │  "Fixed the bug"│                 │
    │◀─────────────────│◀────────────────│                 │
-   │                  │                 │                 │
 ```
 
 ## Deep Dive: Tool System Integration
 
 ### Tool Interface
 
-```typescript
-interface Tool {
-  name: string;
-  description: string;
-  parameters: JSONSchema;
-  requiresApproval: boolean | ((params: unknown) => boolean);
+**Tool Structure:**
+- name: identifier for LLM
+- description: explains capability
+- parameters: JSON Schema for inputs
+- requiresApproval: boolean or function(params) => boolean
+- execute(params, context): performs the operation
 
-  execute(params: unknown, context: ToolContext): Promise<ToolResult>;
-}
+**ToolContext Provides:**
+- workingDirectory: current path
+- permissions: granted permission set
+- abortSignal: for cancellation
 
-interface ToolContext {
-  workingDirectory: string;
-  permissions: PermissionSet;
-  abortSignal: AbortSignal;
-}
-
-interface ToolResult {
-  success: boolean;
-  output?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-}
-```
+**ToolResult Returns:**
+- success: boolean
+- output: string (on success)
+- error: string (on failure)
+- metadata: optional extra data
 
 ### Core Tools
 
@@ -391,102 +291,29 @@ interface ToolResult {
 
 ### Edit Tool - String Replacement
 
-```typescript
-const EditTool: Tool = {
-  name: 'Edit',
-  parameters: {
-    type: 'object',
-    properties: {
-      file_path: { type: 'string' },
-      old_string: { type: 'string' },
-      new_string: { type: 'string' },
-      replace_all: { type: 'boolean' }
-    },
-    required: ['file_path', 'old_string', 'new_string']
-  },
-  requiresApproval: true,
+**Execution flow:**
+1. Read file content from disk
+2. If not replace_all, check uniqueness:
+   - 0 occurrences: return "String not found" error
+   - >1 occurrences: return "String appears N times, use replace_all or provide more context"
+3. Perform replacement (replaceAll or single replace)
+4. Write updated content to file
+5. Return success
 
-  async execute(params, context) {
-    const { file_path, old_string, new_string, replace_all = false } = params;
-
-    const content = await fs.readFile(file_path, 'utf-8');
-
-    // Check uniqueness unless replace_all
-    if (!replace_all) {
-      const occurrences = content.split(old_string).length - 1;
-      if (occurrences === 0) {
-        return { success: false, error: 'String not found in file' };
-      }
-      if (occurrences > 1) {
-        return {
-          success: false,
-          error: `String appears ${occurrences} times. Use replace_all or provide more context.`
-        };
-      }
-    }
-
-    const newContent = replace_all
-      ? content.replaceAll(old_string, new_string)
-      : content.replace(old_string, new_string);
-
-    await fs.writeFile(file_path, newContent);
-
-    return { success: true, output: 'File updated successfully' };
-  }
-};
-```
-
-**Why string replacement over line numbers?**
-- Line numbers change as you edit
-- String matching is more robust
-- Forces LLM to provide sufficient context
+> "Why string replacement over line numbers? Line numbers change as you edit. String matching is more robust and forces LLM to provide sufficient context."
 
 ### Bash Tool - Safety Patterns
 
-```typescript
-const BashTool: Tool = {
-  name: 'Bash',
-  parameters: {
-    type: 'object',
-    properties: {
-      command: { type: 'string' },
-      timeout: { type: 'number' },
-      working_directory: { type: 'string' }
-    },
-    required: ['command']
-  },
-  requiresApproval: (params) => {
-    // Auto-approve safe commands
-    const safePatterns = [
-      /^ls\b/, /^pwd$/, /^cat\b/, /^head\b/, /^tail\b/,
-      /^git status/, /^git log/, /^git diff/,
-      /^npm run (dev|build|test|lint)/
-    ];
-    return !safePatterns.some(p => p.test(params.command));
-  },
+**Auto-approve patterns (safe reads):**
+- `ls`, `pwd`, `cat`, `head`, `tail`
+- `git status`, `git log`, `git diff`
+- `npm run (dev|build|test|lint)`
 
-  async execute(params, context) {
-    const { command, timeout = 120000, working_directory } = params;
-    const cwd = working_directory || context.workingDirectory;
-
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        cwd,
-        timeout,
-        maxBuffer: 10 * 1024 * 1024,
-        signal: context.abortSignal
-      });
-
-      return {
-        success: true,
-        output: stdout + (stderr ? `\n[stderr]\n${stderr}` : '')
-      };
-    } catch (error) {
-      return { success: false, error: error.message };
-    }
-  }
-};
-```
+**Execution:**
+- Run with exec, respecting timeout (default 120000ms)
+- Capture stdout and stderr
+- Respect maxBuffer (10MB)
+- Honor abortSignal for cancellation
 
 ## Deep Dive: Permission System
 
@@ -516,51 +343,15 @@ const BashTool: Tool = {
 └─────────────────────────────────────┘
 ```
 
-### Permission Interface
+### Permission Manager
 
-```typescript
-interface Permission {
-  type: 'read' | 'write' | 'execute';
-  pattern: string; // Glob pattern or command prefix
-  scope: 'session' | 'permanent';
-  grantedAt: Date;
-}
-
-interface PermissionRequest {
-  tool: string;
-  operation: string;
-  details: string;
-}
-
-class PermissionManager {
-  private grants: Permission[] = [];
-  private denials: Set<string> = new Set();
-
-  async check(request: PermissionRequest): Promise<boolean> {
-    // Check explicit grants
-    if (this.hasGrant(request)) {
-      return true;
-    }
-
-    // Check if previously denied
-    const key = this.requestKey(request);
-    if (this.denials.has(key)) {
-      return false;
-    }
-
-    // Prompt user
-    const approved = await this.promptUser(request);
-
-    if (approved) {
-      this.grants.push(this.createGrant(request));
-    } else {
-      this.denials.add(key);
-    }
-
-    return approved;
-  }
-}
-```
+**Check flow:**
+1. Check if request matches existing grant - return true
+2. Check if previously denied - return false
+3. Prompt user for approval
+4. On approval: store grant
+5. On denial: store denial
+6. Return decision
 
 ### Permission Levels
 
@@ -573,335 +364,139 @@ class PermissionManager {
 
 ### File System Guard
 
-```typescript
-class FileSystemGuard {
-  private allowedPaths: string[];
-  private blockedPatterns: RegExp[];
+**Blocked patterns:**
+- `.env$` - Environment files
+- `.ssh/` - SSH keys
+- `credentials` (case-insensitive)
+- `secrets?.` (case-insensitive)
+- `.git/config$` - Git credentials
 
-  constructor(workingDir: string) {
-    this.allowedPaths = [workingDir];
-    this.blockedPatterns = [
-      /\.env$/,           // Environment files
-      /\.ssh\//,          // SSH keys
-      /credentials/i,     // Credential files
-      /secrets?\./i,      // Secret files
-      /\.git\/config$/,   // Git credentials
-    ];
-  }
-
-  canAccess(filePath: string, mode: 'read' | 'write'): boolean {
-    const resolved = path.resolve(filePath);
-
-    // Check blocked patterns
-    if (this.blockedPatterns.some(p => p.test(resolved))) {
-      return false;
-    }
-
-    // Check path is within allowed directories
-    if (!this.allowedPaths.some(p => resolved.startsWith(p))) {
-      return false;
-    }
-
-    return true;
-  }
-}
-```
+**Access check:**
+1. Resolve to absolute path
+2. Check against blocked patterns - reject if match
+3. Check if path is within allowed directories
+4. Return true only if all checks pass
 
 ### Command Sandbox
 
-```typescript
-class CommandSandbox {
-  private blockedCommands = [
-    'rm -rf /',
-    'sudo',
-    'chmod 777',
-    ':(){:|:&};:',  // Fork bomb
-    'curl | sh',
-    'wget | sh',
-  ];
+**Blocked commands (explicit):**
+- `rm -rf /`
+- `sudo`
+- `chmod 777`
+- `:(){:|:&};:` (fork bomb)
+- `curl | sh`, `wget | sh`
 
-  private dangerousPatterns = [
-    /rm\s+-rf?\s+[\/~]/,  // Recursive delete from root or home
-    />\s*\/dev\/sd/,       // Write to block devices
-    /mkfs/,                // Format filesystems
-    /dd\s+if=/,            // Direct disk access
-  ];
-
-  validate(command: string): ValidationResult {
-    // Check explicit blocklist
-    if (this.blockedCommands.some(b => command.includes(b))) {
-      return { valid: false, reason: 'Command is blocked' };
-    }
-
-    // Check dangerous patterns
-    for (const pattern of this.dangerousPatterns) {
-      if (pattern.test(command)) {
-        return { valid: false, reason: 'Potentially dangerous command' };
-      }
-    }
-
-    return { valid: true };
-  }
-}
-```
+**Dangerous patterns (regex):**
+- `rm\s+-rf?\s+[\/~]` - Recursive delete from root/home
+- `>\s*\/dev\/sd` - Write to block devices
+- `mkfs` - Format filesystems
+- `dd\s+if=` - Direct disk access
 
 ## Deep Dive: Session and Context Management
 
 ### Context Window Strategy
 
 ```
-Total: 128K tokens
-
-System prompt:     2K (fixed)
-Recent messages:  30K (last 10 turns)
-Tool definitions:  5K (fixed)
-Context summary:  10K (compressed history)
-File cache:       40K (recently read files)
-Response buffer:  40K (for LLM output)
+┌─────────────────────────────────────────────────────────────┐
+│            Context Window Budget (128K tokens)               │
+├─────────────────────────────────────────────────────────────┤
+│  System prompt:      2K (fixed)                              │
+│  Recent messages:   30K (last 10 turns)                      │
+│  Tool definitions:   5K (fixed)                              │
+│  Context summary:   10K (compressed history)                 │
+│  File cache:        40K (recently read files)                │
+│  Response buffer:   40K (for LLM output)                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Context Compression
 
-```typescript
-class ContextManager {
-  private maxTokens: number;
-  private tokenizer: Tokenizer;
-  private summarizer: Summarizer;
+**Compression triggers:**
+- When currentTokens + newMessage > maxTokens * 0.9
 
-  async addMessage(message: Message): Promise<void> {
-    const tokens = this.tokenizer.count(message.content);
+**Compression strategies:**
 
-    // Check if we need to compress
-    if (this.currentTokens + tokens > this.maxTokens * 0.9) {
-      await this.compressContext();
-    }
+1. **Summarize old messages:**
+   - Keep last 10 messages intact
+   - Summarize earlier messages via summarizer
+   - Replace old messages with summary as system message
 
-    this.messages.push(message);
-  }
-
-  private async compressContext(): Promise<void> {
-    // Strategy 1: Summarize old messages
-    const oldMessages = this.messages.slice(0, -10);
-    const recentMessages = this.messages.slice(-10);
-
-    if (oldMessages.length > 0) {
-      const summary = await this.summarizer.summarize(oldMessages);
-      this.messages = [
-        { role: 'system', content: `Previous context summary:\n${summary}` },
-        ...recentMessages
-      ];
-    }
-
-    // Strategy 2: Truncate large tool outputs
-    for (const msg of this.messages) {
-      if (msg.role === 'tool' && msg.content.length > 10000) {
-        msg.content = msg.content.slice(0, 5000) +
-          '\n... [truncated] ...\n' +
-          msg.content.slice(-2000);
-      }
-    }
-  }
-}
-```
+2. **Truncate large tool outputs:**
+   - If tool result > 10000 chars
+   - Keep first 5000 + "[truncated]" + last 2000
 
 ### Session Persistence
 
-```typescript
-interface Session {
-  id: string;
-  workingDirectory: string;
-  startedAt: Date;
-  messages: Message[];
-  permissions: Permission[];
-  settings: SessionSettings;
-}
+**Session Structure:**
+- id: UUID
+- workingDirectory: absolute path
+- startedAt: timestamp
+- messages: conversation history
+- permissions: granted permissions
+- settings: user preferences
 
-class SessionManager {
-  private sessionDir: string;
+**Storage location:** `~/.ai-assistant/sessions/{id}.json`
 
-  constructor() {
-    this.sessionDir = path.join(os.homedir(), '.ai-assistant', 'sessions');
-  }
-
-  async create(workingDir: string): Promise<Session> {
-    const session: Session = {
-      id: crypto.randomUUID(),
-      workingDirectory: workingDir,
-      startedAt: new Date(),
-      messages: [],
-      permissions: [],
-      settings: this.loadDefaultSettings()
-    };
-
-    await this.save(session);
-    return session;
-  }
-
-  async resume(sessionId: string): Promise<Session | null> {
-    const sessionPath = path.join(this.sessionDir, `${sessionId}.json`);
-
-    if (await fs.pathExists(sessionPath)) {
-      const data = await fs.readJson(sessionPath);
-      return data as Session;
-    }
-
-    return null;
-  }
-
-  async save(session: Session): Promise<void> {
-    const sessionPath = path.join(this.sessionDir, `${session.id}.json`);
-    await fs.ensureDir(this.sessionDir);
-    await fs.writeJson(sessionPath, session, { spaces: 2 });
-  }
-}
-```
+**Operations:**
+- create(workingDir): Initialize new session
+- resume(sessionId): Load existing session from disk
+- save(session): Persist to JSON file
 
 ## Deep Dive: Plugin and MCP Integration
 
 ### Plugin System
 
-```typescript
-interface Plugin {
-  name: string;
-  version: string;
-  tools?: Tool[];
-  hooks?: PluginHooks;
-  commands?: SlashCommand[];
-}
+**Plugin Structure:**
+- name, version: identification
+- tools: array of Tool definitions
+- hooks: lifecycle callbacks
+- commands: slash commands
 
-interface PluginHooks {
-  onSessionStart?: (session: Session) => Promise<void>;
-  onBeforeToolCall?: (call: ToolCall) => Promise<ToolCall>;
-  onAfterToolCall?: (call: ToolCall, result: ToolResult) => Promise<void>;
-  onMessage?: (message: Message) => Promise<Message>;
-}
+**Plugin Hooks:**
+- onSessionStart: initialization
+- onBeforeToolCall: modify/intercept calls
+- onAfterToolCall: post-processing
+- onMessage: message transformation
 
-class PluginManager {
-  private plugins: Map<string, Plugin> = new Map();
-
-  async load(pluginPath: string): Promise<void> {
-    const plugin = await import(pluginPath);
-
-    // Register tools
-    if (plugin.tools) {
-      for (const tool of plugin.tools) {
-        this.toolRegistry.register(tool);
-      }
-    }
-
-    // Register hooks
-    if (plugin.hooks) {
-      this.hookRegistry.register(plugin.name, plugin.hooks);
-    }
-
-    this.plugins.set(plugin.name, plugin);
-  }
-}
-```
+**Loading a plugin:**
+1. Import from plugin path
+2. Register tools with toolRegistry
+3. Register hooks with hookRegistry
+4. Store in plugins map
 
 ### MCP (Model Context Protocol) Support
 
-```typescript
-interface MCPServer {
-  name: string;
-  transport: 'stdio' | 'http';
-  command?: string;
-  url?: string;
-}
+**Transport types:**
+- stdio: spawn child process, communicate via stdin/stdout
+- http: connect to HTTP endpoint
 
-class MCPClient {
-  private servers: Map<string, MCPConnection> = new Map();
-
-  async connect(server: MCPServer): Promise<void> {
-    if (server.transport === 'stdio') {
-      const process = spawn(server.command!);
-      const connection = new StdioMCPConnection(process);
-      await connection.initialize();
-      this.servers.set(server.name, connection);
-    } else {
-      const connection = new HttpMCPConnection(server.url!);
-      await connection.initialize();
-      this.servers.set(server.name, connection);
-    }
-  }
-
-  async listTools(): Promise<Tool[]> {
-    const tools: Tool[] = [];
-    for (const [name, conn] of this.servers) {
-      const serverTools = await conn.listTools();
-      tools.push(...serverTools.map(t => ({
-        ...t,
-        name: `${name}:${t.name}` // Namespace tools
-      })));
-    }
-    return tools;
-  }
-
-  async callTool(name: string, params: unknown): Promise<ToolResult> {
-    const [serverName, toolName] = name.split(':');
-    const conn = this.servers.get(serverName);
-    if (!conn) {
-      throw new Error(`MCP server ${serverName} not connected`);
-    }
-    return conn.callTool(toolName, params);
-  }
-}
-```
+**Operations:**
+- connect(server): Establish connection based on transport type
+- listTools(): Aggregate tools from all connected servers (namespaced as `server:tool`)
+- callTool(name, params): Route to appropriate server, return result
 
 ## Deep Dive: Error Handling
 
 ### Error Types
 
-```typescript
-class ToolExecutionError extends Error {
-  constructor(
-    public tool: string,
-    public params: unknown,
-    public cause: Error
-  ) {
-    super(`Tool ${tool} failed: ${cause.message}`);
-  }
-}
-
-class ContextOverflowError extends Error {
-  constructor(public currentTokens: number, public maxTokens: number) {
-    super(`Context overflow: ${currentTokens} > ${maxTokens}`);
-  }
-}
-
-class PermissionDeniedError extends Error {
-  constructor(public request: PermissionRequest) {
-    super(`Permission denied: ${request.operation}`);
-  }
-}
-```
+| Error | Cause | Contains |
+|-------|-------|----------|
+| ToolExecutionError | Tool failure | tool name, params, cause |
+| ContextOverflowError | Token limit exceeded | currentTokens, maxTokens |
+| PermissionDeniedError | User declined | PermissionRequest |
 
 ### Error Recovery in Agent Loop
 
-```typescript
-class AgentController {
-  async run(userInput: string): Promise<void> {
-    try {
-      await this.executeLoop(userInput);
-    } catch (error) {
-      if (error instanceof ContextOverflowError) {
-        // Compress and retry
-        await this.context.forceCompress();
-        await this.executeLoop(userInput);
-      } else if (error instanceof ToolExecutionError) {
-        // Report to LLM and continue
-        this.context.addMessage({
-          role: 'tool',
-          content: `Error: ${error.message}`
-        });
-        await this.executeLoop(''); // Continue loop
-      } else {
-        throw error;
-      }
-    }
-  }
-}
-```
+**ContextOverflowError:**
+1. Force compress context
+2. Retry the loop
+
+**ToolExecutionError:**
+1. Add error message to context as tool result
+2. Continue loop (LLM will see error and adapt)
+
+**Other errors:**
+- Re-throw for caller to handle
 
 ## Trade-offs Summary
 
@@ -927,12 +522,12 @@ class AgentController {
 
 ## Closing Summary
 
-"The AI Code Assistant is built around an agentic loop where the LLM orchestrates tool calls to interact with the local file system and shell. Key design decisions include:
-
-1. **Streaming-first** for responsive UX
-2. **Layered permissions** for safety
-3. **Context compression** to stay within token limits
-4. **Provider abstraction** for flexibility
-5. **String-based edits** for robustness
-
-The main trade-off is between autonomy and safety - we lean toward explicit user approval for destructive operations while auto-approving reads and safe commands."
+> "The AI Code Assistant is built around an agentic loop where the LLM orchestrates tool calls to interact with the local file system and shell. Key design decisions include:
+>
+> 1. **Streaming-first** for responsive UX
+> 2. **Layered permissions** for safety
+> 3. **Context compression** to stay within token limits
+> 4. **Provider abstraction** for flexibility
+> 5. **String-based edits** for robustness
+>
+> The main trade-off is between autonomy and safety - we lean toward explicit user approval for destructive operations while auto-approving reads and safe commands."

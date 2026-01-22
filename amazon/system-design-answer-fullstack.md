@@ -58,7 +58,6 @@
          ▼                 ▼                 ▼
 ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
 │ Catalog Service │ │  Cart Service   │ │  Order Service  │
-│                 │ │                 │ │                 │
 │ - Search API    │ │ - Cart CRUD     │ │ - Checkout      │
 │ - Product API   │ │ - Reservations  │ │ - Idempotency   │
 │ - Recommendations│ │ - Inventory    │ │ - Order history │
@@ -94,242 +93,88 @@ This is the most critical user journey, requiring tight frontend-backend coordin
 ```
 ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
 │   Browser    │   │   Cart API   │   │  PostgreSQL  │   │    Valkey    │
-│  (React)     │   │  (Express)   │   │  (Inventory) │   │   (Cache)    │
+│   (React)    │   │  (Express)   │   │  (Inventory) │   │   (Cache)    │
 └──────┬───────┘   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
        │                  │                  │                  │
        │ 1. Click "Add"   │                  │                  │
-       │ ──────────────>  │                  │                  │
+       │ ──────────────▶  │                  │                  │
        │ 2. Optimistic    │                  │                  │
        │    UI Update     │                  │                  │
-       │ <──────────────  │                  │                  │
+       │ ◀──────────────  │                  │                  │
        │                  │ 3. BEGIN TRANS   │                  │
-       │                  │ ──────────────>  │                  │
+       │                  │ ──────────────▶  │                  │
        │                  │ 4. SELECT...     │                  │
        │                  │    FOR UPDATE    │                  │
-       │                  │ ──────────────>  │                  │
+       │                  │ ──────────────▶  │                  │
        │                  │ 5. Check avail   │                  │
-       │                  │ <──────────────  │                  │
+       │                  │ ◀──────────────  │                  │
        │                  │ 6. UPDATE        │                  │
        │                  │    reserved +=   │                  │
-       │                  │ ──────────────>  │                  │
+       │                  │ ──────────────▶  │                  │
        │                  │ 7. INSERT cart   │                  │
-       │                  │ ──────────────>  │                  │
+       │                  │ ──────────────▶  │                  │
        │                  │ 8. COMMIT        │                  │
-       │                  │ <──────────────  │                  │
+       │                  │ ◀──────────────  │                  │
        │                  │                  │ 9. Invalidate    │
        │                  │                  │    cart cache    │
-       │                  │ ─────────────────────────────────>  │
+       │                  │ ─────────────────────────────────▶  │
        │ 10. Confirm      │                  │                  │
-       │ <──────────────  │                  │                  │
-       │                  │                  │                  │
+       │ ◀──────────────  │                  │                  │
 ```
 
 ### Frontend Implementation
 
-```typescript
-// stores/cartStore.ts
-import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+**CartStore (Zustand with persist)**:
+- State: `items[]`, `isLoading`, `error`
+- Methods: `addItem`, `removeItem`, `updateQuantity`, `clearCart`, `getTotal`
 
-interface CartItem {
-  productId: string;
-  quantity: number;
-  price: number;
-  title: string;
-  image: string;
-  reservedUntil: Date;
-}
+**addItem() Flow**:
+1. Store previous items for rollback
+2. Optimistic update: add item immediately with 30-min reservation
+3. POST to `/api/cart/items`
+4. On success: update `reservedUntil` from server response
+5. On failure: rollback to previous items, set error
 
-interface CartStore {
-  items: CartItem[];
-  isLoading: boolean;
-  error: string | null;
-  addItem: (product: Product, quantity: number) => Promise<void>;
-  removeItem: (productId: string) => Promise<void>;
-  updateQuantity: (productId: string, quantity: number) => Promise<void>;
-  clearCart: () => void;
-  getTotal: () => number;
-}
-
-export const useCartStore = create<CartStore>()(
-  persist(
-    (set, get) => ({
-      items: [],
-      isLoading: false,
-      error: null,
-
-      addItem: async (product, quantity) => {
-        const previousItems = get().items;
-
-        // Optimistic update - add immediately
-        set(state => ({
-          items: [...state.items, {
-            productId: product.id,
-            quantity,
-            price: product.price,
-            title: product.title,
-            image: product.images[0],
-            reservedUntil: new Date(Date.now() + 30 * 60 * 1000)
-          }],
-          isLoading: true,
-          error: null
-        }));
-
-        try {
-          const response = await fetch('/api/cart/items', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ productId: product.id, quantity })
-          });
-
-          if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.message || 'Failed to add item');
-          }
-
-          const cartItem = await response.json();
-
-          // Update with server response (may include different reservedUntil)
-          set(state => ({
-            items: state.items.map(item =>
-              item.productId === product.id
-                ? { ...item, reservedUntil: new Date(cartItem.reservedUntil) }
-                : item
-            ),
-            isLoading: false
-          }));
-
-        } catch (error) {
-          // Rollback on failure
-          set({
-            items: previousItems,
-            isLoading: false,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-          throw error;
-        }
-      },
-
-      // ... other methods
-    }),
-    {
-      name: 'amazon-cart',
-      partialize: (state) => ({ items: state.items })
-    }
-  )
-);
+**Rollback Pattern**:
+```
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ previousItems │    │   API Call    │    │   Result      │
+│    stored     │──▶ │   attempt     │──▶ │               │
+└───────────────┘    └───────────────┘    └───────────────┘
+                            │                     │
+                            │                     ▼
+                            │              ┌─────────────┐
+                            │              │   Success   │──▶ Update reservedUntil
+                            │              └─────────────┘
+                            │                     │
+                            │              ┌─────────────┐
+                            └─────────────▶│   Failure   │──▶ Restore previousItems
+                                           └─────────────┘
 ```
 
 ### Backend Implementation
 
-```typescript
-// routes/cart.ts
-import { Router } from 'express';
-import { pool } from '../shared/db';
-import { logger } from '../shared/logger';
+**POST /items Endpoint**:
+1. Get connection from pool, BEGIN transaction
+2. Lock inventory row with `SELECT ... FOR UPDATE`
+3. Check `available = quantity - reserved`
+4. If insufficient: throw `InsufficientInventoryError`
+5. UPDATE `reserved += quantity`
+6. INSERT/UPSERT cart item with `reserved_until`
+7. COMMIT transaction
+8. Invalidate cart cache in Redis
+9. Return cart item
 
-const router = Router();
-
-router.post('/items', async (req, res) => {
-  const { productId, quantity } = req.body;
-  const userId = req.session.userId;
-  const correlationId = req.headers['x-correlation-id'] as string;
-
-  const log = logger.child({ correlationId, userId, productId, quantity });
-  log.info('Adding item to cart');
-
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // 1. Lock inventory row and check availability
-    const inventoryResult = await client.query(`
-      SELECT quantity, reserved, quantity - reserved AS available
-      FROM inventory
-      WHERE product_id = $1
-      FOR UPDATE
-    `, [productId]);
-
-    if (inventoryResult.rows.length === 0) {
-      throw new NotFoundError('Product not found');
-    }
-
-    const { available } = inventoryResult.rows[0];
-
-    if (available < quantity) {
-      log.warn({ available, requested: quantity }, 'Insufficient inventory');
-      throw new InsufficientInventoryError(productId, available, quantity);
-    }
-
-    // 2. Reserve inventory
-    await client.query(`
-      UPDATE inventory
-      SET reserved = reserved + $1
-      WHERE product_id = $2
-    `, [quantity, productId]);
-
-    // 3. Add or update cart item
-    const reservedUntil = new Date(Date.now() + 30 * 60 * 1000);
-
-    const cartResult = await client.query(`
-      INSERT INTO cart_items (user_id, product_id, quantity, reserved_until)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (user_id, product_id) DO UPDATE
-      SET quantity = cart_items.quantity + EXCLUDED.quantity,
-          reserved_until = EXCLUDED.reserved_until
-      RETURNING *
-    `, [userId, productId, quantity, reservedUntil]);
-
-    await client.query('COMMIT');
-
-    log.info({ cartItemId: cartResult.rows[0].id }, 'Item added to cart');
-
-    // 4. Invalidate cart cache
-    await redis.del(`cart:${userId}`);
-
-    res.status(201).json(cartResult.rows[0]);
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-
-    if (error instanceof InsufficientInventoryError) {
-      return res.status(409).json({
-        error: 'INSUFFICIENT_INVENTORY',
-        message: `Only ${error.available} units available`,
-        available: error.available
-      });
-    }
-
-    log.error({ error }, 'Failed to add item to cart');
-    res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    client.release();
-  }
-});
-```
+**Error Response**:
+- 409 Conflict: `INSUFFICIENT_INVENTORY` with available count
+- Frontend can show "Only X units available"
 
 ### Error Handling Across the Stack
 
-```typescript
-// Frontend error handling with user feedback
-const handleAddToCart = async (product: Product) => {
-  try {
-    await addItem(product, 1);
-    toast.success(`${product.title} added to cart`);
-  } catch (error) {
-    if (error instanceof InsufficientInventoryError) {
-      toast.error(`Only ${error.available} units available`);
-      // Optionally show in-stock quantity
-      queryClient.invalidateQueries(['product', product.id]);
-    } else if (error instanceof ReservationExpiredError) {
-      toast.warning('Item reservation expired. Please try again.');
-    } else {
-      toast.error('Failed to add to cart. Please try again.');
-    }
-  }
-};
-```
+**Frontend handleAddToCart()**:
+- On `InsufficientInventoryError`: toast "Only X available", invalidate product query
+- On `ReservationExpiredError`: toast "Expired, try again"
+- On generic error: toast "Failed, try again"
 
 ---
 
@@ -342,253 +187,86 @@ User types "wireless headphones"
         │
         ▼
 ┌──────────────────┐
-│ SearchInput.tsx  │ debounce(300ms)
-│ - Controlled     │ ──────────────────>  URL state update
-│ - Debounced      │                      /search?q=wireless+headphones
+│ SearchInput.tsx  │──▶ debounce(300ms) ──▶ URL update
+│ - Controlled     │                       /search?q=wireless+headphones
+│ - Debounced      │
 └──────────────────┘
         │
         ▼
 ┌──────────────────┐
-│ useSearchQuery   │ TanStack Query
-│ - Cache 5min     │ ──────────────────>  GET /api/search?q=...
+│ useSearchQuery   │──▶ GET /api/search?q=...
+│ - Cache 5min     │    TanStack Query
 │ - Stale-while-   │
 │   revalidate     │
 └──────────────────┘
         │
         ▼
 ┌──────────────────┐
-│ Catalog Service  │
-│ - ES query build │ ──────────────────>  Elasticsearch
-│ - Aggregations   │                      products index
+│ Catalog Service  │──▶ Elasticsearch
+│ - ES query build │    products index
+│ - Aggregations   │
 │ - Circuit breaker│
 └──────────────────┘
         │
         ▼
 ┌──────────────────┐
-│ SearchResults    │ Response includes:
-│ - Virtualized    │ - products[]
-│ - Facets sidebar │ - facets (categories, brands, prices)
-│ - Infinite scroll│ - totalCount
+│ SearchResults    │◀── Response:
+│ - Virtualized    │    - products[]
+│ - Facets sidebar │    - facets{}
+│ - Infinite scroll│    - totalCount
 └──────────────────┘
 ```
 
 ### Frontend: Search Component
 
-```tsx
-// components/Search/SearchPage.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
-import { useSearchParams } from '@tanstack/react-router';
-import { useInfiniteQuery } from '@tanstack/react-query';
+**SearchPage component**:
+- Uses `useSearchParams` for URL state
+- Extracts: `query`, `category`, `priceMin`, `priceMax`, `brands[]`
+- Uses `useInfiniteQuery` for paginated results
+- `getNextPageParam`: returns page number if `hasMore`
+- `staleTime`: 5 minutes
 
-export function SearchPage() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const parentRef = useRef<HTMLDivElement>(null);
+**Virtualization with TanStack Virtual**:
+- `count`: products + 1 (for loading indicator)
+- `estimateSize`: 280px per row
+- `overscan`: 5 items
 
-  const query = searchParams.get('q') || '';
-  const category = searchParams.get('category');
-  const priceMin = searchParams.get('priceMin');
-  const priceMax = searchParams.get('priceMax');
-  const brands = searchParams.getAll('brand');
+**Infinite Scroll Trigger**:
+- Watch last virtual item index
+- If near end and `hasNextPage`: call `fetchNextPage()`
 
-  const {
-    data,
-    fetchNextPage,
-    hasNextPage,
-    isFetchingNextPage
-  } = useInfiniteQuery({
-    queryKey: ['search', query, category, priceMin, priceMax, brands],
-    queryFn: ({ pageParam = 0 }) =>
-      searchProducts({ query, category, priceMin, priceMax, brands, page: pageParam }),
-    getNextPageParam: (lastPage, pages) =>
-      lastPage.hasMore ? pages.length : undefined,
-    staleTime: 5 * 60 * 1000,
-  });
-
-  const allProducts = data?.pages.flatMap(page => page.products) ?? [];
-  const facets = data?.pages[0]?.facets;
-
-  const virtualizer = useVirtualizer({
-    count: hasNextPage ? allProducts.length + 1 : allProducts.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 280,
-    overscan: 5,
-  });
-
-  // Infinite scroll trigger
-  useEffect(() => {
-    const [lastItem] = [...virtualizer.getVirtualItems()].reverse();
-    if (!lastItem) return;
-
-    if (
-      lastItem.index >= allProducts.length - 1 &&
-      hasNextPage &&
-      !isFetchingNextPage
-    ) {
-      fetchNextPage();
-    }
-  }, [virtualizer.getVirtualItems(), hasNextPage, isFetchingNextPage]);
-
-  return (
-    <div className="flex gap-6">
-      {/* Facets Sidebar */}
-      <aside className="w-64 shrink-0">
-        <FacetFilters
-          facets={facets}
-          selected={{ category, priceMin, priceMax, brands }}
-          onChange={(filters) => setSearchParams(filters)}
-        />
-      </aside>
-
-      {/* Virtualized Results */}
-      <div ref={parentRef} className="flex-1 h-[calc(100vh-120px)] overflow-auto">
-        <div
-          style={{ height: virtualizer.getTotalSize(), position: 'relative' }}
-        >
-          {virtualizer.getVirtualItems().map((virtualRow) => (
-            <div
-              key={virtualRow.key}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                transform: `translateY(${virtualRow.start}px)`,
-              }}
-            >
-              {virtualRow.index < allProducts.length ? (
-                <ProductCard product={allProducts[virtualRow.index]} />
-              ) : (
-                <LoadingSpinner />
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-```
+**Facets Sidebar**:
+- Receives `facets` from first page response
+- `selected` state from URL params
+- `onChange` updates URL params
 
 ### Backend: Search API with Fallback
 
-```typescript
-// routes/search.ts
-import { Router } from 'express';
-import { esClient } from '../shared/elasticsearch';
-import { pool } from '../shared/db';
-import { searchCircuitBreaker } from '../shared/circuitBreaker';
+**GET / Handler**:
+1. Try Elasticsearch with circuit breaker
+2. Build ES query with filters
+3. Extract products and facets from response
+4. Log search for analytics
+5. If circuit open: fallback to PostgreSQL FTS
 
-const router = Router();
+**Elasticsearch Query Structure**:
+- `function_score` for relevance boosting
+- `bool.must`: fuzzy match on title
+- `bool.filter`: category, price range, brand terms
+- Boost factors: in_stock (2x), rating (sqrt, 1.2x)
 
-router.get('/', async (req, res) => {
-  const { q, category, priceMin, priceMax, brand, page = 0, limit = 20 } = req.query;
-  const startTime = Date.now();
+**Aggregations**:
+- `categories`: top 20 terms
+- `brands`: top 20 terms
+- `price_ranges`: Under $25, $25-50, $50-100, Over $100
+- `avg_rating`: average value
 
-  try {
-    // Try Elasticsearch with circuit breaker
-    const results = await searchCircuitBreaker.fire(async () => {
-      return await esClient.search({
-        index: 'products',
-        body: buildEsQuery({ q, category, priceMin, priceMax, brand, page, limit })
-      });
-    });
-
-    const products = results.hits.hits.map(hit => ({
-      ...hit._source,
-      id: hit._id,
-      score: hit._score
-    }));
-
-    const facets = {
-      categories: results.aggregations.categories.buckets,
-      brands: results.aggregations.brands.buckets,
-      priceRanges: results.aggregations.price_ranges.buckets,
-      avgRating: results.aggregations.avg_rating.value
-    };
-
-    // Log search for analytics
-    await logSearch({
-      query: q,
-      filters: { category, priceMin, priceMax, brand },
-      resultsCount: results.hits.total.value,
-      latencyMs: Date.now() - startTime,
-      engine: 'elasticsearch'
-    });
-
-    res.json({
-      products,
-      facets,
-      totalCount: results.hits.total.value,
-      page: Number(page),
-      hasMore: (Number(page) + 1) * Number(limit) < results.hits.total.value
-    });
-
-  } catch (error) {
-    if (error.message === 'Circuit breaker is OPEN') {
-      // Fallback to PostgreSQL full-text search
-      const fallbackResults = await pgFallbackSearch({ q, category, priceMin, priceMax, page, limit });
-
-      await logSearch({
-        query: q,
-        filters: { category, priceMin, priceMax },
-        resultsCount: fallbackResults.totalCount,
-        latencyMs: Date.now() - startTime,
-        engine: 'postgres_fts'
-      });
-
-      return res.json(fallbackResults);
-    }
-    throw error;
-  }
-});
-
-function buildEsQuery({ q, category, priceMin, priceMax, brand, page, limit }) {
-  return {
-    query: {
-      function_score: {
-        query: {
-          bool: {
-            must: q ? [{ match: { title: { query: q, fuzziness: 'AUTO' } } }] : [],
-            filter: [
-              category && { term: { category } },
-              priceMin && { range: { price: { gte: Number(priceMin) } } },
-              priceMax && { range: { price: { lte: Number(priceMax) } } },
-              brand && { terms: { brand: Array.isArray(brand) ? brand : [brand] } },
-              { term: { is_active: true } }
-            ].filter(Boolean)
-          }
-        },
-        functions: [
-          { filter: { term: { in_stock: true } }, weight: 2 },
-          { field_value_factor: { field: 'rating', modifier: 'sqrt', factor: 1.2 } }
-        ],
-        score_mode: 'multiply'
-      }
-    },
-    aggs: {
-      categories: { terms: { field: 'category', size: 20 } },
-      brands: { terms: { field: 'brand', size: 20 } },
-      price_ranges: {
-        range: {
-          field: 'price',
-          ranges: [
-            { key: 'Under $25', to: 25 },
-            { key: '$25-$50', from: 25, to: 50 },
-            { key: '$50-$100', from: 50, to: 100 },
-            { key: 'Over $100', from: 100 }
-          ]
-        }
-      },
-      avg_rating: { avg: { field: 'rating' } }
-    },
-    size: Number(limit),
-    from: Number(page) * Number(limit),
-    sort: [
-      { _score: 'desc' },
-      { rating: 'desc' }
-    ]
-  };
-}
+**Fallback Strategy**:
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Elasticsearch  │──X──│ Circuit Breaker │──▶  │  PostgreSQL FTS │
+│    Primary      │     │     OPEN        │     │    Fallback     │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
 ```
 
 ---
@@ -599,7 +277,7 @@ function buildEsQuery({ q, category, priceMin, priceMax, brand, page, limit }) {
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Step 1    │ -> │   Step 2    │ -> │   Step 3    │ -> │   Step 4    │
+│   Step 1    │ ─▶ │   Step 2    │ ─▶ │   Step 3    │ ─▶ │   Step 4    │
 │  Shipping   │    │   Payment   │    │   Review    │    │ Confirmation│
 │             │    │             │    │             │    │             │
 │ - Address   │    │ - Card form │    │ - Summary   │    │ - Order ID  │
@@ -610,318 +288,71 @@ function buildEsQuery({ q, category, priceMin, priceMax, brand, page, limit }) {
 
 ### Frontend: Checkout State Machine
 
-```tsx
-// components/Checkout/CheckoutFlow.tsx
-import { useMachine } from '@xstate/react';
-import { checkoutMachine } from './checkoutMachine';
+**CheckoutFlow component**:
+- Uses XState machine for flow control
+- Generates `idempotencyKey` on mount
+- Renders step indicator with completion status
+- Conditionally renders step components
 
-export function CheckoutFlow() {
-  const [state, send] = useMachine(checkoutMachine);
-  const { items, getTotal } = useCartStore();
-  const [idempotencyKey] = useState(() => generateIdempotencyKey());
+**Step Indicator**:
+- Shows checkmark for completed steps
+- Highlights current step
+- Numbered circles for pending steps
 
-  const steps = [
-    { id: 'shipping', label: 'Shipping' },
-    { id: 'payment', label: 'Payment' },
-    { id: 'review', label: 'Review' },
-    { id: 'confirmation', label: 'Confirmation' }
-  ];
+**State Machine Definition**:
 
-  return (
-    <div className="max-w-3xl mx-auto">
-      {/* Step Indicator */}
-      <nav className="flex justify-between mb-8">
-        {steps.map((step, index) => (
-          <div
-            key={step.id}
-            className={cn(
-              'flex items-center',
-              state.matches(step.id) && 'text-blue-600 font-medium',
-              state.context.completedSteps.includes(step.id) && 'text-green-600'
-            )}
-          >
-            <span className="w-8 h-8 rounded-full border-2 flex items-center justify-center">
-              {state.context.completedSteps.includes(step.id) ? (
-                <CheckIcon />
-              ) : (
-                index + 1
-              )}
-            </span>
-            <span className="ml-2">{step.label}</span>
-          </div>
-        ))}
-      </nav>
-
-      {/* Step Content */}
-      {state.matches('shipping') && (
-        <ShippingForm
-          onSubmit={(address) => send({ type: 'SUBMIT_SHIPPING', address })}
-          defaultValues={state.context.shippingAddress}
-        />
-      )}
-
-      {state.matches('payment') && (
-        <PaymentForm
-          onSubmit={(payment) => send({ type: 'SUBMIT_PAYMENT', payment })}
-          onBack={() => send({ type: 'BACK' })}
-        />
-      )}
-
-      {state.matches('review') && (
-        <OrderReview
-          items={items}
-          total={getTotal()}
-          shippingAddress={state.context.shippingAddress}
-          paymentMethod={state.context.paymentMethod}
-          onPlace={() => send({ type: 'PLACE_ORDER', idempotencyKey })}
-          onBack={() => send({ type: 'BACK' })}
-          isLoading={state.matches('review.placing')}
-        />
-      )}
-
-      {state.matches('confirmation') && (
-        <OrderConfirmation
-          orderId={state.context.orderId}
-          email={state.context.email}
-        />
-      )}
-
-      {state.matches('error') && (
-        <ErrorDisplay
-          error={state.context.error}
-          onRetry={() => send({ type: 'RETRY' })}
-        />
-      )}
-    </div>
-  );
-}
-
-// State machine definition
-const checkoutMachine = createMachine({
-  id: 'checkout',
-  initial: 'shipping',
-  context: {
-    shippingAddress: null,
-    paymentMethod: null,
-    orderId: null,
-    error: null,
-    completedSteps: []
-  },
-  states: {
-    shipping: {
-      on: {
-        SUBMIT_SHIPPING: {
-          target: 'payment',
-          actions: assign({
-            shippingAddress: (_, event) => event.address,
-            completedSteps: (ctx) => [...ctx.completedSteps, 'shipping']
-          })
-        }
-      }
-    },
-    payment: {
-      on: {
-        SUBMIT_PAYMENT: {
-          target: 'review',
-          actions: assign({
-            paymentMethod: (_, event) => event.payment,
-            completedSteps: (ctx) => [...ctx.completedSteps, 'payment']
-          })
-        },
-        BACK: 'shipping'
-      }
-    },
-    review: {
-      initial: 'idle',
-      states: {
-        idle: {
-          on: { PLACE_ORDER: 'placing' }
-        },
-        placing: {
-          invoke: {
-            src: 'placeOrder',
-            onDone: {
-              target: '#checkout.confirmation',
-              actions: assign({
-                orderId: (_, event) => event.data.orderId,
-                completedSteps: (ctx) => [...ctx.completedSteps, 'review']
-              })
-            },
-            onError: {
-              target: '#checkout.error',
-              actions: assign({ error: (_, event) => event.data })
-            }
-          }
-        }
-      },
-      on: { BACK: 'payment' }
-    },
-    confirmation: { type: 'final' },
-    error: {
-      on: { RETRY: 'review' }
-    }
-  }
-});
 ```
+┌────────────┐    SUBMIT_SHIPPING     ┌────────────┐
+│  shipping  │ ─────────────────────▶ │  payment   │
+└────────────┘                        └────────────┘
+                                            │
+                    BACK                    │ SUBMIT_PAYMENT
+                    ◀───────────────────────┘
+                                            │
+                                            ▼
+                                      ┌────────────┐
+                                      │   review   │
+                                      │  ┌──────┐  │
+                                      │  │ idle │  │
+                                      │  └──┬───┘  │
+                                      │     │ PLACE_ORDER
+                                      │     ▼      │
+                                      │ ┌────────┐ │
+                                      │ │placing │ │
+                                      │ └──┬─────┘ │
+                                      └────┼───────┘
+                           onDone ─────────┘└────────── onError
+                              │                            │
+                              ▼                            ▼
+                       ┌─────────────┐              ┌───────────┐
+                       │confirmation │              │   error   │
+                       │   (final)   │              │  (RETRY)  │
+                       └─────────────┘              └───────────┘
+```
+
+**Context**:
+- `shippingAddress`, `paymentMethod`, `orderId`, `error`, `completedSteps[]`
 
 ### Backend: Idempotent Order Creation
 
-```typescript
-// routes/orders.ts
-import { Router } from 'express';
-import { pool } from '../shared/db';
-import { processPayment } from '../shared/payment';
-import { logger } from '../shared/logger';
+**POST / Handler** (11-step process):
 
-const router = Router();
+1. **Idempotency Check**: Query existing order by key, return cached response
+2. **BEGIN Transaction**: Get pooled connection
+3. **Get Cart with Lock**: `SELECT ... FOR UPDATE OF inventory`
+4. **Verify Availability**: Check all items still available
+5. **Calculate Totals**: subtotal + tax (8%) + shipping ($5.99 or free over $50)
+6. **Process Payment**: Stripe with `payment-{idempotencyKey}`
+7. **Create Order**: INSERT with status `confirmed`
+8. **Copy Items**: INSERT order_items FROM cart_items
+9. **Commit Inventory**: UPDATE quantity - X, reserved - X
+10. **Clear Cart**: DELETE cart_items
+11. **COMMIT + Events**: Cache response, emit to Kafka
 
-router.post('/', async (req, res) => {
-  const idempotencyKey = req.headers['idempotency-key'] as string;
-  const { shippingAddress, paymentMethodId } = req.body;
-  const userId = req.session.userId;
-
-  const log = logger.child({ idempotencyKey, userId });
-  log.info('Starting checkout');
-
-  // 1. Check idempotency
-  const existingOrder = await pool.query(`
-    SELECT id, status, response FROM orders
-    WHERE idempotency_key = $1
-  `, [idempotencyKey]);
-
-  if (existingOrder.rows.length > 0) {
-    log.info({ orderId: existingOrder.rows[0].id }, 'Returning cached order');
-    return res.json(JSON.parse(existingOrder.rows[0].response));
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // 2. Get cart items with inventory lock
-    const cartResult = await client.query(`
-      SELECT ci.*, p.title, p.price, i.quantity - i.reserved as available
-      FROM cart_items ci
-      JOIN products p ON ci.product_id = p.id
-      JOIN inventory i ON ci.product_id = i.product_id
-      WHERE ci.user_id = $1
-      FOR UPDATE OF i
-    `, [userId]);
-
-    if (cartResult.rows.length === 0) {
-      throw new EmptyCartError();
-    }
-
-    // 3. Verify all items still available
-    for (const item of cartResult.rows) {
-      if (item.available < 0) {
-        throw new InsufficientInventoryError(item.product_id, item.available, item.quantity);
-      }
-    }
-
-    // 4. Calculate totals
-    const subtotal = cartResult.rows.reduce(
-      (sum, item) => sum + item.price * item.quantity, 0
-    );
-    const tax = subtotal * 0.08; // 8% tax
-    const shippingCost = subtotal > 50 ? 0 : 5.99;
-    const total = subtotal + tax + shippingCost;
-
-    // 5. Process payment (with idempotency)
-    const paymentResult = await processPayment({
-      amount: Math.round(total * 100),
-      paymentMethodId,
-      idempotencyKey: `payment-${idempotencyKey}`,
-      metadata: { userId, cartItemCount: cartResult.rows.length }
-    });
-
-    if (paymentResult.status !== 'succeeded') {
-      throw new PaymentFailedError(paymentResult.error);
-    }
-
-    // 6. Create order
-    const orderResult = await client.query(`
-      INSERT INTO orders (
-        user_id, status, subtotal, tax, shipping_cost, total,
-        shipping_address, payment_method, payment_status, idempotency_key
-      ) VALUES ($1, 'confirmed', $2, $3, $4, $5, $6, $7, 'completed', $8)
-      RETURNING id
-    `, [userId, subtotal, tax, shippingCost, total, shippingAddress, 'card', idempotencyKey]);
-
-    const orderId = orderResult.rows[0].id;
-
-    // 7. Copy cart items to order items
-    await client.query(`
-      INSERT INTO order_items (order_id, product_id, product_title, quantity, price)
-      SELECT $1, ci.product_id, p.title, ci.quantity, p.price
-      FROM cart_items ci
-      JOIN products p ON ci.product_id = p.id
-      WHERE ci.user_id = $2
-    `, [orderId, userId]);
-
-    // 8. Commit inventory (convert reserved to decremented)
-    await client.query(`
-      UPDATE inventory i
-      SET quantity = quantity - ci.quantity,
-          reserved = reserved - ci.quantity
-      FROM cart_items ci
-      WHERE i.product_id = ci.product_id
-        AND ci.user_id = $1
-    `, [userId]);
-
-    // 9. Clear cart
-    await client.query('DELETE FROM cart_items WHERE user_id = $1', [userId]);
-
-    await client.query('COMMIT');
-
-    // 10. Create response and cache it
-    const response = {
-      orderId,
-      status: 'confirmed',
-      total,
-      estimatedDelivery: getEstimatedDelivery(shippingAddress)
-    };
-
-    await pool.query(`
-      UPDATE orders SET response = $1 WHERE id = $2
-    `, [JSON.stringify(response), orderId]);
-
-    // 11. Emit order event for async processing
-    await kafka.send('order-events', {
-      type: 'ORDER_CREATED',
-      orderId,
-      userId,
-      items: cartResult.rows.map(i => ({ productId: i.product_id, quantity: i.quantity }))
-    });
-
-    log.info({ orderId, total }, 'Order created successfully');
-    res.status(201).json(response);
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-
-    // Log audit event for failed checkout
-    await logAudit({
-      action: 'order.failed',
-      actor: { id: userId, type: 'user' },
-      resource: { type: 'checkout', id: idempotencyKey },
-      changes: { error: error.message }
-    });
-
-    if (error instanceof PaymentFailedError) {
-      return res.status(402).json({
-        error: 'PAYMENT_FAILED',
-        message: error.message
-      });
-    }
-
-    throw error;
-  } finally {
-    client.release();
-  }
-});
-```
+**Error Handling**:
+- 402 Payment Required: `PAYMENT_FAILED`
+- Rollback on any error
+- Audit log for failed checkouts
 
 ---
 
@@ -929,112 +360,31 @@ router.post('/', async (req, res) => {
 
 ### Real-Time Inventory Updates
 
-```typescript
-// Backend: Kafka consumer for inventory updates
-import { Kafka } from 'kafkajs';
+**Kafka Consumer** (`inventory-sync` group):
+- On `INVENTORY_UPDATED`: Update ES document, invalidate Redis cache
 
-const consumer = kafka.consumer({ groupId: 'inventory-sync' });
-
-await consumer.subscribe({ topic: 'inventory-updates' });
-
-await consumer.run({
-  eachMessage: async ({ message }) => {
-    const event = JSON.parse(message.value.toString());
-
-    switch (event.type) {
-      case 'INVENTORY_UPDATED':
-        // Update Elasticsearch
-        await esClient.update({
-          index: 'products',
-          id: event.productId,
-          body: {
-            doc: { in_stock: event.available > 0, available: event.available }
-          }
-        });
-
-        // Invalidate product cache
-        await redis.del(`product:${event.productId}`);
-        break;
-    }
-  }
-});
-
-// Frontend: WebSocket for real-time updates
-export function useInventoryUpdates(productIds: string[]) {
-  const queryClient = useQueryClient();
-
-  useEffect(() => {
-    const ws = new WebSocket(`${WS_URL}/inventory`);
-
-    ws.onmessage = (event) => {
-      const { productId, available } = JSON.parse(event.data);
-
-      if (productIds.includes(productId)) {
-        // Update cached product data
-        queryClient.setQueryData(['product', productId], (old: Product) => ({
-          ...old,
-          available,
-          inStock: available > 0
-        }));
-
-        // Show toast if item in cart became unavailable
-        const cartItems = useCartStore.getState().items;
-        const cartItem = cartItems.find(i => i.productId === productId);
-        if (cartItem && available < cartItem.quantity) {
-          toast.warning(`${cartItem.title} availability changed`);
-        }
-      }
-    };
-
-    return () => ws.close();
-  }, [productIds]);
-}
-```
+**Frontend WebSocket Hook** (`useInventoryUpdates`):
+- Subscribe to product IDs
+- On message: update query cache with new availability
+- If cart item became unavailable: show warning toast
 
 ### Search Index Synchronization
 
-```typescript
-// Background job: Keep Elasticsearch in sync with PostgreSQL
-async function syncProductToElasticsearch(productId: string) {
-  const product = await pool.query(`
-    SELECT p.*,
-           SUM(i.quantity - i.reserved) as available,
-           c.name as category_name,
-           s.business_name as seller_name
-    FROM products p
-    LEFT JOIN inventory i ON p.id = i.product_id
-    LEFT JOIN categories c ON p.category_id = c.id
-    LEFT JOIN sellers s ON p.seller_id = s.id
-    WHERE p.id = $1
-    GROUP BY p.id, c.name, s.business_name
-  `, [productId]);
+**syncProductToElasticsearch()** Background Job:
+- Query product with inventory, category, seller joins
+- If deleted: remove from index
+- Otherwise: index with all searchable fields
 
-  if (product.rows.length === 0) {
-    // Product deleted, remove from index
-    await esClient.delete({ index: 'products', id: productId });
-    return;
-  }
-
-  const p = product.rows[0];
-
-  await esClient.index({
-    index: 'products',
-    id: productId,
-    body: {
-      title: p.title,
-      description: p.description,
-      category: p.category_name,
-      brand: p.attributes?.brand,
-      price: p.price,
-      rating: p.rating,
-      review_count: p.review_count,
-      in_stock: p.available > 0,
-      seller: p.seller_name,
-      images: p.images,
-      created_at: p.created_at
-    }
-  });
-}
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  PostgreSQL │──▶ │  Background │──▶ │Elasticsearch│
+│   (source)  │    │    Job      │    │   (index)   │
+└─────────────┘    └─────────────┘    └─────────────┘
+        │                                    │
+        │         ┌─────────────┐            │
+        └────────▶│   Valkey    │◀───────────┘
+                  │   (cache)   │
+                  └─────────────┘
 ```
 
 ---

@@ -7,6 +7,7 @@
 ## 1. Requirements Clarification (3-4 minutes)
 
 ### Functional Requirements
+
 - **Upload**: Upload documents (primarily PDFs) for signing
 - **Prepare**: Add signature fields and assign to recipients
 - **Route**: Send to recipients in specified order (serial or parallel)
@@ -14,6 +15,7 @@
 - **Complete**: Generate final signed document with certificate of completion
 
 ### Non-Functional Requirements
+
 - **Availability**: 99.99% for signing ceremonies
 - **Durability**: Documents stored for 10+ years with guaranteed integrity
 - **Compliance**: ESIGN Act, UETA, eIDAS compliant
@@ -21,6 +23,7 @@
 - **Auditability**: Every action logged with tamper-proof trail
 
 ### Scale Estimation
+
 - 100K envelopes per day, average 3 recipients each
 - Document sizes: 100KB - 50MB (PDFs)
 - Long-term storage: 10+ years with integrity verification
@@ -30,38 +33,41 @@
 ## 2. High-Level Architecture (5 minutes)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│           Web App │ Mobile App │ API Integration                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-│               (Auth, Rate Limiting)                             │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Document Service│    │Workflow Engine│    │ Signing Service│
-│               │    │               │    │               │
-│ - PDF process │    │ - State mgmt  │    │ - Capture sig │
-│ - Fields      │    │ - Routing     │    │ - Verify ID   │
-│ - Templates   │    │ - Reminders   │    │ - Audit log   │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │     S3/MinIO      │      Elasticsearch        │
-│   - Envelopes   │  - Documents      │      - Audit logs         │
-│   - Recipients  │  - Signatures     │      - Search             │
-│   - Workflow    │  - Certificates   │      - Analytics          │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Client Layer                                 │
+│               Web App │ Mobile App │ API Integration                 │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          API Gateway                                 │
+│                     (Auth, Rate Limiting)                            │
+└───────────┬───────────────────┼───────────────────┬─────────────────┘
+            │                   │                   │
+            ▼                   ▼                   ▼
+┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+│ Document Service  │  │ Workflow Engine   │  │ Signing Service   │
+├───────────────────┤  ├───────────────────┤  ├───────────────────┤
+│ - PDF processing  │  │ - State mgmt      │  │ - Capture sig     │
+│ - Field placement │  │ - Routing logic   │  │ - Verify ID       │
+│ - Templates       │  │ - Reminders       │  │ - Audit logging   │
+└─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
+          │                      │                      │
+          └──────────────────────┼──────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Data Layer                                  │
+├─────────────────────┬─────────────────────┬─────────────────────────┤
+│     PostgreSQL      │      S3/MinIO       │     Elasticsearch       │
+│  - Envelopes        │  - Documents        │  - Audit logs           │
+│  - Recipients       │  - Signatures       │  - Search               │
+│  - Workflow state   │  - Certificates     │  - Analytics            │
+└─────────────────────┴─────────────────────┴─────────────────────────┘
 ```
 
 ### Component Responsibilities
+
 - **Document Service**: PDF processing, field placement, template management
 - **Workflow Engine**: State machine for signing orchestration
 - **Signing Service**: Signature capture, recipient verification, audit logging
@@ -70,104 +76,57 @@
 
 ## 3. Database Schema Design (6 minutes)
 
-```sql
--- Envelopes (signing packages)
-CREATE TABLE envelopes (
-  id UUID PRIMARY KEY,
-  sender_id UUID REFERENCES users(id),
-  name VARCHAR(200) NOT NULL,
-  status VARCHAR(30) DEFAULT 'draft',
-  authentication_level VARCHAR(30) DEFAULT 'email',
-  expiration_date TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  completed_at TIMESTAMP
-);
+### Schema Overview
 
-CREATE INDEX idx_envelopes_sender_status ON envelopes(sender_id, status);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  envelopes                                                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  id UUID PK, sender_id UUID FK, name VARCHAR(200)                   │
+│  status VARCHAR(30) DEFAULT 'draft'                                 │
+│  authentication_level VARCHAR(30) DEFAULT 'email'                   │
+│  expiration_date TIMESTAMP, created_at, updated_at, completed_at    │
+│  INDEX: idx_envelopes_sender_status ON (sender_id, status)          │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+        ▼                       ▼                       ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   recipients    │    │    documents    │    │  audit_events   │
+├─────────────────┤    ├─────────────────┤    ├─────────────────┤
+│ id UUID PK      │    │ id UUID PK      │    │ id UUID PK      │
+│ envelope_id FK  │    │ envelope_id FK  │    │ envelope_id FK  │
+│ name, email     │    │ name, page_count│    │ event_type      │
+│ role            │    │ s3_key, status  │    │ data JSONB      │
+│ routing_order   │    │ created_at      │    │ timestamp       │
+│ status          │    └────────┬────────┘    │ actor           │
+│ access_token    │             │             │ previous_hash   │
+│ ip_address      │             ▼             │ hash (SHA-256)  │
+│ completed_at    │    ┌─────────────────┐    └─────────────────┘
+└────────┬────────┘    │ document_fields │
+         │             ├─────────────────┤
+         │             │ id UUID PK      │
+         │             │ document_id FK  │
+         │             │ recipient_id FK │
+         │             │ type, page_num  │
+         ▼             │ x, y, w, h      │
+┌─────────────────┐    │ required, done  │
+│   signatures    │    │ value, sig_id   │
+├─────────────────┤    └─────────────────┘
+│ id UUID PK      │
+│ recipient_id FK │
+│ field_id FK     │
+│ s3_key, type    │
+│ created_at      │
+└─────────────────┘
 
--- Recipients
-CREATE TABLE recipients (
-  id UUID PRIMARY KEY,
-  envelope_id UUID REFERENCES envelopes(id),
-  name VARCHAR(100) NOT NULL,
-  email VARCHAR(200) NOT NULL,
-  role VARCHAR(50) DEFAULT 'signer', -- 'signer', 'cc', 'in_person'
-  routing_order INTEGER DEFAULT 1,
-  status VARCHAR(30) DEFAULT 'pending',
-  access_token VARCHAR(64) UNIQUE,
-  ip_address VARCHAR(50),
-  completed_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_recipients_envelope ON recipients(envelope_id, routing_order);
-CREATE INDEX idx_recipients_token ON recipients(access_token);
-
--- Documents
-CREATE TABLE documents (
-  id UUID PRIMARY KEY,
-  envelope_id UUID REFERENCES envelopes(id),
-  name VARCHAR(200) NOT NULL,
-  page_count INTEGER,
-  s3_key VARCHAR(500) NOT NULL,
-  status VARCHAR(30) DEFAULT 'processing',
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Document Fields
-CREATE TABLE document_fields (
-  id UUID PRIMARY KEY,
-  document_id UUID REFERENCES documents(id),
-  recipient_id UUID REFERENCES recipients(id),
-  type VARCHAR(30) NOT NULL, -- 'signature', 'initial', 'date', 'text'
-  page_number INTEGER NOT NULL,
-  x DECIMAL NOT NULL,
-  y DECIMAL NOT NULL,
-  width DECIMAL NOT NULL,
-  height DECIMAL NOT NULL,
-  required BOOLEAN DEFAULT TRUE,
-  completed BOOLEAN DEFAULT FALSE,
-  value TEXT,
-  signature_id UUID REFERENCES signatures(id),
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_fields_recipient ON document_fields(recipient_id, completed);
-
--- Signatures
-CREATE TABLE signatures (
-  id UUID PRIMARY KEY,
-  recipient_id UUID REFERENCES recipients(id),
-  field_id UUID REFERENCES document_fields(id),
-  s3_key VARCHAR(500) NOT NULL,
-  type VARCHAR(30) NOT NULL, -- 'draw', 'typed', 'upload'
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Audit Events (append-only hash chain)
-CREATE TABLE audit_events (
-  id UUID PRIMARY KEY,
-  envelope_id UUID REFERENCES envelopes(id),
-  event_type VARCHAR(50) NOT NULL,
-  data JSONB,
-  timestamp TIMESTAMP NOT NULL,
-  actor VARCHAR(100),
-  previous_hash VARCHAR(64) NOT NULL,
-  hash VARCHAR(64) NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_audit_envelope ON audit_events(envelope_id, timestamp);
-
--- Idempotency Keys (prevent duplicate operations)
-CREATE TABLE idempotency_keys (
-  key VARCHAR(255) PRIMARY KEY,
-  response JSONB NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
+┌─────────────────────────────────────────────────────────────────────┐
+│  idempotency_keys (prevent duplicate operations)                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  key VARCHAR(255) PK, response JSONB, created_at TIMESTAMP          │
+│  INDEX: idx_idempotency_created ON (created_at)                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -176,171 +135,121 @@ CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
 
 ### State Transitions
 
-```typescript
-const ENVELOPE_STATES = {
-  draft: ['sent', 'voided'],
-  sent: ['delivered', 'voided'],
-  delivered: ['signed', 'declined', 'voided'],
-  signed: ['completed'],  // When all recipients sign
-  declined: [],
-  voided: [],
-  completed: []
-};
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Envelope State Machine                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│      ┌───────┐                                                       │
+│      │ draft │                                                       │
+│      └───┬───┘                                                       │
+│          │ send                                                      │
+│          ▼                                                           │
+│      ┌───────┐                                                       │
+│      │ sent  │─────────────┐                                         │
+│      └───┬───┘             │ void                                    │
+│          │ deliver         │                                         │
+│          ▼                 ▼                                         │
+│   ┌───────────┐      ┌────────┐                                      │
+│   │ delivered │      │ voided │ (terminal)                           │
+│   └─────┬─────┘      └────────┘                                      │
+│         │                                                            │
+│    ┌────┴────┐                                                       │
+│    │         │                                                       │
+│    ▼         ▼                                                       │
+│ ┌────────┐ ┌──────────┐                                              │
+│ │ signed │ │ declined │ (terminal)                                   │
+│ └────┬───┘ └──────────┘                                              │
+│      │ all recipients done                                           │
+│      ▼                                                               │
+│ ┌───────────┐                                                        │
+│ │ completed │ (terminal)                                             │
+│ └───────────┘                                                        │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-class WorkflowEngine {
-  async sendEnvelope(envelopeId: string, idempotencyKey: string) {
-    return this.transitionWithIdempotency(envelopeId, 'sent', idempotencyKey, async () => {
-      const envelope = await this.getEnvelope(envelopeId);
+### Routing Logic
 
-      if (envelope.status !== 'draft') {
-        throw new Error('Can only send draft envelopes');
-      }
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Get Next Recipients                                │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. Query recipients ordered by routing_order ASC                    │
+│  2. Filter to pending status only                                    │
+│  3. Find lowest incomplete routing order                             │
+│  4. Return ALL recipients at that order (parallel signing)           │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-      // Validate all required fields have recipients
-      await this.validateEnvelope(envelope);
+"Recipients with the same routing_order sign in parallel. Recipients with different orders sign serially."
 
-      // Perform state transition
-      await this.updateStatus(envelopeId, 'sent');
+### Complete Recipient Flow
 
-      // Determine first recipients based on routing order
-      const firstRecipients = await this.getNextRecipients(envelopeId);
-
-      // Queue notification jobs
-      for (const recipient of firstRecipients) {
-        await this.queueNotification(recipient, 'signing_request');
-      }
-
-      return envelope;
-    });
-  }
-
-  async getNextRecipients(envelopeId: string): Promise<Recipient[]> {
-    const recipients = await db.query(`
-      SELECT * FROM recipients
-      WHERE envelope_id = $1
-      ORDER BY routing_order ASC
-    `, [envelopeId]);
-
-    // Find lowest incomplete routing order
-    const pending = recipients.rows.filter(r => r.status === 'pending');
-    if (pending.length === 0) return [];
-
-    const nextOrder = pending[0].routing_order;
-
-    // Return all recipients at that order (parallel signing)
-    return pending.filter(r => r.routing_order === nextOrder);
-  }
-
-  async completeRecipient(recipientId: string) {
-    const recipient = await db.query(`
-      UPDATE recipients SET status = 'completed', completed_at = NOW()
-      WHERE id = $1
-      RETURNING *
-    `, [recipientId]);
-
-    // Check if all recipients at this routing order are done
-    const siblings = await db.query(`
-      SELECT * FROM recipients
-      WHERE envelope_id = $1 AND routing_order = $2
-    `, [recipient.rows[0].envelope_id, recipient.rows[0].routing_order]);
-
-    const allComplete = siblings.rows.every(r => r.status === 'completed');
-
-    if (allComplete) {
-      const nextRecipients = await this.getNextRecipients(recipient.rows[0].envelope_id);
-
-      if (nextRecipients.length === 0) {
-        // All done - complete the envelope
-        await this.completeEnvelope(recipient.rows[0].envelope_id);
-      } else {
-        for (const next of nextRecipients) {
-          await this.queueNotification(next, 'signing_request');
-        }
-      }
-    }
-  }
-
-  async completeEnvelope(envelopeId: string) {
-    await this.updateStatus(envelopeId, 'completed');
-
-    // Generate signed document with flattened fields
-    await this.queueJob('pdf_processing', {
-      type: 'generate_completed',
-      envelopeId,
-    });
-
-    // Generate certificate of completion
-    await this.queueJob('pdf_processing', {
-      type: 'generate_certificate',
-      envelopeId,
-    });
-
-    // Notify all parties
-    await this.queueNotification(envelopeId, 'completed');
-  }
-}
+```
+┌──────────────────┐
+│ Recipient signs  │
+│ all their fields │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ Mark recipient   │
+│ as completed     │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Check: All siblings at this      │
+│ routing order complete?          │
+└────────────────┬─────────────────┘
+                 │
+     ┌───────────┴───────────┐
+     │ No                    │ Yes
+     ▼                       ▼
+┌─────────────┐     ┌─────────────────────────┐
+│ Wait for    │     │ Get next recipients     │
+│ siblings    │     └────────────┬────────────┘
+└─────────────┘                  │
+                     ┌───────────┴───────────┐
+                     │ None                  │ Some
+                     ▼                       ▼
+            ┌─────────────────┐    ┌─────────────────┐
+            │ Complete        │    │ Queue signing   │
+            │ envelope        │    │ notifications   │
+            └────────┬────────┘    └─────────────────┘
+                     │
+                     ▼
+            ┌─────────────────┐
+            │ Generate signed │
+            │ PDF + cert      │
+            └─────────────────┘
 ```
 
 ### Idempotent State Transitions
 
-```typescript
-async transitionWithIdempotency(
-  envelopeId: string,
-  newStatus: string,
-  idempotencyKey: string,
-  operation: () => Promise<any>
-): Promise<any> {
-  const client = await db.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // Check for duplicate request
-    const existing = await client.query(`
-      SELECT * FROM idempotency_keys
-      WHERE key = $1 AND created_at > NOW() - INTERVAL '24 hours'
-    `, [idempotencyKey]);
-
-    if (existing.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return existing.rows[0].response;
-    }
-
-    // Lock envelope row
-    const envelope = await client.query(`
-      SELECT * FROM envelopes WHERE id = $1 FOR UPDATE
-    `, [envelopeId]);
-
-    if (!envelope.rows[0]) {
-      throw new Error('Envelope not found');
-    }
-
-    const currentStatus = envelope.rows[0].status;
-    const allowedTransitions = ENVELOPE_STATES[currentStatus];
-
-    if (!allowedTransitions.includes(newStatus)) {
-      throw new Error(`Invalid transition: ${currentStatus} -> ${newStatus}`);
-    }
-
-    // Execute operation
-    const result = await operation();
-
-    // Store idempotency key
-    await client.query(`
-      INSERT INTO idempotency_keys (key, response, created_at)
-      VALUES ($1, $2, NOW())
-    `, [idempotencyKey, JSON.stringify(result)]);
-
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│             Idempotent Transition (Database Transaction)             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. BEGIN transaction                                                │
+│  2. Check idempotency_keys table for duplicate request               │
+│     - If found: ROLLBACK, return cached response                     │
+│  3. Lock envelope row with FOR UPDATE                                │
+│  4. Validate state transition is allowed                             │
+│  5. Execute operation                                                │
+│  6. Store idempotency key with response                              │
+│  7. COMMIT transaction                                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+"This prevents race conditions and duplicate processing when clients retry failed requests."
 
 ---
 
@@ -348,243 +257,134 @@ async transitionWithIdempotency(
 
 ### Hash Chain Implementation
 
-```typescript
-import crypto from 'crypto';
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Audit Event Hash Chain                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Event 1          Event 2          Event 3          Event 4         │
+│  ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐     │
+│  │ data    │      │ data    │      │ data    │      │ data    │     │
+│  │ prev: 0 │──────│ prev: H1│──────│ prev: H2│──────│ prev: H3│     │
+│  │ hash: H1│      │ hash: H2│      │ hash: H3│      │ hash: H4│     │
+│  └─────────┘      └─────────┘      └─────────┘      └─────────┘     │
+│       │                │                │                │          │
+│       └────────────────┴────────────────┴────────────────┘          │
+│                        Linked by hashes                              │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-class AuditService {
-  async log(envelopeId: string, eventType: string, data: any) {
-    const event = {
-      id: uuid(),
-      envelopeId,
-      eventType,
-      data,
-      timestamp: new Date().toISOString(),
-      actor: data.recipientId || data.userId || 'system'
-    };
+### Hash Calculation
 
-    // Get previous event's hash for chain
-    const previousEvent = await this.getLastEvent(envelopeId);
-    const previousHash = previousEvent?.hash || '0'.repeat(64);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Hash Calculation Process                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Input payload:                                                      │
+│  ├── event.id                                                        │
+│  ├── event.envelopeId                                                │
+│  ├── event.eventType                                                 │
+│  ├── event.data (JSON)                                               │
+│  ├── event.timestamp                                                 │
+│  └── event.previousHash                                              │
+│                                                                      │
+│  Output: SHA-256(JSON.stringify(payload)) ──▶ 64-char hex string    │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-    event.previousHash = previousHash;
-    event.hash = this.calculateHash(event);
+### Chain Verification
 
-    // Store in append-only table
-    await db.query(`
-      INSERT INTO audit_events
-        (id, envelope_id, event_type, data, timestamp, actor, previous_hash, hash)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `, [event.id, envelopeId, eventType, JSON.stringify(data),
-        event.timestamp, event.actor, previousHash, event.hash]);
-
-    // Also index in Elasticsearch for search
-    await elasticsearch.index({
-      index: 'audit-events',
-      body: event
-    });
-
-    return event;
-  }
-
-  calculateHash(event: any): string {
-    const payload = JSON.stringify({
-      id: event.id,
-      envelopeId: event.envelopeId,
-      eventType: event.eventType,
-      data: event.data,
-      timestamp: event.timestamp,
-      previousHash: event.previousHash
-    });
-
-    return crypto.createHash('sha256').update(payload).digest('hex');
-  }
-
-  async verifyChain(envelopeId: string): Promise<{ valid: boolean; error?: string }> {
-    const events = await db.query(`
-      SELECT * FROM audit_events
-      WHERE envelope_id = $1
-      ORDER BY timestamp ASC
-    `, [envelopeId]);
-
-    let previousHash = '0'.repeat(64);
-
-    for (const event of events.rows) {
-      // Verify chain link
-      if (event.previous_hash !== previousHash) {
-        return { valid: false, error: 'Chain broken', eventId: event.id };
-      }
-
-      // Verify event hash
-      const calculatedHash = this.calculateHash({
-        id: event.id,
-        envelopeId: event.envelope_id,
-        eventType: event.event_type,
-        data: event.data,
-        timestamp: event.timestamp,
-        previousHash: event.previous_hash
-      });
-
-      if (calculatedHash !== event.hash) {
-        return { valid: false, error: 'Hash mismatch', eventId: event.id };
-      }
-
-      previousHash = event.hash;
-    }
-
-    return { valid: true };
-  }
-}
+```
+┌────────────────────┐
+│ Verify Chain       │
+│ for envelope       │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────┐
+│ Fetch all events   │
+│ ORDER BY timestamp │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────────┐
+│  For each event:                                                │
+│  1. Verify previous_hash matches prior event's hash            │
+│  2. Recalculate hash from event data                           │
+│  3. Compare calculated hash with stored hash                    │
+│  4. If mismatch: chain is broken, return invalid               │
+└────────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────┐
+│ Return: valid/     │
+│ invalid + error    │
+└────────────────────┘
 ```
 
 ### Audit Event Types
 
-```typescript
-const AUDIT_EVENTS = {
-  // Envelope lifecycle
-  ENVELOPE_CREATED: 'envelope_created',
-  ENVELOPE_SENT: 'envelope_sent',
-  ENVELOPE_VOIDED: 'envelope_voided',
-  ENVELOPE_COMPLETED: 'envelope_completed',
+| Category | Event Types |
+|----------|-------------|
+| Envelope lifecycle | envelope_created, envelope_sent, envelope_voided, envelope_completed |
+| Document events | document_uploaded, field_added, field_removed |
+| Recipient events | recipient_added, recipient_viewed, recipient_declined, recipient_completed |
+| Signature events | signature_captured, field_completed |
+| Authentication | access_token_generated, sms_verification_sent, sms_verification_completed |
 
-  // Document events
-  DOCUMENT_UPLOADED: 'document_uploaded',
-  FIELD_ADDED: 'field_added',
-  FIELD_REMOVED: 'field_removed',
-
-  // Recipient events
-  RECIPIENT_ADDED: 'recipient_added',
-  RECIPIENT_VIEWED: 'recipient_viewed',
-  RECIPIENT_DECLINED: 'recipient_declined',
-  RECIPIENT_COMPLETED: 'recipient_completed',
-
-  // Signature events
-  SIGNATURE_CAPTURED: 'signature_captured',
-  FIELD_COMPLETED: 'field_completed',
-
-  // Authentication events
-  ACCESS_TOKEN_GENERATED: 'access_token_generated',
-  SMS_VERIFICATION_SENT: 'sms_verification_sent',
-  SMS_VERIFICATION_COMPLETED: 'sms_verification_completed',
-};
-
-// Example: Signature capture audit
-await auditService.log(documentId, 'signature_captured', {
-  recipientId,
-  fieldId,
-  signatureId,
-  signatureType: 'draw',
-  ipAddress: req.ip,
-  userAgent: req.headers['user-agent'],
-  timestamp: new Date().toISOString(),
-  geolocation: req.body.geolocation
-});
-```
+"Each signature capture includes: recipientId, fieldId, signatureId, signatureType, ipAddress, userAgent, timestamp, geolocation."
 
 ---
 
 ## 6. Signature Capture Service (6 minutes)
 
-```typescript
-async function captureSignature(
-  recipientId: string,
-  fieldId: string,
-  signatureData: SignatureInput,
-  idempotencyKey: string
-) {
-  // Check idempotency first
-  const cached = await redis.get(`idempotent:${idempotencyKey}`);
-  if (cached) return JSON.parse(cached);
+### Capture Flow
 
-  const client = await db.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // Lock the field to prevent concurrent signing
-    const field = await client.query(`
-      SELECT * FROM document_fields WHERE id = $1 FOR UPDATE
-    `, [fieldId]);
-
-    if (field.rows[0].completed) {
-      throw new ConflictError('Field already signed');
-    }
-
-    const recipient = await getRecipient(recipientId);
-
-    // Verify recipient owns this field
-    if (field.rows[0].recipient_id !== recipientId) {
-      throw new UnauthorizedError('Field not assigned to this recipient');
-    }
-
-    // Process signature based on type
-    let signatureImage: Buffer;
-    if (signatureData.type === 'draw') {
-      signatureImage = Buffer.from(signatureData.imageData.split(',')[1], 'base64');
-    } else if (signatureData.type === 'typed') {
-      signatureImage = await renderTypedSignature(signatureData.text, signatureData.font);
-    }
-
-    // Store signature with encryption
-    const signatureId = uuid();
-    const s3Key = `signatures/${signatureId}.png`;
-    await s3.upload({
-      Bucket: 'docusign-signatures',
-      Key: s3Key,
-      Body: signatureImage,
-      ContentType: 'image/png',
-      ServerSideEncryption: 'aws:kms'
-    }).promise();
-
-    // Create signature record
-    await client.query(`
-      INSERT INTO signatures (id, recipient_id, field_id, s3_key, type, created_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
-    `, [signatureId, recipientId, fieldId, s3Key, signatureData.type]);
-
-    // Mark field as completed
-    await client.query(`
-      UPDATE document_fields SET completed = true, signature_id = $1
-      WHERE id = $2
-    `, [signatureId, fieldId]);
-
-    await client.query('COMMIT');
-
-    // Comprehensive audit log
-    await auditService.log(field.rows[0].document_id, 'signature_captured', {
-      recipientId,
-      fieldId,
-      signatureId,
-      ipAddress: signatureData.ipAddress,
-      userAgent: signatureData.userAgent,
-      timestamp: new Date().toISOString()
-    });
-
-    // Cache result for idempotency
-    const result = { signatureId };
-    await redis.setex(`idempotent:${idempotencyKey}`, 86400, JSON.stringify(result));
-
-    // Check if recipient has completed all required fields
-    await checkRecipientCompletion(recipientId);
-
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-async function checkRecipientCompletion(recipientId: string) {
-  const incompleteFields = await db.query(`
-    SELECT COUNT(*) as count FROM document_fields
-    WHERE recipient_id = $1 AND required = true AND completed = false
-  `, [recipientId]);
-
-  if (parseInt(incompleteFields.rows[0].count) === 0) {
-    await workflowEngine.completeRecipient(recipientId);
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Signature Capture Flow                            │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. Check idempotency key in Redis                                   │
+│     - If found: return cached result                                 │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. BEGIN database transaction                                       │
+│  3. Lock field row with FOR UPDATE                                   │
+│  4. Verify field not already completed                               │
+│  5. Verify recipient owns this field                                 │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  6. Process signature based on type:                                 │
+│     ├── draw: decode base64 image data                               │
+│     ├── typed: render text with selected font                        │
+│     └── upload: validate uploaded image                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  7. Store signature in S3 with KMS encryption                        │
+│  8. Create signature record in database                              │
+│  9. Mark field as completed                                          │
+│  10. COMMIT transaction                                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  11. Log to audit trail with full context                            │
+│  12. Cache result for idempotency (24h TTL)                          │
+│  13. Check if recipient completed all required fields                │
+│      - If yes: trigger workflow.completeRecipient()                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -594,282 +394,209 @@ async function checkRecipientCompletion(recipientId: string) {
 ### RabbitMQ Queue Topology
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     RabbitMQ Exchange                           │
-├─────────────────┬─────────────────────┬─────────────────────────┤
-│  docusign.direct│  docusign.fanout    │  docusign.dlx           │
-│  (direct)       │  (fanout)           │  (dead letter)          │
-└────────┬────────┴──────────┬──────────┴────────────┬────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      RabbitMQ Exchanges                              │
+├─────────────────┬─────────────────────┬─────────────────────────────┤
+│ docusign.direct │   docusign.fanout   │      docusign.dlx           │
+│ (direct type)   │   (fanout type)     │   (dead letter)             │
+└────────┬────────┴──────────┬──────────┴────────────┬────────────────┘
          │                   │                       │
-    ┌────▼────┐         ┌────▼────┐            ┌────▼────┐
-    │ workflow │         │  email  │            │   dlq   │
-    │  queue   │         │  queue  │            │  queue  │
-    └────┬────┘         └────┬────┘            └─────────┘
-         │                   │
-    ┌────▼────┐         ┌────▼────┐
-    │Workflow │         │ Email   │
-    │ Worker  │         │ Worker  │
-    └─────────┘         └─────────┘
+         ▼                   ▼                       ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ workflow queue  │  │  email queue    │  │    dlq queue    │
+└────────┬────────┘  └────────┬────────┘  └─────────────────┘
+         │                    │
+         ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐
+│ Workflow Worker │  │  Email Worker   │
+└─────────────────┘  └─────────────────┘
 ```
 
 ### Message Publishing with Delivery Guarantees
 
-```typescript
-class QueuePublisher {
-  async publishWorkflowEvent(event: WorkflowEvent) {
-    const message = {
-      id: uuid(),
-      type: event.type,
-      envelopeId: event.envelopeId,
-      data: event.data,
-      timestamp: new Date().toISOString(),
-      idempotencyKey: event.idempotencyKey || `${event.type}:${event.envelopeId}:${Date.now()}`
-    };
-
-    return new Promise((resolve, reject) => {
-      this.channel.publish(
-        'docusign.direct',
-        'workflow',
-        Buffer.from(JSON.stringify(message)),
-        {
-          persistent: true,
-          messageId: message.id,
-          headers: {
-            'x-idempotency-key': message.idempotencyKey,
-            'x-retry-count': 0
-          }
-        },
-        (err) => {
-          if (err) reject(new Error('Message not confirmed'));
-          else resolve(message.id);
-        }
-      );
-    });
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Message Structure                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  {                                                                   │
+│    id: UUID,                                                        │
+│    type: event_type,                                                │
+│    envelopeId: UUID,                                                │
+│    data: {...},                                                     │
+│    timestamp: ISO8601,                                              │
+│    idempotencyKey: "{type}:{envelopeId}:{timestamp}"                │
+│  }                                                                   │
+│                                                                      │
+│  Options: persistent=true, messageId=id,                            │
+│           headers: { x-idempotency-key, x-retry-count }             │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Consumer with Backpressure
 
-```typescript
-class WorkflowConsumer {
-  async start() {
-    // Prefetch limits concurrent processing (backpressure)
-    await this.channel.prefetch(5);
-
-    await this.channel.consume('docusign.workflow', async (msg) => {
-      if (!msg) return;
-
-      const message = JSON.parse(msg.content.toString());
-      const retryCount = msg.properties.headers['x-retry-count'] || 0;
-
-      try {
-        // Idempotency check
-        const processed = await redis.get(`processed:${message.idempotencyKey}`);
-        if (processed) {
-          this.channel.ack(msg);
-          return;
-        }
-
-        await this.processEvent(message);
-
-        await redis.setex(`processed:${message.idempotencyKey}`, 86400, message.id);
-        this.channel.ack(msg);
-      } catch (error) {
-        if (retryCount < 3) {
-          await this.republishWithRetry(message, retryCount + 1);
-          this.channel.nack(msg, false, false);
-        } else {
-          // Send to DLQ
-          this.channel.nack(msg, false, false);
-        }
-      }
-    });
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Consumer Processing                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Prefetch: 5 (limits concurrent processing)                         │
+│                                                                      │
+│  For each message:                                                   │
+│  1. Check Redis for processed:{idempotencyKey}                      │
+│     - If found: ACK and skip (already processed)                    │
+│  2. Process the event                                               │
+│  3. Store processed key in Redis (24h TTL)                          │
+│  4. ACK the message                                                 │
+│                                                                      │
+│  On error:                                                          │
+│  - If retryCount < 3: republish with incremented count, NACK        │
+│  - If retryCount >= 3: NACK (goes to DLQ)                           │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 8. Recipient Authentication (4 minutes)
 
-```typescript
-async function authenticateRecipient(recipientId: string, method: string) {
-  const recipient = await getRecipient(recipientId);
-  const envelope = await getEnvelope(recipient.envelope_id);
+### Authentication Levels
 
-  const requiredAuth = envelope.authentication_level || 'email';
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Authentication Methods                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  email          ──▶  Email link with access token (default)         │
+│  sms            ──▶  6-digit code sent via SMS                      │
+│  knowledge      ──▶  Knowledge-based questions                      │
+│  id_verification──▶  Government ID verification                     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  switch (requiredAuth) {
-    case 'email':
-      // Email link with access token is sufficient
-      return { authenticated: true };
+### SMS Verification Flow
 
-    case 'sms':
-      return await smsVerification(recipient);
-
-    case 'knowledge':
-      return await knowledgeBasedAuth(recipient);
-
-    case 'id_verification':
-      return await idVerification(recipient);
-
-    default:
-      return { authenticated: true };
-  }
-}
-
-async function smsVerification(recipient: Recipient) {
-  const code = crypto.randomInt(100000, 999999).toString();
-
-  await redis.setex(`sms_code:${recipient.id}`, 300, code); // 5 min expiry
-
-  await smsService.send(recipient.phone, `Your DocuSign code is: ${code}`);
-
-  await auditService.log(recipient.envelope_id, 'sms_verification_sent', {
-    recipientId: recipient.id,
-    phone: maskPhone(recipient.phone)
-  });
-
-  return { requiresCode: true, method: 'sms' };
-}
-
-async function verifySMSCode(recipientId: string, code: string) {
-  const stored = await redis.get(`sms_code:${recipientId}`);
-
-  if (stored === code) {
-    await redis.del(`sms_code:${recipientId}`);
-
-    await auditService.log(recipientId, 'sms_verification_completed', {
-      success: true
-    });
-
-    return { authenticated: true };
-  }
-
-  await auditService.log(recipientId, 'sms_verification_completed', {
-    success: false
-  });
-
-  return { authenticated: false, error: 'Invalid code' };
-}
+```
+┌────────────────────┐
+│ Recipient requests │
+│ signing access     │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────┐                    ┌────────────────────┐
+│ Generate 6-digit   │───────────────────▶│ Store in Redis     │
+│ random code        │                    │ 5-minute expiry    │
+└─────────┬──────────┘                    └────────────────────┘
+          │
+          ▼
+┌────────────────────┐                    ┌────────────────────┐
+│ Send SMS via       │───────────────────▶│ Log audit event:   │
+│ provider           │                    │ sms_verification_  │
+└─────────┬──────────┘                    │ sent               │
+          │                               └────────────────────┘
+          ▼
+┌────────────────────┐
+│ Recipient enters   │
+│ code               │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Compare with stored code                                        │
+│ ├── Match: delete key, log success, return authenticated       │
+│ └── No match: log failure, return error                        │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 9. Circuit Breaker for External Services (3 minutes)
 
-```typescript
-import Opossum from 'opossum';
+### Circuit Breaker Configuration
 
-const circuitBreakers = {
-  email: new Opossum(emailService.send, {
-    timeout: 5000,
-    errorThresholdPercentage: 50,
-    resetTimeout: 60000
-  }),
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| Email | 5s | 50% | 60s |
+| S3 | 30s | 50% | 30s |
+| SMS | 10s | 50% | 120s |
 
-  s3: new Opossum(s3.upload, {
-    timeout: 30000,
-    errorThresholdPercentage: 50,
-    resetTimeout: 30000
-  }),
+### Circuit Breaker States
 
-  sms: new Opossum(smsService.send, {
-    timeout: 10000,
-    errorThresholdPercentage: 50,
-    resetTimeout: 120000
-  })
-};
-
-// Log circuit breaker state changes
-circuitBreakers.s3.on('open', () => {
-  console.log('S3 circuit breaker opened');
-  metrics.increment('circuit_breaker_open', { service: 's3' });
-});
-
-circuitBreakers.s3.on('halfOpen', () => {
-  console.log('S3 circuit breaker half-open');
-});
-
-circuitBreakers.s3.on('close', () => {
-  console.log('S3 circuit breaker closed');
-});
-
-// Usage with fallback
-async function uploadWithFallback(key: string, body: Buffer) {
-  return circuitBreakers.s3.fire({ Bucket: 'documents', Key: key, Body: body })
-    .catch(async (error) => {
-      if (circuitBreakers.s3.opened) {
-        // Queue for retry when storage recovers
-        await queuePublisher.publishPDFJob({
-          type: 's3_upload_retry',
-          key,
-          body: body.toString('base64')
-        });
-        return { queued: true };
-      }
-      throw error;
-    });
-}
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Circuit Breaker States                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│    CLOSED ────────▶ OPEN ────────▶ HALF-OPEN                        │
+│       │               │               │                              │
+│   (normal)      (50% failures)   (after reset                        │
+│       ▲               │            timeout)                          │
+│       │               │               │                              │
+│       └───────────────┴───────────────┘                              │
+│            (on success in half-open)                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Fallback Strategy
+
+"When S3 circuit breaker is open, queue uploads for retry when storage recovers. Return {queued: true} to client."
 
 ---
 
 ## 10. Certificate of Completion (3 minutes)
 
-```typescript
-async function generateCertificate(envelopeId: string) {
-  const events = await db.query(`
-    SELECT * FROM audit_events
-    WHERE envelope_id = $1
-    ORDER BY timestamp ASC
-  `, [envelopeId]);
+### Certificate Generation Flow
 
-  // Verify chain integrity
-  const chainVerification = await auditService.verifyChain(envelopeId);
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                Certificate of Completion                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. Fetch all audit events for envelope                              │
+│  2. Verify hash chain integrity                                      │
+│  3. Build certificate object:                                        │
+│     ├── envelopeId, documentName, completedAt                        │
+│     ├── signers: [{ name, email, signedAt, ipAddress }]              │
+│     ├── events: [{ time, action, actor, details }]                   │
+│     ├── chainVerified: true/false                                    │
+│     └── integrityHash: final event hash                              │
+│  4. Render certificate as PDF                                        │
+│  5. Store in S3: envelopes/{id}/certificate.pdf                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-  const certificate = {
-    envelopeId,
-    documentName: await getDocumentName(envelopeId),
-    completedAt: new Date().toISOString(),
-    signers: [],
-    events: events.rows.map(e => ({
-      time: e.timestamp,
-      action: e.event_type,
-      actor: e.actor,
-      details: formatEventDetails(e)
-    })),
-    chainVerified: chainVerification.valid,
-    integrityHash: events.rows[events.rows.length - 1]?.hash
-  };
+### Certificate Contents
 
-  // Add signer details
-  const recipients = await db.query(`
-    SELECT * FROM recipients WHERE envelope_id = $1 AND status = 'completed'
-  `, [envelopeId]);
-
-  for (const r of recipients.rows) {
-    certificate.signers.push({
-      name: r.name,
-      email: r.email,
-      signedAt: r.completed_at,
-      ipAddress: r.ip_address
-    });
-  }
-
-  // Generate PDF certificate
-  const pdfBytes = await renderCertificatePDF(certificate);
-
-  await s3.upload({
-    Bucket: 'docusign-documents',
-    Key: `envelopes/${envelopeId}/certificate.pdf`,
-    Body: pdfBytes,
-    ContentType: 'application/pdf'
-  }).promise();
-
-  return certificate;
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Certificate Structure                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Document: [Document Name]                                           │
+│  Completed: [Timestamp]                                              │
+│  Integrity Hash: [SHA-256]                                           │
+│  Chain Verified: Yes/No                                              │
+│                                                                      │
+│  Signers:                                                            │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ Name        │ Email           │ Signed At    │ IP Address  │    │
+│  ├─────────────┼─────────────────┼──────────────┼─────────────┤    │
+│  │ John Doe    │ john@example.com│ 2024-01-15   │ 192.168.1.1 │    │
+│  │ Jane Smith  │ jane@example.com│ 2024-01-16   │ 10.0.0.1    │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Audit Trail:                                                        │
+│  [Timestamp] envelope_created by sender@example.com                  │
+│  [Timestamp] envelope_sent                                           │
+│  [Timestamp] recipient_viewed by john@example.com from IP           │
+│  [Timestamp] signature_captured                                      │
+│  [Timestamp] recipient_completed                                     │
+│  [Timestamp] envelope_completed                                      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -895,7 +622,7 @@ async function generateCertificate(envelopeId: string) {
 
 ## Summary
 
-This DocuSign backend design demonstrates:
+"This DocuSign backend design demonstrates:
 
 1. **Workflow State Machine**: Explicit transitions prevent invalid states
 2. **Tamper-Proof Audit**: Hash chain provides legal defensibility
@@ -905,4 +632,4 @@ This DocuSign backend design demonstrates:
 6. **Circuit Breakers**: Protect against external service failures
 7. **Certificate Generation**: Complete signing record with integrity proof
 
-The design prioritizes legal compliance - every action is logged, hashed, and verifiable years after signing.
+The design prioritizes legal compliance - every action is logged, hashed, and verifiable years after signing."

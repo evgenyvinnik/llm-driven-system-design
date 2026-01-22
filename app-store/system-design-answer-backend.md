@@ -32,6 +32,8 @@ Design the backend infrastructure for the App Store, Apple's digital marketplace
 - 10 billion downloads/year (~300 downloads/second average)
 - Thousands of new app submissions daily
 
+---
+
 ## High-Level Architecture
 
 ```
@@ -66,773 +68,633 @@ Design the backend infrastructure for the App Store, Apple's digital marketplace
 └─────────────────┴───────────────────┴───────────────────────────┘
 ```
 
+---
+
 ## Deep Dive: Database Schema Design
 
-### Core Tables
+### Core Tables Structure
 
-```sql
--- Developers
-CREATE TABLE developers (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id),
-  company_name VARCHAR(200) NOT NULL,
-  website VARCHAR(500),
-  verified BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Apps with ranking metadata
-CREATE TABLE apps (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  bundle_id VARCHAR(200) UNIQUE NOT NULL,
-  name VARCHAR(200) NOT NULL,
-  developer_id UUID REFERENCES developers(id),
-  category VARCHAR(100),
-  subcategory VARCHAR(100),
-  description TEXT,
-  version VARCHAR(50),
-  size_bytes BIGINT,
-  age_rating VARCHAR(20),
-  is_free BOOLEAN DEFAULT TRUE,
-
-  -- Aggregated metrics for ranking
-  download_count BIGINT DEFAULT 0,
-  rating_sum DECIMAL DEFAULT 0,
-  rating_count INTEGER DEFAULT 0,
-  average_rating DECIMAL GENERATED ALWAYS AS (
-    CASE WHEN rating_count > 0 THEN rating_sum / rating_count ELSE 0 END
-  ) STORED,
-
-  -- Engagement metrics from analytics
-  dau INTEGER DEFAULT 0,
-  mau INTEGER DEFAULT 0,
-  day7_retention DECIMAL DEFAULT 0,
-  avg_session_minutes DECIMAL DEFAULT 0,
-
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_apps_category ON apps(category);
-CREATE INDEX idx_apps_developer ON apps(developer_id);
-CREATE INDEX idx_apps_ranking ON apps(category, download_count DESC);
-
--- Reviews with integrity scoring
-CREATE TABLE reviews (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id),
-  app_id UUID REFERENCES apps(id),
-  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
-  title VARCHAR(200),
-  body TEXT,
-
-  -- Integrity analysis
-  integrity_score DECIMAL,
-  integrity_signals JSONB,
-  status VARCHAR(20) DEFAULT 'pending', -- pending, approved, rejected
-
-  -- Developer response
-  developer_response TEXT,
-  developer_response_at TIMESTAMP,
-
-  created_at TIMESTAMP DEFAULT NOW(),
-
-  UNIQUE(user_id, app_id) -- One review per user per app
-);
-
-CREATE INDEX idx_reviews_app ON reviews(app_id, created_at DESC);
-CREATE INDEX idx_reviews_status ON reviews(status) WHERE status = 'pending';
-
--- Precomputed daily rankings
-CREATE TABLE rankings (
-  date DATE,
-  country VARCHAR(2),
-  category VARCHAR(100),
-  rank_type VARCHAR(20), -- 'free', 'paid', 'grossing'
-  app_id UUID REFERENCES apps(id),
-  rank INTEGER,
-  score DECIMAL,
-  PRIMARY KEY (date, country, category, rank_type, app_id)
-);
-
--- Purchase with receipt data
-CREATE TABLE purchases (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id),
-  app_id UUID REFERENCES apps(id),
-  price_id UUID REFERENCES app_prices(id),
-  amount DECIMAL NOT NULL,
-  currency VARCHAR(3) NOT NULL,
-  payment_provider_id VARCHAR(100),
-  receipt_data TEXT,
-  purchased_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP -- For subscriptions
-);
-
-CREATE INDEX idx_purchases_user ON purchases(user_id);
-CREATE INDEX idx_purchases_app_user ON purchases(app_id, user_id);
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                         DEVELOPERS                               │
+├─────────────────────────────────────────────────────────────────┤
+│ id (UUID PK)  │ user_id (FK) │ company_name │ verified │ ...    │
+└───────────────┬─────────────────────────────────────────────────┘
+                │ 1:N
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                            APPS                                  │
+├─────────────────────────────────────────────────────────────────┤
+│ id (UUID PK)      │ bundle_id (UNIQUE)    │ name               │
+│ developer_id (FK) │ category              │ subcategory        │
+│ description       │ version               │ size_bytes         │
+│ is_free           │ age_rating            │                    │
+├─────────────────────────────────────────────────────────────────┤
+│           AGGREGATED METRICS (for ranking)                      │
+├─────────────────────────────────────────────────────────────────┤
+│ download_count    │ rating_sum            │ rating_count       │
+│ average_rating    │ (computed column)     │                    │
+├─────────────────────────────────────────────────────────────────┤
+│           ENGAGEMENT METRICS (from analytics)                   │
+├─────────────────────────────────────────────────────────────────┤
+│ dau               │ mau                   │ day7_retention     │
+│ avg_session_min   │                       │                    │
+└───────────────────┬─────────────────────────────────────────────┘
+                    │ 1:N
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                          REVIEWS                                 │
+├─────────────────────────────────────────────────────────────────┤
+│ id (UUID PK)      │ user_id (FK)          │ app_id (FK)        │
+│ rating (1-5)      │ title                 │ body               │
+├─────────────────────────────────────────────────────────────────┤
+│           INTEGRITY ANALYSIS                                    │
+├─────────────────────────────────────────────────────────────────┤
+│ integrity_score   │ integrity_signals     │ status             │
+│ (DECIMAL)         │ (JSONB)               │ (pending/approved) │
+├─────────────────────────────────────────────────────────────────┤
+│           DEVELOPER RESPONSE                                    │
+├─────────────────────────────────────────────────────────────────┤
+│ developer_response │ developer_response_at │                   │
+└───────────────────┬─────────────────────────────────────────────┘
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+┌───────────────┐       ┌───────────────────────────────────────┐
+│   RANKINGS    │       │              PURCHASES                │
+├───────────────┤       ├───────────────────────────────────────┤
+│ date          │       │ id (UUID PK)    │ user_id (FK)        │
+│ country       │       │ app_id (FK)     │ price_id (FK)       │
+│ category      │       │ amount          │ currency            │
+│ rank_type     │       │ payment_id      │ receipt_data        │
+│ app_id (FK)   │       │ purchased_at    │ expires_at          │
+│ rank          │       └───────────────────────────────────────┘
+│ score         │
+└───────────────┘
+
+INDEXES:
+├── idx_apps_category ON apps(category)
+├── idx_apps_developer ON apps(developer_id)
+├── idx_apps_ranking ON apps(category, download_count DESC)
+├── idx_reviews_app ON reviews(app_id, created_at DESC)
+├── idx_reviews_status ON reviews(status) WHERE status = 'pending'
+├── idx_purchases_user ON purchases(user_id)
+└── idx_purchases_app_user ON purchases(app_id, user_id)
+```
+
+---
 
 ## Deep Dive: Multi-Signal Ranking Algorithm
 
-### Ranking Service Implementation
+### Ranking Signal Weights
 
-```typescript
-interface RankingSignals {
-  downloadVelocity: number;
-  ratingScore: number;
-  engagementScore: number;
-  revenueScore: number;
-  freshnessScore: number;
-}
-
-class RankingService {
-  private readonly WEIGHTS = {
-    downloadVelocity: 0.30,
-    ratingScore: 0.25,
-    engagementScore: 0.20,
-    revenueScore: 0.15,
-    freshnessScore: 0.10,
-  };
-
-  async computeRankings(category: string, country: string): Promise<void> {
-    const apps = await this.getAppsInCategory(category, country);
-    const categoryMedian = await this.getCategoryDownloadMedian(category);
-
-    const rankedApps = apps.map(app => {
-      const signals = this.computeSignals(app, categoryMedian);
-      const score = this.computeFinalScore(signals);
-      return { appId: app.id, score, signals };
-    });
-
-    // Sort and persist rankings
-    rankedApps.sort((a, b) => b.score - a.score);
-
-    await db.query(`
-      INSERT INTO rankings (date, country, category, rank_type, app_id, rank, score)
-      SELECT
-        CURRENT_DATE, $1, $2, 'free',
-        unnest($3::uuid[]),
-        generate_series(1, array_length($3, 1)),
-        unnest($4::decimal[])
-      ON CONFLICT (date, country, category, rank_type, app_id)
-      DO UPDATE SET rank = EXCLUDED.rank, score = EXCLUDED.score
-    `, [country, category, rankedApps.map(r => r.appId), rankedApps.map(r => r.score)]);
-  }
-
-  private computeSignals(app: App, categoryMedian: number): RankingSignals {
-    return {
-      downloadVelocity: this.computeDownloadVelocity(app, categoryMedian),
-      ratingScore: this.computeBayesianRating(app),
-      engagementScore: this.computeEngagement(app),
-      revenueScore: this.computeRevenue(app),
-      freshnessScore: this.computeFreshness(app),
-    };
-  }
-
-  /**
-   * Download velocity with exponential decay
-   * Recent downloads weighted more heavily to catch trends
-   */
-  private computeDownloadVelocity(app: App, categoryMedian: number): number {
-    const now = Date.now();
-    let weightedDownloads = 0;
-
-    for (const day of app.dailyDownloads) {
-      const daysAgo = (now - day.date.getTime()) / (24 * 60 * 60 * 1000);
-      // Half-life of 1 week
-      const weight = Math.exp(-daysAgo / 7);
-      weightedDownloads += day.count * weight;
-    }
-
-    // Normalize by category median to compare fairly
-    return Math.log1p(weightedDownloads / Math.max(categoryMedian, 1));
-  }
-
-  /**
-   * Bayesian average rating
-   * Prevents gaming with early fake reviews
-   */
-  private computeBayesianRating(app: App): number {
-    const C = 100;  // Confidence parameter (prior weight)
-    const m = 3.5;  // Global average rating
-
-    const bayesianRating = (C * m + app.ratingSum) / (C + app.ratingCount);
-
-    // Penalize apps with very few ratings
-    const countMultiplier = Math.min(1, app.ratingCount / 50);
-
-    return (bayesianRating / 5.0) * countMultiplier;
-  }
-
-  /**
-   * Engagement metrics are harder to fake
-   * Requires real user behavior
-   */
-  private computeEngagement(app: App): number {
-    const dauMauRatio = app.dau / Math.max(app.mau, 1);
-    const sessionScore = Math.min(app.avgSessionMinutes / 10, 1);
-    const retentionScore = app.day7Retention;
-
-    return dauMauRatio * 0.4 + sessionScore * 0.3 + retentionScore * 0.3;
-  }
-
-  private computeFinalScore(signals: RankingSignals): number {
-    return Object.entries(this.WEIGHTS).reduce((sum, [signal, weight]) => {
-      return sum + signals[signal as keyof RankingSignals] * weight;
-    }, 0);
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RANKING SCORE COMPUTATION                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   FINAL_SCORE = Σ (signal_value × weight)                       │
+│                                                                 │
+│   ┌───────────────────────────┬────────┬───────────────────┐   │
+│   │ Signal                    │ Weight │ Purpose            │   │
+│   ├───────────────────────────┼────────┼───────────────────┤   │
+│   │ Download Velocity         │  0.30  │ Trending apps      │   │
+│   │ Rating Score (Bayesian)   │  0.25  │ User satisfaction  │   │
+│   │ Engagement Score          │  0.20  │ Real usage metrics │   │
+│   │ Revenue Score             │  0.15  │ Commercial success │   │
+│   │ Freshness Score           │  0.10  │ Recent updates     │   │
+│   └───────────────────────────┴────────┴───────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Download Velocity Computation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              DOWNLOAD VELOCITY (Exponential Decay)               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   FOR each day in app.dailyDownloads:                           │
+│       daysAgo = (now - day.date) / (24 × 60 × 60 × 1000)        │
+│       weight = exp(-daysAgo / 7)    ◀── Half-life of 1 week    │
+│       weightedDownloads += day.count × weight                   │
+│                                                                 │
+│   RETURN log1p(weightedDownloads / max(categoryMedian, 1))      │
+│                    ▲                                            │
+│                    └── Normalize by category for fair comparison│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Bayesian Average Rating
+
+"We use Bayesian averaging to prevent gaming with early fake reviews. Apps with few ratings get pulled toward the global average until they accumulate enough legitimate reviews."
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BAYESIAN RATING FORMULA                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   C = 100          ◀── Confidence parameter (prior weight)     │
+│   m = 3.5          ◀── Global average rating                   │
+│                                                                 │
+│   bayesianRating = (C × m + ratingSum) / (C + ratingCount)      │
+│                                                                 │
+│   countMultiplier = min(1, ratingCount / 50)                    │
+│                            ▲                                    │
+│                            └── Penalize apps with few ratings   │
+│                                                                 │
+│   FINAL = (bayesianRating / 5.0) × countMultiplier              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Engagement Score (Hard to Fake)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ENGAGEMENT COMPUTATION                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   "Engagement metrics are harder to fake - they require         │
+│    real user behavior, not just downloads or reviews."          │
+│                                                                 │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ Component              │ Weight │ Calculation          │   │
+│   ├────────────────────────┼────────┼──────────────────────┤   │
+│   │ DAU/MAU Ratio          │  0.40  │ dau / max(mau, 1)    │   │
+│   │ Session Duration       │  0.30  │ min(avgMin / 10, 1)  │   │
+│   │ Day-7 Retention        │  0.30  │ day7Retention        │   │
+│   └────────────────────────┴────────┴──────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Review Integrity System
 
 ### Multi-Signal Fake Review Detection
 
-```typescript
-interface IntegritySignal {
-  name: string;
-  score: number;  // 0.0 = suspicious, 1.0 = legitimate
-  weight: number;
-  reason?: string;
-}
-
-class ReviewIntegrityService {
-  async analyzeReview(
-    review: ReviewSubmission,
-    userId: string,
-    appId: string
-  ): Promise<IntegrityResult> {
-    const signals: IntegritySignal[] = [];
-
-    // 1. Review velocity - suspicious if many reviews in short time
-    const userReviews = await this.getUserRecentReviews(userId, 24);
-    signals.push({
-      name: 'review_velocity',
-      score: this.checkVelocity(userReviews),
-      weight: 0.15,
-    });
-
-    // 2. Content quality - check for generic/templated content
-    signals.push({
-      name: 'content_quality',
-      score: await this.analyzeContent(review.body),
-      weight: 0.25,
-    });
-
-    // 3. Account age - new accounts are more suspicious
-    const accountAge = await this.getAccountAge(userId);
-    signals.push({
-      name: 'account_age',
-      score: Math.min(accountAge / 30, 1), // Full trust after 30 days
-      weight: 0.10,
-    });
-
-    // 4. Verified purchase - did user actually download the app?
-    const hasPurchased = await this.verifyPurchase(userId, appId);
-    signals.push({
-      name: 'verified_purchase',
-      score: hasPurchased ? 1.0 : 0.3,
-      weight: 0.20,
-    });
-
-    // 5. Coordination detection - review bombing patterns
-    signals.push({
-      name: 'coordination',
-      score: await this.checkCoordination(appId, review),
-      weight: 0.20,
-    });
-
-    // 6. Text originality - similarity to other reviews
-    signals.push({
-      name: 'originality',
-      score: await this.checkOriginality(review.body, appId),
-      weight: 0.10,
-    });
-
-    const integrityScore = signals.reduce(
-      (sum, s) => sum + s.score * s.weight, 0
-    );
-
-    return {
-      integrityScore,
-      signals,
-      action: this.determineAction(integrityScore),
-    };
-  }
-
-  private checkVelocity(recentReviews: Review[]): number {
-    if (recentReviews.length > 5) return 0.2;  // Very suspicious
-    if (recentReviews.length > 2) return 0.6;  // Somewhat suspicious
-    return 1.0;
-  }
-
-  private async analyzeContent(text: string): Promise<number> {
-    const genericPhrases = [
-      'great app', 'love it', 'best app ever',
-      'must download', 'amazing', 'awesome', '5 stars'
-    ];
-
-    const hasGeneric = genericPhrases.some(
-      p => text.toLowerCase().includes(p)
-    );
-
-    const lengthScore = Math.min(text.length / 100, 1);
-    const hasSpecifics = /\b(feature|update|version|bug|problem|solved|crash)\b/i.test(text);
-
-    return (
-      (hasGeneric ? 0.5 : 1.0) * 0.3 +
-      lengthScore * 0.3 +
-      (hasSpecifics ? 1.0 : 0.5) * 0.4
-    );
-  }
-
-  private async checkCoordination(appId: string, review: ReviewSubmission): Promise<number> {
-    const recentReviews = await this.getAppReviews(appId, 24);
-    const avgDailyReviews = await this.getAvgDailyReviews(appId);
-
-    // Spike detection: 5x normal volume is suspicious
-    if (recentReviews.length > avgDailyReviews * 5) {
-      return 0.3;
-    }
-
-    // Time clustering detection
-    const timestamps = recentReviews.map(r => r.createdAt.getTime());
-    const clustering = this.detectTimeClustering(timestamps);
-    if (clustering > 0.8) {
-      return 0.4;  // Coordinated timing
-    }
-
-    return 1.0;
-  }
-
-  private determineAction(score: number): 'approve' | 'manual_review' | 'reject' {
-    if (score < 0.3) return 'reject';
-    if (score < 0.6) return 'manual_review';
-    return 'approve';
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                  INTEGRITY ANALYSIS FLOW                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Review Submitted ──▶ Analyze 6 Signals ──▶ Compute Score      │
+│                                │                                │
+│                                ▼                                │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ Signal              │ Weight │ Description             │   │
+│   ├─────────────────────┼────────┼─────────────────────────┤   │
+│   │ Review Velocity     │  0.15  │ Many reviews = spam     │   │
+│   │ Content Quality     │  0.25  │ Generic phrase detect   │   │
+│   │ Account Age         │  0.10  │ New accounts suspicious │   │
+│   │ Verified Purchase   │  0.20  │ Actually downloaded?    │   │
+│   │ Coordination        │  0.20  │ Review bombing detect   │   │
+│   │ Originality         │  0.10  │ Similarity to others    │   │
+│   └─────────────────────┴────────┴─────────────────────────┘   │
+│                                │                                │
+│                                ▼                                │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ Score Range         │ Action                           │   │
+│   ├─────────────────────┼──────────────────────────────────┤   │
+│   │ < 0.3               │ REJECT automatically             │   │
+│   │ 0.3 - 0.6           │ MANUAL_REVIEW required           │   │
+│   │ > 0.6               │ APPROVE automatically            │   │
+│   └─────────────────────┴──────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Velocity Check Logic
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    VELOCITY SCORING                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   recentReviews = getUserRecentReviews(userId, 24 hours)        │
+│                                                                 │
+│   IF recentReviews.length > 5  ──▶ RETURN 0.2  (Very suspicious)│
+│   IF recentReviews.length > 2  ──▶ RETURN 0.6  (Somewhat sus)   │
+│   ELSE                         ──▶ RETURN 1.0  (Normal)         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Content Quality Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 CONTENT ANALYSIS SCORING                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   GENERIC PHRASES (red flags):                                  │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ "great app" │ "love it" │ "best app ever" │ "5 stars" │   │
+│   │ "must download" │ "amazing" │ "awesome"                │   │
+│   └────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│   SCORE COMPUTATION:                                            │
+│   ├── hasGeneric: contains generic phrase?  × 0.3              │
+│   │     IF yes → 0.5, IF no → 1.0                              │
+│   ├── lengthScore: min(text.length / 100, 1) × 0.3             │
+│   └── hasSpecifics: mentions feature/bug/crash? × 0.4          │
+│         IF yes → 1.0, IF no → 0.5                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Coordination Detection (Review Bombing)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  COORDINATION DETECTION                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   recentReviews = getAppReviews(appId, 24 hours)                │
+│   avgDaily = getAvgDailyReviews(appId)                          │
+│                                                                 │
+│   SPIKE DETECTION:                                              │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ IF recentReviews.length > avgDaily × 5                  │  │
+│   │     ──▶ RETURN 0.3 (Suspicious spike)                   │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   TIME CLUSTERING:                                              │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ clustering = detectTimeClustering(timestamps)            │  │
+│   │ IF clustering > 0.8                                      │  │
+│   │     ──▶ RETURN 0.4 (Coordinated timing)                 │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ELSE ──▶ RETURN 1.0 (Normal pattern)                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Elasticsearch Search Integration
 
-### Search Index Configuration
+### Index Configuration
 
-```typescript
-// Elasticsearch index mapping
-const appIndexMapping = {
-  settings: {
-    analysis: {
-      analyzer: {
-        app_analyzer: {
-          type: 'custom',
-          tokenizer: 'standard',
-          filter: ['lowercase', 'asciifolding', 'app_synonyms']
-        }
-      },
-      filter: {
-        app_synonyms: {
-          type: 'synonym',
-          synonyms: [
-            'photo,picture,image',
-            'video,movie,film',
-            'game,gaming',
-          ]
-        }
-      }
-    }
-  },
-  mappings: {
-    properties: {
-      id: { type: 'keyword' },
-      name: { type: 'text', analyzer: 'app_analyzer', boost: 3 },
-      developer: { type: 'text', analyzer: 'app_analyzer', boost: 2 },
-      description: { type: 'text', analyzer: 'app_analyzer' },
-      keywords: { type: 'text', analyzer: 'app_analyzer' },
-      category: { type: 'keyword' },
-      isFree: { type: 'boolean' },
-      averageRating: { type: 'float' },
-      ratingCount: { type: 'integer' },
-      downloads: { type: 'long' },
-      engagementScore: { type: 'float' },
-    }
-  }
-};
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 ELASTICSEARCH INDEX: apps                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   SETTINGS:                                                     │
+│   ├── analyzer: app_analyzer (custom)                           │
+│   │   ├── tokenizer: standard                                   │
+│   │   └── filters: lowercase, asciifolding, app_synonyms        │
+│   │                                                             │
+│   └── synonyms:                                                 │
+│       ├── photo, picture, image                                 │
+│       ├── video, movie, film                                    │
+│       └── game, gaming                                          │
+│                                                                 │
+│   FIELD MAPPINGS:                                               │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ Field           │ Type    │ Boost │ Analyzer            │  │
+│   ├─────────────────┼─────────┼───────┼─────────────────────┤  │
+│   │ id              │ keyword │   -   │ -                   │  │
+│   │ name            │ text    │   3   │ app_analyzer        │  │
+│   │ developer       │ text    │   2   │ app_analyzer        │  │
+│   │ description     │ text    │   1   │ app_analyzer        │  │
+│   │ keywords        │ text    │   1   │ app_analyzer        │  │
+│   │ category        │ keyword │   -   │ -                   │  │
+│   │ isFree          │ boolean │   -   │ -                   │  │
+│   │ averageRating   │ float   │   -   │ -                   │  │
+│   │ downloads       │ long    │   -   │ -                   │  │
+│   │ engagementScore │ float   │   -   │ -                   │  │
+│   └─────────────────┴─────────┴───────┴─────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Search with Quality Re-ranking
 
-```typescript
-class SearchService {
-  async search(query: string, options: SearchOptions = {}): Promise<App[]> {
-    const { category, price, rating, limit = 20 } = options;
+"We fetch more results than needed, then re-rank combining text relevance with quality signals. This prevents low-quality apps from ranking high just because of keyword stuffing."
 
-    const esQuery = {
-      bool: {
-        must: [{
-          multi_match: {
-            query,
-            fields: ['name^3', 'developer^2', 'description', 'keywords'],
-            type: 'best_fields',
-            fuzziness: 'AUTO',  // Typo tolerance
-          }
-        }],
-        filter: this.buildFilters(options),
-      }
-    };
-
-    const results = await this.elasticsearch.search({
-      index: 'apps',
-      body: {
-        query: esQuery,
-        size: limit * 2,  // Fetch extra for re-ranking
-      }
-    });
-
-    // Re-rank combining text relevance with quality signals
-    return this.rerank(results.hits.hits, query).slice(0, limit);
-  }
-
-  private buildFilters(options: SearchOptions): object[] {
-    const filters: object[] = [];
-
-    if (options.category) {
-      filters.push({ term: { category: options.category } });
-    }
-    if (options.price === 'free') {
-      filters.push({ term: { isFree: true } });
-    }
-    if (options.rating) {
-      filters.push({ range: { averageRating: { gte: options.rating } } });
-    }
-
-    return filters;
-  }
-
-  private rerank(hits: EsHit[], query: string): App[] {
-    return hits
-      .map(hit => {
-        const app = hit._source;
-        const textScore = hit._score;
-
-        // Quality signals (harder to game)
-        const qualityScore =
-          app.averageRating * 0.3 +
-          Math.log1p(app.ratingCount) * 0.2 +
-          Math.log1p(app.downloads) * 0.3 +
-          app.engagementScore * 0.2;
-
-        // Combine: 60% text relevance, 40% quality
-        const finalScore = textScore * 0.6 + qualityScore * 0.4;
-
-        return { ...app, score: finalScore };
-      })
-      .sort((a, b) => b.score - a.score);
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SEARCH FLOW                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Query: "photo editor"                                         │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ ELASTICSEARCH QUERY                                      │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ multi_match:                                             │  │
+│   │   query: "photo editor"                                  │  │
+│   │   fields: [name^3, developer^2, description, keywords]   │  │
+│   │   type: best_fields                                      │  │
+│   │   fuzziness: AUTO  ◀── Typo tolerance                   │  │
+│   │                                                          │  │
+│   │ filters:                                                 │  │
+│   │   category: "Photo & Video" (if specified)               │  │
+│   │   isFree: true (if specified)                           │  │
+│   │   averageRating: >= 4.0 (if specified)                  │  │
+│   │                                                          │  │
+│   │ size: limit × 2  ◀── Fetch extra for re-ranking         │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ RE-RANKING                                               │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │                                                          │  │
+│   │ qualityScore =                                           │  │
+│   │   averageRating      × 0.3                               │  │
+│   │ + log1p(ratingCount) × 0.2                               │  │
+│   │ + log1p(downloads)   × 0.3                               │  │
+│   │ + engagementScore    × 0.2                               │  │
+│   │                                                          │  │
+│   │ finalScore = textScore × 0.6 + qualityScore × 0.4        │  │
+│   │              ▲                                           │  │
+│   │              └── 60% relevance, 40% quality              │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼                                            │
+│   Return top N results sorted by finalScore                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Purchase Idempotency
 
-### Redis-Backed Idempotency
+### Three-Layer Protection
 
-```typescript
-class PurchaseService {
-  async purchaseApp(
-    userId: string,
-    appId: string,
-    priceId: string,
-    idempotencyKey: string
-  ): Promise<PurchaseResult> {
-    // Layer 1: Check for cached result
-    const cachedResult = await redis.get(`idem:purchase:${userId}:${idempotencyKey}`);
-    if (cachedResult) {
-      logger.info('Returning cached purchase result', { idempotencyKey });
-      return JSON.parse(cachedResult);
-    }
+"Purchase operations require idempotency to handle network failures and retries safely. We use three layers: Redis cache, distributed lock, and database constraint."
 
-    // Layer 2: Acquire lock to prevent concurrent duplicates
-    const lockKey = `lock:purchase:${userId}:${idempotencyKey}`;
-    const lockAcquired = await redis.set(lockKey, '1', 'NX', 'EX', 30);
-    if (!lockAcquired) {
-      throw new ConflictError('Purchase already in progress');
-    }
-
-    try {
-      // Layer 3: Database-level duplicate check
-      const existingPurchase = await db.query(`
-        SELECT id FROM purchases
-        WHERE user_id = $1 AND app_id = $2 AND purchased_at > NOW() - INTERVAL '1 hour'
-      `, [userId, appId]);
-
-      if (existingPurchase.rows.length > 0) {
-        throw new AlreadyPurchasedError('App already purchased');
-      }
-
-      // Process payment
-      const payment = await this.paymentService.charge(userId, priceId);
-
-      // Create purchase in transaction
-      const purchase = await db.transaction(async (tx) => {
-        const [purchase] = await tx.query(`
-          INSERT INTO purchases (user_id, app_id, price_id, amount, currency, payment_provider_id)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          RETURNING *
-        `, [userId, appId, priceId, payment.amount, payment.currency, payment.id]);
-
-        await tx.query(`
-          INSERT INTO user_apps (user_id, app_id, purchased_at)
-          VALUES ($1, $2, NOW())
-        `, [userId, appId]);
-
-        await tx.query(`
-          UPDATE apps SET download_count = download_count + 1 WHERE id = $1
-        `, [appId]);
-
-        return purchase;
-      });
-
-      const result = {
-        purchase,
-        receipt: await this.generateReceipt(purchase),
-      };
-
-      // Cache result for idempotency (24 hour window)
-      await redis.setex(
-        `idem:purchase:${userId}:${idempotencyKey}`,
-        86400,
-        JSON.stringify(result)
-      );
-
-      // Publish event for async processing
-      await this.messageQueue.publish('purchase.completed', {
-        purchaseId: purchase.id,
-        userId,
-        appId,
-        amount: payment.amount,
-      });
-
-      return result;
-    } finally {
-      await redis.del(lockKey);
-    }
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                 PURCHASE FLOW (3-Layer Idempotency)              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Request: purchaseApp(userId, appId, priceId, idempotencyKey)  │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ LAYER 1: Redis Cache Check                               │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ GET idem:purchase:{userId}:{idempotencyKey}              │  │
+│   │                                                          │  │
+│   │ IF cached ──▶ RETURN cached result (no reprocessing)     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼ (not cached)                               │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ LAYER 2: Distributed Lock                                │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ SET lock:purchase:{userId}:{idempotencyKey} "1" NX EX 30 │  │
+│   │                                                          │  │
+│   │ IF not acquired ──▶ THROW ConflictError                  │  │
+│   │    "Purchase already in progress"                        │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼ (lock acquired)                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ LAYER 3: Database Duplicate Check                        │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ SELECT id FROM purchases                                 │  │
+│   │ WHERE user_id = $1 AND app_id = $2                       │  │
+│   │   AND purchased_at > NOW() - INTERVAL '1 hour'           │  │
+│   │                                                          │  │
+│   │ IF exists ──▶ THROW AlreadyPurchasedError                │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼ (no duplicate)                             │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ PROCESS PURCHASE                                         │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ 1. Charge payment via paymentService                     │  │
+│   │ 2. BEGIN TRANSACTION                                     │  │
+│   │    ├── INSERT INTO purchases                             │  │
+│   │    ├── INSERT INTO user_apps                             │  │
+│   │    └── UPDATE apps SET download_count += 1               │  │
+│   │ 3. COMMIT TRANSACTION                                    │  │
+│   │ 4. Generate receipt                                      │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ POST-PROCESSING                                          │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ • SETEX result in Redis (24h TTL) for idempotency        │  │
+│   │ • PUBLISH "purchase.completed" to RabbitMQ               │  │
+│   │ • DELETE lock key                                        │  │
+│   │ • RETURN { purchase, receipt }                           │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Async Processing with RabbitMQ
 
-### Queue Architecture
+### Queue Configuration
 
-```typescript
-// Queue configuration
-const queues = {
-  'review.created': {
-    durable: true,
-    deadLetterExchange: 'app-store.dlx',
-    messageTtl: 86400000,  // 24 hours
-  },
-  'purchase.completed': {
-    durable: true,
-    deadLetterExchange: 'app-store.dlx',
-    messageTtl: 604800000,  // 7 days (critical for payouts)
-  },
-  'ranking.compute': {
-    durable: true,
-    maxPriority: 10,
-  },
-  'search.reindex': {
-    durable: true,
-    prefetch: 5,  // Batch ES updates
-  },
-};
-
-// Worker: Review integrity analysis
-async function startReviewWorker() {
-  const channel = await connection.createChannel();
-  await channel.prefetch(1);  // ML inference is slow
-
-  await channel.consume('review.created', async (msg) => {
-    const event = JSON.parse(msg.content.toString());
-
-    try {
-      // Deduplication check
-      const processed = await redis.get(`processed:review:${event.eventId}`);
-      if (processed) {
-        channel.ack(msg);
-        return;
-      }
-
-      // Run integrity analysis
-      const result = await reviewIntegrityService.analyzeReview(
-        event.data.review,
-        event.data.userId,
-        event.data.appId
-      );
-
-      // Update review status
-      await db.query(`
-        UPDATE reviews
-        SET integrity_score = $1, integrity_signals = $2, status = $3
-        WHERE id = $4
-      `, [result.integrityScore, result.signals, result.action, event.data.reviewId]);
-
-      // Mark as processed
-      await redis.setex(`processed:review:${event.eventId}`, 86400, '1');
-
-      channel.ack(msg);
-    } catch (error) {
-      const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
-      if (retryCount <= 3) {
-        // Exponential backoff retry
-        setTimeout(() => {
-          channel.publish('', 'review.created', msg.content, {
-            headers: { 'x-retry-count': retryCount }
-          });
-          channel.ack(msg);
-        }, Math.pow(2, retryCount) * 1000);
-      } else {
-        channel.nack(msg, false, false);  // Send to DLQ
-      }
-    }
-  });
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                      MESSAGE QUEUES                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ Queue             │ TTL      │ Notes                    │  │
+│   ├───────────────────┼──────────┼──────────────────────────┤  │
+│   │ review.created    │ 24 hours │ Integrity analysis       │  │
+│   │ purchase.completed│ 7 days   │ Critical for payouts     │  │
+│   │ ranking.compute   │ -        │ Priority queue (0-10)    │  │
+│   │ search.reindex    │ -        │ Prefetch: 5 (batch ES)   │  │
+│   └───────────────────┴──────────┴──────────────────────────┘  │
+│                                                                 │
+│   All queues: durable = true, deadLetterExchange = app-store.dlx│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Review Worker Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   REVIEW WORKER FLOW                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   consume("review.created", prefetch: 1)  ◀── ML inference slow │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ DEDUPLICATION CHECK                                      │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ GET processed:review:{eventId}                           │  │
+│   │ IF exists ──▶ ACK message (already processed)            │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼ (not processed)                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ RUN INTEGRITY ANALYSIS                                   │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ result = reviewIntegrityService.analyzeReview(           │  │
+│   │   review, userId, appId                                  │  │
+│   │ )                                                        │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ UPDATE REVIEW STATUS                                     │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ UPDATE reviews SET                                       │  │
+│   │   integrity_score = result.score,                        │  │
+│   │   integrity_signals = result.signals,                    │  │
+│   │   status = result.action                                 │  │
+│   │ WHERE id = reviewId                                      │  │
+│   │                                                          │  │
+│   │ SETEX processed:review:{eventId} 86400 "1"               │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                    │                                            │
+│                    ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ ERROR HANDLING                                           │  │
+│   ├─────────────────────────────────────────────────────────┤  │
+│   │ ON SUCCESS: ACK message                                  │  │
+│   │                                                          │  │
+│   │ ON ERROR:                                                │  │
+│   │   retryCount = headers['x-retry-count'] + 1              │  │
+│   │   IF retryCount <= 3                                     │  │
+│   │       setTimeout(exponentialBackoff) ──▶ Re-publish      │  │
+│   │   ELSE                                                   │  │
+│   │       NACK(requeue: false) ──▶ Send to DLQ               │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Circuit Breaker Pattern
 
-```typescript
-class CircuitBreaker {
-  private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
-  private failures = 0;
-  private lastFailure: number | null = null;
-
-  constructor(
-    private name: string,
-    private failureThreshold = 5,
-    private resetTimeout = 30000
-  ) {}
-
-  async execute<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.state === 'OPEN') {
-      if (Date.now() - (this.lastFailure || 0) > this.resetTimeout) {
-        this.state = 'HALF_OPEN';
-      } else {
-        throw new CircuitOpenError(`Circuit ${this.name} is OPEN`);
-      }
-    }
-
-    try {
-      const result = await operation();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-
-  private onSuccess(): void {
-    this.failures = 0;
-    this.state = 'CLOSED';
-  }
-
-  private onFailure(): void {
-    this.failures++;
-    this.lastFailure = Date.now();
-
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN';
-      metrics.circuitBreakerState.labels(this.name, 'OPEN').set(1);
-      logger.warn(`Circuit breaker ${this.name} opened`);
-    }
-  }
-}
-
-// Pre-configured breakers
-const esBreaker = new CircuitBreaker('elasticsearch', 3, 30000);
-const paymentBreaker = new CircuitBreaker('payment', 2, 60000);
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                   CIRCUIT BREAKER STATES                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│            ┌──────────┐         ┌──────────┐                   │
+│            │  CLOSED  │◀───────▶│   OPEN   │                   │
+│            └────┬─────┘         └────┬─────┘                   │
+│                 │                    │                          │
+│                 │   ┌───────────┐    │                          │
+│                 └──▶│ HALF_OPEN │◀───┘                          │
+│                     └───────────┘                               │
+│                                                                 │
+│   CLOSED → OPEN:                                                │
+│     failures >= failureThreshold                                │
+│                                                                 │
+│   OPEN → HALF_OPEN:                                             │
+│     now - lastFailure > resetTimeout                            │
+│                                                                 │
+│   HALF_OPEN → CLOSED:                                           │
+│     next request succeeds                                       │
+│                                                                 │
+│   HALF_OPEN → OPEN:                                             │
+│     next request fails                                          │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│   PRE-CONFIGURED BREAKERS                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌───────────────┬──────────────────┬───────────────┐         │
+│   │ Service       │ Failure Threshold │ Reset Timeout │         │
+│   ├───────────────┼──────────────────┼───────────────┤         │
+│   │ Elasticsearch │ 3 failures        │ 30 seconds    │         │
+│   │ Payment       │ 2 failures        │ 60 seconds    │         │
+│   └───────────────┴──────────────────┴───────────────┘         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Deep Dive: Observability
 
 ### Prometheus Metrics
 
-```typescript
-import { Counter, Histogram, Gauge } from 'prom-client';
-
-// Request metrics
-const httpRequestDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
-});
-
-// Business metrics
-const purchasesTotal = new Counter({
-  name: 'purchases_total',
-  help: 'Total purchases processed',
-  labelNames: ['status', 'country'],
-});
-
-const reviewsAnalyzed = new Counter({
-  name: 'reviews_analyzed_total',
-  help: 'Total reviews analyzed for integrity',
-  labelNames: ['action'],  // approve, reject, manual_review
-});
-
-const searchLatency = new Histogram({
-  name: 'search_latency_seconds',
-  help: 'Search query latency',
-  labelNames: ['has_filters'],
-  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5],
-});
-
-// Infrastructure metrics
-const esCircuitState = new Gauge({
-  name: 'circuit_breaker_state',
-  help: 'Circuit breaker state (0=closed, 1=open, 0.5=half_open)',
-  labelNames: ['name'],
-});
-
-const queueDepth = new Gauge({
-  name: 'rabbitmq_queue_depth',
-  help: 'Number of messages in queue',
-  labelNames: ['queue'],
-});
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    METRICS COLLECTION                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   REQUEST METRICS (Histogram):                                  │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ http_request_duration_seconds                            │  │
+│   │   labels: [method, route, status]                        │  │
+│   │   buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5]          │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   BUSINESS METRICS (Counter):                                   │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ purchases_total                                          │  │
+│   │   labels: [status, country]                              │  │
+│   │                                                          │  │
+│   │ reviews_analyzed_total                                   │  │
+│   │   labels: [action]  ── approve, reject, manual_review    │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   LATENCY METRICS (Histogram):                                  │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ search_latency_seconds                                   │  │
+│   │   labels: [has_filters]                                  │  │
+│   │   buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5]           │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   INFRASTRUCTURE METRICS (Gauge):                               │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ circuit_breaker_state                                    │  │
+│   │   labels: [name]                                         │  │
+│   │   values: 0=closed, 0.5=half_open, 1=open                │  │
+│   │                                                          │  │
+│   │ rabbitmq_queue_depth                                     │  │
+│   │   labels: [queue]                                        │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Structured Logging
 
-```typescript
-import pino from 'pino';
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label }),
-  },
-});
-
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
-  req.log = logger.child({ requestId, userId: req.session?.userId });
-
-  const start = Date.now();
-  res.on('finish', () => {
-    req.log.info({
-      method: req.method,
-      path: req.path,
-      status: res.statusCode,
-      duration: Date.now() - start,
-    }, 'request completed');
-  });
-
-  next();
-});
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    REQUEST LOGGING                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Logger: pino (JSON format)                                    │
+│                                                                 │
+│   Each request:                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ {                                                        │  │
+│   │   "level": "info",                                       │  │
+│   │   "requestId": "uuid-from-x-request-id-or-generated",    │  │
+│   │   "userId": "session-user-id",                           │  │
+│   │   "method": "POST",                                      │  │
+│   │   "path": "/api/v1/reviews",                             │  │
+│   │   "status": 201,                                         │  │
+│   │   "duration": 45,                                        │  │
+│   │   "msg": "request completed"                             │  │
+│   │ }                                                        │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Trade-offs Summary
 
@@ -844,6 +706,8 @@ app.use((req, res, next) => {
 | Message queue | RabbitMQ | Kafka | Simpler for moderate scale |
 | Idempotency | Redis + DB | DB only | Faster, handles concurrent retries |
 | Consistency | Strong for purchases | Eventual everywhere | Financial correctness |
+
+---
 
 ## Future Backend Enhancements
 

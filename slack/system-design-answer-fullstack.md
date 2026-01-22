@@ -80,110 +80,84 @@ This answer covers the end-to-end architecture, emphasizing the integration betw
 
 ### Database Schema
 
-```sql
--- Users
-CREATE TABLE users (
-    id UUID PRIMARY KEY,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    username VARCHAR(100) NOT NULL,
-    display_name VARCHAR(200) NOT NULL,
-    avatar_url TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Workspaces
-CREATE TABLE workspaces (
-    id UUID PRIMARY KEY,
-    name VARCHAR(200) NOT NULL,
-    domain VARCHAR(100) UNIQUE,
-    settings JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Workspace members
-CREATE TABLE workspace_members (
-    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    role VARCHAR(20) DEFAULT 'member'
-        CHECK (role IN ('owner', 'admin', 'member', 'guest')),
-    joined_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (workspace_id, user_id)
-);
-
--- Channels
-CREATE TABLE channels (
-    id UUID PRIMARY KEY,
-    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
-    name VARCHAR(100) NOT NULL,
-    topic TEXT,
-    is_private BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(workspace_id, name)
-);
-
--- Messages with threading
-CREATE TABLE messages (
-    id BIGSERIAL PRIMARY KEY,
-    workspace_id UUID REFERENCES workspaces(id),
-    channel_id UUID REFERENCES channels(id) ON DELETE CASCADE,
-    user_id UUID REFERENCES users(id),
-    thread_ts BIGINT REFERENCES messages(id),
-    content TEXT NOT NULL,
-    reply_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    edited_at TIMESTAMPTZ
-);
-
-CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
-CREATE INDEX idx_messages_thread ON messages(thread_ts) WHERE thread_ts IS NOT NULL;
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Database Schema                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────┐      ┌──────────────────┐                          │
+│  │     users       │      │   workspaces     │                          │
+│  ├─────────────────┤      ├──────────────────┤                          │
+│  │ id (UUID PK)    │      │ id (UUID PK)     │                          │
+│  │ email (UNIQUE)  │      │ name             │                          │
+│  │ password_hash   │      │ domain (UNIQUE)  │                          │
+│  │ username        │      │ settings (JSONB) │                          │
+│  │ display_name    │      │ created_at       │                          │
+│  │ avatar_url      │      └────────┬─────────┘                          │
+│  │ created_at      │               │                                    │
+│  └────────┬────────┘               │                                    │
+│           │                        ▼                                    │
+│           │          ┌──────────────────────────┐                       │
+│           └─────────▶│   workspace_members      │                       │
+│                      ├──────────────────────────┤                       │
+│                      │ workspace_id (PK, FK)    │                       │
+│                      │ user_id (PK, FK)         │                       │
+│                      │ role (owner/admin/member)│                       │
+│                      │ joined_at                │                       │
+│                      └──────────────────────────┘                       │
+│                                                                          │
+│  ┌─────────────────────┐      ┌──────────────────────────────────────┐  │
+│  │     channels        │      │              messages                 │  │
+│  ├─────────────────────┤      ├──────────────────────────────────────┤  │
+│  │ id (UUID PK)        │◀─────│ channel_id (FK)                      │  │
+│  │ workspace_id (FK)   │      │ id (BIGSERIAL PK)                    │  │
+│  │ name (UNIQUE/ws)    │      │ workspace_id (FK)                    │  │
+│  │ topic               │      │ user_id (FK)                         │  │
+│  │ is_private          │      │ thread_ts (FK to messages.id)        │  │
+│  │ created_at          │      │ content (TEXT)                       │  │
+│  └─────────────────────┘      │ reply_count (DEFAULT 0)              │  │
+│                               │ created_at                            │  │
+│                               │ edited_at                             │  │
+│                               └──────────────────────────────────────┘  │
+│                                                                          │
+│  KEY INDEXES:                                                            │
+│  • messages: (channel_id, created_at DESC) - chronological fetching     │
+│  • messages: (thread_ts) WHERE thread_ts IS NOT NULL - thread replies   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### TypeScript Interfaces (Shared Types)
+### Shared TypeScript Interfaces
 
-```typescript
-// shared/types.ts - Used by both frontend and backend
-
-interface User {
-  id: string;
-  email: string;
-  username: string;
-  display_name: string;
-  avatar_url?: string;
-}
-
-interface Workspace {
-  id: string;
-  name: string;
-  domain?: string;
-}
-
-interface Channel {
-  id: string;
-  workspace_id: string;
-  name: string;
-  topic?: string;
-  is_private: boolean;
-}
-
-interface Message {
-  id: string;
-  channel_id: string;
-  user_id: string;
-  content: string;
-  thread_ts?: string;
-  reply_count: number;
-  created_at: string;
-  edited_at?: string;
-  // Frontend-only fields
-  pending?: boolean;
-  failed?: boolean;
-}
-
-interface WebSocketMessage {
-  type: 'message' | 'presence' | 'typing' | 'reaction_added';
-  [key: string]: any;
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  shared/types.ts - Frontend + Backend                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  User                          │  Workspace                              │
+│  ┌───────────────────────────┐ │  ┌───────────────────────────────────┐ │
+│  │ id: string                │ │  │ id: string                        │ │
+│  │ email: string             │ │  │ name: string                      │ │
+│  │ username: string          │ │  │ domain?: string                   │ │
+│  │ display_name: string      │ │  └───────────────────────────────────┘ │
+│  │ avatar_url?: string       │ │                                        │
+│  └───────────────────────────┘ │  Channel                               │
+│                                │  ┌───────────────────────────────────┐ │
+│  Message                       │  │ id: string                        │ │
+│  ┌───────────────────────────┐ │  │ workspace_id: string              │ │
+│  │ id: string                │ │  │ name: string                      │ │
+│  │ channel_id: string        │ │  │ topic?: string                    │ │
+│  │ user_id: string           │ │  │ is_private: boolean               │ │
+│  │ content: string           │ │  └───────────────────────────────────┘ │
+│  │ thread_ts?: string        │ │                                        │
+│  │ reply_count: number       │ │  WebSocketMessage                      │
+│  │ created_at: string        │ │  ┌───────────────────────────────────┐ │
+│  │ edited_at?: string        │ │  │ type: 'message' | 'presence'      │ │
+│  │ pending?: boolean (FE)    │ │  │      | 'typing' | 'reaction'      │ │
+│  │ failed?: boolean (FE)     │ │  │ [key: string]: any                │ │
+│  └───────────────────────────┘ │  └───────────────────────────────────┘ │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Real-Time Message Flow
@@ -233,548 +207,475 @@ User A types message
 
 ### Backend: Message Send Handler
 
-```typescript
-// Backend: routes/messages.ts
-router.post('/channels/:channelId/messages', async (req, res) => {
-  const { channelId } = req.params;
-  const { content, idempotency_key } = req.body;
-  const userId = req.session.userId;
-
-  // 1. Idempotency check
-  if (idempotency_key) {
-    const existing = await redis.get(`idem:${idempotency_key}`);
-    if (existing) {
-      return res.json(JSON.parse(existing));
-    }
-  }
-
-  // 2. Verify channel membership
-  const membership = await db('channel_members')
-    .where({ channel_id: channelId, user_id: userId })
-    .first();
-
-  if (!membership) {
-    return res.status(403).json({ error: 'Not a channel member' });
-  }
-
-  // 3. Insert message
-  const [message] = await db('messages')
-    .insert({
-      channel_id: channelId,
-      user_id: userId,
-      content,
-      workspace_id: membership.workspace_id,
-    })
-    .returning('*');
-
-  // 4. Fan-out to channel members
-  const members = await db('channel_members')
-    .where({ channel_id: channelId })
-    .pluck('user_id');
-
-  for (const memberId of members) {
-    await redis.publish(
-      `user:${memberId}:messages`,
-      JSON.stringify({ type: 'message', message })
-    );
-  }
-
-  // 5. Queue for search indexing
-  await searchQueue.add({ type: 'index_message', message });
-
-  // 6. Cache idempotency key
-  if (idempotency_key) {
-    await redis.setex(`idem:${idempotency_key}`, 86400, JSON.stringify(message));
-  }
-
-  res.status(201).json(message);
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                POST /channels/:channelId/messages                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  INPUT: { content, idempotency_key } + session.userId                   │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 1. IDEMPOTENCY CHECK                                              │  │
+│  │    If idempotency_key provided:                                   │  │
+│  │      Check Redis: idem:{key}                                      │  │
+│  │      If exists: return cached response immediately                │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 2. AUTHORIZATION                                                  │  │
+│  │    Query channel_members WHERE channel_id AND user_id             │  │
+│  │    If not member: return 403 "Not a channel member"               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 3. INSERT MESSAGE                                                 │  │
+│  │    INSERT INTO messages (channel_id, user_id, content, ws_id)     │  │
+│  │    RETURNING *                                                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 4. FAN-OUT TO CHANNEL MEMBERS                                     │  │
+│  │    Query all user_ids in channel_members                          │  │
+│  │    For each member:                                               │  │
+│  │      redis.publish(user:{memberId}:messages, {type, message})     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 5. QUEUE FOR SEARCH INDEXING                                      │  │
+│  │    searchQueue.add({ type: 'index_message', message })            │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 6. CACHE IDEMPOTENCY KEY                                          │  │
+│  │    redis.setex(idem:{key}, 86400, JSON.stringify(message))        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  OUTPUT: 201 Created + message object                                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: Optimistic Message Send
 
-```tsx
-// Frontend: components/MessageComposer.tsx
-function MessageComposer({ channelId }: { channelId: string }) {
-  const [content, setContent] = useState('');
-  const addMessage = useSlackStore((state) => state.addMessage);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!content.trim()) return;
-
-    // Generate idempotency key
-    const idempotencyKey = `msg:${channelId}:${Date.now()}`;
-
-    // Optimistic update
-    const tempId = `temp-${Date.now()}`;
-    const optimisticMessage: Message = {
-      id: tempId,
-      channel_id: channelId,
-      user_id: currentUserId,
-      content: content.trim(),
-      created_at: new Date().toISOString(),
-      reply_count: 0,
-      pending: true,
-    };
-
-    addMessage(channelId, optimisticMessage);
-    setContent('');
-
-    try {
-      const realMessage = await api.sendMessage(channelId, {
-        content: content.trim(),
-        idempotency_key: idempotencyKey,
-      });
-
-      // Replace optimistic message with real one
-      useSlackStore.setState((state) => ({
-        messages: {
-          ...state.messages,
-          [channelId]: state.messages[channelId].map((m) =>
-            m.id === tempId ? realMessage : m
-          ),
-        },
-      }));
-    } catch (error) {
-      // Mark as failed
-      useSlackStore.setState((state) => ({
-        messages: {
-          ...state.messages,
-          [channelId]: state.messages[channelId].map((m) =>
-            m.id === tempId ? { ...m, failed: true, pending: false } : m
-          ),
-        },
-      }));
-    }
-  };
-
-  return (
-    <form onSubmit={handleSubmit} className="border-t p-4">
-      <textarea
-        value={content}
-        onChange={(e) => setContent(e.target.value)}
-        placeholder={`Message #${channelName}`}
-        className="w-full p-2 border rounded"
-      />
-      <button type="submit" className="mt-2 px-4 py-2 bg-blue-500 text-white rounded">
-        Send
-      </button>
-    </form>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     MessageComposer Component                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  User submits message                                                    │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 1. GENERATE IDEMPOTENCY KEY                                       │  │
+│  │    key = msg:{channelId}:{Date.now()}                             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 2. CREATE OPTIMISTIC MESSAGE                                      │  │
+│  │    {                                                              │  │
+│  │      id: temp-{timestamp},                                        │  │
+│  │      channel_id, user_id, content,                                │  │
+│  │      created_at: new Date().toISOString(),                        │  │
+│  │      reply_count: 0,                                              │  │
+│  │      pending: true   ◀── UI shows "sending..." indicator          │  │
+│  │    }                                                              │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 3. ADD TO ZUSTAND STORE IMMEDIATELY                               │  │
+│  │    addMessage(channelId, optimisticMessage)                       │  │
+│  │    Clear input field                                              │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌─────────────────────────────┐                                        │
+│  │ 4. CALL API                 │                                        │
+│  │    api.sendMessage(...)     │                                        │
+│  └─────────────┬───────────────┘                                        │
+│                │                                                         │
+│      ┌─────────┴─────────┐                                              │
+│      ▼                   ▼                                              │
+│  ┌────────┐         ┌────────────────────────────────────────────────┐  │
+│  │SUCCESS │         │ FAILURE                                        │  │
+│  │        │         │                                                │  │
+│  │Replace │         │ Update message in store:                       │  │
+│  │temp msg│         │ { ...msg, failed: true, pending: false }       │  │
+│  │with    │         │                                                │  │
+│  │real msg│         │ UI shows retry button                          │  │
+│  └────────┘         └────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: WebSocket Integration
 
-```tsx
-// Frontend: hooks/useWebSocket.ts
-function useWebSocket() {
-  const addMessage = useSlackStore((state) => state.addMessage);
-  const setPresence = useSlackStore((state) => state.setPresence);
-
-  useEffect(() => {
-    const ws = new WebSocket('wss://api.slack.local/ws');
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-
-      switch (data.type) {
-        case 'message':
-          // Don't add if it's our own message (already optimistically added)
-          if (data.message.user_id !== currentUserId) {
-            addMessage(data.message.channel_id, data.message);
-          }
-          break;
-
-        case 'presence':
-          setPresence(data.user_id, data.status);
-          break;
-
-        case 'typing':
-          setTyping(data.channel_id, data.user_id);
-          break;
-      }
-    };
-
-    return () => ws.close();
-  }, []);
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       useWebSocket Hook                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  On Mount: Connect to wss://api.slack.local/ws                          │
+│                                                                          │
+│  ws.onmessage = (event) => {                                            │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Parse JSON: data = JSON.parse(event.data)                        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  SWITCH on data.type:                                             │  │
+│  │                                                                   │  │
+│  │  case 'message':                                                  │  │
+│  │    • Skip if message.user_id === currentUserId                    │  │
+│  │      (already added optimistically)                               │  │
+│  │    • Otherwise: addMessage(channel_id, message)                   │  │
+│  │                                                                   │  │
+│  │  case 'presence':                                                 │  │
+│  │    • setPresence(data.user_id, data.status)                       │  │
+│  │                                                                   │  │
+│  │  case 'typing':                                                   │  │
+│  │    • setTyping(data.channel_id, data.user_id)                     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  On Unmount: ws.close()                                                 │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Thread Implementation
 
-### Backend: Thread Reply
+### Backend: Thread Reply Handler
 
-```typescript
-// Backend: routes/messages.ts
-router.post('/messages/:messageId/replies', async (req, res) => {
-  const { messageId } = req.params;
-  const { content } = req.body;
-  const userId = req.session.userId;
-
-  // Get parent message
-  const parent = await db('messages').where({ id: messageId }).first();
-  if (!parent) {
-    return res.status(404).json({ error: 'Message not found' });
-  }
-
-  // Transaction: insert reply + update parent reply_count
-  const [reply] = await db.transaction(async (trx) => {
-    const [newReply] = await trx('messages')
-      .insert({
-        channel_id: parent.channel_id,
-        workspace_id: parent.workspace_id,
-        user_id: userId,
-        thread_ts: messageId,
-        content,
-      })
-      .returning('*');
-
-    await trx('messages')
-      .where({ id: messageId })
-      .increment('reply_count', 1);
-
-    return [newReply];
-  });
-
-  // Fan-out to thread participants + channel members
-  await fanOutThreadReply(parent, reply);
-
-  res.status(201).json(reply);
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  POST /messages/:messageId/replies                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  INPUT: { content } + messageId from URL + session.userId               │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 1. FETCH PARENT MESSAGE                                           │  │
+│  │    SELECT * FROM messages WHERE id = messageId                    │  │
+│  │    If not found: return 404                                       │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 2. TRANSACTION                                                    │  │
+│  │    BEGIN                                                          │  │
+│  │      INSERT INTO messages (                                       │  │
+│  │        channel_id: parent.channel_id,                             │  │
+│  │        workspace_id: parent.workspace_id,                         │  │
+│  │        user_id: session.userId,                                   │  │
+│  │        thread_ts: messageId,   ◀── Link to parent                 │  │
+│  │        content                                                    │  │
+│  │      ) RETURNING *                                                │  │
+│  │                                                                   │  │
+│  │      UPDATE messages SET reply_count = reply_count + 1            │  │
+│  │        WHERE id = messageId                                       │  │
+│  │    COMMIT                                                         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 3. FAN-OUT                                                        │  │
+│  │    Notify: thread participants + channel members                  │  │
+│  │    fanOutThreadReply(parent, reply)                               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  OUTPUT: 201 Created + reply object                                     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: Thread Panel
 
-```tsx
-// Frontend: components/ThreadPanel.tsx
-function ThreadPanel() {
-  const activeThreadId = useSlackStore((state) => state.activeThreadId);
-  const closeThread = useSlackStore((state) => state.closeThread);
-  const [replies, setReplies] = useState<Message[]>([]);
-
-  // Fetch thread replies
-  useEffect(() => {
-    if (!activeThreadId) return;
-
-    api.getThreadReplies(activeThreadId).then(setReplies);
-  }, [activeThreadId]);
-
-  // Listen for new replies via WebSocket
-  useEffect(() => {
-    function handleReply(data: WebSocketMessage) {
-      if (data.type === 'message' && data.message.thread_ts === activeThreadId) {
-        setReplies((prev) => [...prev, data.message]);
-      }
-    }
-
-    wsEvents.on('message', handleReply);
-    return () => wsEvents.off('message', handleReply);
-  }, [activeThreadId]);
-
-  if (!activeThreadId) return null;
-
-  return (
-    <div className="w-96 border-l flex flex-col">
-      <header className="p-4 border-b flex justify-between">
-        <h3 className="font-bold">Thread</h3>
-        <button onClick={closeThread}>Close</button>
-      </header>
-
-      <div className="flex-1 overflow-auto">
-        {replies.map((reply) => (
-          <MessageItem key={reply.id} message={reply} />
-        ))}
-      </div>
-
-      <ThreadComposer parentId={activeThreadId} />
-    </div>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        ThreadPanel Component                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ STATE                                                             │  │
+│  │ • activeThreadId from Zustand store                               │  │
+│  │ • replies: Message[] (local state)                                │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ useEffect [activeThreadId]                                        │  │
+│  │   If activeThreadId:                                              │  │
+│  │     api.getThreadReplies(activeThreadId).then(setReplies)         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ useEffect [WebSocket listener]                                    │  │
+│  │   wsEvents.on('message', (data) => {                              │  │
+│  │     If data.message.thread_ts === activeThreadId:                 │  │
+│  │       setReplies(prev => [...prev, data.message])                 │  │
+│  │   })                                                              │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  RENDER (if activeThreadId):                                            │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │ ┌────────────────────────────────────────────────────────────┐ │     │
+│  │ │ Header: "Thread" + Close button                            │ │     │
+│  │ └────────────────────────────────────────────────────────────┘ │     │
+│  │ ┌────────────────────────────────────────────────────────────┐ │     │
+│  │ │ Scrollable reply list                                      │ │     │
+│  │ │   {replies.map(r => <MessageItem message={r} />)}          │ │     │
+│  │ └────────────────────────────────────────────────────────────┘ │     │
+│  │ ┌────────────────────────────────────────────────────────────┐ │     │
+│  │ │ ThreadComposer (parentId={activeThreadId})                 │ │     │
+│  │ └────────────────────────────────────────────────────────────┘ │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Presence System
 
 ### Backend: Presence Tracking
 
-```typescript
-// Backend: routes/presence.ts
-
-// Called by WebSocket gateway on heartbeat
-async function updatePresence(userId: string, workspaceId: string) {
-  // Set presence with 60-second TTL
-  await redis.setex(
-    `presence:${workspaceId}:${userId}`,
-    60,
-    JSON.stringify({ status: 'online', lastSeen: Date.now() })
-  );
-
-  // Broadcast to users who can see this person
-  await broadcastPresenceChange(workspaceId, userId, 'online');
-}
-
-// Get online users for a workspace
-async function getOnlineUsers(workspaceId: string): Promise<string[]> {
-  const keys: string[] = [];
-  let cursor = '0';
-
-  do {
-    const [newCursor, matchedKeys] = await redis.scan(
-      cursor,
-      'MATCH', `presence:${workspaceId}:*`,
-      'COUNT', 100
-    );
-    cursor = newCursor;
-    keys.push(...matchedKeys);
-  } while (cursor !== '0');
-
-  return keys.map((k) => k.split(':')[2]);
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Presence Service                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  updatePresence(userId, workspaceId)                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Called by WebSocket gateway on heartbeat                         │  │
+│  │                                                                   │  │
+│  │  1. Set presence with TTL:                                        │  │
+│  │     SETEX presence:{workspaceId}:{userId} 60                      │  │
+│  │           {status: 'online', lastSeen: Date.now()}                │  │
+│  │                                                                   │  │
+│  │  2. Broadcast to visible users:                                   │  │
+│  │     broadcastPresenceChange(workspaceId, userId, 'online')        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  getOnlineUsers(workspaceId) -> string[]                                │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Use SCAN to iterate (not KEYS - production safe):                │  │
+│  │                                                                   │  │
+│  │  cursor = '0'                                                     │  │
+│  │  keys = []                                                        │  │
+│  │  do {                                                             │  │
+│  │    [cursor, matchedKeys] = SCAN cursor                            │  │
+│  │                            MATCH presence:{workspaceId}:*         │  │
+│  │                            COUNT 100                              │  │
+│  │    keys.push(...matchedKeys)                                      │  │
+│  │  } while (cursor !== '0')                                         │  │
+│  │                                                                   │  │
+│  │  return keys.map(k => k.split(':')[2])  // Extract user IDs       │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  "60-second TTL provides automatic cleanup when users disconnect"       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: Presence Display
 
-```tsx
-// Frontend: components/PresenceIndicator.tsx
-function PresenceIndicator({ userId }: { userId: string }) {
-  const isOnline = useSlackStore((state) => state.onlineUsers.has(userId));
-
-  return (
-    <span
-      className={cn(
-        'w-2 h-2 rounded-full',
-        isOnline ? 'bg-green-500' : 'bg-gray-400'
-      )}
-      aria-label={isOnline ? 'Online' : 'Offline'}
-    />
-  );
-}
-
-// In the channel sidebar
-function ChannelItem({ channel }: { channel: Channel }) {
-  return (
-    <button className="flex items-center gap-2 px-3 py-1 w-full hover:bg-gray-100">
-      {channel.is_dm ? (
-        <PresenceIndicator userId={channel.other_user_id} />
-      ) : (
-        <HashIcon className="w-4 h-4" />
-      )}
-      <span>{channel.name}</span>
-    </button>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Presence Components                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PresenceIndicator({ userId })                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Read from Zustand: isOnline = onlineUsers.has(userId)            │  │
+│  │                                                                   │  │
+│  │  Render:                                                          │  │
+│  │    <span className={isOnline ? 'bg-green-500' : 'bg-gray-400'}    │  │
+│  │          aria-label={isOnline ? 'Online' : 'Offline'} />          │  │
+│  │                                                                   │  │
+│  │  Visual: ● (green) = online, ● (gray) = offline                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ChannelItem({ channel })                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  <button className="flex items-center gap-2">                     │  │
+│  │    {channel.is_dm                                                 │  │
+│  │      ? <PresenceIndicator userId={channel.other_user_id} />       │  │
+│  │      : <HashIcon />}                                              │  │
+│  │    <span>{channel.name}</span>                                    │  │
+│  │  </button>                                                        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deep Dive: Search
 
 ### Backend: Search API
 
-```typescript
-// Backend: routes/search.ts
-router.get('/search', async (req, res) => {
-  const { q, channel_id, user_id, from, to } = req.query;
-  const workspaceId = req.session.workspaceId;
-
-  try {
-    const results = await es.search({
-      index: 'messages',
-      body: {
-        query: {
-          bool: {
-            must: [
-              { term: { workspace_id: workspaceId } },
-              { match: { content: q } },
-            ],
-            filter: [
-              channel_id && { term: { channel_id } },
-              user_id && { term: { user_id } },
-              (from || to) && {
-                range: {
-                  created_at: {
-                    ...(from && { gte: from }),
-                    ...(to && { lte: to }),
-                  },
-                },
-              },
-            ].filter(Boolean),
-          },
-        },
-        highlight: { fields: { content: {} } },
-      },
-    });
-
-    res.json({
-      messages: results.hits.hits.map((hit) => ({
-        ...hit._source,
-        highlight: hit.highlight?.content?.[0],
-      })),
-      total: results.hits.total.value,
-    });
-  } catch (error) {
-    // Fallback to PostgreSQL FTS
-    const results = await db('messages')
-      .where({ workspace_id: workspaceId })
-      .whereRaw(
-        "to_tsvector('english', content) @@ plainto_tsquery('english', ?)",
-        [q]
-      )
-      .limit(50);
-
-    res.json({ messages: results, total: results.length });
-  }
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           GET /search                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  INPUT: query params { q, channel_id?, user_id?, from?, to? }           │
+│         + session.workspaceId                                           │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ TRY: ELASTICSEARCH QUERY                                          │  │
+│  │                                                                   │  │
+│  │   bool:                                                           │  │
+│  │     must:                                                         │  │
+│  │       - term: workspace_id                                        │  │
+│  │       - match: content = q                                        │  │
+│  │     filter (if provided):                                         │  │
+│  │       - term: channel_id                                          │  │
+│  │       - term: user_id                                             │  │
+│  │       - range: created_at { gte: from, lte: to }                  │  │
+│  │                                                                   │  │
+│  │   highlight: { fields: { content: {} } }                          │  │
+│  │                                                                   │  │
+│  │   Response: messages with highlight.content[0] for matched text   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ CATCH: FALLBACK TO POSTGRESQL FTS                                 │  │
+│  │                                                                   │  │
+│  │   SELECT * FROM messages                                          │  │
+│  │   WHERE workspace_id = ?                                          │  │
+│  │     AND to_tsvector('english', content)                           │  │
+│  │         @@ plainto_tsquery('english', ?)                          │  │
+│  │   LIMIT 50                                                        │  │
+│  │                                                                   │  │
+│  │   "PostgreSQL FTS as graceful degradation when ES unavailable"   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  OUTPUT: { messages: [...], total: number }                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend: Search UI
 
-```tsx
-// Frontend: components/SearchModal.tsx
-function SearchModal() {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-
-  // Debounced search
-  const debouncedSearch = useMemo(
-    () =>
-      debounce(async (q: string) => {
-        if (!q.trim()) {
-          setResults([]);
-          return;
-        }
-
-        setIsLoading(true);
-        try {
-          const response = await api.search({ q });
-          setResults(response.messages);
-        } finally {
-          setIsLoading(false);
-        }
-      }, 300),
-    []
-  );
-
-  useEffect(() => {
-    debouncedSearch(query);
-  }, [query]);
-
-  return (
-    <div className="fixed inset-0 bg-black/50 flex items-start justify-center pt-20">
-      <div className="bg-white rounded-lg w-full max-w-2xl shadow-xl">
-        <div className="p-4 border-b">
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search messages..."
-            className="w-full text-lg outline-none"
-            autoFocus
-          />
-        </div>
-
-        <div className="max-h-96 overflow-auto">
-          {isLoading ? (
-            <div className="p-4 text-center text-gray-500">Searching...</div>
-          ) : results.length === 0 ? (
-            <div className="p-4 text-center text-gray-500">No results</div>
-          ) : (
-            results.map((result) => (
-              <SearchResultItem key={result.id} result={result} />
-            ))
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SearchResultItem({ result }: { result: SearchResult }) {
-  const navigate = useNavigate();
-
-  return (
-    <button
-      onClick={() => navigate(`/channel/${result.channel_id}?message=${result.id}`)}
-      className="w-full p-4 text-left hover:bg-gray-50 border-b"
-    >
-      <div className="text-sm text-gray-500">
-        #{result.channel_name} · {formatDate(result.created_at)}
-      </div>
-      <div
-        className="mt-1"
-        dangerouslySetInnerHTML={{
-          __html: result.highlight || result.content,
-        }}
-      />
-    </button>
-  );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        SearchModal Component                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  STATE: query (string), results (SearchResult[]), isLoading (boolean)  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ DEBOUNCED SEARCH (300ms)                                          │  │
+│  │                                                                   │  │
+│  │ useMemo(() => debounce(async (q) => {                             │  │
+│  │   if (!q.trim()) { setResults([]); return; }                      │  │
+│  │   setIsLoading(true);                                             │  │
+│  │   try {                                                           │  │
+│  │     const response = await api.search({ q });                     │  │
+│  │     setResults(response.messages);                                │  │
+│  │   } finally {                                                     │  │
+│  │     setIsLoading(false);                                          │  │
+│  │   }                                                               │  │
+│  │ }, 300), [])                                                      │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  RENDER:                                                                │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │ Modal overlay (bg-black/50)                                    │     │
+│  │ ┌────────────────────────────────────────────────────────────┐ │     │
+│  │ │ Search input (autofocus)                                   │ │     │
+│  │ └────────────────────────────────────────────────────────────┘ │     │
+│  │ ┌────────────────────────────────────────────────────────────┐ │     │
+│  │ │ Results (scrollable, max-h-96):                            │ │     │
+│  │ │   isLoading ? "Searching..."                               │ │     │
+│  │ │   : results.length === 0 ? "No results"                    │ │     │
+│  │ │   : results.map(r => <SearchResultItem />)                 │ │     │
+│  │ └────────────────────────────────────────────────────────────┘ │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  SearchResultItem:                                                      │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ onClick: navigate(`/channel/${channel_id}?message=${id}`)         │  │
+│  │                                                                   │  │
+│  │ Render:                                                           │  │
+│  │   <div>#{channel_name} · {formatDate(created_at)}</div>           │  │
+│  │   <div dangerouslySetInnerHTML={{ __html: highlight || content }} │  │
+│  │        />  ◀── Shows <em> tags from ES highlight                  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Session Management
 
 ### Backend Configuration
 
-```typescript
-// Backend: app.ts
-import session from 'express-session';
-
-app.use(
-  session({
-    store: new RedisStore({ client: redis }),
-    secret: process.env.SESSION_SECRET!,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      maxAge: 24 * 60 * 60 * 1000, // 24 hours
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-    },
-  })
-);
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Express Session Setup                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Session Configuration:                                                  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  store: new RedisStore({ client: redis })                         │  │
+│  │  secret: process.env.SESSION_SECRET                               │  │
+│  │  resave: false                                                    │  │
+│  │  saveUninitialized: false                                         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Cookie Options:                                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  maxAge: 24 * 60 * 60 * 1000 (24 hours)                           │  │
+│  │  httpOnly: true                                                   │  │
+│  │  secure: NODE_ENV === 'production'                                │  │
+│  │  sameSite: 'lax'                                                  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  "Redis store enables session sharing across multiple API instances"    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend Auth State
 
-```typescript
-// Frontend: stores/authStore.ts
-interface AuthState {
-  user: User | null;
-  isAuthenticated: boolean;
-  isLoading: boolean;
-
-  login: (email: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
-  checkAuth: () => Promise<void>;
-}
-
-export const useAuthStore = create<AuthState>((set) => ({
-  user: null,
-  isAuthenticated: false,
-  isLoading: true,
-
-  checkAuth: async () => {
-    try {
-      const user = await api.getCurrentUser();
-      set({ user, isAuthenticated: true });
-    } catch {
-      set({ user: null, isAuthenticated: false });
-    } finally {
-      set({ isLoading: false });
-    }
-  },
-
-  login: async (email, password) => {
-    const user = await api.login(email, password);
-    set({ user, isAuthenticated: true });
-  },
-
-  logout: async () => {
-    await api.logout();
-    set({ user: null, isAuthenticated: false });
-  },
-}));
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     useAuthStore (Zustand)                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  user: User | null                                                │  │
+│  │  isAuthenticated: boolean                                         │  │
+│  │  isLoading: boolean                                               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Actions:                                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  checkAuth:                                                       │  │
+│  │    try: user = await api.getCurrentUser()                         │  │
+│  │         set({ user, isAuthenticated: true })                      │  │
+│  │    catch: set({ user: null, isAuthenticated: false })             │  │
+│  │    finally: set({ isLoading: false })                             │  │
+│  │                                                                   │  │
+│  │  login(email, password):                                          │  │
+│  │    user = await api.login(email, password)                        │  │
+│  │    set({ user, isAuthenticated: true })                           │  │
+│  │                                                                   │  │
+│  │  logout:                                                          │  │
+│  │    await api.logout()                                             │  │
+│  │    set({ user: null, isAuthenticated: false })                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Trade-offs Summary

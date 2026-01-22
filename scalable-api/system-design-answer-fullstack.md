@@ -145,304 +145,123 @@ Client                Gateway              LB              API Server           
   │  X-Cache: MISS       │                  │                    │                │                 │
 ```
 
-**Gateway Middleware Chain**:
+### Gateway Middleware Chain
 
-```javascript
-// backend/gateway/src/index.js
-const app = express();
+"I designed the middleware chain with careful ordering - request ID first for tracing, then logging, then auth, then rate limiting. This ensures every request is traceable even if it fails authentication."
 
-// Middleware order matters!
-app.use(requestIdMiddleware);      // 1. Assign request ID
-app.use(loggingMiddleware);        // 2. Log request start
-app.use(apiKeyAuthMiddleware);     // 3. Validate API key
-app.use(rateLimitMiddleware);      // 4. Check rate limits
-app.use(proxyMiddleware);          // 5. Forward to load balancer
+**Middleware order (critical):**
+1. requestIdMiddleware - Assign unique request ID
+2. loggingMiddleware - Log request start
+3. apiKeyAuthMiddleware - Validate API key
+4. rateLimitMiddleware - Check rate limits
+5. proxyMiddleware - Forward to load balancer
+6. errorHandler - Catch and format errors (must be last)
 
-// Error handler (must be last)
-app.use(errorHandler);
+### API Key Authentication
 
-// API Key Auth Middleware
-async function apiKeyAuthMiddleware(req, res, next) {
-  const apiKey = req.headers['x-api-key'];
+**Flow:**
+1. Extract X-API-Key header
+2. Return 401 if missing
+3. Check cache first (1-hour TTL), then database
+4. Validate key is active
+5. Attach keyData to request for downstream use
 
-  if (!apiKey) {
-    return res.status(401).json({
-      error: 'Missing API key',
-      code: 'AUTH_MISSING_KEY'
-    });
-  }
+### Rate Limiting with Headers
 
-  // Check cache first, then database
-  const keyData = await cache.getOrFetch(
-    `apikey:${hashKey(apiKey)}`,
-    () => db.validateApiKey(apiKey),
-    3600 // 1 hour TTL
-  );
+"I always set rate limit headers regardless of whether the request is allowed. This gives clients visibility into their quota before they hit limits."
 
-  if (!keyData || !keyData.isActive) {
-    return res.status(401).json({
-      error: 'Invalid API key',
-      code: 'AUTH_INVALID_KEY'
-    });
-  }
+**Response headers (always set):**
+- X-RateLimit-Limit: Total requests allowed
+- X-RateLimit-Remaining: Requests left in window
+- X-RateLimit-Reset: Unix timestamp when window resets
 
-  req.apiKey = keyData;
-  next();
-}
-
-// Rate Limit Middleware with Headers
-async function rateLimitMiddleware(req, res, next) {
-  const result = await rateLimiter.checkLimit(
-    req.apiKey.id,
-    req.apiKey.tier
-  );
-
-  // Always set rate limit headers
-  res.set('X-RateLimit-Limit', result.limit);
-  res.set('X-RateLimit-Remaining', result.remaining);
-  res.set('X-RateLimit-Reset', Math.ceil(result.resetAt / 1000));
-
-  if (!result.allowed) {
-    res.set('Retry-After', Math.ceil((result.resetAt - Date.now()) / 1000));
-    return res.status(429).json({
-      error: 'Rate limit exceeded',
-      code: 'RATE_LIMIT_EXCEEDED',
-      retryAfter: Math.ceil((result.resetAt - Date.now()) / 1000)
-    });
-  }
-
-  next();
-}
-```
+**On 429 (rate limited):**
+- Retry-After header with seconds until reset
+- Error body with retryAfter field
 
 ---
 
 ### Deep Dive 2: API Contract and Error Handling (6 minutes)
 
-**Consistent API Response Format**:
+### Consistent API Response Format
 
-```typescript
-// Shared types between frontend and backend
-interface APIResponse<T> {
-  data?: T;
-  error?: APIError;
-  meta?: {
-    requestId: string;
-    timestamp: string;
-    pagination?: {
-      page: number;
-      limit: number;
-      total: number;
-      hasMore: boolean;
-    };
-  };
-}
-
-interface APIError {
-  message: string;
-  code: string;
-  details?: Record<string, string[]>;
-}
-
-// Example responses
-// Success
-{
-  "data": { "users": [...] },
-  "meta": {
-    "requestId": "req_abc123",
-    "timestamp": "2024-01-15T10:30:00Z",
-    "pagination": { "page": 1, "limit": 20, "total": 150, "hasMore": true }
-  }
-}
-
-// Error
-{
-  "error": {
-    "message": "Rate limit exceeded",
-    "code": "RATE_LIMIT_EXCEEDED"
-  },
-  "meta": {
-    "requestId": "req_xyz789",
-    "timestamp": "2024-01-15T10:30:00Z"
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         APIResponse<T>                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │ data?: T                    │ Response payload (success only)       │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │ error?: {                   │ Error details (error only)            │ │
+│  │   message: string           │   Human-readable message              │ │
+│  │   code: string              │   Machine-readable code               │ │
+│  │   details?: Record<...>     │   Field-level validation errors       │ │
+│  │ }                           │                                       │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │ meta?: {                    │ Request metadata (always present)     │ │
+│  │   requestId: string         │   For tracing/debugging               │ │
+│  │   timestamp: string         │   ISO 8601 response time              │ │
+│  │   pagination?: {            │   For paginated responses             │ │
+│  │     page, limit, total,     │                                       │ │
+│  │     hasMore                 │                                       │ │
+│  │   }                         │                                       │ │
+│  │ }                           │                                       │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frontend API Client with Error Handling**:
+### Frontend API Client
 
-```typescript
-// frontend/src/services/api.ts
-class APIClient {
-  private baseUrl = '/api/v1';
+"I designed the API client to automatically extract rate limit headers and update the UI store. This way, any component can display current quota without extra API calls."
 
-  async request<T>(
-    endpoint: string,
-    options: RequestInit = {}
-  ): Promise<APIResponse<T>> {
-    const response = await fetch(`${this.baseUrl}${endpoint}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-      },
-      credentials: 'include' // Include session cookie for admin API
-    });
+**Key features:**
+- Automatic rate limit header extraction on every response
+- Updates Zustand store for UI display
+- Custom APIError class with helper methods (isRateLimited, isUnauthorized, isServerError)
+- Typed methods for common operations (getMetrics, createAPIKey, revokeAPIKey)
 
-    // Extract rate limit info from headers
-    const rateLimitInfo = {
-      limit: parseInt(response.headers.get('X-RateLimit-Limit') || '0'),
-      remaining: parseInt(response.headers.get('X-RateLimit-Remaining') || '0'),
-      resetAt: parseInt(response.headers.get('X-RateLimit-Reset') || '0') * 1000
-    };
+### Error Handling Strategy
 
-    // Update rate limit store for UI display
-    useRateLimitStore.getState().update(rateLimitInfo);
-
-    const data: APIResponse<T> = await response.json();
-
-    if (!response.ok) {
-      throw new APIError(
-        data.error?.message || 'Unknown error',
-        data.error?.code || 'UNKNOWN_ERROR',
-        response.status,
-        data.meta?.requestId
-      );
-    }
-
-    return data;
-  }
-
-  // Typed methods for common operations
-  async getMetrics(): Promise<MetricsData> {
-    const response = await this.request<MetricsData>('/admin/metrics');
-    return response.data!;
-  }
-
-  async createAPIKey(params: CreateKeyParams): Promise<APIKeyResponse> {
-    const response = await this.request<APIKeyResponse>('/admin/keys', {
-      method: 'POST',
-      body: JSON.stringify(params)
-    });
-    return response.data!;
-  }
-
-  async revokeAPIKey(keyId: string): Promise<void> {
-    await this.request(`/admin/keys/${keyId}`, {
-      method: 'DELETE'
-    });
-  }
-}
-
-// Custom error class for API errors
-class APIError extends Error {
-  constructor(
-    message: string,
-    public code: string,
-    public status: number,
-    public requestId?: string
-  ) {
-    super(message);
-    this.name = 'APIError';
-  }
-
-  get isRateLimited(): boolean {
-    return this.status === 429;
-  }
-
-  get isUnauthorized(): boolean {
-    return this.status === 401;
-  }
-
-  get isServerError(): boolean {
-    return this.status >= 500;
-  }
-}
 ```
-
-**Frontend Error Boundary and Display**:
-
-```tsx
-// frontend/src/components/ErrorBoundary.tsx
-function ErrorBoundary({ children }: { children: React.ReactNode }) {
-  return (
-    <ErrorBoundaryPrimitive
-      fallbackRender={({ error, resetErrorBoundary }) => (
-        <ErrorFallback error={error} onRetry={resetErrorBoundary} />
-      )}
-    >
-      {children}
-    </ErrorBoundaryPrimitive>
-  );
-}
-
-function ErrorFallback({
-  error,
-  onRetry
-}: {
-  error: Error;
-  onRetry: () => void;
-}) {
-  if (error instanceof APIError) {
-    return <APIErrorDisplay error={error} onRetry={onRetry} />;
-  }
-
-  return (
-    <div className="p-6 bg-red-50 rounded-lg text-center">
-      <h2 className="text-lg font-semibold text-red-800">
-        Something went wrong
-      </h2>
-      <p className="text-red-600 mt-2">{error.message}</p>
-      <button
-        onClick={onRetry}
-        className="mt-4 px-4 py-2 bg-red-600 text-white rounded"
-      >
-        Try Again
-      </button>
-    </div>
-  );
-}
-
-function APIErrorDisplay({
-  error,
-  onRetry
-}: {
-  error: APIError;
-  onRetry: () => void;
-}) {
-  if (error.isRateLimited) {
-    return (
-      <div className="p-6 bg-amber-50 rounded-lg text-center">
-        <ClockIcon className="w-12 h-12 text-amber-500 mx-auto" />
-        <h2 className="text-lg font-semibold text-amber-800 mt-4">
-          Rate Limit Exceeded
-        </h2>
-        <p className="text-amber-600 mt-2">
-          Please wait before making more requests.
-        </p>
-        <RateLimitCountdown onComplete={onRetry} />
-      </div>
-    );
-  }
-
-  if (error.isUnauthorized) {
-    return <Navigate to="/login" replace />;
-  }
-
-  return (
-    <div className="p-6 bg-red-50 rounded-lg">
-      <h2 className="text-lg font-semibold text-red-800">
-        {error.message}
-      </h2>
-      <p className="text-sm text-red-600 mt-2">
-        Error Code: {error.code}
-        {error.requestId && ` | Request ID: ${error.requestId}`}
-      </p>
-      <button onClick={onRetry} className="mt-4 btn-primary">
-        Retry
-      </button>
-    </div>
-  );
-}
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        Error Handling Flow                                │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│   API Response                                                            │
+│        │                                                                  │
+│        ▼                                                                  │
+│   ┌────────────────┐                                                      │
+│   │ response.ok?   │                                                      │
+│   └───────┬────────┘                                                      │
+│           │                                                               │
+│     ┌─────┴─────┐                                                         │
+│     ▼           ▼                                                         │
+│   [Yes]       [No]                                                        │
+│     │           │                                                         │
+│     │           ▼                                                         │
+│     │    ┌──────────────────────────────────────┐                         │
+│     │    │ throw APIError(message, code, status)│                         │
+│     │    └───────────────┬──────────────────────┘                         │
+│     │                    │                                                │
+│     │                    ▼                                                │
+│     │    ┌──────────────────────────────────────┐                         │
+│     │    │ ErrorBoundary catches                │                         │
+│     │    └───────────────┬──────────────────────┘                         │
+│     │                    │                                                │
+│     │         ┌──────────┼──────────┐                                     │
+│     │         ▼          ▼          ▼                                     │
+│     │    [429]       [401]      [500+]                                    │
+│     │       │           │          │                                      │
+│     │       ▼           ▼          ▼                                      │
+│     │  RateLimit    Redirect   Generic                                    │
+│     │  Countdown    to Login   Error UI                                   │
+│     │                                                                     │
+│     ▼                                                                     │
+│  Return data                                                              │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -451,155 +270,65 @@ function APIErrorDisplay({
 
 **Challenge**: Secure admin access with session management, separate from API key authentication.
 
-**Backend Session Setup**:
+### Backend Session Setup
 
-```javascript
-// backend/gateway/src/middleware/session.js
-import session from 'express-session';
-import RedisStore from 'connect-redis';
+**Configuration:**
+- Store: RedisStore with prefix 'session:'
+- Cookie name: 'admin_session'
+- maxAge: 24 hours
+- httpOnly: true, secure in production, sameSite: 'lax'
 
-const sessionMiddleware = session({
-  store: new RedisStore({
-    client: redisClient,
-    prefix: 'session:'
-  }),
-  secret: process.env.SESSION_SECRET,
-  name: 'admin_session',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
-  }
-});
+### Admin Route Protection
 
-// Admin authentication endpoint
-app.post('/api/v1/admin/login', async (req, res) => {
-  const { email, password } = req.body;
-
-  const user = await db.findAdminByEmail(email);
-  if (!user || !await bcrypt.compare(password, user.passwordHash)) {
-    return res.status(401).json({
-      error: { message: 'Invalid credentials', code: 'AUTH_INVALID' }
-    });
-  }
-
-  // Create session
-  req.session.userId = user.id;
-  req.session.role = user.role;
-  req.session.createdAt = Date.now();
-
-  res.json({
-    data: {
-      user: { id: user.id, email: user.email, name: user.name }
-    }
-  });
-});
-
-// Admin route protection
-function requireAdmin(req, res, next) {
-  if (!req.session.userId) {
-    return res.status(401).json({
-      error: { message: 'Not authenticated', code: 'AUTH_REQUIRED' }
-    });
-  }
-
-  if (req.session.role !== 'admin') {
-    return res.status(403).json({
-      error: { message: 'Admin access required', code: 'FORBIDDEN' }
-    });
-  }
-
-  next();
-}
-
-// Apply to admin routes
-app.use('/api/v1/admin/*', sessionMiddleware, requireAdmin);
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      Admin Auth Middleware Chain                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Request to /api/v1/admin/*                                               │
+│            │                                                              │
+│            ▼                                                              │
+│  ┌─────────────────────┐                                                  │
+│  │ sessionMiddleware   │  Parse session cookie, load from Redis           │
+│  └──────────┬──────────┘                                                  │
+│             │                                                             │
+│             ▼                                                             │
+│  ┌─────────────────────┐     No                                           │
+│  │ req.session.userId? │──────────▶ 401 AUTH_REQUIRED                     │
+│  └──────────┬──────────┘                                                  │
+│             │ Yes                                                         │
+│             ▼                                                             │
+│  ┌─────────────────────┐     No                                           │
+│  │ role === 'admin'?   │──────────▶ 403 FORBIDDEN                         │
+│  └──────────┬──────────┘                                                  │
+│             │ Yes                                                         │
+│             ▼                                                             │
+│  ┌─────────────────────┐                                                  │
+│  │     next()          │  Continue to route handler                       │
+│  └─────────────────────┘                                                  │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frontend Auth Store and Protected Routes**:
+### Frontend Auth Store (Zustand)
 
-```typescript
-// frontend/src/stores/authStore.ts
-interface AuthState {
-  user: AdminUser | null;
-  isLoading: boolean;
-  error: string | null;
+**State:**
+- user: AdminUser | null
+- isLoading: boolean
+- error: string | null
 
-  login: (email: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
-  checkSession: () => Promise<void>;
-}
+**Actions:**
+- login(email, password): POST to /admin/login, set user on success
+- logout(): POST to /admin/logout, clear user
+- checkSession(): GET /admin/me on app startup
 
-export const useAuthStore = create<AuthState>((set) => ({
-  user: null,
-  isLoading: true,
-  error: null,
+### Protected Route Component
 
-  login: async (email, password) => {
-    set({ isLoading: true, error: null });
-    try {
-      const response = await api.post('/admin/login', { email, password });
-      set({ user: response.data.user, isLoading: false });
-    } catch (error) {
-      set({
-        error: error instanceof APIError ? error.message : 'Login failed',
-        isLoading: false
-      });
-      throw error;
-    }
-  },
-
-  logout: async () => {
-    await api.post('/admin/logout');
-    set({ user: null });
-  },
-
-  checkSession: async () => {
-    try {
-      const response = await api.get('/admin/me');
-      set({ user: response.data.user, isLoading: false });
-    } catch {
-      set({ user: null, isLoading: false });
-    }
-  }
-}));
-
-// Protected route component
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, isLoading, checkSession } = useAuthStore();
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    checkSession();
-  }, []);
-
-  if (isLoading) {
-    return <LoadingSpinner />;
-  }
-
-  if (!user) {
-    return <Navigate to="/login" replace />;
-  }
-
-  return <>{children}</>;
-}
-
-// Route configuration
-const router = createRouter({
-  routeTree: rootRoute.addChildren([
-    loginRoute,
-    protectedRoute.addChildren([
-      dashboardRoute,
-      apiKeysRoute,
-      logsRoute,
-      settingsRoute
-    ])
-  ])
-});
-```
+**Behavior:**
+1. On mount, call checkSession()
+2. While loading, show LoadingSpinner
+3. If no user after load, redirect to /login
+4. If authenticated, render children
 
 ---
 
@@ -607,200 +336,115 @@ const router = createRouter({
 
 **Challenge**: Keep dashboard metrics current while minimizing server load.
 
-**Backend Metrics Aggregation**:
+### Backend Metrics Aggregation
 
-```javascript
-// backend/api-server/src/routes/admin.js
-app.get('/api/v1/admin/metrics/current', requireAdmin, async (req, res) => {
-  // Aggregate from multiple sources
-  const [
-    requestMetrics,
-    cacheMetrics,
-    rateLimitMetrics,
-    serverHealth
-  ] = await Promise.all([
-    getRequestMetrics(),
-    getCacheMetrics(),
-    getRateLimitMetrics(),
-    getServerHealth()
-  ]);
-
-  res.json({
-    data: {
-      requests: {
-        perSecond: requestMetrics.rps,
-        total24h: requestMetrics.total24h,
-        errorRate: requestMetrics.errorRate
-      },
-      latency: {
-        p50: requestMetrics.p50,
-        p95: requestMetrics.p95,
-        p99: requestMetrics.p99
-      },
-      cache: {
-        hitRate: cacheMetrics.hitRate,
-        l1Hits: cacheMetrics.l1Hits,
-        l2Hits: cacheMetrics.l2Hits,
-        misses: cacheMetrics.misses
-      },
-      rateLimit: {
-        blocked24h: rateLimitMetrics.blocked,
-        topBlocked: rateLimitMetrics.topBlockedKeys
-      },
-      servers: serverHealth
-    },
-    meta: {
-      timestamp: new Date().toISOString(),
-      requestId: req.requestId
-    }
-  });
-});
-
-async function getRequestMetrics() {
-  // Use Redis for real-time counters
-  const pipeline = redis.pipeline();
-
-  pipeline.get('metrics:requests:current_minute');
-  pipeline.get('metrics:requests:24h');
-  pipeline.get('metrics:errors:current_minute');
-  pipeline.lrange('metrics:latency:samples', -100, -1);
-
-  const results = await pipeline.exec();
-
-  const samples = results[3][1].map(Number);
-  samples.sort((a, b) => a - b);
-
-  return {
-    rps: parseInt(results[0][1] || '0') / 60,
-    total24h: parseInt(results[1][1] || '0'),
-    errorRate: parseInt(results[2][1] || '0') / parseInt(results[0][1] || '1'),
-    p50: samples[Math.floor(samples.length * 0.5)] || 0,
-    p95: samples[Math.floor(samples.length * 0.95)] || 0,
-    p99: samples[Math.floor(samples.length * 0.99)] || 0
-  };
-}
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      Metrics Collection Flow                              │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  GET /api/v1/admin/metrics/current                                        │
+│            │                                                              │
+│            ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ Promise.all([                                                        │ │
+│  │   getRequestMetrics(),    ◀── Redis counters + latency samples      │ │
+│  │   getCacheMetrics(),      ◀── L1/L2 hit rates                       │ │
+│  │   getRateLimitMetrics(),  ◀── Blocked requests, top offenders       │ │
+│  │   getServerHealth()       ◀── Health check results per server       │ │
+│  │ ])                                                                   │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│            │                                                              │
+│            ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ Response: {                                                          │ │
+│  │   requests: { perSecond, total24h, errorRate }                       │ │
+│  │   latency: { p50, p95, p99 }                                         │ │
+│  │   cache: { hitRate, l1Hits, l2Hits, misses }                         │ │
+│  │   rateLimit: { blocked24h, topBlockedKeys }                          │ │
+│  │   servers: [ { id, status, latency, load } ]                         │ │
+│  │ }                                                                    │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frontend Polling with Stale State Handling**:
+### Latency Percentile Calculation
 
-```typescript
-// frontend/src/hooks/useMetricsPolling.ts
-function useMetricsPolling(intervalMs = 5000) {
-  const { fetchMetrics, current, error } = useMetricsStore();
-  const [isStale, setIsStale] = useState(false);
-  const lastFetchRef = useRef<number>(0);
+**Using Redis sorted samples:**
+1. Store last 100 latency samples in Redis list
+2. Sort samples in memory
+3. Calculate p50 (50th percentile), p95, p99 from sorted array
 
-  useEffect(() => {
-    let mounted = true;
-    let timeoutId: NodeJS.Timeout;
+### Frontend Polling with Stale State Handling
 
-    const poll = async () => {
-      if (!mounted) return;
+"I implemented a polling hook that marks data as stale after 3 consecutive failures. This lets users know when the dashboard data might be outdated while still showing the last known values."
 
-      try {
-        await fetchMetrics();
-        lastFetchRef.current = Date.now();
-        setIsStale(false);
-      } catch (err) {
-        // Mark data as stale after 3 failed fetches
-        if (Date.now() - lastFetchRef.current > intervalMs * 3) {
-          setIsStale(true);
-        }
-      }
+**useMetricsPolling behavior:**
+- Poll at configurable interval (default 5 seconds)
+- Track last successful fetch timestamp
+- Mark data as stale after intervalMs * 3 without success
+- Display warning banner when stale
 
-      if (mounted) {
-        timeoutId = setTimeout(poll, intervalMs);
-      }
-    };
+### Stale Data UI Pattern
 
-    poll();
-
-    return () => {
-      mounted = false;
-      clearTimeout(timeoutId);
-    };
-  }, [intervalMs]);
-
-  return { current, error, isStale };
-}
-
-// Usage in Dashboard component
-function Dashboard() {
-  const { current, error, isStale } = useMetricsPolling(5000);
-
-  return (
-    <div>
-      {isStale && (
-        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-amber-700">
-          Data may be outdated. Last update: {formatRelativeTime(lastUpdate)}
-        </div>
-      )}
-
-      {error && !isStale && (
-        <div className="bg-red-50 border-b border-red-200 px-4 py-2 text-red-700">
-          Failed to fetch metrics: {error}
-        </div>
-      )}
-
-      <MetricsOverview metrics={current} isStale={isStale} />
-    </div>
-  );
-}
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        Dashboard State Handling                           │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  isStale: true                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ ⚠️ Data may be outdated. Last update: 2 minutes ago                  │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  error && !isStale                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ ❌ Failed to fetch metrics: Connection refused                       │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │                     Metrics Cards (dimmed if stale)                  │ │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌──────────────┐   │ │
+│  │  │  RPS: 1,234 │ │ P99: 45ms   │ │ Cache: 94%  │ │ Errors: 0.1% │   │ │
+│  │  └─────────────┘ └─────────────┘ └─────────────┘ └──────────────┘   │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 5. Rate Limit Display Integration (3 minutes)
 
-**Displaying Rate Limits in UI**:
+### Zustand Store for Rate Limits
 
-```typescript
-// frontend/src/stores/rateLimitStore.ts
-interface RateLimitState {
-  limit: number;
-  remaining: number;
-  resetAt: number;
-  update: (info: RateLimitInfo) => void;
-}
+**State:**
+- limit: number
+- remaining: number
+- resetAt: number (Unix timestamp)
+- update(info): Action to update from headers
 
-export const useRateLimitStore = create<RateLimitState>((set) => ({
-  limit: 0,
-  remaining: 0,
-  resetAt: 0,
-  update: (info) => set(info)
-}));
+### Rate Limit Indicator Component
 
-// Rate limit indicator component
-function RateLimitIndicator() {
-  const { limit, remaining, resetAt } = useRateLimitStore();
-  const percentage = limit > 0 ? (remaining / limit) * 100 : 100;
-
-  const getColor = () => {
-    if (percentage > 50) return 'bg-green-500';
-    if (percentage > 20) return 'bg-amber-500';
-    return 'bg-red-500';
-  };
-
-  return (
-    <div className="flex items-center gap-2">
-      <div className="w-24 h-2 bg-gray-200 rounded-full overflow-hidden">
-        <div
-          className={`h-full ${getColor()} transition-all`}
-          style={{ width: `${percentage}%` }}
-        />
-      </div>
-      <span className="text-sm text-gray-600">
-        {remaining}/{limit} requests
-      </span>
-      {remaining < limit * 0.2 && (
-        <span className="text-xs text-amber-600">
-          Resets {formatRelativeTime(resetAt)}
-        </span>
-      )}
-    </div>
-  );
-}
 ```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     Rate Limit Visual Indicator                           │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  percentage = (remaining / limit) * 100                                   │
+│                                                                           │
+│  > 50%  ──▶  ████████████████████░░░░░░░░░░  GREEN                       │
+│                                                                           │
+│  20-50% ──▶  ████████░░░░░░░░░░░░░░░░░░░░░░  AMBER                       │
+│                                                                           │
+│  < 20%  ──▶  ████░░░░░░░░░░░░░░░░░░░░░░░░░░  RED                         │
+│              + "Resets in 5 minutes" warning                              │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Display format:** "{remaining}/{limit} requests"
 
 ---
 
@@ -817,7 +461,81 @@ function RateLimitIndicator() {
 
 ---
 
-## 7. Future Enhancements
+## 7. Two-Level Caching Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      Two-Level Cache Strategy                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Request ──▶ L1 (In-Memory)                                               │
+│                   │                                                       │
+│           ┌──────┴──────┐                                                 │
+│           ▼             ▼                                                 │
+│         [HIT]        [MISS]                                               │
+│           │             │                                                 │
+│           │             ▼                                                 │
+│           │      L2 (Redis)                                               │
+│           │             │                                                 │
+│           │     ┌──────┴──────┐                                           │
+│           │     ▼             ▼                                           │
+│           │   [HIT]        [MISS]                                         │
+│           │     │             │                                           │
+│           │     │ Populate    │                                           │
+│           │     │ L1 cache    ▼                                           │
+│           │     │         Database                                        │
+│           │     │             │                                           │
+│           │     │             │ Populate L1 + L2                          │
+│           │     │             │                                           │
+│           ▼     ▼             ▼                                           │
+│        Return Data                                                        │
+│                                                                           │
+├──────────────────────────────────────────────────────────────────────────┤
+│ L1 Config: 5-second TTL, 1000 items max, per-instance                    │
+│ L2 Config: Configurable TTL, shared across instances                      │
+│ Benefit: 90% of requests served from L1, sub-millisecond latency          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 8. Sliding Window Rate Limiting
+
+"I chose sliding window over fixed window for more accurate rate limiting. Fixed windows can allow 2x the intended rate at window boundaries."
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    Sliding Window Rate Limiting                           │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Redis Sorted Set: rate_limit:{key_id}                                    │
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │ Score: timestamp    │    Member: request_id                        │  │
+│  ├────────────────────────────────────────────────────────────────────┤  │
+│  │ 1705312800000       │    req_001                                   │  │
+│  │ 1705312801000       │    req_002                                   │  │
+│  │ 1705312802500       │    req_003                                   │  │
+│  │ ...                 │    ...                                       │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  Check limit:                                                             │
+│  1. ZREMRANGEBYSCORE to remove entries older than window                  │
+│  2. ZCARD to count current requests                                       │
+│  3. If count < limit, ZADD new request                                    │
+│  4. Return allowed: true/false, remaining count                           │
+│                                                                           │
+│  Benefits:                                                                │
+│  - Atomic operations (Lua script)                                         │
+│  - Works across multiple gateway instances                                │
+│  - More accurate than fixed window                                        │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. Future Enhancements
 
 1. **WebSocket for Alerts**: Push critical alerts immediately to dashboard
 2. **Request Tracing**: Propagate request IDs through all services

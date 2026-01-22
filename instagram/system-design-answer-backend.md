@@ -36,35 +36,35 @@
 ## Step 2: High-Level Architecture
 
 ```
-                                    +------------------+
-                                    |   Load Balancer  |
-                                    |   (nginx:3000)   |
-                                    +--------+---------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-     +--------v--------+          +----------v---------+          +---------v--------+
-     |  API Server 1   |          |   API Server 2     |          |  API Server 3    |
-     |    (:3001)      |          |     (:3002)        |          |    (:3003)       |
-     +--------+--------+          +----------+---------+          +---------+--------+
-              |                              |                              |
-              +------------------------------+------------------------------+
-                                             |
-         +-----------------------------------+-----------------------------------+
-         |                   |                   |                   |           |
-+--------v--------+ +--------v--------+ +--------v--------+ +--------v--------+  |
-|   PostgreSQL    | |  Valkey/Redis   | |     MinIO       | |   RabbitMQ      |  |
-|    (:5432)      | |    (:6379)      | |    (:9000)      | |    (:5672)      |  |
-|   Primary DB    | |   Cache/Session | |  Object Store   | |  Task Queue     |  |
-+-----------------+ +-----------------+ +-----------------+ +-----------------+  |
-        |                                                                        |
-        |  +---------------------------------------------------------------------+
-        |  |                                                     |
-+-------v--v------+                                     +--------v--------+
-|   Cassandra     |                                     |  Image Worker   |
-|    (:9042)      |                                     |  (background)   |
-|  Direct Msgs    |                                     +-----------------+
-+-----------------+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           Load Balancer (nginx:3000)                      │
+└─────────────────────────────────┬────────────────────────────────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+┌───────────────┐        ┌───────────────┐        ┌───────────────┐
+│ API Server 1  │        │ API Server 2  │        │ API Server 3  │
+│   (:3001)     │        │   (:3002)     │        │   (:3003)     │
+└───────┬───────┘        └───────┬───────┘        └───────┬───────┘
+        │                        │                        │
+        └────────────────────────┼────────────────────────┘
+                                 │
+    ┌────────────┬───────────────┼───────────────┬────────────┐
+    │            │               │               │            │
+    ▼            ▼               ▼               ▼            ▼
+┌────────┐  ┌────────┐      ┌────────┐      ┌────────┐   ┌─────────┐
+│Postgres│  │ Valkey │      │ MinIO  │      │RabbitMQ│   │Cassandra│
+│(:5432) │  │(:6379) │      │(:9000) │      │(:5672) │   │ (:9042) │
+│Primary │  │ Cache/ │      │ Object │      │  Task  │   │  Direct │
+│   DB   │  │Session │      │ Store  │      │ Queue  │   │Messages │
+└────────┘  └────────┘      └────────┘      └───┬────┘   └─────────┘
+                                                │
+                                                ▼
+                                         ┌─────────────┐
+                                         │Image Worker │
+                                         │(background) │
+                                         └─────────────┘
 ```
 
 ---
@@ -78,94 +78,52 @@ Users upload high-resolution images (2-10 MB), but we need multiple sizes for di
 ### Processing Flow
 
 ```
-1. Client → API: POST /api/v1/posts (multipart: image + metadata)
-2. API → MinIO: Store original image with UUID
-3. API → PostgreSQL: Create post (status: 'processing')
-4. API → RabbitMQ: Enqueue image processing job
-5. API → Client: 202 Accepted {post_id, status: 'processing'}
-6. Worker ← RabbitMQ: Dequeue job
-7. Worker ← MinIO: Fetch original image
-8. Worker: Generate 4 resolutions using Sharp
-9. Worker → MinIO: Store processed images
-10. Worker → PostgreSQL: Update post (status: 'published', image_urls)
+┌────────┐    POST /api/v1/posts     ┌─────────┐
+│ Client │ ─────────────────────────▶│   API   │
+└────────┘   (multipart: image)      └────┬────┘
+                                          │
+         ┌────────────────────────────────┼────────────────────────────────┐
+         │                                │                                │
+         ▼                                ▼                                ▼
+┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
+│  Store original │              │  Create post    │              │  Enqueue job    │
+│    in MinIO     │              │ status:process  │              │  to RabbitMQ    │
+└─────────────────┘              └─────────────────┘              └────────┬────────┘
+                                                                           │
+         ┌─────────────────────────────────────────────────────────────────┘
+         ▼
+┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
+│  Worker dequeue │ ────────────▶│  Generate 4     │ ────────────▶│  Update post    │
+│     job         │              │  resolutions    │              │ status:published│
+└─────────────────┘              └─────────────────┘              └─────────────────┘
 ```
 
 ### Resolution Strategy
 
-```typescript
-interface ImageProcessingJob {
-  postId: string;
-  originalUrl: string;
-  traceId: string;  // For distributed tracing
-}
+| Resolution | Size | Quality | Use Case |
+|------------|------|---------|----------|
+| Thumbnail | 150px | 80% | Story rings, notifications |
+| Small | 320px | 85% | Grid view |
+| Medium | 640px | 85% | Feed on mobile |
+| Large | 1080px | 90% | Full-screen view |
 
-const resolutions = [
-  { name: 'thumbnail', size: 150, quality: 80 },   // Story rings, notifications
-  { name: 'small', size: 320, quality: 85 },       // Grid view
-  { name: 'medium', size: 640, quality: 85 },      // Feed on mobile
-  { name: 'large', size: 1080, quality: 90 },      // Full-screen view
-];
-
-async function processImage(job: ImageProcessingJob): Promise<void> {
-  const original = await minio.getObject('originals', job.originalUrl);
-
-  // Auto-orient based on EXIF and strip metadata (privacy)
-  const normalized = await sharp(original)
-    .rotate()  // Auto-orient
-    .toBuffer();
-
-  const processedUrls: Record<string, string> = {};
-
-  for (const res of resolutions) {
-    const processed = await sharp(normalized)
-      .resize(res.size, res.size, { fit: 'cover', position: 'center' })
-      .webp({ quality: res.quality })  // 30% smaller than JPEG
-      .toBuffer();
-
-    const key = `processed/${res.name}/${job.postId}.webp`;
-    await minio.putObject('instagram-media', key, processed);
-    processedUrls[`${res.name}_url`] = key;
-  }
-
-  await db.query(`
-    UPDATE posts
-    SET status = 'published',
-        thumbnail_url = $1, small_url = $2, medium_url = $3, large_url = $4,
-        updated_at = NOW()
-    WHERE id = $5
-  `, [processedUrls.thumbnail_url, processedUrls.small_url,
-      processedUrls.medium_url, processedUrls.large_url, job.postId]);
-}
-```
+"I use Sharp library for high-performance image resizing. Auto-orient based on EXIF metadata and strip it for privacy. Output as WebP format which is 30% smaller than JPEG."
 
 ### Dead Letter Queue for Failed Jobs
 
-```typescript
-const queueOptions = {
-  durable: true,
-  arguments: {
-    'x-dead-letter-exchange': 'dlx',
-    'x-dead-letter-routing-key': 'image-processing-failed',
-    'x-message-ttl': 300000  // 5 minute TTL before dead-lettering
-  }
-};
-
-// Retry with exponential backoff
-async function processWithRetry(job: ImageProcessingJob, attempt = 1): Promise<void> {
-  try {
-    await processImage(job);
-  } catch (error) {
-    if (attempt < 3) {
-      const delay = Math.pow(2, attempt) * 1000;  // 2s, 4s
-      await sleep(delay);
-      return processWithRetry(job, attempt + 1);
-    }
-    // Mark post as failed
-    await db.query('UPDATE posts SET status = $1 WHERE id = $2', ['failed', job.postId]);
-    throw error;  // Let RabbitMQ dead-letter it
-  }
-}
 ```
+┌─────────────────┐     success     ┌─────────────────┐
+│  Image Worker   │ ───────────────▶│  Post Updated   │
+└────────┬────────┘                 └─────────────────┘
+         │ failure (3 retries)
+         ▼
+┌─────────────────┐                 ┌─────────────────┐
+│   Dead Letter   │ ───────────────▶│  Post marked    │
+│     Queue       │                 │  as 'failed'    │
+└─────────────────┘                 └─────────────────┘
+```
+
+"Retry with exponential backoff: 2s, 4s delays. After 3 failures, dead-letter the message and mark post as failed."
 
 ---
 
@@ -178,139 +136,90 @@ With 500 accounts followed, generating feed on each request is expensive. But pu
 ### Hybrid Strategy
 
 ```
-+-----------------------------------------------------------+
-|                     Hybrid Fan-out                         |
-|                                                           |
-|   Small accounts (< 10K followers):                        |
-|     → Fan-out on write (push to followers' timelines)      |
-|                                                           |
-|   Large accounts (> 10K followers):                        |
-|     → Fan-out on read (pull when user loads feed)          |
-|     → Merge with pre-pushed content at read time           |
-+-----------------------------------------------------------+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         New Post Created                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │   Check follower      │
+                    │      count            │
+                    └───────────┬───────────┘
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         │                                             │
+         ▼                                             ▼
+┌─────────────────────┐                     ┌─────────────────────┐
+│  < 10K followers    │                     │  >= 10K followers   │
+│  (Regular account)  │                     │  (Celebrity)        │
+└──────────┬──────────┘                     └──────────┬──────────┘
+           │                                           │
+           ▼                                           ▼
+┌─────────────────────┐                     ┌─────────────────────┐
+│ Fan-out on WRITE    │                     │ Fan-out on READ     │
+│ Push to followers'  │                     │ Mark as "pull-only" │
+│ timeline caches     │                     │ Store separately    │
+└─────────────────────┘                     └─────────────────────┘
 ```
 
 ### Data Model in Redis
 
 ```
-Timeline Cache (Sorted Set):
-Key: timeline:{user_id}
-Score: timestamp (Unix epoch)
-Value: post_id
-Max entries: 500
-TTL: 7 days (refreshed on access)
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Timeline Cache (Sorted Set)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Key: timeline:{user_id}                                            │
+│  Score: timestamp (Unix epoch)                                      │
+│  Value: post_id                                                     │
+│  Max entries: 500                                                   │
+│  TTL: 7 days (refreshed on access)                                  │
+└─────────────────────────────────────────────────────────────────────┘
 
-Post Metadata Cache (Hash):
-Key: post:{post_id}
-Fields: author_id, caption, like_count, thumbnail_url, created_at
-TTL: 1 hour
-```
-
-### Fan-out on Write Pipeline
-
-```typescript
-async function handleNewPost(post: Post): Promise<void> {
-  const followerCount = await getFollowerCount(post.userId);
-
-  if (followerCount < 10000) {
-    // Small account: push to all followers
-    await queueFanoutJob({
-      postId: post.id,
-      authorId: post.userId,
-      timestamp: post.createdAt.getTime()
-    });
-  } else {
-    // Celebrity: mark as "pull-only"
-    await redis.sadd('celebrity_accounts', post.userId);
-  }
-}
-
-// Fan-out worker (parallel processing)
-async function fanoutToFollowers(job: FanoutJob): Promise<void> {
-  const followers = await getFollowerIds(job.authorId);
-
-  // Batch updates using Redis pipeline
-  const pipeline = redis.pipeline();
-  for (const followerId of followers) {
-    pipeline.zadd(`timeline:${followerId}`, job.timestamp, job.postId);
-    pipeline.zremrangebyrank(`timeline:${followerId}`, 0, -501);  // Keep last 500
-  }
-  await pipeline.exec();
-}
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Post Metadata Cache (Hash)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  Key: post:{post_id}                                                │
+│  Fields: author_id, caption, like_count, thumbnail_url, created_at  │
+│  TTL: 1 hour                                                        │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Feed Generation with Merge
 
-```typescript
-async function getFeed(userId: string, cursor: number, limit: number = 20): Promise<Post[]> {
-  // 1. Get pre-pushed timeline posts
-  const timelinePostIds = await redis.zrevrangebyscore(
-    `timeline:${userId}`,
-    cursor,
-    '-inf',
-    'LIMIT', 0, limit
-  );
-
-  // 2. Get celebrity posts (fan-out on read)
-  const celebrityFollows = await redis.sinter(
-    `following:${userId}`,
-    'celebrity_accounts'
-  );
-
-  let celebrityPosts: string[] = [];
-  if (celebrityFollows.length > 0) {
-    // Fetch recent posts from each celebrity (parallel)
-    const celebrityPostPromises = celebrityFollows.map(celebId =>
-      redis.zrevrangebyscore(`posts:${celebId}`, cursor, cursor - 86400000, 'LIMIT', 0, 3)
-    );
-    const results = await Promise.all(celebrityPostPromises);
-    celebrityPosts = results.flat();
-  }
-
-  // 3. Merge and deduplicate
-  const allPostIds = [...new Set([...timelinePostIds, ...celebrityPosts])];
-
-  // 4. Fetch full post data (batch)
-  const posts = await getPostsById(allPostIds.slice(0, limit));
-
-  // 5. Sort by creation time
-  return posts.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-}
 ```
-
-### Feed Cache Layer
-
-```typescript
-const FEED_CACHE_TTL = 60;  // 60 seconds
-
-async function getCachedFeed(userId: string, cursor: number, limit: number): Promise<Post[]> {
-  const cacheKey = `feed:${userId}:${cursor}:${limit}`;
-
-  // Check cache
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    metrics.feedCacheHits.inc();
-    return JSON.parse(cached);
-  }
-
-  metrics.feedCacheMisses.inc();
-
-  // Generate feed
-  const feed = await getFeed(userId, cursor, limit);
-
-  // Cache result
-  await redis.setex(cacheKey, FEED_CACHE_TTL, JSON.stringify(feed));
-
-  return feed;
-}
-
-// Invalidate on follow/unfollow
-async function onFollowChange(followerId: string): Promise<void> {
-  const keys = await redis.keys(`feed:${followerId}:*`);
-  if (keys.length > 0) {
-    await redis.del(...keys);
-  }
-}
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Get Feed for User                               │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        │                                               │
+        ▼                                               ▼
+┌─────────────────────┐                      ┌─────────────────────┐
+│ Get pre-pushed      │                      │ Get celebrity       │
+│ timeline posts      │                      │ follows for user    │
+│ from Redis          │                      │                     │
+└──────────┬──────────┘                      └──────────┬──────────┘
+           │                                            │
+           │                                            ▼
+           │                                 ┌─────────────────────┐
+           │                                 │ Fetch recent posts  │
+           │                                 │ from each celebrity │
+           │                                 │ (parallel)          │
+           │                                 └──────────┬──────────┘
+           │                                            │
+           └─────────────────┬──────────────────────────┘
+                             │
+                             ▼
+                  ┌─────────────────────┐
+                  │ Merge, deduplicate, │
+                  │ sort by time        │
+                  └──────────┬──────────┘
+                             │
+                             ▼
+                  ┌─────────────────────┐
+                  │ Cache result (60s)  │
+                  │ Invalidate on       │
+                  │ follow/unfollow     │
+                  └─────────────────────┘
 ```
 
 ---
@@ -326,176 +235,92 @@ async function onFollowChange(followerId: string): Promise<void> {
 | Likes, comments | Atomic counters, constraints | - |
 | Typing indicators | - | 5-second TTL |
 
-### PostgreSQL Schema
+### PostgreSQL Schema Overview
 
-```sql
--- Users table
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username VARCHAR(30) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    is_private BOOLEAN DEFAULT FALSE,
-    follower_count INTEGER DEFAULT 0,
-    following_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Posts with status tracking
-CREATE TABLE posts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    caption TEXT,
-    status VARCHAR(20) DEFAULT 'processing'
-        CHECK (status IN ('processing', 'published', 'failed', 'deleted')),
-    original_url VARCHAR(500) NOT NULL,
-    thumbnail_url VARCHAR(500),
-    small_url VARCHAR(500),
-    medium_url VARCHAR(500),
-    large_url VARCHAR(500),
-    like_count INTEGER DEFAULT 0,
-    comment_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Composite index for feed queries
-CREATE INDEX idx_posts_user_created
-ON posts(user_id, created_at DESC)
-WHERE status = 'published';
-
--- Follows with compound primary key for idempotency
-CREATE TABLE follows (
-    follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (follower_id, following_id)
-);
-
--- Likes with idempotent upsert support
-CREATE TABLE likes (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (user_id, post_id)
-);
-
--- Stories with automatic expiration filter
-CREATE TABLE stories (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    media_url VARCHAR(500) NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
-    view_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_stories_active
-ON stories(expires_at)
-WHERE expires_at > NOW();
-
--- Story views with deduplication
-CREATE TABLE story_views (
-    story_id UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
-    viewer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    viewed_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (story_id, viewer_id)
-);
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│  users                                                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  id UUID PK, username VARCHAR(30) UNIQUE, email VARCHAR(255) UNIQUE │
+│  password_hash, is_private BOOLEAN, follower_count, following_count │
+│  created_at TIMESTAMPTZ                                             │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│     posts       │   │    follows      │   │    stories      │
+├─────────────────┤   ├─────────────────┤   ├─────────────────┤
+│ id, user_id FK  │   │ follower_id FK  │   │ id, user_id FK  │
+│ caption, status │   │ following_id FK │   │ media_url       │
+│ original_url    │   │ created_at      │   │ expires_at      │
+│ thumbnail_url   │   │ PK(follower,    │   │ view_count      │
+│ small/med/large │   │    following)   │   │ created_at      │
+│ like_count      │   └─────────────────┘   └─────────────────┘
+│ comment_count   │
+│ created_at      │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│     likes       │
+├─────────────────┤
+│ user_id FK      │
+│ post_id FK      │
+│ PK(user, post)  │
+│ created_at      │
+└─────────────────┘
+```
+
+"Posts have status field: processing, published, failed, deleted. Composite index on (user_id, created_at DESC) WHERE status = 'published' for feed queries."
 
 ### Cassandra Schema for Direct Messages
 
-```cql
--- Messages by conversation (main storage)
-CREATE TABLE messages_by_conversation (
-    conversation_id UUID,
-    message_id TIMEUUID,          -- Natural time ordering
-    sender_id UUID,
-    content TEXT,
-    content_type TEXT,             -- 'text', 'image', 'video', 'heart'
-    media_url TEXT,
-    created_at TIMESTAMP,
-    PRIMARY KEY (conversation_id, message_id)
-) WITH CLUSTERING ORDER BY (message_id DESC)
-  AND default_time_to_live = 31536000;  -- 1 year TTL
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  messages_by_conversation                                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  PK: conversation_id                                                │
+│  Clustering: message_id TIMEUUID DESC                               │
+│  Fields: sender_id, content, content_type, media_url, created_at    │
+│  TTL: 1 year                                                        │
+└─────────────────────────────────────────────────────────────────────┘
 
--- Conversations by user (inbox view)
-CREATE TABLE conversations_by_user (
-    user_id UUID,
-    last_message_at TIMESTAMP,
-    conversation_id UUID,
-    other_user_id UUID,
-    other_username TEXT,           -- Denormalized for fast display
-    other_avatar_url TEXT,
-    last_message_preview TEXT,
-    unread_count INT,
-    PRIMARY KEY (user_id, last_message_at, conversation_id)
-) WITH CLUSTERING ORDER BY (last_message_at DESC);
+┌─────────────────────────────────────────────────────────────────────┐
+│  conversations_by_user (inbox view)                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  PK: user_id                                                        │
+│  Clustering: last_message_at DESC, conversation_id                  │
+│  Fields: other_user_id, other_username, other_avatar_url,           │
+│          last_message_preview, unread_count                         │
+└─────────────────────────────────────────────────────────────────────┘
 
--- Typing indicators (ephemeral)
-CREATE TABLE typing_indicators (
-    conversation_id UUID,
-    user_id UUID,
-    started_at TIMESTAMP,
-    PRIMARY KEY (conversation_id, user_id)
-) WITH default_time_to_live = 5;  -- Auto-expire after 5 seconds
+┌─────────────────────────────────────────────────────────────────────┐
+│  typing_indicators (ephemeral)                                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  PK: conversation_id, user_id                                       │
+│  Fields: started_at                                                 │
+│  TTL: 5 seconds (auto-expire)                                       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Message Send Flow
 
-```typescript
-interface Message {
-  conversationId: string;
-  senderId: string;
-  content: string;
-  contentType: 'text' | 'image' | 'video' | 'heart';
-  mediaUrl?: string;
-}
-
-async function sendMessage(msg: Message): Promise<MessageResult> {
-  const messageId = TimeUUID.now();
-  const createdAt = new Date();
-
-  // 1. Insert message (Cassandra)
-  await cassandra.execute(`
-    INSERT INTO messages_by_conversation
-    (conversation_id, message_id, sender_id, content, content_type, media_url, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `, [msg.conversationId, messageId, msg.senderId, msg.content,
-      msg.contentType, msg.mediaUrl, createdAt]);
-
-  // 2. Update conversation metadata for all participants
-  const participants = await getConversationParticipants(msg.conversationId);
-  const senderProfile = await getUserProfile(msg.senderId);
-
-  for (const participantId of participants) {
-    const otherUser = participantId === msg.senderId
-      ? await getUserProfile(participants.find(p => p !== msg.senderId)!)
-      : senderProfile;
-
-    // Upsert conversation in inbox
-    await cassandra.execute(`
-      INSERT INTO conversations_by_user
-      (user_id, last_message_at, conversation_id, other_user_id,
-       other_username, other_avatar_url, last_message_preview, unread_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [participantId, createdAt, msg.conversationId, otherUser.id,
-        otherUser.username, otherUser.avatarUrl,
-        msg.content.substring(0, 100),
-        participantId === msg.senderId ? 0 : 1]);
-  }
-
-  // 3. Publish to WebSocket for real-time delivery
-  await redis.publish(`user:${participants[1]}:messages`, JSON.stringify({
-    type: 'new_message',
-    conversationId: msg.conversationId,
-    messageId: messageId.toString(),
-    senderId: msg.senderId,
-    content: msg.content,
-    createdAt: createdAt.toISOString()
-  }));
-
-  return { messageId: messageId.toString(), createdAt };
-}
+```
+┌────────────┐                     ┌────────────────────┐
+│   Client   │ ───────────────────▶│   Insert message   │
+│ sends msg  │                     │   to Cassandra     │
+└────────────┘                     └─────────┬──────────┘
+                                             │
+        ┌────────────────────────────────────┴────────────────────┐
+        │                                                         │
+        ▼                                                         ▼
+┌─────────────────────┐                              ┌─────────────────────┐
+│ Update conversation │                              │ Publish to Redis    │
+│ metadata for all    │                              │ pub/sub for         │
+│ participants        │                              │ real-time delivery  │
+└─────────────────────┘                              └─────────────────────┘
 ```
 
 ---
@@ -504,143 +329,86 @@ async function sendMessage(msg: Message): Promise<MessageResult> {
 
 ### Like Idempotency with ON CONFLICT
 
-```typescript
-async function likePost(userId: string, postId: string): Promise<LikeResult> {
-  // Idempotent insert - duplicate likes are silently ignored
-  const result = await db.query(`
-    INSERT INTO likes (user_id, post_id)
-    VALUES ($1, $2)
-    ON CONFLICT (user_id, post_id) DO NOTHING
-    RETURNING id
-  `, [userId, postId]);
-
-  const isNewLike = result.rowCount > 0;
-
-  if (isNewLike) {
-    // Only increment if this was a new like
-    await db.query(`
-      UPDATE posts SET like_count = like_count + 1 WHERE id = $1
-    `, [postId]);
-
-    metrics.likesTotal.inc({ action: 'like' });
-  } else {
-    metrics.likesDuplicate.inc();
-  }
-
-  return { success: true, idempotent: !isNewLike };
-}
 ```
+┌────────────┐     POST /like      ┌────────────────────┐
+│   Client   │ ───────────────────▶│  INSERT INTO likes │
+│            │                     │  ON CONFLICT       │
+└────────────┘                     │  DO NOTHING        │
+                                   └─────────┬──────────┘
+                                             │
+                              ┌──────────────┴──────────────┐
+                              │                             │
+                              ▼                             ▼
+                    ┌───────────────────┐       ┌───────────────────┐
+                    │   New like        │       │  Duplicate like   │
+                    │   rowCount > 0    │       │  rowCount = 0     │
+                    │   Increment       │       │  No action        │
+                    │   like_count      │       │  (idempotent)     │
+                    └───────────────────┘       └───────────────────┘
+```
+
+"Idempotent insert - duplicate likes are silently ignored. Only increment counter if this was a new like."
 
 ### Story View Deduplication
 
-```typescript
-async function recordStoryView(storyId: string, viewerId: string): Promise<boolean> {
-  // Fast deduplication check in Redis
-  const alreadyViewed = await redis.sismember(`story_views:${storyId}`, viewerId);
-  if (alreadyViewed) {
-    return false;  // Already counted
-  }
-
-  // Record in Redis (fast)
-  await redis.sadd(`story_views:${storyId}`, viewerId);
-  await redis.incr(`story_view_count:${storyId}`);
-
-  // Async persist to PostgreSQL
-  await queue.publish('story_view', { storyId, viewerId });
-
-  return true;  // New view
-}
-
-// Background worker persists to PostgreSQL
-async function persistStoryView(event: StoryViewEvent): Promise<void> {
-  await db.query(`
-    INSERT INTO story_views (story_id, viewer_id)
-    VALUES ($1, $2)
-    ON CONFLICT (story_id, viewer_id) DO NOTHING
-  `, [event.storyId, event.viewerId]);
-}
+```
+┌────────────┐                    ┌────────────────────┐
+│ View story │ ──────────────────▶│ Check Redis set    │
+│            │                    │ story_views:{id}   │
+└────────────┘                    └─────────┬──────────┘
+                                            │
+                           ┌────────────────┴────────────────┐
+                           │                                 │
+                           ▼                                 ▼
+                 ┌───────────────────┐            ┌───────────────────┐
+                 │  Already in set   │            │  Not in set       │
+                 │  Return false     │            │  Add to set       │
+                 │                   │            │  Incr counter     │
+                 └───────────────────┘            │  Queue persist    │
+                                                  │  Return true      │
+                                                  └───────────────────┘
 ```
 
 ---
 
 ## Step 7: Rate Limiting with Sliding Window
 
-```typescript
-interface RateLimitConfig {
-  keyPrefix: string;
-  max: number;
-  windowMs: number;
-}
+### Rate Limit Configuration
 
-const rateLimits: Record<string, RateLimitConfig> = {
-  follow: { keyPrefix: 'follows', max: 30, windowMs: 3600000 },     // 30/hour
-  post: { keyPrefix: 'posts', max: 10, windowMs: 3600000 },         // 10/hour
-  like: { keyPrefix: 'likes', max: 100, windowMs: 3600000 },        // 100/hour
-  comment: { keyPrefix: 'comments', max: 50, windowMs: 3600000 },   // 50/hour
-  login: { keyPrefix: 'login', max: 5, windowMs: 60000 },           // 5/minute
-};
+| Action | Limit | Window |
+|--------|-------|--------|
+| Follow | 30 | per hour |
+| Post | 10 | per hour |
+| Like | 100 | per hour |
+| Comment | 50 | per hour |
+| Login | 5 | per minute |
 
-async function checkRateLimit(
-  userId: string,
-  action: string
-): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
-  const config = rateLimits[action];
-  const key = `ratelimit:${config.keyPrefix}:${userId}`;
-  const now = Date.now();
+### Sliding Window Implementation
 
-  // Sliding window using sorted set
-  const pipeline = redis.pipeline();
-
-  // Remove expired entries
-  pipeline.zremrangebyscore(key, 0, now - config.windowMs);
-
-  // Add current request
-  pipeline.zadd(key, now, `${now}-${Math.random()}`);
-
-  // Count requests in window
-  pipeline.zcard(key);
-
-  // Set expiry
-  pipeline.expire(key, Math.ceil(config.windowMs / 1000));
-
-  const results = await pipeline.exec();
-  const count = results[2][1] as number;
-
-  if (count > config.max) {
-    metrics.rateLimitHits.inc({ action });
-    return {
-      allowed: false,
-      remaining: 0,
-      resetAt: now + config.windowMs
-    };
-  }
-
-  return {
-    allowed: true,
-    remaining: config.max - count,
-    resetAt: now + config.windowMs
-  };
-}
-
-// Express middleware
-function rateLimitMiddleware(action: string) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const result = await checkRateLimit(req.session.userId, action);
-
-    res.setHeader('X-RateLimit-Remaining', result.remaining);
-    res.setHeader('X-RateLimit-Reset', result.resetAt);
-
-    if (!result.allowed) {
-      return res.status(429).json({
-        error: 'Too Many Requests',
-        retryAfter: Math.ceil((result.resetAt - Date.now()) / 1000)
-      });
-    }
-
-    next();
-  };
-}
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Rate Limit Check (Redis Sorted Set)                │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. ZREMRANGEBYSCORE - Remove expired entries                        │
+│  2. ZADD - Add current request with timestamp                        │
+│  3. ZCARD - Count requests in window                                 │
+│  4. EXPIRE - Set key expiry                                          │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                    ▼                       ▼
+          ┌───────────────────┐   ┌───────────────────┐
+          │  count > max      │   │  count <= max     │
+          │  429 Too Many     │   │  Allow request    │
+          │  Requests         │   │  Return remaining │
+          └───────────────────┘   └───────────────────┘
+```
+
+"Response headers include X-RateLimit-Remaining and X-RateLimit-Reset for client-side handling."
 
 ---
 
@@ -648,59 +416,20 @@ function rateLimitMiddleware(action: string) {
 
 ### Implementation with Opossum
 
-```typescript
-import CircuitBreaker from 'opossum';
-
-const circuitBreakerOptions = {
-  timeout: 30000,              // Fail after 30 seconds
-  errorThresholdPercentage: 50, // Open if 50% fail
-  resetTimeout: 60000,          // Try again after 1 minute
-  volumeThreshold: 3,           // Need 3 requests to evaluate
-};
-
-// Create circuit breakers for external operations
-const imageProcessingBreaker = new CircuitBreaker(
-  processImage,
-  {
-    ...circuitBreakerOptions,
-    name: 'image_processing',
-    fallback: (job: ImageProcessingJob) => {
-      // Mark post as requiring retry
-      return db.query(
-        'UPDATE posts SET status = $1 WHERE id = $2',
-        ['processing_delayed', job.postId]
-      );
-    }
-  }
-);
-
-const feedGenerationBreaker = new CircuitBreaker(
-  getFeed,
-  {
-    ...circuitBreakerOptions,
-    name: 'feed_generation',
-    fallback: () => ({ posts: [], fromCache: false, degraded: true })
-  }
-);
-
-// Metrics for circuit breaker state
-imageProcessingBreaker.on('success', () => {
-  metrics.circuitBreakerEvents.inc({ name: 'image_processing', event: 'success' });
-});
-
-imageProcessingBreaker.on('failure', () => {
-  metrics.circuitBreakerEvents.inc({ name: 'image_processing', event: 'failure' });
-});
-
-imageProcessingBreaker.on('open', () => {
-  metrics.circuitBreakerState.set({ name: 'image_processing' }, 1);
-  logger.warn('Image processing circuit breaker OPENED');
-});
-
-imageProcessingBreaker.on('close', () => {
-  metrics.circuitBreakerState.set({ name: 'image_processing' }, 0);
-  logger.info('Image processing circuit breaker CLOSED');
-});
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Circuit Breaker States                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│    CLOSED ────▶ OPEN ────▶ HALF-OPEN ────▶ CLOSED                   │
+│       │          │            │               ▲                      │
+│       │    (50% fail)    (after 60s)          │                      │
+│       │          │            │          (success)                   │
+│       ▼          ▼            ▼               │                      │
+│   Normal     Fallback     Test one      ─────┘                      │
+│   operation  response     request                                    │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Graceful Degradation Strategy
@@ -719,167 +448,60 @@ imageProcessingBreaker.on('close', () => {
 
 ### Active Story Filtering
 
-```sql
--- Query active stories for a user
-SELECT s.*, u.username, u.avatar_url
-FROM stories s
-JOIN users u ON u.id = s.user_id
-WHERE s.user_id = $1 AND s.expires_at > NOW()
-ORDER BY s.created_at DESC;
-
--- Story tray: users with active stories that I follow
-SELECT DISTINCT ON (u.id)
-    u.id, u.username, u.avatar_url,
-    s.created_at as latest_story_time,
-    CASE WHEN sv.viewer_id IS NULL THEN false ELSE true END as has_seen
-FROM follows f
-JOIN users u ON u.id = f.following_id
-JOIN stories s ON s.user_id = u.id AND s.expires_at > NOW()
-LEFT JOIN story_views sv ON sv.story_id = s.id AND sv.viewer_id = $1
-WHERE f.follower_id = $1
-ORDER BY u.id, has_seen ASC, s.created_at DESC;
-```
+"Stories use database-level filtering with expires_at > NOW(). Index on (expires_at) WHERE expires_at > NOW() for efficient queries."
 
 ### Background Cleanup Job
 
-```typescript
-// Runs every hour via cron
-async function cleanupExpiredStories(): Promise<CleanupResult> {
-  // 1. Find expired stories (with 1-hour buffer for edge cases)
-  const expired = await db.query<Story>(`
-    SELECT id, media_url FROM stories
-    WHERE expires_at < NOW() - INTERVAL '1 hour'
-  `);
-
-  let deletedMedia = 0;
-  let deletedRecords = 0;
-
-  for (const story of expired.rows) {
-    try {
-      // 2. Delete from object storage
-      await minio.removeObject('instagram-media', story.media_url);
-      deletedMedia++;
-
-      // 3. Delete from database (cascades to story_views)
-      await db.query('DELETE FROM stories WHERE id = $1', [story.id]);
-      deletedRecords++;
-    } catch (error) {
-      logger.error('Failed to cleanup story', { storyId: story.id, error });
-    }
-  }
-
-  // 4. Clean up Redis view sets
-  const viewKeys = await redis.keys('story_views:*');
-  for (const key of viewKeys) {
-    const storyId = key.split(':')[1];
-    const exists = await db.query('SELECT id FROM stories WHERE id = $1', [storyId]);
-    if (exists.rowCount === 0) {
-      await redis.del(key, `story_view_count:${storyId}`);
-    }
-  }
-
-  metrics.storiesCleanedUp.inc(deletedRecords);
-
-  return { deletedMedia, deletedRecords };
-}
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                 Story Cleanup (Runs Hourly)                          │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. Find expired stories (with 1-hour buffer for edge cases)         │
+│  2. For each expired story:                                          │
+│     a. Delete from MinIO object storage                              │
+│     b. Delete from PostgreSQL (cascades to story_views)              │
+│  3. Clean up orphaned Redis view sets                                │
+│  4. Emit metrics for monitoring                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Step 10: Prometheus Metrics
 
-```typescript
-import { Counter, Histogram, Gauge, Registry } from 'prom-client';
+### Metrics Categories
 
-const registry = new Registry();
-
-// Request metrics
-const httpRequestsTotal = new Counter({
-  name: 'instagram_http_requests_total',
-  help: 'Total HTTP requests',
-  labelNames: ['method', 'path', 'status_code'],
-  registers: [registry]
-});
-
-const httpRequestDuration = new Histogram({
-  name: 'instagram_http_request_duration_seconds',
-  help: 'HTTP request duration',
-  labelNames: ['method', 'path'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
-  registers: [registry]
-});
-
-// Business metrics
-const postsCreated = new Counter({
-  name: 'instagram_posts_created_total',
-  help: 'Total posts created',
-  registers: [registry]
-});
-
-const likesTotal = new Counter({
-  name: 'instagram_likes_total',
-  help: 'Total like/unlike actions',
-  labelNames: ['action'],
-  registers: [registry]
-});
-
-const likesDuplicate = new Counter({
-  name: 'instagram_likes_duplicate_total',
-  help: 'Duplicate like attempts (idempotency working)',
-  registers: [registry]
-});
-
-// Feed metrics
-const feedGenerationDuration = new Histogram({
-  name: 'instagram_feed_generation_seconds',
-  help: 'Feed generation duration',
-  labelNames: ['cache_status'],
-  buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1],
-  registers: [registry]
-});
-
-const feedCacheHits = new Counter({
-  name: 'instagram_feed_cache_hits_total',
-  help: 'Feed cache hits',
-  registers: [registry]
-});
-
-const feedCacheMisses = new Counter({
-  name: 'instagram_feed_cache_misses_total',
-  help: 'Feed cache misses',
-  registers: [registry]
-});
-
-// Image processing metrics
-const imageProcessingDuration = new Histogram({
-  name: 'instagram_image_processing_seconds',
-  help: 'Image processing duration',
-  buckets: [0.5, 1, 2, 5, 10, 30],
-  registers: [registry]
-});
-
-// Circuit breaker metrics
-const circuitBreakerState = new Gauge({
-  name: 'instagram_circuit_breaker_state',
-  help: 'Circuit breaker state (0=closed, 1=open, 2=half-open)',
-  labelNames: ['name'],
-  registers: [registry]
-});
-
-const circuitBreakerEvents = new Counter({
-  name: 'instagram_circuit_breaker_events_total',
-  help: 'Circuit breaker events',
-  labelNames: ['name', 'event'],
-  registers: [registry]
-});
-
-// Rate limiting metrics
-const rateLimitHits = new Counter({
-  name: 'instagram_rate_limit_hits_total',
-  help: 'Rate limit violations',
-  labelNames: ['action'],
-  registers: [registry]
-});
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Metrics Overview                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Request Metrics                                                     │
+│  ├── instagram_http_requests_total (method, path, status_code)       │
+│  └── instagram_http_request_duration_seconds (method, path)          │
+│                                                                      │
+│  Business Metrics                                                    │
+│  ├── instagram_posts_created_total                                   │
+│  ├── instagram_likes_total (action: like/unlike)                     │
+│  └── instagram_likes_duplicate_total (idempotency working)           │
+│                                                                      │
+│  Feed Metrics                                                        │
+│  ├── instagram_feed_generation_seconds (cache_status)                │
+│  ├── instagram_feed_cache_hits_total                                 │
+│  └── instagram_feed_cache_misses_total                               │
+│                                                                      │
+│  Processing Metrics                                                  │
+│  └── instagram_image_processing_seconds                              │
+│                                                                      │
+│  Reliability Metrics                                                 │
+│  ├── instagram_circuit_breaker_state (name)                          │
+│  ├── instagram_circuit_breaker_events_total (name, event)            │
+│  └── instagram_rate_limit_hits_total (action)                        │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

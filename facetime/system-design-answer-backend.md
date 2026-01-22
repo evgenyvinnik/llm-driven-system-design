@@ -87,282 +87,149 @@
 
 ### WebSocket Connection Management
 
-```typescript
-// backend/src/services/signaling.ts
-import { WebSocket, WebSocketServer } from 'ws'
-import { pool } from '../shared/db.js'
-import { redis } from '../shared/cache.js'
+The signaling server maintains WebSocket connections for all active devices and tracks which devices belong to each user.
 
-interface ConnectedDevice {
-  ws: WebSocket
-  userId: string
-  deviceId: string
-  lastPing: number
-}
-
-class SignalingServer {
-  private devices = new Map<string, ConnectedDevice>()
-  private userDevices = new Map<string, Set<string>>() // userId -> deviceIds
-
-  constructor(wss: WebSocketServer) {
-    wss.on('connection', this.handleConnection.bind(this))
-
-    // Cleanup stale connections every 30 seconds
-    setInterval(() => this.cleanupStaleConnections(), 30000)
-  }
-
-  private async handleConnection(ws: WebSocket) {
-    ws.on('message', async (data) => {
-      const message = JSON.parse(data.toString())
-      await this.handleMessage(ws, message)
-    })
-
-    ws.on('close', () => this.handleDisconnect(ws))
-    ws.on('pong', () => this.handlePong(ws))
-  }
-
-  private async handleMessage(ws: WebSocket, message: SignalingMessage) {
-    switch (message.type) {
-      case 'register':
-        await this.handleRegister(ws, message)
-        break
-      case 'call_initiate':
-        await this.handleCallInitiate(ws, message)
-        break
-      case 'call_answer':
-        await this.handleCallAnswer(ws, message)
-        break
-      case 'call_decline':
-        await this.handleCallDecline(ws, message)
-        break
-      case 'ice_candidate':
-        await this.handleICECandidate(ws, message)
-        break
-      case 'call_end':
-        await this.handleCallEnd(ws, message)
-        break
-    }
-  }
-
-  private async handleRegister(ws: WebSocket, message: RegisterMessage) {
-    const { userId, deviceId } = message
-
-    // Store device connection
-    this.devices.set(deviceId, {
-      ws,
-      userId,
-      deviceId,
-      lastPing: Date.now()
-    })
-
-    // Track user's devices
-    if (!this.userDevices.has(userId)) {
-      this.userDevices.set(userId, new Set())
-    }
-    this.userDevices.get(userId)!.add(deviceId)
-
-    // Update presence in Redis
-    await redis.hset(`presence:${userId}`, {
-      status: 'online',
-      lastSeen: Date.now()
-    })
-    await redis.expire(`presence:${userId}`, 60)
-    await redis.sadd(`presence:${userId}:devices`, deviceId)
-    await redis.expire(`presence:${userId}:devices`, 60)
-
-    // Update device in PostgreSQL
-    await pool.query(`
-      INSERT INTO user_devices (id, user_id, is_active, last_seen)
-      VALUES ($1, $2, true, NOW())
-      ON CONFLICT (id) DO UPDATE
-      SET is_active = true, last_seen = NOW()
-    `, [deviceId, userId])
-
-    ws.send(JSON.stringify({ type: 'registered', deviceId }))
-  }
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SignalingServer Class                        │
+├─────────────────────────────────────────────────────────────────┤
+│  In-Memory State:                                               │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ devices: Map<deviceId, ConnectedDevice>                  │  │
+│  │   └──▶ { ws, userId, deviceId, lastPing }               │  │
+│  │                                                          │  │
+│  │ userDevices: Map<userId, Set<deviceId>>                 │  │
+│  │   └──▶ Track all devices per user                       │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Message Handlers:                                              │
+│  ┌──────────────────┬───────────────────────────────────────┐  │
+│  │ register         │ Device joins, update presence         │  │
+│  │ call_initiate    │ Start call, ring callees              │  │
+│  │ call_answer      │ Accept call, race condition handling  │  │
+│  │ call_decline     │ Reject call                           │  │
+│  │ ice_candidate    │ Forward ICE to peers                  │  │
+│  │ call_end         │ Terminate call, cleanup               │  │
+│  └──────────────────┴───────────────────────────────────────┘  │
+│                                                                 │
+│  Cleanup: 30s interval removes stale connections               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Device Registration Flow
+
+```
+┌────────┐     register      ┌────────────────┐     SET presence     ┌───────┐
+│ Device │ ──────────────▶  │ Signaling      │ ─────────────────▶  │ Redis │
+│        │                   │ Server         │                      │       │
+└────────┘                   └────────────────┘                      └───────┘
+                                    │
+                                    │ UPSERT device
+                                    ▼
+                             ┌────────────────┐
+                             │  PostgreSQL    │
+                             │  user_devices  │
+                             └────────────────┘
+                                    │
+                                    │ registered ack
+                                    ▼
+                             ┌────────────────┐
+                             │ Device         │
+                             └────────────────┘
+```
+
+**Presence Storage:**
+- Redis hash: `presence:{userId}` with status and lastSeen
+- Redis set: `presence:{userId}:devices` for all connected devices
+- 60-second TTL with refresh on heartbeat
 
 ### Call Initiation with Idempotency
 
-```typescript
-// backend/src/services/signaling.ts (continued)
-private async handleCallInitiate(
-  ws: WebSocket,
-  message: CallInitiateMessage
-) {
-  const { calleeIds, callType, idempotencyKey } = message
-  const caller = this.getDeviceByWs(ws)
-  if (!caller) return
-
-  // Check idempotency - prevent duplicate calls on retry
-  const existingCallId = await redis.get(`idempotency:call:${idempotencyKey}`)
-  if (existingCallId) {
-    ws.send(JSON.stringify({
-      type: 'call_initiated',
-      callId: existingCallId,
-      deduplicated: true
-    }))
-    return
-  }
-
-  const callId = crypto.randomUUID()
-
-  // Store idempotency key BEFORE creating call (crash-safe ordering)
-  await redis.setex(`idempotency:call:${idempotencyKey}`, 300, callId)
-
-  // Create call record in transaction
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-
-    await client.query(`
-      INSERT INTO calls (id, initiator_id, call_type, state, created_at)
-      VALUES ($1, $2, $3, 'ringing', NOW())
-    `, [callId, caller.userId, callType])
-
-    for (const calleeId of calleeIds) {
-      await client.query(`
-        INSERT INTO call_participants (call_id, user_id, state)
-        VALUES ($1, $2, 'ringing')
-      `, [callId, calleeId])
-    }
-
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK')
-    await redis.del(`idempotency:call:${idempotencyKey}`)
-    throw error
-  } finally {
-    client.release()
-  }
-
-  // Store active call in Redis for fast lookup
-  await redis.hset(`call:${callId}`, {
-    initiator: caller.userId,
-    callType,
-    state: 'ringing',
-    createdAt: Date.now()
-  })
-  await redis.expire(`call:${callId}`, 1800) // 30 min TTL
-
-  // Ring all callee devices
-  for (const calleeId of calleeIds) {
-    const calleeDeviceIds = this.userDevices.get(calleeId)
-
-    if (calleeDeviceIds) {
-      for (const deviceId of calleeDeviceIds) {
-        const device = this.devices.get(deviceId)
-        if (device) {
-          device.ws.send(JSON.stringify({
-            type: 'incoming_call',
-            callId,
-            caller: caller.userId,
-            callType
-          }))
-        }
-      }
-    }
-
-    // Also send push notification for devices not connected
-    await this.sendPushNotification(calleeId, {
-      type: 'incoming_call',
-      callId,
-      caller: caller.userId,
-      callType
-    })
-  }
-
-  // Set ring timeout
-  setTimeout(() => this.handleRingTimeout(callId), 30000)
-
-  ws.send(JSON.stringify({
-    type: 'call_initiated',
-    callId,
-    deduplicated: false
-  }))
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Call Initiation Flow                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Check Idempotency                                                        │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ Redis GET idempotency:call:{key}                                    │ │
+│     │   ├──▶ exists: return cached callId (deduplicated: true)           │ │
+│     │   └──▶ not exists: continue with new call                          │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  2. Create Call (Transaction)                                                │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ BEGIN                                                               │ │
+│     │   INSERT INTO calls (id, initiator_id, call_type, state='ringing') │ │
+│     │   INSERT INTO call_participants (call_id, user_id, state='ringing')│ │
+│     │ COMMIT                                                              │ │
+│     │                                                                     │ │
+│     │ On error: ROLLBACK + delete idempotency key                        │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  3. Store Active Call in Redis                                               │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ HSET call:{callId}                                                  │ │
+│     │   initiator: userId                                                 │ │
+│     │   callType: video|audio                                             │ │
+│     │   state: ringing                                                    │ │
+│     │   createdAt: timestamp                                              │ │
+│     │ EXPIRE call:{callId} 1800  (30 min TTL)                            │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  4. Ring All Callee Devices                                                  │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ For each callee:                                                    │ │
+│     │   For each connected device:                                        │ │
+│     │     WebSocket.send({ type: 'incoming_call', callId, caller })      │ │
+│     │   Send push notification for offline devices                        │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  5. Set Ring Timeout: 30 seconds                                             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Call Answer with Race Condition Handling
 
-```typescript
-// backend/src/services/signaling.ts (continued)
-private async handleCallAnswer(ws: WebSocket, message: CallAnswerMessage) {
-  const { callId, sdpAnswer } = message
-  const device = this.getDeviceByWs(ws)
-  if (!device) return
+> "When multiple devices try to answer, only the first one wins. We use PostgreSQL's `FOR UPDATE SKIP LOCKED` to atomically claim the call."
 
-  // Atomic check-and-update - only first device to answer wins
-  const result = await pool.query(`
-    WITH locked_call AS (
-      SELECT id, state, initiator_id FROM calls
-      WHERE id = $1
-      FOR UPDATE SKIP LOCKED
-    )
-    UPDATE calls
-    SET state = 'connected',
-        answered_by_device = $2,
-        connected_at = NOW()
-    FROM locked_call
-    WHERE calls.id = locked_call.id
-      AND locked_call.state = 'ringing'
-    RETURNING calls.*, locked_call.initiator_id
-  `, [callId, device.deviceId])
-
-  if (result.rowCount === 0) {
-    // Call was already answered by another device or doesn't exist
-    const call = await pool.query(
-      'SELECT state, answered_by_device FROM calls WHERE id = $1',
-      [callId]
-    )
-
-    if (call.rows[0]?.state === 'connected') {
-      ws.send(JSON.stringify({
-        type: 'call_answer_rejected',
-        callId,
-        reason: 'already_answered',
-        answeredBy: call.rows[0].answered_by_device
-      }))
-    } else {
-      ws.send(JSON.stringify({
-        type: 'call_answer_rejected',
-        callId,
-        reason: 'call_not_found'
-      }))
-    }
-    return
-  }
-
-  // Update Redis state
-  await redis.hset(`call:${callId}`, {
-    state: 'connected',
-    answeredBy: device.deviceId,
-    connectedAt: Date.now()
-  })
-
-  // Stop ringing on all other devices
-  const call = result.rows[0]
-  await this.stopRingingOnOtherDevices(callId, device.deviceId)
-
-  // Send answer to caller
-  const callerDevices = this.userDevices.get(call.initiator_id)
-  if (callerDevices) {
-    for (const callerDeviceId of callerDevices) {
-      const callerDevice = this.devices.get(callerDeviceId)
-      if (callerDevice) {
-        callerDevice.ws.send(JSON.stringify({
-          type: 'call_answered',
-          callId,
-          answer: sdpAnswer,
-          answeredBy: device.userId
-        }))
-      }
-    }
-  }
-
-  ws.send(JSON.stringify({ type: 'call_connected', callId }))
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Atomic Answer (First Device Wins)                         │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SQL Query:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ WITH locked_call AS (                                                   ││
+│  │   SELECT id, state, initiator_id FROM calls                            ││
+│  │   WHERE id = $callId                                                    ││
+│  │   FOR UPDATE SKIP LOCKED  ◄── Prevents race conditions                 ││
+│  │ )                                                                       ││
+│  │ UPDATE calls                                                            ││
+│  │ SET state = 'connected',                                                ││
+│  │     answered_by_device = $deviceId,                                     ││
+│  │     connected_at = NOW()                                                ││
+│  │ FROM locked_call                                                        ││
+│  │ WHERE calls.id = locked_call.id                                         ││
+│  │   AND locked_call.state = 'ringing'                                     ││
+│  │ RETURNING calls.*, locked_call.initiator_id                             ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Result Handling:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ rowCount = 0:                                                           ││
+│  │   ├──▶ state = 'connected': already_answered (tell device who won)    ││
+│  │   └──▶ else: call_not_found                                            ││
+│  │                                                                         ││
+│  │ rowCount = 1:                                                           ││
+│  │   ├──▶ Update Redis call state                                         ││
+│  │   ├──▶ Stop ringing on other devices                                   ││
+│  │   ├──▶ Send SDP answer to caller                                       ││
+│  │   └──▶ Confirm call_connected to answerer                              ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -371,148 +238,119 @@ private async handleCallAnswer(ws: WebSocket, message: CallAnswerMessage) {
 
 ### ICE Candidate Handling with Deduplication
 
-```typescript
-// backend/src/services/signaling.ts (continued)
-private async handleICECandidate(
-  ws: WebSocket,
-  message: ICECandidateMessage
-) {
-  const { callId, candidate } = message
-  const device = this.getDeviceByWs(ws)
-  if (!device) return
-
-  // Generate deterministic hash for deduplication
-  const candidateHash = crypto
-    .createHash('sha256')
-    .update(`${callId}:${device.deviceId}:${candidate.candidate}`)
-    .digest('hex')
-    .slice(0, 16)
-
-  // SETNX returns 1 if key was set (new), 0 if exists (duplicate)
-  const isNew = await redis.setnx(
-    `ice:${callId}:${candidateHash}`,
-    Date.now()
-  )
-
-  if (!isNew) {
-    // Duplicate candidate - ignore silently
-    return
-  }
-
-  // Set TTL for cleanup
-  await redis.expire(`ice:${callId}:${candidateHash}`, 3600)
-
-  // Get call to find other participants
-  const call = await redis.hgetall(`call:${callId}`)
-  if (!call || call.state === 'ended') {
-    return
-  }
-
-  // Forward to all other participants in the call
-  const participants = await pool.query(`
-    SELECT user_id FROM call_participants
-    WHERE call_id = $1 AND user_id != $2
-  `, [callId, device.userId])
-
-  for (const participant of participants.rows) {
-    const participantDevices = this.userDevices.get(participant.user_id)
-    if (participantDevices) {
-      for (const participantDeviceId of participantDevices) {
-        const participantDevice = this.devices.get(participantDeviceId)
-        if (participantDevice) {
-          participantDevice.ws.send(JSON.stringify({
-            type: 'ice_candidate',
-            callId,
-            from: device.userId,
-            candidate
-          }))
-        }
-      }
-    }
-  }
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     ICE Candidate Flow                                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────┐  ice_candidate   ┌──────────────┐                               │
+│  │ Device │ ───────────────▶ │  Signaling   │                               │
+│  │   A    │                   │   Server     │                               │
+│  └────────┘                   └──────┬───────┘                               │
+│                                      │                                       │
+│                                      ▼                                       │
+│                         ┌────────────────────────────┐                       │
+│                         │ Generate Candidate Hash    │                       │
+│                         │ SHA256(callId:deviceId:    │                       │
+│                         │        candidate).slice(16)│                       │
+│                         └────────────────────────────┘                       │
+│                                      │                                       │
+│                                      ▼                                       │
+│                         ┌────────────────────────────┐                       │
+│                         │ SETNX ice:{callId}:{hash}  │                       │
+│                         │   └──▶ returns 0: duplicate│──▶ ignore            │
+│                         │   └──▶ returns 1: new     │                       │
+│                         └────────────────────────────┘                       │
+│                                      │                                       │
+│                                      ▼                                       │
+│                         ┌────────────────────────────┐                       │
+│                         │ Forward to All Peers       │                       │
+│                         │   - Query call_participants│                       │
+│                         │   - Send to connected      │                       │
+│                         │     devices via WebSocket  │                       │
+│                         └────────────────────────────┘                       │
+│                                      │                                       │
+│                                      ▼                                       │
+│  ┌────────┐  ice_candidate   ┌──────────────┐                               │
+│  │ Device │ ◀─────────────── │   Signaling  │                               │
+│  │   B    │                   │   Server     │                               │
+│  └────────┘                   └──────────────┘                               │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### TURN Credential Service
 
-```typescript
-// backend/src/services/turnCredentials.ts
-import crypto from 'crypto'
-import { redis } from '../shared/cache.js'
+> "TURN credentials are short-lived (5 minutes) for security. We use RFC 5389 time-limited credentials with HMAC-SHA1."
 
-const TURN_SECRET = process.env.TURN_SECRET!
-const CREDENTIAL_TTL = 300 // 5 minutes
-
-export async function getTURNCredentials(userId: string): Promise<TURNCredentials> {
-  const cacheKey = `turn:${userId}`
-
-  // Check cache first
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  // Generate time-limited credentials (RFC 5389)
-  const timestamp = Math.floor(Date.now() / 1000) + CREDENTIAL_TTL
-  const username = `${timestamp}:${userId}`
-  const credential = crypto
-    .createHmac('sha1', TURN_SECRET)
-    .update(username)
-    .digest('base64')
-
-  const credentials: TURNCredentials = {
-    username,
-    credential,
-    urls: [
-      'turn:turn.example.com:3478?transport=udp',
-      'turn:turn.example.com:3478?transport=tcp',
-      'turns:turn.example.com:5349?transport=tcp'
-    ],
-    ttl: CREDENTIAL_TTL
-  }
-
-  // Cache with TTL slightly shorter than credential validity
-  await redis.setex(cacheKey, CREDENTIAL_TTL - 30, JSON.stringify(credentials))
-
-  return credentials
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     TURN Credential Generation                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Credential Format (RFC 5389):                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ username = {expiry_timestamp}:{userId}                                  ││
+│  │            │                                                            ││
+│  │            └──▶ Unix timestamp when credential expires                  ││
+│  │                                                                         ││
+│  │ credential = HMAC-SHA1(TURN_SECRET, username).base64()                  ││
+│  │                                                                         ││
+│  │ TTL = 300 seconds (5 minutes)                                           ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Response:                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ {                                                                       ││
+│  │   username: "1674567890:user123",                                       ││
+│  │   credential: "abc123...",                                              ││
+│  │   urls: [                                                               ││
+│  │     "turn:turn.example.com:3478?transport=udp",                         ││
+│  │     "turn:turn.example.com:3478?transport=tcp",                         ││
+│  │     "turns:turn.example.com:5349?transport=tcp"  (TLS)                  ││
+│  │   ],                                                                    ││
+│  │   ttl: 300                                                              ││
+│  │ }                                                                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Caching:                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ Redis SETEX turn:{userId} (TTL - 30) credentials                        ││
+│  │                     │                                                   ││
+│  │                     └──▶ Cache slightly shorter than validity          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### ICE Server Configuration Endpoint
 
-```typescript
-// backend/src/routes/ice.ts
-import { Router } from 'express'
-import { requireAuth } from '../shared/auth.js'
-import { getTURNCredentials } from '../services/turnCredentials.js'
-
-const router = Router()
-
-router.get('/ice-servers', requireAuth, async (req, res) => {
-  const userId = req.session.userId
-
-  const turnCredentials = await getTURNCredentials(userId)
-
-  const iceServers = [
-    // STUN servers (no authentication needed)
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    // TURN servers (with short-lived credentials)
-    {
-      urls: turnCredentials.urls,
-      username: turnCredentials.username,
-      credential: turnCredentials.credential
-    }
-  ]
-
-  res.json({
-    iceServers,
-    iceTransportPolicy: 'all', // or 'relay' to force TURN
-    ttl: turnCredentials.ttl
-  })
-})
-
-export default router
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     GET /api/ice-servers                                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Response:                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ {                                                                       ││
+│  │   iceServers: [                                                         ││
+│  │     // STUN (no auth needed)                                            ││
+│  │     { urls: 'stun:stun.l.google.com:19302' },                          ││
+│  │     { urls: 'stun:stun1.l.google.com:19302' },                         ││
+│  │                                                                         ││
+│  │     // TURN (with short-lived credentials)                              ││
+│  │     {                                                                   ││
+│  │       urls: ['turn:...', 'turns:...'],                                 ││
+│  │       username: 'timestamp:userId',                                     ││
+│  │       credential: 'hmac-sha1-signature'                                 ││
+│  │     }                                                                   ││
+│  │   ],                                                                    ││
+│  │   iceTransportPolicy: 'all',  // or 'relay' to force TURN              ││
+│  │   ttl: 300                                                              ││
+│  │ }                                                                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -521,187 +359,166 @@ export default router
 
 ### SFU Architecture
 
-```typescript
-// backend/src/services/sfu.ts
-interface Room {
-  id: string
-  participants: Map<string, Participant>
-  dominantSpeaker: string | null
-  createdAt: number
-}
+> "For group calls, mesh topology doesn't scale - with 5 participants, each sends 4 streams. The SFU acts as a central hub: each participant sends one stream up, and the SFU selectively forwards to others."
 
-interface Participant {
-  userId: string
-  deviceId: string
-  peerConnection: RTCPeerConnection
-  tracks: MediaStreamTrack[]
-  audioLevel: number
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     SFU (Selective Forwarding Unit)                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Room Structure:                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ Room {                                                                  ││
+│  │   id: string                                                            ││
+│  │   participants: Map<userId, Participant>                                ││
+│  │   dominantSpeaker: string | null                                        ││
+│  │   createdAt: number                                                     ││
+│  │ }                                                                       ││
+│  │                                                                         ││
+│  │ Participant {                                                           ││
+│  │   userId: string                                                        ││
+│  │   deviceId: string                                                      ││
+│  │   peerConnection: RTCPeerConnection                                     ││
+│  │   tracks: MediaStreamTrack[]                                            ││
+│  │   audioLevel: number  (for speaker detection)                           ││
+│  │ }                                                                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Media Flow:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                         ││
+│  │   ┌─────────┐           ┌─────────┐           ┌─────────┐              ││
+│  │   │ User A  │           │   SFU   │           │ User B  │              ││
+│  │   └────┬────┘           └────┬────┘           └────┬────┘              ││
+│  │        │                     │                     │                   ││
+│  │        │  ──── video ────▶  │  ──── video ────▶  │                   ││
+│  │        │                     │                     │                   ││
+│  │        │  ◀──── video ────  │  ◀──── video ────  │                   ││
+│  │        │                     │                     │                   ││
+│  │   Each participant: 1 upload stream, N-1 download streams              ││
+│  │                                                                         ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
-class SFU {
-  private rooms = new Map<string, Room>()
+### Join Room Flow
 
-  async joinRoom(
-    roomId: string,
-    userId: string,
-    deviceId: string,
-    offer: RTCSessionDescriptionInit
-  ): Promise<{ answer: RTCSessionDescriptionInit; participants: string[] }> {
-    let room = this.rooms.get(roomId)
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     joinRoom(roomId, userId, deviceId, offer)                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Create/Get Room                                                          │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ if (!rooms.has(roomId))                                             │ │
+│     │   rooms.set(roomId, new Room())                                     │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  2. Create Peer Connection for Participant                                   │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ pc = new RTCPeerConnection({ sdpSemantics: 'unified-plan' })        │ │
+│     │                                                                     │ │
+│     │ pc.ontrack = (event) => {                                           │ │
+│     │   participant.tracks.push(event.track)                              │ │
+│     │   forwardTrackToOtherParticipants(room, userId, event.track)        │ │
+│     │ }                                                                   │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  3. Add Existing Tracks from Other Participants                              │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ for (otherParticipant of room.participants.values())                │ │
+│     │   for (track of otherParticipant.tracks)                            │ │
+│     │     pc.addTrack(track)                                              │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  4. Process SDP Offer/Answer                                                 │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ await pc.setRemoteDescription(offer)                                │ │
+│     │ const answer = await pc.createAnswer()                              │ │
+│     │ await pc.setLocalDescription(answer)                                │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  5. Store Participant & Notify Others                                        │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │ room.participants.set(userId, { userId, deviceId, pc, tracks: [] })│ │
+│     │ notifyParticipantJoined(room, userId)                               │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  Return: { answer, participants: [...room.participants.keys()] }             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
-    if (!room) {
-      room = {
-        id: roomId,
-        participants: new Map(),
-        dominantSpeaker: null,
-        createdAt: Date.now()
-      }
-      this.rooms.set(roomId, room)
-    }
+### Track Forwarding & Renegotiation
 
-    // Create peer connection for this participant
-    const pc = new RTCPeerConnection({
-      sdpSemantics: 'unified-plan'
-    })
-
-    // Handle incoming tracks from this participant
-    pc.ontrack = (event) => {
-      const participant = room!.participants.get(userId)
-      if (participant) {
-        participant.tracks.push(event.track)
-      }
-
-      // Forward to all other participants
-      this.forwardTrackToParticipants(room!, userId, event.track, event.streams[0])
-    }
-
-    // Add existing tracks from other participants
-    for (const [otherId, otherParticipant] of room.participants) {
-      for (const track of otherParticipant.tracks) {
-        pc.addTrack(track)
-      }
-    }
-
-    // Process offer and create answer
-    await pc.setRemoteDescription(offer)
-    const answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    // Store participant
-    room.participants.set(userId, {
-      userId,
-      deviceId,
-      peerConnection: pc,
-      tracks: [],
-      audioLevel: 0
-    })
-
-    // Notify existing participants about new joiner
-    this.notifyParticipantJoined(room, userId)
-
-    return {
-      answer,
-      participants: Array.from(room.participants.keys())
-    }
-  }
-
-  private forwardTrackToParticipants(
-    room: Room,
-    fromUserId: string,
-    track: MediaStreamTrack,
-    stream: MediaStream
-  ) {
-    for (const [userId, participant] of room.participants) {
-      if (userId !== fromUserId) {
-        participant.peerConnection.addTrack(track, stream)
-
-        // Trigger renegotiation
-        this.renegotiate(participant)
-      }
-    }
-  }
-
-  private async renegotiate(participant: Participant) {
-    const pc = participant.peerConnection
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-
-    // Send offer to participant through signaling
-    this.signaling.sendToDevice(participant.deviceId, {
-      type: 'renegotiate',
-      offer
-    })
-  }
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Track Forwarding                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  When User A publishes a track:                                              │
+│                                                                              │
+│  ┌────────┐   track    ┌─────┐   addTrack    ┌────────┐                     │
+│  │ User A │ ────────▶ │ SFU │ ─────────────▶ │ User B │                     │
+│  └────────┘            │     │               │ PC     │                     │
+│                        │     │               └────────┘                     │
+│                        │     │   addTrack    ┌────────┐                     │
+│                        │     │ ─────────────▶ │ User C │                     │
+│                        └─────┘               │ PC     │                     │
+│                                              └────────┘                     │
+│                                                                              │
+│  Renegotiation Required:                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ 1. SFU creates new offer for affected participant                       ││
+│  │ 2. Sends offer via signaling: { type: 'renegotiate', offer }            ││
+│  │ 3. Client responds with answer                                          ││
+│  │ 4. SFU applies answer                                                   ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Dominant Speaker Detection
 
-```typescript
-// backend/src/services/sfu.ts (continued)
-class DominantSpeakerDetector {
-  private audioLevelHistory = new Map<string, number[]>()
-  private readonly SMOOTHING_WINDOW = 5
-  private readonly SILENCE_THRESHOLD = 0.01
-
-  constructor(private room: Room) {
-    // Run detection every 100ms
-    setInterval(() => this.detect(), 100)
-  }
-
-  async detect() {
-    for (const [userId, participant] of this.room.participants) {
-      const stats = await participant.peerConnection.getStats()
-
-      for (const report of stats.values()) {
-        if (report.type === 'inbound-rtp' && report.kind === 'audio') {
-          const audioLevel = report.audioLevel || 0
-          this.updateLevel(userId, audioLevel)
-        }
-      }
-    }
-
-    // Find user with highest average level
-    let maxAvg = 0
-    let dominant: string | null = null
-
-    for (const [userId, levels] of this.audioLevelHistory) {
-      const avg = levels.reduce((a, b) => a + b, 0) / levels.length
-      if (avg > maxAvg && avg > this.SILENCE_THRESHOLD) {
-        maxAvg = avg
-        dominant = userId
-      }
-    }
-
-    // Notify if dominant speaker changed
-    if (dominant !== this.room.dominantSpeaker) {
-      this.room.dominantSpeaker = dominant
-      this.notifyDominantSpeakerChange(dominant)
-    }
-  }
-
-  private updateLevel(userId: string, level: number) {
-    if (!this.audioLevelHistory.has(userId)) {
-      this.audioLevelHistory.set(userId, [])
-    }
-
-    const levels = this.audioLevelHistory.get(userId)!
-    levels.push(level)
-
-    if (levels.length > this.SMOOTHING_WINDOW) {
-      levels.shift()
-    }
-  }
-
-  private notifyDominantSpeakerChange(userId: string | null) {
-    for (const [, participant] of this.room.participants) {
-      this.signaling.sendToDevice(participant.deviceId, {
-        type: 'dominant_speaker_changed',
-        userId
-      })
-    }
-  }
-}
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Dominant Speaker Detection                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Algorithm:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ Interval: every 100ms                                                   ││
+│  │                                                                         ││
+│  │ 1. For each participant:                                                ││
+│  │    - Get audio level from RTCPeerConnection stats                       ││
+│  │    - Update rolling window (last 5 samples)                             ││
+│  │                                                                         ││
+│  │ 2. Calculate average audio level per participant                        ││
+│  │                                                                         ││
+│  │ 3. Find participant with:                                               ││
+│  │    - Highest average level                                              ││
+│  │    - Level > SILENCE_THRESHOLD (0.01)                                   ││
+│  │                                                                         ││
+│  │ 4. If dominant speaker changed:                                         ││
+│  │    - Update room.dominantSpeaker                                        ││
+│  │    - Broadcast to all: { type: 'dominant_speaker_changed', userId }     ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Audio Level Source:                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ pc.getStats() ──▶ find report where type='inbound-rtp' && kind='audio' ││
+│  │              ──▶ report.audioLevel (0.0 to 1.0)                         ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Smoothing:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ audioLevelHistory: Map<userId, number[]>                                ││
+│  │ SMOOTHING_WINDOW = 5 samples                                            ││
+│  │ Average = sum(levels) / levels.length                                   ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -710,56 +527,68 @@ class DominantSpeakerDetector {
 
 ### PostgreSQL Schema
 
-```sql
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(100) NOT NULL,
-  avatar_url VARCHAR(500),
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- User Devices (for multi-device ring)
-CREATE TABLE user_devices (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id) NOT NULL,
-  device_type VARCHAR(50),
-  push_token VARCHAR(500),
-  is_active BOOLEAN DEFAULT TRUE,
-  last_seen TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_devices_user_active ON user_devices(user_id) WHERE is_active;
-
--- Calls
-CREATE TABLE calls (
-  id UUID PRIMARY KEY,
-  initiator_id UUID REFERENCES users(id) NOT NULL,
-  call_type VARCHAR(20) NOT NULL, -- 'video', 'audio', 'group'
-  state VARCHAR(20) NOT NULL,     -- 'ringing', 'connected', 'ended', 'missed'
-  answered_by_device UUID,
-  connected_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  duration_seconds INTEGER,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_calls_initiator ON calls(initiator_id, created_at DESC);
-CREATE INDEX idx_calls_state ON calls(state) WHERE state IN ('ringing', 'connected');
-
--- Call Participants
-CREATE TABLE call_participants (
-  call_id UUID REFERENCES calls(id),
-  user_id UUID REFERENCES users(id) NOT NULL,
-  device_id UUID,
-  state VARCHAR(20), -- 'ringing', 'connected', 'left', 'declined'
-  joined_at TIMESTAMP,
-  left_at TIMESTAMP,
-  PRIMARY KEY (call_id, user_id)
-);
-
-CREATE INDEX idx_participants_user ON call_participants(user_id, call_id);
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Database Tables                                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  users                                                                       │
+│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
+│  │ Column          │ Type             │ Notes                             │ │
+│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
+│  │ id              │ UUID PK          │ gen_random_uuid()                 │ │
+│  │ name            │ VARCHAR(100)     │ NOT NULL                          │ │
+│  │ avatar_url      │ VARCHAR(500)     │                                   │ │
+│  │ created_at      │ TIMESTAMP        │ DEFAULT NOW()                     │ │
+│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
+│                                                                              │
+│  user_devices (for multi-device ring)                                        │
+│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
+│  │ Column          │ Type             │ Notes                             │ │
+│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
+│  │ id              │ UUID PK          │                                   │ │
+│  │ user_id         │ UUID FK          │ REFERENCES users(id)              │ │
+│  │ device_type     │ VARCHAR(50)      │ iPhone, iPad, Mac, Watch          │ │
+│  │ push_token      │ VARCHAR(500)     │ For offline notifications         │ │
+│  │ is_active       │ BOOLEAN          │ DEFAULT TRUE                      │ │
+│  │ last_seen       │ TIMESTAMP        │                                   │ │
+│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
+│                                                                              │
+│  INDEX: idx_devices_user_active ON user_devices(user_id) WHERE is_active     │
+│                                                                              │
+│  calls                                                                       │
+│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
+│  │ Column          │ Type             │ Notes                             │ │
+│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
+│  │ id              │ UUID PK          │                                   │ │
+│  │ initiator_id    │ UUID FK          │ REFERENCES users(id)              │ │
+│  │ call_type       │ VARCHAR(20)      │ 'video', 'audio', 'group'         │ │
+│  │ state           │ VARCHAR(20)      │ 'ringing','connected','ended'     │ │
+│  │ answered_by     │ UUID             │ Device that answered              │ │
+│  │ connected_at    │ TIMESTAMP        │                                   │ │
+│  │ ended_at        │ TIMESTAMP        │                                   │ │
+│  │ duration_seconds│ INTEGER          │ Computed on end                   │ │
+│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
+│                                                                              │
+│  INDEXES:                                                                    │
+│    idx_calls_initiator ON calls(initiator_id, created_at DESC)              │
+│    idx_calls_state ON calls(state) WHERE state IN ('ringing','connected')   │
+│                                                                              │
+│  call_participants                                                           │
+│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
+│  │ Column          │ Type             │ Notes                             │ │
+│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
+│  │ call_id         │ UUID             │ PK with user_id                   │ │
+│  │ user_id         │ UUID FK          │ PK with call_id                   │ │
+│  │ device_id       │ UUID             │ Device that joined                │ │
+│  │ state           │ VARCHAR(20)      │ 'ringing','connected','left'      │ │
+│  │ joined_at       │ TIMESTAMP        │                                   │ │
+│  │ left_at         │ TIMESTAMP        │                                   │ │
+│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
+│                                                                              │
+│  INDEX: idx_participants_user ON call_participants(user_id, call_id)        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Redis Caching Strategy
@@ -779,63 +608,58 @@ CREATE INDEX idx_participants_user ON call_participants(user_id, call_id);
 
 ### Key Metrics
 
-```typescript
-// backend/src/shared/metrics.ts
-import { Counter, Histogram, Gauge } from 'prom-client'
-
-export const callsInitiated = new Counter({
-  name: 'facetime_calls_initiated_total',
-  labelNames: ['call_type']
-})
-
-export const callsAnswered = new Counter({
-  name: 'facetime_calls_answered_total',
-  labelNames: ['call_type']
-})
-
-export const callDuration = new Histogram({
-  name: 'facetime_call_duration_seconds',
-  labelNames: ['call_type'],
-  buckets: [30, 60, 120, 300, 600, 1800, 3600]
-})
-
-export const callSetupLatency = new Histogram({
-  name: 'facetime_call_setup_latency_seconds',
-  labelNames: ['call_type'],
-  buckets: [0.5, 1, 2, 5, 10, 30]
-})
-
-export const activeConnections = new Gauge({
-  name: 'facetime_active_websocket_connections'
-})
-
-export const iceConnectionType = new Counter({
-  name: 'facetime_ice_connection_type_total',
-  labelNames: ['type'] // 'host', 'srflx', 'relay'
-})
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Prometheus Metrics                                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Counters:                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ facetime_calls_initiated_total{call_type}                               ││
+│  │ facetime_calls_answered_total{call_type}                                ││
+│  │ facetime_ice_connection_type_total{type}  (host, srflx, relay)          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Histograms:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ facetime_call_duration_seconds{call_type}                               ││
+│  │   buckets: [30, 60, 120, 300, 600, 1800, 3600]                          ││
+│  │                                                                         ││
+│  │ facetime_call_setup_latency_seconds{call_type}                          ││
+│  │   buckets: [0.5, 1, 2, 5, 10, 30]                                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  Gauges:                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ facetime_active_websocket_connections                                   ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Health Check Endpoint
 
-```typescript
-// backend/src/routes/health.ts
-router.get('/health', async (req, res) => {
-  const checks = {
-    postgres: await checkPostgres(),
-    redis: await checkRedis(),
-    websocket: checkWebSocketServer()
-  }
-
-  const healthy = Object.values(checks).every(c => c.status === 'healthy')
-
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'ok' : 'degraded',
-    uptime: process.uptime(),
-    services: checks,
-    activeConnections: signaling.getConnectionCount(),
-    activeCalls: await redis.keys('call:*').then(k => k.length)
-  })
-})
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     GET /health                                               │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Response (200 OK / 503 Degraded):                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ {                                                                       ││
+│  │   status: 'ok' | 'degraded',                                            ││
+│  │   uptime: process.uptime(),                                             ││
+│  │   services: {                                                           ││
+│  │     postgres: { status: 'healthy' | 'unhealthy' },                      ││
+│  │     redis: { status: 'healthy' | 'unhealthy' },                         ││
+│  │     websocket: { status: 'healthy' | 'unhealthy' }                      ││
+│  │   },                                                                    ││
+│  │   activeConnections: 1234,                                              ││
+│  │   activeCalls: 567                                                      ││
+│  │ }                                                                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -852,20 +676,43 @@ router.get('/health', async (req, res) => {
 
 ### Why SFU over MCU?
 
-**MCU (Multipoint Control Unit):**
-- Mixes all streams into one
-- High server CPU (transcoding)
-- Lower client bandwidth
-- Higher latency
-
-**SFU (Selective Forwarding Unit):**
-- Forwards streams selectively
-- Low server CPU (no transcoding)
-- Higher client bandwidth
-- Lower latency
-- Better video quality (no re-encoding)
-
-For a quality-focused service like FaceTime, SFU is the right choice.
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     MCU vs SFU Comparison                                     │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  MCU (Multipoint Control Unit):                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ [User A] ──▶ ┌─────────┐                                                ││
+│  │              │   MCU   │ ──▶ [Mixed stream to all]                      ││
+│  │ [User B] ──▶ │ transcode│                                                ││
+│  │              └─────────┘                                                ││
+│  │                                                                         ││
+│  │ - Mixes all streams into one                                            ││
+│  │ - HIGH server CPU (transcoding)                                         ││
+│  │ - Lower client bandwidth                                                ││
+│  │ - Higher latency (transcoding delay)                                    ││
+│  │ - Quality loss from re-encoding                                         ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  SFU (Selective Forwarding Unit):                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ [User A] ──▶ ┌─────────┐ ──▶ [User B]                                   ││
+│  │              │   SFU   │                                                ││
+│  │ [User B] ──▶ │ forward │ ──▶ [User A]                                   ││
+│  │              └─────────┘                                                ││
+│  │                                                                         ││
+│  │ - Forwards streams selectively                                          ││
+│  │ - LOW server CPU (no transcoding)                                       ││
+│  │ - Higher client bandwidth                                               ││
+│  │ - Lower latency (just routing)                                          ││
+│  │ - Better video quality (no re-encoding)                                 ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  For a quality-focused service like FaceTime, SFU is the right choice.      │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
