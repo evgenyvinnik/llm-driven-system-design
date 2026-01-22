@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
-import type { Suggestion, HistoryItem } from '../types';
+import type { Suggestion } from '../types';
 import { api } from '../services/api';
 
 interface SearchState {

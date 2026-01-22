@@ -28,7 +28,7 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
     error,
     responseTime,
     recentSearches,
-    fuzzyEnabled,
+    fuzzyEnabled: _fuzzyEnabled,
     setQuery,
     search,
     selectSuggestion,
@@ -202,7 +202,7 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
         <div className="px-4 py-2 text-xs text-gray-500 font-medium border-b">
           Recent Searches
         </div>
-        {recentSearches.slice(0, 5).map((search, index) => (
+        {recentSearches.slice(0, 5).map((search, _index) => (
           <li
             key={search}
             className="px-4 py-2 cursor-pointer flex items-center gap-2 hover:bg-gray-50"

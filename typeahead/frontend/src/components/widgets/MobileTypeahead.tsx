@@ -7,7 +7,7 @@ import { getHistory, clearHistory, type HistoryEntry } from '../../db/database.j
 import type { MobileTypeaheadProps } from './types.js';
 
 export function MobileTypeahead({
-  title = 'Search',
+  title: _title = 'Search',
   showCancel = true,
   cancelText = 'Cancel',
   fullScreen = true,

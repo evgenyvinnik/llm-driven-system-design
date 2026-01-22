@@ -3,11 +3,11 @@ import { useEffect, useRef, useCallback } from 'react';
 /**
  * useDebounce - Debounce a callback function
  */
-export function useDebounce<T extends (...args: unknown[]) => void>(
+export function useDebounce<T extends (...args: never[]) => void>(
   callback: T,
   delay: number
 ): T {
-  const timeoutRef = useRef<number>();
+  const timeoutRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     return () => {

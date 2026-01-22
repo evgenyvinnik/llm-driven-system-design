@@ -4,7 +4,6 @@
  */
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../services/api.js';
-import { memoryCache } from '../services/cache.js';
 import {
   getCachedSuggestions,
   cacheSuggestions,
@@ -84,7 +83,7 @@ export interface UseTypeaheadReturn {
  * Generate a unique ID for ARIA relationships.
  */
 function useUniqueId(prefix: string): string {
-  const idRef = useRef<string>();
+  const idRef = useRef<string | undefined>(undefined);
   if (!idRef.current) {
     idRef.current = `${prefix}-${Math.random().toString(36).substr(2, 9)}`;
   }
@@ -110,7 +109,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
   const [error, setError] = useState<Error | null>(null);
   const [isCached, setIsCached] = useState(false);
 
-  const debounceTimer = useRef<number>();
+  const debounceTimer = useRef<number | undefined>(undefined);
   const listboxId = useUniqueId('typeahead-listbox');
 
   // Fetch suggestions with multi-layer caching

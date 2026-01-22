@@ -2,6 +2,7 @@ import express, { Router, Request, Response } from 'express';
 import type { Pool } from 'pg';
 import type { Trie } from '../data-structures/trie.js';
 import type { AggregationService } from '../services/aggregation-service.js';
+import { cacheSuggestions, cacheTrending } from '../shared/cache-headers.js';
 
 const router: Router = express.Router();
 
@@ -28,7 +29,7 @@ interface HourlyRow {
  * GET /api/v1/analytics/summary
  * Get analytics summary for the typeahead service.
  */
-router.get('/summary', async (req: Request, res: Response) => {
+router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
     const trie = req.app.get('trie') as Trie;
@@ -107,7 +108,7 @@ router.get('/summary', async (req: Request, res: Response) => {
  * - offset: Pagination offset (default: 0)
  * - search: Filter by query text (optional)
  */
-router.get('/queries', async (req: Request, res: Response) => {
+router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => {
   try {
     const { limit = '50', offset = '0', search } = req.query;
     const pgPool = req.app.get('pgPool') as Pool;
@@ -167,7 +168,7 @@ router.get('/queries', async (req: Request, res: Response) => {
  * Query params:
  * - limit: Max number of phrases (default: 50)
  */
-router.get('/top-phrases', async (req: Request, res: Response) => {
+router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response) => {
   try {
     const { limit = '50' } = req.query;
     const pgPool = req.app.get('pgPool') as Pool;
@@ -206,7 +207,7 @@ router.get('/top-phrases', async (req: Request, res: Response) => {
  * GET /api/v1/analytics/hourly
  * Get query volume by hour for the last 24 hours.
  */
-router.get('/hourly', async (req: Request, res: Response) => {
+router.get('/hourly', cacheTrending, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
 

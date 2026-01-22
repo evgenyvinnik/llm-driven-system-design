@@ -340,7 +340,7 @@ router.get('/popular', cacheSuggestions, async (req: Request, res: Response) => 
  * - userId: User ID (required)
  * - limit: Max number of history items (default: 10)
  */
-router.get('/history', async (req: Request, res: Response) => {
+router.get('/history', cacheUserSpecific, async (req: Request, res: Response) => {
   const timer = suggestionLatency.startTimer();
 
   try {
