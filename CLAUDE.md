@@ -11,20 +11,9 @@ This is a **system design learning repository** where each subdirectory represen
 ## Quick Start for Any Project
 
 1. Read the project's `architecture.md` first to understand the design
-2. Check `CLAUDE.md` for iteration history and key decisions (this is the primary source of truth for project-specific guidance)
+2. Check `CLAUDE.md` for iteration history and key decisions (primary source of truth for project-specific guidance - captures the "why" behind implementation choices)
 3. Look at `README.md` for setup instructions
 4. Check `package.json` to find available scripts
-
-## Project-Specific CLAUDE.md Files
-
-Each project has its own `CLAUDE.md` documenting:
-- **Project Context** - What system is being built and why
-- **Key Learning Goals** - Specific concepts being explored
-- **Key Challenges Explored** - Implementation decisions with rationale
-- **Architecture Decisions** - Database choices, caching strategies, etc.
-- **Iteration History** - How the design evolved
-
-These files capture the "why" behind implementation choices and serve as the primary context when working on that specific project.
 
 ## Project Structure
 
@@ -40,6 +29,8 @@ Each project folder typically contains:
 ├── training/                  # ML training code (Python, when applicable)
 └── docker-compose.yml         # Infrastructure services (PostgreSQL, Redis, etc.)
 ```
+
+**Note:** Some projects (mdreader, MCPlator, 20forms-20designs) are external personal projects with architecture documentation only - they link to separate repositories for implementation.
 
 ## Common Commands
 
@@ -112,6 +103,11 @@ npm run generate-tests bitly        # Generate for specific project
 # Run smoke tests (automated UI tests)
 npm run test:smoke instagram        # Run smoke tests for specific project
 npm run test:smoke:all              # Run smoke tests for all projects
+
+# ESLint/Prettier maintenance (batch operations across projects)
+node scripts/add-eslint-configs.mjs # Add ESLint configs to all backends
+node scripts/fix-eslint-errors.mjs  # Auto-fix ESLint errors across projects
+node scripts/fix-unused-vars.mjs    # Prefix unused variables with underscore
 ```
 
 ### Full Development Workflow
@@ -139,9 +135,11 @@ For projects requiring seed data (screenshots, demos):
 PGPASSWORD=password psql -h localhost -U user -d dbname -f backend/db-seed/seed.sql
 ```
 
-### Screenshot Automation
+### Screenshot & Smoke Test Automation
 
-Capture screenshots of frontend projects for documentation using Playwright.
+The repository includes tooling for visual documentation and automated UI testing using **Playwright** (primary) and **Puppeteer** (legacy/fallback).
+
+**Screenshots** capture frontend UI for documentation. **Smoke tests** are auto-generated from screenshot configs and verify that pages load correctly - use them after making frontend changes to catch regressions.
 
 **Prerequisites:**
 - Playwright installed: `npm install playwright` and `npx playwright install`
@@ -300,7 +298,7 @@ backend/src/
     └── seed-*.ts        # Database seeders
 ```
 
-### Database Schema Files
+### Database Schema and Seed Files
 
 SQL schemas are stored as `init.sql` files (not numbered migrations). Common locations:
 
@@ -317,15 +315,7 @@ For projects using multiple databases:
 
 The `npm run db:migrate` command runs `migrate.ts` which executes `init.sql` against the database.
 
-### Database Seed Files
-
-Seed files populate the database with sample data for development and testing. They are stored in a dedicated folder:
-
-| Location | Purpose |
-|----------|---------|
-| `backend/db-seed/seed.sql` | Sample data (users, posts, etc.) |
-
-The screenshot automation script (`scripts/screenshots.mjs --start`) automatically runs `seed.sql` after `init.sql` when setting up the database for capturing screenshots.
+**Seed files** (`backend/db-seed/seed.sql`) populate sample data for development. The screenshot automation script automatically runs seeds when setting up for captures.
 
 ### Testing
 
@@ -362,15 +352,7 @@ See [TECHNOLOGIES.md](./TECHNOLOGIES.md) for a comprehensive guide to all techno
 
 ## Implementation Notes
 
-Projects have both frontend and backend implementations following the standard `frontend/` + `backend/` structure.
-
-### Backend Language Variants
-
-| Language | Runner | Example Projects |
-|----------|--------|------------------|
-| TypeScript | `tsx` | All backend projects (scale-ai, web-crawler, ad-click-aggregator, discord, twitter, airbnb, instagram, uber, icloud, apple-tv, youtube) |
-
-Check each project's `package.json` for available scripts.
+All projects use TypeScript with `tsx` for backend development. Check each project's `package.json` for available scripts.
 
 ### Python Training Scripts
 
@@ -453,6 +435,17 @@ REDIS_URL=redis://localhost:6379
 MINIO_ENDPOINT=localhost:9000
 RABBITMQ_URL=amqp://user:pass@localhost:5672
 ```
+
+### Default Development Credentials
+
+Most projects use these default credentials in docker-compose.yml:
+
+| Service | Username | Password | Database/Bucket |
+|---------|----------|----------|-----------------|
+| PostgreSQL | `user` | `password` | Project-specific (e.g., `instagram`, `airbnb`) |
+| Redis/Valkey | - | - | (no auth in dev) |
+| MinIO | `minioadmin` | `minioadmin` | Project-specific buckets |
+| RabbitMQ | `guest` | `guest` | Default vhost |
 
 This ensures projects are accessible to developers who prefer not to use Docker.
 
