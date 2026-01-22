@@ -672,92 +672,21 @@ Host selects multiple dates
 
 ### Store Structure
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        ZUSTAND STORES                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  AUTH STORE                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ user: User | null                                           ││
-│  │ isLoading: boolean                                          ││
-│  │ ──────────────────────────────────────                      ││
-│  │ login(email, password) -> set user                          ││
-│  │ logout() -> clear user, POST /logout                        ││
-│  │ checkAuth() -> GET /me, set user or null                    ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                 │
-│  SEARCH STORE                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ location: string                                            ││
-│  │ coordinates: { lat, lon } | null                            ││
-│  │ dateRange: { checkIn, checkOut } | null                     ││
-│  │ guests: number                                              ││
-│  │ filters: { priceMin, priceMax, types[], amenities[] }       ││
-│  │ ──────────────────────────────────────                      ││
-│  │ setLocation(location, coords) -> update both                ││
-│  │ setDateRange(range) -> update                               ││
-│  │ setFilters(partial) -> merge with existing                  ││
-│  │ clear() -> reset to defaults                                ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                 │
-│  BOOKING STORE (local to ListingPage)                           │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ selectedDates: DateRange | null                             ││
-│  │ guests: number                                              ││
-│  │ availability: AvailabilityBlock[]                           ││
-│  │ isSubmitting: boolean                                       ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Store | State | Actions |
+|-------|-------|---------|
+| Auth | user, isLoading | login(), logout(), checkAuth() |
+| Search | location, coords, dateRange, guests, filters | setLocation(), setDateRange(), setFilters(), clear() |
+| Booking (local) | selectedDates, guests, availability, isSubmitting | - |
 
-### Data Flow: URL as Source of Truth for Search
+### Data Flow: URL as Source of Truth
 
 ```
-User types in SearchBar
-         │
-         ▼
-┌─────────────────────┐
-│  Debounce 300ms     │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  Geocode location   │
-│  -> get lat/lon     │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  setSearchParams()  │  Update URL without navigation
-│  Updates URL        │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  useEffect listens  │
-│  to searchParams    │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  Fetch listings     │
-│  with all params    │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  Update UI:         │
-│  - Results list     │
-│  - Map markers      │
-└─────────────────────┘
+User types ──▶ Debounce 300ms ──▶ Geocode ──▶ setSearchParams()
+                                                    │
+                                                    ▼
+Update UI (Results + Map) ◀── Fetch listings ◀── useEffect on URL
 
-Benefits:
-- Shareable URLs
-- Browser back/forward works
-- Single source of truth
-- Easy deep linking
+Benefits: Shareable URLs, browser navigation works, single source of truth
 ```
 
 ---
