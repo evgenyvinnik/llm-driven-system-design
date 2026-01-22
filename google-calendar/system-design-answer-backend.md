@@ -10,7 +10,9 @@ Design the backend infrastructure for a calendar application that allows users t
 - Handle efficient date range queries
 - Scale to millions of users
 
-## Requirements Clarification
+---
+
+## 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 1. **User Management**: Authentication, session handling, user preferences (timezone)
@@ -21,149 +23,131 @@ Design the backend infrastructure for a calendar application that allows users t
 
 ### Non-Functional Requirements
 1. **Low Latency**: Event queries < 50ms at p99
-2. **Consistency**: Strong consistency for event operations (no double-booking)
+2. **Consistency**: Strong consistency for event operations (no double-booking issues)
 3. **Availability**: 99.9% uptime for read operations
 4. **Scalability**: Support 10M+ users with 100+ events each
 
 ### Scale Estimates
-- 10M users, avg 100 events/user = 1B events
-- Avg event size: 500 bytes → 500GB raw data
-- Read-heavy: 100:1 read:write ratio
-- Peak: 100K reads/sec, 1K writes/sec
+- 10M users × 100 events avg = **1B total events**
+- Avg event size: 500 bytes → **500GB raw data**
+- Read-heavy: **100:1 read:write ratio**
+- Peak traffic: **100K reads/sec, 1K writes/sec**
 
-## High-Level Architecture
+### Out of Scope (for 45 min)
+- Recurring event expansion (RRULE)
+- Calendar sharing/collaboration
+- Notification system
+
+---
+
+## 2. High-Level Architecture (10 minutes)
+
+### System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Load Balancer (nginx)                           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │ API Server  │ │ API Server  │ │ API Server  │
-            │   (Node)    │ │   (Node)    │ │   (Node)    │
-            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                   │               │               │
-                   └───────────────┼───────────────┘
-                                   │
-            ┌──────────────────────┼──────────────────────┐
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-    │    Valkey    │      │  PostgreSQL  │      │  PostgreSQL  │
-    │   (Cache +   │      │   Primary    │      │   Replica    │
-    │   Sessions)  │      │              │      │              │
-    └──────────────┘      └──────────────┘      └──────────────┘
+                              ┌─────────────────────────────────────┐
+                              │        Load Balancer (nginx)         │
+                              └─────────────────┬───────────────────┘
+                                                │
+                    ┌───────────────────────────┼───────────────────────────┐
+                    │                           │                           │
+                    ▼                           ▼                           ▼
+            ┌──────────────┐           ┌──────────────┐           ┌──────────────┐
+            │  API Server  │           │  API Server  │           │  API Server  │
+            │   (Node.js)  │           │   (Node.js)  │           │   (Node.js)  │
+            └──────┬───────┘           └──────┬───────┘           └──────┬───────┘
+                   │                          │                          │
+                   └──────────────────────────┼──────────────────────────┘
+                                              │
+                   ┌──────────────────────────┼──────────────────────────┐
+                   │                          │                          │
+                   ▼                          ▼                          ▼
+           ┌──────────────┐          ┌───────────────┐          ┌───────────────┐
+           │    Valkey    │          │  PostgreSQL   │          │  PostgreSQL   │
+           │   (Cache +   │          │    Primary    │          │    Replica    │
+           │   Sessions)  │          │               │          │  (Read-only)  │
+           └──────────────┘          └───────────────┘          └───────────────┘
 ```
 
-## Deep Dive: Data Model Design
+### Component Responsibilities
 
-### Database Schema
+| Component | Responsibility |
+|-----------|----------------|
+| **Load Balancer** | Distribute traffic, health checks, SSL termination |
+| **API Servers** | Stateless request handling, business logic, conflict detection |
+| **PostgreSQL Primary** | Source of truth for all writes (events, calendars, users) |
+| **PostgreSQL Replica** | Handle read-heavy date range queries |
+| **Valkey Cache** | Session storage, event cache, rate limiting |
 
-```sql
--- Users table with timezone preference
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    timezone VARCHAR(50) DEFAULT 'UTC',
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+---
 
--- Calendars support multiple per user
-CREATE TABLE calendars (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name VARCHAR(100) NOT NULL,
-    color VARCHAR(7) DEFAULT '#3B82F6',
-    is_primary BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+## 3. Data Model Design (10 minutes)
 
-    -- Ensure only one primary per user
-    CONSTRAINT unique_primary_per_user
-        UNIQUE (user_id, is_primary) WHERE is_primary = TRUE
-);
+### Entity Relationships
 
--- Events with time range validation
-CREATE TABLE events (
-    id SERIAL PRIMARY KEY,
-    calendar_id INTEGER NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    description TEXT,
-    location VARCHAR(255),
-    start_time TIMESTAMPTZ NOT NULL,
-    end_time TIMESTAMPTZ NOT NULL,
-    all_day BOOLEAN DEFAULT FALSE,
-    color VARCHAR(7),
-    recurrence_rule TEXT,  -- iCal RRULE format for future use
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-
-    -- Database-level time validation
-    CONSTRAINT valid_time_range CHECK (end_time > start_time)
-);
-
--- Sessions for authentication (alternative to Redis)
-CREATE TABLE sessions (
-    sid VARCHAR NOT NULL PRIMARY KEY,
-    sess JSON NOT NULL,
-    expire TIMESTAMPTZ NOT NULL
-);
 ```
+┌─────────────┐       1:N       ┌─────────────┐       1:N       ┌─────────────┐
+│    Users    │────────────────►│  Calendars  │────────────────►│   Events    │
+│             │                 │             │                 │             │
+│ • id        │                 │ • id        │                 │ • id        │
+│ • email     │                 │ • user_id   │                 │ • calendar_id│
+│ • timezone  │                 │ • name      │                 │ • title     │
+│             │                 │ • color     │                 │ • start_time│
+│             │                 │ • is_primary│                 │ • end_time  │
+└─────────────┘                 └─────────────┘                 │ • location  │
+                                                                └─────────────┘
+```
+
+### Key Schema Decisions
+
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| **users** | id, email, password_hash, timezone | User account with TZ preference |
+| **calendars** | id, user_id, name, color, is_primary | Support multiple calendars per user |
+| **events** | id, calendar_id, title, start_time, end_time | Core event data with TIMESTAMPTZ |
+| **sessions** | sid, sess, expire | Server-side session storage |
 
 ### Index Strategy
 
-```sql
--- Primary index for date range queries
--- Supports: "Get all events for calendar X between date A and B"
-CREATE INDEX idx_events_calendar_time
-    ON events(calendar_id, start_time, end_time);
+```
+Events Table Indexes:
+├── PRIMARY KEY (id)
+├── BTREE (calendar_id, start_time, end_time)  ← Date range queries
+└── BTREE (calendar_id, start_time) INCLUDE (title, end_time)  ← Covering index for list views
 
--- Index for conflict detection across all user calendars
--- Supports: "Find overlapping events for user Y"
-CREATE INDEX idx_events_user_time
-    ON events(calendar_id, start_time, end_time)
-    INCLUDE (title);
-
--- Session cleanup
-CREATE INDEX idx_sessions_expire ON sessions(expire);
-
--- Fast user lookup by email
-CREATE INDEX idx_users_email ON users(email);
+Purpose:
+• Fast lookups: "All events for calendar X between dates A and B"
+• Conflict detection: "Find events overlapping time range [start, end]"
 ```
 
-### Why PostgreSQL Over Alternatives?
+### Database Selection: Alternatives Considered
 
-| Consideration | PostgreSQL | Cassandra | MongoDB |
-|---------------|------------|-----------|---------|
-| Time range queries | Excellent (B-tree indexes) | Poor (requires partition key) | Good |
-| Conflict detection | Excellent (single query) | Poor (requires scatter-gather) | Moderate |
-| Transactions | Full ACID | Limited | Limited |
-| Schema flexibility | Good (JSONB if needed) | Good | Excellent |
-| Operational complexity | Low | High | Moderate |
+| Database | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **PostgreSQL** | ACID, excellent range queries, mature tooling | Single-writer scaling | ✓ Chosen |
+| **Cassandra** | High write throughput, horizontal scale | Poor range queries, eventual consistency | Rejected |
+| **MongoDB** | Flexible schema, good read scale | Weaker consistency guarantees | Rejected |
+| **CockroachDB** | Distributed SQL, auto-scaling | Operational complexity, higher latency | Future option |
 
-**Decision**: PostgreSQL is ideal for calendar data because:
-1. Time range queries are core to calendar functionality
-2. Conflict detection requires cross-record queries
-3. Strong consistency prevents double-booking
-4. Mature tooling and read replica support
+**Decision Rationale**: Calendar data requires:
+1. Time range queries (core feature) → PostgreSQL B-tree indexes excel
+2. Strong consistency for conflict detection → ACID required
+3. Moderate write volume (1K/sec) → Single-writer PostgreSQL handles this
 
-## Deep Dive: Conflict Detection Algorithm
+---
+
+## 4. Deep Dive: Conflict Detection (10 minutes)
 
 ### The Time Overlap Problem
 
-Two events overlap if and only if:
-- Event A starts before Event B ends, AND
-- Event A ends after Event B starts
+Two events overlap if their time ranges intersect:
 
 ```
 Case 1: Partial overlap (A starts during B)
     B: |---------|
     A:      |---------|
 
-Case 2: Partial overlap (A ends during B)
+Case 2: Partial overlap (B starts during A)
     B:      |---------|
     A: |---------|
 
@@ -174,313 +158,219 @@ Case 3: A contains B
 Case 4: B contains A
     B: |---------|
     A:    |---|
+
+All cases detected by: (A.start < B.end) AND (A.end > B.start)
 ```
 
-### SQL Implementation
+### Query Approach
 
-```sql
--- Find all events that conflict with a proposed time range
-SELECT
-    e.id,
-    e.title,
-    e.start_time,
-    e.end_time,
-    c.name AS calendar_name,
-    c.color
-FROM events e
-JOIN calendars c ON e.calendar_id = c.id
-WHERE c.user_id = $1
-  AND e.id != COALESCE($4, 0)  -- Exclude self when editing
-  AND e.start_time < $3         -- Existing starts before proposed ends
-  AND e.end_time > $2           -- Existing ends after proposed starts
-ORDER BY e.start_time;
+**Find conflicts for a proposed event [start, end] across all user calendars:**
+
+```
+SELECT events.id, title, start_time, end_time, calendar.name, calendar.color
+FROM events
+JOIN calendars ON events.calendar_id = calendars.id
+WHERE calendars.user_id = :user_id
+  AND events.start_time < :proposed_end    -- Existing starts before proposed ends
+  AND events.end_time > :proposed_start    -- Existing ends after proposed starts
+  AND events.id != :exclude_id             -- Exclude self when editing
+ORDER BY start_time
 ```
 
-### Performance Analysis
-
-With the composite index `(calendar_id, start_time, end_time)`:
-- Index range scan on `start_time < $3`
-- Filter on `end_time > $2`
-- Expected time: O(log N) + O(conflicts)
-
-For a user with 1000 events, worst case scans ~30 index pages.
-
-### Service Layer Implementation
-
-```typescript
-// services/conflictService.ts
-export async function checkConflicts(
-    userId: number,
-    startTime: Date,
-    endTime: Date,
-    excludeEventId?: number
-): Promise<Conflict[]> {
-    const result = await pool.query(`
-        SELECT e.id, e.title, e.start_time, e.end_time, c.name, c.color
-        FROM events e
-        JOIN calendars c ON e.calendar_id = c.id
-        WHERE c.user_id = $1
-          AND e.id != COALESCE($4, 0)
-          AND e.start_time < $3
-          AND e.end_time > $2
-        ORDER BY e.start_time
-    `, [userId, startTime, endTime, excludeEventId]);
-
-    return result.rows;
-}
-```
+**Index utilization**: Uses `(calendar_id, start_time, end_time)` composite index for efficient range scan.
 
 ### Design Decision: Non-Blocking Conflicts
 
-**Decision**: Return conflicts as warnings, don't block event creation.
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Warn but allow** | Flexible, matches real calendar behavior | Users may miss warnings | ✓ Chosen |
+| **Block creation** | Prevents all overlaps | Too restrictive (intentional overlaps exist) | Rejected |
+| **Require confirmation** | Explicit user acknowledgment | Adds friction to workflow | Alternative for settings |
 
-**Rationale**:
-- Real calendars allow overlapping events (e.g., "maybe" meetings)
-- Users may intentionally create overlapping events
-- Better UX to inform than to block
+**Rationale**: Real calendars allow overlapping events (e.g., "tentative" meetings, background tasks). Better to inform than to block.
 
-**Alternative considered**: Database constraint preventing overlaps
-- Rejected: Too restrictive, complex to implement correctly
+---
 
-## Deep Dive: Session Management
-
-### Architecture Choice
-
-```
-┌────────────────┐         ┌────────────────┐
-│   API Server   │◄───────►│   PostgreSQL   │
-│                │  store   │   (sessions    │
-│  express-      │  sessions│    table)      │
-│  session       │         │                │
-└────────────────┘         └────────────────┘
-```
-
-### Why PostgreSQL Over Redis for Sessions?
-
-| Factor | PostgreSQL | Redis/Valkey |
-|--------|-----------|--------------|
-| Latency | ~5ms | ~1ms |
-| Durability | Yes | Optional (AOF) |
-| Infrastructure | Already have | Additional service |
-| Transactions | With user data | Separate |
-| Cost | Lower | Higher |
-
-For this scale (<1K writes/sec), PostgreSQL session storage is acceptable.
-
-### Implementation
-
-```typescript
-// Session configuration
-import session from 'express-session';
-import PgSession from 'connect-pg-simple';
-
-const PgStore = PgSession(session);
-
-app.use(session({
-    store: new PgStore({
-        pool,
-        tableName: 'sessions',
-        pruneSessionInterval: 60 * 15  // 15 min cleanup
-    }),
-    secret: process.env.SESSION_SECRET!,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        maxAge: 7 * 24 * 60 * 60 * 1000,  // 7 days
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax'
-    }
-}));
-```
-
-### Session Security Measures
-
-1. **HttpOnly cookies**: Prevents XSS token theft
-2. **Secure flag in production**: HTTPS only
-3. **SameSite=Lax**: CSRF protection
-4. **Session rotation on login**: Prevent fixation attacks
-5. **Automatic expiration cleanup**: Prevents table bloat
-
-## API Design
+## 5. API Design (5 minutes)
 
 ### RESTful Endpoints
 
 ```
 Authentication:
-POST   /api/auth/register     Create new account
-POST   /api/auth/login        Authenticate and create session
-POST   /api/auth/logout       Destroy session
-GET    /api/auth/me           Get current user
+┌─────────────────────────────────────────────────────────────────────┐
+│ POST   /api/auth/register   → Create account                       │
+│ POST   /api/auth/login      → Authenticate, create session         │
+│ POST   /api/auth/logout     → Destroy session                      │
+│ GET    /api/auth/me         → Get current user                     │
+└─────────────────────────────────────────────────────────────────────┘
 
 Calendars:
-GET    /api/calendars         List user's calendars
-POST   /api/calendars         Create calendar
-PUT    /api/calendars/:id     Update calendar (name, color)
-DELETE /api/calendars/:id     Delete calendar and all events
+┌─────────────────────────────────────────────────────────────────────┐
+│ GET    /api/calendars       → List user's calendars                │
+│ POST   /api/calendars       → Create new calendar                  │
+│ PUT    /api/calendars/:id   → Update calendar (name, color)        │
+│ DELETE /api/calendars/:id   → Delete calendar + all events         │
+└─────────────────────────────────────────────────────────────────────┘
 
 Events:
-GET    /api/events?start=&end=  Fetch events in date range
-GET    /api/events/:id          Get single event
-POST   /api/events              Create event (returns conflicts)
-PUT    /api/events/:id          Update event (returns conflicts)
-DELETE /api/events/:id          Delete event
+┌─────────────────────────────────────────────────────────────────────┐
+│ GET    /api/events?start=&end=  → Fetch events in range            │
+│ GET    /api/events/:id          → Get single event                 │
+│ POST   /api/events              → Create (returns conflicts)       │
+│ PUT    /api/events/:id          → Update (returns conflicts)       │
+│ DELETE /api/events/:id          → Delete event                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Request/Response Examples
+### Response Pattern for Conflict-Aware Operations
 
-**Create Event with Conflict Check**:
+```
+POST /api/events → 201 Created
 
-```http
-POST /api/events
-Content-Type: application/json
-
+Response:
 {
-    "calendar_id": 1,
-    "title": "Team Standup",
-    "start_time": "2025-01-21T09:00:00Z",
-    "end_time": "2025-01-21T09:30:00Z",
-    "location": "Conference Room A"
+  "event": { id, title, start_time, end_time, ... },
+  "conflicts": [
+    { id, title, start_time, end_time, calendar_name }
+  ]
 }
 ```
 
-Response (201 Created):
-```json
-{
-    "event": {
-        "id": 42,
-        "calendar_id": 1,
-        "title": "Team Standup",
-        "start_time": "2025-01-21T09:00:00Z",
-        "end_time": "2025-01-21T09:30:00Z"
-    },
-    "conflicts": [
-        {
-            "id": 15,
-            "title": "1:1 with Manager",
-            "start_time": "2025-01-21T09:00:00Z",
-            "end_time": "2025-01-21T09:30:00Z",
-            "calendar_name": "Work"
-        }
-    ]
-}
-```
+The event is created AND conflicts are returned as informational data.
 
-## Caching Strategy
+---
 
-### Cache Layers
+## 6. Caching Strategy (3 minutes)
+
+### Cache Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                      Application                          │
-│   ┌────────────────────────────────────────────────────┐ │
-│   │  Request: GET /api/events?start=X&end=Y            │ │
-│   └───────────────────────┬────────────────────────────┘ │
-│                           ▼                               │
-│   ┌─────────────────────────────────────────────────────┐│
-│   │  1. Check Valkey cache: events:{userId}:{range}     ││
-│   │     Hit? → Return cached data                        ││
-│   │     Miss? → Query PostgreSQL                         ││
-│   │           → Store in cache (TTL: 5 min)             ││
-│   └─────────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       Request Flow                               │
+├─────────────────────────────────────────────────────────────────┤
+│  GET /api/events?start=2025-01-01&end=2025-01-31                │
+│                          │                                       │
+│                          ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │ 1. Check Valkey: events:{userId}:{month}                    ││
+│  │    HIT?  → Return cached (< 1ms)                            ││
+│  │    MISS? → Query PostgreSQL → Cache result (TTL: 5 min)     ││
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Cache Key Design
+### Cache Key Patterns
 
-```typescript
-// Cache key patterns
-const CACHE_KEYS = {
-    // User's calendars (rarely changes)
-    userCalendars: (userId: number) => `calendars:${userId}`,
+| Key Pattern | TTL | Purpose |
+|-------------|-----|---------|
+| `sessions:{sid}` | 7 days | User session data |
+| `calendars:{userId}` | 1 hour | User's calendar list (rarely changes) |
+| `events:{userId}:{month}` | 5 min | Events for a month (common query) |
 
-    // Events for a date range (TTL: 5 min)
-    events: (userId: number, start: string, end: string) =>
-        `events:${userId}:${start}:${end}`,
+### Cache Invalidation Strategy
 
-    // Single event (for detail views)
-    event: (eventId: number) => `event:${eventId}`
-};
+**Invalidate on write**: When user creates/updates/deletes an event:
+1. Delete all `events:{userId}:*` keys
+2. Event is immediately visible on next read
+
+**Trade-off**: Slightly aggressive invalidation vs. stale data risk.
+
+---
+
+## 7. Scalability Considerations (3 minutes)
+
+### Read Scaling Path
+
+```
+            ┌─────────────────────────────────────────────────┐
+            │              Read Scaling Options                │
+            ├─────────────────────────────────────────────────┤
+            │                                                  │
+            │  Level 1: Read Replicas                          │
+            │  ├── Route reads to replicas                     │
+            │  └── Handles 10x read throughput                 │
+            │                                                  │
+            │  Level 2: Caching                                │
+            │  ├── Valkey for hot data                         │
+            │  └── 90%+ cache hit rate target                  │
+            │                                                  │
+            │  Level 3: Connection Pooling                     │
+            │  ├── PgBouncer for connection management         │
+            │  └── 1000s of app connections → 100 DB conns     │
+            │                                                  │
+            └─────────────────────────────────────────────────┘
 ```
 
-### Cache Invalidation
+### Write Scaling Path (Future)
 
-```typescript
-async function invalidateUserEventCache(userId: number) {
-    // Pattern-based deletion
-    const keys = await valkey.keys(`events:${userId}:*`);
-    if (keys.length > 0) {
-        await valkey.del(...keys);
-    }
-}
+| Technique | When to Apply | Complexity |
+|-----------|---------------|------------|
+| **Partitioning by user_id** | > 10K writes/sec | Medium |
+| **Sharding across databases** | > 100K writes/sec | High |
+| **CQRS (separate read/write stores)** | > 1M writes/sec | Very High |
 
-// Called on event create/update/delete
-router.post('/events', async (req, res) => {
-    const event = await createEvent(req.body);
-    await invalidateUserEventCache(req.session.userId);
-    res.json({ event });
-});
-```
+For this design (1K writes/sec), single primary with replicas is sufficient.
 
-## Scalability Considerations
+### Capacity Estimates
 
-### Read Scaling
+| Component | Single Instance | With Scaling |
+|-----------|-----------------|--------------|
+| PostgreSQL writes | 1K/sec | 4K/sec (partitioned) |
+| PostgreSQL reads | 10K/sec | 40K/sec (4 replicas) |
+| Valkey ops | 100K/sec | 100K/sec |
+| API servers | 5K req/sec each | 20K/sec (4 servers) |
 
-1. **Read Replicas**: Route read queries to replicas
-   ```typescript
-   const readPool = new Pool({ host: 'pg-replica.internal' });
-   const writePool = new Pool({ host: 'pg-primary.internal' });
-   ```
+---
 
-2. **Connection Pooling**: PgBouncer for connection management
-   ```
-   App → PgBouncer → PostgreSQL (with 100s of connections)
-   ```
+## 8. Session Management (2 minutes)
 
-3. **Query Result Caching**: Valkey for frequently accessed date ranges
+### Session Storage: Alternatives Considered
 
-### Write Scaling
+| Approach | Latency | Persistence | Ops Complexity | Decision |
+|----------|---------|-------------|----------------|----------|
+| **PostgreSQL** | ~5ms | Yes | Low (already have) | ✓ Default |
+| **Valkey/Redis** | ~1ms | Optional | Medium | For scale |
+| **JWT (stateless)** | 0ms | N/A | Low | Rejected (revocation issues) |
 
-1. **Partitioning by user_id**: Shard events table across databases
-   ```sql
-   -- Partition by user_id hash
-   CREATE TABLE events_p0 PARTITION OF events
-       FOR VALUES WITH (MODULUS 4, REMAINDER 0);
-   ```
+**Decision**: Use PostgreSQL sessions for simplicity. Switch to Valkey when session operations become a bottleneck (unlikely at < 10K users).
 
-2. **Batch operations**: Allow bulk event creation
-   ```sql
-   INSERT INTO events (calendar_id, title, start_time, end_time)
-   VALUES
-       ($1, $2, $3, $4),
-       ($5, $6, $7, $8),
-       ...
-   ON CONFLICT DO NOTHING;
-   ```
+### Security Measures
 
-### Estimated Capacity
+- **HttpOnly cookies**: Prevent XSS token theft
+- **Secure flag**: HTTPS only in production
+- **SameSite=Lax**: CSRF protection
+- **Session rotation on login**: Prevent fixation attacks
+- **Automatic expiration cleanup**: Prevent table bloat
 
-| Component | Single Node | Scaled (4x) |
-|-----------|-------------|-------------|
-| PostgreSQL writes | 1K/sec | 4K/sec |
-| PostgreSQL reads | 10K/sec | 40K/sec (replicas) |
-| Valkey cache | 100K/sec | 100K/sec |
-| API servers | 5K req/sec | 20K req/sec |
+---
 
-## Trade-offs Summary
+## 9. Trade-offs Summary
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| PostgreSQL for sessions | Simpler infra, transactional | Slower than Redis |
-| Non-blocking conflicts | Flexible, matches real calendars | May have overlaps |
-| Composite index | Fast range queries | Larger index size |
-| Per-user event cache | Reduces DB load | Invalidation complexity |
-| Sync conflict check | Simple, consistent | Adds latency to writes |
+| Decision | Trade-off |
+|----------|-----------|
+| **PostgreSQL over NoSQL** | Strong consistency vs. horizontal write scaling |
+| **Non-blocking conflicts** | User flexibility vs. potential overlaps |
+| **PostgreSQL sessions** | Simpler ops vs. slightly higher latency |
+| **Aggressive cache invalidation** | Freshness vs. more DB queries on write |
+| **Synchronous conflict check** | Consistency vs. added write latency (~5ms) |
 
-## Future Backend Enhancements
+---
 
-1. **Recurring Events**: Expand RRULE into instances on read
+## 10. Future Enhancements
+
+1. **Recurring Events**: Store RRULE, expand instances on read with caching
 2. **Event Sharing**: Add `event_invites` table with RSVP status
-3. **Webhooks**: Notify external systems on event changes
-4. **Audit Log**: Track all event modifications for compliance
-5. **Rate Limiting**: Per-user quotas on API calls
+3. **Real-time Sync**: WebSocket server for multi-device updates
+4. **Webhooks**: Notify external systems on event changes
+5. **Audit Logging**: Track modifications for compliance
+6. **Rate Limiting**: Per-user quotas with Valkey counters
+
+---
+
+## Questions I Would Ask
+
+1. What's the expected user scale? (Affects sharding strategy)
+2. Do we need recurring events in MVP?
+3. Is calendar sharing required? (Adds complexity)
+4. What's the consistency requirement? (Strong vs. eventual)
+5. Any compliance requirements? (GDPR, data residency)

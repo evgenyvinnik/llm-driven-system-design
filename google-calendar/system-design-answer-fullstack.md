@@ -1,696 +1,436 @@
-# Google Calendar - System Design Answer (Full-Stack Focus)
+# 📅 Google Calendar - System Design Answer (Full-Stack Focus)
 
 *45-minute system design interview format - Full-Stack Engineer Position*
 
-## Problem Statement
+---
 
-Design a calendar application that allows users to:
-- View their schedule in Month, Week, and Day views
-- Create, edit, and delete events
-- Detect scheduling conflicts
-- Manage multiple calendars
+## 🎯 Problem Statement
 
-This answer covers the end-to-end architecture, emphasizing the integration between frontend and backend components.
+Design a calendar application with:
+- Month, Week, and Day views
+- Event creation, editing, and deletion
+- Scheduling conflict detection
+- Multiple calendars per user
 
-## Requirements Clarification
+---
 
-### Functional Requirements
-1. **User authentication** with session management
-2. **Three calendar views**: Month (grid), Week (time columns), Day (hourly slots)
-3. **Event CRUD** with optimistic UI updates
-4. **Conflict detection** displayed as warnings in the UI
-5. **Multiple calendars** per user with visibility toggles
+## 1️⃣ Requirements Clarification (5 minutes)
 
-### Non-Functional Requirements
-1. **Low latency**: View switches < 200ms, event creation < 500ms
-2. **Consistency**: No lost events, accurate conflict detection
-3. **Responsive UI**: Desktop and tablet layouts
-4. **Offline resilience**: Show cached data when offline
+### ✅ Functional Requirements
 
-### Scale Estimates
-- 100K users, avg 50 events/user = 5M events
-- Read-heavy: 50:1 read:write ratio
-- Peak: 10K reads/sec, 200 writes/sec
+| # | Requirement | Notes |
+|---|-------------|-------|
+| 1 | User authentication | Session-based login |
+| 2 | Three calendar views | Month grid, Week columns, Day hourly |
+| 3 | Event CRUD | Create, read, update, delete |
+| 4 | Conflict detection | Warn on overlapping events |
+| 5 | Multiple calendars | Toggle visibility per calendar |
 
-## High-Level Architecture
+### ⚡ Non-Functional Requirements
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Browser (React Application)                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Views: MonthView | WeekView | DayView                             │  │
-│  │  Components: EventModal, CalendarSidebar, DateNavigator            │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-│  ┌───────────────────────────┴───────────────────────────────────────┐  │
-│  │  Zustand Store: currentDate, view, events[], calendars[]           │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-│  ┌───────────────────────────┴───────────────────────────────────────┐  │
-│  │  API Service: fetch wrapper with auth, error handling              │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-└──────────────────────────────┼───────────────────────────────────────────┘
-                               │ REST API (JSON)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Express API Server                                │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Middleware: cors, session, auth, errorHandler                     │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│  ┌────────────────┐  ┌──────────────────┐  ┌───────────────────────┐   │
-│  │  auth.ts       │  │  calendars.ts     │  │  events.ts            │   │
-│  │  - login       │  │  - list           │  │  - list (range query) │   │
-│  │  - logout      │  │  - create         │  │  - create + conflicts │   │
-│  │  - register    │  │  - update         │  │  - update + conflicts │   │
-│  │  - me          │  │  - delete         │  │  - delete             │   │
-│  └────────────────┘  └──────────────────┘  └───────────────────────┘   │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Conflict Service: checkConflicts(userId, start, end, excludeId)   │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬───────────────────────────────────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          PostgreSQL                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │    users     │  │  calendars   │  │    events    │  │   sessions   │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Requirement | Target | Rationale |
+|-------------|--------|-----------|
+| **Latency** | View switch < 200ms | Smooth navigation |
+| **Consistency** | Strong | No lost events |
+| **Availability** | 99.9% reads | Calendar is read-heavy |
+| **Responsive** | Desktop + tablet | Wide screen layouts |
 
-## Data Model
+### 📊 Scale Estimates
 
-### Database Schema
+- **Users**: 100K → **5M events** (50 events/user avg)
+- **Ratio**: 50:1 read:write
+- **Peak**: 10K reads/sec, 200 writes/sec
 
-```sql
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    timezone VARCHAR(50) DEFAULT 'UTC',
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+### 🚫 Out of Scope
 
-CREATE TABLE calendars (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    name VARCHAR(100) NOT NULL,
-    color VARCHAR(7) DEFAULT '#3B82F6',
-    is_primary BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+- Recurring events (RRULE)
+- Calendar sharing
+- Email notifications
 
-CREATE TABLE events (
-    id SERIAL PRIMARY KEY,
-    calendar_id INTEGER REFERENCES calendars(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    description TEXT,
-    location VARCHAR(255),
-    start_time TIMESTAMPTZ NOT NULL,
-    end_time TIMESTAMPTZ NOT NULL,
-    all_day BOOLEAN DEFAULT FALSE,
-    color VARCHAR(7),
-    recurrence_rule TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
+---
 
-    CONSTRAINT valid_time_range CHECK (end_time > start_time)
-);
+## 2️⃣ High-Level Architecture (10 minutes)
 
-CREATE INDEX idx_events_calendar_time ON events(calendar_id, start_time, end_time);
-```
-
-### TypeScript Interfaces (Shared Types)
-
-```typescript
-// shared/types.ts - Used by both frontend and backend
-
-interface User {
-  id: number;
-  username: string;
-  email: string;
-  timezone: string;
-}
-
-interface Calendar {
-  id: number;
-  user_id: number;
-  name: string;
-  color: string;
-  is_primary: boolean;
-}
-
-interface CalendarEvent {
-  id: number;
-  calendar_id: number;
-  title: string;
-  description?: string;
-  location?: string;
-  start_time: string;  // ISO 8601
-  end_time: string;
-  all_day: boolean;
-  color?: string;
-}
-
-interface Conflict {
-  id: number;
-  title: string;
-  start_time: string;
-  end_time: string;
-  calendar_name: string;
-  color: string;
-}
-
-interface EventCreateRequest {
-  calendar_id: number;
-  title: string;
-  start_time: string;
-  end_time: string;
-  description?: string;
-  location?: string;
-  all_day?: boolean;
-}
-
-interface EventCreateResponse {
-  event: CalendarEvent;
-  conflicts: Conflict[];
-}
-```
-
-## Deep Dive: API Design
-
-### RESTful Endpoints
+### 🏗️ End-to-End System
 
 ```
-POST   /api/auth/login        - Create session
-POST   /api/auth/logout       - Destroy session
-GET    /api/auth/me           - Get current user
-
-GET    /api/calendars         - List user's calendars
-POST   /api/calendars         - Create calendar
-PUT    /api/calendars/:id     - Update calendar
-DELETE /api/calendars/:id     - Delete calendar (cascade events)
-
-GET    /api/events?start=&end= - Get events in date range
-POST   /api/events             - Create event (returns conflicts)
-PUT    /api/events/:id         - Update event (returns conflicts)
-DELETE /api/events/:id         - Delete event
+┌─────────────────────────────────────────────────────────────────┐
+│  🌐 BROWSER                                                      │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  🎨 UI LAYER                                               │  │
+│  │  MonthView │ WeekView │ DayView │ EventModal │ Sidebar    │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+│                            │                                     │
+│  ┌─────────────────────────┴─────────────────────────────────┐  │
+│  │  📦 STATE (Zustand)                                        │  │
+│  │  currentDate │ view │ events[] │ calendars[] │ modal      │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+│                            │                                     │
+│  ┌─────────────────────────┴─────────────────────────────────┐  │
+│  │  🔌 API SERVICE                                            │  │
+│  │  fetch wrapper with cookies, error handling                │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+└────────────────────────────┼────────────────────────────────────┘
+                             │ REST / JSON
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🖥️ EXPRESS SERVER                                              │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  🛡️ MIDDLEWARE: cors → session → auth → validation        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌─────────────┐  │
+│  │ 🔐 Auth    │ │ 📁 Cals    │ │ 📅 Events  │ │ ⚠️ Conflicts│  │
+│  │ login     │ │ list       │ │ query      │ │ check       │  │
+│  │ logout    │ │ create     │ │ create     │ │ overlap     │  │
+│  │ register  │ │ update     │ │ update     │ │             │  │
+│  └────────────┘ └────────────┘ └────────────┘ └─────────────┘  │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🗄️ POSTGRESQL                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │  users   │─▶│ calendars│─▶│  events  │  │ sessions │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### API Integration Pattern
+### 🔀 Layer Responsibilities
 
-```typescript
-// Frontend: services/api.ts
-const api = {
-  async getEvents(params: { start: string; end: string }): Promise<CalendarEvent[]> {
-    const res = await fetch(`/api/events?start=${params.start}&end=${params.end}`, {
-      credentials: 'include',
-    });
-    if (!res.ok) throw new ApiError(res);
-    return res.json();
-  },
+| Layer | Role | Key Concern |
+|-------|------|-------------|
+| 🎨 UI Components | Render views, handle input | Performance |
+| 📦 State Store | Cache data, manage view state | Consistency |
+| 🔌 API Service | HTTP requests with auth | Error handling |
+| 🖥️ Express Routes | Business logic, validation | Authorization |
+| ⚠️ Conflict Service | Time overlap detection | Query efficiency |
+| 🗄️ PostgreSQL | Persistent storage | ACID compliance |
 
-  async createEvent(data: EventCreateRequest): Promise<EventCreateResponse> {
-    const res = await fetch('/api/events', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) throw new ApiError(res);
-    return res.json();
-  },
+---
 
-  async checkConflicts(data: { start: string; end: string; exclude_id?: number }): Promise<Conflict[]> {
-    const params = new URLSearchParams({
-      start: data.start,
-      end: data.end,
-      ...(data.exclude_id && { exclude_id: data.exclude_id.toString() }),
-    });
-    const res = await fetch(`/api/events/conflicts?${params}`, {
-      credentials: 'include',
-    });
-    if (!res.ok) throw new ApiError(res);
-    return res.json();
-  },
-};
-```
+## 3️⃣ Data Model (5 minutes)
 
-```typescript
-// Backend: routes/events.ts
-router.post('/', async (req, res) => {
-  const userId = req.session.userId!;
-  const { calendar_id, title, start_time, end_time, description, location, all_day } = req.body;
-
-  // Verify calendar ownership
-  const calendarResult = await pool.query(
-    'SELECT id FROM calendars WHERE id = $1 AND user_id = $2',
-    [calendar_id, userId]
-  );
-  if (calendarResult.rows.length === 0) {
-    return res.status(403).json({ error: 'Not authorized to add to this calendar' });
-  }
-
-  // Check for conflicts
-  const conflicts = await checkConflicts(userId, new Date(start_time), new Date(end_time));
-
-  // Create event regardless of conflicts (non-blocking)
-  const eventResult = await pool.query(
-    `INSERT INTO events (calendar_id, title, start_time, end_time, description, location, all_day)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING *`,
-    [calendar_id, title, start_time, end_time, description, location, all_day || false]
-  );
-
-  res.status(201).json({
-    event: eventResult.rows[0],
-    conflicts,
-  });
-});
-```
-
-## Deep Dive: Conflict Detection (Full Stack Flow)
-
-### Backend: SQL Query
-
-```sql
-SELECT e.id, e.title, e.start_time, e.end_time, c.name as calendar_name, c.color
-FROM events e
-JOIN calendars c ON e.calendar_id = c.id
-WHERE c.user_id = $1
-  AND e.id != COALESCE($4, 0)  -- Exclude current event when editing
-  AND e.start_time < $3         -- Existing event starts before new ends
-  AND e.end_time > $2           -- Existing event ends after new starts
-ORDER BY e.start_time;
-```
-
-### Frontend: Real-time Conflict Display
-
-```tsx
-// components/calendar/EventModal.tsx
-function EventModal() {
-  const [formData, setFormData] = useState<EventFormData>(initialData);
-  const [conflicts, setConflicts] = useState<Conflict[]>([]);
-  const [isCheckingConflicts, setIsCheckingConflicts] = useState(false);
-
-  // Debounced conflict check when times change
-  useEffect(() => {
-    if (!formData.start_time || !formData.end_time) return;
-
-    const timer = setTimeout(async () => {
-      setIsCheckingConflicts(true);
-      try {
-        const result = await api.checkConflicts({
-          start: formData.start_time,
-          end: formData.end_time,
-          exclude_id: selectedEvent?.id,
-        });
-        setConflicts(result);
-      } catch (err) {
-        console.error('Failed to check conflicts:', err);
-      } finally {
-        setIsCheckingConflicts(false);
-      }
-    }, 500);
-
-    return () => clearTimeout(timer);
-  }, [formData.start_time, formData.end_time]);
-
-  return (
-    <div className="modal">
-      {/* Form fields */}
-
-      {/* Conflict Warning */}
-      {isCheckingConflicts ? (
-        <div className="text-gray-500">Checking for conflicts...</div>
-      ) : conflicts.length > 0 ? (
-        <div className="bg-amber-50 border border-amber-200 rounded p-3">
-          <div className="flex items-center gap-2 text-amber-800 font-medium">
-            <AlertTriangle className="w-4 h-4" />
-            {conflicts.length} conflict{conflicts.length > 1 ? 's' : ''} found
-          </div>
-          <ul className="mt-2 text-sm text-amber-700">
-            {conflicts.map(c => (
-              <li key={c.id}>
-                <strong>{c.title}</strong> ({c.calendar_name})
-                <span className="text-amber-600 ml-2">
-                  {formatTimeRange(c.start_time, c.end_time)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {/* Submit button - always enabled, conflicts are warnings */}
-      <button type="submit">Save Event</button>
-    </div>
-  );
-}
-```
-
-## Deep Dive: View State Synchronization
-
-### Frontend State (Zustand)
-
-```typescript
-// stores/calendarStore.ts
-interface CalendarState {
-  currentDate: Date;
-  view: 'month' | 'week' | 'day';
-  events: CalendarEvent[];
-  calendars: Calendar[];
-  visibleCalendarIds: Set<number>;
-  isLoading: boolean;
-
-  // Actions
-  setView: (view: View) => void;
-  goToToday: () => void;
-  goToPrevious: () => void;
-  goToNext: () => void;
-  toggleCalendarVisibility: (id: number) => void;
-  fetchEvents: () => Promise<void>;
-
-  // Computed
-  getViewDateRange: () => { start: Date; end: Date };
-  getVisibleEvents: () => CalendarEvent[];
-}
-
-export const useCalendarStore = create<CalendarState>((set, get) => ({
-  // Initial state
-  currentDate: new Date(),
-  view: 'month',
-  events: [],
-  calendars: [],
-  visibleCalendarIds: new Set(),
-  isLoading: false,
-
-  getViewDateRange: () => {
-    const { currentDate, view } = get();
-    switch (view) {
-      case 'month':
-        return {
-          start: startOfWeek(startOfMonth(currentDate)),
-          end: endOfWeek(endOfMonth(currentDate)),
-        };
-      case 'week':
-        return { start: startOfWeek(currentDate), end: endOfWeek(currentDate) };
-      case 'day':
-        return { start: startOfDay(currentDate), end: endOfDay(currentDate) };
-    }
-  },
-
-  fetchEvents: async () => {
-    const { getViewDateRange } = get();
-    const { start, end } = getViewDateRange();
-
-    set({ isLoading: true });
-    try {
-      const events = await api.getEvents({
-        start: start.toISOString(),
-        end: end.toISOString(),
-      });
-      set({ events });
-    } finally {
-      set({ isLoading: false });
-    }
-  },
-
-  getVisibleEvents: () => {
-    const { events, visibleCalendarIds } = get();
-    return events.filter(e => visibleCalendarIds.has(e.calendar_id));
-  },
-}));
-```
-
-### Data Flow: View Change → API Fetch
-
-```tsx
-// hooks/useEventSync.ts
-function useEventSync() {
-  const { currentDate, view, fetchEvents } = useCalendarStore();
-
-  // Refetch when date range changes
-  useEffect(() => {
-    fetchEvents();
-  }, [currentDate, view]);
-}
-
-// App.tsx
-function App() {
-  useEventSync();
-
-  return (
-    <div className="flex h-screen">
-      <CalendarSidebar />
-      <main className="flex-1 flex flex-col">
-        <Header />
-        <CalendarView />
-      </main>
-      <EventModal />
-    </div>
-  );
-}
-```
-
-## Deep Dive: Calendar View Rendering
-
-### Week View Event Positioning
-
-```typescript
-// utils/dateUtils.ts
-export function calculateEventPosition(event: CalendarEvent, dayStart: Date) {
-  const MINUTES_IN_DAY = 24 * 60;
-  const start = new Date(event.start_time);
-  const end = new Date(event.end_time);
-
-  const startMinutes = differenceInMinutes(start, dayStart);
-  const endMinutes = differenceInMinutes(end, dayStart);
-
-  // Clamp to day boundaries
-  const clampedStart = Math.max(0, Math.min(MINUTES_IN_DAY, startMinutes));
-  const clampedEnd = Math.max(0, Math.min(MINUTES_IN_DAY, endMinutes));
-
-  return {
-    top: (clampedStart / MINUTES_IN_DAY) * 100,
-    height: Math.max(2, ((clampedEnd - clampedStart) / MINUTES_IN_DAY) * 100),
-  };
-}
-```
-
-```tsx
-// components/calendar/WeekView.tsx
-function WeekView() {
-  const events = useCalendarStore(state => state.getVisibleEvents());
-  const currentDate = useCalendarStore(state => state.currentDate);
-
-  const weekStart = startOfWeek(currentDate);
-  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
-
-  return (
-    <div className="flex flex-1">
-      {/* Time gutter */}
-      <div className="w-16">
-        {hours.map(hour => (
-          <div key={hour} className="h-[60px] text-xs text-gray-500 text-right pr-2">
-            {format(setHours(new Date(), hour), 'h a')}
-          </div>
-        ))}
-      </div>
-
-      {/* Day columns */}
-      <div className="flex-1 grid grid-cols-7">
-        {days.map(day => {
-          const dayEvents = events.filter(e => eventOverlapsDay(e, day));
-
-          return (
-            <div key={day.toISOString()} className="relative border-r">
-              {/* Hour grid lines */}
-              {hours.map(h => (
-                <div key={h} className="h-[60px] border-b" />
-              ))}
-
-              {/* Events */}
-              {dayEvents.map(event => {
-                const pos = calculateEventPosition(event, startOfDay(day));
-                return (
-                  <div
-                    key={event.id}
-                    className="absolute left-1 right-1 rounded px-1 text-xs text-white overflow-hidden cursor-pointer hover:opacity-90"
-                    style={{
-                      top: `${pos.top}%`,
-                      height: `${pos.height}%`,
-                      backgroundColor: event.color || '#3B82F6',
-                    }}
-                    onClick={() => openEditModal(event)}
-                  >
-                    <div className="font-medium truncate">{event.title}</div>
-                    <div className="opacity-80">
-                      {format(new Date(event.start_time), 'h:mm a')}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-```
-
-## Session Management
-
-### Backend Configuration
-
-```typescript
-// Backend: app.ts
-import session from 'express-session';
-import PgSession from 'connect-pg-simple';
-
-const PgStore = PgSession(session);
-
-app.use(session({
-  store: new PgStore({
-    pool,
-    tableName: 'sessions',
-    pruneSessionInterval: 60 * 15,  // Clean expired sessions every 15 min
-  }),
-  secret: process.env.SESSION_SECRET!,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000,  // 7 days
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-  },
-}));
-```
-
-### Frontend Auth State
-
-```typescript
-// stores/authStore.ts
-interface AuthState {
-  user: User | null;
-  isAuthenticated: boolean;
-  isLoading: boolean;
-
-  login: (username: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
-  checkAuth: () => Promise<void>;
-}
-
-export const useAuthStore = create<AuthState>((set) => ({
-  user: null,
-  isAuthenticated: false,
-  isLoading: true,
-
-  checkAuth: async () => {
-    try {
-      const user = await api.getCurrentUser();
-      set({ user, isAuthenticated: true });
-    } catch {
-      set({ user: null, isAuthenticated: false });
-    } finally {
-      set({ isLoading: false });
-    }
-  },
-
-  login: async (username, password) => {
-    const user = await api.login(username, password);
-    set({ user, isAuthenticated: true });
-  },
-
-  logout: async () => {
-    await api.logout();
-    set({ user: null, isAuthenticated: false });
-  },
-}));
-```
-
-## Optimistic Updates
-
-### Event Creation Flow
-
-```tsx
-async function handleCreateEvent(data: EventFormData) {
-  const { events } = useCalendarStore.getState();
-
-  // Optimistic: Add event with temporary ID
-  const tempId = -Date.now();
-  const optimisticEvent: CalendarEvent = {
-    id: tempId,
-    ...data,
-    calendar_id: data.calendar_id,
-  };
-
-  useCalendarStore.setState({
-    events: [...events, optimisticEvent],
-    isModalOpen: false,
-  });
-
-  try {
-    // Actual API call
-    const { event, conflicts } = await api.createEvent(data);
-
-    // Replace optimistic with real event
-    useCalendarStore.setState(state => ({
-      events: state.events.map(e => e.id === tempId ? event : e),
-    }));
-
-    // Show conflict toast if any
-    if (conflicts.length > 0) {
-      showToast(`Created with ${conflicts.length} conflicts`);
-    }
-  } catch (err) {
-    // Rollback on failure
-    useCalendarStore.setState(state => ({
-      events: state.events.filter(e => e.id !== tempId),
-    }));
-    showToast('Failed to create event');
-  }
-}
-```
-
-## Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| PostgreSQL sessions | Transactional with user data | Slower than Redis |
-| Non-blocking conflicts | Flexible, matches real calendars | Users may miss conflicts |
-| Zustand over Context | Less boilerplate, selective updates | Extra dependency |
-| Percentage positioning | Responsive, simple math | Overlapping events stack |
-| Debounced conflict check | Reduces API calls | 500ms feedback delay |
-| Optimistic updates | Instant UI feedback | Rollback complexity |
-
-## Scalability Path
-
-### Current: Single Server
+### 📐 Entity Relationships
 
 ```
-Browser → Express (Node.js) → PostgreSQL
+┌─────────────┐       1:N       ┌─────────────┐       1:N       ┌─────────────┐
+│   👤 User   │────────────────▶│ 📁 Calendar │────────────────▶│  📅 Event   │
+│             │                 │             │                 │             │
+│ • id        │                 │ • id        │                 │ • id        │
+│ • email     │                 │ • user_id   │                 │ • calendar_id│
+│ • timezone  │                 │ • name      │                 │ • title     │
+│             │                 │ • color     │                 │ • start     │
+│             │                 │ • is_primary│                 │ • end       │
+└─────────────┘                 └─────────────┘                 └─────────────┘
 ```
 
-### Future: Scaled
+### 🗂️ Key Tables
+
+| Table | Purpose | Key Index |
+|-------|---------|-----------|
+| **users** | Account data, timezone pref | email (unique) |
+| **calendars** | Multiple cals per user | user_id (FK) |
+| **events** | Core event data | (calendar_id, start, end) |
+| **sessions** | Server-side auth | sid + expire |
+
+### 🔗 Shared Contracts (Frontend ↔ Backend)
+
+| Type | Key Fields |
+|------|------------|
+| **Event** | id, calendar_id, title, start_time, end_time |
+| **Calendar** | id, name, color, is_primary |
+| **Conflict** | id, title, time range, calendar_name |
+
+---
+
+## 4️⃣ Deep Dive: Data Flow (10 minutes)
+
+### 🔄 Event Creation Flow
 
 ```
-Browser → CDN (static) → Load Balancer → Express (3 nodes) → Read Replicas
-                                    ↓
-                              Valkey (cache + sessions)
-                                    ↓
-                              PostgreSQL Primary
+┌────────────────────────────────────────────────────────────────┐
+│                    📝 EVENT CREATION FLOW                       │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1️⃣ USER FILLS FORM                                            │
+│     └─▶ Title, start time, end time, calendar                  │
+│                                                                 │
+│  2️⃣ OPTIMISTIC UPDATE                                          │
+│     └─▶ Immediately add to UI with temp ID                     │
+│     └─▶ Close modal, show event on grid                        │
+│                                                                 │
+│  3️⃣ API REQUEST (POST /api/events)                             │
+│     └─▶ Validate session                                       │
+│     └─▶ Verify calendar ownership                              │
+│     └─▶ Check conflicts (separate query)                       │
+│     └─▶ INSERT event (even if conflicts exist)                 │
+│                                                                 │
+│  4️⃣ RESPONSE                                                   │
+│     └─▶ { event: {...}, conflicts: [...] }                     │
+│     └─▶ Replace temp ID with real ID                           │
+│     └─▶ Show conflict toast if any                             │
+│                                                                 │
+│  5️⃣ ERROR ROLLBACK (if failed)                                 │
+│     └─▶ Remove optimistic event                                │
+│     └─▶ Show error message                                     │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Move sessions to Valkey**: Enables stateless API servers
-2. **Add read replicas**: Scale read-heavy event queries
-3. **CDN for frontend**: Offload static assets
-4. **Event caching**: Cache frequently accessed date ranges
+### 🔄 Alternatives: Update Strategy
 
-## Future Enhancements
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Optimistic** ⚡ | Instant feedback | Rollback complexity | ✅ Chosen |
+| **Pessimistic** 🐢 | Simple, guaranteed | Feels slow | ❌ |
+| **Hybrid** | Best of both | Complex | Future |
 
-1. **Recurring Events**: Parse RRULE, expand instances on read
-2. **Drag & Drop**: React DnD for moving events
-3. **Real-time Sync**: WebSocket for multi-device updates
-4. **Event Sharing**: Invite system with RSVP
-5. **Offline Support**: Service worker + IndexedDB
+> 💡 **Rationale**: Calendar ops have low conflict rate. Optimistic feels snappy, rollbacks are rare.
+
+---
+
+## 5️⃣ Deep Dive: Conflict Detection (5 minutes)
+
+### 📐 Time Overlap Logic
+
+```
+Two events OVERLAP when their time ranges intersect:
+
+Case 1: Partial overlap      Case 2: Containment
+   B: |───────|                 B:   |───|
+   A:     |───────|             A: |───────|
+
+✨ Single condition catches all cases:
+   (A.start < B.end) AND (A.end > B.start)
+```
+
+### 🔄 Full-Stack Conflict Flow
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    ⚠️ CONFLICT DETECTION                        │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  🎨 FRONTEND (EventModal)                                       │
+│  ├─▶ User changes start/end time                               │
+│  ├─▶ Debounce 500ms                                            │
+│  ├─▶ GET /api/events/conflicts?start=...&end=...               │
+│  └─▶ Display warning (NON-BLOCKING)                            │
+│                                                                 │
+│  🖥️ BACKEND (Conflict Service)                                 │
+│  ├─▶ Join events → calendars                                   │
+│  ├─▶ Filter by user_id                                         │
+│  ├─▶ WHERE start < :end AND end > :start                       │
+│  └─▶ Return conflicts with calendar colors                     │
+│                                                                 │
+│  🎨 UI DISPLAY                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ⚠️ 2 conflicts found:                                    │   │
+│  │ • Team Standup (Work) 9:00-9:30                         │   │
+│  │ • Design Review (Work) 9:15-10:00                       │   │
+│  │                                                          │   │
+│  │ [Cancel]  [Save Anyway] ← User CAN still save           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 🔄 Alternatives: Conflict Handling
+
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Warn only** 💛 | Flexible, real-world | May miss warnings | ✅ Chosen |
+| **Block** 🛑 | Prevents overlaps | Too restrictive | ❌ |
+| **Confirm modal** 🔔 | Explicit ack | Extra friction | User setting |
+
+---
+
+## 6️⃣ View Rendering (5 minutes)
+
+### 📊 Calendar Layout Strategy
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    📅 WEEK VIEW LAYOUT                          │
+├─────────┬─────────┬─────────┬─────────┬─────────┬──────────────┤
+│  Time   │  Mon    │  Tue    │  Wed    │  Thu    │  Positioning │
+├─────────┼─────────┼─────────┼─────────┼─────────┼──────────────┤
+│  8:00   │         │ ░░░░░░░ │         │         │              │
+│         │         │░Standup░│         │         │  top = start │
+│  9:00   │ ░░░░░░░ │ ░░░░░░░ │         │         │       ÷ 1440 │
+│         │░ Design░│         │         │         │       × 100% │
+│  10:00  │░ Review░│         │ ░░░░░░░ │         │              │
+│         │ ░░░░░░░ │         │░ Sprint░│         │  height =    │
+│  11:00  │         │         │░Planning│         │  duration    │
+│         │         │         │ ░░░░░░░ │         │  ÷ 1440×100% │
+└─────────┴─────────┴─────────┴─────────┴─────────┴──────────────┘
+
+Events: Absolutely positioned within day columns
+Container: 100% height = 24 hours (1440 minutes)
+```
+
+### 📋 View Comparison
+
+| View | Layout | Best For |
+|------|--------|----------|
+| 📆 **Month** | 7×6 CSS Grid | Planning, overview |
+| 📊 **Week** | 7 columns + time gutter | Weekly scheduling |
+| 📋 **Day** | Single column + time gutter | Detailed day view |
+
+### 🔄 Alternatives: Positioning
+
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Percentage CSS** | Responsive | Fixed height container | ✅ Chosen |
+| **Pixel JS** | Precise | Resize observers needed | ❌ |
+| **CSS Subgrid** | Native | Browser support | Future |
+
+---
+
+## 7️⃣ Session Management (3 minutes)
+
+### 🔐 Authentication Flow
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    🔐 SESSION AUTH FLOW                         │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  LOGIN                                                          │
+│  ┌─────────┐   POST /login    ┌─────────┐   Set-Cookie         │
+│  │ Browser │ ───────────────▶ │ Express │ ──────────────────▶  │
+│  └─────────┘  {user, pass}    └────┬────┘   sid=xxx; httpOnly  │
+│                                    │                            │
+│                                    ▼                            │
+│                              ┌──────────┐                       │
+│                              │ sessions │ ← Store in PostgreSQL │
+│                              └──────────┘                       │
+│                                                                 │
+│  SUBSEQUENT REQUESTS                                            │
+│  ┌─────────┐   Cookie: sid    ┌─────────┐                       │
+│  │ Browser │ ───────────────▶ │ Express │ → Lookup session     │
+│  └─────────┘   GET /events    └─────────┘   → req.userId       │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 🔄 Alternatives: Session Storage
+
+| Approach | Latency | Scalability | Decision |
+|----------|---------|-------------|----------|
+| **PostgreSQL** 🐘 | ~5ms | Moderate | ✅ Simple |
+| **Redis/Valkey** ⚡ | ~1ms | High | Scaling option |
+| **JWT** 🎫 | 0ms | Unlimited | ❌ Revocation issues |
+
+---
+
+## 8️⃣ State Management (3 minutes)
+
+### 📦 Frontend Store Structure
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    📦 ZUSTAND STORE                             │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  📍 NAVIGATION                                                  │
+│  ├── currentDate     → focused date                            │
+│  ├── view            → 'month' | 'week' | 'day'                │
+│  └── isLoading       → fetch state                             │
+│                                                                 │
+│  📊 DATA                                                        │
+│  ├── events[]        → fetched for current range               │
+│  ├── calendars[]     → user's calendar list                    │
+│  └── visibleIds      → toggled calendars                       │
+│                                                                 │
+│  🪟 MODAL                                                       │
+│  ├── isOpen          → show/hide                               │
+│  ├── selectedEvent   → for editing                             │
+│  └── conflicts[]     → real-time detection                     │
+│                                                                 │
+│  📐 COMPUTED                                                    │
+│  ├── getViewDateRange()  → { start, end } for API             │
+│  └── getVisibleEvents()  → filtered by visibility             │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 🔄 Alternatives: State Management
+
+| Approach | Pros | Cons | Decision |
+|----------|------|------|----------|
+| **Zustand** 🐻 | Minimal boilerplate | Extra dep | ✅ Chosen |
+| **Context** ⚛️ | Built-in | Re-renders all | ❌ |
+| **Redux** 🔴 | Mature ecosystem | Overkill | ❌ |
+
+---
+
+## 9️⃣ Trade-offs Summary
+
+| Decision | Trade-off |
+|----------|-----------|
+| 🐘 PostgreSQL over NoSQL | Strong consistency ↔ Write scaling |
+| 💛 Non-blocking conflicts | Flexibility ↔ Missed warnings |
+| ⚡ Optimistic updates | Instant UI ↔ Rollback complexity |
+| 🔐 PostgreSQL sessions | Simple ops ↔ Slower than Redis |
+| ⏱️ Debounced conflict check | Fewer API calls ↔ 500ms delay |
+
+---
+
+## 🔟 Scalability Path
+
+### Current: Simple Stack
+
+```
+Browser → Express (1 node) → PostgreSQL
+```
+
+### Future: Scaled Stack
+
+```
+                        ┌─────────────────────────┐
+                        │   🌐 CDN (static)       │
+                        └────────────┬────────────┘
+                                     │
+Browser ────────▶ Load Balancer ────▶ Express (N nodes)
+                                     │
+                   ┌─────────────────┼─────────────────┐
+                   │                 │                 │
+                   ▼                 ▼                 ▼
+            ┌──────────┐      ┌──────────┐      ┌──────────┐
+            │  Valkey  │      │  Primary │      │ Replicas │
+            │ sessions │      │    DB    │      │  (reads) │
+            └──────────┘      └──────────┘      └──────────┘
+```
+
+### 📈 Scaling Triggers
+
+| Trigger | Action |
+|---------|--------|
+| > 10K users | Sessions → Valkey |
+| > 100K reads/sec | Add read replicas |
+| > 1M users | Shard by user_id |
+| Global reach | Multi-region |
+
+---
+
+## 🚀 Future Enhancements
+
+1. 🔁 **Recurring events** - RRULE parsing
+2. 🖱️ **Drag & drop** - Move/resize events
+3. ⚡ **Real-time sync** - WebSocket updates
+4. 👥 **Event sharing** - Invites with RSVP
+5. 📴 **Offline support** - Service Worker + IndexedDB
+
+---
+
+## ❓ Questions I Would Ask
+
+1. 📊 **Scale target?** → Affects session store, sharding
+2. ⚡ **Real-time collab?** → WebSocket vs polling
+3. 🛑 **Conflicts block or warn?** → User preference
+4. 📱 **Mobile-first?** → Layout priorities
+5. 🌍 **Timezone complexity?** → User locations
