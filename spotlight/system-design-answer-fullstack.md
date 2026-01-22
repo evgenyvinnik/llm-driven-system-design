@@ -2,15 +2,20 @@
 
 *45-minute system design interview format - Full-Stack Engineer Position*
 
-## Opening Statement (1 minute)
+---
+
+## 📋 Introduction (1 minute)
 
 "I'll design Spotlight, Apple's universal search system that provides instant results across files, apps, contacts, messages, and the web. From a full-stack perspective, the core challenge is building an end-to-end system where the frontend delivers instant typeahead feedback while the backend maintains real-time indexes - all while keeping data on-device for privacy.
 
 The architecture integrates three key flows: a search flow where keystrokes trigger debounced API calls that query multiple sources in parallel, an indexing flow where file system events propagate through content extractors to the inverted index, and a suggestions flow where usage patterns feed proactive recommendations. The full stack works together to deliver sub-100ms latency from keystroke to rendered results."
 
-## Requirements Clarification (3 minutes)
+---
+
+## 🎯 Requirements (3 minutes)
 
 ### Functional Requirements
+
 - **Search**: Instant results from files, apps, contacts, messages
 - **Indexing**: Real-time file watching with incremental updates
 - **Special Queries**: Math expressions, unit conversions, definitions
@@ -18,1006 +23,378 @@ The architecture integrates three key flows: a search flow where keystrokes trig
 - **Web Fallback**: Search the web when local results are sparse
 
 ### Non-Functional Requirements
-- **End-to-End Latency**: < 100ms from keystroke to rendered results
+
+- **End-to-End Latency**: Less than 100ms from keystroke to rendered results
 - **Privacy**: All indexing on-device, no cloud telemetry
-- **Efficiency**: < 5% CPU during background indexing
+- **Efficiency**: Less than 5% CPU during background indexing
 - **Accessibility**: Full keyboard navigation, screen reader support
 
 ### Data Flow Overview
+
 1. User types in search bar
 2. Frontend debounces (50ms) and sends API request
 3. Backend queries local index, app providers, cloud in parallel
 4. Results merged, ranked, and returned
 5. Frontend renders grouped results with selection state
 
-## High-Level Architecture (5 minutes)
+---
+
+## 🏗️ High-Level Design (5 minutes)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            FRONTEND                                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
-│  │ SearchBar   │───▶│ SearchStore │───▶│ ResultsList │                  │
-│  │ (debounce)  │    │ (Zustand)   │    │ (keyboard   │                  │
-│  └─────────────┘    └─────────────┘    │  navigation)│                  │
-│         │                  ▲            └─────────────┘                  │
-│         │                  │                                             │
-│         ▼                  │                                             │
-│  ┌─────────────────────────────────────┐                                │
-│  │            API Client               │                                │
-│  │  GET /api/v1/search?q=...           │                                │
-│  │  GET /api/v1/suggestions            │                                │
-│  └─────────────────────────────────────┘                                │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            BACKEND                                      │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                      Query Engine                                │   │
-│  │         (Parse, Route, Rank, Merge results)                     │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│          │                     │                     │                  │
-│          ▼                     ▼                     ▼                  │
-│  ┌───────────────┐    ┌───────────────┐    ┌───────────────┐          │
-│  │  Local Index  │    │ App Providers │    │  Cloud Search │          │
-│  │  (SQLite)     │    │               │    │               │          │
-│  └───────────────┘    └───────────────┘    └───────────────┘          │
-│          ▲                                                              │
-│          │                                                              │
-│  ┌───────────────────────────────────────────────────────────────┐     │
-│  │                   Indexing Service                             │     │
-│  │       (File watcher, Content extraction, Tokenization)        │     │
-│  └───────────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------------------+
+|                              FRONTEND                                    |
+|                                                                          |
+|   +-------------+      +-------------+      +-------------+             |
+|   | SearchBar   |----->| SearchStore |----->| ResultsList |             |
+|   | (debounce)  |      | (Zustand)   |      | (keyboard   |             |
+|   +-------------+      +-------------+      |  navigation)|             |
+|         |                    ^              +-------------+             |
+|         |                    |                                          |
+|         v                    |                                          |
+|   +-------------------------------------+                               |
+|   |           API Client                |                               |
+|   |  GET /api/v1/search?q=...           |                               |
+|   |  GET /api/v1/suggestions            |                               |
+|   +-------------------------------------+                               |
++-------------------------------------------------------------------------+
+                               |
+                               v
++-------------------------------------------------------------------------+
+|                              BACKEND                                     |
+|                                                                          |
+|   +---------------------------------------------------------------+     |
+|   |                      Query Engine                              |     |
+|   |         (Parse, Route, Rank, Merge results)                   |     |
+|   +---------------------------------------------------------------+     |
+|          |                     |                     |                  |
+|          v                     v                     v                  |
+|   +---------------+    +---------------+    +---------------+           |
+|   |  Local Index  |    | App Providers |    |  Cloud Search |           |
+|   |  (SQLite)     |    |               |    |               |           |
+|   +---------------+    +---------------+    +---------------+           |
+|          ^                                                              |
+|          |                                                              |
+|   +---------------------------------------------------------------+     |
+|   |                   Indexing Service                             |     |
+|   |       (File watcher, Content extraction, Tokenization)        |     |
+|   +---------------------------------------------------------------+     |
++-------------------------------------------------------------------------+
 ```
 
-## Deep Dive: End-to-End Search Flow (8 minutes)
+---
 
-### Frontend: Debounced Search Input
+## 🔍 Deep Dive (25 minutes)
 
-```typescript
-// SearchBar.tsx
-export function SearchBar() {
-  const { query, setQuery, search, clearResults } = useSearchStore();
+### Frontend State Management
 
-  // Debounce for API calls but update UI immediately
-  const debouncedSearch = useRef(
-    debounce((q: string) => search(q), 50)
-  ).current;
+The frontend needs to manage search query state, results, loading indicators, selection state for keyboard navigation, and preview visibility. The key challenge is keeping the UI responsive while making API calls.
 
-  const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
+#### Why Zustand Over Redux?
 
-    // Update query immediately for responsive UI
-    setQuery(value);
+| Aspect | Zustand | Redux | Context API |
+|--------|---------|-------|-------------|
+| Boilerplate | Minimal | Heavy | Medium |
+| Bundle Size | ~1KB | ~7KB | Built-in |
+| Learning Curve | Low | High | Low |
+| DevTools | Yes | Yes | Limited |
+| TypeScript DX | Excellent | Good | Good |
+| Async Actions | Built-in | Middleware needed | Manual |
 
-    if (value.length === 0) {
-      clearResults();
-      return;
-    }
+✅ Decision: Zustand
 
-    // Debounce actual search
-    debouncedSearch(value);
-  }, [setQuery, debouncedSearch, clearResults]);
+"I'm choosing Zustand because Spotlight's state is focused and localized - we have a single search store managing query, results, selection, and loading state. Redux's ceremonies like action creators, reducers, and middleware would add complexity without proportional benefit. Zustand gives us the same predictable state updates with hooks-based access, but with 80% less code. The minimal bundle size also matters since Spotlight needs to feel instant."
 
-  return (
-    <input
-      type="text"
-      value={query}
-      onChange={handleChange}
-      placeholder="Spotlight Search"
-      aria-autocomplete="list"
-      aria-controls="results-list"
-    />
-  );
-}
+The store manages immediate query updates for responsive typing while debouncing the actual API calls. Selection state enables full keyboard navigation with up/down arrows wrapping at list boundaries.
+
+---
+
+### Input Debouncing Strategy
+
+When users type rapidly, we need to balance responsiveness with network efficiency. Too aggressive debouncing feels sluggish; too little creates request floods.
+
+#### Why 50ms Debounce Over Other Values?
+
+| Debounce Time | User Perception | Network Impact | Use Case |
+|---------------|-----------------|----------------|----------|
+| 0ms (none) | Instant | Request per keystroke | Not viable |
+| 50ms | Near-instant | Batches fast typing | Spotlight |
+| 150ms | Slight lag | Efficient | Traditional search |
+| 300ms | Noticeable wait | Minimal requests | Mobile/slow network |
+
+✅ Decision: 50ms debounce
+
+"I'm choosing 50ms because Spotlight's core promise is instant feedback. At 50ms, users perceive no delay - the 100ms threshold for 'instant' perception gives us 50ms of budget remaining for the API round-trip and render. This debounce still batches rapid keystrokes (average typing speed produces ~150ms between keys, but bursts can hit 30-50ms), reducing network calls by 60% compared to no debouncing while maintaining perceived instantaneity."
+
+The implementation uses immediate UI updates (query text shows instantly) while debouncing the API call, giving users visual feedback that their input was received.
+
+---
+
+### Multi-Source Query Architecture
+
+Spotlight queries multiple data sources: local file index, app providers (Calendar, Mail, Notes), contacts, and cloud fallback. The challenge is aggregating results without creating a latency bottleneck.
+
+#### Why Parallel Multi-Source Query Over Sequential?
+
+| Approach | Latency | Complexity | Graceful Degradation | Resource Usage |
+|----------|---------|------------|---------------------|----------------|
+| Sequential | O(sum of all sources) | Low | Single point failure | Low |
+| Parallel | O(max single source) | Medium | Per-source fallback | Higher |
+| Hybrid | Medium | High | Best of both | Variable |
+
+✅ Decision: Parallel with timeouts
+
+"I'm choosing parallel execution because the 100ms latency target requires it mathematically. If local index takes 20ms, contacts 15ms, calendar 25ms, and cloud 40ms, sequential execution would take 100ms minimum - leaving zero margin. Parallel execution caps at the slowest source (40ms), giving us 60ms for network overhead and rendering. Each source gets its own circuit breaker, so a failing calendar service doesn't block file search results."
+
+The query engine fires all source queries simultaneously using Promise.all with a 3-second timeout fallback. Results are merged as they arrive, with the response sent once all sources complete or timeout.
+
+---
+
+### On-Device Storage
+
+Spotlight indexes files, apps, contacts, and usage patterns. The storage choice affects query performance, privacy, and system integration.
+
+#### Why SQLite Over PostgreSQL?
+
+| Factor | SQLite | PostgreSQL | Elasticsearch |
+|--------|--------|------------|---------------|
+| Deployment | Embedded, zero-config | Separate server | Separate cluster |
+| Privacy | On-device by design | Requires local install | Cloud-tempting |
+| FTS Support | FTS5 built-in | pg_trgm extension | Native |
+| Resource Usage | ~500KB | 100MB+ | 200MB+ |
+| Backup/Sync | File copy | pg_dump | Snapshots |
+| Concurrent Writes | WAL mode | Native | Native |
+
+✅ Decision: SQLite with FTS5
+
+"I'm choosing SQLite because Spotlight's core promise is privacy through on-device processing. SQLite is the only option that's truly embedded - no daemon, no ports, no network surface. FTS5 provides full-text search with prefix matching, tokenization, and ranking built-in. The 50MB index of 100,000 files fits comfortably in memory for lightning queries. PostgreSQL would require users to run a database server, fundamentally changing the user experience from 'it just works' to 'configure your database.'"
+
+The schema includes tables for indexed files (with content hash for deduplication), an inverted index for token-to-document mapping, app usage patterns for suggestions, and recent activity for ranking boosts.
+
+---
+
+### Authentication and Session Management
+
+The demo implementation needs auth for the admin interface to view indexing status and configure providers.
+
+#### Why Session-Based Auth with Valkey Over JWT?
+
+| Aspect | Session + Valkey | JWT | Cookie-only |
+|--------|------------------|-----|-------------|
+| Revocation | Instant (delete session) | Wait for expiry | Delete cookie |
+| Server State | Required | Stateless | Stateless |
+| Token Size | Small session ID | Large (claims embedded) | Medium |
+| Role Changes | Immediate | Re-issue token | Re-issue cookie |
+| XSS Risk | HttpOnly cookies | Often localStorage | HttpOnly possible |
+
+✅ Decision: Session-based auth with Valkey
+
+"I'm choosing session-based auth because Spotlight's admin interface needs instant session revocation - if an admin's laptop is compromised, we need to invalidate their session immediately. JWT's stateless nature means we'd have to wait for token expiry or maintain a blocklist (negating the stateless benefit). Valkey gives us sub-millisecond session lookups with automatic expiry, and sessions are HttpOnly cookies so they're immune to XSS attacks that plague localStorage JWT patterns."
+
+Sessions store user ID, role, and creation timestamp. The auth middleware checks session validity on each request, with role-based access control for admin-only endpoints.
+
+---
+
+### Frontend-Backend Type Sharing
+
+With TypeScript on both ends, we need to keep API contracts synchronized to catch type mismatches at compile time.
+
+#### Why Shared TypeScript Types Over OpenAPI Codegen?
+
+| Approach | Type Safety | Setup Complexity | Runtime Overhead | Flexibility |
+|----------|-------------|------------------|------------------|-------------|
+| Shared types file | Compile-time | Minimal | None | High |
+| OpenAPI codegen | Compile-time | High (toolchain) | None | Medium |
+| Zod runtime validation | Runtime | Medium | Small | High |
+| No sharing | None | None | None | Maximum |
+
+✅ Decision: Shared TypeScript types
+
+"I'm choosing a shared types file because Spotlight is a single-team project with co-located frontend and backend. OpenAPI codegen adds a build step, generator config, and template maintenance - overhead justified for large teams or public APIs, but friction for us. A shared types directory with SearchResult, SearchRequest, and Suggestion interfaces gives us compile-time safety with zero tooling complexity. If we later expose a public API, we can add OpenAPI on top of these types."
+
+The shared types include result type unions (application, file, contact, calculation, web_search), search request/response shapes, and suggestion structures for Siri-style recommendations.
+
+---
+
+### Provider Resilience
+
+External providers (Calendar, Mail, cloud search) can fail. The system must degrade gracefully rather than failing entirely.
+
+#### Why Circuit Breaker Pattern?
+
+| Pattern | Failure Handling | Recovery | Implementation |
+|---------|------------------|----------|----------------|
+| No protection | Cascade failures | Manual restart | None |
+| Retry with backoff | Repeated attempts | Eventually succeeds | Simple |
+| Circuit breaker | Fast-fail when broken | Auto-recovery probe | Medium |
+| Bulkhead | Isolated failure domains | Per-domain | Complex |
+
+✅ Decision: Circuit breaker with per-provider isolation
+
+"I'm choosing circuit breakers because repeated failures to a slow provider would accumulate latency debt - each search waiting for timeout on a known-bad service. The circuit breaker trips after 5 consecutive failures, immediately returning empty results instead of waiting. After 30 seconds in 'open' state, it allows one probe request - if successful, the circuit closes and normal traffic resumes. Combined with parallel queries, this means one provider's outage has zero impact on results from healthy sources."
+
+Each provider gets its own breaker instance. The state machine transitions: CLOSED (normal) -> OPEN (after threshold failures) -> HALF_OPEN (probe) -> CLOSED (if probe succeeds) or OPEN (if probe fails).
+
+---
+
+### Indexing Architecture
+
+Spotlight must maintain a real-time index of files, apps, and contacts without impacting system performance.
+
+#### Why On-Device Indexing Over Cloud Hybrid?
+
+| Approach | Privacy | Offline | Resource Cost | Intelligence |
+|----------|---------|---------|---------------|--------------|
+| On-device only | Complete | Full | Local CPU/storage | Limited |
+| Cloud hybrid | Partial | Degraded | Network + cloud | AI-powered |
+| Cloud primary | None | None | Minimal local | Full AI |
+
+✅ Decision: On-device indexing with idle-time processing
+
+"I'm choosing on-device indexing because Spotlight's differentiation is privacy. Users trust that their documents, messages, and photos aren't being sent to servers for indexing. This means we forfeit cloud-powered semantic search and cross-device sync, but we gain complete offline functionality and zero data leakage. The indexing service monitors file system events and queues work, but only processes during idle time (when CPU usage drops below threshold) to stay under the 5% background CPU budget."
+
+The indexing service uses pluggable content extractors for different file types (PDF, DOCX, TXT), tokenizes extracted text, and updates the inverted index with position information for phrase matching.
+
+---
+
+## 📊 Data Flow (3 minutes)
+
+### Search Flow
+
+```
+User Types "doc"
+      |
+      v
++------------------+
+| SearchBar        |
+| - Update UI      |
+| - Start debounce |
++------------------+
+      | 50ms
+      v
++------------------+
+| API Client       |
+| GET /search?q=   |
++------------------+
+      |
+      v
++------------------+
+| Query Engine     |
+| - Parse query    |
+| - Check special  |
++------------------+
+      |
+      +--------------------+--------------------+
+      |                    |                    |
+      v                    v                    v
++----------+        +----------+        +----------+
+| SQLite   |        | App      |        | Cloud    |
+| Index    |        | Providers|        | Search   |
++----------+        +----------+        +----------+
+      |                    |                    |
+      +--------------------+--------------------+
+      |
+      v
++------------------+
+| Result Merger    |
+| - Rank by score  |
+| - Group by type  |
+| - Add web fallback|
++------------------+
+      |
+      v
++------------------+
+| SearchStore      |
+| - Update results |
+| - Reset selection|
++------------------+
+      |
+      v
++------------------+
+| ResultsList      |
+| - Render grouped |
+| - Keyboard nav   |
++------------------+
 ```
 
-### Zustand Store with API Integration
+### Indexing Flow
 
-```typescript
-// stores/searchStore.ts
-import { create } from 'zustand';
-import { searchAPI } from '../api/searchAPI';
-
-interface SearchResult {
-  id: string;
-  type: 'application' | 'file' | 'contact' | 'calculation' | 'web_search';
-  name: string;
-  subtitle?: string;
-  icon?: string;
-  path?: string;
-  score: number;
-}
-
-interface SearchState {
-  query: string;
-  results: SearchResult[];
-  isLoading: boolean;
-  selectedIndex: number;
-  showPreview: boolean;
-
-  setQuery: (query: string) => void;
-  search: (query: string) => Promise<void>;
-  clearResults: () => void;
-  moveSelection: (direction: 'up' | 'down') => void;
-  executeSelected: () => void;
-}
-
-export const useSearchStore = create<SearchState>((set, get) => ({
-  query: '',
-  results: [],
-  isLoading: false,
-  selectedIndex: 0,
-  showPreview: false,
-
-  setQuery: (query) => set({ query }),
-
-  search: async (query) => {
-    if (query.length === 0) {
-      set({ results: [], selectedIndex: 0 });
-      return;
-    }
-
-    set({ isLoading: true });
-
-    try {
-      const results = await searchAPI.search(query);
-      set({
-        results,
-        isLoading: false,
-        selectedIndex: 0
-      });
-    } catch (error) {
-      set({ isLoading: false });
-    }
-  },
-
-  clearResults: () => set({
-    query: '',
-    results: [],
-    selectedIndex: 0
-  }),
-
-  moveSelection: (direction) => {
-    const { results, selectedIndex } = get();
-    if (results.length === 0) return;
-
-    const newIndex = direction === 'up'
-      ? (selectedIndex <= 0 ? results.length - 1 : selectedIndex - 1)
-      : (selectedIndex >= results.length - 1 ? 0 : selectedIndex + 1);
-
-    set({ selectedIndex: newIndex });
-  },
-
-  executeSelected: () => {
-    const { results, selectedIndex } = get();
-    const selected = results[selectedIndex];
-    if (selected) {
-      searchAPI.executeAction(selected);
-    }
-  }
-}));
+```
+File System Event (create/modify/delete)
+      |
+      v
++------------------+
+| File Watcher     |
+| - Filter paths   |
+| - Debounce rapid |
++------------------+
+      |
+      v
++------------------+
+| Index Queue      |
+| - Priority order |
+| - Wait for idle  |
++------------------+
+      |
+      v
++------------------+
+| Content Extractor|
+| - Detect type    |
+| - Extract text   |
+| - Get metadata   |
++------------------+
+      |
+      v
++------------------+
+| Tokenizer        |
+| - Lowercase      |
+| - Stem words     |
+| - Remove stops   |
++------------------+
+      |
+      v
++------------------+
+| SQLite FTS5      |
+| - Upsert doc     |
+| - Update index   |
++------------------+
 ```
 
-### API Client
+---
 
-```typescript
-// api/searchAPI.ts
-const API_BASE = '/api/v1';
+## ⚖️ Trade-offs Summary
 
-export const searchAPI = {
-  async search(query: string): Promise<SearchResult[]> {
-    const response = await fetch(
-      `${API_BASE}/search?q=${encodeURIComponent(query)}`
-    );
+| Decision | ✅ Chosen | ❌ Alternative | Rationale |
+|----------|-----------|----------------|-----------|
+| State Management | Zustand | Redux | Simpler for focused scope, less boilerplate, smaller bundle |
+| Input Debounce | 50ms | 150ms | Prioritize perceived speed within 100ms budget |
+| Data Storage | SQLite | PostgreSQL | On-device privacy, zero-config, embedded FTS5 |
+| Session Storage | Valkey sessions | JWT tokens | Instant revocation, HttpOnly security, role changes |
+| Multi-source Query | Parallel | Sequential | Meet 100ms target with graceful degradation |
+| Type Sharing | Shared TS file | OpenAPI codegen | Minimal tooling for single-team project |
+| Provider Resilience | Circuit breaker | Simple retry | Fast-fail prevents latency accumulation |
+| Indexing Location | On-device | Cloud hybrid | Complete privacy, full offline support |
 
-    if (!response.ok) {
-      throw new Error('Search failed');
-    }
+---
 
-    return response.json();
-  },
+## 🚀 Future Enhancements
 
-  async getSuggestions(): Promise<Suggestion[]> {
-    const response = await fetch(`${API_BASE}/suggestions`);
-    return response.json();
-  },
+1. **Natural Language Queries**: Parse "emails from John last week" using on-device NLP models to extract entities and temporal constraints
+2. **Vector Embeddings**: Semantic similarity search using on-device transformer models, enabling "find documents about our Q3 strategy" without exact keyword matches
+3. **Cross-Device Sync**: Secure index sharing via iCloud Keychain with end-to-end encryption, maintaining privacy while enabling search across devices
+4. **Voice Input**: Integration with Web Speech API for "Hey Siri, search for..." allowing hands-free search activation
+5. **Custom Extractors**: Plugin system for third-party content types (Figma files, Notion exports, Slack messages) with sandboxed extraction
 
-  executeAction(result: SearchResult): void {
-    switch (result.type) {
-      case 'application':
-        window.electronAPI?.launchApp(result.id);
-        break;
-      case 'file':
-        window.electronAPI?.openFile(result.path!);
-        break;
-      case 'calculation':
-        navigator.clipboard.writeText(result.name.split('=')[1].trim());
-        break;
-      case 'web_search':
-        window.open(result.path, '_blank');
-        break;
-    }
-  }
-};
-```
+---
 
-### Backend: Query Engine
-
-```javascript
-// QueryEngine.js
-class QueryEngine {
-  constructor() {
-    this.localIndex = new SearchIndex();
-    this.providers = new Map();
-  }
-
-  async query(queryString, options = {}) {
-    const parsedQuery = this.parseQuery(queryString);
-
-    // Check for special queries first
-    const specialResult = await this.handleSpecialQuery(parsedQuery);
-    if (specialResult) {
-      return specialResult;
-    }
-
-    // Query all sources in parallel
-    const [localResults, providerResults, cloudResults] = await Promise.all([
-      this.localIndex.search(queryString, options),
-      this.queryProviders(queryString),
-      this.queryCloud(queryString)
-    ]);
-
-    // Merge and rank across sources
-    const merged = this.mergeResults([
-      ...localResults,
-      ...providerResults,
-      ...cloudResults
-    ]);
-
-    // Add web search fallback if few results
-    if (merged.length < 3) {
-      merged.push({
-        id: 'web-search',
-        type: 'web_search',
-        name: `Search the web for "${queryString}"`,
-        path: `https://google.com/search?q=${encodeURIComponent(queryString)}`,
-        score: 0
-      });
-    }
-
-    return merged;
-  }
-
-  parseQuery(queryString) {
-    const query = {
-      raw: queryString,
-      tokens: queryString.toLowerCase().split(/\s+/),
-      type: 'search'
-    };
-
-    // Detect math expression
-    if (/^[\d\s+\-*/().%^]+$/.test(queryString)) {
-      query.type = 'math';
-      query.expression = queryString;
-    }
-
-    // Detect unit conversion
-    const conversionMatch = queryString.match(/^([\d.]+)\s*(\w+)\s+(?:to|in)\s+(\w+)$/i);
-    if (conversionMatch) {
-      query.type = 'conversion';
-      query.value = parseFloat(conversionMatch[1]);
-      query.fromUnit = conversionMatch[2];
-      query.toUnit = conversionMatch[3];
-    }
-
-    return query;
-  }
-
-  async handleSpecialQuery(query) {
-    if (query.type === 'math') {
-      try {
-        const result = this.safeEval(query.expression);
-        return [{
-          id: 'calculation',
-          type: 'calculation',
-          name: `${query.expression} = ${result}`,
-          score: 100
-        }];
-      } catch (e) {
-        return null;
-      }
-    }
-
-    if (query.type === 'conversion') {
-      const result = this.convert(query.value, query.fromUnit, query.toUnit);
-      if (result) {
-        return [{
-          id: 'conversion',
-          type: 'calculation',
-          name: `${query.value} ${query.fromUnit} = ${result.value} ${result.unit}`,
-          score: 100
-        }];
-      }
-    }
-
-    return null;
-  }
-}
-```
-
-### Express API Routes
-
-```javascript
-// routes/search.js
-import express from 'express';
-import { queryEngine } from '../services/queryEngine.js';
-import { rateLimit } from '../middleware/rateLimit.js';
-import { requireAuth } from '../middleware/auth.js';
-
-const router = express.Router();
-
-// Search endpoint
-router.get('/search', requireAuth, rateLimit('search'), async (req, res) => {
-  const { q: query, types } = req.query;
-
-  if (!query || query.length === 0) {
-    return res.json([]);
-  }
-
-  try {
-    const results = await queryEngine.query(query, {
-      types: types ? types.split(',') : null,
-      userId: req.session.userId
-    });
-
-    res.json(results);
-  } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ error: 'Search failed' });
-  }
-});
-
-// Suggestions endpoint
-router.get('/suggestions', requireAuth, async (req, res) => {
-  try {
-    const suggestions = await siriSuggestions.getSuggestions({
-      userId: req.session.userId,
-      timeOfDay: new Date().getHours()
-    });
-
-    res.json(suggestions);
-  } catch (error) {
-    console.error('Suggestions error:', error);
-    res.status(500).json({ error: 'Failed to get suggestions' });
-  }
-});
-
-export default router;
-```
-
-## Deep Dive: Shared Types and Contracts (5 minutes)
-
-### Shared Type Definitions
-
-```typescript
-// shared/types.ts
-
-export type ResultType =
-  | 'application'
-  | 'file'
-  | 'contact'
-  | 'message'
-  | 'calculation'
-  | 'conversion'
-  | 'web_search';
-
-export interface SearchResult {
-  id: string;
-  type: ResultType;
-  name: string;
-  subtitle?: string;
-  icon?: string;
-  path?: string;
-  score: number;
-  metadata?: Record<string, unknown>;
-}
-
-export interface SearchRequest {
-  query: string;
-  types?: ResultType[];
-  limit?: number;
-}
-
-export interface SearchResponse {
-  results: SearchResult[];
-  timing: {
-    total: number;
-    local: number;
-    providers: number;
-  };
-}
-
-export interface Suggestion {
-  id: string;
-  type: 'app' | 'contact' | 'continue';
-  name: string;
-  icon: string;
-  reason: string;
-  score: number;
-}
-
-// Usage pattern for Siri Suggestions
-export interface UsagePattern {
-  bundleId: string;
-  hour: number;
-  dayOfWeek: number;
-  count: number;
-  lastUsed: Date;
-}
-```
-
-### API Response Envelope
-
-```typescript
-// shared/apiTypes.ts
-
-export interface ApiResponse<T> {
-  data: T;
-  error?: string;
-  meta?: {
-    timing?: Record<string, number>;
-    version?: string;
-  };
-}
-
-export interface PaginatedResponse<T> extends ApiResponse<T[]> {
-  pagination: {
-    offset: number;
-    limit: number;
-    total: number;
-    hasMore: boolean;
-  };
-}
-```
-
-## Deep Dive: Indexing and Suggestions Flow (7 minutes)
-
-### Indexing Service (Backend)
-
-```javascript
-// services/IndexingService.js
-class IndexingService {
-  constructor() {
-    this.index = new SearchIndex();
-    this.contentExtractors = new Map();
-    this.pendingQueue = [];
-    this.isIndexing = false;
-  }
-
-  async initialize() {
-    // Register content extractors
-    this.registerExtractor('pdf', new PDFExtractor());
-    this.registerExtractor('docx', new WordExtractor());
-    this.registerExtractor('txt', new TextExtractor());
-
-    // Watch file system for changes
-    this.fileWatcher = new FileWatcher({
-      paths: ['/Users', '/Applications'],
-      ignorePaths: ['Library/Caches', 'node_modules', '.git']
-    });
-
-    this.fileWatcher.on('created', (path) => this.queueForIndexing(path, 'add'));
-    this.fileWatcher.on('modified', (path) => this.queueForIndexing(path, 'update'));
-    this.fileWatcher.on('deleted', (path) => this.removeFromIndex(path));
-
-    this.startBackgroundIndexing();
-  }
-
-  async processQueue() {
-    this.isIndexing = true;
-
-    while (this.pendingQueue.length > 0) {
-      // Only index when system is idle
-      if (await this.isSystemBusy()) {
-        await this.sleep(5000);
-        continue;
-      }
-
-      const item = this.pendingQueue.shift();
-      await this.indexFile(item.path);
-
-      // Yield to other processes
-      await this.sleep(10);
-    }
-
-    this.isIndexing = false;
-  }
-
-  async indexFile(path) {
-    const stats = await fs.stat(path);
-
-    // Skip large files
-    if (stats.size > 50 * 1024 * 1024) return;
-
-    const ext = this.getExtension(path);
-    const extractor = this.contentExtractors.get(ext) ||
-                      this.contentExtractors.get('txt');
-
-    try {
-      const content = await extractor.extract(path);
-      const tokens = this.tokenize(content.text);
-
-      const entry = {
-        path,
-        name: content.name || path.split('/').pop(),
-        type: content.type || 'file',
-        content: tokens,
-        metadata: content.metadata || {},
-        modifiedAt: stats.mtime,
-        size: stats.size
-      };
-
-      await this.index.upsert(path, entry);
-    } catch (error) {
-      console.error(`Failed to index ${path}:`, error);
-    }
-  }
-}
-```
-
-### Siri Suggestions (Backend)
-
-```javascript
-// services/SiriSuggestions.js
-class SiriSuggestions {
-  async getSuggestions(context) {
-    const { timeOfDay, userId } = context;
-    const suggestions = [];
-
-    // Time-based app suggestions
-    const timeApps = await this.getTimeBasedApps(timeOfDay);
-    suggestions.push(...timeApps.map(app => ({
-      id: app.bundleId,
-      type: 'app',
-      name: app.name,
-      icon: app.icon,
-      reason: 'Based on your routine',
-      score: app.score
-    })));
-
-    // Frequent contacts
-    const frequentContacts = await this.getFrequentContacts(userId);
-    suggestions.push(...frequentContacts.slice(0, 4).map(contact => ({
-      id: contact.id,
-      type: 'contact',
-      name: contact.name,
-      icon: contact.avatar,
-      reason: 'Frequently contacted',
-      score: contact.score
-    })));
-
-    return suggestions.sort((a, b) => b.score - a.score).slice(0, 8);
-  }
-
-  async recordAppLaunch(bundleId, context) {
-    const hour = new Date().getHours();
-    const dayOfWeek = new Date().getDay();
-
-    await db.query(`
-      INSERT INTO app_usage_patterns (bundle_id, hour, day_of_week, count, last_used)
-      VALUES ($1, $2, $3, 1, NOW())
-      ON CONFLICT (bundle_id, hour, day_of_week)
-      DO UPDATE SET count = app_usage_patterns.count + 1, last_used = NOW()
-    `, [bundleId, hour, dayOfWeek]);
-  }
-}
-```
-
-### Frontend: Suggestions Display
-
-```typescript
-// SiriSuggestions.tsx
-export function SiriSuggestions() {
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const { query } = useSearchStore();
-
-  useEffect(() => {
-    if (query.length === 0) {
-      fetchSuggestions();
-    }
-  }, [query]);
-
-  async function fetchSuggestions() {
-    const data = await searchAPI.getSuggestions();
-    setSuggestions(data);
-  }
-
-  if (query.length > 0) return null;
-
-  return (
-    <div className="siri-suggestions">
-      <h3 className="suggestions-title">Siri Suggestions</h3>
-      <div className="suggestions-grid">
-        {suggestions.map((suggestion) => (
-          <SuggestionCard
-            key={suggestion.id}
-            suggestion={suggestion}
-            onClick={() => searchAPI.executeAction(suggestion)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-```
-
-## Deep Dive: Database Schema (5 minutes)
-
-### SQLite Schema
-
-```sql
--- File Index (on-device SQLite)
-CREATE TABLE indexed_files (
-  path TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  type TEXT,
-  content_hash TEXT,
-  tokens TEXT, -- JSON array of tokens
-  metadata TEXT, -- JSON
-  size INTEGER,
-  modified_at INTEGER,
-  indexed_at INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
-CREATE INDEX idx_files_name ON indexed_files(name);
-CREATE INDEX idx_files_type ON indexed_files(type);
-
--- Inverted Index
-CREATE TABLE inverted_index (
-  term TEXT,
-  doc_path TEXT,
-  position INTEGER,
-  PRIMARY KEY (term, doc_path, position)
-);
-
-CREATE INDEX idx_inverted_term ON inverted_index(term);
-
--- App Usage Patterns (for Siri Suggestions)
-CREATE TABLE app_usage_patterns (
-  bundle_id TEXT,
-  hour INTEGER,
-  day_of_week INTEGER,
-  count INTEGER DEFAULT 0,
-  last_used INTEGER,
-  PRIMARY KEY (bundle_id, hour, day_of_week)
-);
-
--- Recent Activity
-CREATE TABLE recent_activity (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT, -- 'file', 'app', 'contact', 'url'
-  item_id TEXT,
-  item_name TEXT,
-  timestamp INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
-CREATE INDEX idx_activity_time ON recent_activity(timestamp DESC);
-
--- Users (for auth)
-CREATE TABLE users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT DEFAULT 'user',
-  created_at INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
--- Audit Log
-CREATE TABLE audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-  event_type TEXT NOT NULL,
-  user_id INTEGER,
-  ip_address TEXT,
-  details TEXT
-);
-
-CREATE INDEX idx_audit_timestamp ON audit_log(timestamp DESC);
-```
-
-## Deep Dive: Authentication and Session Management (4 minutes)
-
-### Session-Based Auth
-
-```javascript
-// middleware/auth.js
-import session from 'express-session';
-import RedisStore from 'connect-redis';
-import { valkeyClient } from '../shared/cache.js';
-
-const sessionConfig = {
-  store: new RedisStore({ client: valkeyClient }),
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000,
-    sameSite: 'strict'
-  }
-};
-
-export function requireAuth(req, res, next) {
-  if (!req.session?.userId) {
-    return res.status(401).json({ error: 'Authentication required' });
-  }
-  next();
-}
-
-export function requireAdmin(req, res, next) {
-  if (req.session?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
-}
-```
-
-### Frontend Auth Context
-
-```typescript
-// context/AuthContext.tsx
-interface AuthState {
-  user: User | null;
-  isLoading: boolean;
-  login: (username: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
-}
-
-export const AuthContext = createContext<AuthState | null>(null);
-
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    checkSession();
-  }, []);
-
-  async function checkSession() {
-    try {
-      const response = await fetch('/api/v1/auth/me');
-      if (response.ok) {
-        setUser(await response.json());
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  async function login(username: string, password: string) {
-    const response = await fetch('/api/v1/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-
-    if (!response.ok) throw new Error('Login failed');
-    setUser(await response.json());
-  }
-
-  async function logout() {
-    await fetch('/api/v1/auth/logout', { method: 'POST' });
-    setUser(null);
-  }
-
-  return (
-    <AuthContext.Provider value={{ user, isLoading, login, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-```
-
-## Deep Dive: Error Handling and Resilience (4 minutes)
-
-### Backend Circuit Breaker
-
-```javascript
-// services/circuitBreaker.js
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5;
-    this.timeout = options.timeout || 30000;
-    this.state = 'CLOSED';
-    this.failures = 0;
-    this.lastFailure = null;
-  }
-
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailure > this.timeout) {
-        this.state = 'HALF_OPEN';
-      } else {
-        throw new Error('Circuit breaker is OPEN');
-      }
-    }
-
-    try {
-      const result = await operation();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-
-  onSuccess() {
-    this.failures = 0;
-    if (this.state === 'HALF_OPEN') {
-      this.state = 'CLOSED';
-    }
-  }
-
-  onFailure() {
-    this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN';
-    }
-  }
-}
-```
-
-### Frontend Error Boundary
-
-```typescript
-// components/ErrorBoundary.tsx
-class ErrorBoundary extends React.Component<Props, State> {
-  state = { hasError: false, error: null };
-
-  static getDerivedStateFromError(error: Error) {
-    return { hasError: true, error };
-  }
-
-  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.error('Search error:', error, errorInfo);
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="error-fallback">
-          <p>Something went wrong with search.</p>
-          <button onClick={() => this.setState({ hasError: false })}>
-            Try again
-          </button>
-        </div>
-      );
-    }
-
-    return this.props.children;
-  }
-}
-```
-
-### Graceful Degradation
-
-```javascript
-// Backend: graceful degradation when providers fail
-async function search(query) {
-  const results = [];
-
-  // Local index is always available (critical path)
-  const localResults = await localIndex.search(query);
-  results.push(...localResults);
-
-  // Provider queries are best-effort
-  const providerPromises = Array.from(providers.entries()).map(
-    async ([name, provider]) => {
-      try {
-        return await queryProviderWithBreaker(name, query);
-      } catch (error) {
-        console.warn(`Provider ${name} failed, degrading gracefully`);
-        return [];
-      }
-    }
-  );
-
-  // Wait for providers with timeout
-  const providerResults = await Promise.race([
-    Promise.all(providerPromises),
-    sleep(3000).then(() => [])
-  ]);
-
-  results.push(...providerResults.flat());
-  return mergeResults(results);
-}
-```
-
-## Trade-offs and Alternatives
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| State Management | Zustand | Redux | Simpler for focused scope, less boilerplate |
-| Input Debounce | 50ms | 150ms | Prioritize perceived speed |
-| Data Storage | SQLite | PostgreSQL | On-device, zero-config, FTS5 support |
-| Session Storage | Valkey | Cookie-only | Supports session invalidation, role checks |
-| Multi-source Query | Parallel | Sequential | Lower latency with graceful degradation |
-| Type Sharing | Shared types file | OpenAPI codegen | Simpler for single-team project |
-
-## Observability (2 minutes)
-
-### Full-Stack Tracing
-
-```javascript
-// Backend tracing
-async function handleSearch(req, res) {
-  const span = tracer.startSpan('search', {
-    attributes: { query: req.query.q, userId: req.session.userId }
-  });
-
-  try {
-    const [localResults, providerResults] = await Promise.all([
-      tracer.startActiveSpan('search.local', async (localSpan) => {
-        const results = await localIndex.search(req.query.q);
-        localSpan.end();
-        return results;
-      }),
-      tracer.startActiveSpan('search.providers', async (provSpan) => {
-        const results = await queryProviders(req.query.q);
-        provSpan.end();
-        return results;
-      })
-    ]);
-
-    span.setStatus({ code: SpanStatusCode.OK });
-    return mergeResults([...localResults, ...providerResults]);
-  } finally {
-    span.end();
-  }
-}
-```
-
-### Frontend Performance Metrics
-
-```typescript
-// Measure search latency
-async function search(query: string) {
-  const start = performance.now();
-
-  const results = await searchAPI.search(query);
-
-  const duration = performance.now() - start;
-  performance.measure('search-latency', { start, duration });
-
-  if (duration > 100) {
-    console.warn('Search latency exceeded 100ms:', duration);
-  }
-
-  return results;
-}
-```
-
-## Future Enhancements
-
-1. **Natural Language Queries**: Parse "emails from John last week" using on-device NLP
-2. **Vector Embeddings**: Semantic similarity search with on-device ML
-3. **Cross-Device Sync**: Secure index sharing via iCloud Keychain
-4. **Voice Input**: "Hey Siri, search for..." with Web Speech API
-5. **Custom Extractors**: Plugin system for third-party content types
-
-## Closing Summary
+## 📝 Summary
 
 "Spotlight's full-stack architecture is built around three integrated flows:
 
-1. **Search flow**: 50ms debounced frontend input triggers parallel backend queries to local index, app providers, and cloud, with results merged and ranked before rendering in a keyboard-navigable list.
+**Search flow**: 50ms debounced frontend input triggers parallel backend queries to local index, app providers, and cloud, with results merged and ranked before rendering in a keyboard-navigable list. Zustand manages UI state with minimal boilerplate while circuit breakers ensure provider failures don't cascade.
 
-2. **Indexing flow**: File system events trigger content extraction and tokenization during idle time, updating the SQLite inverted index with trie-augmented prefix support.
+**Indexing flow**: File system events trigger content extraction and tokenization during idle time, updating the SQLite inverted index. The on-device approach sacrifices cloud intelligence but guarantees complete privacy and offline functionality.
 
-3. **Suggestions flow**: Usage patterns are recorded in SQLite and analyzed to provide time-based Siri Suggestions displayed when the search bar is empty.
+**Suggestions flow**: Usage patterns are recorded by time-of-day and day-of-week, analyzed to provide Siri-style suggestions displayed when the search bar is empty - 'Based on your routine, here's what you might need.'
 
-The main trade-off is privacy vs. cloud features. By keeping everything on-device with SQLite and file system watching, we sacrifice cross-device sync and cloud-powered intelligence but achieve complete user privacy and offline functionality. The full stack works together to deliver sub-100ms perceived latency from keystroke to rendered results."
+The main trade-off is privacy versus cloud features. By keeping everything on-device with SQLite and file system watching, we sacrifice cross-device sync and AI-powered semantic search but achieve complete user privacy and instant offline access. Session-based auth with Valkey provides secure admin access with instant revocation capability. The full stack works together through shared TypeScript types to deliver sub-100ms perceived latency from keystroke to rendered results."

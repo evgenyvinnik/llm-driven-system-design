@@ -2,13 +2,17 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Opening Statement (1 minute)
+---
+
+## 📋 Introduction (1 minute)
 
 "I'll design Spotlight, Apple's universal search system that provides instant results across files, apps, contacts, messages, and the web. From a backend perspective, the core challenge is building an on-device indexing system with real-time file watching, efficient content extraction, and a high-performance inverted index that delivers sub-100ms search latency.
 
 The backend architecture centers on three pillars: an incremental indexing service that watches file system events and processes them during idle time, a SQLite-based inverted index with trie-augmented prefix matching for typeahead, and a multi-source query engine that routes requests to local index, app providers, and cloud services in parallel. Privacy is paramount - all data stays on-device with no search telemetry sent to servers."
 
-## Requirements Clarification (3 minutes)
+---
+
+## 🎯 Requirements (3 minutes)
 
 ### Functional Requirements
 - **Indexing**: Real-time file watching with incremental updates
@@ -18,45 +22,47 @@ The backend architecture centers on three pillars: an incremental indexing servi
 - **Siri Suggestions**: Time/location-based proactive recommendations
 
 ### Non-Functional Requirements
-- **Latency**: < 100ms for local search results
-- **Efficiency**: < 5% CPU during background indexing
-- **Storage**: Minimal index size (100MB - 1GB depending on content)
+- **Latency**: Less than 100ms for local search results
+- **Efficiency**: Less than 5% CPU during background indexing
+- **Storage**: Minimal index size (100MB to 1GB depending on content)
 - **Privacy**: All indexing on-device, no cloud telemetry
 
 ### Scale Estimates (Per Device)
 - **Files indexed**: 1M+ (documents, photos, media)
 - **Apps**: 100+ with their searchable data
 - **Tokens per file**: Up to 10,000
-- **Index size**: 100MB - 1GB
+- **Index size**: 100MB to 1GB
 
-## High-Level Architecture (5 minutes)
+---
+
+## 🏗️ High-Level Design (5 minutes)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Spotlight UI                                │
-│              (Search bar, Results list, Previews)               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Query Engine                                 │
-│         (Parse, Route, Rank, Merge results)                    │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Local Index  │    │ App Providers │    │  Cloud Search │
-│               │    │               │    │               │
-│ - Files       │    │ - Contacts    │    │ - iCloud      │
-│ - Apps        │    │ - Calendar    │    │ - Mail        │
-│ - Messages    │    │ - Notes       │    │ - Safari      │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Indexing Service                             │
-│       (File watcher, Content extraction, Tokenization)         │
-└─────────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------+
+|                       Spotlight UI                             |
+|            (Search bar, Results list, Previews)                |
++---------------------------------------------------------------+
+                              |
+                              v
++---------------------------------------------------------------+
+|                      Query Engine                              |
+|           (Parse, Route, Rank, Merge results)                  |
++---------------------------------------------------------------+
+        |                     |                     |
+        v                     v                     v
++---------------+    +---------------+    +---------------+
+|  Local Index  |    | App Providers |    | Cloud Search  |
+|               |    |               |    |               |
+| - Files       |    | - Contacts    |    | - iCloud      |
+| - Apps        |    | - Calendar    |    | - Mail        |
+| - Messages    |    | - Notes       |    | - Safari      |
++---------------+    +---------------+    +---------------+
+        |
+        v
++---------------------------------------------------------------+
+|                     Indexing Service                           |
+|        (File watcher, Content extraction, Tokenization)        |
++---------------------------------------------------------------+
 ```
 
 ### Core Backend Components
@@ -67,613 +73,302 @@ The backend architecture centers on three pillars: an incremental indexing servi
 4. **App Provider API**: Interface for apps to register searchable content
 5. **Siri Suggestions**: Usage pattern tracking in SQLite
 
-## Deep Dive: Indexing Service Architecture (8 minutes)
+---
 
-### File System Watcher
+## 🔍 Deep Dive: On-Device Storage (8 minutes)
 
-The indexing service uses FSEvents (macOS) to monitor file system changes with minimal overhead.
+### Why SQLite with FTS5 Over PostgreSQL or Custom Binary Format?
 
-```javascript
-class IndexingService {
-  constructor() {
-    this.index = new SearchIndex();
-    this.contentExtractors = new Map();
-    this.pendingQueue = [];
-    this.isIndexing = false;
-  }
+| Approach | Deployment | Complexity | Full-Text | ACID | Size Overhead |
+|----------|------------|------------|-----------|------|---------------|
+| SQLite + FTS5 | Embedded, zero-config | Low | Native FTS5 | Yes | Medium |
+| PostgreSQL | Requires daemon process | High | GIN indexes | Yes | High |
+| Custom Binary | Fully custom | Very High | Build from scratch | Manual | Low |
+| LevelDB/RocksDB | Embedded key-value | Medium | No native FTS | No | Low |
 
-  async initialize() {
-    // Register content extractors per file type
-    this.registerExtractor('pdf', new PDFExtractor());
-    this.registerExtractor('docx', new WordExtractor());
-    this.registerExtractor('txt', new TextExtractor());
-    this.registerExtractor('html', new HTMLExtractor());
-    this.registerExtractor('image', new ImageMetadataExtractor());
+**Decision**: SQLite with FTS5
 
-    // Watch file system for changes (FSEvents on macOS)
-    this.fileWatcher = new FileWatcher({
-      paths: ['/Users', '/Applications'],
-      ignorePaths: ['Library/Caches', 'node_modules', '.git']
-    });
+"I'm choosing SQLite with FTS5 because this is an on-device system that must work without any server processes. PostgreSQL would require running a separate daemon, which adds complexity and resource usage for a desktop search feature. A custom binary format would give us the smallest footprint, but we'd need to implement our own full-text search, crash recovery, and concurrent access handling. SQLite gives us battle-tested ACID guarantees, built-in FTS5 for efficient text search with prefix matching, and zero configuration. Apple has shipped SQLite on every device for over a decade, so users already have the dependency."
 
-    this.fileWatcher.on('created', (path) => this.queueForIndexing(path, 'add'));
-    this.fileWatcher.on('modified', (path) => this.queueForIndexing(path, 'update'));
-    this.fileWatcher.on('deleted', (path) => this.removeFromIndex(path));
+### Database Design
 
-    this.startBackgroundIndexing();
-  }
+The schema consists of four main tables:
 
-  async queueForIndexing(path, action) {
-    this.pendingQueue.push({ path, action, queuedAt: Date.now() });
+**Indexed Files Table**: Stores file paths as primary keys with name, type, content hash, tokens as a JSON array, metadata as JSON, file size, modification time, and indexing timestamp. Indexed on name and type for fast filtering.
 
-    // Process immediately if not busy
-    if (!this.isIndexing) {
-      this.processQueue();
-    }
-  }
+**Inverted Index Table**: Maps terms to document paths with position information. The primary key is a composite of term, document path, and position. Indexed on term for fast lookups.
 
-  async processQueue() {
-    this.isIndexing = true;
+**App Usage Patterns Table**: Tracks usage by bundle ID, hour, and day of week. Stores count and last used timestamp. Primary key is bundle ID plus hour plus day of week for Siri Suggestions.
 
-    while (this.pendingQueue.length > 0) {
-      // Check system load before processing
-      if (await this.isSystemBusy()) {
-        await this.sleep(5000); // Wait 5 seconds
-        continue;
-      }
+**Recent Activity Table**: Auto-incrementing ID with type (file, app, contact, url), item ID, item name, and timestamp. Indexed on timestamp descending for recency queries.
 
-      const item = this.pendingQueue.shift();
-      await this.indexFile(item.path);
+---
 
-      // Yield to other processes
-      await this.sleep(10);
-    }
+## 🔍 Deep Dive: File System Monitoring (6 minutes)
 
-    this.isIndexing = false;
-  }
-}
-```
+### Why FSEvents Over Periodic Scanning?
 
-### Idle-Time Scheduling
+| Approach | Latency | CPU Usage | Battery Impact | Reliability |
+|----------|---------|-----------|----------------|-------------|
+| FSEvents (macOS) | Real-time | Near zero | Minimal | High (kernel-level) |
+| Periodic Scan | Minutes | High during scan | Significant | High |
+| inotify (Linux) | Real-time | Near zero | Minimal | High |
+| Polling | Seconds | Constant overhead | Moderate | High |
 
-```javascript
-async isSystemBusy() {
-  const cpuUsage = await getCPUUsage();
-  const userActivity = await getLastUserInput();
+**Decision**: FSEvents file watcher
 
-  // Only index when:
-  // - CPU usage is below 30%
-  // - User hasn't typed/clicked in 5+ seconds
-  // - Battery is not critically low (or plugged in)
-  return cpuUsage > 0.3 ||
-         userActivity < 5000 ||
-         (getBatteryLevel() < 0.2 && !isPluggedIn());
-}
-```
+"I'm choosing FSEvents because it's a kernel-level notification system that Apple specifically designed for this use case. The kernel already tracks file system changes, so FSEvents just lets us subscribe to those events at near-zero CPU cost. Periodic scanning would require traversing millions of files every few minutes, which would drain battery and spike CPU usage. FSEvents gives us real-time notifications, historical event replay after sleep/wake, and coalescing of rapid changes. The main trade-off is that FSEvents is macOS-specific, but since Spotlight is an Apple product, that's acceptable."
+
+### File Watcher Architecture
+
+The indexing service registers to watch the Users and Applications directories while ignoring paths like Library/Caches, node_modules, and .git directories. When files are created or modified, they're added to a pending queue with the action type and timestamp. When files are deleted, they're immediately removed from the index.
+
+The key insight is that we don't process changes immediately. Instead, we queue them and process during idle time to avoid impacting user activities.
+
+### Why Idle-Time Scheduling Over Immediate Indexing?
+
+| Approach | User Experience | Indexing Speed | Resource Usage | Complexity |
+|----------|-----------------|----------------|----------------|------------|
+| Idle-Time | Excellent | Delayed | Low when user active | Medium |
+| Immediate | May lag during heavy writes | Fast | Potentially high | Low |
+| Batched Periodic | Good | Delayed | Predictable spikes | Low |
+| Priority Queue | Good | Fast for important files | Medium | High |
+
+**Decision**: Idle-time scheduling with priority hints
+
+"I'm choosing idle-time scheduling because Spotlight should be invisible to the user. If someone is writing a document or compiling code, they shouldn't notice any slowdown from indexing. The system checks CPU usage (must be below 30%), time since last user input (must be over 5 seconds), and battery state (not critically low unless plugged in). We sacrifice indexing speed for user experience. A file saved right now might not be searchable for 30 seconds, but the user's active work is never interrupted. For important files like the currently open document, we can add priority hints to index them sooner."
 
 ### Content Extraction Pipeline
 
-```javascript
-async indexFile(path) {
-  const stats = await fs.stat(path);
+Files under 50MB are processed through type-specific extractors:
+- PDFs use a PDF extractor to pull text content
+- DOCX files use a Word document extractor
+- Plain text uses a simple text extractor
+- HTML uses an extractor that strips tags
+- Images use a metadata extractor for EXIF data and filenames
 
-  // Skip large files (index metadata only)
-  if (stats.size > 50 * 1024 * 1024) return; // > 50MB
+The extracted text is tokenized by converting to lowercase, removing non-word characters, splitting on whitespace, filtering out single-character tokens, and limiting to 10,000 tokens per file to bound index size.
 
-  const ext = this.getExtension(path);
-  const extractor = this.contentExtractors.get(ext) ||
-                    this.contentExtractors.get('txt');
+---
 
-  try {
-    // Extract searchable content
-    const content = await extractor.extract(path);
+## 🔍 Deep Dive: Inverted Index with Trie (7 minutes)
 
-    // Tokenize for indexing
-    const tokens = this.tokenize(content.text);
+### Why Inverted Index + Trie Hybrid Over Pure Inverted Index?
 
-    // Create index entry
-    const entry = {
-      path,
-      name: content.name || path.split('/').pop(),
-      type: content.type || 'file',
-      content: tokens,
-      metadata: content.metadata || {},
-      modifiedAt: stats.mtime,
-      size: stats.size
-    };
+| Approach | Exact Match | Prefix Match | Memory | Update Cost |
+|----------|-------------|--------------|--------|-------------|
+| Inverted Index + Trie | O(1) lookup | O(prefix length) | Medium-High | Medium |
+| Pure Inverted Index | O(1) lookup | O(n) scan | Medium | Low |
+| Trie Only | O(word length) | O(prefix length) | High | Medium |
+| Suffix Array | O(log n) | O(log n + results) | Medium | High |
 
-    await this.index.upsert(path, entry);
-  } catch (error) {
-    console.error(`Failed to index ${path}:`, error);
-  }
-}
+**Decision**: Inverted index with trie augmentation
 
-tokenize(text) {
-  if (!text) return [];
+"I'm choosing a hybrid approach because Spotlight has two distinct access patterns. When users finish typing a word and press enter, we need exact matching, which is what inverted indexes excel at. But the more common case is typeahead, where users type 'doc' and expect to see 'Documents' immediately. For typeahead, we need prefix matching. A pure inverted index would require scanning all terms starting with 'doc', which is O(n) where n is the vocabulary size. A trie gives us O(prefix length) for prefix lookups, which is constant time relative to vocabulary size. The cost is extra memory for the trie, but on a modern Mac with 8GB+ RAM, a few hundred MB is acceptable."
 
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .split(/\s+/)
-    .filter(t => t.length > 1)
-    .slice(0, 10000); // Limit tokens per file
-}
-```
+### Hybrid Data Structure
 
-## Deep Dive: Inverted Index with Trie (7 minutes)
+The search index maintains three structures:
+1. **Inverted Index** (term to document IDs): Hash map for O(1) exact term lookup
+2. **Documents Map** (document ID to document): Stores full document metadata
+3. **Prefix Index** (trie): Stores prefixes pointing to document IDs
 
-### Data Structure Design
+When inserting a document, we store it in the documents map, then for each token, we add it to both the inverted index and the prefix trie. File names get special treatment in the prefix index since they're the most common search target.
 
-The search index uses a hybrid approach: inverted index for exact term lookup and trie for prefix matching.
+### Search Algorithm
 
-```javascript
-class SearchIndex {
-  constructor() {
-    this.invertedIndex = new Map();   // term -> Set<docId>
-    this.documents = new Map();        // docId -> document
-    this.prefixIndex = new Trie();     // For prefix matching
-  }
+For a query like "proj rep", we split into tokens and process them differently:
+- Non-final tokens use exact matching from the inverted index
+- The final token (what the user is currently typing) uses prefix matching from the trie
 
-  async upsert(docId, document) {
-    // Remove old entry if exists
-    await this.remove(docId);
-
-    // Store document
-    this.documents.set(docId, document);
-
-    // Index each token
-    for (const token of document.content) {
-      // Full term index
-      if (!this.invertedIndex.has(token)) {
-        this.invertedIndex.set(token, new Set());
-      }
-      this.invertedIndex.get(token).add(docId);
-
-      // Prefix index (for typeahead)
-      this.prefixIndex.insert(token, docId);
-    }
-
-    // Index name specially (higher weight in ranking)
-    const nameTokens = document.name.toLowerCase().split(/[\s._-]+/);
-    for (const token of nameTokens) {
-      this.prefixIndex.insert(token, docId);
-    }
-  }
-
-  async search(query, options = {}) {
-    const { limit = 20, types = null } = options;
-    const tokens = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-
-    if (tokens.length === 0) return [];
-
-    // Get matching docs for each token
-    const matchingSets = tokens.map((token, i) => {
-      // Last token: prefix match (user is still typing)
-      if (i === tokens.length - 1 && token.length < 4) {
-        return this.prefixIndex.getDocsWithPrefix(token);
-      }
-      // Other tokens: exact match
-      return this.invertedIndex.get(token) || new Set();
-    });
-
-    // Intersect for AND semantics
-    let resultSet = matchingSets[0];
-    for (let i = 1; i < matchingSets.length; i++) {
-      resultSet = new Set([...resultSet].filter(x => matchingSets[i].has(x)));
-    }
-
-    // Score and rank results
-    const results = [];
-    for (const docId of resultSet) {
-      const doc = this.documents.get(docId);
-      if (!doc) continue;
-      if (types && !types.includes(doc.type)) continue;
-
-      const score = this.calculateScore(doc, tokens);
-      results.push({ ...doc, score });
-    }
-
-    results.sort((a, b) => b.score - a.score);
-    return results.slice(0, limit);
-  }
-}
-```
+We intersect the result sets for AND semantics, meaning all terms must match. Then we score and rank the results.
 
 ### Ranking Algorithm
 
-```javascript
-calculateScore(doc, queryTokens) {
-  let score = 0;
+The scoring combines multiple signals:
 
-  // Name match is most important
-  const nameLower = doc.name.toLowerCase();
-  for (const token of queryTokens) {
-    if (nameLower.includes(token)) {
-      score += 10;
-      if (nameLower.startsWith(token)) {
-        score += 5; // Prefix match bonus
-      }
-    }
-  }
+**Name Match (highest weight)**: If query tokens appear in the file name, add 10 points. Prefix matches in the name get an additional 5 points.
 
-  // Recency boost
-  const daysSinceModified = (Date.now() - doc.modifiedAt) / (24 * 60 * 60 * 1000);
-  score += Math.max(0, 5 - daysSinceModified * 0.1);
+**Recency Boost**: Files modified recently get up to 5 points, decaying by 0.1 points per day.
 
-  // Type boost (apps and contacts higher than random files)
-  const typeBoost = {
-    'application': 3,
-    'contact': 2,
-    'message': 2,
-    'file': 1
-  };
-  score += typeBoost[doc.type] || 1;
+**Type Boost**: Applications get 3 points, contacts and messages get 2 points, regular files get 1 point.
 
-  return score;
-}
+This simple scoring works well because name matches are almost always what users want. A search for "resume" should show resume.pdf before a random document that mentions the word resume in paragraph 15.
+
+---
+
+## 🔍 Deep Dive: Query Engine and Multi-Source Routing (5 minutes)
+
+### Query Engine Architecture
+
+The query engine handles three types of requests:
+
+**Special Queries**: Math expressions (detected by regex for numbers and operators), unit conversions (detected by "X unit to Y unit" pattern), and dictionary lookups. These bypass the search index entirely.
+
+**Local Search**: Queries the on-device inverted index for files, apps, and local messages.
+
+**Provider Queries**: Sends queries in parallel to registered app providers (Contacts, Calendar, Notes, Mail) and cloud services (iCloud, Safari suggestions).
+
+All sources are queried in parallel using Promise.all, then results are merged and re-ranked. If we get fewer than 3 results, we add a web search fallback option.
+
+### Why Circuit Breaker Pattern for App Providers?
+
+| Approach | Failure Handling | Recovery | Latency Impact | Complexity |
+|----------|------------------|----------|----------------|------------|
+| Circuit Breaker | Fails fast after threshold | Auto-recovery | Minimal | Medium |
+| Simple Timeout | Waits for timeout each time | Immediate retry | High during failures | Low |
+| Retry with Backoff | Multiple attempts | Gradual | Very high during failures | Medium |
+| No Protection | Cascading failures | Manual | Catastrophic | None |
+
+**Decision**: Circuit breaker per provider
+
+"I'm choosing circuit breakers because third-party app providers can fail in unpredictable ways. A buggy Notes extension might hang indefinitely, or a Calendar provider might crash. Without protection, one failing provider would make every search slow. The circuit breaker has three states: CLOSED (normal operation), OPEN (failing fast without calling the provider), and HALF_OPEN (testing if the provider recovered). After 3 consecutive failures, the circuit opens for 60 seconds. This means users see fast results from working providers while the broken one is isolated. When the timeout expires, we try one request to see if it recovered."
+
+The key insight is graceful degradation. If Contacts is failing, searches should still show files and apps instantly. The circuit breaker returns an empty array when open, which gets merged with results from healthy providers.
+
+---
+
+## 🔍 Deep Dive: Rate Limiting (4 minutes)
+
+### Why Token Bucket Over Fixed Window?
+
+| Approach | Burst Handling | Smoothness | Memory | Implementation |
+|----------|----------------|------------|--------|----------------|
+| Token Bucket | Allows controlled bursts | Smooth over time | O(1) per key | Medium |
+| Fixed Window | Edge case double-burst | Choppy at boundaries | O(1) per key | Simple |
+| Sliding Window Log | No bursts | Perfectly smooth | O(n) per key | Complex |
+| Leaky Bucket | Strict rate | Very smooth | O(1) per key | Medium |
+
+**Decision**: Token bucket rate limiting
+
+"I'm choosing token bucket because it matches real user behavior. A user might type quickly for a few seconds (burst), then pause to read results (refill). Fixed window has the boundary problem where a user could make 100 requests at 11:59:59 and 100 more at 12:00:01, effectively doubling the limit. Token bucket naturally handles this by accumulating tokens during idle periods. For search, we allow 100 tokens with a refill rate of 10 per second. For expensive operations like forcing a re-index, we allow only 5 tokens with 1 refill per minute."
+
+Rate limits are applied per category:
+- **Search**: 100 tokens, refills at 10/second
+- **Suggestions**: 30 tokens, refills at 5/second
+- **Reindex**: 5 tokens, refills at 1/minute
+
+Global limits prevent abuse even if individual limits pass:
+- **Global Search**: 500 tokens, refills at 50/second
+- **Cloud Query**: 20 tokens, refills at 2/second
+
+---
+
+## 📊 Data Flow
+
+### Indexing Flow
+```
+File Created/Modified
+        |
+        v
++------------------+
+| FSEvents Watcher |
++------------------+
+        |
+        v
++------------------+     +------------------+
+| Pending Queue    |---->| Idle Check       |
++------------------+     | - CPU < 30%      |
+                         | - User idle > 5s |
+                         | - Battery OK     |
+                         +------------------+
+                                 |
+                                 v
+                         +------------------+
+                         | Content Extractor|
+                         | - PDF, DOCX, TXT |
+                         | - HTML, Images   |
+                         +------------------+
+                                 |
+                                 v
+                         +------------------+
+                         | Tokenizer        |
+                         | - Lowercase      |
+                         | - Split words    |
+                         | - Limit 10K      |
+                         +------------------+
+                                 |
+                                 v
+                         +------------------+
+                         | SQLite + Trie    |
+                         | - Inverted index |
+                         | - Prefix index   |
+                         +------------------+
 ```
 
-### Why Trie for Prefixes?
-
-| Structure | Prefix Lookup | Insert | Space |
-|-----------|---------------|--------|-------|
-| Trie | O(prefix_len) | O(word_len) | High |
-| Sorted Array | O(log n) | O(n) | Low |
-| Hash Map | O(n) | O(1) | Medium |
-
-Trie is optimal for prefix matching - the core use case for typeahead search.
-
-## Deep Dive: SQLite Schema and Storage (5 minutes)
-
-### Database Schema
-
-```sql
--- File Index (on-device SQLite)
-CREATE TABLE indexed_files (
-  path TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  type TEXT,
-  content_hash TEXT,
-  tokens TEXT, -- JSON array of tokens
-  metadata TEXT, -- JSON
-  size INTEGER,
-  modified_at INTEGER,
-  indexed_at INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
-CREATE INDEX idx_files_name ON indexed_files(name);
-CREATE INDEX idx_files_type ON indexed_files(type);
-
--- Inverted Index (on-device)
-CREATE TABLE inverted_index (
-  term TEXT,
-  doc_path TEXT,
-  position INTEGER,
-  PRIMARY KEY (term, doc_path, position)
-);
-
-CREATE INDEX idx_inverted_term ON inverted_index(term);
-
--- App Usage Patterns (for Siri Suggestions)
-CREATE TABLE app_usage_patterns (
-  bundle_id TEXT,
-  hour INTEGER,
-  day_of_week INTEGER,
-  count INTEGER DEFAULT 0,
-  last_used INTEGER,
-  PRIMARY KEY (bundle_id, hour, day_of_week)
-);
-
--- Recent Activity
-CREATE TABLE recent_activity (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT, -- 'file', 'app', 'contact', 'url'
-  item_id TEXT,
-  item_name TEXT,
-  timestamp INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
-CREATE INDEX idx_activity_time ON recent_activity(timestamp DESC);
-
--- Audit Log
-CREATE TABLE audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-  event_type TEXT NOT NULL,
-  user_id INTEGER,
-  ip_address TEXT,
-  details TEXT -- JSON
-);
-
-CREATE INDEX idx_audit_timestamp ON audit_log(timestamp DESC);
-CREATE INDEX idx_audit_type ON audit_log(event_type);
+### Search Flow
+```
+User Types "proj"
+        |
+        v
++------------------+
+| Query Parser     |-----> Math? Conversion? Definition?
++------------------+              |
+        |                    Special Handler
+        v                         |
++-------+-------+-------+         v
+|       |       |       |    Direct Result
+v       v       v       |
+Local   App     Cloud   |
+Index   Providers Search|
+|       |       |       |
++---(Circuit Breakers)--+
+        |
+        v
++------------------+
+| Result Merger    |
+| - Deduplicate    |
+| - Score/Rank     |
+| - Limit to 20    |
++------------------+
+        |
+        v
++------------------+
+| Spotlight UI     |
+| - Instant update |
+| - As-you-type    |
++------------------+
 ```
 
-### Why SQLite?
+---
 
-- **Battle-tested**: Optimized for mobile/desktop, handles concurrent access
-- **FTS5 support**: Built-in full-text search extension
-- **ACID guarantees**: Safe for incremental updates
-- **Zero-config**: No separate server process
+## ⚖️ Trade-offs Summary
 
-## Deep Dive: Query Engine and Multi-Source Routing (5 minutes)
+| Decision | ✅ Chosen | ❌ Alternative | Rationale |
+|----------|-----------|----------------|-----------|
+| Storage | SQLite with FTS5 | PostgreSQL, Custom binary | Zero-config embedded DB with native FTS, ACID guarantees, battle-tested on Apple platforms |
+| File Monitoring | FSEvents watcher | Periodic scanning | Real-time at near-zero CPU cost, kernel-level reliability |
+| Index Structure | Inverted index + Trie | Pure inverted index | O(prefix) typeahead while keeping O(1) exact match |
+| Scheduling | Idle-time processing | Immediate indexing | User experience over indexing speed, invisible to active user |
+| Provider Resilience | Circuit breaker pattern | Simple timeout | Fail fast, auto-recovery, graceful degradation |
+| Rate Limiting | Token bucket | Fixed window | Handles bursts naturally, no boundary double-burst problem |
+| Multi-source Query | Parallel with merge | Sequential fallback | Lower latency, one slow provider doesn't block others |
+| Privacy Model | On-device only | Cloud hybrid | Complete privacy, works offline, no telemetry |
 
-### Query Engine
+---
 
-```javascript
-class QueryEngine {
-  constructor() {
-    this.localIndex = new SearchIndex();
-    this.providers = new Map();
-    this.specialHandlers = new Map();
-  }
+## 🚀 Future Enhancements
 
-  async query(queryString, options = {}) {
-    const parsedQuery = this.parseQuery(queryString);
+1. **Vector Embeddings**: On-device ML for semantic similarity search using CoreML, enabling queries like "that beach photo from vacation" to find images without exact keyword matches.
 
-    // Check for special queries first
-    const specialResult = await this.handleSpecialQuery(parsedQuery);
-    if (specialResult) {
-      return specialResult;
-    }
+2. **Content-Addressed Deduplication**: Hash-based dedup for similar files, reducing index size when users have multiple versions of the same document.
 
-    // Query all sources in parallel
-    const [localResults, providerResults, cloudResults] = await Promise.all([
-      this.localIndex.search(queryString, options),
-      this.queryProviders(queryString),
-      this.queryCloud(queryString)
-    ]);
+3. **Smart Compaction**: Merge index segments during idle time to reduce fragmentation and improve query performance.
 
-    // Merge and rank across sources
-    const merged = this.mergeResults([
-      ...localResults,
-      ...providerResults,
-      ...cloudResults
-    ]);
+4. **Natural Language Understanding**: Parse queries like "emails from John last week" into structured filters on sender and date range.
 
-    // Add web search fallback if few results
-    if (merged.length < 3) {
-      merged.push({
-        type: 'web_search',
-        name: `Search the web for "${queryString}"`,
-        action: { type: 'open_url', url: `https://google.com/search?q=${encodeURIComponent(queryString)}` }
-      });
-    }
+5. **Cross-Device Index Sync**: Secure index synchronization via iCloud Keychain, allowing search on one device to find files on another without exposing content to Apple's servers.
 
-    return merged;
-  }
+---
 
-  parseQuery(queryString) {
-    const query = {
-      raw: queryString,
-      tokens: queryString.toLowerCase().split(/\s+/),
-      type: 'search'
-    };
-
-    // Detect math expression
-    if (/^[\d\s+\-*/().%^]+$/.test(queryString)) {
-      query.type = 'math';
-      query.expression = queryString;
-    }
-
-    // Detect unit conversion
-    const conversionMatch = queryString.match(/^([\d.]+)\s*(\w+)\s+(?:to|in)\s+(\w+)$/i);
-    if (conversionMatch) {
-      query.type = 'conversion';
-      query.value = parseFloat(conversionMatch[1]);
-      query.fromUnit = conversionMatch[2];
-      query.toUnit = conversionMatch[3];
-    }
-
-    return query;
-  }
-}
-```
-
-### Circuit Breaker for Providers
-
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5;
-    this.successThreshold = options.successThreshold || 3;
-    this.timeout = options.timeout || 30000; // 30 seconds
-
-    this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
-    this.failures = 0;
-    this.successes = 0;
-    this.lastFailure = null;
-  }
-
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailure > this.timeout) {
-        this.state = 'HALF_OPEN';
-        this.successes = 0;
-      } else {
-        throw new Error('Circuit breaker is OPEN');
-      }
-    }
-
-    try {
-      const result = await operation();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-}
-
-// Per-provider circuit breakers
-const providerBreakers = new Map();
-
-async function queryProviderWithBreaker(providerName, query) {
-  if (!providerBreakers.has(providerName)) {
-    providerBreakers.set(providerName, new CircuitBreaker({
-      failureThreshold: 3,
-      timeout: 60000
-    }));
-  }
-
-  const breaker = providerBreakers.get(providerName);
-
-  try {
-    return await breaker.execute(() =>
-      providers.get(providerName).search(query, { timeout: 2000 })
-    );
-  } catch (error) {
-    if (error.message === 'Circuit breaker is OPEN') {
-      return []; // Return empty results, don't fail the whole search
-    }
-    throw error;
-  }
-}
-```
-
-## Deep Dive: Rate Limiting and Authentication (4 minutes)
-
-### Token Bucket Rate Limiting
-
-```javascript
-const rateLimits = {
-  user: {
-    search: { tokens: 100, refillRate: 10, refillInterval: 1000 },
-    suggestions: { tokens: 30, refillRate: 5, refillInterval: 1000 },
-    reindex: { tokens: 5, refillRate: 1, refillInterval: 60000 }
-  },
-  global: {
-    search: { tokens: 500, refillRate: 50, refillInterval: 1000 },
-    cloudQuery: { tokens: 20, refillRate: 2, refillInterval: 1000 }
-  }
-};
-
-async function rateLimit(category, identifier) {
-  const key = `ratelimit:${category}:${identifier}`;
-  const config = rateLimits.user[category];
-
-  const tokens = await valkey.decr(key);
-  if (tokens < 0) {
-    await valkey.incr(key); // Restore the token
-    return false; // Rate limited
-  }
-  return true;
-}
-```
-
-### Session-Based Authentication
-
-```javascript
-const sessionConfig = {
-  store: new RedisStore({ client: valkeyClient }),
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000,
-    sameSite: 'strict'
-  }
-};
-
-// RBAC Middleware
-function requireAuth(req, res, next) {
-  if (!req.session?.userId) {
-    return res.status(401).json({ error: 'Authentication required' });
-  }
-  next();
-}
-
-function requireAdmin(req, res, next) {
-  if (req.session?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
-}
-```
-
-## Observability (3 minutes)
-
-### Prometheus Metrics
-
-```javascript
-const promClient = require('prom-client');
-
-// Search metrics
-const searchLatency = new promClient.Histogram({
-  name: 'spotlight_search_latency_seconds',
-  help: 'Search query latency',
-  labelNames: ['source'],
-  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
-});
-
-// Indexing metrics
-const indexingQueueSize = new promClient.Gauge({
-  name: 'spotlight_indexing_queue_size',
-  help: 'Number of files pending indexing'
-});
-
-const indexedFilesTotal = new promClient.Counter({
-  name: 'spotlight_indexed_files_total',
-  help: 'Total files indexed',
-  labelNames: ['type', 'status']
-});
-
-// Provider metrics
-const providerErrors = new promClient.Counter({
-  name: 'spotlight_provider_errors_total',
-  help: 'Provider query errors',
-  labelNames: ['provider', 'error_type']
-});
-```
-
-### Alert Rules
-
-```yaml
-groups:
-  - name: spotlight_alerts
-    rules:
-      - alert: HighSearchLatency
-        expr: histogram_quantile(0.95, rate(spotlight_search_latency_seconds_bucket[5m])) > 0.1
-        for: 2m
-        labels:
-          severity: warning
-
-      - alert: IndexingQueueBacklog
-        expr: spotlight_indexing_queue_size > 5000
-        for: 5m
-        labels:
-          severity: warning
-```
-
-## Trade-offs and Alternatives
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Storage | SQLite with FTS5 | Custom binary format | Battle-tested, built-in FTS, ACID |
-| Indexing | Incremental with file watching | Periodic full scan | Real-time updates, lower resource usage |
-| Prefix Match | Trie | Sorted array + binary search | O(prefix_len) lookup optimal for typeahead |
-| Multi-source | Parallel query + merge | Sequential fallback | Lower latency, graceful degradation |
-| Privacy | On-device only | Cloud hybrid | Complete privacy, works offline |
-
-## Future Enhancements (Backend)
-
-1. **Vector Embeddings**: On-device ML for semantic similarity search
-2. **Content-Addressed Deduplication**: Hash-based dedup for similar files
-3. **Smart Compaction**: Merge index segments during idle time
-4. **Natural Language Understanding**: Parse queries like "emails from John last week"
-5. **Distributed Index Sync**: Secure cross-device index sharing via iCloud Keychain
-
-## Closing Summary
+## 📝 Summary
 
 "Spotlight's backend architecture is built around three principles:
 
-1. **Privacy-first on-device indexing**: File system watching with FSEvents, idle-time processing to minimize battery impact, and pluggable content extractors for different file types.
+**Privacy-first on-device indexing**: File system watching with FSEvents provides real-time notifications at near-zero CPU cost. Idle-time processing ensures indexing never interferes with user activities. Pluggable content extractors handle diverse file formats from PDFs to images.
 
-2. **Hybrid index structure**: Inverted index for exact term lookup combined with trie for O(prefix_len) typeahead matching, all stored in SQLite for ACID guarantees.
+**Hybrid index structure**: An inverted index provides O(1) exact term lookup for complete queries, while a trie augmentation gives O(prefix length) typeahead matching as users type. SQLite stores everything with ACID guarantees and built-in FTS5 support.
 
-3. **Fault-tolerant query routing**: Parallel queries to local index, app providers, and cloud with per-provider circuit breakers and graceful degradation when sources fail.
+**Fault-tolerant query routing**: Parallel queries to local index, app providers, and cloud services return the fastest results first. Per-provider circuit breakers isolate failures, ensuring one buggy extension doesn't slow down the entire search experience. Token bucket rate limiting handles natural user bursts while preventing abuse.
 
-The main trade-off is privacy vs. cross-device features. By keeping everything on-device, we sacrifice cloud-powered intelligence and index sync, but we achieve complete user privacy and offline functionality."
+The main trade-off is privacy versus cross-device features. By keeping everything on-device, we sacrifice cloud-powered intelligence and automatic index synchronization, but we achieve complete user privacy and full offline functionality. Users can search their files even without an internet connection, and no search queries ever leave the device."
