@@ -20,11 +20,11 @@ interface CalendarQuery {
   month?: string;
 }
 
-interface BookingParams {
+interface _BookingParams {
   bookingId: string;
 }
 
-interface HotelParams {
+interface _HotelParams {
   hotelId: string;
 }
 

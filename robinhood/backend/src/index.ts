@@ -218,7 +218,7 @@ const wsHandler = new WebSocketHandler(server);
 /**
  * Updates WebSocket connection metrics.
  */
-function updateWebSocketMetrics(): void {
+function _updateWebSocketMetrics(): void {
   // This would need to be integrated into WebSocketHandler
   // For now, we'll track via the quote service subscriber count
 }

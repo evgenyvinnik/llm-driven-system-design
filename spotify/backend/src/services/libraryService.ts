@@ -2,17 +2,13 @@ import { pool } from '../db.js';
 
 // Save item to library (like a track, album, artist, or follow a playlist)
 export async function saveToLibrary(userId, itemType, itemId) {
-  try {
-    await pool.query(
-      `INSERT INTO user_library (user_id, item_type, item_id)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
-      [userId, itemType, itemId]
-    );
-    return { saved: true };
-  } catch (error) {
-    throw error;
-  }
+  await pool.query(
+    `INSERT INTO user_library (user_id, item_type, item_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
+    [userId, itemType, itemId]
+  );
+  return { saved: true };
 }
 
 // Remove item from library

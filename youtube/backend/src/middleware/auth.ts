@@ -21,7 +21,7 @@ export const ROLES = {
   ADMIN: 'admin',
 } as const;
 
-type Role = typeof ROLES[keyof typeof ROLES];
+type _Role = typeof ROLES[keyof typeof ROLES];
 
 // Role hierarchy for permission checks
 const ROLE_HIERARCHY: Record<string, number> = {
@@ -58,7 +58,7 @@ export const PERMISSIONS = {
   ADMIN_TRANSCODE: 'admin:transcode',
 } as const;
 
-type Permission = typeof PERMISSIONS[keyof typeof PERMISSIONS];
+type _Permission = typeof PERMISSIONS[keyof typeof PERMISSIONS];
 
 // Role to permissions mapping
 const ROLE_PERMISSIONS: Record<string, string[]> = {

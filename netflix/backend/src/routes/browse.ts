@@ -49,7 +49,7 @@ interface ContinueWatchingRow {
 }
 
 /** Database row type for My List queries */
-interface MyListRow {
+interface _MyListRow {
   video_id: string;
   added_at: Date;
 }

@@ -3,7 +3,7 @@ import { query, queryWithTenant } from '../services/db.js';
 import { getDomainMapping, setDomainMapping } from '../services/redis.js';
 
 // Store row interface
-interface StoreRow {
+interface _StoreRow {
   id: number;
   name: string;
   subdomain: string;

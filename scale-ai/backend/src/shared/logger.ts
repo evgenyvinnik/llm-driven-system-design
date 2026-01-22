@@ -76,7 +76,7 @@ export function createChildLogger(context: Record<string, unknown>): pino.Logger
  *
  * @returns Unique request ID string
  */
-function generateRequestId(): string {
+function _generateRequestId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 9)}`
 }
 

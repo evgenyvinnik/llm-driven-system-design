@@ -43,7 +43,7 @@ interface Source {
 }
 
 /** Represents an article stored in the database */
-interface Article {
+interface _Article {
   id: string;
   source_id: string;
   story_id: string | null;

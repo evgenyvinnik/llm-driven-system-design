@@ -26,11 +26,11 @@ interface SearchQuery {
   sortBy?: string;
 }
 
-interface HotelParams {
+interface _HotelParams {
   hotelId: string;
 }
 
-interface RoomTypeParams {
+interface _RoomTypeParams {
   roomTypeId: string;
 }
 

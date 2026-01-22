@@ -55,7 +55,7 @@ interface ReviewCheckRow {
   old_rating?: number;
 }
 
-interface ReviewOwnerCheckRow {
+interface _ReviewOwnerCheckRow {
   owner_id: string;
 }
 
