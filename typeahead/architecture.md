@@ -2078,3 +2078,389 @@ The `api.ts` service provides a typed API client with methods for:
 - Suggestions: `getSuggestions()`, `logSearch()`, `getTrending()`, `getHistory()`
 - Analytics: `getAnalyticsSummary()`, `getHourlyStats()`, `getTopPhrases()`
 - Admin: `getSystemStatus()`, `rebuildTrie()`, `clearCache()`, `addPhrase()`, `filterPhrase()`
+
+---
+
+## Frontend Production Features
+
+The frontend includes production-ready features for offline support, performance optimization, accessibility, and multiple widget types.
+
+### Directory Structure (Enhanced)
+
+```
+frontend/src/
+├── components/
+│   ├── widgets/                  # Typeahead widget variants
+│   │   ├── index.ts              # Barrel export
+│   │   ├── types.ts              # Widget type definitions
+│   │   ├── CommandPalette.tsx    # Cmd+K command palette
+│   │   ├── InlineFormTypeahead.tsx # Form field typeahead
+│   │   ├── RichTypeahead.tsx     # Metadata and thumbnails
+│   │   └── MobileTypeahead.tsx   # Full-screen mobile experience
+│   └── ...
+├── db/
+│   └── database.ts               # IndexedDB with Dexie
+├── hooks/
+│   ├── index.ts                  # Core hooks (useDebounce, useClickOutside, useKeyboard)
+│   └── useTypeahead.ts           # Shared typeahead logic hook
+├── services/
+│   ├── api.ts                    # API client with AbortController
+│   ├── cache.ts                  # In-memory LRU cache
+│   ├── prefetch.ts               # Keyboard adjacency prefetching
+│   └── performance.ts            # PerformanceObserver metrics
+└── sw.ts                         # Service Worker
+```
+
+### Multi-Layer Caching Architecture
+
+The frontend implements a three-layer caching strategy for optimal performance and offline support:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      User Types Query                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 1: Memory Cache (cache.ts)                               │
+│  - LRU eviction with 1000 entry max                             │
+│  - 60-second TTL                                                │
+│  - ~1ms lookup time                                             │
+│  - Lost on page refresh                                         │
+└─────────────────────────────────────────────────────────────────┘
+                              │ (miss)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 2: IndexedDB (database.ts via Dexie)                     │
+│  - Persisted to browser storage                                 │
+│  - 1-hour TTL for suggestions                                   │
+│  - Survives page refresh and browser restart                    │
+│  - ~5ms lookup time                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              │ (miss)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: Service Worker (sw.ts)                                │
+│  - Intercepts fetch requests                                    │
+│  - Stale-while-revalidate strategy                              │
+│  - Enables true offline support                                 │
+│  - Returns cached response immediately, updates in background   │
+└─────────────────────────────────────────────────────────────────┘
+                              │ (network request)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Backend API                                 │
+│                   (with cache headers)                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### In-Memory Cache (cache.ts)
+
+**Location:** `/frontend/src/services/cache.ts`
+
+Implements an LRU (Least Recently Used) cache with TTL expiration:
+
+```typescript
+interface CacheEntry<T> {
+  value: T;
+  timestamp: number;
+  ttl: number;
+}
+
+class MemoryCache {
+  private cache: Map<string, CacheEntry<unknown>>;
+  private maxSize: number;
+
+  get<T>(key: string): T | null;
+  set<T>(key: string, value: T, ttl?: number): void;
+  delete(key: string): void;
+  clear(): void;
+}
+```
+
+**Features:**
+- Configurable max entries (default: 1000)
+- Per-entry TTL support (default: 60s)
+- Automatic LRU eviction when full
+- Used by `api.ts` to cache suggestion responses
+
+### IndexedDB Persistence (database.ts)
+
+**Location:** `/frontend/src/db/database.ts`
+
+Uses Dexie.js for IndexedDB operations with the following tables:
+
+| Table | Purpose | TTL |
+|-------|---------|-----|
+| `suggestions` | Cached prefix → suggestions mapping | 1 hour |
+| `history` | User search history | 500 entries max |
+| `popularQueries` | Local popularity tracking | Permanent |
+| `trieNodes` | Offline trie data | On update |
+| `syncMetadata` | Sync timestamps | Permanent |
+
+**Key Functions:**
+```typescript
+// Cache suggestions for a prefix
+cacheSuggestions(prefix: string, suggestions: Suggestion[]): Promise<void>;
+
+// Get cached suggestions (returns null if expired)
+getCachedSuggestions(prefix: string): Promise<Suggestion[] | null>;
+
+// Add to search history
+addToHistory(phrase: string): Promise<void>;
+
+// Get recent history entries
+getHistory(limit?: number): Promise<HistoryEntry[]>;
+
+// Update local popularity counter
+updatePopularity(phrase: string): Promise<void>;
+```
+
+### Service Worker (sw.ts)
+
+**Location:** `/frontend/src/sw.ts`
+
+Implements stale-while-revalidate caching for API endpoints:
+
+```typescript
+// Intercepted endpoints:
+// - /api/v1/suggestions/*
+// - /api/v1/analytics/trending
+
+// Strategy:
+// 1. Check cache for existing response
+// 2. If cached: return immediately, fetch update in background
+// 3. If not cached: fetch from network, cache response
+// 4. Cache updates trigger UI refresh via postMessage
+```
+
+**Registration:** The service worker is registered in `main.tsx` and built via `vite.config.ts` with the `vite-plugin-pwa` or manual SW bundling.
+
+### Request Cancellation (api.ts)
+
+**Location:** `/frontend/src/services/api.ts`
+
+Implements AbortController for request lifecycle management:
+
+```typescript
+// Cancel previous request when user types next character
+let currentController: AbortController | null = null;
+
+async function getSuggestions(prefix: string, options: SuggestionOptions) {
+  // Cancel any pending request
+  if (currentController) {
+    currentController.abort();
+  }
+
+  currentController = new AbortController();
+
+  // Combined signal: AbortController + 5s timeout
+  const signal = AbortSignal.any([
+    currentController.signal,
+    AbortSignal.timeout(5000)
+  ]);
+
+  const response = await fetch(url, { signal });
+  // ...
+}
+```
+
+**Benefits:**
+- Prevents stale responses from overwriting newer ones
+- Reduces network congestion during fast typing
+- Automatic cleanup on timeout
+
+### Prefetch Service (prefetch.ts)
+
+**Location:** `/frontend/src/services/prefetch.ts`
+
+Implements keyboard-adjacency prefetching using `requestIdleCallback`:
+
+```typescript
+// Keyboard layout for adjacent key detection
+const KEYBOARD_LAYOUT = [
+  'qwertyuiop',
+  'asdfghjkl',
+  'zxcvbnm'
+];
+
+// Prefetch suggestions for likely next characters
+function prefetchAdjacent(currentPrefix: string): void {
+  const lastChar = currentPrefix.slice(-1);
+  const adjacentKeys = getAdjacentKeys(lastChar);
+
+  requestIdleCallback(() => {
+    for (const key of adjacentKeys) {
+      const nextPrefix = currentPrefix + key;
+      // Warm cache if not already cached
+      if (!memoryCache.has(nextPrefix)) {
+        api.getSuggestions(nextPrefix, { priority: 'low' });
+      }
+    }
+  });
+}
+```
+
+### Performance Monitor (performance.ts)
+
+**Location:** `/frontend/src/services/performance.ts`
+
+Uses PerformanceObserver to track key metrics:
+
+```typescript
+interface TypeaheadMetrics {
+  // Time from keypress to suggestions displayed
+  keystrokeToSuggestion: number[];
+
+  // Time from API request to response
+  networkLatency: number[];
+
+  // Time from suggestion display to user selection
+  selectionTime: number[];
+
+  // Cache hit rates by layer
+  cacheHits: { memory: number; indexeddb: number; serviceWorker: number };
+}
+
+// Reports metrics to console in development
+// Can be extended to send to analytics service
+```
+
+### Widget System
+
+**Location:** `/frontend/src/components/widgets/`
+
+Provides multiple typeahead variants for different use cases:
+
+| Widget | Use Case | Features |
+|--------|----------|----------|
+| `CommandPalette` | App-wide search (Cmd+K) | Keyboard shortcut, full-screen overlay |
+| `InlineFormTypeahead` | Form field autocomplete | Minimal styling, form integration |
+| `RichTypeahead` | Enhanced suggestions | Metadata display, thumbnails, scores |
+| `MobileTypeahead` | Mobile devices | Full-screen, touch-optimized, swipe gestures |
+
+All widgets share the `useTypeahead` hook for consistent behavior.
+
+### useTypeahead Hook
+
+**Location:** `/frontend/src/hooks/useTypeahead.ts`
+
+Centralizes typeahead logic for all widgets:
+
+```typescript
+interface UseTypeaheadOptions {
+  debounceMs?: number;      // Default: 150
+  limit?: number;           // Default: 5
+  userId?: string;          // For personalization
+  fuzzy?: boolean;          // Enable fuzzy matching
+  minChars?: number;        // Minimum chars before fetching
+  onSelect?: (phrase: string) => void;
+  onSubmit?: (query: string) => void;
+}
+
+interface UseTypeaheadReturn {
+  query: string;
+  setQuery: (value: string) => void;
+  suggestions: Suggestion[];
+  isLoading: boolean;
+  isOpen: boolean;
+  highlightedIndex: number;
+  selectSuggestion: (index: number) => void;
+  submitQuery: () => void;
+  error: Error | null;
+  isCached: boolean;
+
+  // ARIA props for accessibility
+  inputProps: { role, aria-expanded, aria-controls, ... };
+  listboxProps: { role, id, aria-label };
+  getOptionProps: (index: number) => { role, id, aria-selected };
+
+  // Keyboard handlers
+  handleKeyDown: (event: KeyboardEvent) => void;
+}
+```
+
+### ARIA Accessibility
+
+**Location:** `/frontend/src/components/SearchBox.tsx`
+
+Implements WAI-ARIA combobox pattern:
+
+```tsx
+<input
+  role="combobox"
+  aria-expanded={isOpen}
+  aria-controls={listboxId}
+  aria-activedescendant={selectedId}
+  aria-autocomplete="list"
+  aria-haspopup="listbox"
+  aria-label="Search"
+/>
+
+<ul
+  role="listbox"
+  id={listboxId}
+  aria-label="Search suggestions"
+>
+  {suggestions.map((s, i) => (
+    <li
+      role="option"
+      id={`option-${i}`}
+      aria-selected={i === highlightedIndex}
+    >
+      {s.phrase}
+    </li>
+  ))}
+</ul>
+
+{/* Live region for screen reader announcements */}
+<div role="status" aria-live="polite" aria-atomic="true">
+  {announcement}
+</div>
+```
+
+**Keyboard Navigation:**
+- `ArrowDown` / `ArrowUp` - Navigate suggestions
+- `Enter` - Select highlighted suggestion
+- `Escape` - Close dropdown
+- `Tab` - Close and move focus
+
+### Backend Cache Headers
+
+**Location:** `/backend/src/shared/cache-headers.ts`
+
+Middleware for HTTP cache headers on API responses:
+
+| Endpoint Pattern | Cache Strategy | Headers |
+|------------------|----------------|---------|
+| `/suggestions?q=` | Public, short TTL | `public, max-age=60, s-maxage=60, stale-while-revalidate=300` |
+| `/trending` | Public, very short | `public, max-age=30, s-maxage=30, stale-while-revalidate=60` |
+| `/history` | Private, user-specific | `private, max-age=300` |
+| `POST /*` | No cache | `no-cache, no-store, must-revalidate` |
+
+**Implementation:**
+```typescript
+// cache-headers.ts
+export const cacheSuggestions: RequestHandler = (req, res, next) => {
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=300');
+  res.set('Vary', 'Accept-Encoding');
+  next();
+};
+
+export const cacheTrending: RequestHandler = (req, res, next) => {
+  res.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=60');
+  next();
+};
+
+export const cacheUserSpecific: RequestHandler = (req, res, next) => {
+  res.set('Cache-Control', 'private, max-age=300');
+  next();
+};
+
+export const noCache: RequestHandler = (req, res, next) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  next();
+};
+```
+
+Applied to routes in `suggestions.ts` and `analytics.ts`.
