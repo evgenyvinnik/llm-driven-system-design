@@ -344,13 +344,12 @@ The test click generator creates synthetic clicks for development:
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │                    Response Format                             │  │
 │  ├───────────────────────────────────────────────────────────────┤  │
-│  │ {                                                              │  │
-│  │   "data": [                                                   │  │
-│  │     { time_bucket, clicks, unique_users, fraud_count }        │  │
-│  │   ],                                                          │  │
-│  │   "total_clicks": sum of all clicks,                         │  │
-│  │   "query_time_ms": ClickHouse execution time                  │  │
-│  │ }                                                              │  │
+│  │                                                                │  │
+│  │  data: array of { time_bucket, clicks, unique_users,          │  │
+│  │                   fraud_count }                                │  │
+│  │  total_clicks: sum of all clicks                              │  │
+│  │  query_time_ms: ClickHouse execution time                     │  │
+│  │                                                                │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -567,7 +566,7 @@ The test click generator creates synthetic clicks for development:
 │                                                                      │
 │  Display:                                                            │
 │  ┌──────────────────────────────────────────────┐                   │
-│  │  ⚠️ Fraud Rate                                │                   │
+│  │  Fraud Rate                                   │                   │
 │  │                                               │                   │
 │  │     2.45%                                     │                   │
 │  │                                               │                   │
@@ -592,6 +591,76 @@ The test click generator creates synthetic clicks for development:
 
 ---
 
+## 🔬 Deep Trade-off #1: Dual-Write (PostgreSQL + ClickHouse) vs Single Database
+
+### Why Dual-Write Works
+
+"For ad click aggregation, the dual-write architecture is non-negotiable because the workloads are fundamentally incompatible. PostgreSQL handles transactional integrity—advertiser disputes require us to prove exactly when a click occurred, its fraud status, and any modifications. ClickHouse handles analytical speed—dashboards querying millions of clicks across time dimensions need sub-100ms response times."
+
+The key insight is that these databases excel at opposite things. PostgreSQL maintains ACID guarantees: when an advertiser disputes a charge, we can trace the exact click, its original fraud flag, and any subsequent updates with full transactional history. ClickHouse's columnar storage and materialized views enable real-time aggregation: the same query that takes 30 seconds in PostgreSQL returns in 50ms from ClickHouse because it only reads the columns needed (timestamp, campaign_id, count) rather than entire rows.
+
+The Promise.all() dual-write pattern ensures consistency without distributed transactions. Both writes happen in parallel—if ClickHouse fails, the PostgreSQL write still succeeds, preserving the audit trail. ClickHouse can be backfilled from PostgreSQL during recovery. This "eventually consistent for analytics, immediately consistent for audit" model matches the actual business requirements: advertisers need billing accuracy (PostgreSQL) while dashboard users tolerate 5-second staleness (ClickHouse).
+
+### Why Single Database Would Struggle
+
+PostgreSQL-only fails at scale. At 10,000 clicks/second, aggregation queries compete with writes for row locks. Adding read replicas helps but still requires scanning row-oriented storage for columnar analytics—fundamentally inefficient. Materialized views in PostgreSQL refresh synchronously and don't approach ClickHouse's incremental aggregation speed.
+
+ClickHouse-only fails at compliance. Its MergeTree engine is eventually consistent, potentially losing recent inserts during compaction. Updates are expensive (requires rewriting entire parts), making fraud flag corrections problematic. No foreign key constraints means referential integrity lives entirely in application code. For billing disputes, "probably correct" data isn't acceptable.
+
+TimescaleDB offers a middle ground but compromises both: it's slower than native ClickHouse for analytics while adding complexity to PostgreSQL's transactional model. The hybrid approach costs more in operational complexity but delivers uncompromised capabilities for both use cases.
+
+---
+
+## 🔬 Deep Trade-off #2: Velocity-Based Fraud Detection vs ML-Based Detection
+
+### Why Velocity Rules Work
+
+"Rule-based fraud detection provides predictable, explainable decisions that advertisers can understand and dispute. When we tell an advertiser '50 clicks from user X in one minute triggered the fraud flag,' they can verify this against their own logs. ML models that output probability scores create ambiguity in billing disputes."
+
+Velocity thresholds operate at Redis speed—INCR operations take microseconds, enabling synchronous fraud detection without adding latency to the click ingestion path. The rules are tunable per advertiser: conservative advertisers get tighter thresholds, performance marketers accepting higher fraud rates get looser ones. Threshold changes take effect immediately without retraining.
+
+The "flag, don't block" strategy preserves evidence. Blocked clicks disappear from analysis; flagged clicks remain queryable. When fraud patterns evolve, we can retroactively analyze flagged clicks to refine thresholds. Advertisers receive invoices showing total clicks with fraud breakdowns—they pay for clean clicks only but see the full picture.
+
+Redis key expiration (60-second TTL) naturally implements sliding windows without explicit window management. Each IP/user gets a fresh counter every minute, preventing memory growth while maintaining accurate velocity detection.
+
+### Why ML Detection Would Struggle (Initially)
+
+ML-based fraud detection requires labeled training data we don't have at launch. The cold-start problem is severe: initial models would be no better than random until we accumulate months of confirmed fraud cases from advertiser disputes. False positives during this period damage advertiser trust.
+
+Model training introduces latency. Either we run inference synchronously (adding 10-50ms per click, violating our <10ms API latency target) or asynchronously (allowing fraudulent clicks to appear "clean" in real-time dashboards). Neither matches our requirements.
+
+Explainability suffers. When an advertiser asks "Why was this click flagged?", "The neural network assigned it a 0.73 probability score based on 47 input features" isn't actionable. Regulatory requirements in some jurisdictions mandate explainable automated decisions.
+
+ML becomes valuable later, after velocity rules establish baseline fraud patterns. The hybrid approach—velocity rules for real-time flagging, ML for retroactive pattern discovery—offers the best of both: immediate protection with continuous improvement.
+
+---
+
+## 🔬 Deep Trade-off #3: HTTP Polling vs WebSocket for Dashboard Updates
+
+### Why HTTP Polling Works
+
+"Polling at 5-second intervals delivers 'real-enough-time' updates for analytics dashboards. Users don't need sub-second visibility into click counts—they're analyzing trends, not trading stocks. The implementation simplicity pays dividends across the entire stack."
+
+HTTP polling works through every proxy, load balancer, and firewall. Enterprise networks that block WebSocket connections still allow standard HTTP. This deployment universality eliminates a category of support tickets entirely.
+
+Debugging is straightforward. Each poll is an independent request visible in browser DevTools, backend logs, and monitoring dashboards. When users report "dashboard not updating," we check if requests are reaching the server and if responses contain fresh data. WebSocket connection state (connecting, reconnecting, backoff timers) adds diagnostic complexity.
+
+Server-side implementation stays stateless. Each request is independent—no connection registry, no heartbeat management, no cleanup of abandoned connections. Horizontal scaling is trivial: any backend instance can serve any poll request. Load balancers don't need sticky sessions or WebSocket awareness.
+
+The Zustand store pattern—fetch, transform, set—is predictable and testable. Component re-renders happen after complete state updates, avoiding partial UI states during WebSocket message bursts.
+
+### Why WebSocket Would Add Complexity (For Now)
+
+WebSocket connections require state management on both ends. The server must track connected clients, implement heartbeats to detect stale connections, and handle reconnection storms after server restarts. A pool of 1,000 dashboard users means 1,000 persistent connections with associated memory and keepalive overhead.
+
+Client-side complexity increases significantly. Reconnection with exponential backoff, handling message ordering (out-of-order messages during reconnection), and graceful degradation when WebSocket unavailable all require careful implementation. These are solved problems, but they're still problems to maintain.
+
+The benefit—instant updates instead of 5-second polling—doesn't justify the complexity for analytics use cases. If we were building a trading dashboard or collaborative editor where latency matters, WebSocket would be mandatory. For aggregate click counts refreshing on a 5-second interval, HTTP polling meets requirements with less code, easier debugging, and universal compatibility.
+
+Future migration to WebSocket remains straightforward: the Zustand store doesn't care how it receives updates, only that the update function is called with new data.
+
+---
+
 ## 🚀 Future Full-Stack Enhancements
 
 1. **WebSocket Real-Time Updates**: Replace polling with push notifications
@@ -600,5 +669,31 @@ The test click generator creates synthetic clicks for development:
 4. **A/B Testing Integration**: Track conversion metrics alongside clicks
 5. **Multi-Tenant Architecture**: Isolated dashboards per advertiser
 6. **Data Export**: CSV/PDF generation for reports
-7. **ML Fraud Detection**: Replace rule-based with trained models
+7. **ML Fraud Detection**: Supplement rule-based with trained models
 8. **Geo-Velocity Detection**: Flag impossible travel patterns
+
+---
+
+## ✅ Summary
+
+This full-stack ad click aggregator demonstrates key patterns for real-time analytics systems:
+
+**Frontend Patterns:**
+- Zustand for reactive state with selective subscriptions
+- 5-second polling with immediate fetch on filter changes
+- KPI cards with conditional styling based on thresholds
+- Health indicator polling separate from metrics polling
+
+**Backend Patterns:**
+- Three-layer deduplication (idempotency, Redis, PostgreSQL)
+- Synchronous fraud detection via Redis velocity tracking
+- Parallel dual-write to transactional and analytical databases
+- Zod validation with structured error responses
+
+**Architecture Patterns:**
+- PostgreSQL for ACID compliance and audit trails
+- ClickHouse for sub-100ms OLAP queries
+- Redis for deduplication, rate limiting, and idempotency caching
+- Materialized views for automatic multi-granularity aggregation
+
+The hybrid storage architecture provides the foundation for a billing-accurate, legally-compliant system that still delivers real-time dashboard performance at scale.

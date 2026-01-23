@@ -2,7 +2,9 @@
 
 *45-minute system design interview format - Full-Stack Engineer Position*
 
-## Problem Statement
+---
+
+## 📋 Problem Statement
 
 Design a mobile payment system that allows users to:
 - Add credit/debit cards to a digital wallet
@@ -12,7 +14,9 @@ Design a mobile payment system that allows users to:
 
 This answer covers the end-to-end architecture, emphasizing the integration between frontend and backend components.
 
-## Requirements Clarification
+---
+
+## 🎯 Requirements Clarification
 
 ### Functional Requirements
 1. **Card Provisioning**: Add cards with tokenization through card networks
@@ -32,686 +36,738 @@ This answer covers the end-to-end architecture, emphasizing the integration betw
 - 500M transactions/day
 - 1B+ provisioned cards
 
-## High-Level Architecture
+---
+
+## 🏗️ High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     Browser/Mobile (React Application)                   │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Views: Wallet | CardDetail | Transactions | AddCard               │  │
-│  │  Components: CardStack, PaymentSheet, TransactionList              │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-│  ┌───────────────────────────┴───────────────────────────────────────┐  │
-│  │  Zustand Store: cards[], transactions[], paymentSheet, auth        │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-│  ┌───────────────────────────┴───────────────────────────────────────┐  │
-│  │  API Service: fetch wrapper with auth, idempotency keys            │  │
-│  └───────────────────────────┬───────────────────────────────────────┘  │
-└──────────────────────────────┼───────────────────────────────────────────┘
-                               │ REST API (JSON)
-                               ▼
+├─────────────────────────────────────────────────────────────────────────┤
+│  Views: Wallet │ CardDetail │ Transactions │ AddCard                     │
+│  Components: CardStack, PaymentSheet, TransactionList                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Zustand Store: cards[], transactions[], paymentSheet, auth             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  API Service: fetch wrapper with auth, idempotency keys                 │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │ REST API (JSON)
+                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Express API Server                                │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Middleware: cors, session, auth, idempotency, metrics             │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│  ┌────────────────┐  ┌──────────────────┐  ┌───────────────────────┐   │
-│  │  cards.ts      │  │  payments.ts      │  │  transactions.ts      │   │
-│  │  - provision   │  │  - nfc            │  │  - list               │   │
-│  │  - suspend     │  │  - in-app         │  │  - detail             │   │
-│  │  - remove      │  │  - cryptogram     │  │                       │   │
-│  └────────────────┘  └──────────────────┘  └───────────────────────┘   │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Services: NetworkClient, TokenLifecycle, CircuitBreaker          │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬───────────────────────────────────────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          ▼                   ▼                   ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   Valkey      │    │  PostgreSQL   │    │ Card Networks │
-│  (Cache +     │    │   (Source     │    │   (TSPs)      │
-│  Idempotency) │    │   of Truth)   │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
+├─────────────────────────────────────────────────────────────────────────┤
+│  Middleware: cors, session, auth, idempotency, metrics                  │
+├──────────────────┬───────────────────┬──────────────────────────────────┤
+│  cards.ts        │  payments.ts      │  transactions.ts                 │
+│  • provision     │  • nfc            │  • list                          │
+│  • suspend       │  • in-app         │  • detail                        │
+│  • remove        │  • cryptogram     │                                  │
+├──────────────────┴───────────────────┴──────────────────────────────────┤
+│  Services: NetworkClient, TokenLifecycle, CircuitBreaker                │
+└──────────────────────────┬──────────────────────────────────────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│    Valkey     │  │  PostgreSQL   │  │ Card Networks │
+│  (Cache +     │  │   (Source     │  │    (TSPs)     │
+│  Idempotency) │  │   of Truth)   │  │               │
+└───────────────┘  └───────────────┘  └───────────────┘
 ```
 
-## Data Model
+---
+
+## 🗄️ Data Model
 
 ### Database Schema
 
-```sql
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE provisioned_cards (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id),
-    device_id UUID NOT NULL,
-    token_ref VARCHAR(100) NOT NULL,
-    network VARCHAR(20) NOT NULL,
-    last4 VARCHAR(4) NOT NULL,
-    card_type VARCHAR(20),
-    card_art_url VARCHAR(500),
-    status VARCHAR(20) DEFAULT 'active',
-    is_default BOOLEAN DEFAULT FALSE,
-    suspended_at TIMESTAMPTZ,
-    suspend_reason VARCHAR(100),
-    provisioned_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    token_ref VARCHAR(100) NOT NULL,
-    merchant_name VARCHAR(200),
-    merchant_category VARCHAR(10),
-    amount DECIMAL(12,2) NOT NULL,
-    currency VARCHAR(3) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    auth_code VARCHAR(20),
-    transaction_type VARCHAR(20),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_cards_user ON provisioned_cards(user_id);
-CREATE INDEX idx_transactions_token ON transactions(token_ref, created_at DESC);
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              users                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id           UUID PRIMARY KEY                                           │
+│  email        VARCHAR(255) UNIQUE NOT NULL                               │
+│  password_hash VARCHAR(255) NOT NULL                                     │
+│  created_at   TIMESTAMPTZ DEFAULT NOW()                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 1:N
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         provisioned_cards                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id            UUID PRIMARY KEY                                          │
+│  user_id       UUID NOT NULL REFERENCES users(id)                        │
+│  device_id     UUID NOT NULL                                             │
+│  token_ref     VARCHAR(100) NOT NULL  ──▶ Network token reference        │
+│  network       VARCHAR(20) NOT NULL   ──▶ visa, mastercard, amex         │
+│  last4         VARCHAR(4) NOT NULL    ──▶ Display only                   │
+│  card_type     VARCHAR(20)            ──▶ credit, debit                  │
+│  card_art_url  VARCHAR(500)           ──▶ Card image URL                 │
+│  status        VARCHAR(20) DEFAULT 'active'                              │
+│  is_default    BOOLEAN DEFAULT FALSE                                     │
+│  suspended_at  TIMESTAMPTZ                                               │
+│  suspend_reason VARCHAR(100)                                             │
+│  provisioned_at TIMESTAMPTZ DEFAULT NOW()                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  INDEX idx_cards_user ON (user_id)                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 1:N (via token_ref)
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            transactions                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id               UUID PRIMARY KEY                                       │
+│  token_ref        VARCHAR(100) NOT NULL  ──▶ Links to card token         │
+│  merchant_name    VARCHAR(200)                                           │
+│  merchant_category VARCHAR(10)           ──▶ MCC code                    │
+│  amount           DECIMAL(12,2) NOT NULL                                 │
+│  currency         VARCHAR(3) NOT NULL                                    │
+│  status           VARCHAR(20) NOT NULL   ──▶ approved, declined, pending │
+│  auth_code        VARCHAR(20)                                            │
+│  transaction_type VARCHAR(20)            ──▶ nfc, in_app, web            │
+│  created_at       TIMESTAMPTZ DEFAULT NOW()                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  INDEX idx_transactions_token ON (token_ref, created_at DESC)            │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### TypeScript Interfaces (Shared Types)
+### Shared Type Interfaces
 
-```typescript
-// shared/types.ts - Used by both frontend and backend
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Card Interface (Frontend + Backend)                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id: string                                                              │
+│  userId: string                                                          │
+│  deviceId: string                                                        │
+│  tokenRef: string                                                        │
+│  network: 'visa' | 'mastercard' | 'amex'                                 │
+│  last4: string                                                           │
+│  cardType: 'credit' | 'debit'                                            │
+│  cardArtUrl?: string                                                     │
+│  status: 'active' | 'suspended'                                          │
+│  isDefault: boolean                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface Card {
-    id: string;
-    userId: string;
-    deviceId: string;
-    tokenRef: string;
-    network: 'visa' | 'mastercard' | 'amex';
-    last4: string;
-    cardType: 'credit' | 'debit';
-    cardArtUrl?: string;
-    status: 'active' | 'suspended';
-    isDefault: boolean;
-}
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  Transaction Interface (Frontend + Backend)              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id: string                                                              │
+│  merchantName: string                                                    │
+│  merchantCategory: string                                                │
+│  amount: number                                                          │
+│  currency: string                                                        │
+│  status: 'approved' | 'declined' | 'pending'                             │
+│  transactionType: 'nfc' | 'in_app' | 'web'                               │
+│  createdAt: string                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
 
-interface Transaction {
-    id: string;
-    merchantName: string;
-    merchantCategory: string;
-    amount: number;
-    currency: string;
-    status: 'approved' | 'declined' | 'pending';
-    transactionType: 'nfc' | 'in_app' | 'web';
-    createdAt: string;
-}
-
-interface PaymentRequest {
-    amount: number;
-    currency: string;
-    merchantId: string;
-    merchantName: string;
-}
-
-interface PaymentResult {
-    approved: boolean;
-    authCode?: string;
-    network: string;
-    transactionId: string;
-}
+┌─────────────────────────────────────────────────────────────────────────┐
+│              PaymentRequest / PaymentResult (API Contract)               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  PaymentRequest:                                                         │
+│  ├── amount: number                                                      │
+│  ├── currency: string                                                    │
+│  ├── merchantId: string                                                  │
+│  └── merchantName: string                                                │
+│                                                                          │
+│  PaymentResult:                                                          │
+│  ├── approved: boolean                                                   │
+│  ├── authCode?: string                                                   │
+│  ├── network: string                                                     │
+│  └── transactionId: string                                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Deep Dive: Card Provisioning Flow (Full Stack)
+---
+
+## 🔐 Card Provisioning Flow (Full Stack)
 
 ### Frontend: Add Card Form
 
-```tsx
-// components/add-card/AddCardFlow.tsx
-function AddCardFlow() {
-    const [step, setStep] = useState<'input' | 'verify' | 'complete'>('input');
-    const [cardData, setCardData] = useState<CardInput | null>(null);
-    const [verificationMethods, setVerificationMethods] = useState<string[]>([]);
-    const { addCard } = useWalletStore();
-
-    const handleSubmit = async (data: CardInput) => {
-        setCardData(data);
-
-        try {
-            const result = await api.provisionCard({
-                pan: data.pan,
-                expiry: data.expiry,
-                cvv: data.cvv
-            });
-
-            if (result.status === 'verification_required') {
-                setVerificationMethods(result.methods);
-                setStep('verify');
-            } else if (result.status === 'success') {
-                addCard(result.card);
-                setStep('complete');
-            }
-        } catch (error) {
-            showToast('Failed to add card');
-        }
-    };
-
-    const handleVerification = async (method: string, code: string) => {
-        const result = await api.completeVerification({
-            verificationId: cardData?.verificationId,
-            method,
-            code
-        });
-
-        if (result.success) {
-            addCard(result.card);
-            setStep('complete');
-        }
-    };
-
-    return (
-        <AnimatePresence mode="wait">
-            {step === 'input' && <CardInputForm onSubmit={handleSubmit} />}
-            {step === 'verify' && (
-                <VerificationStep
-                    methods={verificationMethods}
-                    onVerify={handleVerification}
-                />
-            )}
-            {step === 'complete' && <SuccessScreen card={cardData} />}
-        </AnimatePresence>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AddCardFlow Component                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                  │
+│  ├── step: 'input' | 'verify' | 'complete'                               │
+│  ├── cardData: CardInput | null                                          │
+│  └── verificationMethods: string[]                                       │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │                        Step Flow                                     ││
+│  │                                                                      ││
+│  │  ┌─────────┐      ┌─────────┐      ┌──────────┐                      ││
+│  │  │  input  │─────▶│  verify │─────▶│ complete │                      ││
+│  │  └─────────┘      └─────────┘      └──────────┘                      ││
+│  │       │                │                │                            ││
+│  │       ▼                ▼                ▼                            ││
+│  │  CardInputForm   VerificationStep  SuccessScreen                     ││
+│  │                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  handleSubmit(data):                                                     │
+│  ├── setCardData(data)                                                   │
+│  ├── result = await api.provisionCard({ pan, expiry, cvv })              │
+│  ├── if result.status === 'verification_required':                       │
+│  │       setVerificationMethods(result.methods)                          │
+│  │       setStep('verify')                                               │
+│  └── else if result.status === 'success':                                │
+│          addCard(result.card)                                            │
+│          setStep('complete')                                             │
+│                                                                          │
+│  handleVerification(method, code):                                       │
+│  ├── result = await api.completeVerification(...)                        │
+│  └── if result.success:                                                  │
+│          addCard(result.card)                                            │
+│          setStep('complete')                                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Provisioning Endpoint
 
-```typescript
-// routes/cards.ts
-router.post('/', idempotencyMiddleware, async (req, res) => {
-    const userId = req.session.userId!;
-    const { pan, expiry, cvv } = req.body;
-
-    // Step 1: Identify card network from BIN
-    const network = identifyNetwork(pan);
-
-    // Step 2: Encrypt PAN for network
-    const encryptedPAN = await encryptForNetwork(pan, network);
-
-    // Step 3: Request token from network's TSP
-    const tokenResponse = await circuitBreaker.execute(
-        network,
-        () => networkClient[network].requestToken({
-            encryptedPAN,
-            expiry,
-            cvv,
-            deviceId: req.headers['x-device-id'],
-            walletId: userId
-        })
-    );
-
-    // Handle verification requirement
-    if (tokenResponse.requiresVerification) {
-        return res.json({
-            status: 'verification_required',
-            verificationId: tokenResponse.verificationId,
-            methods: tokenResponse.verificationMethods
-        });
-    }
-
-    // Step 4: Store token reference
-    const result = await pool.query(`
-        INSERT INTO provisioned_cards
-            (user_id, device_id, token_ref, network, last4, card_type, card_art_url)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING *
-    `, [
-        userId,
-        req.headers['x-device-id'],
-        tokenResponse.tokenRef,
-        network,
-        pan.slice(-4),
-        tokenResponse.cardType,
-        tokenResponse.cardArtUrl
-    ]);
-
-    // Step 5: Invalidate user's card cache
-    await redis.del(`cards:${userId}`);
-
-    res.status(201).json({
-        status: 'success',
-        card: mapToCardResponse(result.rows[0])
-    });
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    POST /api/cards  (Provisioning)                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Middleware: idempotencyMiddleware                                       │
+│                                                                          │
+│  Step 1: Identify card network from BIN                                  │
+│  ────────────────────────────────────────                                │
+│  network = identifyNetwork(pan)  ──▶ visa, mastercard, amex              │
+│                                                                          │
+│  Step 2: Encrypt PAN for network                                         │
+│  ────────────────────────────────────────                                │
+│  encryptedPAN = await encryptForNetwork(pan, network)                    │
+│                                                                          │
+│  Step 3: Request token from network's TSP                                │
+│  ────────────────────────────────────────                                │
+│  tokenResponse = await circuitBreaker.execute(                           │
+│      network,                                                            │
+│      () => networkClient[network].requestToken({                         │
+│          encryptedPAN, expiry, cvv, deviceId, walletId                   │
+│      })                                                                  │
+│  )                                                                       │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │  if tokenResponse.requiresVerification:                              ││
+│  │      return { status: 'verification_required', methods: [...] }      ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  Step 4: Store token reference (NOT the PAN)                             │
+│  ────────────────────────────────────────                                │
+│  INSERT INTO provisioned_cards                                           │
+│      (user_id, device_id, token_ref, network, last4, card_type, ...)     │
+│                                                                          │
+│  Step 5: Invalidate user's card cache                                    │
+│  ────────────────────────────────────────                                │
+│  redis.del(`cards:${userId}`)                                            │
+│                                                                          │
+│  Return: { status: 'success', card: {...} }                              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Deep Dive: Payment Processing (Full Stack)
+---
+
+## 💳 Payment Processing (Full Stack)
 
 ### Frontend: Payment Sheet
 
-```tsx
-// components/payment/PaymentSheet.tsx
-function PaymentSheet() {
-    const {
-        isPaymentSheetOpen,
-        paymentRequest,
-        selectedCardId,
-        cards,
-        selectCard,
-        closePaymentSheet
-    } = useWalletStore();
-
-    const [authState, setAuthState] = useState<AuthState>('idle');
-    const selectedCard = cards.find(c => c.id === selectedCardId);
-
-    const handlePayment = async () => {
-        if (!selectedCard || !paymentRequest) return;
-
-        setAuthState('authenticating');
-
-        try {
-            // Simulate biometric authentication
-            const authenticated = await requestBiometricAuth();
-            if (!authenticated) {
-                setAuthState('error');
-                return;
-            }
-
-            // Generate idempotency key
-            const idempotencyKey = `pay-${paymentRequest.merchantId}-${Date.now()}`;
-
-            // Process payment
-            const result = await api.processPayment({
-                cardId: selectedCard.id,
-                amount: paymentRequest.amount,
-                currency: paymentRequest.currency,
-                merchantId: paymentRequest.merchantId
-            }, { idempotencyKey });
-
-            if (result.approved) {
-                setAuthState('success');
-                // Add transaction optimistically
-                addTransaction(result.transaction);
-                await new Promise(resolve => setTimeout(resolve, 1500));
-                closePaymentSheet();
-            } else {
-                setAuthState('error');
-            }
-        } catch (error) {
-            setAuthState('error');
-        }
-    };
-
-    if (!isPaymentSheetOpen) return null;
-
-    return (
-        <Modal>
-            <PaymentHeader merchant={paymentRequest?.merchantName} />
-            <AmountDisplay amount={paymentRequest?.amount} currency={paymentRequest?.currency} />
-            <CardSelector cards={cards} selected={selectedCardId} onSelect={selectCard} />
-            <PaymentButton state={authState} onPress={handlePayment} />
-        </Modal>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      PaymentSheet Component                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Props from Store:                                                       │
+│  ├── isPaymentSheetOpen                                                  │
+│  ├── paymentRequest: { amount, currency, merchantId, merchantName }      │
+│  ├── selectedCardId                                                      │
+│  └── cards[]                                                             │
+│                                                                          │
+│  Local State:                                                            │
+│  └── authState: 'idle' | 'authenticating' | 'success' | 'error'          │
+│                                                                          │
+│  handlePayment():                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │  1. setAuthState('authenticating')                                   ││
+│  │                                                                      ││
+│  │  2. authenticated = await requestBiometricAuth()                     ││
+│  │     if !authenticated: setAuthState('error'), return                 ││
+│  │                                                                      ││
+│  │  3. Generate idempotency key:                                        ││
+│  │     idempotencyKey = `pay-${merchantId}-${Date.now()}`               ││
+│  │                                                                      ││
+│  │  4. result = await api.processPayment(                               ││
+│  │         { cardId, amount, currency, merchantId },                    ││
+│  │         { idempotencyKey }                                           ││
+│  │     )                                                                ││
+│  │                                                                      ││
+│  │  5. if result.approved:                                              ││
+│  │         setAuthState('success')                                      ││
+│  │         addTransaction(result.transaction)  ──▶ Optimistic update    ││
+│  │         setTimeout(closePaymentSheet, 1500)                          ││
+│  │     else:                                                            ││
+│  │         setAuthState('error')                                        ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  Render:                                                                 │
+│  ├── PaymentHeader (merchant name)                                       │
+│  ├── AmountDisplay (amount, currency)                                    │
+│  ├── CardSelector (active cards dropdown)                                │
+│  └── PaymentButton (state-aware, FaceID icon)                            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Payment Endpoint
 
-```typescript
-// routes/payments.ts
-router.post('/in-app', idempotencyMiddleware, async (req, res) => {
-    const userId = req.session.userId!;
-    const { cardId, amount, currency, merchantId } = req.body;
-
-    // Step 1: Get card and verify ownership
-    const cardResult = await pool.query(`
-        SELECT * FROM provisioned_cards
-        WHERE id = $1 AND user_id = $2 AND status = 'active'
-    `, [cardId, userId]);
-
-    if (cardResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Card not found or inactive' });
-    }
-
-    const card = cardResult.rows[0];
-
-    // Step 2: Generate cryptogram (simulated - real SE would do this)
-    const cryptogram = generateCryptogram({
-        tokenRef: card.token_ref,
-        amount,
-        merchantId
-    });
-
-    // Step 3: Process with card network (with circuit breaker)
-    const authResult = await circuitBreaker.execute(
-        card.network,
-        () => networkClient[card.network].authorize({
-            token: card.token_ref,
-            cryptogram: cryptogram.value,
-            atc: cryptogram.atc,
-            amount,
-            currency,
-            merchantId
-        }),
-        // Fallback for open circuit
-        () => ({
-            approved: false,
-            reason: 'Network temporarily unavailable'
-        })
-    );
-
-    // Step 4: Record transaction
-    const txResult = await pool.query(`
-        INSERT INTO transactions
-            (token_ref, merchant_name, amount, currency, status, auth_code, transaction_type)
-        VALUES ($1, $2, $3, $4, $5, $6, 'in_app')
-        RETURNING *
-    `, [
-        card.token_ref,
-        req.body.merchantName,
-        amount,
-        currency,
-        authResult.approved ? 'approved' : 'declined',
-        authResult.authCode
-    ]);
-
-    // Step 5: Audit log
-    await auditLog({
-        userId,
-        action: authResult.approved ? 'payment.approved' : 'payment.declined',
-        resourceType: 'transaction',
-        resourceId: txResult.rows[0].id,
-        metadata: { amount, currency, merchantId }
-    });
-
-    res.json({
-        approved: authResult.approved,
-        authCode: authResult.authCode,
-        transaction: mapToTransactionResponse(txResult.rows[0])
-    });
-});
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   POST /api/payments/in-app                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Middleware: idempotencyMiddleware                                       │
+│                                                                          │
+│  Step 1: Get card and verify ownership                                   │
+│  ────────────────────────────────────────                                │
+│  SELECT * FROM provisioned_cards                                         │
+│  WHERE id = $cardId AND user_id = $userId AND status = 'active'          │
+│                                                                          │
+│  if no rows: return 404 'Card not found or inactive'                     │
+│                                                                          │
+│  Step 2: Generate cryptogram                                             │
+│  ────────────────────────────────────────                                │
+│  cryptogram = generateCryptogram({                                       │
+│      tokenRef: card.token_ref,                                           │
+│      amount,                                                             │
+│      merchantId                                                          │
+│  })                                                                      │
+│  ──▶ Simulated; real implementation uses Secure Element                  │
+│                                                                          │
+│  Step 3: Process with card network (circuit breaker)                     │
+│  ────────────────────────────────────────                                │
+│  authResult = await circuitBreaker.execute(                              │
+│      card.network,                                                       │
+│      () => networkClient[card.network].authorize({                       │
+│          token: card.token_ref,                                          │
+│          cryptogram: cryptogram.value,                                   │
+│          atc: cryptogram.atc,                                            │
+│          amount, currency, merchantId                                    │
+│      }),                                                                 │
+│      fallback: () => ({ approved: false, reason: 'Network unavailable' })│
+│  )                                                                       │
+│                                                                          │
+│  Step 4: Record transaction                                              │
+│  ────────────────────────────────────────                                │
+│  INSERT INTO transactions                                                │
+│      (token_ref, merchant_name, amount, currency, status, auth_code,     │
+│       transaction_type='in_app')                                         │
+│                                                                          │
+│  Step 5: Audit log                                                       │
+│  ────────────────────────────────────────                                │
+│  await auditLog({                                                        │
+│      userId, action: 'payment.approved' | 'payment.declined',            │
+│      resourceType: 'transaction', resourceId, metadata                   │
+│  })                                                                      │
+│                                                                          │
+│  Return: { approved, authCode, transaction }                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Deep Dive: Token Lifecycle Management
+---
+
+## 🔄 Token Lifecycle Management
 
 ### Frontend: Card Management
 
-```tsx
-// components/wallet/CardActions.tsx
-function CardActions({ card }: { card: Card }) {
-    const { suspendCard, removeCard } = useWalletStore();
-
-    const handleSuspend = async () => {
-        const confirmed = await showConfirm('Suspend this card?');
-        if (!confirmed) return;
-
-        try {
-            await api.suspendCard(card.id);
-            suspendCard(card.id);
-            showToast('Card suspended');
-        } catch (error) {
-            showToast('Failed to suspend card');
-        }
-    };
-
-    const handleRemove = async () => {
-        const confirmed = await showConfirm('Remove this card permanently?');
-        if (!confirmed) return;
-
-        try {
-            await api.removeCard(card.id);
-            removeCard(card.id);
-            showToast('Card removed');
-        } catch (error) {
-            showToast('Failed to remove card');
-        }
-    };
-
-    return (
-        <div className="space-y-2">
-            {card.status === 'active' ? (
-                <button onClick={handleSuspend} className="w-full py-3 bg-yellow-500 rounded-xl">
-                    Suspend Card
-                </button>
-            ) : (
-                <button onClick={handleReactivate} className="w-full py-3 bg-green-500 rounded-xl">
-                    Reactivate Card
-                </button>
-            )}
-            <button onClick={handleRemove} className="w-full py-3 bg-red-500 rounded-xl">
-                Remove Card
-            </button>
-        </div>
-    );
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      CardActions Component                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Props: card                                                             │
+│  Store: suspendCard(), removeCard()                                      │
+│                                                                          │
+│  handleSuspend():                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │  confirmed = await showConfirm('Suspend this card?')                 ││
+│  │  if !confirmed: return                                               ││
+│  │                                                                      ││
+│  │  await api.suspendCard(card.id)                                      ││
+│  │  suspendCard(card.id)  ──▶ Update local store                        ││
+│  │  showToast('Card suspended')                                         ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  handleRemove():                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │  confirmed = await showConfirm('Remove this card permanently?')      ││
+│  │  if !confirmed: return                                               ││
+│  │                                                                      ││
+│  │  await api.removeCard(card.id)                                       ││
+│  │  removeCard(card.id)  ──▶ Update local store                         ││
+│  │  showToast('Card removed')                                           ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  Render (conditional):                                                   │
+│  ├── if status === 'active':  [Suspend Card] button (yellow)            │
+│  ├── if status === 'suspended': [Reactivate Card] button (green)        │
+│  └── [Remove Card] button (red)                                          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Backend: Token Lifecycle Service
 
-```typescript
-// services/tokenLifecycle.ts
-class TokenLifecycleService {
-    async suspendCard(userId: string, cardId: string, reason: string) {
-        // Get card
-        const card = await this.getCard(userId, cardId);
-
-        // Suspend at network
-        await networkClient[card.network].suspendToken(card.tokenRef, reason);
-
-        // Update database
-        await pool.query(`
-            UPDATE provisioned_cards
-            SET status = 'suspended', suspended_at = NOW(), suspend_reason = $3
-            WHERE id = $1 AND user_id = $2
-        `, [cardId, userId, reason]);
-
-        // Invalidate cache
-        await redis.del(`token:${card.tokenRef}`);
-        await redis.del(`cards:${userId}`);
-
-        // Audit log
-        await auditLog({
-            userId,
-            action: 'card.suspended',
-            resourceType: 'card',
-            resourceId: cardId,
-            metadata: { reason }
-        });
-    }
-
-    async handleDeviceLost(userId: string, deviceId: string) {
-        // Get all cards on device
-        const cards = await pool.query(`
-            SELECT * FROM provisioned_cards
-            WHERE user_id = $1 AND device_id = $2 AND status = 'active'
-        `, [userId, deviceId]);
-
-        // Suspend each card
-        for (const card of cards.rows) {
-            await this.suspendCard(userId, card.id, 'device_lost');
-        }
-
-        return { suspendedCount: cards.rows.length };
-    }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     TokenLifecycleService                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  suspendCard(userId, cardId, reason):                                    │
+│  ────────────────────────────────────────                                │
+│  1. card = await getCard(userId, cardId)                                 │
+│                                                                          │
+│  2. await networkClient[card.network].suspendToken(card.tokenRef, reason)│
+│     ──▶ Notify card network to block transactions                        │
+│                                                                          │
+│  3. UPDATE provisioned_cards                                             │
+│     SET status = 'suspended',                                            │
+│         suspended_at = NOW(),                                            │
+│         suspend_reason = reason                                          │
+│     WHERE id = cardId AND user_id = userId                               │
+│                                                                          │
+│  4. redis.del(`token:${card.tokenRef}`)                                  │
+│     redis.del(`cards:${userId}`)                                         │
+│     ──▶ Invalidate caches                                                │
+│                                                                          │
+│  5. await auditLog({                                                     │
+│         userId, action: 'card.suspended', resourceType: 'card',          │
+│         resourceId: cardId, metadata: { reason }                         │
+│     })                                                                   │
+│                                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  handleDeviceLost(userId, deviceId):                                     │
+│  ────────────────────────────────────────                                │
+│  1. SELECT * FROM provisioned_cards                                      │
+│     WHERE user_id = userId AND device_id = deviceId AND status = 'active'│
+│                                                                          │
+│  2. for each card:                                                       │
+│         await suspendCard(userId, card.id, 'device_lost')                │
+│                                                                          │
+│  3. return { suspendedCount: cards.length }                              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## API Design
+---
+
+## 📡 API Design
 
 ### RESTful Endpoints
 
 ```
-POST   /api/auth/login              - Create session
-POST   /api/auth/logout             - Destroy session
-GET    /api/auth/me                 - Get current user
-
-GET    /api/cards                   - List user's cards
-POST   /api/cards                   - Provision new card
-DELETE /api/cards/:id               - Remove card
-POST   /api/cards/:id/suspend       - Suspend card
-POST   /api/cards/:id/reactivate    - Reactivate card
-PUT    /api/cards/:id/default       - Set as default
-
-POST   /api/payments/in-app         - Process in-app payment
-
-GET    /api/transactions            - List transactions
-GET    /api/transactions/:id        - Get transaction detail
-
-POST   /api/devices/:id/lost        - Mark device as lost
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          API Endpoints                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Authentication:                                                         │
+│  POST   /api/auth/login            ──▶ Create session                    │
+│  POST   /api/auth/logout           ──▶ Destroy session                   │
+│  GET    /api/auth/me               ──▶ Get current user                  │
+│                                                                          │
+│  Cards:                                                                  │
+│  GET    /api/cards                 ──▶ List user's cards                 │
+│  POST   /api/cards                 ──▶ Provision new card (idempotent)   │
+│  DELETE /api/cards/:id             ──▶ Remove card                       │
+│  POST   /api/cards/:id/suspend     ──▶ Suspend card                      │
+│  POST   /api/cards/:id/reactivate  ──▶ Reactivate card                   │
+│  PUT    /api/cards/:id/default     ──▶ Set as default                    │
+│                                                                          │
+│  Payments:                                                               │
+│  POST   /api/payments/in-app       ──▶ Process in-app payment (idempotent)│
+│                                                                          │
+│  Transactions:                                                           │
+│  GET    /api/transactions          ──▶ List transactions (paginated)     │
+│  GET    /api/transactions/:id      ──▶ Get transaction detail            │
+│                                                                          │
+│  Devices:                                                                │
+│  POST   /api/devices/:id/lost      ──▶ Mark device as lost               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### API Client with Idempotency
 
-```typescript
-// Frontend: services/api.ts
-const api = {
-    async provisionCard(data: CardInput): Promise<ProvisionResult> {
-        const idempotencyKey = `provision-${data.pan.slice(-4)}-${Date.now()}`;
-
-        const res = await fetch('/api/cards', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Idempotency-Key': idempotencyKey
-            },
-            credentials: 'include',
-            body: JSON.stringify(data)
-        });
-
-        return res.json();
-    },
-
-    async processPayment(
-        data: PaymentData,
-        options: { idempotencyKey: string }
-    ): Promise<PaymentResult> {
-        const res = await fetch('/api/payments/in-app', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Idempotency-Key': options.idempotencyKey
-            },
-            credentials: 'include',
-            body: JSON.stringify(data)
-        });
-
-        if (!res.ok) throw new ApiError(res);
-        return res.json();
-    }
-};
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Frontend API Service                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  provisionCard(data):                                                    │
+│  ────────────────────────────────────────                                │
+│  idempotencyKey = `provision-${data.pan.slice(-4)}-${Date.now()}`        │
+│                                                                          │
+│  fetch('/api/cards', {                                                   │
+│      method: 'POST',                                                     │
+│      headers: {                                                          │
+│          'Content-Type': 'application/json',                             │
+│          'Idempotency-Key': idempotencyKey                               │
+│      },                                                                  │
+│      credentials: 'include',                                             │
+│      body: JSON.stringify(data)                                          │
+│  })                                                                      │
+│                                                                          │
+│  processPayment(data, { idempotencyKey }):                               │
+│  ────────────────────────────────────────                                │
+│  fetch('/api/payments/in-app', {                                         │
+│      method: 'POST',                                                     │
+│      headers: {                                                          │
+│          'Content-Type': 'application/json',                             │
+│          'Idempotency-Key': idempotencyKey                               │
+│      },                                                                  │
+│      credentials: 'include',                                             │
+│      body: JSON.stringify(data)                                          │
+│  })                                                                      │
+│                                                                          │
+│  Purpose: Prevent duplicate card provisioning or payment processing      │
+│  if user retries due to network timeout or UI double-click              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Session & Authentication
+---
+
+## 🔒 Session & Authentication
 
 ### Backend Configuration
 
-```typescript
-// app.ts
-import session from 'express-session';
-import RedisStore from 'connect-redis';
-
-app.use(session({
-    store: new RedisStore({ client: redis }),
-    secret: process.env.SESSION_SECRET!,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax'
-    }
-}));
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Express Session Setup                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Session Store: RedisStore (Valkey)                                      │
+│                                                                          │
+│  Configuration:                                                          │
+│  ├── secret: process.env.SESSION_SECRET                                  │
+│  ├── resave: false                                                       │
+│  ├── saveUninitialized: false                                            │
+│  └── cookie:                                                             │
+│      ├── maxAge: 7 days (7 * 24 * 60 * 60 * 1000)                        │
+│      ├── httpOnly: true   ──▶ Prevents XSS access                        │
+│      ├── secure: true (production)  ──▶ HTTPS only                       │
+│      └── sameSite: 'lax'  ──▶ CSRF protection                            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Frontend Auth State
 
-```typescript
-// stores/authStore.ts
-interface AuthState {
-    user: User | null;
-    isAuthenticated: boolean;
-    isLoading: boolean;
-    login: (credentials: Credentials) => Promise<void>;
-    logout: () => Promise<void>;
-}
-
-export const useAuthStore = create<AuthState>((set) => ({
-    user: null,
-    isAuthenticated: false,
-    isLoading: true,
-
-    login: async ({ email, password }) => {
-        const user = await api.login(email, password);
-        set({ user, isAuthenticated: true });
-    },
-
-    logout: async () => {
-        await api.logout();
-        set({ user: null, isAuthenticated: false });
-        // Clear wallet data
-        useWalletStore.getState().clear();
-    }
-}));
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AuthStore (Zustand)                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  State:                                                                  │
+│  ├── user: User | null                                                   │
+│  ├── isAuthenticated: boolean                                            │
+│  └── isLoading: boolean                                                  │
+│                                                                          │
+│  Actions:                                                                │
+│  ├── login({ email, password }):                                         │
+│  │       user = await api.login(email, password)                         │
+│  │       set({ user, isAuthenticated: true })                            │
+│  │                                                                       │
+│  └── logout():                                                           │
+│          await api.logout()                                              │
+│          set({ user: null, isAuthenticated: false })                     │
+│          useWalletStore.getState().clear()  ──▶ Clear card data          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Caching Strategy
+---
+
+## 💾 Caching Strategy
 
 ### Cache Layers
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Frontend: Zustand persist → localStorage (offline support)  │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Backend: Valkey/Redis                                        │
-│  - Token lookups: 5 min TTL                                  │
-│  - User's cards: 2 min TTL                                   │
-│  - Idempotency: 24h TTL                                      │
-│  - Sessions: 7 day TTL                                       │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  PostgreSQL: Source of Truth                                  │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Caching Architecture                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Layer 1: Frontend (Zustand + localStorage)                              │
+│  ────────────────────────────────────────                                │
+│  ├── cards[]         ──▶ Full offline access                             │
+│  ├── transactions[]  ──▶ Last 50 cached                                  │
+│  └── Purpose: Offline resilience, instant app load                       │
+│                                                                          │
+│                              │                                           │
+│                              ▼                                           │
+│                                                                          │
+│  Layer 2: Backend Cache (Valkey/Redis)                                   │
+│  ────────────────────────────────────────                                │
+│  ├── token:${tokenRef}   ──▶ 5 min TTL (token lookups)                   │
+│  ├── cards:${userId}     ──▶ 2 min TTL (user's card list)                │
+│  ├── idempotency:${key}  ──▶ 24h TTL (duplicate prevention)              │
+│  └── sessions:${sid}     ──▶ 7 day TTL (user sessions)                   │
+│                                                                          │
+│                              │                                           │
+│                              ▼                                           │
+│                                                                          │
+│  Layer 3: PostgreSQL (Source of Truth)                                   │
+│  ────────────────────────────────────────                                │
+│  ├── provisioned_cards                                                   │
+│  ├── transactions                                                        │
+│  └── users                                                               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Trade-offs Summary
+### Cache Invalidation
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Cache Invalidation Triggers                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Event                         │  Invalidation Action                    │
+│  ──────────────────────────────┼────────────────────────────────────────│
+│  Card provisioned              │  DEL cards:${userId}                    │
+│  Card suspended/reactivated    │  DEL cards:${userId}                    │
+│                                │  DEL token:${tokenRef}                  │
+│  Card removed                  │  DEL cards:${userId}                    │
+│                                │  DEL token:${tokenRef}                  │
+│  Device marked lost            │  DEL cards:${userId}                    │
+│                                │  DEL token:${tokenRef} for each card    │
+│  User logout                   │  DEL session:${sessionId}               │
+│                                │  (wallet store cleared on frontend)     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ⚖️ Deep Trade-off Analysis
+
+### Trade-off 1: Idempotency Keys vs Optimistic Locking
+
+**Why Idempotency Keys Work for Payment APIs:**
+
+Payment operations are inherently non-idempotent - charging a card twice is a critical bug, not a minor inconvenience. The idempotency key pattern solves network unreliability: if a client sends a payment request and the connection drops before receiving the response, they can't know if the payment succeeded. Retrying without protection could result in double charges.
+
+With idempotency keys, the backend stores the request hash and result in Redis with 24-hour TTL. When the same key arrives again, we return the cached result instead of processing again. The key generation happens client-side (`pay-${merchantId}-${Date.now()}`) ensuring the client controls when retries are safe.
+
+The frontend generates keys at request time rather than having the backend generate them - this is intentional. The client knows when the user genuinely wants a new transaction (new click) versus when they're retrying a failed request (same intent, network issue). Server-generated keys would require the server to distinguish between "user clicked twice" and "network retry" - information only the client has.
+
+**Why Optimistic Locking Falls Short:**
+
+Optimistic locking (version columns, ETags) protects against concurrent modifications to the same resource but doesn't prevent duplicate operations creating new resources. When provisioning a card, there's no existing row to version-check - we're creating new data. A retry would create another card token, even with perfect optimistic locking on the user's card list.
+
+Database-level constraints (unique on tokenRef) catch some duplicates, but the token comes from the external network TSP - by the time we'd detect the duplicate, we've already requested two tokens from Visa. The idempotency check must happen before network calls, not after database insertion.
+
+---
+
+### Trade-off 2: Circuit Breaker per Network vs Global Fallback
+
+**Why Per-Network Circuit Breakers Work:**
+
+Each card network (Visa, Mastercard, Amex) operates independently. If Visa's TSP is experiencing issues, we should fail Visa card operations quickly while continuing to serve Mastercard payments normally. A global circuit breaker would take down all payment processing when one network has problems.
+
+The per-network approach uses the network identifier as the circuit key. When Visa's failure rate exceeds threshold, only the Visa circuit opens - returning immediate failures for Visa cards while Mastercard continues working. Users with multiple cards can simply select a working one.
+
+The fallback function returns `{ approved: false, reason: 'Network temporarily unavailable' }` rather than throwing. This lets the frontend show a meaningful message and offer the card selector, enabling the user to try a different card. Hard failures would crash the payment sheet entirely.
+
+**Why Global Fallback Would Fail:**
+
+A global "payment service" circuit breaker would have simpler code but worse user experience. If any network fails too often, all payments stop. This violates isolation - an infrastructure principle stating that unrelated failures shouldn't cascade. Visa's problems have nothing to do with Mastercard's infrastructure.
+
+The complexity cost of per-network breakers is additional Redis keys and configuration (`circuit:visa`, `circuit:mastercard`, `circuit:amex`), but this is minimal compared to the availability benefit. In production, network issues are common - rate limiting, maintenance windows, regional outages. Per-network isolation means these only affect the specific network's cards.
+
+---
+
+### Trade-off 3: Session Storage vs JWT for Payment Authentication
+
+**Why Session Storage Works for Wallet Apps:**
+
+Payment applications need the ability to immediately revoke access - if a user's device is stolen, they call customer service and expect instant protection. Session-based auth with Redis enables this: deleting the session key immediately invalidates access, effective on the very next request.
+
+The session ID is stored in an httpOnly cookie, preventing JavaScript access and eliminating XSS token theft. The actual session data (userId, deviceId, permissions) lives in Redis server-side, not exposed to the client. When the user marks their device as lost, we can invalidate all sessions for that device by scanning Redis keys.
+
+For payment apps specifically, we also need to track which sessions have completed device verification. This mutable session state (isDeviceVerified, biometricEnrolled) is easy with server-side sessions - just update the Redis hash. With JWT, you'd need to issue new tokens whenever session state changes.
+
+**Why JWT Would Cause Security Challenges:**
+
+JWT tokens are stateless - once issued, they're valid until expiration. Revoking a JWT before expiry requires maintaining a blocklist, which negates the statelessness benefit. For a wallet app where instant revocation is critical (lost device scenario), you'd need Redis for the blocklist anyway, so you've gained nothing over sessions.
+
+JWT's typical 15-minute access token + refresh token pattern means stolen tokens grant 15 minutes of unauthorized access. For social media, this might be acceptable; for payment authorization, it's not. The refresh token dance also adds complexity: refresh endpoint implementation, secure refresh token storage, token rotation.
+
+The "stateless scaling" benefit of JWT matters less when you already need Redis for caching, rate limiting, and idempotency. Adding session storage to existing Redis infrastructure is trivial compared to implementing secure JWT revocation.
+
+---
+
+## ✅ Trade-offs Summary
 
 | Decision | Pros | Cons |
 |----------|------|------|
 | Zustand + persist | Offline card viewing | Manual sync on reconnect |
 | Idempotency middleware | Safe retries | Redis dependency |
-| Circuit breaker per network | Isolated failures | Complexity |
+| Circuit breaker per network | Isolated failures | Configuration complexity |
 | Serializable transactions | Financial accuracy | Lower throughput |
 | Card network tokens | Security | Integration complexity |
 | Optimistic UI updates | Instant feedback | Rollback needed on error |
 
-## Scalability Path
+---
+
+## 📈 Scalability Path
 
 ### Current: Single Server
 
 ```
-Browser → Express (Node.js) → PostgreSQL + Valkey
-                           → Card Networks
+┌──────────┐     ┌───────────────────┐     ┌─────────────────┐
+│ Browser  │────▶│ Express (Node.js) │────▶│ PostgreSQL      │
+└──────────┘     └───────────────────┘     │ + Valkey        │
+                          │                └─────────────────┘
+                          │
+                          ▼
+                 ┌───────────────────┐
+                 │   Card Networks   │
+                 │   (Visa/MC/Amex)  │
+                 └───────────────────┘
 ```
 
 ### Future: Scaled
 
 ```
-Browser → CDN (static) → Load Balancer → Express (N nodes)
-                                      → Read Replicas
-                                      → Valkey Cluster
-                                      → PostgreSQL (sharded)
-                                      → Card Networks (circuit breaker)
+┌──────────┐     ┌─────────┐     ┌────────────────┐     ┌─────────────────┐
+│ Browser  │────▶│   CDN   │────▶│ Load Balancer  │────▶│ Express (N×)    │
+└──────────┘     │ (static)│     └────────────────┘     └─────────────────┘
+                 └─────────┘                                     │
+                                                   ┌─────────────┼─────────────┐
+                                                   ▼             ▼             ▼
+                                           ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+                                           │ Read Replicas│ │Valkey Cluster│ │ Card Networks│
+                                           └─────────────┘ └─────────────┘ └─────────────┘
+                                                   │
+                                                   ▼
+                                           ┌─────────────────────┐
+                                           │ PostgreSQL (Primary)│
+                                           │ + Sharding by userId │
+                                           └─────────────────────┘
 ```
 
-## Future Enhancements
+---
+
+## 🚀 Future Enhancements
 
 1. **Real-time Updates**: WebSocket for transaction notifications
 2. **Multi-Region**: Active-active for global availability
