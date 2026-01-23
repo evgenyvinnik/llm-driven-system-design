@@ -23,12 +23,53 @@ Each project folder typically contains:
 ├── README.md                  # Setup instructions and implementation guide
 ├── architecture.md            # System design documentation and trade-offs
 ├── system-design-answer.md    # Interview-style answer (45-minute format)
+├── system-design-answer-*.md  # Variant answers (frontend/backend/fullstack focus)
 ├── CLAUDE.md                  # LLM collaboration notes and iteration history
 ├── frontend/                  # React + TypeScript frontend (when applicable)
 ├── backend/                   # Node.js + Express backend (when applicable)
 ├── training/                  # ML training code (Python, when applicable)
 └── docker-compose.yml         # Infrastructure services (PostgreSQL, Redis, etc.)
 ```
+
+**Documentation file purposes:**
+- `architecture.md`: Deep technical documentation with diagrams, schemas, and implementation details
+- `system-design-answer*.md`: Concise 45-minute interview answers using ASCII diagrams (no code blocks), trade-off tables, and first-person rationale. Variants: `-frontend`, `-backend`, `-fullstack`
+- `CLAUDE.md`: Captures iteration history and the "why" behind key decisions
+
+### Writing System Design Answers
+
+The `system-design-answer*.md` files simulate realistic interview answers. Keep them concise (400-600 lines) and focused on architectural thinking rather than implementation details.
+
+**Do NOT include:**
+- Code blocks (```typescript, ```tsx, ```sql, ```json, etc.)
+- Directory tree structures
+- Detailed class prototypes or interface definitions
+- Line-by-line implementation walkthroughs
+
+**DO include:**
+- ASCII box diagrams using: `┌ ─ ┐ │ └ ┘ ├ ┤ ┴ ┬ ┼ ──▶`
+- Trade-off tables with ✅ Chosen / ❌ Alternative format
+- Emoji section headers (## 🏗️ Architecture, ## 💾 Data Model)
+- Quoted first-person rationale explaining decisions
+- High-level component interactions and data flow
+- Scalability considerations and bottleneck analysis
+
+**Example trade-off table:**
+```
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ WebSocket | Real-time, bidirectional | Connection overhead |
+| ❌ Polling | Simple | Latency, server load |
+```
+
+**Example ASCII diagram:**
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │────▶│   API GW    │────▶│   Service   │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
+
+The goal is demonstrating architectural judgment, not proving you can write code.
 
 **Note:** Some projects (mdreader, MCPlator, 20forms-20designs) are external personal projects with architecture documentation only - they link to separate repositories for implementation.
 
