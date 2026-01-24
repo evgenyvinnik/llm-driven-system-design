@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Table of Contents
+
+- [Repository Overview](#repository-overview)
+- [Quick Start for Any Project](#quick-start-for-any-project)
+- [Project Structure](#project-structure)
+- [Common Commands](#common-commands)
+- [Repository Scripts](#repository-scripts)
+- [Technology Stack Defaults](#technology-stack-defaults)
+- [Key Design Principles](#key-design-principles)
+- [Port Conventions](#port-conventions)
+- [Frontend Best Practices](#frontend-best-practices)
+- [Backend Architecture Pattern](#backend-architecture-pattern)
+- [Database Selection Guide](#database-selection-guide)
+- [Creating New Projects](#creating-new-projects)
+- [Local Development Philosophy](#local-development-philosophy)
+- [Infrastructure Options](#infrastructure-options)
+- [ESM Import Convention](#esm-import-convention)
+
 ## Repository Overview
 
 This is a **system design learning repository** where each subdirectory represents an independent system design challenge. Most projects have both design documentation and working implementations.
