@@ -395,6 +395,132 @@ GET    /api/v1/users/progress    ──▶ Get solve progress
 
 ---
 
+## 📊 Deep Dive: Capacity Planning
+
+### Traffic Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Request Distribution                        │
+│                                                                  │
+│  Normal Day (500K DAU):                                          │
+│  ├── Status polling:     10K users × 1 req/s = 10,000 QPS       │
+│  ├── Problem list/view:  5K users × 0.1 req/s = 500 QPS         │
+│  ├── Submissions:        1M/day ÷ 86400 = 12 QPS                │
+│  └── Total API load:     ~11,000 QPS                            │
+│                                                                  │
+│  Contest Peak (100K concurrent):                                 │
+│  ├── Status polling:     50K users × 1 req/s = 50,000 QPS       │
+│  ├── Problem view:       10K users × 0.2 req/s = 2,000 QPS      │
+│  ├── Submissions:        10K/min ÷ 60 = 170 QPS                 │
+│  └── Total API load:     ~52,000 QPS                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Server Sizing Calculations
+
+**API Servers (Node.js + Express)**
+
+| Metric | Value | Calculation |
+|--------|-------|-------------|
+| Single server capacity | 5,000 QPS | Cached reads, simple routing |
+| Normal load | 11,000 QPS | Requires 3 servers (2.2x headroom) |
+| Contest peak | 52,000 QPS | Requires 11 servers |
+| Recommended minimum | 4 servers | 3 active + 1 spare for deployments |
+| Auto-scale ceiling | 15 servers | Handle unexpected spikes |
+
+> "I size API servers for the 95th percentile of normal traffic with 2x headroom, then auto-scale for contests. Each Node.js server handles 5K QPS for cached endpoints (status polling hits Valkey, not DB). The key insight is that 90%+ of requests are status polls—simple Valkey lookups returning in <1ms. We run 4 servers normally (one can fail or deploy while 3 handle load) and scale to 12-15 during contests."
+
+**Judge Workers**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Worker Capacity Model                         │
+│                                                                  │
+│  Submission rate (peak): 170/second                              │
+│  Average execution time: 2 seconds (including all test cases)   │
+│  Concurrent executions needed: 170 × 2 = 340                     │
+│                                                                  │
+│  Per-worker capacity: 1 concurrent execution (safety)            │
+│  Workers needed at peak: 340 + 20% buffer = 408                  │
+│                                                                  │
+│  Distribution by language (based on submission mix):             │
+│  ├── Python (70%):     286 workers                               │
+│  ├── JavaScript (15%): 61 workers                                │
+│  ├── Java (8%):        33 workers                                │
+│  ├── C++ (5%):         20 workers                                │
+│  └── Other (2%):       8 workers                                 │
+│                                                                  │
+│  Normal operation (12 submissions/sec):                          │
+│  ├── Python: 17 workers                                          │
+│  ├── JavaScript: 4 workers                                       │
+│  ├── Java: 2 workers                                             │
+│  ├── C++: 2 workers (minimum for availability)                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Database Sizing
+
+**PostgreSQL**
+
+| Component | Normal | Contest | Notes |
+|-----------|--------|---------|-------|
+| Write QPS | 12 | 170 | Submission inserts + progress updates |
+| Read QPS | 500 | 2,000 | Problem fetches (mostly cached) |
+| Connections | 50 | 200 | Pool per API server × servers |
+| Storage | 500GB | +1GB/day | 1M submissions × 1KB avg |
+| Instance | db.r6g.large | db.r6g.xlarge | Scale up for contests |
+
+> "A single PostgreSQL instance handles our normal load trivially—12 writes/second is nothing. During contests, we scale vertically to handle 170 writes/second with faster storage. The real constraint is connection count: 15 API servers × 20 connections each = 300 connections. We use PgBouncer to pool connections and reduce overhead."
+
+**Valkey (Redis-compatible)**
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Memory | 8GB | 100K status entries × 500 bytes + sessions |
+| Read QPS | 50,000 | Status polling at peak |
+| Write QPS | 170 | Worker status updates |
+| Instance | cache.r6g.large | Single node sufficient |
+| Replication | 1 replica | Failover for sessions |
+
+### Infrastructure Cost Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Monthly Cost Estimate (AWS)                     │
+│                                                                  │
+│  API Servers:                                                    │
+│  ├── Normal: 4 × c6g.large = $200/month                         │
+│  ├── Contest burst: +10 × c6g.large × 10 hours = $15            │
+│                                                                  │
+│  Judge Workers:                                                  │
+│  ├── Normal: 25 × c6g.medium = $250/month                       │
+│  ├── Contest burst: +380 × c6g.medium × 3 hours = $120          │
+│                                                                  │
+│  Databases:                                                      │
+│  ├── PostgreSQL RDS: db.r6g.large = $200/month                  │
+│  ├── Valkey/ElastiCache: cache.r6g.large = $150/month           │
+│                                                                  │
+│  Kafka (MSK):                                                    │
+│  ├── 3-broker cluster: $300/month                               │
+│                                                                  │
+│  Total baseline: ~$1,100/month                                   │
+│  With weekly contests: ~$1,250/month                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Trade-off 7: Vertical vs Horizontal Scaling
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Horizontal (API) | No downtime scaling, fault tolerance | Load balancer complexity |
+| ✅ Vertical (DB) | Simpler ops, no sharding | Downtime for resize, ceiling |
+| ✅ Horizontal (Workers) | Independent language scaling | More coordination |
+
+> "I use horizontal scaling for stateless components (API servers, workers) and vertical scaling for stateful ones (PostgreSQL). Horizontal API scaling is essential—we can add servers during a contest without downtime. Workers scale horizontally per language, letting us add Python capacity without touching Java. PostgreSQL scales vertically because sharding adds complexity we don't need at 170 writes/second—a single db.r6g.2xlarge handles 5,000 writes/second. The inflection point for sharding is around 10K writes/second, which we'd only hit at 10x our projected peak. Until then, vertical scaling is operationally simpler."
+
+---
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Choice | Trade-off |
@@ -406,9 +532,10 @@ GET    /api/v1/users/progress    ──▶ Get solve progress
 | Queue | ✅ Kafka | Complexity vs durability + replay |
 | Output matching | ✅ Tolerant | Complexity vs fewer false rejections |
 | Database | ✅ PostgreSQL | Manual sharding vs ACID + joins |
+| Scaling | ✅ Horizontal API, Vertical DB | Ops simplicity vs infinite scale |
 
 ---
 
 ## 📝 Closing Summary
 
-> "I've designed a backend for an online judge with six key trade-off decisions: gVisor sandboxing for security without VM overhead, sequential test execution for fair timing, early termination for resource efficiency, per-language workers for optimized scaling, Kafka queuing for durability and replay, and tolerant output matching for better user experience. The unifying principle is that correctness and fairness trump performance—users trust our timing comparisons for leaderboards, so we sacrifice parallel execution speed for reproducible measurements. The async architecture with Kafka decouples API responsiveness from execution capacity, enabling independent scaling during contest bursts."
+> "I've designed a backend for an online judge with seven key trade-off decisions: gVisor sandboxing for security without VM overhead, sequential test execution for fair timing, early termination for resource efficiency, per-language workers for optimized scaling, Kafka queuing for durability and replay, tolerant output matching for better user experience, and horizontal/vertical scaling split based on statefulness. The capacity model shows 4 API servers and 25 workers handle normal load at ~$1,100/month, scaling to 15 API servers and 400 workers for contest peaks. The unifying principle is that correctness and fairness trump performance—users trust our timing comparisons for leaderboards, so we sacrifice parallel execution speed for reproducible measurements."
