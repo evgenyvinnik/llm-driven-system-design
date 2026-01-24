@@ -23,7 +23,7 @@ This document tracks the development journey of implementing an online coding pr
 - See `system-design-answer.md` for detailed architecture
 
 ### Phase 2: Initial Implementation
-*In progress*
+*Completed*
 
 **Completed:**
 - Backend API with Express.js
@@ -41,7 +41,7 @@ This document tracks the development journey of implementing an online coding pr
   - Support for Python and JavaScript
   - Output comparison with normalization
 - Frontend with React + TypeScript
-  - Problem catalog with filtering
+  - Problem catalog with filtering and virtualized list
   - Code editor with syntax highlighting (CodeMirror)
   - Real-time test results
   - Submission status polling
@@ -49,30 +49,45 @@ This document tracks the development journey of implementing an online coding pr
   - Admin dashboard
 - Seed data with 7 problems (Two Sum, Palindrome Number, etc.)
 
-**Remaining:**
-- Add more problems
-- Improve error handling
-- Add input validation
-
 ### Phase 3: Scaling and Optimization
-*Not started*
+*Completed*
 
-**Focus areas:**
-- Add caching layer (partially done with Redis)
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
-- Worker pool for code execution
-- Rate limiting
+**Implemented:**
+- Rate limiting (fully implemented in src/shared/rateLimiter.ts)
+  - Submissions: 10/minute per user
+  - Code runs: 30/minute per user
+  - General API: 100/minute per user/IP
+  - Auth endpoints: 5/15 minutes per IP (brute force protection)
+- Circuit breaker for code execution (src/shared/circuitBreaker.ts)
+  - Protects against Docker daemon failures
+  - Opens after 50% error rate with 5+ requests
+  - 30-second reset timeout
+- Idempotency for submissions (src/shared/idempotency.ts)
+  - Content-hash based deduplication
+  - 5-minute TTL in Redis
+- Prometheus metrics (src/shared/metrics.ts)
+  - HTTP request metrics
+  - Submission lifecycle metrics
+  - Code execution metrics
+  - Circuit breaker state
+  - Cache hit/miss rates
+- Structured logging with pino (src/shared/logger.ts)
+- Health check endpoints (/health, /health/live, /health/ready)
+- Graceful shutdown handling
+- Frontend virtualized problem list (@tanstack/react-virtual)
+- Rate limit error handling in frontend API client
 
 ### Phase 4: Polish and Documentation
-*Not started*
+*In progress*
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+**Completed:**
+- System design answer documents (fullstack, frontend, backend variants)
+- Architecture.md with comprehensive trade-off discussions
+- README with setup instructions
+
+**Remaining:**
+- Add comprehensive tests (vitest)
+- Add more problems to seed data
 
 ## Design Decisions Log
 
@@ -104,6 +119,30 @@ This document tracks the development journey of implementing an online coding pr
 - Follows repository guidelines (avoid JWT complexity)
 - Easy session management and revocation
 
+### Decision 5: Circuit Breaker for Code Execution
+**Choice:** Use opossum library to protect code execution
+**Rationale:**
+- Docker daemon can become unavailable or hang
+- Circuit breaker provides fail-fast behavior
+- Prevents cascading failures to rest of API
+- Users can still browse problems when execution is down
+
+### Decision 6: Virtualized Problem List
+**Choice:** Use @tanstack/react-virtual for problem list
+**Rationale:**
+- Scales to thousands of problems efficiently
+- Only renders visible rows + overscan buffer
+- Maintains 60fps scrolling performance
+- Reduces DOM node count from N to ~20
+
+### Decision 7: Rate Limiting with Multiple Tiers
+**Choice:** Implement per-endpoint rate limiting
+**Rationale:**
+- Submissions need strict limits (Docker resources expensive)
+- Code runs can be more lenient (no persistence)
+- Auth needs brute force protection
+- General API needs abuse prevention
+
 ## Iterations and Learnings
 
 ### Iteration 1: Initial Setup
@@ -124,14 +163,17 @@ This document tracks the development journey of implementing an online coding pr
 ## Questions and Discussions
 
 ### Open Questions
-1. How to handle very large test case outputs?
-2. Should we implement queue-based execution for better scaling?
-3. How to detect and prevent plagiarism?
+1. How to handle very large test case outputs? (Consider streaming or truncation)
+2. How to detect and prevent plagiarism? (MOSS algorithm, or simpler hash-based detection)
+
+### Resolved Questions
+1. Should we implement queue-based execution? **Decision:** Not needed for local dev scope. Current async processing with circuit breaker is sufficient. Can add Kafka/RabbitMQ later for production scale.
 
 ### Future Considerations
 - WebSocket for real-time updates
 - Contests with time-limited submissions
 - More language support (C++, Java, Go, Rust)
+- Queue-based execution with Kafka for production scale
 
 ## Resources and References
 
@@ -145,9 +187,14 @@ This document tracks the development journey of implementing an online coding pr
 - [x] Sketch initial architecture
 - [x] Choose technology stack
 - [x] Implement MVP
+- [x] Add rate limiting
+- [x] Add circuit breaker
+- [x] Add metrics and observability
+- [x] Add idempotency
+- [x] Add list virtualization
 - [ ] Add more problems
-- [ ] Add tests
-- [ ] Performance optimization
+- [ ] Add comprehensive tests
+- [ ] Add more language support (C++, Java)
 
 ---
 

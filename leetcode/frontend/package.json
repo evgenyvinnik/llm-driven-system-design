@@ -13,6 +13,7 @@
   "dependencies": {
     "@codemirror/lang-javascript": "^6.2.1",
     "@codemirror/lang-python": "^6.1.4",
+    "@tanstack/react-virtual": "^3.10.9",
     "@uiw/codemirror-theme-vscode": "^4.21.21",
     "@uiw/react-codemirror": "^4.21.21",
     "react": "^19.0.0",

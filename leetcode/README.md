@@ -33,9 +33,13 @@ An online coding practice and evaluation platform where users can solve programm
 - [x] Database/Storage layer (PostgreSQL + Redis)
 - [x] API endpoints
 - [x] Code execution sandbox
+- [x] Rate limiting and abuse prevention
+- [x] Circuit breaker for resilience
+- [x] Metrics and observability
+- [x] Idempotency for submissions
+- [x] Virtualized problem list
+- [x] Documentation
 - [ ] Testing
-- [ ] Performance optimization
-- [ ] Documentation
 
 ## Getting Started
 
@@ -221,13 +225,24 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 See [claude.md](./claude.md) for development insights and iteration history.
 
+## Implemented Features
+
+- **Rate Limiting**: Protects execution resources
+  - 10 submissions/minute per user
+  - 30 code runs/minute per user
+  - Brute force protection on auth endpoints
+- **Circuit Breaker**: Graceful degradation when Docker is unavailable
+- **Idempotency**: Prevents duplicate submissions on retry
+- **Metrics**: Prometheus-compatible observability
+- **Virtualized Lists**: Efficient rendering for large problem catalogs
+
 ## Future Enhancements
 
 - Contests with real-time leaderboards
 - More language support (C++, Java, Go)
 - Code similarity detection for plagiarism
 - WebSocket for real-time submission updates
-- Rate limiting and abuse prevention
+- Queue-based execution for production scale
 
 ## References & Inspiration
 

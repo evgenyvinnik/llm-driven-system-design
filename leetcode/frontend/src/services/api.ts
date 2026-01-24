@@ -1,5 +1,16 @@
 const API_BASE = '/api/v1';
 
+// Custom error class for rate limit errors
+export class RateLimitError extends Error {
+  retryAfter: number;
+
+  constructor(message: string, retryAfter: number) {
+    super(message);
+    this.name = 'RateLimitError';
+    this.retryAfter = retryAfter;
+  }
+}
+
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -15,6 +26,13 @@ async function request<T>(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Request failed' }));
+
+    // Handle rate limiting specifically
+    if (response.status === 429) {
+      const retryAfter = error.retryAfter || parseInt(response.headers.get('Retry-After') || '60', 10);
+      throw new RateLimitError(error.message || 'Rate limit exceeded. Please wait before trying again.', retryAfter);
+    }
+
     throw new Error(error.error || 'Request failed');
   }
 

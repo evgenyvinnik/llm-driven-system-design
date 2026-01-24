@@ -2,8 +2,11 @@ import { Router, type Request, type Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../db/pool.js';
+import { authRateLimiter } from '../shared/rateLimiter.js';
+import { createModuleLogger } from '../shared/logger.js';
 
 const router = Router();
+const logger = createModuleLogger('auth');
 
 interface RegisterBody {
   username?: string;
@@ -16,8 +19,8 @@ interface LoginBody {
   password?: string;
 }
 
-// Register
-router.post('/register', async (req: Request<unknown, unknown, RegisterBody>, res: Response): Promise<void> => {
+// Register - rate limited to prevent abuse
+router.post('/register', authRateLimiter, async (req: Request<unknown, unknown, RegisterBody>, res: Response): Promise<void> => {
   try {
     const { username, email, password } = req.body;
 
@@ -60,13 +63,13 @@ router.post('/register', async (req: Request<unknown, unknown, RegisterBody>, re
       user: { id: userId, username, email, role: 'user' }
     });
   } catch (error) {
-    console.error('Register error:', error);
+    logger.error({ error, username: req.body.username }, 'Registration failed');
     res.status(500).json({ error: 'Registration failed' });
   }
 });
 
-// Login
-router.post('/login', async (req: Request<unknown, unknown, LoginBody>, res: Response): Promise<void> => {
+// Login - rate limited to prevent brute force attacks
+router.post('/login', authRateLimiter, async (req: Request<unknown, unknown, LoginBody>, res: Response): Promise<void> => {
   try {
     const { username, password } = req.body;
 
@@ -107,7 +110,7 @@ router.post('/login', async (req: Request<unknown, unknown, LoginBody>, res: Res
       }
     });
   } catch (error) {
-    console.error('Login error:', error);
+    logger.error({ error, username: req.body.username }, 'Login failed');
     res.status(500).json({ error: 'Login failed' });
   }
 });
