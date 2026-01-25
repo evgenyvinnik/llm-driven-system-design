@@ -381,7 +381,7 @@
 - When: Relative time (e.g., "2 minutes ago")
 
 ---
-
+up
 ## ⚡ 7. Performance Optimizations
 
 ### Canvas Rendering Optimizations

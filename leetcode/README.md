@@ -204,8 +204,8 @@ npm run dev:server3  # Port 3003
 The code execution sandbox uses Docker to safely run user-submitted code:
 
 - **Security:** Containers run with dropped capabilities, no network access, read-only filesystem
-- **Resource limits:** Memory (256MB), CPU (50%), PIDs (50), time limits
-- **Languages:** Python 3.11, JavaScript (Node 20)
+- **Resource limits:** Memory (256MB/512MB), CPU (50%), PIDs (50), time limits
+- **Languages:** Python 3.11, JavaScript (Node 20), C++ (GCC 13), Java (OpenJDK 21)
 
 To enable code execution, ensure Docker is running and the user has Docker socket access.
 
@@ -236,13 +236,33 @@ See [claude.md](./claude.md) for development insights and iteration history.
 - **Metrics**: Prometheus-compatible observability
 - **Virtualized Lists**: Efficient rendering for large problem catalogs
 
+## Kafka Queue Mode (Optional)
+
+For production scale, enable Kafka queue-based execution:
+
+1. **Start Kafka:**
+```bash
+docker-compose up -d zookeeper kafka
+```
+
+2. **Enable queue mode:**
+```bash
+export USE_KAFKA_QUEUE=true
+```
+
+3. **Start workers:**
+```bash
+npm run dev:worker1  # Worker 1
+npm run dev:worker2  # Worker 2 (in another terminal)
+```
+
+Workers consume submission jobs from Kafka and execute them independently, enabling horizontal scaling.
+
 ## Future Enhancements
 
 - Contests with real-time leaderboards
-- More language support (C++, Java, Go)
 - Code similarity detection for plagiarism
 - WebSocket for real-time submission updates
-- Queue-based execution for production scale
 
 ## References & Inspiration
 

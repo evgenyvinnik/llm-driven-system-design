@@ -2,7 +2,7 @@
 
 ## Introduction (2 minutes)
 
-"Thanks for this challenge. I'll be designing r/place, Reddit's collaborative pixel art canvas where millions of users place colored pixels on a shared canvas in real-time, with rate limiting to encourage collaboration. This is a fascinating real-time systems problem. Let me clarify the requirements."
+"Thanks for this challenge. I'll be designing r/place, Reddit's collaborative pixel art canvas where millions of users place colored pixels on a shared canvas in real-time, with rate limiting to encourage collaboration. Reddit actually ran this at massive scale—10.4 million concurrent users in 2022. Let me clarify the requirements."
 
 ---
 
@@ -20,7 +20,7 @@
 ### Non-Functional Requirements
 
 - **Latency** - Pixel updates visible to all users within 500ms
-- **Scale** - Support 1+ million concurrent users during peak events
+- **Scale** - Support 10+ million concurrent users during peak events
 - **Consistency** - Every user sees the same canvas state (eventual consistency acceptable with <1s lag)
 - **Availability** - Must stay up during the event; downtime ruins the experience
 
@@ -32,237 +32,205 @@
 
 ## 📊 2. Scale Estimation (3 minutes)
 
-### Assumptions
+### Assumptions (Based on Reddit 2022 r/place)
 
-- Canvas size: 2000 x 2000 pixels = 4 million pixels
+- Canvas size: 2000 x 2000 pixels = 4 million pixels (expanded during event)
 - Rate limit: 1 pixel per 5 minutes per user
-- Peak concurrent users: 1 million
+- Peak concurrent users: 10.4 million
 - Event duration: 4 days
+- Total pixels placed: 160+ million
 
 ### Traffic Estimates
 
 | Metric | Value | Calculation |
 |--------|-------|-------------|
-| Max pixel placements | 3,333/second | 1M users / 5 min cooldown |
-| Canvas reads | ~100,000/second | With aggressive caching |
-| WebSocket connections | 1 million | Concurrent users |
+| Max pixel placements | ~35,000/second | 10.4M users / 5 min cooldown |
+| Canvas state requests | Served via CDN | Bitmap snapshots cached at edge |
+| WebSocket connections | 10.4 million | Concurrent users |
 
 ### Storage Estimates
 
 | Data Type | Size | Notes |
 |-----------|------|-------|
-| Canvas state | 4 MB | 4M pixels × 1 byte (color index) |
-| Single pixel event | ~50 bytes | x, y, color, user_id, timestamp |
-| Total events (4 days) | ~58 GB | 1.15B events × 50 bytes |
-
-### Bandwidth
-
-- Full canvas download: 4 MB (served from CDN)
-- Incremental updates: ~167 KB/second outbound per server cluster
+| Canvas state | 2 MB | 4M pixels × 4 bits (bit-packed for 16 colors) |
+| Single pixel event | ~32 bytes | x, y, color, user_id, timestamp (packed) |
+| Total events (4 days) | ~5 GB | 160M events × 32 bytes |
 
 ---
 
 ## 🏗️ 3. High-Level Architecture (8 minutes)
 
+"Reddit's architecture was CDN-first: Fastly served canvas snapshots, while Kafka handled the real-time event stream."
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              CDN                                        │
-│                    (Canvas snapshots, static assets)                    │
+│                          CDN (Fastly)                                    │
+│              Canvas bitmap snapshots (1-2 second TTL)                    │
 └───────────────────────────────────┬─────────────────────────────────────┘
-                                    │
+                                    │ Cache MISS only
 ┌─────────────┐     ┌───────────────▼───────────────┐     ┌──────────────┐
 │   Web       │────▶│        Load Balancer          │◀────│   Mobile     │
-│   Client    │     │   (Sticky sessions optional)  │     │   Client     │
+│   Client    │     │                               │     │   Client     │
 └─────────────┘     └───────────────┬───────────────┘     └──────────────┘
                                     │
                     ┌───────────────┼───────────────┐
                     │               │               │
              ┌──────▼─────┐  ┌──────▼─────┐  ┌──────▼─────┐
              │ WebSocket  │  │ WebSocket  │  │ WebSocket  │
-             │ Server 1   │  │ Server 2   │  │ Server N   │
+             │ Server(Go) │  │ Server(Go) │  │ Server(Go) │
              └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
                     │               │               │
                     └───────────────┼───────────────┘
                                     │
-                    ┌───────────────▼───────────────┐
-                    │       Redis Pub/Sub           │
-                    │   (Pixel event broadcast)     │
-                    └───────────────┬───────────────┘
-                                    │
         ┌───────────────────────────┼───────────────────────────┐
         │                           │                           │
 ┌───────▼───────┐     ┌─────────────▼─────────────┐     ┌───────▼───────┐
-│  Pixel        │     │      Redis Cluster        │     │   Kafka       │
-│  Service      │     │  (Canvas state + Rate     │     │ (Event log)   │
+│  Placement    │     │      Redis Cluster        │     │   Kafka       │
+│  Service(Go)  │     │  (Canvas bitmap + Rate    │     │ (Event stream)│
 │               │     │   limiting)               │     │               │
 └───────────────┘     └───────────────────────────┘     └───────┬───────┘
                                                                 │
                                                         ┌───────▼───────┐
-                                                        │  History      │
-                                                        │  Service      │
-                                                        └───────┬───────┘
-                                                                │
-                                                        ┌───────▼───────┐
-                                                        │  PostgreSQL   │
-                                                        │  (Events)     │
+                                                        │  Cassandra    │
+                                                        │ (Event store) │
                                                         └───────────────┘
 ```
 
-### Core Components
+### Core Components (Reddit's Stack)
 
-| Component | Purpose | Key Responsibility |
-|-----------|---------|-------------------|
-| WebSocket Servers | Client connections | Maintain 100K connections each, push pixel updates |
-| Pixel Service | Business logic | Validate placements, enforce rate limits |
-| Redis Cluster | Live state | Canvas bitmap, rate limit keys with TTL |
-| Redis Pub/Sub | Event broadcast | Fan out pixel events to all WebSocket servers |
-| Kafka | Durable log | Persist all pixel events for history/replay |
-| History Service | Analytics | Generate snapshots, timelapses, point-in-time views |
+| Component | Technology | Key Responsibility |
+|-----------|------------|-------------------|
+| WebSocket Servers | Go | Handle millions of connections via goroutines |
+| Placement Service | Go | Validate placements, enforce rate limits |
+| Canvas State | Redis | Bit-packed bitmap (4 bits per pixel) |
+| Event Stream | Kafka | Real-time fan-out to all WebSocket servers |
+| Event Storage | Cassandra | Time-series storage for history/replay |
+| CDN | Fastly | Serve canvas snapshots globally |
 
 ---
 
 ## 💾 4. Data Model (5 minutes)
 
-### Canvas State in Redis
+### Canvas State in Redis (Bit-Packed)
 
-"I store the entire canvas as a single binary string where each byte represents one pixel's color index (0-15 for 16 colors)."
+"Reddit stored the canvas as a bit-packed bitmap. With 16 colors (4 bits each), two pixels fit in one byte, halving storage and bandwidth."
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `canvas:current` | String (binary) | 4MB byte array, pixel at (x,y) = offset y × width + x |
-| `cooldown:{user_id}` | String + TTL | Timestamp of last placement, auto-expires after 5 min |
+| Key | Type | Size | Description |
+|-----|------|------|-------------|
+| `canvas:bitmap` | String (binary) | 2 MB | Pixel (x,y) at byte (y×width+x)/2, bit offset (y×width+x)%2×4 |
+| `ratelimit:{user_id}` | String + TTL | — | Auto-expires after cooldown |
 
-**Why this works:** SETRANGE provides atomic single-byte updates. GET returns the entire canvas in one operation. No locking needed.
+### Kafka Event Schema (Compact)
 
-### Event Schema (PostgreSQL)
+| Field | Type | Bytes | Description |
+|-------|------|-------|-------------|
+| x | uint16 | 2 | X coordinate |
+| y | uint16 | 2 | Y coordinate |
+| color | uint8 | 1 | Color index (0-15) |
+| user_id | uint64 | 8 | User identifier |
+| timestamp | uint64 | 8 | Unix timestamp (ms) |
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| id | BIGSERIAL | Primary key |
-| x | SMALLINT | X coordinate (0-1999) |
-| y | SMALLINT | Y coordinate (0-1999) |
-| color | SMALLINT | Color index (0-15) |
-| user_id | UUID | Who placed it |
-| placed_at | TIMESTAMP | When (partitioned by time) |
-
-### Canvas Snapshots
+### Cassandra Event Table
 
 | Column | Type | Purpose |
 |--------|------|---------|
-| id | SERIAL | Primary key |
-| captured_at | TIMESTAMP | Snapshot time |
-| canvas_data | BYTEA | Compressed canvas state |
-| pixel_count | INTEGER | Running total of placements |
+| date | date | Partition key (by day) |
+| timestamp | timeuuid | Clustering key, time-ordered |
+| x, y | smallint | Coordinates |
+| color | tinyint | Color index |
+| user_id | bigint | Who placed it |
 
 ---
 
-## 🔧 5. Deep Dive: Pixel Placement Flow (10 minutes)
+## 🔧 5. Deep Dive: CDN-First Architecture (8 minutes)
 
-### Request Flow
+### Why CDN-First?
+
+"The key insight: don't serve canvas state from your servers—let the CDN handle it."
 
 ```
-User clicks      WebSocket        Pixel           Redis           Redis
-canvas    ─────▶ Server    ─────▶ Service  ─────▶ (Rate Limit) ─▶ (Canvas)
-                    │                                   │             │
-                    │◀──────────────────────────────────┴─────────────┘
-                    │                    │
-                    │                    ▼
-                    │              Redis Pub/Sub ────▶ All WebSocket Servers
-                    │                                        │
-                    ▼                                        ▼
-               Response to                           Broadcast to
-               this client                           all clients
+┌─────────────────────────────────────────────────────────────────┐
+│                    CDN-First Canvas Serving                       │
+│                                                                  │
+│  Client Request                                                  │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌─────────┐     Cache HIT (99.9%)     ┌─────────────────────┐  │
+│  │  Fastly │ ──────────────────────────▶│ Return cached       │  │
+│  │   CDN   │                            │ bitmap (< 10ms)     │  │
+│  └────┬────┘                            └─────────────────────┘  │
+│       │                                                          │
+│       │ Cache MISS (0.1%)                                        │
+│       ▼                                                          │
+│  ┌─────────────────────┐                                         │
+│  │ Origin: Redis GET   │                                         │
+│  │ + Set cache headers │                                         │
+│  └─────────────────────┘                                         │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Placement Logic (Step by Step)
+### Canvas Update Flow
 
-1. **Validate coordinates** - Ensure 0 ≤ x < WIDTH and 0 ≤ y < HEIGHT
-2. **Validate color** - Ensure color is in valid palette (0-15)
-3. **Check rate limit atomically** - Redis SET with NX (only if not exists) and EX (5 min expiry)
-4. **Update canvas** - Redis SETRANGE at calculated offset
-5. **Publish event** - Redis PUBLISH to `pixel_updates` channel
-6. **Log to Kafka** - For durability and history reconstruction
-7. **Return success** - Include `next_placement` timestamp for client cooldown UI
+1. **Snapshot Service** reads canvas from Redis every 1-2 seconds
+2. Generates binary bitmap (optionally PNG)
+3. Pushes to CDN with short TTL (1-2 seconds)
+4. CDN serves globally with edge caching
 
-### Rate Limiting Deep Dive
+**Why this works:** 10 million users requesting a 2MB file would be 20 petabytes of bandwidth. CDN handles this trivially. Origin only sees cache misses.
 
-"The key insight is using Redis SET NX EX as an atomic check-and-set operation."
+---
+
+## 🔧 6. Deep Dive: Real-time Updates via Kafka (5 minutes)
+
+"Reddit used Kafka as the real-time event bus, not Redis Pub/Sub, because durability matters."
+
+### Event Flow
+
+```
+Placement      Kafka         WebSocket      WebSocket      Client
+Service    ──▶ Topic    ──▶  Consumers  ──▶ Broadcast  ──▶ Update
+   │                           (Go)
+   │
+   └──▶ Redis SETBIT (update canvas state)
+```
+
+### Why Kafka over Redis Pub/Sub?
+
+| Aspect | Kafka | Redis Pub/Sub |
+|--------|-------|---------------|
+| Durability | ✅ Persisted, replayable | ❌ Fire-and-forget |
+| Consumer recovery | ✅ Resume from offset | ❌ Missed messages lost |
+| Consumer groups | ✅ Built-in partitioning | ❌ Manual coordination |
+| Throughput | ✅ 100K+ msg/sec | ✅ Similar |
+
+### Batched WebSocket Updates
+
+"WebSocket servers batch updates every 1 second to reduce message overhead."
+
+| Approach | Messages/sec to 10M clients | Feasibility |
+|----------|----------------------------|-------------|
+| Individual pixels | 35,000 × 10M = 350B/s | ❌ Impossible |
+| Batched (1s window) | 10M × ~5KB | ✅ 50GB/s (distributed) |
+
+---
+
+## 🔧 7. Deep Dive: Rate Limiting at Scale (3 minutes)
+
+### Redis-Based Rate Limiting
+
+"The key is using Redis SET NX EX for atomic check-and-set."
 
 | Operation | Redis Command | Purpose |
 |-----------|---------------|---------|
-| Check + Set | `SET cooldown:{uid} 1 NX EX 300` | Only sets if key doesn't exist, auto-expires |
-| Get TTL | `TTL cooldown:{uid}` | Returns remaining cooldown seconds |
+| Place attempt | `SET ratelimit:{uid} 1 NX EX 300` | Only sets if not exists, expires in 5 min |
+| Check remaining | `TTL ratelimit:{uid}` | Returns seconds until can place again |
 
-**Why this works:** NX prevents race conditions where two requests slip through. EX auto-cleans expired keys. No separate check-then-set that could race.
-
----
-
-## 🔧 6. Deep Dive: Scaling WebSocket Connections (5 minutes)
-
-### Connection Distribution
+### Throughput Calculation
 
 ```
-1 million connections / 100,000 per server = 10 WebSocket servers minimum
-(Provision 15-20 for headroom and rolling deploys)
+35K placements/sec × 2 Redis ops = 70K ops/sec
+Redis single node capacity: 100K+ ops/sec ✅
 ```
-
-### Server Resource Requirements
-
-| Resource | Per Server | Notes |
-|----------|------------|-------|
-| Memory | 1-2 GB | ~10KB per connection |
-| CPU | 4-8 cores | JSON encoding, broadcast loops |
-| Network | 100+ Mbps | Fan-out to 100K clients |
-
-### Regional Distribution
-
-```
-                    ┌─────────────────┐
-                    │   Global LB     │
-                    │  (GeoDNS)       │
-                    └────────┬────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-    ┌────▼─────┐       ┌─────▼────┐       ┌─────▼────┐
-    │  US-West │       │  US-East │       │  Europe  │
-    │  Cluster │       │  Cluster │       │  Cluster │
-    └────┬─────┘       └────┬─────┘       └────┬─────┘
-         │                  │                  │
-         └──────────────────┼──────────────────┘
-                            │
-                    ┌───────▼───────┐
-                    │ Kafka (Global)│
-                    │  Event Stream │
-                    └───────────────┘
-```
-
-"Each region has local Redis for pub/sub. Kafka provides global ordering and cross-region replication. Users connect to nearest region for lowest latency."
-
----
-
-## 🔧 7. Deep Dive: Canvas History and Timelapse (3 minutes)
-
-### Snapshot Strategy
-
-| Interval | Purpose | Storage |
-|----------|---------|---------|
-| Every 30 seconds | Fine-grained history | ~2,880/day |
-| Compressed | Reduce storage | ~1MB per snapshot (zlib) |
-
-### Point-in-Time Reconstruction
-
-1. Find nearest snapshot before target time
-2. Decompress snapshot into memory
-3. Replay events from snapshot time to target time
-4. Each event: set canvas[y × width + x] = color
-
-### Timelapse Generation
-
-1. Query snapshots at desired frame interval
-2. Decompress each snapshot
-3. Convert to image frame (color palette lookup)
-4. Encode as video (ffmpeg or similar)
 
 ---
 
@@ -270,66 +238,60 @@ canvas    ─────▶ Server    ─────▶ Service  ────�
 
 ### WebSocket Protocol
 
-**Client → Server Messages:**
+**Client → Server:**
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `place` | x, y, color, requestId | Place a pixel |
-| `ping` | — | Keep connection alive |
+| `place` | x, y, color | Place a pixel |
 
-**Server → Client Messages:**
+**Server → Client:**
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `welcome` | userId, cooldownRemaining, canvasInfo | Connection established |
-| `canvas` | data (base64), width, height | Full canvas state |
-| `pixels` | events[] | Batch of pixel updates |
-| `success` | requestId, nextPlacement | Placement confirmed |
-| `error` | code, message, requestId?, remainingSeconds? | Placement failed |
-| `pong` | — | Heartbeat response |
+| `init` | canvasUrl, cooldownRemaining | Connection established, CDN URL for canvas |
+| `batch` | pixels[] | Batch of pixel updates (every 1s) |
+| `placed` | x, y, color, nextPlacement | Confirmation + cooldown end time |
+| `error` | code, message, retryAfter | Placement failed |
 
 ### REST API Endpoints
 
 | Method | Endpoint | Description | Response |
 |--------|----------|-------------|----------|
-| GET | `/api/v1/canvas` | Full canvas binary | Binary data (4MB) |
-| GET | `/api/v1/canvas/info` | Canvas metadata | `{ width, height, colorCount, cooldownSeconds }` |
-| GET | `/api/v1/history/pixel?x={x}&y={y}` | Pixel history | `{ placements: [{ color, userId, placedAt }] }` |
-| GET | `/api/v1/history/snapshot?time={iso}` | Canvas at time | Binary data |
-| GET | `/api/v1/auth/me` | Current user info | `{ userId, username, isGuest }` |
-| POST | `/api/v1/auth/login` | Login | `{ success, username }` |
-| POST | `/api/v1/auth/logout` | Logout | `{ success }` |
+| GET | `/api/v1/canvas` | Redirect to CDN | 302 → CDN URL |
+| GET | `/api/v1/canvas/info` | Canvas metadata | `{ width, height, colors, cooldownSec }` |
+| GET | `/api/v1/history?t={iso}` | Canvas at timestamp | Binary bitmap |
+| GET | `/api/v1/pixel?x={x}&y={y}` | Pixel history | `{ placements: [...] }` |
 
 ---
 
 ## ⚖️ 9. Trade-offs Analysis
 
-### Trade-off 1: Single Redis Key vs. Tile-Based Sharding
+### Trade-off 1: CDN-First vs. Direct Serving
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Single Redis key | Atomic updates, simple addressing, no coordination | Limited to ~16K×16K (256MB) |
-| ❌ Tile-based sharding | Unlimited canvas size | Cross-tile transactions, cache invalidation complexity |
+| ✅ CDN-first (Fastly) | Handles 10M+ users, global edge caching | 1-2s staleness for full canvas |
+| ❌ Direct from Redis | Always fresh | Can't scale to millions of requests |
 
-> "We chose a single Redis byte array because our 2000×2000 canvas (4MB) fits comfortably in memory. With SETRANGE, pixel updates are atomic single-byte writes requiring zero coordination. A tile system would need cross-shard transactions when users view tile boundaries, and cache invalidation becomes complex when tiles overlap in the viewport. The 256MB theoretical limit far exceeds our needs. If we needed a 100K×100K canvas, we'd redesign with tiles—but for r/place's actual scale, simplicity wins. The trade-off is we can't horizontally scale canvas storage itself, but a single Redis instance handles our write throughput easily."
+> "Reddit chose CDN-first because serving a 2MB bitmap to 10 million users directly is impossible—that's 20 petabytes of bandwidth. The CDN handles global distribution with edge caching. The trade-off is 1-2 second staleness for the full canvas, but real-time WebSocket updates provide the latest pixels. Clients render CDN bitmap as background with WebSocket deltas overlaid. This hybrid gives both scalability and real-time feel."
 
-### Trade-off 2: Redis Pub/Sub vs. Kafka for Real-time Broadcast
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Redis Pub/Sub | Sub-millisecond latency, simple | No persistence, missed messages are lost |
-| ❌ Kafka for broadcast | Durable, replayable | Higher latency (10-50ms), overkill for ephemeral updates |
-
-> "We use Redis Pub/Sub for real-time broadcast because pixel updates are ephemeral—if a client misses one update, the next batch will include the current state anyway. Pub/Sub delivers in under 1ms, critical for the 'instant' feel users expect. Kafka's durability is wasted here since we don't need replay for live updates. However, we DO send events to Kafka in parallel for history—this gives us durability for timelapse without adding latency to the hot path. The trade-off is that during Redis Pub/Sub failures, clients see stale canvases until reconnection triggers a full canvas fetch."
-
-### Trade-off 3: Eventual Consistency vs. Strong Consistency
+### Trade-off 2: Kafka vs. Redis Pub/Sub for Event Stream
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Eventual consistency | Multi-region deployment, high availability | Users may briefly see different states |
-| ❌ Strong consistency | Perfect agreement | Single region or high latency, reduced availability |
+| ✅ Kafka | Durable, replayable, consumer groups | 10-50ms latency, operational complexity |
+| ❌ Redis Pub/Sub | Sub-millisecond latency | Fire-and-forget, no replay |
 
-> "We accept eventual consistency with ~500ms lag because r/place is fundamentally a collaborative art project, not a financial system. If two users in different regions place pixels simultaneously, last-write-wins is acceptable—there's no 'incorrect' pixel, just the most recent one. Strong consistency would require either single-region deployment (bad latency for global users) or distributed consensus (adding 100-200ms per write). During the 2017 r/place event, Reddit observed that users naturally adapted to brief inconsistencies. The trade-off is that during network partitions, regions may diverge temporarily, but Kafka's global ordering reconciles them within seconds."
+> "Reddit used Kafka because durability matters. If a WebSocket server restarts, it replays recent events from Kafka to catch up. If they discover a bug, they can reprocess from the log. With 1-second batching anyway, Kafka's latency is invisible. For a 4-day event where every pixel matters for the final timelapse, Kafka's durability is essential. The trade-off is operational complexity, but Reddit already had Kafka expertise."
+
+### Trade-off 3: Bit-Packed vs. Byte-per-Pixel Storage
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Bit-packed (4 bits) | 2MB for 4M pixels, half the bandwidth | Complex bit manipulation |
+| ❌ Byte-per-pixel | Simple addressing (offset = y×width+x) | 4MB storage, 2x bandwidth |
+
+> "Reddit bit-packed the canvas because bandwidth is the constraint at scale. With 16 colors, each pixel needs only 4 bits, so two pixels fit in one byte. This halves storage and CDN bandwidth. The trade-off is more complex code: reading pixel (x,y) requires calculating byte offset and bit shift. But this is a one-time implementation cost, and the bandwidth savings compound across 10 million users."
 
 ---
 
@@ -337,41 +299,41 @@ canvas    ─────▶ Server    ─────▶ Service  ────�
 
 | Component | Failure Mode | Mitigation |
 |-----------|--------------|------------|
-| Redis | Primary down | Replica promotion, serve cached canvas from CDN |
-| WebSocket Server | Crash | Load balancer health checks, client auto-reconnect |
-| Kafka | Partition unavailable | Buffer events in memory, retry on recovery |
-| PostgreSQL | Down | History writes queued in Kafka, catch up on recovery |
+| Redis | Primary down | Redis Cluster with automatic failover |
+| Kafka | Broker down | Replication factor 3, leader election |
+| WebSocket Server | Crash | Client auto-reconnect, replay from Kafka |
+| CDN | Edge failure | Multiple edge PoPs, automatic failover |
 
 ### Client Reconnection Strategy
 
 - Exponential backoff: 1s, 2s, 4s, 8s... up to 30s max
-- Random jitter: ±0-1000ms to prevent thundering herd
-- On reconnect: fetch fresh canvas state, resume from current
+- Random jitter to prevent thundering herd
+- On reconnect: fetch fresh canvas from CDN, resume WebSocket stream
 
 ---
 
 ## 📝 Summary
 
-"To summarize, I've designed r/place with:
+"To summarize, I've designed r/place following Reddit's actual architecture:
 
-1. **Redis-backed canvas** storing the entire 4MB state as a byte array for atomic reads/writes
-2. **Redis Pub/Sub** for broadcasting pixel updates across all WebSocket servers in sub-millisecond time
-3. **Atomic rate limiting** using SET NX EX to prevent race conditions
-4. **Kafka event log** for durability, history reconstruction, and cross-region sync
-5. **Regional clusters** with global coordination for worldwide scale
-6. **Snapshot system** enabling point-in-time views and timelapse generation
+1. **CDN-first canvas serving** - Fastly serves 2MB bitmap snapshots, handling 10M+ users
+2. **Kafka event stream** - Durable, replayable event log for all pixel placements
+3. **Redis for hot state** - Bit-packed canvas bitmap and rate limit keys
+4. **Go WebSocket servers** - Millions of connections via goroutines + Kafka consumers
+5. **Cassandra for persistence** - Time-series storage for history and timelapse
+6. **Batched updates** - 1-second WebSocket batches reduce message overhead 1000x
 
-The key insight is that the canvas is small enough to fit in memory, making reads trivial, while the real challenge is efficiently broadcasting 3,000+ updates per second to 1 million connected clients. We solve this through batched WebSocket messages, regional distribution, and accepting eventual consistency."
+The key insight is that the canvas is small enough (2MB) to serve via CDN, while real-time updates flow through Kafka → WebSocket. This separation lets the CDN handle read load while the backend focuses on write coordination and real-time fan-out."
 
 ---
 
 ## ❓ Questions I'd Expect
 
-**Q: What if someone tries to overwrite pixels programmatically?**
-A: Rate limiting applies equally to all users. We can add CAPTCHA for suspicious accounts and IP-based rate limits. The 5-minute cooldown makes botting ineffective for claiming territory.
+**Q: How did Reddit handle 10 million WebSocket connections?**
+A: Go's goroutine model handles millions of connections efficiently (~10KB per connection). Each server handled ~500K connections, requiring about 20 servers. They used epoll/kqueue for I/O multiplexing.
 
-**Q: How do you handle the initial canvas load for a million users?**
-A: Canvas is served from CDN as a compressed file (~1MB with gzip). CDN handles millions of concurrent downloads. WebSocket connection only needed for real-time updates after initial load.
+**Q: How did they expand the canvas mid-event?**
+A: The 2022 r/place used a tile-based system where each tile was a separate Redis key. They could add new tiles without touching existing ones, allowing expansion from 1000×1000 to 4000×4000.
 
-**Q: What about moderating inappropriate content?**
-A: We log all placements with user IDs. Moderators can view history of any region, ban users retroactively, and use ML-based image recognition to flag problematic patterns in near-real-time.
+**Q: What about the final timelapse?**
+A: Kafka retained all 160M events. A batch job read the entire log, reconstructed canvas state at each second, and rendered frames. Processing took a few hours after the event ended.

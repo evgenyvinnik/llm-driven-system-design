@@ -17,8 +17,12 @@ interface Problem {
   difficulty: string;
   starter_code_python: string;
   starter_code_javascript: string;
+  starter_code_cpp: string;
+  starter_code_java: string;
   solution_python: string;
   solution_javascript: string;
+  solution_cpp: string;
+  solution_java: string;
   test_cases: TestCase[];
 }
 
@@ -120,6 +124,116 @@ rl.on('close', () => {
     const result = twoSum(nums, target);
     console.log(JSON.stringify(result));
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <sstream>
+using namespace std;
+
+vector<int> twoSum(vector<int>& nums, int target) {
+    // Your code here
+    return {};
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) {
+        nums.push_back(stoi(num));
+    }
+    int target;
+    cin >> target;
+    vector<int> result = twoSum(nums, target);
+    cout << "[" << result[0] << "," << result[1] << "]" << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int[] twoSum(int[] nums, int target) {
+        // Your code here
+        return new int[]{};
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine().trim();
+        line = line.substring(1, line.length() - 1);
+        String[] parts = line.split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            nums[i] = Integer.parseInt(parts[i].trim());
+        }
+        int target = Integer.parseInt(sc.nextLine().trim());
+        int[] result = twoSum(nums, target);
+        System.out.println("[" + result[0] + "," + result[1] + "]");
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <sstream>
+using namespace std;
+
+vector<int> twoSum(vector<int>& nums, int target) {
+    unordered_map<int, int> seen;
+    for (int i = 0; i < nums.size(); i++) {
+        int complement = target - nums[i];
+        if (seen.count(complement)) {
+            return {seen[complement], i};
+        }
+        seen[nums[i]] = i;
+    }
+    return {};
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) {
+        nums.push_back(stoi(num));
+    }
+    int target;
+    cin >> target;
+    vector<int> result = twoSum(nums, target);
+    cout << "[" << result[0] << "," << result[1] << "]" << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int[] twoSum(int[] nums, int target) {
+        Map<Integer, Integer> seen = new HashMap<>();
+        for (int i = 0; i < nums.length; i++) {
+            int complement = target - nums[i];
+            if (seen.containsKey(complement)) {
+                return new int[]{seen.get(complement), i};
+            }
+            seen.put(nums[i], i);
+        }
+        return new int[]{};
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine().trim();
+        line = line.substring(1, line.length() - 1);
+        String[] parts = line.split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            nums[i] = Integer.parseInt(parts[i].trim());
+        }
+        int target = Integer.parseInt(sc.nextLine().trim());
+        int[] result = twoSum(nums, target);
+        System.out.println("[" + result[0] + "," + result[1] + "]");
+    }
+}`,
     test_cases: [
       { input: '[2,7,11,15]\n9', expected_output: '[0,1]', is_sample: true },
       { input: '[3,2,4]\n6', expected_output: '[1,2]', is_sample: true },
@@ -204,6 +318,70 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <string>
+#include <algorithm>
+using namespace std;
+
+bool isPalindrome(int x) {
+    // Your code here
+    return false;
+}
+
+int main() {
+    int x;
+    cin >> x;
+    cout << (isPalindrome(x) ? "true" : "false") << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static boolean isPalindrome(int x) {
+        // Your code here
+        return false;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int x = sc.nextInt();
+        System.out.println(isPalindrome(x));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <string>
+#include <algorithm>
+using namespace std;
+
+bool isPalindrome(int x) {
+    if (x < 0) return false;
+    string s = to_string(x);
+    string rev = s;
+    reverse(rev.begin(), rev.end());
+    return s == rev;
+}
+
+int main() {
+    int x;
+    cin >> x;
+    cout << (isPalindrome(x) ? "true" : "false") << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static boolean isPalindrome(int x) {
+        if (x < 0) return false;
+        String s = String.valueOf(x);
+        return s.equals(new StringBuilder(s).reverse().toString());
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int x = sc.nextInt();
+        System.out.println(isPalindrome(x));
+    }
+}`,
     test_cases: [
       { input: '121', expected_output: 'true', is_sample: true },
       { input: '-121', expected_output: 'false', is_sample: true },
@@ -300,6 +478,83 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <stack>
+#include <unordered_map>
+using namespace std;
+
+bool isValid(string s) {
+    // Your code here
+    return false;
+}
+
+int main() {
+    string s;
+    getline(cin, s);
+    cout << (isValid(s) ? "true" : "false") << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static boolean isValid(String s) {
+        // Your code here
+        return false;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String s = sc.nextLine();
+        System.out.println(isValid(s));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <stack>
+#include <unordered_map>
+using namespace std;
+
+bool isValid(string s) {
+    stack<char> st;
+    unordered_map<char, char> mapping = {{')', '('}, {'}', '{'}, {']', '['}};
+    for (char c : s) {
+        if (mapping.count(c)) {
+            if (st.empty() || st.top() != mapping[c]) return false;
+            st.pop();
+        } else {
+            st.push(c);
+        }
+    }
+    return st.empty();
+}
+
+int main() {
+    string s;
+    getline(cin, s);
+    cout << (isValid(s) ? "true" : "false") << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static boolean isValid(String s) {
+        Stack<Character> stack = new Stack<>();
+        Map<Character, Character> mapping = Map.of(')', '(', '}', '{', ']', '[');
+        for (char c : s.toCharArray()) {
+            if (mapping.containsKey(c)) {
+                if (stack.isEmpty() || stack.pop() != mapping.get(c)) return false;
+            } else {
+                stack.push(c);
+            }
+        }
+        return stack.isEmpty();
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String s = sc.nextLine();
+        System.out.println(isValid(s));
+    }
+}`,
     test_cases: [
       { input: '()', expected_output: 'true', is_sample: true },
       { input: '()[]{}', expected_output: 'true', is_sample: true },
@@ -410,6 +665,134 @@ rl.on('close', () => {
     const result = mergeTwoLists(list1, list2);
     console.log(JSON.stringify(result));
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+vector<int> parseArray(string& line) {
+    vector<int> arr;
+    if (line == "[]") return arr;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) arr.push_back(stoi(num));
+    return arr;
+}
+
+vector<int> mergeTwoLists(vector<int>& list1, vector<int>& list2) {
+    // Your code here
+    return {};
+}
+
+int main() {
+    string line1, line2;
+    getline(cin, line1);
+    getline(cin, line2);
+    vector<int> list1 = parseArray(line1);
+    vector<int> list2 = parseArray(line2);
+    vector<int> result = mergeTwoLists(list1, list2);
+    cout << "[";
+    for (int i = 0; i < result.size(); i++) {
+        cout << result[i] << (i < result.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int[] mergeTwoLists(int[] list1, int[] list2) {
+        // Your code here
+        return new int[]{};
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int[] list1 = parseArray(sc.nextLine());
+        int[] list2 = parseArray(sc.nextLine());
+        int[] result = mergeTwoLists(list1, list2);
+        System.out.println(Arrays.toString(result).replace(" ", ""));
+    }
+
+    static int[] parseArray(String line) {
+        if (line.equals("[]")) return new int[0];
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] arr = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) arr[i] = Integer.parseInt(parts[i].trim());
+        return arr;
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+vector<int> parseArray(string& line) {
+    vector<int> arr;
+    if (line == "[]") return arr;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) arr.push_back(stoi(num));
+    return arr;
+}
+
+vector<int> mergeTwoLists(vector<int>& list1, vector<int>& list2) {
+    vector<int> result;
+    int i = 0, j = 0;
+    while (i < list1.size() && j < list2.size()) {
+        if (list1[i] <= list2[j]) result.push_back(list1[i++]);
+        else result.push_back(list2[j++]);
+    }
+    while (i < list1.size()) result.push_back(list1[i++]);
+    while (j < list2.size()) result.push_back(list2[j++]);
+    return result;
+}
+
+int main() {
+    string line1, line2;
+    getline(cin, line1);
+    getline(cin, line2);
+    vector<int> list1 = parseArray(line1);
+    vector<int> list2 = parseArray(line2);
+    vector<int> result = mergeTwoLists(list1, list2);
+    cout << "[";
+    for (int i = 0; i < result.size(); i++) {
+        cout << result[i] << (i < result.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int[] mergeTwoLists(int[] list1, int[] list2) {
+        int[] result = new int[list1.length + list2.length];
+        int i = 0, j = 0, k = 0;
+        while (i < list1.length && j < list2.length) {
+            if (list1[i] <= list2[j]) result[k++] = list1[i++];
+            else result[k++] = list2[j++];
+        }
+        while (i < list1.length) result[k++] = list1[i++];
+        while (j < list2.length) result[k++] = list2[j++];
+        return result;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int[] list1 = parseArray(sc.nextLine());
+        int[] list2 = parseArray(sc.nextLine());
+        int[] result = mergeTwoLists(list1, list2);
+        System.out.println(Arrays.toString(result).replace(" ", ""));
+    }
+
+    static int[] parseArray(String line) {
+        if (line.equals("[]")) return new int[0];
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] arr = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) arr[i] = Integer.parseInt(parts[i].trim());
+        return arr;
+    }
+}`,
     test_cases: [
       { input: '[1,2,4]\n[1,3,4]', expected_output: '[1,1,2,3,4,4]', is_sample: true },
       { input: '[]\n[]', expected_output: '[]', is_sample: true },
@@ -500,6 +883,90 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+using namespace std;
+
+int maxSubArray(vector<int>& nums) {
+    // Your code here
+    return 0;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    cout << maxSubArray(nums) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int maxSubArray(int[] nums) {
+        // Your code here
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(maxSubArray(nums));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+using namespace std;
+
+int maxSubArray(vector<int>& nums) {
+    int maxSum = nums[0], currentSum = nums[0];
+    for (int i = 1; i < nums.size(); i++) {
+        currentSum = max(nums[i], currentSum + nums[i]);
+        maxSum = max(maxSum, currentSum);
+    }
+    return maxSum;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    cout << maxSubArray(nums) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int maxSubArray(int[] nums) {
+        int maxSum = nums[0], currentSum = nums[0];
+        for (int i = 1; i < nums.length; i++) {
+            currentSum = Math.max(nums[i], currentSum + nums[i]);
+            maxSum = Math.max(maxSum, currentSum);
+        }
+        return maxSum;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(maxSubArray(nums));
+    }
+}`,
     test_cases: [
       { input: '[-2,1,-3,4,-1,2,1,-5,4]', expected_output: '6', is_sample: true },
       { input: '[1]', expected_output: '1', is_sample: true },
@@ -604,6 +1071,84 @@ rl.on('close', () => {
     const result = longestCommonSubsequence(lines[0], lines[1]);
     console.log(result);
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <algorithm>
+using namespace std;
+
+int longestCommonSubsequence(string text1, string text2) {
+    // Your code here
+    return 0;
+}
+
+int main() {
+    string text1, text2;
+    getline(cin, text1);
+    getline(cin, text2);
+    cout << longestCommonSubsequence(text1, text2) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int longestCommonSubsequence(String text1, String text2) {
+        // Your code here
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String text1 = sc.nextLine();
+        String text2 = sc.nextLine();
+        System.out.println(longestCommonSubsequence(text1, text2));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <algorithm>
+using namespace std;
+
+int longestCommonSubsequence(string text1, string text2) {
+    int m = text1.size(), n = text2.size();
+    vector<vector<int>> dp(m + 1, vector<int>(n + 1, 0));
+    for (int i = 1; i <= m; i++) {
+        for (int j = 1; j <= n; j++) {
+            if (text1[i-1] == text2[j-1]) dp[i][j] = dp[i-1][j-1] + 1;
+            else dp[i][j] = max(dp[i-1][j], dp[i][j-1]);
+        }
+    }
+    return dp[m][n];
+}
+
+int main() {
+    string text1, text2;
+    getline(cin, text1);
+    getline(cin, text2);
+    cout << longestCommonSubsequence(text1, text2) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int longestCommonSubsequence(String text1, String text2) {
+        int m = text1.length(), n = text2.length();
+        int[][] dp = new int[m + 1][n + 1];
+        for (int i = 1; i <= m; i++) {
+            for (int j = 1; j <= n; j++) {
+                if (text1.charAt(i-1) == text2.charAt(j-1)) dp[i][j] = dp[i-1][j-1] + 1;
+                else dp[i][j] = Math.max(dp[i-1][j], dp[i][j-1]);
+            }
+        }
+        return dp[m][n];
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String text1 = sc.nextLine();
+        String text2 = sc.nextLine();
+        System.out.println(longestCommonSubsequence(text1, text2));
+    }
+}`,
     test_cases: [
       { input: 'abcde\nace', expected_output: '3', is_sample: true },
       { input: 'abc\nabc', expected_output: '3', is_sample: true },
@@ -698,6 +1243,122 @@ rl.on('close', () => {
     const result = findMedianSortedArrays(nums1, nums2);
     console.log(result);
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+#include <iomanip>
+using namespace std;
+
+vector<int> parseArray(string& line) {
+    vector<int> arr;
+    if (line == "[]") return arr;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) arr.push_back(stoi(num));
+    return arr;
+}
+
+double findMedianSortedArrays(vector<int>& nums1, vector<int>& nums2) {
+    // Your code here
+    return 0.0;
+}
+
+int main() {
+    string line1, line2;
+    getline(cin, line1);
+    getline(cin, line2);
+    vector<int> nums1 = parseArray(line1);
+    vector<int> nums2 = parseArray(line2);
+    cout << fixed << setprecision(1) << findMedianSortedArrays(nums1, nums2) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static double findMedianSortedArrays(int[] nums1, int[] nums2) {
+        // Your code here
+        return 0.0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int[] nums1 = parseArray(sc.nextLine());
+        int[] nums2 = parseArray(sc.nextLine());
+        System.out.println(findMedianSortedArrays(nums1, nums2));
+    }
+
+    static int[] parseArray(String line) {
+        if (line.equals("[]")) return new int[0];
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] arr = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) arr[i] = Integer.parseInt(parts[i].trim());
+        return arr;
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+#include <iomanip>
+using namespace std;
+
+vector<int> parseArray(string& line) {
+    vector<int> arr;
+    if (line == "[]") return arr;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) arr.push_back(stoi(num));
+    return arr;
+}
+
+double findMedianSortedArrays(vector<int>& nums1, vector<int>& nums2) {
+    vector<int> merged;
+    merged.insert(merged.end(), nums1.begin(), nums1.end());
+    merged.insert(merged.end(), nums2.begin(), nums2.end());
+    sort(merged.begin(), merged.end());
+    int n = merged.size();
+    if (n % 2 == 1) return merged[n / 2];
+    return (merged[n / 2 - 1] + merged[n / 2]) / 2.0;
+}
+
+int main() {
+    string line1, line2;
+    getline(cin, line1);
+    getline(cin, line2);
+    vector<int> nums1 = parseArray(line1);
+    vector<int> nums2 = parseArray(line2);
+    cout << fixed << setprecision(1) << findMedianSortedArrays(nums1, nums2) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static double findMedianSortedArrays(int[] nums1, int[] nums2) {
+        int[] merged = new int[nums1.length + nums2.length];
+        System.arraycopy(nums1, 0, merged, 0, nums1.length);
+        System.arraycopy(nums2, 0, merged, nums1.length, nums2.length);
+        Arrays.sort(merged);
+        int n = merged.length;
+        if (n % 2 == 1) return merged[n / 2];
+        return (merged[n / 2 - 1] + merged[n / 2]) / 2.0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int[] nums1 = parseArray(sc.nextLine());
+        int[] nums2 = parseArray(sc.nextLine());
+        System.out.println(findMedianSortedArrays(nums1, nums2));
+    }
+
+    static int[] parseArray(String line) {
+        if (line.equals("[]")) return new int[0];
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] arr = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) arr[i] = Integer.parseInt(parts[i].trim());
+        return arr;
+    }
+}`,
     test_cases: [
       { input: '[1,3]\n[2]', expected_output: '2.0', is_sample: true },
       { input: '[1,2]\n[3,4]', expected_output: '2.5', is_sample: true },
@@ -777,6 +1438,104 @@ rl.on('line', (line) => {
     console.log(JSON.stringify(s));
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+void reverseString(vector<char>& s) {
+    // Your code here
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<char> s;
+    for (int i = 2; i < line.size() - 1; i += 4) s.push_back(line[i]);
+    reverseString(s);
+    cout << "[";
+    for (int i = 0; i < s.size(); i++) {
+        cout << "\\"" << s[i] << "\\"" << (i < s.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static void reverseString(char[] s) {
+        // Your code here
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        char[] s = new char[parts.length];
+        for (int i = 0; i < parts.length; i++) s[i] = parts[i].trim().charAt(1);
+        reverseString(s);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < s.length; i++) {
+            sb.append("\\"").append(s[i]).append("\\"");
+            if (i < s.length - 1) sb.append(",");
+        }
+        sb.append("]");
+        System.out.println(sb);
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+void reverseString(vector<char>& s) {
+    int left = 0, right = s.size() - 1;
+    while (left < right) {
+        swap(s[left++], s[right--]);
+    }
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<char> s;
+    for (int i = 2; i < line.size() - 1; i += 4) s.push_back(line[i]);
+    reverseString(s);
+    cout << "[";
+    for (int i = 0; i < s.size(); i++) {
+        cout << "\\"" << s[i] << "\\"" << (i < s.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static void reverseString(char[] s) {
+        int left = 0, right = s.length - 1;
+        while (left < right) {
+            char temp = s[left];
+            s[left++] = s[right];
+            s[right--] = temp;
+        }
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        char[] s = new char[parts.length];
+        for (int i = 0; i < parts.length; i++) s[i] = parts[i].trim().charAt(1);
+        reverseString(s);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < s.length; i++) {
+            sb.append("\\"").append(s[i]).append("\\"");
+            if (i < s.length - 1) sb.append(",");
+        }
+        sb.append("]");
+        System.out.println(sb);
+    }
+}`,
     test_cases: [
       { input: '["h","e","l","l","o"]', expected_output: '["o","l","l","e","h"]', is_sample: true },
       { input: '["H","a","n","n","a","h"]', expected_output: '["h","a","n","n","a","H"]', is_sample: true },
@@ -861,6 +1620,74 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+using namespace std;
+
+int climbStairs(int n) {
+    // Your code here
+    return 0;
+}
+
+int main() {
+    int n;
+    cin >> n;
+    cout << climbStairs(n) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int climbStairs(int n) {
+        // Your code here
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int n = sc.nextInt();
+        System.out.println(climbStairs(n));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+using namespace std;
+
+int climbStairs(int n) {
+    if (n <= 2) return n;
+    int prev = 1, curr = 2;
+    for (int i = 3; i <= n; i++) {
+        int temp = curr;
+        curr = prev + curr;
+        prev = temp;
+    }
+    return curr;
+}
+
+int main() {
+    int n;
+    cin >> n;
+    cout << climbStairs(n) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int climbStairs(int n) {
+        if (n <= 2) return n;
+        int prev = 1, curr = 2;
+        for (int i = 3; i <= n; i++) {
+            int temp = curr;
+            curr = prev + curr;
+            prev = temp;
+        }
+        return curr;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int n = sc.nextInt();
+        System.out.println(climbStairs(n));
+    }
+}`,
     test_cases: [
       { input: '2', expected_output: '2', is_sample: true },
       { input: '3', expected_output: '3', is_sample: true },
@@ -948,6 +1775,92 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <climits>
+#include <algorithm>
+using namespace std;
+
+int maxProfit(vector<int>& prices) {
+    // Your code here
+    return 0;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> prices;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) prices.push_back(stoi(num));
+    cout << maxProfit(prices) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int maxProfit(int[] prices) {
+        // Your code here
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] prices = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) prices[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(maxProfit(prices));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <climits>
+#include <algorithm>
+using namespace std;
+
+int maxProfit(vector<int>& prices) {
+    int minPrice = INT_MAX, maxProfit = 0;
+    for (int price : prices) {
+        minPrice = min(minPrice, price);
+        maxProfit = max(maxProfit, price - minPrice);
+    }
+    return maxProfit;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> prices;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) prices.push_back(stoi(num));
+    cout << maxProfit(prices) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int maxProfit(int[] prices) {
+        int minPrice = Integer.MAX_VALUE, maxProfit = 0;
+        for (int price : prices) {
+            minPrice = Math.min(minPrice, price);
+            maxProfit = Math.max(maxProfit, price - minPrice);
+        }
+        return maxProfit;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] prices = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) prices[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(maxProfit(prices));
+    }
+}`,
     test_cases: [
       { input: '[7,1,5,3,6,4]', expected_output: '5', is_sample: true },
       { input: '[7,6,4,3,1]', expected_output: '0', is_sample: true },
@@ -1025,6 +1938,83 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <unordered_set>
+using namespace std;
+
+bool containsDuplicate(vector<int>& nums) {
+    // Your code here
+    return false;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    cout << (containsDuplicate(nums) ? "true" : "false") << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static boolean containsDuplicate(int[] nums) {
+        // Your code here
+        return false;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(containsDuplicate(nums));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <unordered_set>
+using namespace std;
+
+bool containsDuplicate(vector<int>& nums) {
+    unordered_set<int> seen(nums.begin(), nums.end());
+    return seen.size() != nums.size();
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    cout << (containsDuplicate(nums) ? "true" : "false") << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static boolean containsDuplicate(int[] nums) {
+        Set<Integer> seen = new HashSet<>();
+        for (int n : nums) seen.add(n);
+        return seen.size() != nums.length;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        System.out.println(containsDuplicate(nums));
+    }
+}`,
     test_cases: [
       { input: '[1,2,3,1]', expected_output: 'true', is_sample: true },
       { input: '[1,2,3,4]', expected_output: 'false', is_sample: true },
@@ -1121,6 +2111,102 @@ rl.on('line', (line) => {
     console.log(JSON.stringify(result));
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <string>
+using namespace std;
+
+vector<string> fizzBuzz(int n) {
+    // Your code here
+    return {};
+}
+
+int main() {
+    int n;
+    cin >> n;
+    vector<string> result = fizzBuzz(n);
+    cout << "[";
+    for (int i = 0; i < result.size(); i++) {
+        cout << "\\"" << result[i] << "\\"" << (i < result.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static List<String> fizzBuzz(int n) {
+        // Your code here
+        return new ArrayList<>();
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int n = sc.nextInt();
+        List<String> result = fizzBuzz(n);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < result.size(); i++) {
+            sb.append("\\"").append(result.get(i)).append("\\"");
+            if (i < result.size() - 1) sb.append(",");
+        }
+        sb.append("]");
+        System.out.println(sb);
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <string>
+using namespace std;
+
+vector<string> fizzBuzz(int n) {
+    vector<string> result;
+    for (int i = 1; i <= n; i++) {
+        if (i % 15 == 0) result.push_back("FizzBuzz");
+        else if (i % 3 == 0) result.push_back("Fizz");
+        else if (i % 5 == 0) result.push_back("Buzz");
+        else result.push_back(to_string(i));
+    }
+    return result;
+}
+
+int main() {
+    int n;
+    cin >> n;
+    vector<string> result = fizzBuzz(n);
+    cout << "[";
+    for (int i = 0; i < result.size(); i++) {
+        cout << "\\"" << result[i] << "\\"" << (i < result.size() - 1 ? "," : "");
+    }
+    cout << "]" << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static List<String> fizzBuzz(int n) {
+        List<String> result = new ArrayList<>();
+        for (int i = 1; i <= n; i++) {
+            if (i % 15 == 0) result.add("FizzBuzz");
+            else if (i % 3 == 0) result.add("Fizz");
+            else if (i % 5 == 0) result.add("Buzz");
+            else result.add(String.valueOf(i));
+        }
+        return result;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int n = sc.nextInt();
+        List<String> result = fizzBuzz(n);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < result.size(); i++) {
+            sb.append("\\"").append(result.get(i)).append("\\"");
+            if (i < result.size() - 1) sb.append(",");
+        }
+        sb.append("]");
+        System.out.println(sb);
+    }
+}`,
     test_cases: [
       { input: '3', expected_output: '["1","2","Fizz"]', is_sample: true },
       { input: '5', expected_output: '["1","2","Fizz","4","Buzz"]', is_sample: true },
@@ -1218,6 +2304,98 @@ rl.on('close', () => {
     const result = search(nums, target);
     console.log(result);
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+int search(vector<int>& nums, int target) {
+    // Your code here
+    return -1;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    int target;
+    cin >> target;
+    cout << search(nums, target) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int search(int[] nums, int target) {
+        // Your code here
+        return -1;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        int target = Integer.parseInt(sc.nextLine().trim());
+        System.out.println(search(nums, target));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+using namespace std;
+
+int search(vector<int>& nums, int target) {
+    int left = 0, right = nums.size() - 1;
+    while (left <= right) {
+        int mid = (left + right) / 2;
+        if (nums[mid] == target) return mid;
+        else if (nums[mid] < target) left = mid + 1;
+        else right = mid - 1;
+    }
+    return -1;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> nums;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) nums.push_back(stoi(num));
+    int target;
+    cin >> target;
+    cout << search(nums, target) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int search(int[] nums, int target) {
+        int left = 0, right = nums.length - 1;
+        while (left <= right) {
+            int mid = (left + right) / 2;
+            if (nums[mid] == target) return mid;
+            else if (nums[mid] < target) left = mid + 1;
+            else right = mid - 1;
+        }
+        return -1;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] nums = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) nums[i] = Integer.parseInt(parts[i].trim());
+        int target = Integer.parseInt(sc.nextLine().trim());
+        System.out.println(search(nums, target));
+    }
+}`,
     test_cases: [
       { input: '[-1,0,3,5,9,12]\n9', expected_output: '4', is_sample: true },
       { input: '[-1,0,3,5,9,12]\n2', expected_output: '-1', is_sample: true },
@@ -1321,6 +2499,107 @@ rl.on('close', () => {
     const result = coinChange(coins, amount);
     console.log(result);
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <climits>
+#include <algorithm>
+using namespace std;
+
+int coinChange(vector<int>& coins, int amount) {
+    // Your code here
+    return -1;
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> coins;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) coins.push_back(stoi(num));
+    int amount;
+    cin >> amount;
+    cout << coinChange(coins, amount) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int coinChange(int[] coins, int amount) {
+        // Your code here
+        return -1;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] coins = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) coins[i] = Integer.parseInt(parts[i].trim());
+        int amount = Integer.parseInt(sc.nextLine().trim());
+        System.out.println(coinChange(coins, amount));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <vector>
+#include <sstream>
+#include <climits>
+#include <algorithm>
+using namespace std;
+
+int coinChange(vector<int>& coins, int amount) {
+    vector<int> dp(amount + 1, INT_MAX);
+    dp[0] = 0;
+    for (int i = 1; i <= amount; i++) {
+        for (int coin : coins) {
+            if (coin <= i && dp[i - coin] != INT_MAX) {
+                dp[i] = min(dp[i], dp[i - coin] + 1);
+            }
+        }
+    }
+    return dp[amount] == INT_MAX ? -1 : dp[amount];
+}
+
+int main() {
+    string line;
+    getline(cin, line);
+    vector<int> coins;
+    stringstream ss(line.substr(1, line.size() - 2));
+    string num;
+    while (getline(ss, num, ',')) coins.push_back(stoi(num));
+    int amount;
+    cin >> amount;
+    cout << coinChange(coins, amount) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int coinChange(int[] coins, int amount) {
+        int[] dp = new int[amount + 1];
+        Arrays.fill(dp, amount + 1);
+        dp[0] = 0;
+        for (int i = 1; i <= amount; i++) {
+            for (int coin : coins) {
+                if (coin <= i) {
+                    dp[i] = Math.min(dp[i], dp[i - coin] + 1);
+                }
+            }
+        }
+        return dp[amount] > amount ? -1 : dp[amount];
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String line = sc.nextLine();
+        String[] parts = line.substring(1, line.length() - 1).split(",");
+        int[] coins = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) coins[i] = Integer.parseInt(parts[i].trim());
+        int amount = Integer.parseInt(sc.nextLine().trim());
+        System.out.println(coinChange(coins, amount));
+    }
+}`,
     test_cases: [
       { input: '[1,2,5]\n11', expected_output: '3', is_sample: true },
       { input: '[2]\n3', expected_output: '-1', is_sample: true },
@@ -1416,6 +2695,82 @@ rl.on('line', (line) => {
     console.log(result);
     rl.close();
 });`,
+    starter_code_cpp: `#include <iostream>
+#include <unordered_set>
+#include <algorithm>
+using namespace std;
+
+int lengthOfLongestSubstring(string s) {
+    // Your code here
+    return 0;
+}
+
+int main() {
+    string s;
+    getline(cin, s);
+    cout << lengthOfLongestSubstring(s) << endl;
+    return 0;
+}`,
+    starter_code_java: `import java.util.*;
+
+public class Solution {
+    public static int lengthOfLongestSubstring(String s) {
+        // Your code here
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String s = sc.hasNextLine() ? sc.nextLine() : "";
+        System.out.println(lengthOfLongestSubstring(s));
+    }
+}`,
+    solution_cpp: `#include <iostream>
+#include <unordered_set>
+#include <algorithm>
+using namespace std;
+
+int lengthOfLongestSubstring(string s) {
+    unordered_set<char> charSet;
+    int left = 0, maxLen = 0;
+    for (int right = 0; right < s.size(); right++) {
+        while (charSet.count(s[right])) {
+            charSet.erase(s[left++]);
+        }
+        charSet.insert(s[right]);
+        maxLen = max(maxLen, right - left + 1);
+    }
+    return maxLen;
+}
+
+int main() {
+    string s;
+    getline(cin, s);
+    cout << lengthOfLongestSubstring(s) << endl;
+    return 0;
+}`,
+    solution_java: `import java.util.*;
+
+public class Solution {
+    public static int lengthOfLongestSubstring(String s) {
+        Set<Character> charSet = new HashSet<>();
+        int left = 0, maxLen = 0;
+        for (int right = 0; right < s.length(); right++) {
+            while (charSet.contains(s.charAt(right))) {
+                charSet.remove(s.charAt(left++));
+            }
+            charSet.add(s.charAt(right));
+            maxLen = Math.max(maxLen, right - left + 1);
+        }
+        return maxLen;
+    }
+
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        String s = sc.hasNextLine() ? sc.nextLine() : "";
+        System.out.println(lengthOfLongestSubstring(s));
+    }
+}`,
     test_cases: [
       { input: 'abcabcbb', expected_output: '3', is_sample: true },
       { input: 'bbbbb', expected_output: '1', is_sample: true },
@@ -1450,8 +2805,8 @@ async function seed(): Promise<void> {
       const problemId = uuidv4();
 
       await pool.query(`
-        INSERT INTO problems (id, title, slug, description, examples, constraints, difficulty, starter_code_python, starter_code_javascript, solution_python, solution_javascript)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO problems (id, title, slug, description, examples, constraints, difficulty, starter_code_python, starter_code_javascript, starter_code_cpp, starter_code_java, solution_python, solution_javascript, solution_cpp, solution_java)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         ON CONFLICT (slug) DO UPDATE SET
           title = EXCLUDED.title,
           description = EXCLUDED.description,
@@ -1460,8 +2815,12 @@ async function seed(): Promise<void> {
           difficulty = EXCLUDED.difficulty,
           starter_code_python = EXCLUDED.starter_code_python,
           starter_code_javascript = EXCLUDED.starter_code_javascript,
+          starter_code_cpp = EXCLUDED.starter_code_cpp,
+          starter_code_java = EXCLUDED.starter_code_java,
           solution_python = EXCLUDED.solution_python,
           solution_javascript = EXCLUDED.solution_javascript,
+          solution_cpp = EXCLUDED.solution_cpp,
+          solution_java = EXCLUDED.solution_java,
           updated_at = NOW()
         RETURNING id
       `, [
@@ -1474,8 +2833,12 @@ async function seed(): Promise<void> {
         problem.difficulty,
         problem.starter_code_python,
         problem.starter_code_javascript,
+        problem.starter_code_cpp,
+        problem.starter_code_java,
         problem.solution_python,
-        problem.solution_javascript
+        problem.solution_javascript,
+        problem.solution_cpp,
+        problem.solution_java
       ]);
 
       // Get the actual problem ID (in case of update)

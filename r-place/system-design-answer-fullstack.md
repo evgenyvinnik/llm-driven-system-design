@@ -4,7 +4,7 @@
 
 ## Introduction (2 minutes)
 
-"Thanks for this challenge. I'll be designing r/place, Reddit's collaborative pixel art canvas where millions of users place colored pixels on a shared canvas in real-time, with rate limiting to encourage collaboration. As a fullstack engineer, I'll focus on the end-to-end pixel placement flow, the real-time WebSocket protocol, session management, and how frontend and backend coordinate to deliver a smooth collaborative experience. Let me clarify the requirements."
+"Thanks for this challenge. I'll be designing r/place, Reddit's collaborative pixel art canvas where millions of users place colored pixels in real-time. As a fullstack engineer, I'll focus on how the frontend and backend coordinate: the hybrid CDN + WebSocket architecture, optimistic updates with server validation, and the end-to-end pixel placement flow. Reddit handled 10.4 million concurrent users with this design."
 
 ---
 
@@ -13,142 +13,183 @@
 ### Functional Requirements
 
 1. **Shared Pixel Canvas** - A grid where any authenticated user can place colored pixels
-2. **Rate Limiting** - Users can only place one pixel every 5 seconds
-3. **Real-time Updates** - All users see pixel placements from others instantly
+2. **Rate Limiting** - Users can only place one pixel every 5 minutes
+3. **Real-time Updates** - All users see pixel placements instantly
 4. **Color Palette** - 16-color selection
 5. **Canvas History** - Store all pixel placement events
 6. **Session Management** - Support both registered users and anonymous guests
 
 ### Non-Functional Requirements
 
-- **Latency** - Pixel updates visible within 100ms
-- **Scale** - Support 100K concurrent users
+- **Latency** - Pixel updates visible within 500ms globally
+- **Scale** - Support 10+ million concurrent users (Reddit's actual number)
 - **Consistency** - Eventual consistency with last-write-wins
-- **Availability** - 99.9% uptime during events
+- **Availability** - Must stay up during the 4-day event
 
 ### Fullstack Considerations
 
-- WebSocket protocol design for bidirectional communication
-- Optimistic UI with server-side validation
+- Hybrid rendering: CDN bitmap + WebSocket delta overlay
+- Optimistic UI with server-side validation and rollback
 - Session handling across frontend and backend
-- Error handling and graceful degradation
+- Graceful degradation when components fail
 
 ---
 
 ## 🏗️ 2. High-Level Architecture (5 minutes)
 
+"The key insight is separating canvas reads (CDN) from real-time updates (WebSocket)."
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      FRONTEND (React)                            │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ Canvas View  │  │ WebSocket    │  │ Auth Store   │          │
-│  │ (HTML5)      │  │ Manager      │  │ (Zustand)    │          │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-└─────────┼─────────────────┼─────────────────┼───────────────────┘
-          │                 │                 │
-          ▼                 ▼                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      API GATEWAY (nginx)                         │
-│                        Port 3000                                 │
-└─────────────────────────────────────────────────────────────────┘
-          │                 │                 │
-          ▼                 ▼                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    BACKEND (Express + WS)                        │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ REST Routes  │  │ WebSocket    │  │ Session      │          │
-│  │ /api/v1/*    │  │ Handler      │  │ Middleware   │          │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-└─────────┼─────────────────┼─────────────────┼───────────────────┘
-          │                 │                 │
-          ▼                 ▼                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    INFRASTRUCTURE LAYER                          │
-├───────────────┬───────────────┬───────────────┬─────────────────┤
-│    Redis      │  PostgreSQL   │   RabbitMQ    │     Redis       │
-│   (Canvas)    │   (History)   │   (Jobs)      │   (Sessions)    │
-└───────────────┴───────────────┴───────────────┴─────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           FRONTEND (React)                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐             │
+│  │  Canvas Layer  │  │  WebSocket     │  │  Auth/Session  │             │
+│  │  (CDN bitmap + │  │  Manager       │  │  Store         │             │
+│  │   WS overlay)  │  │  (reconnect)   │  │  (Zustand)     │             │
+│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘             │
+│          │                   │                   │                       │
+└──────────┼───────────────────┼───────────────────┼───────────────────────┘
+           │                   │                   │
+           ▼                   ▼                   ▼
+┌──────────────────┐  ┌────────────────────────────────────────────────────┐
+│   CDN (Fastly)   │  │              BACKEND (Go)                          │
+│   Canvas bitmap  │  ├────────────────────────────────────────────────────┤
+│   (1-2s TTL)     │  │  ┌──────────────┐  ┌──────────────┐               │
+└──────────────────┘  │  │  WebSocket   │  │  REST API    │               │
+                      │  │  Handler     │  │  /api/v1/*   │               │
+                      │  └──────┬───────┘  └──────┬───────┘               │
+                      └─────────┼─────────────────┼────────────────────────┘
+                                │                 │
+           ┌────────────────────┼─────────────────┼────────────────────┐
+           │                    │                 │                    │
+    ┌──────▼──────┐      ┌──────▼──────┐   ┌──────▼──────┐      ┌──────▼──────┐
+    │   Redis     │      │   Kafka     │   │  Cassandra  │      │   Redis     │
+    │  (Canvas +  │      │  (Events)   │   │  (History)  │      │ (Sessions)  │
+    │  Rate limit)│      │             │   │             │      │             │
+    └─────────────┘      └─────────────┘   └─────────────┘      └─────────────┘
 ```
 
 ---
 
-## 🔧 3. Deep Dive: End-to-End Pixel Placement Flow (10 minutes)
+## 🔧 3. Deep Dive: Hybrid Canvas Rendering (10 minutes)
 
-### Complete Flow Diagram
+"The frontend renders two layers: a CDN-served bitmap (background) and WebSocket deltas (overlay)."
+
+### Frontend Rendering Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Canvas Rendering Stack                         │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Layer 2: WebSocket Delta Overlay                          │  │
+│  │  - Accumulated pixel updates since CDN fetch               │  │
+│  │  - Rendered on top of base layer                           │  │
+│  │  - Cleared when new CDN bitmap loads                       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                           ▲                                      │
+│                           │ Overlay                              │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Layer 1: CDN Bitmap (Base)                                │  │
+│  │  - Fetched from Fastly CDN on load                         │  │
+│  │  - Refreshed every 30-60 seconds                           │  │
+│  │  - 2MB bit-packed (4 bits per pixel)                       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why Hybrid Rendering?
+
+| Approach | Bandwidth | Latency | Complexity |
+|----------|-----------|---------|------------|
+| ❌ WebSocket only | 35K msg/s × 10M = impossible | Low | High |
+| ❌ CDN polling | 10M × 2MB/s = 20PB/s | 1-2s stale | Low |
+| ✅ Hybrid | CDN once + small deltas | Real-time | Medium |
+
+### Frontend Canvas State (Zustand)
+
+| Property | Type | Description |
+|----------|------|-------------|
+| baseCanvas | Uint8Array | CDN bitmap (bit-packed) |
+| deltaPixels | Map<string, number> | WebSocket updates: "x,y" → color |
+| lastCdnFetch | number | Timestamp of last CDN refresh |
+
+### Rendering Flow
+
+1. **Initial load**: Fetch bitmap from CDN, decode bit-packed data, render to canvas
+2. **WebSocket updates**: Add to deltaPixels map, render overlay
+3. **Periodic refresh**: Every 30-60s, fetch new CDN bitmap, clear deltas
+4. **Zoom/pan**: Apply CSS transform, no re-render needed
+
+---
+
+## 🔧 4. Deep Dive: End-to-End Pixel Placement (8 minutes)
+
+### Complete Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                   PIXEL PLACEMENT FLOW                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  FRONTEND                 BACKEND                    REDIS      │
-│     │                        │                         │        │
-│     │ 1. Click canvas (x,y)  │                         │        │
-│     │───────────────────────▶│                         │        │
-│     │    WebSocket: place    │                         │        │
-│     │                        │                         │        │
-│     │                        │ 2. Check rate limit     │        │
-│     │                        │────────────────────────▶│        │
-│     │                        │ SET NX EX               │        │
-│     │                        │                         │        │
-│     │                        │ 3. Update canvas        │        │
-│     │                        │────────────────────────▶│        │
-│     │                        │ SETRANGE                │        │
-│     │                        │                         │        │
-│     │                        │ 4. Publish update       │        │
-│     │                        │────────────────────────▶│        │
-│     │                        │ PUBLISH                 │        │
-│     │                        │                         │        │
-│     │ 5. Receive update      │                         │        │
-│     │◀───────────────────────│                         │        │
-│     │    pixels: [...]       │                         │        │
-│     │                        │                         │        │
-│     │ 6. Update local canvas │                         │        │
-│     ▼                        ▼                         ▼        │
+│                                                                  │
+│  FRONTEND                BACKEND                 INFRASTRUCTURE  │
+│     │                       │                          │         │
+│     │ 1. User clicks        │                          │         │
+│     │    (x=100, y=200)     │                          │         │
+│     │                       │                          │         │
+│     │ 2. Optimistic update  │                          │         │
+│     │    (show pixel)       │                          │         │
+│     │                       │                          │         │
+│     │ 3. WebSocket: place   │                          │         │
+│     │───────────────────────▶                          │         │
+│     │                       │ 4. Rate limit check      │         │
+│     │                       │─────────────────────────▶│ Redis   │
+│     │                       │    SET NX EX             │         │
+│     │                       │                          │         │
+│     │                       │ 5. Update canvas         │         │
+│     │                       │─────────────────────────▶│ Redis   │
+│     │                       │    SETBIT                │         │
+│     │                       │                          │         │
+│     │                       │ 6. Publish event         │         │
+│     │                       │─────────────────────────▶│ Kafka   │
+│     │                       │                          │         │
+│     │ 7. Confirmation       │                          │         │
+│     │◀───────────────────────                          │         │
+│     │    { success, next }  │                          │         │
+│     │                       │                          │         │
+│     │ 8. Broadcast (batch)  │◀─────────────────────────│ Kafka   │
+│     │◀───────────────────────                          │         │
+│     │    { pixels: [...] }  │                          │         │
+│     ▼                       ▼                          ▼         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend: Click Handler with Optimistic Update
+### Frontend: Optimistic Update with Rollback
 
-"We use optimistic updates to show the pixel immediately, then rollback if the server rejects it."
+**placePixel(x, y, color):**
 
-**Step-by-step:**
-1. **Get coordinates** - Convert click position to canvas (x, y)
-2. **Check local cooldown** - If cooldownEnd > now, show toast and return
-3. **Store previous color** - For rollback: previousColor = canvas[y × width + x]
-4. **Optimistic update** - Immediately update canvas and start cooldown
-5. **Send to server** - WebSocket message with x, y, color, requestId
-6. **Handle response:**
-   - On success: Update cooldown from server's nextPlacement
-   - On error: Rollback to previousColor, show error toast
+1. **Check local cooldown** - If cooldownEnd > Date.now(), show toast, return
+2. **Store rollback state** - previousColor = getPixel(x, y)
+3. **Optimistic update** - setPixel(x, y, color), start cooldown UI
+4. **Send to server** - WebSocket message with requestId
+5. **On success** - Update cooldown from server's nextPlacement
+6. **On error** - setPixel(x, y, previousColor), show error toast
 
 ### Backend: Placement Handler
 
-**Validation:**
-1. Check 0 ≤ x < WIDTH and 0 ≤ y < HEIGHT → INVALID_COORDS error
-2. Check 0 ≤ color < 16 → INVALID_COLOR error
+**handlePlace(x, y, color, userId):**
 
-**Rate limit check:**
-- Key: `ratelimit:user:{userId}`
-- Command: SET key 1 NX EX 5 (only set if not exists, expire in 5s)
-- If returns null → RATE_LIMITED error with TTL
-
-**Update canvas:**
-- offset = y × WIDTH + x
-- SETRANGE canvas:main {offset} {colorByte}
-
-**Broadcast and persist:**
-- PUBLISH canvas:updates {x, y, color, userId, timestamp}
-- Queue event for PostgreSQL via RabbitMQ
-
-**Return success:**
-- `{ type: 'success', requestId, nextPlacement: now + cooldownMs }`
+1. **Validate** - 0 ≤ x < WIDTH, 0 ≤ y < HEIGHT, 0 ≤ color < 16
+2. **Rate limit** - `SET ratelimit:{userId} 1 NX EX 300` (5 min)
+3. **Update Redis** - Bit-pack and SETBIT at calculated offset
+4. **Publish to Kafka** - Event for broadcast and persistence
+5. **Return** - { success: true, nextPlacement: now + 300000 }
 
 ---
 
-## 📡 4. Deep Dive: WebSocket Protocol Design (8 minutes)
+## 📡 5. Deep Dive: WebSocket Protocol (6 minutes)
 
 ### Message Types
 
@@ -157,251 +198,185 @@
 | Type | Fields | Description |
 |------|--------|-------------|
 | `place` | x, y, color, requestId | Place a pixel |
-| `ping` | — | Keepalive |
+| `ping` | — | Keepalive (every 30s) |
 
 **Server → Client:**
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `welcome` | userId, cooldown, canvasInfo | Connection established |
-| `canvas` | data (base64), width, height | Full canvas state |
-| `pixels` | events[] | Batch of pixel updates |
-| `success` | requestId, nextPlacement | Placement confirmed |
-| `error` | code, message, requestId?, remainingSeconds? | Placement failed |
+| `init` | canvasUrl, cooldown, canvasInfo | Connection established |
+| `batch` | pixels[], timestamp | Batched updates (every 1s) |
+| `placed` | requestId, nextPlacement | Your placement confirmed |
+| `error` | code, message, requestId?, retryAfter? | Placement failed |
 | `pong` | — | Heartbeat response |
 
-**CanvasInfo structure:**
-- width: number (e.g., 500)
-- height: number (e.g., 500)
-- cooldownSeconds: number (e.g., 5)
-- colorCount: number (e.g., 16)
+### Why Batch Updates?
 
-### Backend: Connection Lifecycle
-
-**On server start:**
-1. Create Redis subscriber
-2. Subscribe to `canvas:updates` channel
-3. On message: broadcast to all connected clients
-
-**On new connection:**
-1. Get or create session from cookie
-2. Add to connections set
-3. Send welcome message with userId, remaining cooldown
-4. Send full canvas state (base64 encoded)
-5. Set up message and close handlers
-
-**On disconnect:**
-1. Remove from connections set
-2. Clean up pending requests
+| Approach | Messages to 10M clients | Feasibility |
+|----------|------------------------|-------------|
+| Individual | 35K × 10M = 350B/sec | ❌ Impossible |
+| 1s batches | 10M × ~5KB = 50GB/sec | ✅ Distributed |
 
 ### Frontend: WebSocket Manager
 
 **State:**
-- ws: WebSocket | null
-- reconnectAttempts: number
-- pendingRequests: Map<requestId, { resolve, reject }>
 
-**connect():**
-1. Determine protocol (wss: for https:, ws: for http:)
-2. Create WebSocket to `${protocol}//${host}/ws`
-3. Set up handlers for open, message, close, error
-4. On open: reset attempts, set connected, start batch processing
+| Property | Type | Description |
+|----------|------|-------------|
+| ws | WebSocket \| null | Current connection |
+| reconnectAttempts | number | For exponential backoff |
+| pendingRequests | Map | requestId → { resolve, reject, timeout } |
+| updateBuffer | PixelUpdate[] | Incoming updates for batch render |
 
-**Reconnection:**
-- Delay: min(1000 × 2^attempts, 30000)
-- Jitter: random() × 1000
-- Schedule reconnect with delay + jitter
+**Reconnection with Backoff:**
 
-**placePixel(x, y, color) → Promise:**
-1. Generate requestId (UUID)
-2. Store { resolve, reject } in pendingRequests
-3. Send message, set 5s timeout
-4. On response: match by requestId, resolve or reject
+| Attempt | Delay | With Jitter |
+|---------|-------|-------------|
+| 1 | 1s | 1.0-2.0s |
+| 2 | 2s | 2.0-3.0s |
+| 3 | 4s | 4.0-5.0s |
+| 4+ | 8-30s | + random 0-1s |
 
 ---
 
-## 🔐 5. Deep Dive: Session Management (6 minutes)
+## 🔐 6. Deep Dive: Session Management (5 minutes)
 
-### Session Structure
+### Architecture
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Session Flow                                 │
+│                                                                 │
+│  Browser           Backend              Redis                   │
+│     │                 │                   │                     │
+│     │ 1. First visit  │                   │                     │
+│     │ (no cookie)     │                   │                     │
+│     │────────────────▶│                   │                     │
+│     │                 │ 2. Create guest   │                     │
+│     │                 │────────────────────▶                    │
+│     │                 │ SET session:{id}  │                     │
+│     │                 │ TTL 24h           │                     │
+│     │ 3. Set-Cookie   │                   │                     │
+│     │◀────────────────│                   │                     │
+│     │ sessionId=abc   │                   │                     │
+│     │ httpOnly,secure │                   │                     │
+│     │                 │                   │                     │
+│     │ 4. Subsequent   │                   │                     │
+│     │ requests        │                   │                     │
+│     │────────────────▶│ 5. Lookup session │                     │
+│     │                 │────────────────────▶                    │
+│     │                 │ GET session:{id}  │                     │
+│     ▼                 ▼                   ▼                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Session Structure (Redis JSON)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| userId | string | Unique identifier |
+| userId | string | UUID, persists across logins |
 | username | string | Display name |
 | isGuest | boolean | Anonymous or registered |
-| isAdmin | boolean | Admin privileges |
-| createdAt | Date | Session creation time |
+| isAdmin | boolean | Moderation privileges |
+| createdAt | number | Session start timestamp |
+| lastCooldown | number | Last pixel placement time |
 
-### Backend: Session Middleware
+### Frontend Auth Store (Zustand)
 
-**On each request:**
-1. Check for sessionId cookie
-2. If exists: fetch session from Redis (`session:{sessionId}`)
-3. If valid: attach to request, refresh TTL
-4. If missing/invalid: create guest session
+| State | Type | Description |
+|-------|------|-------------|
+| user | User \| null | Current user info |
+| isLoading | boolean | Fetching session |
+| cooldownEnd | number \| null | When can place next |
 
-**Creating guest session:**
-- Generate new sessionId (UUID)
-- Create session with random username (Guest_XXXXXX)
-- Store in Redis with 24h TTL
-- Set httpOnly, secure, sameSite cookie
-
-### Auth API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/register` | Create account |
-| POST | `/api/v1/auth/login` | Login |
-| POST | `/api/v1/auth/logout` | End session |
-| GET | `/api/v1/auth/me` | Get current user |
-
-**Register flow:**
-1. Validate username (3-32 chars) and password (≥8 chars)
-2. Check username not taken
-3. Hash password with bcrypt (cost 12)
-4. Insert into users table
-5. Update session to non-guest
-
-**Login flow:**
-1. Look up user by username (check not banned)
-2. Verify password with bcrypt
-3. Update session with user data
-
-### Frontend: Auth Store (Zustand)
-
-**State:**
-- userId, username, isGuest, isAdmin, isLoading
-
-**Actions:**
-- fetchSession(): GET /api/v1/auth/me on app load
-- login(username, password): POST /api/v1/auth/login
-- logout(): POST /api/v1/auth/logout, reload page
+| Action | Description |
+|--------|-------------|
+| fetchSession() | GET /api/v1/auth/me on app load |
+| login(u, p) | POST /api/v1/auth/login |
+| logout() | POST /api/v1/auth/logout, reload |
 
 ---
 
-## 🚨 6. Deep Dive: Error Handling (5 minutes)
-
-### Error Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  FRONTEND                 BACKEND               USER FEEDBACK   │
-│     │                        │                       │          │
-│     │ 1. Place pixel         │                       │          │
-│     │───────────────────────▶│                       │          │
-│     │                        │                       │          │
-│     │ 2. Rate limited        │                       │          │
-│     │◀───────────────────────│                       │          │
-│     │  error: RATE_LIMITED   │                       │          │
-│     │  remainingSeconds: 3   │                       │          │
-│     │                        │                       │          │
-│     │ 3. Rollback pixel      │                       │          │
-│     │ 4. Update cooldown     │                       │          │
-│     │ 5. Show toast ─────────────────────────────────▶│         │
-│     │                        │    "Wait 3 seconds"   │          │
-│     ▼                        ▼                       ▼          │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Backend: AppError Class
-
-| Property | Type | Example |
-|----------|------|---------|
-| code | string | 'RATE_LIMITED' |
-| message | string | 'Please wait before placing another pixel' |
-| statusCode | number | 429 |
-| metadata | object | { remainingSeconds: 3 } |
-
-**Error handler middleware:**
-- If AppError: respond with code, message, metadata
-- Else: log error, respond with generic INTERNAL_ERROR
-
-### Frontend: Error Handling
-
-**ErrorBoundary:**
-- Wrap entire app
-- Show fallback UI on crash
-- Log error to monitoring
-
-**Toast notifications:**
-- Queue of toasts with auto-dismiss (3s)
-- Color-coded by type (error, success, info)
-
----
-
-## 📡 7. API Design Summary
+## 📡 7. API Design
 
 ### REST Endpoints
 
 | Method | Endpoint | Description | Response |
 |--------|----------|-------------|----------|
-| GET | `/api/v1/canvas` | Full canvas binary | Binary (250KB) |
-| GET | `/api/v1/canvas/info` | Canvas metadata | `{ width, height, colorCount, cooldownSeconds }` |
-| GET | `/api/v1/history/pixel?x=&y=` | Pixel history | `{ placements: [...] }` |
-| POST | `/api/v1/auth/register` | Create account | `{ success, username }` |
-| POST | `/api/v1/auth/login` | Login | `{ success, username, isAdmin }` |
+| GET | `/api/v1/canvas` | Redirect to CDN | 302 → CDN URL |
+| GET | `/api/v1/canvas/info` | Metadata | `{ width, height, colors, cooldownSec }` |
+| GET | `/api/v1/pixel?x=&y=` | Pixel history | `{ placements: [...] }` |
+| GET | `/api/v1/auth/me` | Current user | `{ userId, username, isGuest }` |
+| POST | `/api/v1/auth/login` | Login | `{ success, username }` |
 | POST | `/api/v1/auth/logout` | Logout | `{ success }` |
-| GET | `/api/v1/auth/me` | Current user | `{ userId, username, isGuest, isAdmin }` |
 
 ### WebSocket Endpoint
 
 | Endpoint | Protocol | Purpose |
 |----------|----------|---------|
-| `/ws` | WS/WSS | Real-time bidirectional communication |
+| `/ws` | WS/WSS | Real-time bidirectional |
 
 ---
 
 ## ⚖️ 8. Trade-offs Analysis
 
-### Trade-off 1: WebSocket vs. Server-Sent Events + REST
+### Trade-off 1: CDN + WebSocket Hybrid vs. Pure WebSocket
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ WebSocket | Bidirectional, single connection, request/response matching | Connection management complexity |
-| ❌ SSE + REST | Simpler server, built-in reconnection | Two connections, no request/response correlation |
+| ✅ Hybrid (CDN bitmap + WS deltas) | CDN handles 10M users, WS only for deltas | Two systems to maintain |
+| ❌ Pure WebSocket | Single protocol | Can't scale to 10M concurrent |
 
-> "We chose WebSocket because pixel placement needs request/response correlation—when a user places a pixel, we need to tell them specifically whether THAT placement succeeded or failed. With SSE+REST, we'd have to correlate a POST response with an SSE event, adding complexity. WebSocket lets us send a requestId and match the response. The trade-off is we need to implement reconnection logic, but that's well-understood. For a read-only feed, SSE would be simpler, but r/place is inherently bidirectional."
+> "We use a hybrid approach because serving the full canvas (2MB) to 10 million users via WebSocket is impossible—that's 20 petabytes of bandwidth. Instead, clients fetch the bitmap from CDN (which handles massive scale trivially) and receive only incremental updates via WebSocket. The trade-off is rendering complexity: frontend must overlay WebSocket deltas on the CDN bitmap and periodically reconcile. But this is a one-time implementation cost, and the scalability gain is essential."
 
-### Trade-off 2: Session-Based Auth vs. JWT
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Session + Redis | Revocable, simple, server can invalidate | Requires Redis lookup on each request |
-| ❌ JWT | Stateless, no Redis lookup | Can't revoke without blacklist, token bloat |
-
-> "We chose session-based auth because we need instant session invalidation for moderation (banning abusive users must take effect immediately). With JWT, a banned user's token remains valid until expiration. The Redis lookup adds ~1ms latency, which is negligible compared to our 100ms target. Sessions also keep the cookie small (just a session ID vs. a full JWT payload). The trade-off is that every request hits Redis, but we're already hitting Redis for rate limiting, so it's not an additional dependency."
-
-### Trade-off 3: Optimistic UI vs. Wait for Confirmation
+### Trade-off 2: Optimistic UI vs. Wait for Server
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Optimistic + rollback | Instant feedback, responsive UX | Brief incorrect state on rejection |
+| ✅ Optimistic + rollback | Instant feedback (<10ms) | Brief incorrect state on rejection |
 | ❌ Wait for server | Always accurate | 50-200ms delay feels sluggish |
 
-> "We show the pixel immediately because users expect instant feedback. A 100ms delay is perceptible and makes the app feel broken. The trade-off is that ~1% of placements get rejected (mostly rate limiting), requiring rollback. We mitigate this by checking local cooldown state first—if the frontend knows the user is on cooldown, we don't even try to place. Rollback is visually smooth since we restore a single pixel. For financial transactions this would be unacceptable, but for collaborative art, brief optimistic inaccuracy is fine."
+> "We show the pixel immediately because users expect instant feedback—waiting even 100ms makes the app feel broken. The trade-off is that ~1% of placements get rejected (mostly rate limiting), requiring rollback. We mitigate this by checking local cooldown first. Rollback is visually smooth since we're restoring a single pixel. For a collaborative art project, brief optimistic inaccuracy is acceptable; for financial transactions it wouldn't be."
+
+### Trade-off 3: Session-Based vs. JWT Authentication
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Session + Redis | Instant revocation for bans | Redis lookup on every request |
+| ❌ JWT | Stateless, no Redis lookup | Can't revoke until expiration |
+
+> "We chose sessions because banning abusive users must take effect immediately—with JWT, a banned user's token remains valid until expiration, and they could vandalize art for minutes. The Redis lookup adds ~1ms latency, negligible compared to our 500ms target. We're already hitting Redis for rate limiting, so sessions add no new dependency."
 
 ---
 
 ## 🚨 9. Failure Handling
 
-| Component | Failure Mode | Mitigation |
-|-----------|--------------|------------|
-| Redis | Down | Circuit breaker, serve cached canvas from CDN |
-| PostgreSQL | Down | Buffer events in RabbitMQ, retry on recovery |
-| WebSocket | Disconnect | Auto-reconnect with exponential backoff |
-| API Server | Crash | Load balancer health checks, stateless servers |
+| Component | Failure | Frontend Behavior | Backend Mitigation |
+|-----------|---------|-------------------|-------------------|
+| CDN | Edge down | Use cached bitmap, show stale warning | Multiple edge PoPs |
+| WebSocket | Disconnect | Exponential backoff reconnect | Stateless servers |
+| Redis | Primary down | Placement fails, show error | Redis Cluster failover |
+| Kafka | Broker down | Placements succeed but delayed broadcast | Replication factor 3 |
+
+### Graceful Degradation
+
+| Scenario | User Experience |
+|----------|-----------------|
+| WebSocket down | Can view canvas (CDN), can't place or see updates |
+| Redis rate limit down | Allow placements (fail open) with warning |
+| Kafka down | Placements work, broadcast delayed, history gaps |
 
 ---
 
 ## 📝 Summary
 
-"To summarize, I've designed r/place as a fullstack application with:
+"To summarize, I've designed r/place as a fullstack system following Reddit's actual architecture:
 
-1. **End-to-end pixel flow** using WebSocket for real-time communication with optimistic updates and server-side validation
-2. **Bidirectional protocol** with typed messages for placement, confirmation, errors, and broadcast updates
-3. **Session management** using Redis-backed sessions with cookie authentication, supporting both guests and registered users
-4. **Comprehensive error handling** with rollback on failure, appropriate user feedback, and graceful degradation
-5. **Frontend state** in Zustand with optimistic updates and automatic reconnection
-6. **Backend services** with rate limiting, event persistence, and pub/sub broadcasting
+1. **Hybrid rendering** - CDN serves 2MB bitmap, WebSocket delivers deltas, frontend overlays both
+2. **Optimistic updates** - Instant feedback with rollback on server rejection
+3. **Batched broadcasts** - 1-second WebSocket batches reduce 350B messages to 10M manageable ones
+4. **Session-based auth** - Redis sessions enable instant ban enforcement
+5. **Kafka event stream** - Durable log for broadcast fan-out and history
+6. **Graceful degradation** - System stays usable when individual components fail
 
-The key insight is that the frontend and backend work together as a unified system—optimistic updates provide instant feedback while server validation ensures correctness. The WebSocket protocol enables true real-time collaboration while the session system provides flexible authentication for both casual and engaged users."
+The key fullstack insight is that frontend and backend aren't separate—they form a unified system where CDN, WebSocket, and optimistic rendering work together. The frontend isn't just displaying data; it's actively participating in the distributed system by maintaining local state, reconciling updates, and handling failures gracefully."

@@ -24,8 +24,12 @@ CREATE TABLE IF NOT EXISTS problems (
   memory_limit_mb INTEGER DEFAULT 256,
   starter_code_python TEXT,
   starter_code_javascript TEXT,
+  starter_code_cpp TEXT,
+  starter_code_java TEXT,
   solution_python TEXT,
   solution_javascript TEXT,
+  solution_cpp TEXT,
+  solution_java TEXT,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );

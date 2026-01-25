@@ -10,12 +10,21 @@ import { createModuleLogger } from '../shared/logger.js';
 import { metrics } from '../shared/metrics.js';
 import { submissionRateLimiter, codeRunRateLimiter } from '../shared/rateLimiter.js';
 import { submissionIdempotency } from '../shared/idempotency.js';
+import { publishSubmissionJob, type SubmissionJob } from '../shared/kafka.js';
 
 const logger = createModuleLogger('submissions');
 const router = Router();
 
-// Initialize code executor
-codeExecutor.init();
+// Supported languages
+const SUPPORTED_LANGUAGES = ['python', 'javascript', 'cpp', 'java'];
+
+// Use Kafka queue if enabled (default: false for backward compatibility)
+const USE_KAFKA_QUEUE = process.env.USE_KAFKA_QUEUE === 'true';
+
+// Initialize code executor (only needed if not using Kafka queue)
+if (!USE_KAFKA_QUEUE) {
+  codeExecutor.init();
+}
 
 interface SubmitBody {
   problemSlug?: string;
@@ -58,8 +67,8 @@ router.post('/', requireAuth, submissionRateLimiter, submissionIdempotency(), as
       return;
     }
 
-    if (!['python', 'javascript'].includes(language)) {
-      res.status(400).json({ error: 'Unsupported language. Use python or javascript.' });
+    if (!SUPPORTED_LANGUAGES.includes(language)) {
+      res.status(400).json({ error: `Unsupported language. Use: ${SUPPORTED_LANGUAGES.join(', ')}` });
       return;
     }
 
@@ -107,11 +116,42 @@ router.post('/', requireAuth, submissionRateLimiter, submissionIdempotency(), as
       userId: req.session.userId,
       problemSlug,
       language,
-      difficulty: problem.difficulty
+      difficulty: problem.difficulty,
+      useKafka: USE_KAFKA_QUEUE,
     }, 'Submission created');
 
-    // Process submission asynchronously
-    processSubmission(submissionId, problem, language, code, req.session.userId!, startTime);
+    if (USE_KAFKA_QUEUE) {
+      // Get test cases for Kafka job
+      const testCasesResult = await pool.query(
+        `SELECT id, input, expected_output, is_sample FROM test_cases
+         WHERE problem_id = $1
+         ORDER BY order_index`,
+        [problem.id]
+      );
+
+      // Publish to Kafka queue
+      const job: SubmissionJob = {
+        submissionId,
+        userId: req.session.userId!,
+        problemId: problem.id,
+        code,
+        language,
+        testCases: testCasesResult.rows.map(tc => ({
+          id: tc.id,
+          input: tc.input,
+          expectedOutput: tc.expected_output,
+          isSample: tc.is_sample,
+        })),
+        timeLimit: problem.time_limit_ms,
+        memoryLimit: problem.memory_limit_mb,
+        createdAt: new Date().toISOString(),
+      };
+
+      await publishSubmissionJob(job);
+    } else {
+      // Process submission asynchronously (legacy mode)
+      processSubmission(submissionId, problem, language, code, req.session.userId!, startTime);
+    }
 
     res.status(202).json({
       submissionId,
@@ -139,8 +179,8 @@ router.post('/run', requireAuth, codeRunRateLimiter, async (req: Request<unknown
       return;
     }
 
-    if (!['python', 'javascript'].includes(language)) {
-      res.status(400).json({ error: 'Unsupported language. Use python or javascript.' });
+    if (!SUPPORTED_LANGUAGES.includes(language)) {
+      res.status(400).json({ error: `Unsupported language. Use: ${SUPPORTED_LANGUAGES.join(', ')}` });
       return;
     }
 

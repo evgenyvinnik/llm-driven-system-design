@@ -213,7 +213,7 @@ class CodeExecutor {
     return await this._runInContainerInternal(options);
   }
 
-  async _runInContainerInternal({ image, workDir, command, timeout, memoryMb }: ExecutionOptions): Promise<ExecutionResult> {
+  async _runInContainerInternal({ image, workDir, compileCommand, runCommand, timeout, memoryMb }: ExecutionOptions): Promise<ExecutionResult> {
     let container: Docker.Container | null = null;
 
     try {
@@ -233,13 +233,24 @@ class CodeExecutor {
         });
       }
 
+      // For compiled languages, we need to compile first
+      if (compileCommand) {
+        const compileResult = await this.runCompileStep(image, workDir, compileCommand, memoryMb);
+        if (compileResult.status !== 'success') {
+          return compileResult;
+        }
+      }
+
+      // Determine bind mode - writable for compiled languages (to read compiled output)
+      const bindMode = compileCommand ? 'rw' : 'ro';
+
       // Create container with security restrictions
       container = await docker.createContainer({
         Image: image,
-        Cmd: command,
+        Cmd: runCommand,
         WorkingDir: '/code',
         HostConfig: {
-          Binds: [`${workDir}:/code:ro`],
+          Binds: [`${workDir}:/code:${bindMode}`],
           Memory: memoryMb * 1024 * 1024,
           MemorySwap: memoryMb * 1024 * 1024, // No swap
           CpuPeriod: 100000,
@@ -326,6 +337,86 @@ class CodeExecutor {
           await container.remove({ force: true }).catch(() => {});
         } catch {
           // Container might already be removed due to AutoRemove
+        }
+      }
+    }
+  }
+
+  /**
+   * Run compilation step for compiled languages (C++, Java)
+   */
+  async runCompileStep(image: string, workDir: string, compileCommand: string[], memoryMb: number): Promise<ExecutionResult> {
+    let container: Docker.Container | null = null;
+
+    try {
+      container = await docker.createContainer({
+        Image: image,
+        Cmd: compileCommand,
+        WorkingDir: '/code',
+        HostConfig: {
+          Binds: [`${workDir}:/code:rw`], // Writable for compilation output
+          Memory: memoryMb * 1024 * 1024,
+          MemorySwap: memoryMb * 1024 * 1024,
+          CpuPeriod: 100000,
+          CpuQuota: 50000,
+          PidsLimit: 50,
+          NetworkMode: 'none',
+          ReadonlyRootfs: false,
+          SecurityOpt: ['no-new-privileges'],
+          CapDrop: ['ALL'],
+          AutoRemove: true
+        },
+        AttachStdout: true,
+        AttachStderr: true,
+        Tty: false
+      });
+
+      const stream = await container.attach({
+        stream: true,
+        stdout: true,
+        stderr: true
+      });
+
+      await container.start();
+
+      // Collect compile output with 30 second timeout
+      const { stdout, stderr, timedOut } = await this.collectOutput(container, stream, 30000);
+
+      if (timedOut) {
+        logger.warn('Compilation timed out');
+        return {
+          status: 'compilation_error',
+          error: 'Compilation timed out',
+          stderr: stderr.substring(0, 2000)
+        };
+      }
+
+      const waitResult = await container.wait();
+
+      if (waitResult.StatusCode !== 0) {
+        return {
+          status: 'compilation_error',
+          stdout: stdout.substring(0, 1000),
+          stderr: stderr.substring(0, 2000),
+          error: 'Compilation failed',
+          exitCode: waitResult.StatusCode
+        };
+      }
+
+      return { status: 'success' };
+    } catch (error) {
+      logger.error({ error: (error as Error).message }, 'Compilation error');
+      return {
+        status: 'compilation_error',
+        error: (error as Error).message
+      };
+    } finally {
+      if (container) {
+        try {
+          await container.stop({ t: 0 }).catch(() => {});
+          await container.remove({ force: true }).catch(() => {});
+        } catch {
+          // Container might already be removed
         }
       }
     }

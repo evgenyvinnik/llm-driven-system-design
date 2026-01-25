@@ -51,6 +51,8 @@ This document tracks the development journey of implementing an online coding pr
   - Easy: Two Sum, Palindrome Number, Valid Parentheses, Merge Two Sorted Lists, Reverse String, Climbing Stairs, Best Time to Buy and Sell Stock, Contains Duplicate, FizzBuzz, Binary Search
   - Medium: Maximum Subarray, Longest Common Subsequence, Coin Change, Longest Substring Without Repeating Characters
   - Hard: Median of Two Sorted Arrays
+- Multi-language support: Python, JavaScript, C++, Java
+- Kafka queue-based execution (optional, for production scale)
 
 ### Phase 3: Scaling and Optimization
 *Completed*
@@ -197,7 +199,8 @@ This document tracks the development journey of implementing an online coding pr
 - [x] Add list virtualization
 - [x] Add more problems (expanded from 7 to 15)
 - [x] Add comprehensive tests (vitest)
-- [ ] Add more language support (C++, Java)
+- [x] Add more language support (C++, Java)
+- [x] Queue-based execution with Kafka (optional)
 
 ---
 
