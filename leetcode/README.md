@@ -39,7 +39,7 @@ An online coding practice and evaluation platform where users can solve programm
 - [x] Idempotency for submissions
 - [x] Virtualized problem list
 - [x] Documentation
-- [ ] Testing
+- [x] Testing (vitest)
 
 ## Getting Started
 
@@ -79,7 +79,7 @@ npm run seed
 This creates:
 - Admin user: `admin` / `admin123`
 - Demo user: `demo` / `user123`
-- 7 sample problems (Two Sum, Palindrome Number, etc.)
+- 15 sample problems across easy, medium, and hard difficulties
 
 4. **Start the backend:**
 

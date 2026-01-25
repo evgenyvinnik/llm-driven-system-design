@@ -47,7 +47,10 @@ This document tracks the development journey of implementing an online coding pr
   - Submission status polling
   - User progress dashboard
   - Admin dashboard
-- Seed data with 7 problems (Two Sum, Palindrome Number, etc.)
+- Seed data with 15 problems covering various algorithm types:
+  - Easy: Two Sum, Palindrome Number, Valid Parentheses, Merge Two Sorted Lists, Reverse String, Climbing Stairs, Best Time to Buy and Sell Stock, Contains Duplicate, FizzBuzz, Binary Search
+  - Medium: Maximum Subarray, Longest Common Subsequence, Coin Change, Longest Substring Without Repeating Characters
+  - Hard: Median of Two Sorted Arrays
 
 ### Phase 3: Scaling and Optimization
 *Completed*
@@ -85,9 +88,9 @@ This document tracks the development journey of implementing an online coding pr
 - Architecture.md with comprehensive trade-off discussions
 - README with setup instructions
 
-**Remaining:**
-- Add comprehensive tests (vitest)
-- Add more problems to seed data
+**Completed:**
+- Comprehensive tests with vitest (auth routes, idempotency module, code executor)
+- Expanded seed data from 7 to 15 problems
 
 ## Design Decisions Log
 
@@ -192,8 +195,8 @@ This document tracks the development journey of implementing an online coding pr
 - [x] Add metrics and observability
 - [x] Add idempotency
 - [x] Add list virtualization
-- [ ] Add more problems
-- [ ] Add comprehensive tests
+- [x] Add more problems (expanded from 7 to 15)
+- [x] Add comprehensive tests (vitest)
 - [ ] Add more language support (C++, Java)
 
 ---

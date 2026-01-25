@@ -704,6 +704,726 @@ rl.on('close', () => {
       { input: '[0,0]\n[0,0]', expected_output: '0.0', is_sample: false },
       { input: '[1]\n[2,3,4,5,6]', expected_output: '3.5', is_sample: false },
     ]
+  },
+  {
+    title: 'Reverse String',
+    slug: 'reverse-string',
+    description: `Write a function that reverses a string. The input string is given as an array of characters \`s\`.
+
+You must do this by modifying the input array in-place with O(1) extra memory.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: s = ["h","e","l","l","o"]
+Output: ["o","l","l","e","h"]
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: s = ["H","a","n","n","a","h"]
+Output: ["h","a","n","n","a","H"]
+\`\`\``,
+    constraints: `- \`1 <= s.length <= 10^5\`
+- \`s[i]\` is a printable ascii character.`,
+    difficulty: 'easy',
+    starter_code_python: `def reverseString(s):
+    """
+    :type s: List[str]
+    :rtype: None (modify s in-place)
+    """
+    # Your code here
+    pass
+
+import json
+s = json.loads(input())
+reverseString(s)
+print(json.dumps(s))`,
+    starter_code_javascript: `function reverseString(s) {
+    // Your code here - modify s in-place
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const s = JSON.parse(line);
+    reverseString(s);
+    console.log(JSON.stringify(s));
+    rl.close();
+});`,
+    solution_python: `def reverseString(s):
+    left, right = 0, len(s) - 1
+    while left < right:
+        s[left], s[right] = s[right], s[left]
+        left += 1
+        right -= 1
+
+import json
+s = json.loads(input())
+reverseString(s)
+print(json.dumps(s))`,
+    solution_javascript: `function reverseString(s) {
+    let left = 0, right = s.length - 1;
+    while (left < right) {
+        [s[left], s[right]] = [s[right], s[left]];
+        left++;
+        right--;
+    }
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const s = JSON.parse(line);
+    reverseString(s);
+    console.log(JSON.stringify(s));
+    rl.close();
+});`,
+    test_cases: [
+      { input: '["h","e","l","l","o"]', expected_output: '["o","l","l","e","h"]', is_sample: true },
+      { input: '["H","a","n","n","a","h"]', expected_output: '["h","a","n","n","a","H"]', is_sample: true },
+      { input: '["a"]', expected_output: '["a"]', is_sample: false },
+      { input: '["A","B"]', expected_output: '["B","A"]', is_sample: false },
+    ]
+  },
+  {
+    title: 'Climbing Stairs',
+    slug: 'climbing-stairs',
+    description: `You are climbing a staircase. It takes \`n\` steps to reach the top.
+
+Each time you can either climb \`1\` or \`2\` steps. In how many distinct ways can you climb to the top?`,
+    examples: `**Example 1:**
+\`\`\`
+Input: n = 2
+Output: 2
+Explanation: There are two ways to climb to the top.
+1. 1 step + 1 step
+2. 2 steps
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: n = 3
+Output: 3
+Explanation: There are three ways to climb to the top.
+1. 1 step + 1 step + 1 step
+2. 1 step + 2 steps
+3. 2 steps + 1 step
+\`\`\``,
+    constraints: `- \`1 <= n <= 45\``,
+    difficulty: 'easy',
+    starter_code_python: `def climbStairs(n):
+    """
+    :type n: int
+    :rtype: int
+    """
+    # Your code here
+    pass
+
+n = int(input())
+result = climbStairs(n)
+print(result)`,
+    starter_code_javascript: `function climbStairs(n) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const n = parseInt(line);
+    const result = climbStairs(n);
+    console.log(result);
+    rl.close();
+});`,
+    solution_python: `def climbStairs(n):
+    if n <= 2:
+        return n
+    prev, curr = 1, 2
+    for _ in range(3, n + 1):
+        prev, curr = curr, prev + curr
+    return curr
+
+n = int(input())
+result = climbStairs(n)
+print(result)`,
+    solution_javascript: `function climbStairs(n) {
+    if (n <= 2) return n;
+    let prev = 1, curr = 2;
+    for (let i = 3; i <= n; i++) {
+        [prev, curr] = [curr, prev + curr];
+    }
+    return curr;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const n = parseInt(line);
+    const result = climbStairs(n);
+    console.log(result);
+    rl.close();
+});`,
+    test_cases: [
+      { input: '2', expected_output: '2', is_sample: true },
+      { input: '3', expected_output: '3', is_sample: true },
+      { input: '1', expected_output: '1', is_sample: false },
+      { input: '5', expected_output: '8', is_sample: false },
+      { input: '10', expected_output: '89', is_sample: false },
+    ]
+  },
+  {
+    title: 'Best Time to Buy and Sell Stock',
+    slug: 'best-time-to-buy-and-sell-stock',
+    description: `You are given an array \`prices\` where \`prices[i]\` is the price of a given stock on the \`i\`th day.
+
+You want to maximize your profit by choosing a single day to buy one stock and choosing a different day in the future to sell that stock.
+
+Return the maximum profit you can achieve from this transaction. If you cannot achieve any profit, return \`0\`.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: prices = [7,1,5,3,6,4]
+Output: 5
+Explanation: Buy on day 2 (price = 1) and sell on day 5 (price = 6), profit = 6-1 = 5.
+Note that buying on day 2 and selling on day 1 is not allowed because you must buy before you sell.
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: prices = [7,6,4,3,1]
+Output: 0
+Explanation: In this case, no transactions are done and the max profit = 0.
+\`\`\``,
+    constraints: `- \`1 <= prices.length <= 10^5\`
+- \`0 <= prices[i] <= 10^4\``,
+    difficulty: 'easy',
+    starter_code_python: `def maxProfit(prices):
+    """
+    :type prices: List[int]
+    :rtype: int
+    """
+    # Your code here
+    pass
+
+import json
+prices = json.loads(input())
+result = maxProfit(prices)
+print(result)`,
+    starter_code_javascript: `function maxProfit(prices) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const prices = JSON.parse(line);
+    const result = maxProfit(prices);
+    console.log(result);
+    rl.close();
+});`,
+    solution_python: `def maxProfit(prices):
+    min_price = float('inf')
+    max_profit = 0
+    for price in prices:
+        min_price = min(min_price, price)
+        max_profit = max(max_profit, price - min_price)
+    return max_profit
+
+import json
+prices = json.loads(input())
+result = maxProfit(prices)
+print(result)`,
+    solution_javascript: `function maxProfit(prices) {
+    let minPrice = Infinity;
+    let maxProfit = 0;
+    for (const price of prices) {
+        minPrice = Math.min(minPrice, price);
+        maxProfit = Math.max(maxProfit, price - minPrice);
+    }
+    return maxProfit;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const prices = JSON.parse(line);
+    const result = maxProfit(prices);
+    console.log(result);
+    rl.close();
+});`,
+    test_cases: [
+      { input: '[7,1,5,3,6,4]', expected_output: '5', is_sample: true },
+      { input: '[7,6,4,3,1]', expected_output: '0', is_sample: true },
+      { input: '[1,2]', expected_output: '1', is_sample: false },
+      { input: '[2,4,1]', expected_output: '2', is_sample: false },
+      { input: '[3,3,3,3,3]', expected_output: '0', is_sample: false },
+    ]
+  },
+  {
+    title: 'Contains Duplicate',
+    slug: 'contains-duplicate',
+    description: `Given an integer array \`nums\`, return \`true\` if any value appears at least twice in the array, and return \`false\` if every element is distinct.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: nums = [1,2,3,1]
+Output: true
+Explanation: The element 1 occurs at indices 0 and 3.
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: nums = [1,2,3,4]
+Output: false
+Explanation: All elements are distinct.
+\`\`\`
+
+**Example 3:**
+\`\`\`
+Input: nums = [1,1,1,3,3,4,3,2,4,2]
+Output: true
+\`\`\``,
+    constraints: `- \`1 <= nums.length <= 10^5\`
+- \`-10^9 <= nums[i] <= 10^9\``,
+    difficulty: 'easy',
+    starter_code_python: `def containsDuplicate(nums):
+    """
+    :type nums: List[int]
+    :rtype: bool
+    """
+    # Your code here
+    pass
+
+import json
+nums = json.loads(input())
+result = containsDuplicate(nums)
+print(str(result).lower())`,
+    starter_code_javascript: `function containsDuplicate(nums) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const nums = JSON.parse(line);
+    const result = containsDuplicate(nums);
+    console.log(result);
+    rl.close();
+});`,
+    solution_python: `def containsDuplicate(nums):
+    return len(nums) != len(set(nums))
+
+import json
+nums = json.loads(input())
+result = containsDuplicate(nums)
+print(str(result).lower())`,
+    solution_javascript: `function containsDuplicate(nums) {
+    return nums.length !== new Set(nums).size;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const nums = JSON.parse(line);
+    const result = containsDuplicate(nums);
+    console.log(result);
+    rl.close();
+});`,
+    test_cases: [
+      { input: '[1,2,3,1]', expected_output: 'true', is_sample: true },
+      { input: '[1,2,3,4]', expected_output: 'false', is_sample: true },
+      { input: '[1,1,1,3,3,4,3,2,4,2]', expected_output: 'true', is_sample: true },
+      { input: '[1]', expected_output: 'false', is_sample: false },
+      { input: '[1,5,9,1]', expected_output: 'true', is_sample: false },
+    ]
+  },
+  {
+    title: 'FizzBuzz',
+    slug: 'fizzbuzz',
+    description: `Given an integer \`n\`, return a string array \`answer\` (1-indexed) where:
+
+- \`answer[i] == "FizzBuzz"\` if \`i\` is divisible by \`3\` and \`5\`.
+- \`answer[i] == "Fizz"\` if \`i\` is divisible by \`3\`.
+- \`answer[i] == "Buzz"\` if \`i\` is divisible by \`5\`.
+- \`answer[i] == i\` (as a string) if none of the above conditions are true.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: n = 3
+Output: ["1","2","Fizz"]
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: n = 5
+Output: ["1","2","Fizz","4","Buzz"]
+\`\`\`
+
+**Example 3:**
+\`\`\`
+Input: n = 15
+Output: ["1","2","Fizz","4","Buzz","Fizz","7","8","Fizz","Buzz","11","Fizz","13","14","FizzBuzz"]
+\`\`\``,
+    constraints: `- \`1 <= n <= 10^4\``,
+    difficulty: 'easy',
+    starter_code_python: `def fizzBuzz(n):
+    """
+    :type n: int
+    :rtype: List[str]
+    """
+    # Your code here
+    pass
+
+import json
+n = int(input())
+result = fizzBuzz(n)
+print(json.dumps(result))`,
+    starter_code_javascript: `function fizzBuzz(n) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const n = parseInt(line);
+    const result = fizzBuzz(n);
+    console.log(JSON.stringify(result));
+    rl.close();
+});`,
+    solution_python: `def fizzBuzz(n):
+    result = []
+    for i in range(1, n + 1):
+        if i % 15 == 0:
+            result.append("FizzBuzz")
+        elif i % 3 == 0:
+            result.append("Fizz")
+        elif i % 5 == 0:
+            result.append("Buzz")
+        else:
+            result.append(str(i))
+    return result
+
+import json
+n = int(input())
+result = fizzBuzz(n)
+print(json.dumps(result))`,
+    solution_javascript: `function fizzBuzz(n) {
+    const result = [];
+    for (let i = 1; i <= n; i++) {
+        if (i % 15 === 0) result.push("FizzBuzz");
+        else if (i % 3 === 0) result.push("Fizz");
+        else if (i % 5 === 0) result.push("Buzz");
+        else result.push(String(i));
+    }
+    return result;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const n = parseInt(line);
+    const result = fizzBuzz(n);
+    console.log(JSON.stringify(result));
+    rl.close();
+});`,
+    test_cases: [
+      { input: '3', expected_output: '["1","2","Fizz"]', is_sample: true },
+      { input: '5', expected_output: '["1","2","Fizz","4","Buzz"]', is_sample: true },
+      { input: '15', expected_output: '["1","2","Fizz","4","Buzz","Fizz","7","8","Fizz","Buzz","11","Fizz","13","14","FizzBuzz"]', is_sample: true },
+      { input: '1', expected_output: '["1"]', is_sample: false },
+    ]
+  },
+  {
+    title: 'Binary Search',
+    slug: 'binary-search',
+    description: `Given an array of integers \`nums\` which is sorted in ascending order, and an integer \`target\`, write a function to search \`target\` in \`nums\`. If \`target\` exists, then return its index. Otherwise, return \`-1\`.
+
+You must write an algorithm with \`O(log n)\` runtime complexity.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: nums = [-1,0,3,5,9,12], target = 9
+Output: 4
+Explanation: 9 exists in nums and its index is 4
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: nums = [-1,0,3,5,9,12], target = 2
+Output: -1
+Explanation: 2 does not exist in nums so return -1
+\`\`\``,
+    constraints: `- \`1 <= nums.length <= 10^4\`
+- \`-10^4 < nums[i], target < 10^4\`
+- All the integers in \`nums\` are unique.
+- \`nums\` is sorted in ascending order.`,
+    difficulty: 'easy',
+    starter_code_python: `def search(nums, target):
+    """
+    :type nums: List[int]
+    :type target: int
+    :rtype: int
+    """
+    # Your code here
+    pass
+
+import json
+nums = json.loads(input())
+target = int(input())
+result = search(nums, target)
+print(result)`,
+    starter_code_javascript: `function search(nums, target) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+const lines = [];
+rl.on('line', (line) => lines.push(line));
+rl.on('close', () => {
+    const nums = JSON.parse(lines[0]);
+    const target = parseInt(lines[1]);
+    const result = search(nums, target);
+    console.log(result);
+});`,
+    solution_python: `def search(nums, target):
+    left, right = 0, len(nums) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if nums[mid] == target:
+            return mid
+        elif nums[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    return -1
+
+import json
+nums = json.loads(input())
+target = int(input())
+result = search(nums, target)
+print(result)`,
+    solution_javascript: `function search(nums, target) {
+    let left = 0, right = nums.length - 1;
+    while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        if (nums[mid] === target) return mid;
+        else if (nums[mid] < target) left = mid + 1;
+        else right = mid - 1;
+    }
+    return -1;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+const lines = [];
+rl.on('line', (line) => lines.push(line));
+rl.on('close', () => {
+    const nums = JSON.parse(lines[0]);
+    const target = parseInt(lines[1]);
+    const result = search(nums, target);
+    console.log(result);
+});`,
+    test_cases: [
+      { input: '[-1,0,3,5,9,12]\n9', expected_output: '4', is_sample: true },
+      { input: '[-1,0,3,5,9,12]\n2', expected_output: '-1', is_sample: true },
+      { input: '[5]\n5', expected_output: '0', is_sample: false },
+      { input: '[2,5]\n5', expected_output: '1', is_sample: false },
+      { input: '[1,2,3,4,5,6,7,8,9,10]\n1', expected_output: '0', is_sample: false },
+    ]
+  },
+  {
+    title: 'Coin Change',
+    slug: 'coin-change',
+    description: `You are given an integer array \`coins\` representing coins of different denominations and an integer \`amount\` representing a total amount of money.
+
+Return the fewest number of coins that you need to make up that amount. If that amount of money cannot be made up by any combination of the coins, return \`-1\`.
+
+You may assume that you have an infinite number of each kind of coin.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: coins = [1,2,5], amount = 11
+Output: 3
+Explanation: 11 = 5 + 5 + 1
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: coins = [2], amount = 3
+Output: -1
+\`\`\`
+
+**Example 3:**
+\`\`\`
+Input: coins = [1], amount = 0
+Output: 0
+\`\`\``,
+    constraints: `- \`1 <= coins.length <= 12\`
+- \`1 <= coins[i] <= 2^31 - 1\`
+- \`0 <= amount <= 10^4\``,
+    difficulty: 'medium',
+    starter_code_python: `def coinChange(coins, amount):
+    """
+    :type coins: List[int]
+    :type amount: int
+    :rtype: int
+    """
+    # Your code here
+    pass
+
+import json
+coins = json.loads(input())
+amount = int(input())
+result = coinChange(coins, amount)
+print(result)`,
+    starter_code_javascript: `function coinChange(coins, amount) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+const lines = [];
+rl.on('line', (line) => lines.push(line));
+rl.on('close', () => {
+    const coins = JSON.parse(lines[0]);
+    const amount = parseInt(lines[1]);
+    const result = coinChange(coins, amount);
+    console.log(result);
+});`,
+    solution_python: `def coinChange(coins, amount):
+    dp = [float('inf')] * (amount + 1)
+    dp[0] = 0
+    for i in range(1, amount + 1):
+        for coin in coins:
+            if coin <= i:
+                dp[i] = min(dp[i], dp[i - coin] + 1)
+    return dp[amount] if dp[amount] != float('inf') else -1
+
+import json
+coins = json.loads(input())
+amount = int(input())
+result = coinChange(coins, amount)
+print(result)`,
+    solution_javascript: `function coinChange(coins, amount) {
+    const dp = Array(amount + 1).fill(Infinity);
+    dp[0] = 0;
+    for (let i = 1; i <= amount; i++) {
+        for (const coin of coins) {
+            if (coin <= i) {
+                dp[i] = Math.min(dp[i], dp[i - coin] + 1);
+            }
+        }
+    }
+    return dp[amount] === Infinity ? -1 : dp[amount];
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+const lines = [];
+rl.on('line', (line) => lines.push(line));
+rl.on('close', () => {
+    const coins = JSON.parse(lines[0]);
+    const amount = parseInt(lines[1]);
+    const result = coinChange(coins, amount);
+    console.log(result);
+});`,
+    test_cases: [
+      { input: '[1,2,5]\n11', expected_output: '3', is_sample: true },
+      { input: '[2]\n3', expected_output: '-1', is_sample: true },
+      { input: '[1]\n0', expected_output: '0', is_sample: true },
+      { input: '[1,5,10,25]\n30', expected_output: '2', is_sample: false },
+      { input: '[186,419,83,408]\n6249', expected_output: '20', is_sample: false },
+    ]
+  },
+  {
+    title: 'Longest Substring Without Repeating Characters',
+    slug: 'longest-substring-without-repeating-characters',
+    description: `Given a string \`s\`, find the length of the longest substring without repeating characters.`,
+    examples: `**Example 1:**
+\`\`\`
+Input: s = "abcabcbb"
+Output: 3
+Explanation: The answer is "abc", with the length of 3.
+\`\`\`
+
+**Example 2:**
+\`\`\`
+Input: s = "bbbbb"
+Output: 1
+Explanation: The answer is "b", with the length of 1.
+\`\`\`
+
+**Example 3:**
+\`\`\`
+Input: s = "pwwkew"
+Output: 3
+Explanation: The answer is "wke", with the length of 3.
+Notice that the answer must be a substring, "pwke" is a subsequence and not a substring.
+\`\`\``,
+    constraints: `- \`0 <= s.length <= 5 * 10^4\`
+- \`s\` consists of English letters, digits, symbols and spaces.`,
+    difficulty: 'medium',
+    starter_code_python: `def lengthOfLongestSubstring(s):
+    """
+    :type s: str
+    :rtype: int
+    """
+    # Your code here
+    pass
+
+s = input()
+result = lengthOfLongestSubstring(s)
+print(result)`,
+    starter_code_javascript: `function lengthOfLongestSubstring(s) {
+    // Your code here
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const result = lengthOfLongestSubstring(line);
+    console.log(result);
+    rl.close();
+});`,
+    solution_python: `def lengthOfLongestSubstring(s):
+    char_set = set()
+    left = 0
+    max_len = 0
+    for right in range(len(s)):
+        while s[right] in char_set:
+            char_set.remove(s[left])
+            left += 1
+        char_set.add(s[right])
+        max_len = max(max_len, right - left + 1)
+    return max_len
+
+s = input()
+result = lengthOfLongestSubstring(s)
+print(result)`,
+    solution_javascript: `function lengthOfLongestSubstring(s) {
+    const charSet = new Set();
+    let left = 0;
+    let maxLen = 0;
+    for (let right = 0; right < s.length; right++) {
+        while (charSet.has(s[right])) {
+            charSet.delete(s[left]);
+            left++;
+        }
+        charSet.add(s[right]);
+        maxLen = Math.max(maxLen, right - left + 1);
+    }
+    return maxLen;
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+    const result = lengthOfLongestSubstring(line);
+    console.log(result);
+    rl.close();
+});`,
+    test_cases: [
+      { input: 'abcabcbb', expected_output: '3', is_sample: true },
+      { input: 'bbbbb', expected_output: '1', is_sample: true },
+      { input: 'pwwkew', expected_output: '3', is_sample: true },
+      { input: '', expected_output: '0', is_sample: false },
+      { input: 'au', expected_output: '2', is_sample: false },
+      { input: 'dvdf', expected_output: '3', is_sample: false },
+    ]
   }
 ];
 

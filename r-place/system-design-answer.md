@@ -6,14 +6,14 @@
 
 ---
 
-## 1. Requirements Clarification (5 minutes)
+## 🎯 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 
 1. **Shared Pixel Canvas** - A large grid where any authenticated user can place a colored pixel
 2. **Rate Limiting** - Users can only place one pixel every N minutes (e.g., 5 minutes)
 3. **Real-time Updates** - All users see pixel placements from others instantly
-4. **Color Palette** - Limited color selection (e.g., 16-32 colors)
+4. **Color Palette** - Limited color selection (16-32 colors)
 5. **Canvas History** - Ability to view canvas state at any point in time
 6. **Timelapse Generation** - Create videos showing canvas evolution
 
@@ -30,32 +30,39 @@
 
 ---
 
-## 2. Scale Estimation (3 minutes)
+## 📊 2. Scale Estimation (3 minutes)
 
 ### Assumptions
+
 - Canvas size: 2000 x 2000 pixels = 4 million pixels
 - Rate limit: 1 pixel per 5 minutes per user
 - Peak concurrent users: 1 million
 - Event duration: 4 days
 
 ### Traffic Estimates
-- **Max pixel placements**: 1M users / 5 minutes = 3,333 pixels/second
-- **Canvas reads**: 1M users refreshing = ~100,000 reads/second (with caching)
-- **WebSocket connections**: 1 million concurrent
+
+| Metric | Value | Calculation |
+|--------|-------|-------------|
+| Max pixel placements | 3,333/second | 1M users / 5 min cooldown |
+| Canvas reads | ~100,000/second | With aggressive caching |
+| WebSocket connections | 1 million | Concurrent users |
 
 ### Storage Estimates
-- Canvas state: 4M pixels x 1 byte (color) = 4 MB
-- Pixel event: ~50 bytes (x, y, color, user_id, timestamp)
-- 3,333 pixels/second x 86,400 seconds x 4 days = 1.15 billion events
-- **Event storage**: 1.15B x 50 bytes = ~58 GB
+
+| Data Type | Size | Notes |
+|-----------|------|-------|
+| Canvas state | 4 MB | 4M pixels × 1 byte (color index) |
+| Single pixel event | ~50 bytes | x, y, color, user_id, timestamp |
+| Total events (4 days) | ~58 GB | 1.15B events × 50 bytes |
 
 ### Bandwidth
-- Full canvas download: 4 MB
-- Incremental updates: 50 bytes x 3,333/second = 167 KB/second outbound per connection cluster
+
+- Full canvas download: 4 MB (served from CDN)
+- Incremental updates: ~167 KB/second outbound per server cluster
 
 ---
 
-## 3. High-Level Architecture (8 minutes)
+## 🏗️ 3. High-Level Architecture (8 minutes)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -103,247 +110,109 @@
 
 ### Core Components
 
-1. **WebSocket Servers** - Maintain connections with clients, push pixel updates
-2. **Pixel Service** - Validates and processes pixel placement requests
-3. **Redis Cluster** - Stores live canvas state and rate limiting data
-4. **Redis Pub/Sub** - Broadcasts pixel events to all WebSocket servers
-5. **Kafka** - Durable event log for all pixel placements
-6. **History Service** - Generates snapshots and timelapses
+| Component | Purpose | Key Responsibility |
+|-----------|---------|-------------------|
+| WebSocket Servers | Client connections | Maintain 100K connections each, push pixel updates |
+| Pixel Service | Business logic | Validate placements, enforce rate limits |
+| Redis Cluster | Live state | Canvas bitmap, rate limit keys with TTL |
+| Redis Pub/Sub | Event broadcast | Fan out pixel events to all WebSocket servers |
+| Kafka | Durable log | Persist all pixel events for history/replay |
+| History Service | Analytics | Generate snapshots, timelapses, point-in-time views |
 
 ---
 
-## 4. Data Model (5 minutes)
+## 💾 4. Data Model (5 minutes)
 
 ### Canvas State in Redis
 
-```
-# Canvas stored as a bitmap or string
-# Key: canvas:current
-# Value: 4MB byte array where each byte represents one pixel's color
+"I store the entire canvas as a single binary string where each byte represents one pixel's color index (0-15 for 16 colors)."
 
-# For 2000x2000 canvas, pixel at (x, y) is at index: y * 2000 + x
-SETRANGE canvas:current <offset> <color_byte>
-GETRANGE canvas:current 0 -1  # Get entire canvas
-```
+| Key | Type | Description |
+|-----|------|-------------|
+| `canvas:current` | String (binary) | 4MB byte array, pixel at (x,y) = offset y × width + x |
+| `cooldown:{user_id}` | String + TTL | Timestamp of last placement, auto-expires after 5 min |
 
-### Rate Limiting in Redis
+**Why this works:** SETRANGE provides atomic single-byte updates. GET returns the entire canvas in one operation. No locking needed.
 
-```
-# Per-user cooldown
-# Key: cooldown:{user_id}
-# Value: timestamp of last placement + TTL auto-expiry
+### Event Schema (PostgreSQL)
 
-SET cooldown:user123 1699900000 EX 300  # 5 minute TTL
-```
-
-### Event Schema (Kafka/PostgreSQL)
-
-```sql
-CREATE TABLE pixel_events (
-    id              BIGSERIAL PRIMARY KEY,
-    x               SMALLINT NOT NULL,
-    y               SMALLINT NOT NULL,
-    color           SMALLINT NOT NULL,
-    user_id         UUID NOT NULL,
-    placed_at       TIMESTAMP NOT NULL,
-    session_id      UUID  -- For anti-abuse tracking
-);
-
--- Partitioned by time for efficient timelapse queries
-CREATE INDEX idx_pixel_events_time ON pixel_events(placed_at);
-```
+| Column | Type | Purpose |
+|--------|------|---------|
+| id | BIGSERIAL | Primary key |
+| x | SMALLINT | X coordinate (0-1999) |
+| y | SMALLINT | Y coordinate (0-1999) |
+| color | SMALLINT | Color index (0-15) |
+| user_id | UUID | Who placed it |
+| placed_at | TIMESTAMP | When (partitioned by time) |
 
 ### Canvas Snapshots
 
-```sql
-CREATE TABLE canvas_snapshots (
-    id              SERIAL PRIMARY KEY,
-    captured_at     TIMESTAMP NOT NULL,
-    canvas_data     BYTEA NOT NULL,  -- Compressed canvas state
-    pixel_count     INTEGER          -- Total pixels placed so far
-);
-```
+| Column | Type | Purpose |
+|--------|------|---------|
+| id | SERIAL | Primary key |
+| captured_at | TIMESTAMP | Snapshot time |
+| canvas_data | BYTEA | Compressed canvas state |
+| pixel_count | INTEGER | Running total of placements |
 
 ---
 
-## 5. Deep Dive: Pixel Placement Flow (10 minutes)
+## 🔧 5. Deep Dive: Pixel Placement Flow (10 minutes)
 
-"Let me walk through what happens when a user places a pixel."
-
-### The Flow
+### Request Flow
 
 ```
 User clicks      WebSocket        Pixel           Redis           Redis
 canvas    ─────▶ Server    ─────▶ Service  ─────▶ (Rate Limit) ─▶ (Canvas)
                     │                                   │             │
-                    │                                   │             │
                     │◀──────────────────────────────────┴─────────────┘
                     │                    │
                     │                    ▼
-                    │              Redis Pub/Sub
-                    │                    │
-                    ▼                    ▼
-               Broadcast to      All WebSocket Servers
-               this client       broadcast to their clients
+                    │              Redis Pub/Sub ────▶ All WebSocket Servers
+                    │                                        │
+                    ▼                                        ▼
+               Response to                           Broadcast to
+               this client                           all clients
 ```
 
-### Pixel Placement Logic
+### Placement Logic (Step by Step)
 
-```python
-async def place_pixel(user_id, x, y, color):
-    # 1. Validate coordinates
-    if not (0 <= x < CANVAS_WIDTH and 0 <= y < CANVAS_HEIGHT):
-        raise InvalidCoordinatesError()
+1. **Validate coordinates** - Ensure 0 ≤ x < WIDTH and 0 ≤ y < HEIGHT
+2. **Validate color** - Ensure color is in valid palette (0-15)
+3. **Check rate limit atomically** - Redis SET with NX (only if not exists) and EX (5 min expiry)
+4. **Update canvas** - Redis SETRANGE at calculated offset
+5. **Publish event** - Redis PUBLISH to `pixel_updates` channel
+6. **Log to Kafka** - For durability and history reconstruction
+7. **Return success** - Include `next_placement` timestamp for client cooldown UI
 
-    if color not in VALID_COLORS:
-        raise InvalidColorError()
+### Rate Limiting Deep Dive
 
-    # 2. Check rate limit (Redis atomic operation)
-    cooldown_key = f"cooldown:{user_id}"
+"The key insight is using Redis SET NX EX as an atomic check-and-set operation."
 
-    # SET NX = only set if not exists, returns True if set
-    can_place = await redis.set(
-        cooldown_key,
-        int(time.time()),
-        nx=True,      # Only if not exists
-        ex=COOLDOWN_SECONDS  # 5 minute expiry
-    )
+| Operation | Redis Command | Purpose |
+|-----------|---------------|---------|
+| Check + Set | `SET cooldown:{uid} 1 NX EX 300` | Only sets if key doesn't exist, auto-expires |
+| Get TTL | `TTL cooldown:{uid}` | Returns remaining cooldown seconds |
 
-    if not can_place:
-        # Get remaining cooldown time
-        ttl = await redis.ttl(cooldown_key)
-        raise RateLimitError(f"Wait {ttl} seconds")
-
-    # 3. Update canvas state atomically
-    offset = y * CANVAS_WIDTH + x
-    await redis.setrange('canvas:current', offset, bytes([color]))
-
-    # 4. Create event record
-    event = {
-        'x': x,
-        'y': y,
-        'color': color,
-        'user_id': user_id,
-        'timestamp': time.time()
-    }
-
-    # 5. Publish to all WebSocket servers
-    await redis.publish('pixel_updates', json.dumps(event))
-
-    # 6. Log to Kafka for durability and history
-    await kafka.produce('pixel_events', event)
-
-    return {'success': True, 'next_placement': time.time() + COOLDOWN_SECONDS}
-```
-
-### WebSocket Server Handling
-
-```python
-class PixelWebSocketServer:
-    def __init__(self):
-        self.connections = set()
-        self.redis_sub = None
-
-    async def start(self):
-        # Subscribe to pixel updates
-        self.redis_sub = redis.pubsub()
-        await self.redis_sub.subscribe('pixel_updates')
-
-        # Start broadcast loop
-        asyncio.create_task(self.broadcast_loop())
-
-    async def broadcast_loop(self):
-        async for message in self.redis_sub.listen():
-            if message['type'] == 'message':
-                event = message['data']
-                await self.broadcast_to_all(event)
-
-    async def broadcast_to_all(self, event):
-        # Batch events for efficiency (every 50ms)
-        self.pending_events.append(event)
-
-        if time.time() - self.last_broadcast > 0.05:
-            batch = self.pending_events
-            self.pending_events = []
-
-            message = json.dumps({'type': 'pixels', 'events': batch})
-
-            await asyncio.gather(*[
-                conn.send(message)
-                for conn in self.connections
-            ])
-
-    async def on_connect(self, websocket):
-        self.connections.add(websocket)
-
-        # Send current canvas state
-        canvas = await redis.get('canvas:current')
-        await websocket.send(json.dumps({
-            'type': 'canvas',
-            'data': base64.b64encode(canvas).decode()
-        }))
-
-    async def on_disconnect(self, websocket):
-        self.connections.discard(websocket)
-```
-
-### Client-Side Implementation
-
-```javascript
-class PixelCanvas {
-    constructor() {
-        this.canvas = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT);
-        this.ws = new WebSocket('wss://place.example.com/ws');
-
-        this.ws.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-
-            if (msg.type === 'canvas') {
-                // Initial canvas load
-                this.canvas = new Uint8Array(atob(msg.data).split('').map(c => c.charCodeAt(0)));
-                this.render();
-            } else if (msg.type === 'pixels') {
-                // Incremental updates
-                for (const pixel of msg.events) {
-                    const offset = pixel.y * CANVAS_WIDTH + pixel.x;
-                    this.canvas[offset] = pixel.color;
-                }
-                this.renderDirty(msg.events);
-            }
-        };
-    }
-
-    async placePixel(x, y, color) {
-        const response = await fetch('/api/pixel', {
-            method: 'POST',
-            body: JSON.stringify({ x, y, color })
-        });
-
-        if (!response.ok) {
-            const error = await response.json();
-            showCooldownTimer(error.seconds_remaining);
-        }
-    }
-}
-```
+**Why this works:** NX prevents race conditions where two requests slip through. EX auto-cleans expired keys. No separate check-then-set that could race.
 
 ---
 
-## 6. Deep Dive: Scaling WebSocket Connections (5 minutes)
-
-"With 1 million concurrent users, we need careful WebSocket scaling."
+## 🔧 6. Deep Dive: Scaling WebSocket Connections (5 minutes)
 
 ### Connection Distribution
 
 ```
 1 million connections / 100,000 per server = 10 WebSocket servers minimum
-(We'd provision 15-20 for headroom)
+(Provision 15-20 for headroom and rolling deploys)
 ```
 
-### Server Sizing
-- Each WebSocket connection: ~10 KB memory
-- 100,000 connections: 1 GB base memory
-- Plus CPU for JSON encoding and broadcast
+### Server Resource Requirements
+
+| Resource | Per Server | Notes |
+|----------|------------|-------|
+| Memory | 1-2 GB | ~10KB per connection |
+| CPU | 4-8 cores | JSON encoding, broadcast loops |
+| Network | 100+ Mbps | Fan-out to 100K clients |
 
 ### Regional Distribution
 
@@ -363,220 +232,146 @@ class PixelCanvas {
          └──────────────────┼──────────────────┘
                             │
                     ┌───────▼───────┐
-                    │ Global Redis  │
-                    │   Pub/Sub     │
+                    │ Kafka (Global)│
+                    │  Event Stream │
                     └───────────────┘
 ```
 
-### Cross-Region Pub/Sub
-
-```python
-# Each region has local Redis for pub/sub
-# Global coordination via Kafka
-
-class RegionalPixelBroadcaster:
-    def __init__(self, region):
-        self.region = region
-        self.local_redis = get_regional_redis(region)
-        self.kafka_consumer = KafkaConsumer('pixel_events')
-
-    async def run(self):
-        # Consume global events, publish to local Redis
-        async for event in self.kafka_consumer:
-            await self.local_redis.publish('pixel_updates', event)
-```
+"Each region has local Redis for pub/sub. Kafka provides global ordering and cross-region replication. Users connect to nearest region for lowest latency."
 
 ---
 
-## 7. Canvas History and Timelapse (3 minutes)
+## 🔧 7. Deep Dive: Canvas History and Timelapse (3 minutes)
 
 ### Snapshot Strategy
 
-```python
-async def snapshot_scheduler():
-    while True:
-        # Snapshot every 30 seconds
-        await asyncio.sleep(30)
-
-        canvas_data = await redis.get('canvas:current')
-        compressed = zlib.compress(canvas_data)
-
-        await db.insert_snapshot(
-            captured_at=datetime.now(),
-            canvas_data=compressed,
-            pixel_count=await get_total_pixel_count()
-        )
-```
-
-### Timelapse Generation
-
-```python
-def generate_timelapse(start_time, end_time, fps=30):
-    snapshots = db.get_snapshots(start_time, end_time)
-
-    video = VideoWriter('timelapse.mp4', fps=fps)
-
-    for snapshot in snapshots:
-        canvas = zlib.decompress(snapshot.canvas_data)
-        frame = canvas_to_image(canvas)
-        video.write(frame)
-
-    video.close()
-```
+| Interval | Purpose | Storage |
+|----------|---------|---------|
+| Every 30 seconds | Fine-grained history | ~2,880/day |
+| Compressed | Reduce storage | ~1MB per snapshot (zlib) |
 
 ### Point-in-Time Reconstruction
 
-```python
-def get_canvas_at_time(target_time):
-    # Find nearest snapshot before target time
-    snapshot = db.get_snapshot_before(target_time)
-    canvas = zlib.decompress(snapshot.canvas_data)
+1. Find nearest snapshot before target time
+2. Decompress snapshot into memory
+3. Replay events from snapshot time to target time
+4. Each event: set canvas[y × width + x] = color
 
-    # Replay events from snapshot to target time
-    events = db.get_events(
-        start_time=snapshot.captured_at,
-        end_time=target_time
-    )
+### Timelapse Generation
 
-    for event in events:
-        offset = event.y * CANVAS_WIDTH + event.x
-        canvas[offset] = event.color
-
-    return canvas
-```
+1. Query snapshots at desired frame interval
+2. Decompress each snapshot
+3. Convert to image frame (color palette lookup)
+4. Encode as video (ffmpeg or similar)
 
 ---
 
-## 8. Rate Limiting Deep Dive (3 minutes)
+## 📡 8. API Design
 
-### Basic Rate Limiting
+### WebSocket Protocol
 
-```python
-# Redis-based cooldown
-async def check_and_set_cooldown(user_id):
-    key = f"cooldown:{user_id}"
+**Client → Server Messages:**
 
-    # Atomic check-and-set
-    result = await redis.set(key, 1, nx=True, ex=COOLDOWN_SECONDS)
+| Type | Fields | Description |
+|------|--------|-------------|
+| `place` | x, y, color, requestId | Place a pixel |
+| `ping` | — | Keep connection alive |
 
-    if not result:
-        ttl = await redis.ttl(key)
-        return (False, ttl)
+**Server → Client Messages:**
 
-    return (True, 0)
-```
+| Type | Fields | Description |
+|------|--------|-------------|
+| `welcome` | userId, cooldownRemaining, canvasInfo | Connection established |
+| `canvas` | data (base64), width, height | Full canvas state |
+| `pixels` | events[] | Batch of pixel updates |
+| `success` | requestId, nextPlacement | Placement confirmed |
+| `error` | code, message, requestId?, remainingSeconds? | Placement failed |
+| `pong` | — | Heartbeat response |
 
-### Dynamic Rate Limiting
+### REST API Endpoints
 
-"During the event, we might want to adjust rate limits based on load."
-
-```python
-async def get_dynamic_cooldown():
-    # Check current load
-    current_rps = await get_current_rps()
-
-    if current_rps > 5000:
-        return 600  # 10 minutes during extreme load
-    elif current_rps > 3000:
-        return 450  # 7.5 minutes
-    else:
-        return 300  # 5 minutes default
-```
-
-### Anti-Abuse Measures
-
-```python
-async def validate_placement(user_id, x, y, session_id):
-    # Check for bot patterns
-    recent_placements = await get_recent_placements(user_id, limit=100)
-
-    # Pattern detection
-    if detect_grid_pattern(recent_placements):
-        await flag_for_review(user_id)
-        raise SuspiciousActivityError()
-
-    # Velocity check across sessions
-    if count_sessions_today(user_id) > 10:
-        await require_captcha(user_id)
-```
+| Method | Endpoint | Description | Response |
+|--------|----------|-------------|----------|
+| GET | `/api/v1/canvas` | Full canvas binary | Binary data (4MB) |
+| GET | `/api/v1/canvas/info` | Canvas metadata | `{ width, height, colorCount, cooldownSeconds }` |
+| GET | `/api/v1/history/pixel?x={x}&y={y}` | Pixel history | `{ placements: [{ color, userId, placedAt }] }` |
+| GET | `/api/v1/history/snapshot?time={iso}` | Canvas at time | Binary data |
+| GET | `/api/v1/auth/me` | Current user info | `{ userId, username, isGuest }` |
+| POST | `/api/v1/auth/login` | Login | `{ success, username }` |
+| POST | `/api/v1/auth/logout` | Logout | `{ success }` |
 
 ---
 
-## 9. Trade-offs and Alternatives (3 minutes)
+## ⚖️ 9. Trade-offs Analysis
 
-### Trade-off 1: Single Canvas vs. Sharded Canvas
+### Trade-off 1: Single Redis Key vs. Tile-Based Sharding
 
-**Chose**: Single canvas in Redis (fits in memory)
-**Trade-off**: Limited to ~16K x 16K pixels (256 MB)
-**Alternative**: Sharded canvas across Redis nodes (more complex, but unlimited size)
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Single Redis key | Atomic updates, simple addressing, no coordination | Limited to ~16K×16K (256MB) |
+| ❌ Tile-based sharding | Unlimited canvas size | Cross-tile transactions, cache invalidation complexity |
 
-### Trade-off 2: Eventual Consistency vs. Strong Consistency
+> "We chose a single Redis byte array because our 2000×2000 canvas (4MB) fits comfortably in memory. With SETRANGE, pixel updates are atomic single-byte writes requiring zero coordination. A tile system would need cross-shard transactions when users view tile boundaries, and cache invalidation becomes complex when tiles overlap in the viewport. The 256MB theoretical limit far exceeds our needs. If we needed a 100K×100K canvas, we'd redesign with tiles—but for r/place's actual scale, simplicity wins. The trade-off is we can't horizontally scale canvas storage itself, but a single Redis instance handles our write throughput easily."
 
-**Chose**: Eventual consistency with ~500ms lag acceptable
-**Trade-off**: Users in different regions might see slightly different states briefly
-**Alternative**: Single-region deployment (lower latency but less resilient)
+### Trade-off 2: Redis Pub/Sub vs. Kafka for Real-time Broadcast
 
-### Trade-off 3: WebSocket vs. Server-Sent Events
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Redis Pub/Sub | Sub-millisecond latency, simple | No persistence, missed messages are lost |
+| ❌ Kafka for broadcast | Durable, replayable | Higher latency (10-50ms), overkill for ephemeral updates |
 
-**Chose**: WebSocket for bidirectional communication
-**Trade-off**: More complex but allows pixel placement through same connection
-**Alternative**: SSE for updates + HTTP POST for placements (simpler but two connections)
+> "We use Redis Pub/Sub for real-time broadcast because pixel updates are ephemeral—if a client misses one update, the next batch will include the current state anyway. Pub/Sub delivers in under 1ms, critical for the 'instant' feel users expect. Kafka's durability is wasted here since we don't need replay for live updates. However, we DO send events to Kafka in parallel for history—this gives us durability for timelapse without adding latency to the hot path. The trade-off is that during Redis Pub/Sub failures, clients see stale canvases until reconnection triggers a full canvas fetch."
 
----
+### Trade-off 3: Eventual Consistency vs. Strong Consistency
 
-## 10. Failure Scenarios (2 minutes)
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Eventual consistency | Multi-region deployment, high availability | Users may briefly see different states |
+| ❌ Strong consistency | Perfect agreement | Single region or high latency, reduced availability |
 
-### Redis Failure
-
-```python
-# Fallback to read-only mode
-async def handle_redis_failure():
-    # Serve cached canvas from CDN
-    # Reject new placements with friendly message
-    # Auto-recover when Redis returns
-```
-
-### WebSocket Server Crash
-
-```python
-# Client auto-reconnect with exponential backoff
-class ResilientWebSocket {
-    connect() {
-        this.ws = new WebSocket(this.url);
-        this.ws.onclose = () => this.reconnect();
-    }
-
-    reconnect() {
-        setTimeout(() => this.connect(), this.backoff);
-        this.backoff = Math.min(this.backoff * 2, 30000);
-    }
-}
-```
+> "We accept eventual consistency with ~500ms lag because r/place is fundamentally a collaborative art project, not a financial system. If two users in different regions place pixels simultaneously, last-write-wins is acceptable—there's no 'incorrect' pixel, just the most recent one. Strong consistency would require either single-region deployment (bad latency for global users) or distributed consensus (adding 100-200ms per write). During the 2017 r/place event, Reddit observed that users naturally adapted to brief inconsistencies. The trade-off is that during network partitions, regions may diverge temporarily, but Kafka's global ordering reconciles them within seconds."
 
 ---
 
-## Summary
+## 🚨 10. Failure Scenarios (2 minutes)
+
+| Component | Failure Mode | Mitigation |
+|-----------|--------------|------------|
+| Redis | Primary down | Replica promotion, serve cached canvas from CDN |
+| WebSocket Server | Crash | Load balancer health checks, client auto-reconnect |
+| Kafka | Partition unavailable | Buffer events in memory, retry on recovery |
+| PostgreSQL | Down | History writes queued in Kafka, catch up on recovery |
+
+### Client Reconnection Strategy
+
+- Exponential backoff: 1s, 2s, 4s, 8s... up to 30s max
+- Random jitter: ±0-1000ms to prevent thundering herd
+- On reconnect: fetch fresh canvas state, resume from current
+
+---
+
+## 📝 Summary
 
 "To summarize, I've designed r/place with:
 
-1. **Redis-backed canvas** storing the entire 4 MB state in memory for instant reads
-2. **Redis Pub/Sub** for broadcasting pixel updates across all WebSocket servers
-3. **Atomic rate limiting** ensuring fair cooldowns per user
-4. **Kafka event log** for durability and history reconstruction
+1. **Redis-backed canvas** storing the entire 4MB state as a byte array for atomic reads/writes
+2. **Redis Pub/Sub** for broadcasting pixel updates across all WebSocket servers in sub-millisecond time
+3. **Atomic rate limiting** using SET NX EX to prevent race conditions
+4. **Kafka event log** for durability, history reconstruction, and cross-region sync
 5. **Regional clusters** with global coordination for worldwide scale
-6. **Snapshot system** enabling timelapse generation
+6. **Snapshot system** enabling point-in-time views and timelapse generation
 
-The key insight is that the canvas is small enough to fit in memory, making reads trivial, while the challenge is efficiently broadcasting 3,000+ updates per second to 1 million connected clients."
+The key insight is that the canvas is small enough to fit in memory, making reads trivial, while the real challenge is efficiently broadcasting 3,000+ updates per second to 1 million connected clients. We solve this through batched WebSocket messages, regional distribution, and accepting eventual consistency."
 
 ---
 
-## Questions I'd Expect
+## ❓ Questions I'd Expect
 
 **Q: What if someone tries to overwrite pixels programmatically?**
-A: Rate limiting applies equally to all users. We can add CAPTCHA for suspicious accounts and IP-based rate limits. The 5-minute cooldown makes botting ineffective.
+A: Rate limiting applies equally to all users. We can add CAPTCHA for suspicious accounts and IP-based rate limits. The 5-minute cooldown makes botting ineffective for claiming territory.
 
 **Q: How do you handle the initial canvas load for a million users?**
-A: The canvas is served from CDN as a compressed file. Only ~4 MB compressed. CDN can handle millions of concurrent downloads.
+A: Canvas is served from CDN as a compressed file (~1MB with gzip). CDN handles millions of concurrent downloads. WebSocket connection only needed for real-time updates after initial load.
 
 **Q: What about moderating inappropriate content?**
-A: We log all placements with user IDs. Moderators can view the history of any region, ban users, and use ML-based image recognition to flag problematic content in near-real-time.
+A: We log all placements with user IDs. Moderators can view history of any region, ban users retroactively, and use ML-based image recognition to flag problematic patterns in near-real-time.
