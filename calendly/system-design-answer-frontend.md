@@ -331,221 +331,83 @@ When a booking succeeds:
 
 ## 🔧 Deep Dive: Booking URL Design
 
-> "The booking URL is the host's public interface. It needs to be shareable, memorable, but also secure and revocable. This is a frontend concern because it affects routing, the host dashboard UX, and how we communicate link status to users."
+> "The booking URL is the host's public interface - shared on LinkedIn, email signatures, Twitter bios. It needs to be memorable but also secure and revocable."
 
-### The URL Trade-off
-
-Hosts share their booking links on LinkedIn, email signatures, Twitter bios. The URL matters.
-
-**Option A: Human-readable slug**
-```
-calendly.com/john-doe/30min
-```
-- Memorable, easy to share verbally
-- Professional appearance
-
-**Option B: UUID-only**
-```
-calendly.com/e/abc123-def456-ghi789
-```
-- Impossible to guess or enumerate
-- Can be rotated without changing username
-
-**Option C: Hybrid (human-readable + token)**
-```
-calendly.com/john-doe/30min-x7k2m9
-```
-- Readable prefix for context
-- Token suffix for security
-- Can rotate token without changing slug
-
-### Trade-off Analysis
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Hybrid (slug + token) | Readable, secure, rotatable | Slightly longer URL |
-| ❌ Slug only | Clean, memorable | Enumerable, can't revoke |
-| ❌ UUID only | Most secure | Opaque, can't share verbally |
+| Approach | Example | Trade-off |
+|----------|---------|-----------|
+| ✅ Hybrid (slug + token) | `/john-doe/30min-x7k2m9` | Readable, secure, rotatable |
+| ❌ Slug only | `/john-doe/30min` | Enumerable (`/john-doe/15min`), can't revoke |
+| ❌ UUID only | `/e/abc123-def456` | Secure but opaque - can't share verbally |
 
 **Why hybrid URLs:**
 
-> "With slug-only URLs like `/john-doe/30min`, anyone can enumerate a host's event types by guessing: `/john-doe/15min`, `/john-doe/60min`, `/john-doe/interview`. This leaks information about how someone uses their calendar.
+> "Slug-only URLs can be enumerated - anyone can guess `/john-doe/interview` - and can't be revoked. If a link is spammed, the host must change their username, breaking every link they've ever shared.
 
-> More critically, slug-only URLs can't be revoked. If a host accidentally shares their link on a public forum and gets spammed with fake bookings, their only option is to change their username or event slug - breaking every existing link they've shared.
+> UUID-only URLs are secure but unusable. Try reading `abc123-def456` over the phone.
 
-> UUID-only URLs solve security but create UX problems. Try reading `abc123-def456-ghi789` over the phone. It's also not obvious what the link is for - is it a 30-minute meeting or a 60-minute consultation?
+> The hybrid approach gives both: the readable part (`/john-doe/30min`) tells recipients what they're booking, while the token (`-x7k2m9`) prevents enumeration and enables revocation. If leaked, rotate the token without changing the slug."
 
-> The hybrid approach gives us both: the human-readable part (`/john-doe/30min`) tells recipients what they're booking, while the token (`-x7k2m9`) prevents enumeration and enables revocation. If a link is leaked, the host rotates the token - existing links break, but the new link has the same readable prefix."
-
-### Frontend Implementation Considerations
-
-**Host Dashboard - Link Management:**
-- Show current URL with copy button
-- "Regenerate Link" action with confirmation warning
-- Show when link was last rotated
-- Optional: multiple tokens per event (track which channel converts better)
-
-**Routing:**
-- Parse URL as `/:username/:slug-:token` or `/:username/:slug`
-- If token is missing, could redirect to a landing page or show "link expired"
-- Consider: should old tokens show "this link has been updated" with a request for new link?
-
-**Error States:**
-- Invalid token: "This booking link has been updated. Please request a new link from [host name]."
-- Not enumerable error: Show generic 404, don't reveal whether the slug exists
+**Frontend considerations:**
+- Host dashboard: Copy URL button, "Regenerate Link" with confirmation
+- Routing: Parse `/:username/:slug-:token`, handle missing/invalid tokens gracefully
+- Invalid token error: "This booking link has been updated. Please request a new link."
 
 ---
 
 ## 🔧 Deep Dive: Guest Authentication
 
-> "Should guests need to log in before booking? This seems like a simple question, but it has profound UX and security implications."
-
-### The Core Trade-off
-
-Requiring authentication reduces spam and enables features like booking history. But it adds friction that kills conversion.
-
-### Option Analysis
-
-**Option A: No authentication (anonymous booking)**
-- Guest provides name + email in form
-- No account creation required
-- Email verification optional
-
-**Option B: Required authentication**
-- Guest must log in or create account before booking
-- Can use social login (Google, Microsoft)
-
-**Option C: Optional authentication**
-- Anonymous booking available
-- "Log in to see your booking history" prompt
-- Returning guests recognized by email
+> "Should guests need to log in before booking? This has profound UX and security implications."
 
 | Approach | Pros | Cons |
 |----------|------|------|
 | ✅ No auth (anonymous) | Zero friction, highest conversion | Spam risk, no booking history |
-| ❌ Required auth | Spam prevention, rich features | Massive friction, lower conversion |
+| ❌ Required auth | Spam prevention, rich features | Massive friction, kills conversion |
 | ⚡ Optional auth | Best of both for returning users | More complex UX |
 
-**Why I chose anonymous booking with optional verification:**
+**Why anonymous booking:**
 
-> "The guest booking page serves one purpose: convert a link click into a confirmed meeting. Every friction point - every extra click, every form field, every 'create account' prompt - reduces that conversion.
+> "The guest booking page serves one purpose: convert a link click into a confirmed meeting. Required authentication would devastate conversion rates. Imagine clicking a '30-minute meeting' link and seeing 'Log in to continue.' Many guests would close the tab. They're not invested in the platform - they just want to book with Alice.
 
-> Required authentication would devastate conversion rates. Imagine clicking a '30-minute meeting' link and seeing 'Log in to continue.' Many guests would close the tab. They're not invested in the platform - they just want to book with Alice. Forcing account creation treats guests as product users when they're really just trying to accomplish a task.
+> The spam concern is real but manageable: rate limiting (20 bookings/IP/hour), honeypot form fields, and optional email verification. If a host experiences spam, they can enable CAPTCHA for their links specifically."
 
-> The spam concern is real but manageable. I'd use rate limiting (20 bookings per IP per hour), honeypot fields in the form, and optional email verification. If a host experiences spam, they can enable CAPTCHA or email verification for their links specifically.
-
-> Optional authentication works for returning guests: if someone books frequently, they can create an account to see their history, reschedule easily, and pre-fill forms. But this is opt-in, not required."
-
-### Frontend Implementation
-
-**Anonymous flow:**
-- Form collects name, email, optional notes
-- On submit: create booking, send confirmation email
-- No session created, no cookies beyond CSRF
-
-**Email verification (optional, host-configurable):**
-- After form submit: "Check your email to confirm"
-- Guest clicks link in email → booking finalized
-- Prevents fake email bookings but adds 30-60 seconds of friction
-
-**Returning guest recognition:**
-- If email matches previous booking, pre-fill name
-- Show "You've booked with [host] before" friendly message
-- Offer "Sign up to manage your bookings" (not required)
-
-**Spam mitigation without auth:**
-- Rate limiting per IP
-- Honeypot form fields (hidden field that bots fill)
-- CAPTCHA as escalation (only show if suspicious behavior)
-- Host-level setting to require email verification
+**Implementation:**
+- Anonymous flow: Form collects name, email, notes → create booking → send confirmation
+- Email verification (host-configurable): "Check your email to confirm" adds security at cost of 30-60 seconds friction
+- Returning guests: Pre-fill name if email matches previous booking, offer "Sign up to manage bookings" (optional)
 
 ---
 
 ## 🔧 Deep Dive: Scheduling Configuration
 
-> "Hosts have different needs - a therapist wants 50-minute sessions with 10-minute buffers, a sales rep wants 15-minute calls booked up to 60 days out, a consultant wants 90-minute sessions booked at least 48 hours in advance. The frontend needs to handle this variability gracefully."
+> "Hosts have different needs - a therapist wants 50-minute sessions with buffers, a sales rep wants 15-minute calls booked 60 days out. The frontend handles this variability while keeping the guest experience simple."
 
 ### Variable Slot Durations
 
-**The problem:** Different meeting types have different durations (15, 30, 45, 60, 90 minutes), and the UI needs to adapt.
+| Duration | UI Consideration |
+|----------|------------------|
+| 15 min | Many slots - compact grid (4 columns) |
+| 30 min | Default list view |
+| 60+ min | Sparse - consider week view |
 
-**Considerations:**
-- Slot display density changes with duration (more 15-min slots than 60-min slots)
-- Buffer times (before/after) affect actual availability gaps
-- Some hosts want custom durations (25 minutes, 50 minutes)
+> "The UI shouldn't change dramatically based on duration. The API returns computed slots - guests just see 'available times' without needing to understand the underlying math."
 
-| Duration | Typical Use Case | UI Consideration |
-|----------|------------------|------------------|
-| 15 min | Quick calls, screeners | Many slots - consider grouping or scrolling |
-| 30 min | Standard meetings | Default, fits well in list view |
-| 60 min | Deep dives, interviews | Fewer slots - calendar feels sparse |
-| 90+ min | Workshops, consulting | Very few slots - may need week view |
-
-**Frontend approach:**
-
-> "The UI shouldn't change dramatically based on duration - consistency matters. But I do adjust density. For 15-minute slots, I might show times in a compact grid (4 columns). For 60-minute slots, a single-column list works better because there are fewer options.
-
-> The key is that hosts configure duration on their end. The guest just sees 'available times' without needing to understand the underlying math. The API returns computed slots, not raw availability windows."
-
-### Booking Window Limits
-
-**The problem:** How far ahead can guests book? This is host-configurable and affects what the calendar shows.
-
-**Common configurations:**
-- **Minimum notice**: Can't book within X hours (gives host prep time)
-- **Maximum future**: Can't book more than X days out (prevents calendar clutter)
-- **Rolling window**: Always shows next 14/30/60 days from today
-
-| Window | Use Case | Trade-off |
-|--------|----------|-----------|
-| 7 days | High-demand hosts, urgent bookings | Limited flexibility |
-| 14 days | Standard default | Good balance |
-| 30 days | Consultants, monthly planning | More data to load |
-| 60+ days | Executive scheduling | Calendar can feel overwhelming |
-
-**Trade-off Analysis: How much to fetch upfront?**
+### Booking Window and Minimum Notice
 
 | Approach | Pros | Cons |
 |----------|------|------|
 | ✅ Fetch visible window + prefetch next | Fast initial load, smooth scrolling | Slight delay on far-future months |
-| ❌ Fetch entire booking window | No loading states when browsing | Slow initial load for 60-day windows |
+| ❌ Fetch entire booking window | No loading states | Slow initial load for 60-day windows |
 | ❌ Fetch on-demand only | Minimal initial data | Spinner on every month change |
 
-**Why incremental fetching:**
+> "If a host allows booking 60 days out, fetching all 60 days on page load is wasteful. Most guests book within 2 weeks. I fetch the current 2-week window initially, then prefetch when the user approaches the edge.
 
-> "If a host allows booking 60 days out, fetching all 60 days of availability on page load is wasteful. Most guests book within 2 weeks. I fetch the current 2-week window initially, then prefetch the next 2 weeks when the user shows intent to browse further (hovering near 'next month' or scrolling down).
+> The calendar should disable dates beyond the booking window - not let guests click then show an error. Similarly, minimum notice (can't book within 4 hours) is handled client-side: filter today's slots against current time + notice period. This avoids refetching when the clock ticks past a threshold."
 
-> The calendar should communicate the booking window clearly. If a host only allows bookings 14 days out, the calendar should disable or hide dates beyond that - not let guests click and then show an error. Gray out unavailable dates with a tooltip: 'Bookings open up to 14 days in advance.'"
+### Configuration Display Principle
 
-### Minimum Notice Period
+**Show guests:** Meeting duration prominently, booking window via disabled dates, minimum notice via grayed-out slots.
 
-**The problem:** Hosts often need lead time - can't book a meeting 30 minutes from now.
-
-**Common settings:**
-- 1 hour minimum (quick availability)
-- 4 hours minimum (same-day prep)
-- 24 hours minimum (next-day bookings)
-- 48+ hours (consulting, requires preparation)
-
-**Frontend handling:**
-
-> "Today's slots require special handling. If minimum notice is 4 hours and it's 2 PM, any slot before 6 PM today should be disabled. This changes in real-time as the clock ticks - a slot that was unavailable at 1:59 PM becomes available at 2:00 PM.
-
-> I handle this client-side by filtering slots against current time + minimum notice. The server returns all theoretically available slots for the day, and the client filters based on the notice period. This avoids refetching when the clock ticks past a threshold."
-
-### Configuration Display
-
-**What guests need to see:**
-- Meeting duration prominently displayed ("30 Minute Meeting")
-- Booking window limits communicated via disabled dates (not error messages)
-- Minimum notice reflected in grayed-out slots for today
-
-**What guests DON'T need to see:**
-- Buffer times (internal to host's schedule)
-- Maximum bookings per day limits (just show slots as unavailable)
-- Complex availability rules (host's concern, not guest's)
-
-> "The guest experience should feel simple even when the underlying configuration is complex. A host might have 15-minute buffers, 4-hour minimum notice, 30-day maximum window, and 5 bookings/day limit. The guest just sees: some dates are available (blue dot), some aren't (gray), some times work, some don't. The complexity is hidden."
+**Hide from guests:** Buffer times, max bookings/day, complex availability rules. The complexity is the host's concern - guests just see which slots are available.
 
 ---
 
@@ -627,6 +489,8 @@ Requiring authentication reduces spam and enables features like booking history.
 ## 🎯 Summary
 
 "This design focuses on the **guest booking experience** - the public-facing flow where someone clicks a shared link and books a meeting. The host dashboard is a separate concern.
+
+**Mobile-first design** is essential because most guests arrive via shared links on mobile - texted from a friend, tapped from an email signature, clicked from a social bio. The bottom sheet pattern for time slots and forms creates a native mobile feel, while performance targets (< 3 second FCP on 3G) ensure bookings complete even on cellular connections.
 
 **Anonymous booking** (no login required) maximizes conversion. Guests aren't platform users - they just want to book with Alice. Requiring authentication would add friction that kills conversion. Spam is handled through rate limiting, honeypots, and optional email verification.
 
