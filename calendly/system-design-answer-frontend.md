@@ -475,6 +475,7 @@ When a booking succeeds:
 
 | Decision | Chosen | Alternative | Why Alternative Fails |
 |----------|--------|-------------|----------------------|
+| Mobile layout | Bottom sheet pattern | Scaled-down desktop | Tiny touch targets, awkward scrolling |
 | Booking flow | Progressive disclosure | Multi-page wizard | Higher abandonment between pages |
 | Guest authentication | Anonymous (no login) | Required auth | Massive friction destroys conversion |
 | Timezone conversion | Client-side | Server-side | Requires refetch on timezone change |
