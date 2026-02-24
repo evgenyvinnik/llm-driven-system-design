@@ -2,642 +2,236 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
+---
+
 ## Introduction
 
-"Today I'll design a meeting scheduling platform like Calendly, focusing on the backend architecture. The core challenge is preventing double bookings while efficiently calculating availability across multiple calendar sources. I'll walk through the database design, booking transaction handling, calendar integration patterns, and the notification system."
+"I'll design a meeting scheduling platform like Calendly, focusing on the backend architecture. The core challenge is preventing double bookings under high concurrency while efficiently calculating availability across multiple calendar sources. I need to balance strong consistency for bookings against low latency for availability checks."
 
 ---
 
-## 🎯 Step 1: Requirements Clarification
+## 🎯 Requirements Clarification
 
 ### Functional Requirements
 
-1. **Availability Management**: Users define working hours and weekly schedules
-2. **Meeting Types**: Different durations with buffer times before/after
-3. **Booking Flow**: Invitees see available slots and book instantly with conflict prevention
-4. **Calendar Integration**: OAuth-based sync with Google Calendar and Outlook
-5. **Notifications**: Email confirmations, reminders, cancellation notices via queue
-6. **Time Zone Handling**: Store UTC, display in user's local time zone
+1. **Availability Management** - Hosts define weekly working hours
+2. **Meeting Types** - Configurable durations with buffer times
+3. **Booking Flow** - Guests select slots and book with conflict prevention
+4. **Calendar Integration** - Sync with Google Calendar and Outlook
+5. **Notifications** - Email confirmations and reminders
 
 ### Non-Functional Requirements
 
-- **Consistency**: Zero tolerance for double bookings (strong consistency required)
-- **Latency**: Availability checks < 200ms (5,000 RPS peak)
-- **Availability**: 99.9% uptime for booking system
-- **Scale**: 1M users, 430K bookings/day
+| Requirement | Target | Rationale |
+|-------------|--------|-----------|
+| Consistency | Zero double bookings | A single double booking destroys user trust |
+| Availability p99 | < 200ms | Users browse many dates before booking |
+| Booking p99 | < 500ms | Acceptable for a form submission |
+| Scale | 1M users, 5K RPS | Availability checks dominate (100:1 ratio to bookings) |
+
+> "The key insight is that availability reads vastly outnumber booking writes. This shapes my entire architecture - I'll optimize heavily for reads while ensuring absolute consistency on writes."
 
 ---
 
-## 🏗️ Step 2: High-Level Architecture
+## 🏗️ High-Level Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│         Load Balancer (nginx)           │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│    API Gateway / Application Layer      │
-│        (Node.js + Express)              │
-└─────────────────────────────────────────┘
-                    │
-     ┌──────────────┼──────────────┬──────────────┐
-     ▼              ▼              ▼              ▼
-┌──────────┐  ┌────────────┐ ┌────────────┐ ┌──────────────┐
-│ Booking  │  │Availability│ │Integration │ │Notification  │
-│ Service  │  │ Service    │ │ Service    │ │ Service      │
-└──────────┘  └────────────┘ └────────────┘ └──────────────┘
-     │              │              │              │
-     └──────────────┼──────────────┴──────────────┘
-                    │
-     ┌──────────────┼──────────────┐
-     ▼              ▼              ▼
-┌──────────┐  ┌────────────┐  ┌────────────┐
-│PostgreSQL│  │ Valkey/    │  │  RabbitMQ  │
-│(Primary) │  │  Redis     │  │  (Queue)   │
-└──────────┘  └────────────┘  └────────────┘
-```
-
----
-
-## 💾 Step 3: Database Schema Design
-
-### Core Tables
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        users                                │
-├─────────────────────────────────────────────────────────────┤
-│ id (UUID PK)                                                │
-│ email (VARCHAR UNIQUE NOT NULL)                             │
-│ password_hash, name, time_zone (default 'UTC')              │
-│ role (default 'user'), created_at, updated_at               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-           ┌──────────────────┼──────────────────┐
-           ▼                  ▼                  ▼
-┌─────────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│   meeting_types     │ │availability_    │ │    bookings     │
-├─────────────────────┤ │    rules        │ ├─────────────────┤
-│ id (UUID PK)        │ ├─────────────────┤ │ id (UUID PK)    │
-│ user_id (FK)        │ │ id (UUID PK)    │ │ meeting_type_id │
-│ name, slug (UNIQUE  │ │ user_id (FK)    │ │ host_user_id FK │
-│   with user_id)     │ │ day_of_week 0-6 │ │ invitee_name    │
-│ duration_minutes    │ │ start_time TIME │ │ invitee_email   │
-│ buffer_before/after │ │ end_time TIME   │ │ start_time TZ   │
-│ max_bookings_per_day│ │ is_active       │ │ end_time TZ     │
-│ color, is_active    │ └─────────────────┘ │ status, version │
-└─────────────────────┘                     │ idempotency_key │
-                                            └─────────────────┘
-```
-
-### Critical Indexes for Double-Booking Prevention
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                     Index Strategy                              │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  idx_bookings_no_double (UNIQUE PARTIAL)                       │
-│  ──────────────────────────────────────                        │
-│  ON bookings(host_user_id, start_time)                         │
-│  WHERE status = 'confirmed'                                    │
-│                                                                │
-│  idx_bookings_idempotency_key (UNIQUE PARTIAL)                 │
-│  ─────────────────────────────────────────────                 │
-│  ON bookings(idempotency_key)                                  │
-│  WHERE idempotency_key IS NOT NULL                             │
-│                                                                │
-│  idx_bookings_host_time                                        │
-│  ──────────────────────                                        │
-│  ON bookings(host_user_id, start_time, end_time)               │
-│                                                                │
-│  idx_availability_user_day                                     │
-│  ─────────────────────────                                     │
-│  ON availability_rules(user_id, day_of_week, is_active)        │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### Archive Table for Data Lifecycle
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   bookings_archive                           │
-├──────────────────────────────────────────────────────────────┤
-│ Same columns as bookings (no foreign keys)                   │
-│ archived_at TIMESTAMP                                        │
-│                                                              │
-│ Purpose: Move completed bookings to reduce active table size │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Load Balancer                            │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     API Gateway Layer                            │
+│                   (Rate Limiting, Auth)                          │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         ▼                     ▼                     ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ Booking Service │  │ Availability    │  │ Integration     │
+│                 │  │ Service         │  │ Service         │
+│ Handles writes  │  │ Handles reads   │  │ Calendar sync   │
+└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   PostgreSQL    │  │   Redis/Valkey  │  │    RabbitMQ     │
+│   (Primary)     │  │   (Cache)       │  │   (Async Jobs)  │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
 ---
 
-## 🔒 Step 4: Deep Dive - Double Booking Prevention
+## 💾 Data Model
 
-### Multi-Layer Approach
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| users | id, email, timezone | Host accounts |
+| meeting_types | id, user_id, duration_minutes, buffer_before, buffer_after | Event templates |
+| availability_rules | user_id, day_of_week, start_time, end_time | Weekly schedule |
+| bookings | id, host_user_id, start_time, end_time, status, version | Confirmed meetings |
+| calendar_integrations | user_id, provider, access_token, refresh_token | OAuth connections |
 
-"The booking race condition is the hardest problem. Two invitees clicking 'Book' at the same moment must never both succeed for the same slot."
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    FIVE-LAYER BOOKING PROTECTION                        │
-└─────────────────────────────────────────────────────────────────────────┘
-
-  Invitee A ──▶ ┌─────────────────────────────────────────────────────────┐
-                │ Layer 1: Idempotency Check                              │
-  Invitee B ──▶ │ ────────────────────────                                │
-                │ Check cache for idempotency_key                         │
-                │ If exists ──▶ Return cached booking result              │
-                └────────────────────────┬────────────────────────────────┘
-                                         ▼
-                ┌─────────────────────────────────────────────────────────┐
-                │ Layer 2: Distributed Lock (Valkey/Redis)                │
-                │ ─────────────────────────────────────                   │
-                │ Key: booking_lock:{host_user_id}                        │
-                │ TTL: 5 seconds                                          │
-                │ If lock fails ──▶ Return "Booking in progress, retry"   │
-                └────────────────────────┬────────────────────────────────┘
-                                         ▼
-                ┌─────────────────────────────────────────────────────────┐
-                │ Layer 3: Row-Level Lock (PostgreSQL Transaction)        │
-                │ ───────────────────────────────────────────             │
-                │ SELECT id FROM users WHERE id = host_id FOR UPDATE      │
-                │ Serializes all bookings for same host                   │
-                └────────────────────────┬────────────────────────────────┘
-                                         ▼
-                ┌─────────────────────────────────────────────────────────┐
-                │ Layer 4: Overlap Query Check                            │
-                │ ─────────────────────────                               │
-                │ SELECT id FROM bookings                                 │
-                │ WHERE host_user_id = ? AND status = 'confirmed'         │
-                │   AND start_time < new_end AND end_time > new_start     │
-                │ If rows found ──▶ Throw ConflictError                   │
-                └────────────────────────┬────────────────────────────────┘
-                                         ▼
-                ┌─────────────────────────────────────────────────────────┐
-                │ Layer 5: Unique Partial Index (Database Constraint)     │
-                │ ──────────────────────────────────────────────          │
-                │ INSERT INTO bookings (...) VALUES (...)                 │
-                │ If duplicate key error ──▶ Throw ConflictError          │
-                │ SUCCESS ──▶ Cache idempotency result, invalidate cache  │
-                └─────────────────────────────────────────────────────────┘
-```
-
-### Post-Booking Actions
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                   After Successful Booking                     │
-├───────────────────────────────────────────────────────────────┤
-│                                                               │
-│  1. Store idempotency result (1 hour TTL)                     │
-│     └──▶ Prevents duplicate bookings from network retries     │
-│                                                               │
-│  2. Invalidate availability cache                             │
-│     └──▶ Pattern: availability:{host_user_id}:*               │
-│                                                               │
-│  3. Queue confirmation email (async, non-blocking)            │
-│     └──▶ RabbitMQ: notifications queue                        │
-│                                                               │
-│  4. Release distributed lock                                  │
-│     └──▶ Always in finally block                              │
-│                                                               │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### Why Five Layers?
-
-| Layer | Mechanism | Purpose |
-|-------|-----------|---------|
-| 1 | Idempotency Key | Prevents duplicate submissions from network retries |
-| 2 | Distributed Lock | Serializes concurrent requests to same host |
-| 3 | SELECT FOR UPDATE | Row-level lock within transaction |
-| 4 | Overlap Query | Explicit conflict check with current data |
-| 5 | Unique Partial Index | Database-level constraint as last defense |
+**Critical indexes:**
+- Unique partial index on `bookings(host_user_id, start_time) WHERE status = 'confirmed'` - database-level double booking prevention
+- Composite index on `bookings(host_user_id, start_time, end_time)` - fast overlap queries
 
 ---
 
-## 🔧 Step 5: Deep Dive - Availability Calculation
+## 🔧 Deep Dive: Double Booking Prevention
 
-### Algorithm Flow
+> "This is the hardest problem. Two guests clicking 'Book' at the exact same moment must never both succeed for the same slot. I need to guarantee this without making bookings painfully slow."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     AVAILABILITY CALCULATION                            │
-└─────────────────────────────────────────────────────────────────────────┘
+### The Race Condition Problem
 
- Request: getAvailableSlots(meetingTypeId, date, timezone)
-                              │
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 1: Check Cache (5-min TTL)      │
-           │ Key: availability:{typeId}:{date}    │
-           ├──────────────────────────────────────┤
-           │ Cache hit? ──▶ Convert timezone      │
-           │             ──▶ Return slots         │
-           └──────────────────┬───────────────────┘
-                              │ Cache miss
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 2: Get Availability Rules       │
-           │ Query: availability_rules            │
-           │ WHERE user_id=? AND day_of_week=?    │
-           │       AND is_active=true             │
-           ├──────────────────────────────────────┤
-           │ No rules? ──▶ Return empty []        │
-           └──────────────────┬───────────────────┘
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 3: Get Existing Bookings        │
-           │ Query: bookings WHERE host_user_id=? │
-           │        AND status='confirmed'        │
-           │        AND start_time in day range   │
-           └──────────────────┬───────────────────┘
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 4: Get External Calendar Events │
-           │ CalendarIntegrationService.getEvents │
-           │ (from cache or API)                  │
-           └──────────────────┬───────────────────┘
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 5: Merge Busy Periods           │
-           │ Sort by start time                   │
-           │ Merge overlapping intervals          │
-           └──────────────────┬───────────────────┘
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 6: Generate Available Slots     │
-           │ For each rule window:                │
-           │   Generate 15-min interval slots     │
-           │   Check each against busy periods    │
-           │   Account for buffer before/after    │
-           └──────────────────┬───────────────────┘
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Step 7: Cache and Return             │
-           │ Cache result (5-min TTL)             │
-           │ Convert to requested timezone        │
-           └──────────────────────────────────────┘
-```
+Consider this scenario: Alice and Bob both see 2:00 PM available. Both click "Book" within 50ms of each other. Without proper protection, both database inserts could succeed because each check sees no existing booking.
 
-### Busy Period Merge Algorithm
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   INTERVAL MERGING                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Input (sorted by start):                                           │
-│  ┌─────┐  ┌─────────┐    ┌───┐ ┌───────┐                            │
-│  │ 9-10│  │ 9:30-11 │    │2-3│ │3:30-5 │                            │
-│  └─────┘  └─────────┘    └───┘ └───────┘                            │
-│                                                                     │
-│  Algorithm:                                                         │
-│  1. Sort by start time                                              │
-│  2. For each period:                                                │
-│     - If overlaps with last merged ──▶ Extend end time              │
-│     - Else ──▶ Add as new period                                    │
-│                                                                     │
-│  Output:                                                            │
-│  ┌──────────────┐      ┌───┐ ┌───────┐                              │
-│  │    9-11      │      │2-3│ │3:30-5 │                              │
-│  └──────────────┘      └───┘ └───────┘                              │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Cache Invalidation Strategy
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                 CACHE INVALIDATION TRIGGERS                        │
-├───────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  Trigger                    │  Action                             │
-│  ─────────────────────────  │  ─────────────────────              │
-│  Booking created/cancelled  │  Invalidate all dates for host     │
-│  Calendar sync completed    │  Invalidate all dates for host     │
-│  Availability rules changed │  Invalidate all dates for host     │
-│                                                                   │
-│  Pattern-based deletion: availability:{host_user_id}:*           │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📅 Step 6: Deep Dive - Calendar Integration
-
-### OAuth Token Management Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   OAUTH TOKEN LIFECYCLE                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-
-        getValidToken(integrationId)
-                    │
-                    ▼
-    ┌───────────────────────────────────┐
-    │ Query calendar_integrations       │
-    │ WHERE id = ? AND is_active = true │
-    └──────────────────┬────────────────┘
-                       ▼
-    ┌───────────────────────────────────┐
-    │ Token expires_at > now + 5min?    │
-    ├───────────────────────────────────┤
-    │ Yes ──▶ Return access_token       │
-    │ No  ──▶ Refresh token flow        │
-    └──────────────────┬────────────────┘
-                       │ Needs refresh
-                       ▼
-    ┌───────────────────────────────────┐
-    │ Call provider refresh endpoint    │
-    │ (Google OAuth2 / Microsoft Graph) │
-    └──────────────────┬────────────────┘
-                       ▼
-    ┌───────────────────────────────────┐
-    │ Update DB with new access_token   │
-    │ and expires_at timestamp          │
-    └──────────────────┬────────────────┘
-                       ▼
-    ┌───────────────────────────────────┐
-    │ Return new access_token           │
-    └───────────────────────────────────┘
-```
-
-### Calendar Sync Error Handling
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    ERROR HANDLING MATRIX                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Error Type              │  Action                                  │
-│  ──────────────────────  │  ─────────────────────────────────────   │
-│  RateLimitError          │  Schedule retry with exponential backoff │
-│                          │  (start at 60 seconds)                   │
-│                                                                     │
-│  TokenExpiredError       │  Mark integration as needing             │
-│                          │  reauthorization, notify user            │
-│                                                                     │
-│  NetworkError            │  Use cached data, retry in background    │
-│                                                                     │
-│  ProviderDown            │  Fallback to last cached events          │
-│                          │  Continue with local bookings only       │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Hybrid Sync Strategy
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   CALENDAR SYNC STRATEGY                                │
-└─────────────────────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────┐      ┌─────────────────────┐
-  │ PUSH (Webhooks)     │      │ PULL (Polling)      │
-  │ ─────────────────── │      │ ───────────────────  │
-  │ Google Calendar     │      │ Every 10 minutes    │
-  │ sends notification  │      │ for stale records   │
-  │ to our endpoint     │      │ or webhook failures │
-  └──────────┬──────────┘      └──────────┬──────────┘
-             │                            │
-             ▼                            ▼
-  ┌───────────────────────────────────────────────────┐
-  │              Sync Handler                          │
-  │ 1. Fetch events from provider                     │
-  │ 2. Cache events (10-min TTL)                      │
-  │ 3. Invalidate availability cache                  │
-  └───────────────────────────────────────────────────┘
-
-  Webhook Endpoint: POST /api/webhooks/google-calendar
-  Headers: x-goog-channel-id, x-goog-resource-state
-  States: 'sync' or 'exists' ──▶ Trigger calendar refresh
-```
-
----
-
-## 📧 Step 7: Notification System
-
-### Queue-Based Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   NOTIFICATION FLOW                                     │
-└─────────────────────────────────────────────────────────────────────────┘
-
-  Booking Created
-        │
-        ▼
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │                    NotificationService                               │
-  │                                                                     │
-  │  queueConfirmation(booking)                                         │
-  │  ┌─────────────────────────────────────────────────────────────┐    │
-  │  │ Publish to 'notifications' queue:                           │    │
-  │  │                                                             │    │
-  │  │   ┌──────────────┐  ┌──────────────┐                        │    │
-  │  │   │ To: Invitee  │  │ To: Host     │                        │    │
-  │  │   │ Type: confirm│  │ Type: confirm│                        │    │
-  │  │   │ bookingId    │  │ bookingId    │                        │    │
-  │  │   └──────────────┘  └──────────────┘                        │    │
-  │  └─────────────────────────────────────────────────────────────┘    │
-  │                                                                     │
-  │  scheduleReminders(booking)                                         │
-  │  ┌─────────────────────────────────────────────────────────────┐    │
-  │  │ Publish delayed messages:                                   │    │
-  │  │                                                             │    │
-  │  │   ┌──────────────────┐  ┌──────────────────┐                │    │
-  │  │   │ 24h before       │  │ 1h before        │                │    │
-  │  │   │ Type: reminder   │  │ Type: reminder   │                │    │
-  │  │   └──────────────────┘  └──────────────────┘                │    │
-  │  └─────────────────────────────────────────────────────────────┘    │
-  └─────────────────────────────────────────────────────────────────────┘
-```
-
-### Notification Worker
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   NOTIFICATION WORKER                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  consume('notifications', async (message) => {                          │
-│                                                                         │
-│    ┌────────────────────────────────────────────────────────────────┐   │
-│    │ 1. Fetch booking by ID                                         │   │
-│    │    If cancelled ──▶ Acknowledge and skip                       │   │
-│    └────────────────────────────┬───────────────────────────────────┘   │
-│                                 ▼                                       │
-│    ┌────────────────────────────────────────────────────────────────┐   │
-│    │ 2. Generate email content based on type                        │   │
-│    │    - confirmation: Meeting details + calendar link             │   │
-│    │    - reminder: Time until meeting + join details               │   │
-│    │    - cancellation: Reason + rebooking link                     │   │
-│    └────────────────────────────┬───────────────────────────────────┘   │
-│                                 ▼                                       │
-│    ┌────────────────────────────────────────────────────────────────┐   │
-│    │ 3. Send email via SMTP/SendGrid                                │   │
-│    └────────────────────────────┬───────────────────────────────────┘   │
-│                                 ▼                                       │
-│    ┌────────────────────────────────────────────────────────────────┐   │
-│    │ 4. Log to email_notifications table for audit                  │   │
-│    │    (booking_id, recipient, type, subject, body, status='sent') │   │
-│    └────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│    On error: Throw to trigger RabbitMQ retry with exponential backoff   │
-│  })                                                                     │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📈 Step 8: Database Scaling Strategy
-
-### Table Partitioning
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   MONTHLY PARTITIONING                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  bookings (parent table)                                                │
-│  PARTITION BY RANGE (start_time)                                        │
-│      │                                                                  │
-│      ├──▶ bookings_2024_01 (Jan 1 - Feb 1)                              │
-│      ├──▶ bookings_2024_02 (Feb 1 - Mar 1)                              │
-│      ├──▶ bookings_2024_03 (Mar 1 - Apr 1)                              │
-│      └──▶ ...                                                           │
-│                                                                         │
-│  Benefits:                                                              │
-│  - Query performance: Only scan relevant partitions                     │
-│  - Easy archival: DETACH old partitions, move to cold storage           │
-│  - Maintenance: VACUUM/ANALYZE on smaller tables                        │
-│                                                                         │
-│  Auto-partition creation:                                               │
-│  - Scheduled job creates next month's partition                         │
-│  - create_monthly_partition() function                                  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Read Replica Configuration
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   READ/WRITE SPLITTING                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│                      ┌─────────────────┐                                │
-│                      │  Application    │                                │
-│                      └────────┬────────┘                                │
-│                               │                                         │
-│             ┌─────────────────┴─────────────────┐                       │
-│             ▼                                   ▼                       │
-│  ┌─────────────────────┐             ┌─────────────────────┐            │
-│  │   Primary Pool      │             │   Replica Pool      │            │
-│  │   (max: 20 conn)    │             │   (max: 50 conn)    │            │
-│  │                     │             │                     │            │
-│  │  Used for:          │             │  Used for:          │            │
-│  │  - Booking create   │             │  - Availability     │            │
-│  │  - Cancellation     │             │  - Meeting types    │            │
-│  │  - Status updates   │             │  - User profiles    │            │
-│  │  - Any INSERT/UPDATE│             │  - All SELECT       │            │
-│  └─────────────────────┘             └─────────────────────┘            │
-│             │                                   │                       │
-│             ▼                                   ▼                       │
-│  ┌─────────────────────┐             ┌─────────────────────┐            │
-│  │ PostgreSQL Primary  │ ──repl──▶   │ PostgreSQL Replica  │            │
-│  └─────────────────────┘             └─────────────────────┘            │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## ⚖️ Step 9: Trade-offs Summary
+### Trade-off Analysis: Locking Strategies
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ PostgreSQL | ACID transactions, exclusion constraints for overlap prevention | Single-node write bottleneck at extreme scale |
-| ❌ DynamoDB | Infinite horizontal scale, managed service | No native overlap prevention, eventual consistency |
-| ✅ Pessimistic Locking (FOR UPDATE) | Guarantees no double bookings, simple mental model | Adds 10-50ms latency, potential for lock contention |
-| ❌ Optimistic Only | Lower latency for happy path | More complex retry logic, higher conflict rate |
-| ✅ UTC Storage | No DST issues, single source of truth | Requires conversion for every display |
-| ❌ Local Time Storage | Simpler display logic | DST issues, timezone changes break existing data |
-| ✅ Hybrid Calendar Sync (webhook + polling) | Real-time when webhooks work, polling catches failures | More complex implementation |
-| ❌ Polling Only | Simpler implementation | 10-minute staleness, wastes API quota |
-| ✅ 5-min Availability Cache | Reduces load 80%+, good enough freshness | Stale data possible, requires invalidation logic |
-| ❌ No Cache | Always fresh | 5000 RPS would overwhelm database |
-| ✅ Async Notifications via RabbitMQ | Booking latency excludes email delivery, reliable | Adds infrastructure complexity |
-| ❌ Synchronous Email | Simpler implementation | User waits for email delivery, failure blocks booking |
-| ✅ Monthly Partitioning | Efficient archival, fast date-range queries | More complex schema management |
-| ❌ No Partitioning | Simpler schema | Full table scans, difficult archival |
+| ✅ Pessimistic locking (SELECT FOR UPDATE) | Guarantees correctness, simple mental model | Adds 10-50ms latency, potential lock contention |
+| ❌ Optimistic locking only | Lower latency happy path | Higher conflict rate, complex retry logic |
+| ❌ Serializable isolation | Strongest guarantees | Severe performance penalty, serialization failures |
+| ❌ Application-level locks only | Works across databases | Redis failure = booking system failure |
+
+**Why I chose pessimistic locking with layered protection:**
+
+> "Optimistic locking seems appealing - no locks, lower latency. But for a scheduling system, the conflict rate during popular time slots (Monday 10 AM, lunch hours) would be significant. When 50 people try to book the same slot in a flash sale scenario, optimistic locking means 49 failed transactions that need retry logic, error handling, and user communication. The retry storms would actually create more load than the locks would.
+
+> With pessimistic locking, I serialize access to a host's calendar for the 200ms it takes to complete a booking. This adds latency, but the booking either succeeds or fails cleanly - no retries, no race conditions. For a system where correctness matters more than raw throughput, this is the right trade-off.
+
+> I layer this with a Redis distributed lock as a fast-fail mechanism. If someone is already booking with this host, new requests fail immediately rather than waiting for a database lock. This protects the database while providing better UX - users see 'someone else is booking, please retry' rather than waiting 5 seconds."
+
+### The Five-Layer Approach
+
+1. **Idempotency key** - Prevents duplicate submissions from network retries
+2. **Distributed lock** - Fast-fail if another booking is in progress for this host
+3. **Row-level lock** - Serialize within the transaction
+4. **Overlap query** - Explicit conflict check
+5. **Unique partial index** - Database constraint as final safety net
+
+> "Each layer catches different failure modes. The idempotency key handles the 'user clicked twice' problem. The distributed lock handles concurrent requests. The database constraints catch anything that slips through application code bugs."
 
 ---
 
-## 📊 Step 10: Monitoring
+## 🔧 Deep Dive: Availability Calculation
 
-### Key Backend Metrics
+> "A host might have 5 calendar integrations, each with 100+ events per month, plus internal bookings and availability rules. Computing available slots needs to be fast because users browse many dates before booking."
+
+### The Algorithm
+
+1. Fetch availability rules for the requested day
+2. Fetch confirmed bookings for that day
+3. Fetch external calendar events (from cache or API)
+4. Merge all busy periods into sorted, non-overlapping intervals
+5. Subtract busy periods from availability windows
+6. Generate slots based on meeting duration and buffer times
+
+### Trade-off Analysis: Caching Strategy
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Short TTL cache (5 min) + invalidation | Fresh enough, handles 80%+ of reads | Complexity of invalidation logic |
+| ❌ No cache | Always accurate | 5K RPS would crush the database |
+| ❌ Long TTL cache (1 hour) | Great hit rate | Unacceptable staleness - users book unavailable slots |
+| ❌ Pre-compute all availability | Fastest reads | Explosion of cache keys, complex invalidation |
+
+**Why 5-minute TTL with event-driven invalidation:**
+
+> "The fundamental tension is freshness vs. performance. A user browsing dates expects to see accurate availability, but recalculating from scratch on every request would overwhelm the system.
+
+> I chose a 5-minute TTL because that's the typical browsing session length. If a user is actively looking at availability, they're seeing cached data that's at most 5 minutes old - acceptable for this use case. The key insight is that during active booking, I invalidate the cache immediately. So the sequence is: Alice books 2:00 PM → cache invalidated → Bob refreshes and sees 2:00 PM gone.
+
+> Long TTL (1 hour) fails because it would show slots as available that were booked 45 minutes ago. Users would frequently hit 'slot unavailable' errors after filling out forms - terrible UX. No cache fails because we'd hit the database 5000 times per second during peak, which is unsustainable without massive overprovisioning.
+
+> The invalidation is pattern-based: when anything changes for a host (booking, cancellation, availability rule change, calendar sync), I delete all cache keys matching `availability:{host_id}:*`. This is aggressive but simple - I'd rather have cache misses than stale data for a booking system."
+
+---
+
+## 🔧 Deep Dive: Calendar Integration
+
+### The Sync Challenge
+
+External calendars (Google, Outlook) contain events that block availability. I need to keep this data fresh without overwhelming provider APIs or missing important updates.
+
+### Trade-off Analysis: Sync Strategy
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Webhooks + polling fallback | Real-time when working, resilient to failures | More complex implementation |
+| ❌ Polling only | Simple, predictable | 10-minute staleness minimum, wastes API quota |
+| ❌ Webhooks only | Real-time updates | Silent failures leave data stale for days |
+| ❌ On-demand sync | Always fresh | Adds 500ms+ to every availability request |
+
+**Why hybrid sync:**
+
+> "Google Calendar offers push notifications (webhooks), which is ideal - when a user adds an event, Google notifies us immediately. But webhooks fail silently. The notification might not arrive due to network issues, or our endpoint might be down during deployment. If I rely only on webhooks, a failed notification means the calendar data stays stale until the user manually syncs.
+
+> On-demand sync (fetch calendar on every availability request) seems attractive for freshness, but it adds 200-500ms to every request and quickly exhausts API rate limits. Google allows 1 million requests/day, which sounds like a lot until you have 1M users each browsing 10 dates - that's 10M requests per day just for calendar data.
+
+> The hybrid approach gives me the best of both: webhooks for real-time updates, plus a polling job that runs every 10 minutes to catch anything webhooks missed. The polling is batched by user, only fetching calendars that haven't been updated recently. This catches webhook failures within 10 minutes while keeping API usage reasonable."
+
+---
+
+## 📧 Notifications
+
+### Queue-Based Processing
+
+Booking confirmations and reminders go through RabbitMQ rather than being sent synchronously:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   PROMETHEUS METRICS                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  Booking Metrics                                                        │
-│  ───────────────                                                        │
-│  calendly_booking_operations_total                                      │
-│    Labels: operation (create/cancel), status (success/failure)          │
-│                                                                         │
-│  calendly_booking_creation_duration_seconds                             │
-│    Buckets: 0.1, 0.25, 0.5, 1, 2.5, 5                                   │
-│                                                                         │
-│  calendly_double_booking_prevented_total                                │
-│    Count of race conditions caught                                      │
-│                                                                         │
-│  Availability Metrics                                                   │
-│  ────────────────────                                                   │
-│  calendly_availability_checks_total                                     │
-│    Labels: cache_hit (true/false)                                       │
-│                                                                         │
-│  calendly_availability_calculation_duration_seconds                     │
-│    Buckets: 0.05, 0.1, 0.2, 0.5, 1                                      │
-│                                                                         │
-│  Calendar Sync Metrics                                                  │
-│  ─────────────────────                                                  │
-│  calendly_calendar_sync_lag_seconds                                     │
-│    Labels: provider (google/outlook)                                    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+Booking Created ──▶ Queue Message ──▶ Notification Worker ──▶ Email Sent
 ```
 
-### Alert Thresholds
+**Why async:**
 
-| Metric | Warning | Critical | Action |
-|--------|---------|----------|--------|
-| Booking p95 latency | > 500ms | > 2s | Check database locks |
-| Double booking prevented | Any occurrence | - | Investigate race condition |
-| Availability cache hit rate | < 70% | < 50% | Increase TTL or pre-warm |
-| Calendar sync lag | > 30 min | > 1 hour | Check API rate limits |
-| Notification queue depth | > 100 | > 500 | Scale workers |
+> "Email delivery can take 1-3 seconds (SMTP handshake, retries). If I send synchronously, the user waits 3 seconds after clicking 'Book' before seeing confirmation. Worse, if SendGrid is slow or down, the booking might fail entirely even though the database write succeeded.
+
+> By queuing notifications, the booking completes in 200ms, user sees confirmation immediately, and the email arrives 5-10 seconds later. If email delivery fails, the worker retries with exponential backoff. The booking is never blocked by email infrastructure issues."
+
+---
+
+## 📈 Scaling Considerations
+
+### What Breaks First
+
+At 10x current scale:
+1. **Availability cache** - More users browsing = more cache misses = database pressure
+2. **Calendar sync** - More integrations = more API calls = rate limit issues
+3. **Single PostgreSQL** - Write amplification from all the index updates on bookings
+
+### Scaling Path
+
+1. **Read replicas** for availability queries - most load is reads
+2. **Table partitioning** by month for bookings - keeps active partition small
+3. **Rate-limited calendar sync** with priority queue - popular hosts sync more often
+4. **Horizontal scaling** of stateless API servers behind load balancer
+
+---
+
+## ⚖️ Trade-offs Summary
+
+| Decision | Chosen | Alternative | Why Alternative Fails |
+|----------|--------|-------------|----------------------|
+| DB for bookings | PostgreSQL | DynamoDB | Need ACID transactions for double-booking prevention |
+| Locking strategy | Pessimistic | Optimistic | High conflict rate during popular slots |
+| Availability cache | 5-min TTL | Long TTL | Stale data causes booking failures |
+| Calendar sync | Webhook + poll | Webhook only | Silent failures leave data stale |
+| Notifications | Async queue | Synchronous | Email failures shouldn't block bookings |
+| Time storage | UTC only | Local time | DST transitions corrupt data |
 
 ---
 
 ## 🎯 Summary
 
-"To summarize the backend architecture for Calendly:
+"The Calendly backend architecture centers on one principle: strong consistency for bookings, aggressive caching for availability reads.
 
-1. **Double Booking Prevention**: Five-layer approach with idempotency, distributed locks, row-level locking, conflict queries, and unique partial index
-2. **Availability Calculation**: Merge availability rules, bookings, and calendar events with smart caching (5-min TTL)
-3. **Calendar Integration**: OAuth token management with automatic refresh, hybrid sync (webhooks + polling fallback)
-4. **Notification System**: Async queue-based processing with scheduled reminders and retry logic
-5. **Scaling**: Table partitioning by month, read replicas for availability queries, aggressive caching
+**Double booking prevention** uses five defensive layers - any one of them would likely work alone, but the combination handles edge cases and provides defense in depth. The database unique index is the last line of defense that catches any application bugs.
 
-The key architectural decision is prioritizing consistency over availability - we would rather fail a booking attempt than create a double booking. The multi-layer locking strategy ensures this guarantee while maintaining reasonable latency."
+**Availability calculation** is optimized for the 100:1 read-to-write ratio. Aggressive caching with event-driven invalidation keeps read latency low while ensuring users see fresh data when it matters - right after a booking changes.
+
+**Calendar integration** uses a hybrid approach because neither webhooks nor polling alone is sufficient. Webhooks fail silently; polling is too slow and expensive. Together, they provide real-time updates with reliable fallback.
+
+The key trade-off throughout is complexity vs. correctness. I could build a simpler system that occasionally double-books or shows stale availability, but for a scheduling product, these failures destroy user trust. The extra complexity is worth it."
