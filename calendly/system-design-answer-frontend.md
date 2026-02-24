@@ -549,24 +549,63 @@ Requiring authentication reduces spam and enables features like booking history.
 
 ---
 
-## 📱 UI Implementation Notes
+## 🔧 Deep Dive: Mobile-First Design
 
-### Calendar Display
-- Show availability indicator (dot) on dates with slots - requires month-level availability fetch upfront
-- 6-week grid (42 cells) keeps layout stable across months
-- Visual states: available (blue dot), selected (blue fill), past/unavailable (gray), today (ring)
+> "Most guests arrive via shared links on mobile - texted by a friend, tapped from an email signature, clicked from a social bio. The mobile experience isn't a scaled-down desktop; it's the primary experience."
+
+### Why Mobile Dominates
+
+| Traffic Source | Typical Device | Implication |
+|----------------|---------------|-------------|
+| Email signature link | Phone (checking email) | Thumb-friendly touch targets |
+| Text from friend | Phone | Fast load on cellular |
+| LinkedIn/Twitter bio | Phone (scrolling social) | Minimal data usage |
+| Calendar invite link | 50/50 | Must work on both |
+
+### Trade-off Analysis: Mobile Layout Pattern
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Bottom sheet for time slots/form | Native mobile feel, thumb zone friendly | Different code path from desktop |
+| ❌ Same layout scaled down | Single codebase | Tiny touch targets, awkward scrolling |
+| ❌ Separate mobile site | Optimized experience | Maintenance burden, URL complexity |
+
+**Why bottom sheet pattern:**
+
+> "When a guest taps a date, the time slots should slide up from the bottom - exactly where their thumb already is. Desktop users can see calendar and slots side-by-side because they have screen width. Mobile users need vertical stacking with smart interaction patterns.
+
+> The bottom sheet is familiar from iOS/Android native apps. It can be swiped down to dismiss, dragged up to see more options. The booking form slides up the same way. This feels native to mobile users rather than 'a website on a phone.'
+
+> The trade-off is implementation complexity. I need conditional rendering based on viewport, plus touch gesture handling for the sheet. But the UX improvement is substantial - mobile bookings feel intentionally designed, not cramped."
+
+### Mobile-Specific Considerations
+
+**Touch targets:**
+- Minimum 44x44px for all tappable elements (Apple HIG standard)
+- Time slot buttons spaced with 8px gaps to prevent mis-taps
+- Form fields full-width for easy input
+
+**Performance:**
+- Target < 3 second first contentful paint on 3G
+- Lazy-load non-critical assets (host avatar can be placeholder)
+- Inline critical CSS for initial calendar render
+- Avoid layout shifts as data loads
+
+**Input patterns:**
+- Email field: `type="email"` for @ keyboard
+- Date selection: tap, not hover (no hover states on mobile)
+- Form submission: sticky button at bottom of sheet
+
+**Cellular reliability:**
+- Show optimistic UI while booking request is in flight
+- Clear feedback if network fails ("Couldn't reach server - tap to retry")
+- Don't lose form data on network error
 
 ### Accessibility
-- Keyboard: arrow keys navigate dates, Enter/Space selects, Tab moves between sections
-- Screen readers: `role="grid"` on calendar, each date announces state, `aria-live` for errors
+
+- Keyboard navigation on desktop: arrow keys for dates, Enter to select
+- Screen readers: `role="grid"` on calendar, `aria-live` for errors
 - Focus management through progressive disclosure steps
-
-### Responsive Layout
-
-| Viewport | Layout Strategy |
-|----------|-----------------|
-| Desktop | Calendar + time slots side by side |
-| Mobile | Bottom sheet pattern for slots/form (44px+ touch targets) |
 
 ---
 
