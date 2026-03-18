@@ -2,7 +2,7 @@
 
 ## System Overview
 
-A ride-hailing platform connecting riders and drivers with real-time matching, location tracking, and dynamic pricing.
+A ride-hailing platform connecting riders and drivers with real-time matching, location tracking, and dynamic pricing. This document describes the production-scale architecture (how Uber would work at millions of concurrent users) and the local implementation (what we actually built with Docker + Node.js + Express + React).
 
 ## Requirements
 
@@ -10,113 +10,274 @@ A ride-hailing platform connecting riders and drivers with real-time matching, l
 
 1. **Rider Experience**
    - Request a ride from current location to destination
-   - See nearby available drivers
-   - Get fare estimate before booking
-   - Track driver location in real-time
+   - See nearby available drivers on a map
+   - Get fare estimates with surge pricing before booking
+   - Track driver location in real-time after matching
    - Rate drivers after trip completion
 
 2. **Driver Experience**
-   - Toggle availability status
-   - Receive ride requests with passenger details
-   - Navigate to pickup and dropoff locations
+   - Toggle availability status (online/offline)
+   - Receive ride offers with passenger details, ETA, and estimated fare
+   - Accept or decline ride offers within a countdown timer
+   - Navigate through pickup, arrival, start, and complete states
    - View earnings and trip history
 
 3. **Matching System**
-   - Match riders with optimal nearby drivers
-   - Handle surge pricing during high demand
-   - Calculate ETAs accurately
+   - Match riders with optimal nearby drivers using scoring algorithm
+   - Handle surge pricing during high demand periods
+   - Calculate ETAs based on distance and traffic estimates
+   - Support multiple vehicle types (economy, comfort, premium, XL)
+
+4. **Payment**
+   - Hold authorization at ride request time
+   - Calculate final fare based on actual distance and duration
+   - Process driver payout after ride completion
+
+5. **Safety**
+   - Trip sharing with contacts
+   - Emergency button integration
+   - Driver identity verification
 
 ### Non-Functional Requirements
 
-- **Latency**: Matching should complete within 3-5 seconds
-- **Availability**: 99.99% uptime
-- **Scale**: Support multiple concurrent rides locally
-- **Location Updates**: Handle frequent driver location updates
+- **Latency**: Matching should complete within 3-5 seconds; location updates propagated within 1 second
+- **Availability**: 99.99% uptime -- riders stranded without the app is a critical business risk
+- **Scale**: 10M DAU, 5M rides/day, 1.67M location updates/second at peak
+- **Consistency**: Strong consistency for ride state transitions and payments; eventual consistency for location updates
+- **Durability**: Zero lost payments; ride history retained for regulatory compliance
 
 ## Capacity Estimation
 
-For local development:
-- 5-10 concurrent users
-- 3 active drivers
-- Location updates every 3 seconds
+### Production Scale
 
-For production scale (reference):
-- 10 million DAU (50% riders, 50% drivers)
-- 5 million rides per day
-- 1.67 million location updates per second at peak
-- Storage: 5GB/day for ride history
+| Metric | Value | Derivation |
+|--------|-------|------------|
+| DAU | 10M | 50% riders, 50% drivers |
+| Rides per day | 5M | ~58 rides/second average, ~175/s peak |
+| Location updates/sec (peak) | 1.67M | 5M drivers updating every 3 seconds |
+| Ride data storage | ~5 GB/day | ~1 KB per ride record |
+| Location event storage | ~500 GB/day | If all updates are logged for analytics |
+| WebSocket connections (peak) | ~3M concurrent | Active riders + online drivers |
+
+### Local Development Scale
+
+- 5-10 concurrent users (mix of riders and drivers)
+- 3 active drivers sending location updates every 3-5 seconds
+- Single PostgreSQL instance, single Redis instance
+- All services running on localhost
 
 ## High-Level Architecture
 
+### Production Architecture
+
 ```
-                                 ┌─────────────────┐
-                                 │   CDN (Maps)    │
-                                 └────────┬────────┘
-                                          │
-    ┌──────────────┐              ┌───────┴────────┐              ┌──────────────┐
-    │  Rider App   │──────────────│  API Gateway   │──────────────│  Driver App  │
-    └──────────────┘              │  + Load Balancer│              └──────────────┘
-                                  └───────┬────────┘
-                                          │
-           ┌──────────────────────────────┼──────────────────────────────┐
-           │                              │                              │
-           ▼                              ▼                              ▼
-    ┌──────────────┐              ┌──────────────┐              ┌──────────────┐
-    │ Ride Service │              │Location Service│             │ Pricing Svc  │
-    │              │              │              │              │              │
-    │ - Booking    │              │ - Driver locs │              │ - Fare calc  │
-    │ - Status     │              │ - Geo queries │              │ - Surge      │
-    │ - Matching   │              │ - ETA         │              │ - Estimates  │
-    └──────┬───────┘              └──────┬───────┘              └──────────────┘
-           │                              │
-           │                              ▼
-           │                      ┌──────────────┐
-           │                      │  Geo Index   │
-           │                      │   (Redis)    │
-           │                      │              │
-           │                      │ - GEOADD     │
-           │                      │ - GEORADIUS  │
-           └──────────────────────┤              │
-                                  └──────────────┘
-                                          │
-    ┌─────────────────────────────────────┼─────────────────────────────────────┐
-    │                                     │                                     │
-    ▼                                     ▼                                     ▼
-┌──────────────┐                  ┌──────────────┐                  ┌──────────────┐
-│  PostgreSQL  │                  │   WebSocket  │                  │   Redis      │
-│              │                  │   Server     │                  │              │
-│ - Users      │                  │              │                  │ - Sessions   │
-│ - Rides      │                  │ - Real-time  │                  │ - Geo index  │
-│ - Payments   │                  │   updates    │                  │ - Demand     │
-└──────────────┘                  └──────────────┘                  └──────────────┘
+┌──────────────┐                                              ┌──────────────┐
+│  Rider App   │                                              │  Driver App  │
+│  (Mobile)    │                                              │  (Mobile)    │
+└──────┬───────┘                                              └──────┬───────┘
+       │                                                             │
+       │              ┌─────────────────┐                            │
+       │              │   CDN (Maps +   │                            │
+       │              │  Static Assets) │                            │
+       │              └─────────────────┘                            │
+       │                                                             │
+       └────────────────────┬────────────────────────────────────────┘
+                            │
+                     ┌──────┴───────┐
+                     │  API Gateway │
+                     │  + Load      │
+                     │  Balancer    │
+                     └──────┬───────┘
+                            │
+      ┌─────────────────────┼─────────────────────┐
+      │                     │                      │
+      ▼                     ▼                      ▼
+┌───────────┐        ┌────────────┐         ┌────────────┐
+│ Ride      │        │ Location   │         │ Pricing    │
+│ Service   │        │ Service    │         │ Service    │
+│           │        │            │         │            │
+│ - Request │        │ - Ingest   │         │ - Fare     │
+│ - Match   │        │ - Geo query│         │ - Surge    │
+│ - Status  │        │ - ETA      │         │ - Estimate │
+└─────┬─────┘        └─────┬──────┘         └────────────┘
+      │                     │
+      │     ┌───────────────┼───────────────┐
+      │     │               │               │
+      │     ▼               ▼               ▼
+      │ ┌─────────┐   ┌─────────┐   ┌──────────────┐
+      │ │ Redis   │   │WebSocket│   │  Routing /   │
+      │ │ Cluster │   │ Server  │   │  Maps API    │
+      │ │         │   │         │   │              │
+      │ │ - Geo   │   │ - Live  │   │ - ETA calc   │
+      │ │ - Demand│   │   push  │   │ - Routes     │
+      │ │ - Cache │   │ - Auth  │   │ - Geofencing │
+      │ └─────────┘   └─────────┘   └──────────────┘
+      │
+      ├─────────────────────────────────┐
+      │                                 │
+      ▼                                 ▼
+┌───────────┐                    ┌─────────────┐
+│PostgreSQL │                    │    Kafka     │
+│ (Sharded) │                    │             │
+│           │                    │ - ride.events│
+│ - Users   │                    │ - locations  │
+│ - Rides   │                    │ - payments   │
+│ - Payments│                    └──────┬──────┘
+└───────────┘                           │
+                          ┌─────────────┼─────────────┐
+                          ▼             ▼             ▼
+                    ┌───────────┐ ┌──────────┐ ┌──────────┐
+                    │Notification│ │Analytics │ │ Payment  │
+                    │  Worker   │ │  Worker  │ │ Worker   │
+                    └───────────┘ └──────────┘ └──────────┘
 ```
 
-### Core Components
+## Core Components
 
-**1. API Gateway (Express)**
-- Handles authentication for both riders and drivers
-- Routes requests to appropriate services
-- Rate limiting and request validation
+### 1. Location Tracking Service
 
-**2. Ride Service**
-- Manages the ride lifecycle: request, match, in-progress, completed
-- Coordinates between rider, driver, and payment systems
-- Stores ride state in PostgreSQL
+**Production design**: Drivers send GPS updates every 3-4 seconds over a persistent WebSocket connection. Each update is written to Redis using `GEOADD` for the geospatial index and published to Kafka `locations` topic for downstream consumers (analytics, ETA refinement, safety monitoring).
 
-**3. Location Service**
-- Ingests driver location updates
-- Maintains real-time geospatial index in Redis
-- Powers "find nearby drivers" queries
+**Why Redis GeoSpatial?** Finding nearby drivers requires sub-millisecond queries across millions of locations. Redis `GEORADIUS` (or `GEOSEARCH` in Redis 6.2+) provides O(N+log(M)) performance where N is the number of results and M is the number of elements in the sorted set. PostgreSQL with PostGIS could handle this but adds 10-50x latency for the same query. Tile38 is purpose-built for geofencing but introduces operational complexity for a feature Redis handles natively.
 
-**4. Pricing Service**
-- Calculates base fares using distance and time
-- Implements surge pricing based on supply/demand ratio
-- Provides fare estimates before booking
+**Location data flow:**
 
-**5. Geo Index (Redis with Geospatial)**
-- Stores driver locations using GEOADD
-- Supports GEORADIUS queries for nearby drivers
-- Updates locations in real-time
+```
+Driver App ──WebSocket──▶ Location Service ──▶ Redis GEOADD (hot index)
+                                            ──▶ Kafka "locations" topic
+                                            ──▶ PostgreSQL (async persist)
+```
+
+**Redis keys:**
+
+```
+drivers:available                          # Geo sorted set of all available drivers
+driver:status:{driver_id}                  # "available" | "on_ride" | "offline"
+driver:location:{driver_id}               # Hash: lat, lng, timestamp (60s TTL)
+```
+
+**Stale update handling**: Location updates older than 10 seconds are silently dropped. The `driver:location` hash includes a timestamp, and the 60-second TTL ensures stale entries auto-expire if a driver disconnects without going offline.
+
+### 2. Matching Engine
+
+**Production design**: When a rider requests a ride, the system publishes a matching request to a work queue. A pool of matching workers consume these requests, query Redis for nearby available drivers, score them, and offer the ride to the best candidate.
+
+**Matching algorithm**: The scoring function combines two signals with weighted importance:
+
+- **ETA score (60% weight)**: Lower ETA produces higher score. Normalized assuming a max 30-minute ETA: `etaScore = max(0, 1 - eta/30)`.
+- **Rating score (40% weight)**: Higher rating is better. Normalized from the 3-5 rating scale: `ratingScore = (rating - 3) / 2`.
+- **Final score**: `0.6 * etaScore + 0.4 * ratingScore`
+
+Drivers are sorted by score descending. The top-scored driver receives the ride offer via WebSocket with a 15-second acceptance countdown. If declined or timed out, the next driver is offered. After 3 failed attempts, the ride is cancelled with "no drivers available."
+
+**Why greedy matching over batch (Hungarian algorithm)?** Greedy matching completes in <100ms and is good enough for most scenarios. The Hungarian algorithm optimizes global assignment across all pending rides simultaneously, but requires batching requests (adding latency) and is O(n^3) complexity. At Uber's scale, a hybrid approach works: greedy for normal demand, batch optimization for surge zones where dozens of requests compete for the same drivers.
+
+**Offer/accept/decline flow:**
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────┐
+│  Rider   │     │   Matching   │     │   Driver     │
+│ requests │────▶│   Worker     │────▶│  receives    │
+│  ride    │     │  scores &    │     │  offer via   │
+└──────────┘     │  selects     │     │  WebSocket   │
+                 └──────┬───────┘     └──────┬───────┘
+                        │                     │
+                        │          ┌──────────┴──────────┐
+                        │          │                     │
+                        │    ┌─────┴─────┐         ┌────┴────┐
+                        │    │  Accept   │         │ Decline │
+                        │    │           │         │/Timeout │
+                        │    └─────┬─────┘         └────┬────┘
+                        │          │                    │
+                        │          ▼                    ▼
+                        │    ┌───────────┐       ┌───────────┐
+                        │    │ Ride      │       │ Offer to  │
+                        │    │ matched   │       │ next      │
+                        │    │ (notify   │       │ driver    │
+                        │    │  rider)   │       └───────────┘
+                        │    └───────────┘
+                        │
+                        ▼
+                  (after 3 failed
+                   attempts)
+                  ┌───────────┐
+                  │ No drivers│
+                  │ available │
+                  └───────────┘
+```
+
+### 3. Surge Pricing
+
+**Production design**: Surge pricing balances supply and demand in real-time. The system divides the map into geohash cells (~5km precision) and tracks demand (ride request count) and supply (available driver count) per cell.
+
+**Surge multiplier calculation**: The ratio of available drivers to pending requests determines the multiplier:
+
+| Supply/Demand Ratio | Surge Multiplier |
+|----------------------|------------------|
+| > 2.0 | 1.0x (normal) |
+| 1.5 - 2.0 | 1.1x |
+| 1.0 - 1.5 | 1.2x |
+| 0.75 - 1.0 | 1.5x |
+| 0.5 - 0.75 | 1.8x |
+| 0.25 - 0.5 | 2.0x |
+| < 0.25 | 2.5x (cap) |
+
+**Why geohash over H3 hexagons?** Geohash is simpler to implement (pure string operations) and sufficient for our surge granularity. H3 hexagons provide more uniform area coverage and avoid edge effects at cell boundaries, making them better for production. The trade-off is implementation complexity: H3 requires a native library and more complex neighbor calculations, while geohash is a 30-line function.
+
+**Demand tracking**: Each ride request increments a Redis counter keyed by geohash with a 5-minute TTL. Cancelled or matched rides decrement the counter. This provides a rolling demand window without requiring explicit cleanup.
+
+### 4. Trip Lifecycle
+
+The ride progresses through a strict state machine:
+
+```
+requested ──▶ matched ──▶ driver_arrived ──▶ picked_up ──▶ completed
+    │             │              │
+    ▼             ▼              ▼
+cancelled     cancelled      cancelled
+```
+
+**State transition guarantees**: Each transition uses optimistic locking with a version check in PostgreSQL. The UPDATE query includes a WHERE clause on the current expected status, and if zero rows are affected, the transition is rejected (stale state or already transitioned). This prevents race conditions when, for example, a rider cancels while the driver simultaneously marks arrival.
+
+**Concurrent driver matching**: When multiple matching workers target the same driver for different rides, the first `UPDATE drivers SET is_available = FALSE WHERE is_available = TRUE` wins. The losing request re-enters the matching queue to find another driver. The driver assignment and ride update are wrapped in a single PostgreSQL transaction.
+
+### 5. Payment Processing
+
+**Production design**: Payment follows a two-phase pattern:
+
+1. **Authorization hold**: When a ride is requested, place a hold on the rider's payment method for the estimated fare + 20% buffer. This ensures funds are available without charging.
+2. **Final capture**: When the ride completes, calculate the actual fare based on real distance/duration, capture the exact amount, and release the hold difference.
+3. **Driver payout**: Aggregate completed ride earnings and process driver payouts on a scheduled basis (daily or weekly).
+
+**Why hold-then-capture?** Direct charging at ride completion risks declined payments after the service is delivered. The hold pattern guarantees payment availability while allowing the final amount to differ from the estimate (traffic, route changes, wait time).
+
+**Circuit breaker on payment gateway**: The payment service wraps external payment API calls in a circuit breaker. If the gateway fails (50% error rate over 5+ requests), the circuit opens and payments are queued for retry. The rider still completes the ride, and payment is captured within 1 hour. This prevents a payment outage from blocking the entire ride completion flow.
+
+### 6. ETA Calculation
+
+**Production design**: ETA combines routing engine data with real-time traffic conditions. The routing service provides distance and estimated travel time between two points, accounting for road topology, turn penalties, and current traffic.
+
+**Local simplification**: ETA is calculated using Haversine distance with a fixed average speed of 30 km/h in urban areas: `etaMinutes = ceil(distanceKm / 30 * 60)`. This is accurate enough for demonstration but ignores roads, traffic, and one-way streets.
+
+### 7. Maps and Geofencing
+
+**Production design**: Integration with mapping services (Google Maps, Mapbox, or in-house routing like OSRM) provides:
+- Route polylines for driver navigation
+- Geocoding (address to coordinates and reverse)
+- Geofenced zones for airport surcharges, restricted areas, and pricing regions
+- Map tile rendering on client applications
+
+**Local simplification**: No map integration. Locations are lat/lng coordinates with simulated addresses. The frontend uses text inputs instead of map-based location picking.
+
+### 8. Safety Features
+
+**Production design**:
+- **Trip sharing**: Riders can share their live trip with contacts via a link showing real-time location
+- **Emergency button**: One-tap connection to local emergency services with automatic location sharing
+- **Driver verification**: Background checks, photo verification at login, document validation
+- **Ride recording**: Optional audio recording during trips for dispute resolution
+
+**Local simplification**: None of these are implemented. Authentication uses email/password with session tokens.
 
 ## Database Schema
 
@@ -125,21 +286,22 @@ For production scale (reference):
 ```sql
 -- Users table (both riders and drivers)
 CREATE TABLE users (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     name VARCHAR(255) NOT NULL,
     phone VARCHAR(20),
-    user_type VARCHAR(10) NOT NULL, -- 'rider' or 'driver'
+    user_type VARCHAR(10) NOT NULL CHECK (user_type IN ('rider', 'driver')),
     rating DECIMAL(2,1) DEFAULT 5.0,
     rating_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Drivers extended info
 CREATE TABLE drivers (
-    user_id UUID PRIMARY KEY REFERENCES users(id),
-    vehicle_type VARCHAR(20) NOT NULL, -- economy, comfort, premium, xl
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    vehicle_type VARCHAR(20) NOT NULL CHECK (vehicle_type IN ('economy', 'comfort', 'premium', 'xl')),
     vehicle_make VARCHAR(50),
     vehicle_model VARCHAR(50),
     vehicle_color VARCHAR(30),
@@ -149,30 +311,123 @@ CREATE TABLE drivers (
     current_lat DECIMAL(10,7),
     current_lng DECIMAL(10,7),
     total_rides INTEGER DEFAULT 0,
-    total_earnings_cents INTEGER DEFAULT 0
+    total_earnings_cents INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Rides table
 CREATE TABLE rides (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     rider_id UUID NOT NULL REFERENCES users(id),
     driver_id UUID REFERENCES users(id),
-    status VARCHAR(20) NOT NULL DEFAULT 'requested',
+    status VARCHAR(20) NOT NULL DEFAULT 'requested'
+        CHECK (status IN ('requested', 'matched', 'driver_arrived', 'picked_up', 'completed', 'cancelled')),
     pickup_lat DECIMAL(10,7) NOT NULL,
     pickup_lng DECIMAL(10,7) NOT NULL,
     pickup_address VARCHAR(500),
     dropoff_lat DECIMAL(10,7) NOT NULL,
     dropoff_lng DECIMAL(10,7) NOT NULL,
     dropoff_address VARCHAR(500),
-    vehicle_type VARCHAR(20) NOT NULL,
+    vehicle_type VARCHAR(20) NOT NULL CHECK (vehicle_type IN ('economy', 'comfort', 'premium', 'xl')),
     estimated_fare_cents INTEGER,
     final_fare_cents INTEGER,
     surge_multiplier DECIMAL(3,2) DEFAULT 1.00,
     distance_meters INTEGER,
     duration_seconds INTEGER,
+    rider_rating INTEGER CHECK (rider_rating >= 1 AND rider_rating <= 5),
+    driver_rating INTEGER CHECK (driver_rating >= 1 AND driver_rating <= 5),
+    cancellation_reason VARCHAR(255),
+    cancelled_by VARCHAR(10) CHECK (cancelled_by IN ('rider', 'driver', 'system')),
     requested_at TIMESTAMP DEFAULT NOW(),
-    completed_at TIMESTAMP
+    matched_at TIMESTAMP,
+    driver_arrived_at TIMESTAMP,
+    picked_up_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    cancelled_at TIMESTAMP
 );
+
+-- Ride location tracking (for ride history and analytics)
+CREATE TABLE ride_locations (
+    id SERIAL PRIMARY KEY,
+    ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE CASCADE,
+    lat DECIMAL(10,7) NOT NULL,
+    lng DECIMAL(10,7) NOT NULL,
+    recorded_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Payment methods
+CREATE TABLE payment_methods (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('card', 'cash')),
+    card_last_four VARCHAR(4),
+    card_brand VARCHAR(20),
+    is_default BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Sessions, notifications, analytics tables
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) NOT NULL UNIQUE,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    data JSONB,
+    read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE analytics_daily (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    metric_type VARCHAR(50) NOT NULL,
+    count INTEGER DEFAULT 0,
+    total_value DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (date, metric_type)
+);
+
+CREATE TABLE analytics_hourly (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    hour INTEGER NOT NULL CHECK (hour >= 0 AND hour <= 23),
+    rides_completed INTEGER DEFAULT 0,
+    revenue DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (date, hour)
+);
+
+CREATE TABLE driver_earnings (
+    id SERIAL PRIMARY KEY,
+    driver_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    rides_completed INTEGER DEFAULT 0,
+    total_earnings DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (driver_id, date)
+);
+```
+
+**Key indexes:**
+
+```sql
+CREATE INDEX idx_drivers_availability ON drivers(is_online, is_available);
+CREATE INDEX idx_drivers_location ON drivers(current_lat, current_lng) WHERE is_online = TRUE;
+CREATE INDEX idx_rides_rider ON rides(rider_id);
+CREATE INDEX idx_rides_driver ON rides(driver_id);
+CREATE INDEX idx_rides_status ON rides(status);
+CREATE INDEX idx_rides_requested_at ON rides(requested_at);
+CREATE INDEX idx_sessions_token ON sessions(token);
 ```
 
 ### Redis (Real-time State)
@@ -189,154 +444,111 @@ HSET driver:location:{driver_id} lat {lat} lng {lng} timestamp {ts}
 
 # Demand counting per geohash
 SET demand:{geohash} {count} EX 300
+
+# Ride data for quick access
+HSET ride:{ride_id} riderId status pickupLat pickupLng dropoffLat dropoffLng vehicleType createdAt
+
+# Pending ride requests (sorted set by timestamp)
+ZADD pending:requests {timestamp} {ride_id}
 ```
+
+### Kafka Topics (Production) / RabbitMQ Queues (Local)
+
+| Topic/Queue | Purpose | Consumers |
+|-------------|---------|-----------|
+| `matching.requests` | Ride requests waiting for driver matching | Matching workers |
+| `ride.events` (fanout) | All ride lifecycle events | Notifications, Analytics, Billing |
+| `notifications` | Push/SMS/email delivery | Notification worker |
+| `analytics` | Event sink for data warehouse | Analytics worker |
+| `dead.letter.queue` | Failed messages after max retries | Admin/manual review |
 
 ## API Design
 
-### Core Endpoints
+### Authentication
 
-**Authentication**
-- `POST /api/auth/register/rider` - Register rider
-- `POST /api/auth/register/driver` - Register driver
-- `POST /api/auth/login` - Login
-- `GET /api/auth/me` - Get current user
-- `POST /api/auth/logout` - Logout
+```
+POST /api/auth/register/rider    → Register as rider
+POST /api/auth/register/driver   → Register as driver with vehicle info
+POST /api/auth/login             → Login (returns session token)
+GET  /api/auth/me                → Get current user profile
+POST /api/auth/logout            → Destroy session
+```
 
-**Rides (Rider)**
-- `POST /api/rides/estimate` - Get fare estimates
-- `POST /api/rides/request` - Request a ride
-- `GET /api/rides/:rideId` - Get ride status
-- `POST /api/rides/:rideId/cancel` - Cancel ride
-- `POST /api/rides/:rideId/rate` - Rate the ride
+### Rides (Rider)
 
-**Driver**
-- `POST /api/driver/location` - Update location
-- `POST /api/driver/online` - Go online
-- `POST /api/driver/offline` - Go offline
-- `POST /api/driver/rides/:rideId/accept` - Accept ride
-- `POST /api/driver/rides/:rideId/arrived` - Notify arrival
-- `POST /api/driver/rides/:rideId/start` - Start ride
-- `POST /api/driver/rides/:rideId/complete` - Complete ride
+```
+POST /api/rides/estimate         → Get fare estimates for all vehicle types
+POST /api/rides/request          → Request a ride (idempotent with X-Idempotency-Key)
+GET  /api/rides/:rideId          → Get ride status with driver info
+POST /api/rides/:rideId/cancel   → Cancel ride (idempotent)
+POST /api/rides/:rideId/rate     → Rate the driver (1-5 stars)
+GET  /api/rides/history          → Rider's past rides
+```
+
+### Driver
+
+```
+POST /api/driver/online          → Go online (start receiving offers)
+POST /api/driver/offline         → Go offline
+POST /api/driver/location        → Update location (also via WebSocket)
+POST /api/driver/rides/:rideId/accept    → Accept ride offer
+POST /api/driver/rides/:rideId/arrived   → Notify arrival at pickup
+POST /api/driver/rides/:rideId/start     → Start ride (rider picked up)
+POST /api/driver/rides/:rideId/complete  → Complete ride at dropoff
+GET  /api/driver/earnings        → Earnings summary
+GET  /api/driver/history         → Trip history
+```
 
 ### WebSocket Events
 
-```javascript
-// Client -> Server
-{ type: 'auth', token: 'xxx' }
-{ type: 'location_update', lat: 37.77, lng: -122.41 }
+```
+Client ──▶ Server:
+  { type: "auth", token: "session-token" }
+  { type: "location_update", lat: 37.77, lng: -122.41 }
+  { type: "ping" }
 
-// Server -> Client (Driver)
-{ type: 'ride_offer', rideId, rider, pickup, dropoff, estimatedFare, expiresIn }
+Server ──▶ Driver:
+  { type: "ride_offer", rideId, rider, pickup, dropoff, estimatedFare, expiresIn }
 
-// Server -> Client (Rider)
-{ type: 'ride_matched', rideId, driver }
-{ type: 'driver_arrived', rideId }
-{ type: 'ride_started', rideId }
-{ type: 'ride_completed', rideId, fare }
+Server ──▶ Rider:
+  { type: "ride_matched", rideId, driver }
+  { type: "driver_arrived", rideId }
+  { type: "ride_started", rideId }
+  { type: "ride_completed", rideId, fare }
+  { type: "ride_cancelled", rideId, cancelledBy, reason }
+  { type: "no_drivers_available", rideId }
+
+Server ──▶ Both:
+  { type: "auth_success", userId }
+  { type: "connected", timestamp }
+  { type: "pong", timestamp }
 ```
 
 ## Key Design Decisions
 
-### Real-time Geo-matching
+### Redis Geo vs PostGIS vs Tile38
 
-**Challenge**: Find nearby drivers quickly from millions of locations
+**Chosen: Redis Geo.** For the primary use case of "find 20 nearest available drivers within 5km," Redis GEORADIUS provides sub-millisecond responses at millions of entries. PostGIS handles complex spatial queries (polygons, intersections) but adds 10-50x latency for simple radius searches. Tile38 is purpose-built for geofencing and real-time spatial data but introduces another operational dependency. Redis is already in the stack for caching and sessions, making it the lowest-complexity choice.
 
-**Solution**: Redis Geo commands
+**Trade-off**: Redis Geo stores everything in memory. At 5M drivers with 8 bytes per coordinate pair + member overhead, the geo index consumes ~200MB -- well within a single Redis instance. If we needed complex geofencing (airport zones, restricted areas), Tile38 or PostGIS would be necessary.
 
-```javascript
-// Store driver location
-await redis.geoadd('drivers:available', lng, lat, driverId);
+### WebSocket vs Server-Sent Events vs Polling
 
-// Find 20 nearest drivers within 5km
-const drivers = await redis.georadius(
-  'drivers:available',
-  lng, lat,
-  5, 'km',
-  'WITHCOORD', 'WITHDIST',
-  'COUNT', 20,
-  'ASC'
-);
-```
+**Chosen: WebSocket.** The ride-hailing use case requires bidirectional real-time communication. Drivers send location updates (client-to-server) and receive ride offers (server-to-client) on the same connection. SSE only supports server-to-client push, which would require a separate HTTP channel for location updates. Polling at 1-second intervals creates 60 requests/minute per user; at 3M concurrent users, that is 3M requests/second just for status checks.
 
-**Why Redis Geo?**
-- O(log N) operations
-- Built-in distance calculation
-- Handles millions of updates
-- Simple operational model
+**Trade-off**: WebSocket connections are stateful, which complicates horizontal scaling. Each server instance holds a subset of connections, so sending a message to a specific user requires knowing which server holds their connection. In production, this is solved with a pub/sub layer (Redis Pub/Sub or a dedicated message broker) that routes messages to the correct server. Our local implementation sidesteps this by running a single server instance.
 
-### Matching Algorithm
+### RabbitMQ (Local) vs Kafka (Production)
 
-```javascript
-function computeMatchScore(driver, eta) {
-  // Lower ETA is better (invert and normalize)
-  const etaScore = Math.max(0, 1 - eta / 30);
+**Chosen locally: RabbitMQ.** For local development with low throughput, RabbitMQ provides simpler setup and built-in features (dead letter queues, message TTL, management UI). In production, Kafka would be preferred for ride events because: (1) events are append-only and naturally ordered, (2) multiple consumers need independent read positions, (3) event replay capability is needed for analytics backfills, and (4) Kafka handles 1M+ messages/second per partition.
 
-  // Higher rating is better
-  const ratingScore = (driver.rating - 3) / 2;
+**Trade-off**: RabbitMQ is a traditional message broker (push-based, messages deleted after acknowledgment). Kafka is a distributed log (pull-based, messages retained for configurable duration). For matching requests (work queue semantics), RabbitMQ's model is actually a better fit. For ride events (fan-out to multiple consumers), Kafka's consumer group model is superior.
 
-  // Weighted combination
-  return (0.6 * etaScore) + (0.4 * ratingScore);
-}
-```
+### Session Auth vs JWT
 
-### Surge Pricing
+**Chosen: Session-based auth with Redis.** Session tokens stored in Redis provide immediate revocation (critical when a user reports a stolen device), simple implementation, and no token size overhead. JWTs are stateless but require complex revocation (blacklists, short expiry + refresh tokens) and carry payload in every request.
 
-```javascript
-function calculateSurge(availableDrivers, pendingRequests) {
-  const ratio = availableDrivers / Math.max(pendingRequests, 1);
-
-  if (ratio > 2) return 1.0;      // Plenty of drivers
-  if (ratio > 1.5) return 1.1;
-  if (ratio > 1) return 1.2;
-  if (ratio > 0.75) return 1.5;
-  if (ratio > 0.5) return 1.8;
-  if (ratio > 0.25) return 2.0;
-  return 2.5;                     // Very high demand
-}
-```
-
-## Technology Stack
-
-- **Application Layer**: Node.js + Express + WebSocket
-- **Data Layer**: PostgreSQL (transactional), Redis (real-time)
-- **Caching Layer**: Redis (sessions, geo index, demand counts)
-- **Frontend**: React + TypeScript + Zustand + TanStack Router
-
-## Scalability Considerations
-
-1. **Shard by geography**: Location updates partition naturally by city/region
-2. **Stateless services**: API servers can scale horizontally
-3. **Redis Cluster**: For geo data at scale
-4. **CDN for static assets**: Map tiles, images
-
-## Trade-offs Summary
-
-| Decision | Alternative | Why We Chose This |
-|----------|-------------|-------------------|
-| Redis Geo | PostGIS, Tile38 | Simplicity, speed |
-| Greedy matching | Hungarian algorithm | Fast enough for demo |
-| Session auth | JWT | Simpler, Redis-based |
-| WebSocket | SSE, Polling | Lower latency |
-
-## Observability
-
-Key metrics to track:
-- Request-to-match time: Target < 5 seconds
-- Match-to-pickup time: Track by zone
-- Ride completion rate: Detect failed rides
-- Driver utilization: Optimize supply positioning
-- Surge frequency: Ensure fairness
-
-## Security Considerations
-
-- Password hashing with bcrypt
-- Session tokens stored in Redis with expiry
-- Input validation on all endpoints
-- CORS configuration for frontend
-
-## Consistency and Idempotency Semantics
-
-This section defines how the system handles consistency, replays, and conflicts for core write operations.
+## Consistency and Idempotency
 
 ### Consistency Model by Operation
 
@@ -344,739 +556,282 @@ This section defines how the system handles consistency, replays, and conflicts 
 |-----------|-------------|-----------|
 | Ride request | Strong (PostgreSQL transaction) | Must prevent double-booking |
 | Driver location update | Eventual (Redis overwrite) | Latest location always wins |
-| Ride state transition | Strong (row-level lock) | State machine must be atomic |
+| Ride state transition | Strong (optimistic locking) | State machine must be atomic |
 | Payment capture | Strong (external idempotency) | Financial correctness required |
 | Driver availability toggle | Eventual (Redis + DB sync) | Small delay acceptable |
-| Rating submission | Strong (upsert with conflict) | One rating per ride per party |
+| Rating submission | Strong (constraint check) | One rating per ride per party |
 
 ### Idempotency Key Strategy
 
-All mutating API endpoints accept an `X-Idempotency-Key` header (client-generated UUID). The system uses Redis to track processed requests:
+All mutating API endpoints accept an `X-Idempotency-Key` header (client-generated UUID). The middleware uses Redis to track processed requests:
 
-```javascript
-// Idempotency middleware
-async function idempotencyMiddleware(req, res, next) {
-  const idempotencyKey = req.headers['x-idempotency-key'];
-  if (!idempotencyKey) return next();
+1. Check Redis for existing response with key `idempotency:{operation}:{userId}:{key}`
+2. If found and completed: return cached response (prevents duplicate charges)
+3. If found as "pending": return 409 (request in progress)
+4. If not found: set "pending" marker (60s TTL, NX), process request, cache response (24h TTL)
+5. If Redis is unavailable: proceed without idempotency (fail-open for availability)
 
-  const cacheKey = `idempotency:${req.userId}:${idempotencyKey}`;
+### Ride State Machine Conflicts
 
-  // Check if request was already processed
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    const { status, body } = JSON.parse(cached);
-    return res.status(status).json(body);
-  }
-
-  // Store pending marker to prevent concurrent duplicate requests
-  const acquired = await redis.set(cacheKey, 'pending', 'NX', 'EX', 60);
-  if (!acquired) {
-    return res.status(409).json({ error: 'Request in progress' });
-  }
-
-  // Capture response to cache
-  const originalJson = res.json.bind(res);
-  res.json = async (body) => {
-    await redis.set(cacheKey, JSON.stringify({
-      status: res.statusCode,
-      body
-    }), 'EX', 86400); // Cache for 24 hours
-    return originalJson(body);
-  };
-
-  next();
-}
-```
-
-**Key TTLs:**
-- In-flight lock: 60 seconds
-- Completed response cache: 24 hours
-- Payment idempotency keys: 7 days (for dispute resolution)
-
-### Conflict Resolution Rules
-
-**Ride State Machine Conflicts:**
-
-```
-requested -> [matched, cancelled]
-matched -> [driver_arrived, cancelled]
-driver_arrived -> [in_progress, cancelled]
-in_progress -> [completed]
-completed -> (terminal)
-cancelled -> (terminal)
-```
-
-State transitions use optimistic locking with version numbers:
+State transitions use optimistic locking:
 
 ```sql
 UPDATE rides
-SET status = 'matched',
-    driver_id = $1,
-    version = version + 1
-WHERE id = $2
-  AND status = 'requested'
-  AND version = $3
+SET status = 'matched', driver_id = $1, matched_at = NOW()
+WHERE id = $2 AND status = 'requested'
 RETURNING *;
 ```
 
-If no rows are updated, the operation is rejected (stale state or already transitioned).
+If zero rows are updated, the transition is rejected. This handles:
+- Rider cancels while matching is in progress
+- Two matching workers try to assign different drivers to the same ride
+- Driver marks arrival while rider cancels
 
-**Concurrent Driver Matching:**
-
-When multiple matching workers target the same driver for different rides:
-1. First `UPDATE drivers SET is_available = false WHERE is_available = true` wins
-2. Losing requests re-enter the matching queue
-3. Driver assignment is wrapped in a PostgreSQL transaction with the ride update
-
-**Location Update Conflicts:**
-
-Location updates are last-write-wins by design. Redis GEOADD overwrites previous coordinates. The `driver:location:{id}` hash includes a timestamp to detect stale updates if needed:
-
-```javascript
-// Reject location updates older than 10 seconds
-if (Date.now() - incomingTimestamp > 10000) {
-  return; // Silently drop stale update
-}
-```
-
-## Async Queue Architecture (RabbitMQ)
-
-This section introduces an async queue layer for fanout, background jobs, and backpressure handling.
+## Async Queue Architecture
 
 ### Queue Topology
 
 ```
-                            ┌──────────────────┐
-                            │   ride.events    │ (fanout exchange)
-                            └────────┬─────────┘
-           ┌─────────────────────────┼─────────────────────────┐
-           ▼                         ▼                         ▼
-   ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
-   │ notifications │         │   analytics   │         │    billing    │
-   │    queue      │         │    queue      │         │    queue      │
-   └───────────────┘         └───────────────┘         └───────────────┘
-           │                         │                         │
-           ▼                         ▼                         ▼
-   ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
-   │  Push/SMS/    │         │  Event sink   │         │  Payment      │
-   │  Email worker │         │  (Postgres)   │         │  processor    │
-   └───────────────┘         └───────────────┘         └───────────────┘
-```
+                            ┌──────────────────────┐
+                            │  ride.events.fanout  │ (fanout exchange)
+                            └──────────┬───────────┘
+           ┌───────────────────────────┼───────────────────────────┐
+           ▼                           ▼                           ▼
+   ┌───────────────┐           ┌───────────────┐           ┌───────────────┐
+   │ notifications │           │   analytics   │           │  (billing -   │
+   │    queue      │           │    queue      │           │   future)     │
+   └───────┬───────┘           └───────┬───────┘           └───────────────┘
+           ▼                           ▼
+   ┌───────────────┐           ┌───────────────┐
+   │  Notification │           │  Analytics    │
+   │  Worker       │           │  Worker       │
+   └───────────────┘           └───────────────┘
 
-### Queue Definitions
-
-```javascript
-// RabbitMQ setup for local development
-const QUEUES = {
-  // Ride lifecycle events (fanout to multiple consumers)
-  RIDE_EVENTS: {
-    exchange: 'ride.events',
-    type: 'fanout',
-    queues: ['notifications', 'analytics', 'billing']
-  },
-
-  // Driver matching (work queue with single consumer per message)
-  MATCHING: {
-    queue: 'matching.requests',
-    durable: true,
-    prefetch: 5 // Process 5 concurrent matches per worker
-  },
-
-  // Background jobs (delayed/scheduled)
-  BACKGROUND: {
-    queue: 'background.jobs',
-    deadLetterExchange: 'background.dlx',
-    messageTtl: 300000 // 5 minute max processing time
-  }
-};
+   ┌───────────────────┐
+   │  matching.requests │ (work queue, single consumer per message)
+   └─────────┬─────────┘
+             ▼
+   ┌───────────────┐
+   │  Matching     │
+   │  Worker(s)    │
+   └───────────────┘
 ```
 
 ### Delivery Semantics
 
 | Queue | Semantics | Ack Strategy | Retry Policy |
 |-------|-----------|--------------|--------------|
-| ride.events (notifications) | At-least-once | Manual ack after send | 3 retries, then DLQ |
-| ride.events (analytics) | At-most-once | Auto ack | No retries (best effort) |
-| ride.events (billing) | At-least-once | Manual ack after DB commit | 5 retries with backoff |
-| matching.requests | At-least-once | Manual ack after match | Immediate retry, then requeue |
-| background.jobs | At-least-once | Manual ack | 3 retries, then DLQ |
-
-### Message Schemas
-
-```typescript
-// Ride event envelope
-interface RideEvent {
-  eventId: string;       // UUID for deduplication
-  eventType: 'requested' | 'matched' | 'completed' | 'cancelled';
-  rideId: string;
-  timestamp: number;
-  payload: {
-    riderId?: string;
-    driverId?: string;
-    fare?: number;
-    location?: { lat: number; lng: number };
-  };
-}
-
-// Matching request
-interface MatchingRequest {
-  requestId: string;     // Idempotency key
-  rideId: string;
-  pickupLocation: { lat: number; lng: number };
-  vehicleType: string;
-  maxWaitSeconds: number;
-  attempt: number;       // For retry tracking
-}
-```
+| matching.requests | At-least-once | Manual ack after match | 3 retries with exponential backoff, then DLQ |
+| notifications | At-least-once | Manual ack after send | 3 retries, then DLQ |
+| analytics | At-most-once | Auto ack | No retries (best effort) |
 
 ### Backpressure Handling
 
-**Producer-side (API servers):**
+- **Prefetch limit**: Channel prefetch set to 10, preventing workers from buffering too many messages
+- **Queue TTL**: Matching requests expire after 5 minutes (stale ride requests are no longer relevant)
+- **Dead letter exchange**: Failed messages after max retries are routed to `dead.letter.queue` for admin review
 
-```javascript
-// Check queue depth before accepting new ride requests
-async function checkBackpressure() {
-  const queueInfo = await channel.checkQueue('matching.requests');
-  if (queueInfo.messageCount > 100) {
-    throw new ServiceUnavailableError('High demand - please retry');
-  }
-}
-```
+## Observability
 
-**Consumer-side (matching workers):**
+### Prometheus Metrics
 
-```javascript
-// Prefetch limit prevents overwhelming workers
-channel.prefetch(5);
+The backend exposes a `/metrics` endpoint with comprehensive instrumentation:
 
-// Reject and requeue if worker is overloaded
-if (process.memoryUsage().heapUsed > 500 * 1024 * 1024) {
-  channel.nack(message, false, true); // Requeue
-  return;
-}
-```
+**Ride metrics:**
+- `uber_ride_requests_total{vehicle_type, status}` -- ride request count by type and outcome
+- `uber_ride_matching_duration_seconds{vehicle_type, success}` -- matching latency histogram
+- `uber_rides_by_status{status}` -- current rides by status (gauge)
+- `uber_ride_fare_cents{vehicle_type}` -- fare distribution histogram
 
-### Dead Letter Queue (DLQ) Processing
+**Driver metrics:**
+- `uber_drivers_online_total{vehicle_type}` -- online driver count by vehicle type
+- `uber_drivers_available_total{vehicle_type}` -- available (not on ride) driver count
+- `uber_driver_location_updates_total` -- total location update count
 
-Failed messages after max retries go to DLQ for manual inspection:
+**Surge metrics:**
+- `uber_surge_multiplier{geohash}` -- current surge multiplier by zone
+- `uber_surge_events_total{multiplier_range}` -- ride requests with surge pricing
 
-```javascript
-// DLQ consumer for alerting and manual processing
-channel.consume('background.dlq', async (msg) => {
-  const payload = JSON.parse(msg.content.toString());
+**Infrastructure metrics:**
+- `uber_circuit_breaker_state{circuit, state}` -- circuit breaker status
+- `uber_circuit_breaker_requests_total{circuit, result}` -- circuit breaker request outcomes
+- `uber_geo_query_duration_seconds{operation, success}` -- Redis geo query latency
+- `uber_queue_messages_published_total{queue, event_type}` -- queue throughput
+- `uber_queue_depth{queue}` -- current queue depth
+- `uber_http_requests_total{method, path, status_code}` -- HTTP request count
+- `uber_http_request_duration_seconds{method, path}` -- HTTP latency histogram
+- `uber_idempotency_hits_total{operation}` -- duplicate request prevention count
+- `uber_service_health{service}` -- dependency health status
 
-  // Log for alerting
-  console.error('DLQ message:', {
-    originalQueue: msg.properties.headers['x-first-death-queue'],
-    reason: msg.properties.headers['x-first-death-reason'],
-    payload
-  });
+### Health Check Endpoints
 
-  // Store in PostgreSQL for admin review
-  await db.query(`
-    INSERT INTO failed_jobs (queue, payload, error_reason, created_at)
-    VALUES ($1, $2, $3, NOW())
-  `, [
-    msg.properties.headers['x-first-death-queue'],
-    JSON.stringify(payload),
-    msg.properties.headers['x-first-death-reason']
-  ]);
+| Endpoint | Purpose | What it checks |
+|----------|---------|----------------|
+| `GET /health` | Detailed status | PostgreSQL, Redis, RabbitMQ latency; circuit breaker states; memory usage |
+| `GET /health/live` | Liveness probe | Is the process running? |
+| `GET /health/ready` | Readiness probe | Are critical dependencies (PostgreSQL, Redis) responsive? |
 
-  channel.ack(msg);
-});
-```
+### Structured Logging
 
-### Local Development Setup
+All services use Pino for structured JSON logging with service-specific loggers (e.g., `location-service`, `matching-service`, `ride-lifecycle`). Request logging middleware captures method, path, status, and duration for every HTTP request.
 
-Add to `docker-compose.yml`:
+## Failure Handling
 
-```yaml
-rabbitmq:
-  image: rabbitmq:3-management
-  ports:
-    - "5672:5672"
-    - "15672:15672"
-  environment:
-    RABBITMQ_DEFAULT_USER: uber
-    RABBITMQ_DEFAULT_PASS: uber
-  volumes:
-    - rabbitmq_data:/var/lib/rabbitmq
-```
+### Circuit Breakers
 
-## Failure Handling and Resilience
-
-This section covers retry strategies, circuit breakers, disaster recovery, and backup/restore procedures.
-
-### Retry Strategy with Idempotency Keys
-
-**API Layer Retries:**
-
-```javascript
-// Axios client with retry configuration
-const apiClient = axios.create({
-  timeout: 5000,
-  headers: { 'X-Idempotency-Key': () => uuidv4() }
-});
-
-axiosRetry(apiClient, {
-  retries: 3,
-  retryDelay: (retryCount) => {
-    // Exponential backoff: 100ms, 200ms, 400ms
-    return Math.pow(2, retryCount) * 100;
-  },
-  retryCondition: (error) => {
-    // Retry on network errors and 5xx, but not 4xx
-    return axiosRetry.isNetworkOrIdempotentRequestError(error)
-      || (error.response?.status >= 500);
-  }
-});
-```
-
-**Queue Consumer Retries:**
-
-```javascript
-// Retry with exponential backoff for queue messages
-async function processWithRetry(message, handler) {
-  const attempt = (message.properties.headers['x-retry-count'] || 0) + 1;
-  const maxRetries = 3;
-
-  try {
-    await handler(message);
-    channel.ack(message);
-  } catch (error) {
-    if (attempt >= maxRetries) {
-      // Send to DLQ
-      channel.reject(message, false);
-    } else {
-      // Requeue with delay using message TTL
-      const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
-      channel.publish('', 'matching.requests.delayed', message.content, {
-        headers: { 'x-retry-count': attempt },
-        expiration: delay.toString()
-      });
-      channel.ack(message);
-    }
-  }
-}
-```
-
-### Circuit Breaker Implementation
-
-```javascript
-const CircuitBreaker = require('opossum');
-
-// Circuit breaker for external services (e.g., payment gateway)
-const paymentCircuit = new CircuitBreaker(capturePayment, {
-  timeout: 10000,           // 10 second timeout
-  errorThresholdPercentage: 50,  // Open after 50% failures
-  resetTimeout: 30000,      // Try again after 30 seconds
-  volumeThreshold: 5        // Minimum 5 requests before tripping
-});
-
-paymentCircuit.on('open', () => {
-  console.warn('Payment circuit OPEN - payments disabled');
-  // Alert ops team
-});
-
-paymentCircuit.on('halfOpen', () => {
-  console.info('Payment circuit HALF-OPEN - testing');
-});
-
-paymentCircuit.on('close', () => {
-  console.info('Payment circuit CLOSED - payments restored');
-});
-
-// Fallback behavior when circuit is open
-paymentCircuit.fallback(() => {
-  return { status: 'pending', message: 'Payment queued for retry' };
-});
-
-// Usage
-async function completeRide(rideId, fare) {
-  const payment = await paymentCircuit.fire(rideId, fare);
-  // ...
-}
-```
-
-**Circuit Breakers by Service:**
+Circuit breakers (using Opossum) wrap calls to external dependencies to prevent cascade failures:
 
 | Service | Timeout | Error Threshold | Reset Timeout | Fallback |
 |---------|---------|-----------------|---------------|----------|
-| Payment gateway | 10s | 50% | 30s | Queue for later |
-| Routing/ETA API | 3s | 70% | 15s | Return cached ETA |
+| Redis geo operations | 3s | 50% over 5 requests | 15s | Return empty driver list |
+| Payment gateway | 10s | 50% | 30s | Queue payment for later |
+| Routing/ETA API | 3s | 70% | 15s | Return cached or estimated ETA |
 | Push notifications | 2s | 80% | 10s | Queue in Redis |
-| SMS gateway | 5s | 50% | 60s | Queue in DB |
 
-### Graceful Degradation Modes
+**How circuit breakers prevent cascade failures**: If Redis becomes slow (network issues, memory pressure), every matching request waits for the timeout. These waiting requests consume thread pool capacity, causing the API to become unresponsive even for endpoints that do not need Redis. The circuit breaker detects the 50% failure rate, opens the circuit, and subsequent requests fail immediately (<1ms) with a fallback response instead of waiting 3 seconds. The "no drivers nearby" fallback is better UX than a timeout error. After 15 seconds, the circuit tries one request (half-open state), and if it succeeds, normal operation resumes.
 
-When components fail, the system degrades gracefully:
+### Retry Strategy
+
+All retries use exponential backoff with jitter to prevent thundering herd:
+
+- **API layer**: 3 retries, base delay 100ms, max delay 5s
+- **Queue consumers**: 3 retries, delays of 2s/4s/8s, then DLQ
+- **Database writes**: 2 retries, base delay 100ms (for transient connection errors)
+- **RabbitMQ connection**: 5 retries, base delay 1s, max delay 10s
+
+### Graceful Degradation
 
 | Failure | Degradation | User Impact |
 |---------|-------------|-------------|
-| Redis down | Use PostgreSQL for matching (slower) | Matching takes 2-5s instead of <1s |
-| RabbitMQ down | Queue messages in Redis, process later | Notifications delayed |
-| Payment gateway down | Accept ride, queue payment capture | Payment processed within 1 hour |
-| WebSocket server down | Fall back to polling (5s interval) | Higher latency for updates |
+| Redis down | PostgreSQL bounding-box query for nearby drivers | Matching takes 2-5s instead of <1s |
+| RabbitMQ down | Server starts without queue support, logs warning | Matching works synchronously (slower) |
+| WebSocket server down | Client reconnects with exponential backoff (5 attempts) | Brief interruption in real-time updates |
+| Payment gateway down | Ride completes, payment queued for retry | Payment processed within 1 hour |
 
-### Multi-Region DR (Production Reference)
+### Graceful Shutdown
 
-For local development, we simulate multi-region with multiple instances:
+The server handles SIGTERM/SIGINT by: (1) stopping new connection acceptance, (2) closing RabbitMQ connection, (3) allowing 1 second for in-flight requests, (4) force-exit after 10 seconds.
 
-```bash
-# Simulate "region A" (primary)
-REGION=A PORT=3001 npm run dev:server1
+## Scalability Considerations
 
-# Simulate "region B" (secondary)
-REGION=B PORT=3002 npm run dev:server2
+### What Breaks First
+
+1. **Location updates** (1.67M/s): Redis handles this on a single instance up to ~500K ops/s. Beyond that, shard by city/region using Redis Cluster with geographic hash slots.
+
+2. **WebSocket connections** (3M concurrent): A single server handles ~50K connections. Deploy 60+ WebSocket servers behind a load balancer with sticky sessions. Use Redis Pub/Sub to route messages to the correct server.
+
+3. **Matching workers**: CPU-bound scoring scales linearly with workers. Deploy 10-50 matching workers consuming from the same queue with prefetch limits.
+
+4. **PostgreSQL writes**: Ride creation at 175/s is manageable. At higher scale, partition the rides table by `requested_at` (monthly) and shard by city using Citus or manual application-level sharding.
+
+### Horizontal Scaling Path
+
+```
+Single instance ──▶ Separate services ──▶ Sharded by geography
+                         │
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+  Location Service  Ride Service    Pricing Service
+  (per-city Redis)  (per-city PG)   (global, cached)
 ```
 
-**Production DR strategy (reference architecture):**
+### Multi-Region Strategy
 
-```
-                    ┌─────────────────┐
-                    │   Global LB     │
-                    │  (Route 53/CF)  │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼                             ▼
-       ┌─────────────┐               ┌─────────────┐
-       │  Region A   │               │  Region B   │
-       │  (Primary)  │               │  (Standby)  │
-       └──────┬──────┘               └──────┬──────┘
-              │                             │
-    ┌─────────┼─────────┐         ┌─────────┼─────────┐
-    ▼         ▼         ▼         ▼         ▼         ▼
- ┌─────┐  ┌─────┐  ┌─────┐   ┌─────┐  ┌─────┐  ┌─────┐
- │ API │  │Redis│  │ PG  │   │ API │  │Redis│  │ PG  │
- │     │  │     │  │     │   │     │  │     │  │replica
- └─────┘  └─────┘  └─────┘   └─────┘  └─────┘  └─────┘
-              │         │                         ▲
-              └─────────┼─────────────────────────┘
-                        │ (async replication)
-```
+Each city operates as a mostly-independent deployment. Cross-region concerns (user accounts, payment) use a global database with read replicas per region. Location data and ride state are city-local (a ride in San Francisco never needs data from New York).
 
-**Failover triggers:**
-- Primary region health check fails for 30 seconds
-- Database replication lag exceeds 5 minutes
-- Manual operator intervention
+## Trade-offs Summary
 
-**RTO/RPO targets:**
-- RTO (Recovery Time Objective): 5 minutes
-- RPO (Recovery Point Objective): 30 seconds of data loss acceptable
-
-### Backup and Restore Procedures
-
-**PostgreSQL Backups:**
-
-```bash
-# Daily full backup (local dev)
-pg_dump -h localhost -U uber uber_dev > backup_$(date +%Y%m%d).sql
-
-# Restore from backup
-psql -h localhost -U uber uber_dev < backup_20240115.sql
-```
-
-**Automated backup script (cron job):**
-
-```bash
-#!/bin/bash
-# backup.sh - Run daily at 2 AM
-
-BACKUP_DIR="/backups/postgres"
-RETENTION_DAYS=7
-
-# Create backup
-pg_dump -h localhost -U uber -Fc uber_dev > \
-  "$BACKUP_DIR/uber_$(date +%Y%m%d_%H%M%S).dump"
-
-# Clean old backups
-find "$BACKUP_DIR" -name "*.dump" -mtime +$RETENTION_DAYS -delete
-
-# Verify backup is readable
-pg_restore --list "$BACKUP_DIR/uber_$(date +%Y%m%d)*.dump" > /dev/null
-if [ $? -ne 0 ]; then
-  echo "ALERT: Backup verification failed!" | mail -s "Backup Error" ops@example.com
-fi
-```
-
-**Redis Persistence:**
-
-```bash
-# Redis RDB snapshot (already configured in docker-compose)
-# Manually trigger snapshot
-redis-cli BGSAVE
-
-# Check last save time
-redis-cli LASTSAVE
-```
-
-**Backup Restore Testing (Monthly Drill):**
-
-```bash
-# 1. Stop services
-docker-compose stop api
-
-# 2. Create test database
-docker exec uber-postgres createdb -U uber uber_restore_test
-
-# 3. Restore backup
-cat backup_20240115.sql | docker exec -i uber-postgres psql -U uber uber_restore_test
-
-# 4. Verify row counts match
-docker exec uber-postgres psql -U uber -c "SELECT COUNT(*) FROM rides" uber_restore_test
-
-# 5. Run smoke tests against restored DB
-DATABASE_URL=postgres://uber:uber@localhost:5432/uber_restore_test npm run test:smoke
-
-# 6. Cleanup
-docker exec uber-postgres dropdb -U uber uber_restore_test
-```
-
-**Data Recovery Scenarios:**
-
-| Scenario | Recovery Method | Expected Time |
-|----------|-----------------|---------------|
-| Accidental row deletion | Point-in-time recovery from WAL | 15 minutes |
-| Table corruption | Restore from daily backup | 30 minutes |
-| Full database loss | Restore from backup + replay WAL | 1 hour |
-| Redis data loss | Application re-populates from PostgreSQL | 5 minutes |
-| Complete data center loss | Promote standby region | 5 minutes |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Geo index | Redis Geo | PostGIS, Tile38 | Sub-ms queries, already in stack, sufficient for radius search |
+| Real-time transport | WebSocket | SSE, Polling | Bidirectional needed for location + offers |
+| Matching strategy | Greedy scoring | Hungarian algorithm | <100ms latency, good enough for most demand |
+| Surge zones | Geohash (~5km) | H3 hexagons | Simpler implementation, no native library needed |
+| Message queue (local) | RabbitMQ | Kafka | Simpler setup, built-in DLQ, sufficient for dev |
+| Message queue (prod) | Kafka | RabbitMQ | Higher throughput, event replay, consumer groups |
+| Session storage | Redis + cookie | JWT | Immediate revocation, simpler token management |
+| State transitions | Optimistic locking | Pessimistic locks | Parallel reads, conflicts resolved at write time |
 
 ## Implementation Notes
 
-This section documents the key resilience patterns implemented in the backend code and explains why each is critical for a ride-hailing platform.
+This section documents what was actually built locally vs the production architecture described above.
 
-### Why Idempotency Prevents Duplicate Ride Charges
-
-The `/api/rides/request` endpoint uses idempotency keys to prevent duplicate ride bookings:
-
-```javascript
-// Client sends: POST /api/rides/request with X-Idempotency-Key: "abc123"
-idempotencyMiddleware({ operation: 'ride_request', ttl: 86400 })
-```
-
-**Problem it solves:**
-- Network timeouts can cause the client to retry a request that already succeeded
-- Mobile apps with spotty connectivity often send duplicate requests
-- Without idempotency, a rider could be charged twice for the same ride
-
-**How it works:**
-1. Client generates a unique idempotency key (UUID) for each ride request
-2. Server checks Redis for existing response with that key
-3. If found, return cached response (no duplicate charge)
-4. If not found, process request and cache response for 24 hours
-
-**Key design decisions:**
-- TTL of 24 hours allows for delayed retries after app crashes
-- Pending marker prevents concurrent duplicate processing
-- User-scoped keys prevent cross-user collisions
-- Fail-open behavior (if Redis unavailable, proceed without idempotency) prioritizes availability
-
-**Files:**
-- `/backend/src/middleware/idempotency.js` - Middleware implementation
-- `/backend/src/routes/rides.js` - Applied to ride request, cancel, and rate endpoints
-
-### Why Async Queues Enable Better Load Handling During Surge
-
-RabbitMQ decouples ride requests from driver matching:
+### Local Architecture
 
 ```
-[API Server] --publish--> [matching.requests queue] --consume--> [Matching Worker]
+┌──────────────────┐                    ┌──────────────────┐
+│  Rider Frontend  │                    │ Driver Frontend  │
+│  (React + Vite)  │                    │ (React + Vite)   │
+│  :5173           │                    │  :5173           │
+└────────┬─────────┘                    └────────┬─────────┘
+         │                                       │
+         └───────────────┬───────────────────────┘
+                         │
+              ┌──────────┴──────────┐
+              │  Express + WS       │
+              │  :3000              │
+              │                     │
+              │  Routes:            │
+              │  /api/auth/*        │
+              │  /api/rides/*       │
+              │  /api/driver/*      │
+              │  /health, /metrics  │
+              │  WebSocket /ws      │
+              └──────────┬──────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  PostgreSQL  │  │ Redis/Valkey │  │  RabbitMQ    │
+│  :5432       │  │  :6379       │  │  :5672       │
+│              │  │              │  │  :15672 (UI) │
+│  uber_db     │  │  Geo index   │  │              │
+│              │  │  Sessions    │  │  Exchanges:  │
+│              │  │  Demand      │  │  ride.events │
+│              │  │  Ride cache  │  │  uber.direct │
+│              │  │  Idempotency │  │  DLX         │
+└──────────────┘  └──────────────┘  └──────────────┘
 ```
 
-**Problem it solves:**
-- During surge (New Year's Eve, concerts, bad weather), ride requests spike 10-100x
-- Synchronous matching blocks API responses and causes timeouts
-- Database connections get exhausted under load
+### Production-Grade Patterns Actually Implemented
 
-**How async queues help:**
+**Idempotency middleware** (`backend/src/middleware/idempotency.ts`): Prevents duplicate ride requests when mobile clients retry on network timeouts. Uses Redis with pending markers (60s) and response caching (24h). Scoped per user to prevent cross-user key collisions. Fails open if Redis is unavailable.
 
-1. **Backpressure handling:** Queue depth can grow to absorb spike
-   ```javascript
-   // Check queue depth before accepting new requests
-   if (queueInfo.messageCount > 100) {
-     throw new ServiceUnavailableError('High demand - please retry');
-   }
-   ```
+**Circuit breakers** (`backend/src/utils/circuitBreaker.ts`): Wraps Redis geo operations with Opossum circuit breaker. When Redis is slow or down, the circuit opens and returns empty driver lists instead of timing out every request. Exposes circuit state via Prometheus metrics for monitoring.
 
-2. **Rate limiting without rejection:** Requests wait in queue rather than failing
+**Retry with exponential backoff** (`backend/src/utils/circuitBreaker.ts`): Generic `withRetry` function used for database writes, location persistence, and RabbitMQ connections. Includes jitter to prevent thundering herd on recovery.
 
-3. **Worker scaling:** Can add matching workers without changing API servers
-   ```bash
-   # Scale up during surge
-   npm run dev:matching-worker  # Instance 1
-   npm run dev:matching-worker  # Instance 2
-   ```
+**Prometheus metrics** (`backend/src/utils/metrics.ts`): 20+ custom metrics covering rides, drivers, surge, geo queries, circuit breakers, queues, HTTP, idempotency, and service health. Exposed on `/metrics` endpoint, ready for Grafana dashboards.
 
-4. **Retry with backoff:** Failed matches are re-queued with exponential delay
-   ```javascript
-   // Exponential backoff: 2s, 4s, 8s
-   const delay = Math.pow(2, retryCount) * 1000;
-   ```
+**Structured logging** (`backend/src/utils/logger.ts`): Pino-based loggers with service-specific context. Request logging middleware tracks method, path, status, and duration.
 
-5. **Event fanout:** Ride events are published to multiple consumers
-   - Notifications queue (push/SMS to users)
-   - Analytics queue (event logging for data warehouse)
-   - Billing queue (payment processing)
+**Health checks** (`backend/src/utils/health.ts`): Three-tier health check system (detailed/liveness/readiness) checking PostgreSQL, Redis, and RabbitMQ. Reports circuit breaker states and memory usage. Compatible with Kubernetes probe configuration.
 
-**Queue topology:**
-```
-                        [ride.events fanout exchange]
-                                    |
-           +------------------------+------------------------+
-           |                        |                        |
-   [notifications]           [analytics]               [billing]
-```
+**Async queue processing** (`backend/src/utils/queue.ts`): Full RabbitMQ integration with exchanges (fanout, direct, DLX), durable queues, prefetch limits, retry with exponential backoff, and dead letter routing. Three separate workers for matching, notifications, and analytics.
 
-**Files:**
-- `/backend/src/utils/queue.js` - RabbitMQ connection, publish, consume
-- `/backend/src/services/matchingService.js` - Queue integration
+**Geohash-based surge pricing** (`backend/src/services/pricingService.ts`): Custom geohash encoder partitions the map into ~5km zones. Demand counters with 5-minute TTL provide rolling demand windows. Supply counted via Redis GEORADIUS.
 
-### Why Circuit Breakers Prevent Cascade Failures
+**Modular matching service** (`backend/src/services/matching/`): Decomposed into scoring, driver-finder, allocation, ride-lifecycle, and ride-status modules. Uses dependency injection to break circular dependencies between modules.
 
-The location service wraps Redis geo operations in a circuit breaker:
+### What Was Simplified or Substituted
 
-```javascript
-const redisGeoCircuitBreaker = createCircuitBreakerWithFallback(
-  async (operation, ...args) => { /* Redis operation */ },
-  'redis-geo',
-  async (operation) => { /* Fallback */ },
-  { timeout: 3000, errorThresholdPercentage: 50, resetTimeout: 15000 }
-);
-```
+- **No map integration**: Locations are lat/lng coordinates; the frontend uses text inputs with simulated geocoding (random coordinates near San Francisco)
+- **Simulated location**: Driver location updates use random perturbations around a fixed point instead of real GPS
+- **Session auth for OAuth/JWT**: Simple email/password with session tokens in PostgreSQL, no social login or phone verification
+- **Single server instance**: No load balancer; all API routes, WebSocket, and matching run in one Express process
+- **Valkey for Redis**: Using Valkey (Redis fork) via Docker, functionally identical for our use case
+- **Haversine ETA**: Fixed 30 km/h average speed instead of routing engine with traffic data
+- **Geohash neighbors simplified**: `getGeohashNeighbors()` returns only the same cell instead of computing actual 8 neighbors
 
-**Problem it solves:**
-- If Redis becomes slow (network issues, memory pressure), every request waits
-- Waiting requests consume threads/connections
-- API becomes unresponsive even for endpoints that don't need Redis
-- One failing dependency takes down the entire system
+### What Was Omitted
 
-**How circuit breakers help:**
-
-1. **Fast failure:** After 50% errors (5+ requests), circuit opens
-   - Subsequent requests fail immediately (no waiting)
-   - Error response in <1ms instead of 3s timeout
-
-2. **Graceful degradation:** Fallback returns empty driver list
-   ```javascript
-   // Fallback when circuit is open
-   if (operation === 'georadius') {
-     logger.warn('Redis geo circuit open, returning empty driver list');
-     return [];  // App shows "no drivers nearby" instead of error
-   }
-   ```
-
-3. **Self-healing:** Circuit tries again after 15 seconds
-   - If request succeeds, circuit closes
-   - Normal operation resumes automatically
-
-4. **Monitoring visibility:** Circuit state is exposed via Prometheus
-   ```
-   uber_circuit_breaker_state{circuit="redis-geo",state="open"} 1
-   uber_circuit_breaker_requests_total{circuit="redis-geo",result="rejected"} 42
-   ```
-
-**Circuit breaker states:**
-```
-CLOSED (normal) --> OPEN (failing) --> HALF-OPEN (testing) --> CLOSED
-                        ^                      |
-                        +----------------------+  (if test fails)
-```
-
-**Files:**
-- `/backend/src/utils/circuitBreaker.js` - Circuit breaker wrapper
-- `/backend/src/services/locationService.js` - Applied to geo operations
-
-### Why Metrics Enable Surge Pricing Optimization
-
-Prometheus metrics expose real-time data for pricing decisions:
-
-```javascript
-// Surge pricing metrics
-metrics.surgeMultiplierGauge.set({ geohash: 'dr5ru' }, 1.8);
-metrics.surgeEventCounter.inc({ multiplier_range: '1.6-2.0' });
-```
-
-**Problem it solves:**
-- Surge pricing balances supply and demand, but needs tuning
-- Too aggressive = riders leave, too conservative = drivers leave
-- Need data to adjust surge thresholds by zone and time
-
-**Metrics collected:**
-
-1. **Ride lifecycle:**
-   ```
-   uber_ride_requests_total{vehicle_type="economy",status="requested"} 1234
-   uber_ride_matching_duration_seconds{vehicle_type="economy",success="true"} histogram
-   uber_rides_by_status{status="matched"} 42
-   ```
-
-2. **Driver availability:**
-   ```
-   uber_drivers_online_total{vehicle_type="economy"} 50
-   uber_drivers_available_total{vehicle_type="economy"} 35
-   uber_driver_location_updates_total 98765
-   ```
-
-3. **Surge events:**
-   ```
-   uber_surge_multiplier{geohash="dr5ru"} 1.8
-   uber_surge_events_total{multiplier_range="1.6-2.0"} 89
-   ```
-
-4. **System health:**
-   ```
-   uber_circuit_breaker_state{circuit="redis-geo",state="closed"} 1
-   uber_geo_query_duration_seconds{operation="find_nearby"} histogram
-   ```
-
-**How to use for optimization:**
-
-1. **Grafana dashboard:** Visualize surge patterns by time and zone
-2. **Alert on anomalies:** Matching latency >5s triggers on-call
-3. **A/B test surge thresholds:** Compare conversion rates at different multipliers
-4. **Capacity planning:** Predict driver supply needs for upcoming events
-
-**Prometheus endpoint:** `GET /metrics`
-
-**Files:**
-- `/backend/src/utils/metrics.js` - Metric definitions
-- `/backend/src/index.js` - `/metrics` endpoint
-
-### Health Check Implementation
-
-The health check endpoints support Kubernetes probes and debugging:
-
-| Endpoint | Purpose | Returns |
-|----------|---------|---------|
-| `GET /health` | Detailed status | All service statuses, circuit breaker states, memory usage |
-| `GET /health/live` | Liveness probe | Is process running? |
-| `GET /health/ready` | Readiness probe | Are critical deps (Postgres, Redis) available? |
-
-**Example `/health` response:**
-```json
-{
-  "status": "healthy",
-  "services": {
-    "postgres": { "status": "healthy", "latency": 5 },
-    "redis": { "status": "healthy", "latency": 2 },
-    "rabbitmq": { "status": "healthy", "latency": 8 }
-  },
-  "circuitBreakers": {
-    "redis-geo": { "state": "closed", "stats": { "successes": 1000, "failures": 5 } }
-  },
-  "memory": { "heapUsed": 45, "heapTotal": 64, "rss": 78 }
-}
-```
-
-**Files:**
-- `/backend/src/utils/health.js` - Health check implementation
-
-## Future Optimizations
-
-- [ ] Batch matching for high-demand zones
-- [ ] ML-based ETA prediction
-- [ ] Geofenced surge zones
-- [ ] Driver routing optimization
-- [ ] Ride pooling (shared rides)
+- **CDN**: No static asset distribution; Vite dev server serves everything
+- **Multi-region**: No geographic redundancy or failover
+- **Kubernetes**: Docker Compose only, no orchestration
+- **Database sharding**: Single PostgreSQL instance, no partitioning
+- **Payment integration**: Fare is calculated but no actual payment gateway
+- **Map/routing engine**: No OSRM, Google Maps, or Mapbox integration
+- **Safety features**: No trip sharing, emergency button, or driver verification
+- **Ride pooling**: Single-rider rides only
+- **ML-based ETA**: No machine learning models for traffic prediction
+- **Rate limiting**: No per-user or per-IP rate limiting on API endpoints

@@ -2,13 +2,13 @@
 
 ## System Overview
 
-Spotify is a music streaming platform with personalized recommendations. Core challenges involve audio delivery, recommendation algorithms, and offline synchronization.
+Spotify is a music streaming platform serving personalized audio content to hundreds of millions of users across multiple device types. Core engineering challenges include low-latency audio delivery through CDN infrastructure, recommendation algorithms that balance exploration and exploitation, royalty-accurate stream counting, and offline synchronization with DRM enforcement.
 
 **Learning Goals:**
-- Build audio streaming pipelines
-- Design recommendation systems
-- Implement offline-first architecture
-- Handle playback analytics at scale
+- Build audio streaming pipelines with adaptive bitrate delivery
+- Design recommendation systems combining collaborative and content-based filtering
+- Implement playback analytics pipelines for royalty calculation
+- Handle cross-device state synchronization and offline caching
 
 ---
 
@@ -16,58 +16,104 @@ Spotify is a music streaming platform with personalized recommendations. Core ch
 
 ### Functional Requirements
 
-1. **Stream**: Play music with adaptive quality
-2. **Library**: Browse artists, albums, songs
-3. **Playlists**: Create and manage playlists
-4. **Discover**: Personalized recommendations
-5. **Offline**: Download for offline listening
+1. **Stream**: Play music with adaptive bitrate quality across devices
+2. **Library**: Browse and search artists, albums, and tracks; save favorites
+3. **Playlists**: Create, manage, and collaborate on playlists
+4. **Discover**: Personalized recommendations (For You, Discover Weekly, artist radio)
+5. **Offline**: Download encrypted audio for offline listening (premium)
+6. **Social**: Friend activity feed, shared playlists, artist following
+7. **Ads**: Targeted ad insertion for free-tier users with frequency capping
+8. **Royalties**: Accurate stream counting with rights holder attribution
 
 ### Non-Functional Requirements
 
-- **Latency**: < 200ms to start playback
-- **Availability**: 99.99% for streaming
-- **Scale**: 500M users, 100M songs
-- **Quality**: 320kbps high quality streaming
+- **Latency**: < 200ms time-to-first-byte for audio streaming
+- **Availability**: 99.99% for streaming and playback services
+- **Scale**: 500M registered users, 200M monthly active, 100M+ track catalog
+- **Quality**: Up to 320kbps Ogg Vorbis (premium), 160kbps AAC (free tier)
+- **Consistency**: Exactly-once stream counting for royalty accuracy
+- **Durability**: Zero data loss for playback events and financial records
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value |
+|--------|-------|
+| Monthly active users | 200M |
+| Concurrent streams (peak) | 20M |
+| Average listening time | 30 min/day per active user |
+| Tracks in catalog | 100M+ |
+| New tracks uploaded daily | 100K |
+| Playback events per second | ~500K |
+| Audio storage | ~10 PB (3 quality tiers per track) |
+| Metadata storage | ~5 TB (PostgreSQL) |
+| Listening history | ~50 TB (Cassandra, partitioned by user) |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Users | 2-5 (seeded) |
+| Tracks | ~100 (seeded) |
+| Concurrent streams | 1-3 |
+| Playback events | ~1/second |
+| Storage | < 1 GB |
 
 ---
 
 ## High-Level Architecture
 
+### Production Architecture
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│       Mobile │ Desktop │ Web │ Car │ Smart Speaker              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         CDN                                     │
-│              (Audio files, album art, assets)                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Catalog Service│    │Playback Service│    │  Rec Service  │
-│               │    │               │    │               │
-│ - Artists     │    │ - Stream URLs │    │ - Discovery   │
-│ - Albums      │    │ - Play state  │    │ - Radio       │
-│ - Tracks      │    │ - Analytics   │    │ - Similar     │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │           Feature Store + ML                  │
-│   - Catalog     │           - User embeddings                   │
-│   - Playlists   │           - Track embeddings                  │
-│   - Users       │           - Listening history                 │
-└─────────────────┴───────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            Client Layer                                      │
+│         Mobile (iOS/Android) │ Desktop │ Web │ Car │ Smart Speaker           │
+└──────────────────────────────────────────────────────────────────────────────┘
+                    │ API calls                      │ Audio streams
+                    ▼                                ▼
+┌───────────────────────────┐         ┌────────────────────────────────────────┐
+│        API Gateway        │         │              CDN (Global)              │
+│  (Rate limiting, auth,    │         │  (Audio files, album art, static)      │
+│   request routing)        │         │  Edge caching for popular tracks       │
+└───────────────────────────┘         └────────────────────────────────────────┘
+         │          │          │                      ▲
+         ▼          ▼          ▼                      │ Signed URL redirect
+┌──────────┐ ┌───────────┐ ┌──────────┐ ┌───────────────────┐ ┌──────────────┐
+│ Catalog  │ │ Playback  │ │  Rec     │ │ Playlist Service  │ │  Ad Service  │
+│ Service  │ │ Service   │ │ Service  │ │                   │ │              │
+│          │ │           │ │          │ │ - CRUD            │ │ - Targeting  │
+│ - Search │ │ - Stream  │ │ - CF/CB  │ │ - Collaborative   │ │ - Insertion  │
+│ - Browse │ │ - Events  │ │ - Radio  │ │ - Versioning      │ │ - Frequency  │
+│ - Meta   │ │ - State   │ │ - Daily  │ │                   │ │   capping    │
+└──────────┘ └───────────┘ └──────────┘ └───────────────────┘ └──────────────┘
+     │            │              │              │                    │
+     ▼            ▼              ▼              ▼                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           Message Bus (Kafka)                                │
+│  Topics: playback-events, stream-counts, ad-impressions, user-actions        │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │                    │                    │                    │
+     ▼                    ▼                    ▼                    ▼
+┌──────────┐    ┌───────────────┐    ┌──────────────┐    ┌────────────────────┐
+│ Analytics│    │ Royalty        │    │ Rec Pipeline  │    │ User Taste         │
+│ Worker   │    │ Calculator    │    │ (Spark/ML)    │    │ Profile Worker     │
+└──────────┘    └───────────────┘    └──────────────┘    └────────────────────┘
+     │                    │                    │                    │
+     ▼                    ▼                    ▼                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Data Layer                                      │
+├──────────────┬────────────────┬────────────────┬─────────────────────────────┤
+│  PostgreSQL  │   Cassandra    │   Redis/Valkey │  Object Storage (S3)        │
+│  - Catalog   │   - Listening  │   - Sessions   │  - Audio files (3 tiers)    │
+│  - Users     │     history    │   - Playback   │  - Album art                │
+│  - Playlists │   - Play events│     state      │  - Artist images            │
+│  - Royalties │   (TimeUUID)   │   - Cache      │                             │
+│  - Audit logs│                │   - Rate limits│                             │
+└──────────────┴────────────────┴────────────────┴─────────────────────────────┘
 ```
 
 ---
@@ -76,179 +122,206 @@ Spotify is a music streaming platform with personalized recommendations. Core ch
 
 ### 1. Audio Streaming
 
-**Adaptive Bitrate Streaming:**
-```
-Audio Files Stored as:
-├── track_123_96kbps.ogg    (Low quality, mobile data)
-├── track_123_160kbps.ogg   (Normal quality)
-├── track_123_320kbps.ogg   (High quality, premium)
-```
+**Adaptive Bitrate Delivery:**
+
+Each track is stored in multiple quality tiers to support adaptive bitrate streaming. The encoding format is Ogg Vorbis for all tiers, with AAC as a fallback for devices that lack Vorbis support.
+
+| Tier | Bitrate | Use Case | Target |
+|------|---------|----------|--------|
+| Low | 96 kbps | Mobile data, slow connections | All users |
+| Normal | 160 kbps | Default quality | All users |
+| High | 320 kbps | Premium quality, Wi-Fi | Premium only |
 
 **Streaming Flow:**
-```javascript
-async function getStreamUrl(trackId, userId) {
-  // Check user subscription
-  const user = await getUser(userId)
-  const maxQuality = user.isPremium ? 320 : 160
 
-  // Determine quality based on network
-  const quality = determineQuality(user.connectionType, maxQuality)
+1. Client requests stream URL for a track via the Playback Service
+2. Service validates user subscription tier (free vs. premium) and determines max quality
+3. Client network conditions inform quality selection (bandwidth probe or reported connection type)
+4. Service generates a signed CDN URL with 1-hour expiry, scoped to the user for analytics attribution
+5. Client fetches audio directly from the CDN edge node, bypassing origin servers
+6. For popular tracks, CDN hit rates exceed 95% since the top 1% of tracks account for ~30% of all plays
 
-  // Generate signed URL with expiry
-  const url = await cdn.signedUrl(`tracks/${trackId}_${quality}kbps.ogg`, {
-    expiresIn: 3600,
-    userId // For analytics attribution
-  })
+**Quality Switching:**
 
-  return { url, quality, expiresAt: Date.now() + 3600000 }
-}
-```
+Mid-stream quality switching happens at segment boundaries. The client pre-buffers the next segment at an alternative quality when network conditions change. On a quality downgrade, the transition is immediate; on an upgrade, the client waits until the current buffer drains to avoid wasting bandwidth.
 
-### 2. Recommendation Engine
+**Why CDN with signed URLs over direct streaming:** Direct streaming from origin servers would require provisioning for 20M concurrent connections. CDN edge nodes distribute this load across hundreds of PoPs globally, reducing origin traffic by 95%+ for popular content. Signed URLs provide access control without requiring the CDN to validate sessions, and the 1-hour expiry limits the window for URL sharing. The trade-off is increased complexity in URL generation and cache invalidation when tracks are removed due to rights disputes.
 
-**Hybrid Approach:**
-```javascript
-async function getDiscoverWeekly(userId) {
-  // 1. Get user's listening history
-  const history = await getListeningHistory(userId, { days: 28 })
+### 2. Music Catalog and Metadata
 
-  // 2. Get user embedding from history
-  const userEmbedding = await getUserEmbedding(userId)
+The catalog service manages the artist/album/track hierarchy and serves browse and search requests.
 
-  // 3. Collaborative filtering: Find similar users
-  const similarUsers = await findSimilarUsers(userEmbedding, 100)
-  const collaborativeTracks = await getTopTracks(similarUsers, {
-    excludeListened: history.trackIds
-  })
+**Entity Relationships:**
 
-  // 4. Content-based: Find similar tracks
-  const likedTracks = history.filter(h => h.rating > 0.7)
-  const contentBasedTracks = await findSimilarTracks(likedTracks, {
-    excludeListened: history.trackIds
-  })
+- An **artist** has many **albums** (one-to-many via `artist_id`)
+- An **album** has many **tracks** (one-to-many via `album_id`, ordered by `disc_number`, `track_number`)
+- A **track** can have multiple **artists** (many-to-many via `track_artists` join table with `is_primary` flag)
+- Tracks store `audio_features` as JSONB (tempo, energy, danceability, acousticness, genres)
 
-  // 5. Blend results (60% collaborative, 40% content)
-  const blended = blendResults(collaborativeTracks, contentBasedTracks, 0.6)
+**Search Architecture (Production):**
 
-  // 6. Diversify (avoid too many from same artist)
-  return diversify(blended, { maxPerArtist: 2, totalCount: 30 })
-}
-```
+At scale, search uses Elasticsearch with the following capabilities:
+- **Fuzzy matching**: Handles typos ("bettles" matches "Beatles") using Levenshtein distance
+- **Auto-complete**: Prefix queries on an edge-ngram analyzed field, returning results in < 50ms
+- **Personalized ranking**: Boost scores for artists the user has listened to or followed
+- **Multi-entity search**: Single query searches across artists, albums, and tracks simultaneously
+- **Language-aware analysis**: ICU tokenization for CJK scripts, accent folding for Latin scripts
 
-**Track Embeddings:**
-```javascript
-// Each track has a feature vector based on:
-interface TrackEmbedding {
-  trackId: string
-  embedding: number[] // 128-dimensional vector
-  // Derived from:
-  // - Audio features (tempo, energy, danceability, acousticness)
-  // - Genre tags
-  // - User interaction patterns
-  // - Co-occurrence in playlists
-}
+**Why Elasticsearch over PostgreSQL full-text search:** PostgreSQL `tsvector` search handles simple keyword matching but cannot efficiently support fuzzy matching, auto-complete with prefix queries, or personalized boosting. At 100M tracks with 500M+ daily search queries, Elasticsearch's inverted index and distributed architecture provide sub-50ms p95 latency. The trade-off is eventual consistency in the search index (1-5 second lag after catalog updates) and operational overhead of managing an Elasticsearch cluster.
 
-function findSimilarTracks(tracks, options) {
-  const avgEmbedding = averageEmbeddings(tracks.map(t => t.embedding))
+### 3. Recommendation Engine
 
-  // Approximate nearest neighbors search
-  return vectorDb.query({
-    vector: avgEmbedding,
-    topK: 100,
-    filter: { trackId: { $nin: options.excludeListened } }
-  })
-}
-```
+**Hybrid Approach (Collaborative Filtering + Content-Based):**
 
-### 3. Offline Sync
+Spotify's recommendation challenge requires blending multiple signals because no single algorithm handles all scenarios well.
 
-**Download Manager:**
-```javascript
-class OfflineManager {
-  async downloadPlaylist(playlistId) {
-    const tracks = await getPlaylistTracks(playlistId)
+**Collaborative Filtering (CF):**
+1. Build a user-track interaction matrix from listening history (last 28 days)
+2. Factor the matrix using ALS (Alternating Least Squares) to produce 128-dimensional user and track embeddings
+3. For a target user, find the 100 most similar users by cosine similarity of user embeddings
+4. Aggregate tracks those similar users listened to that the target user has not
+5. Rank by weighted frequency (more similar users listening = higher score)
 
-    for (const track of tracks) {
-      await this.downloadTrack(track.id)
-    }
+**Content-Based Filtering (CB):**
+1. Extract audio features per track: tempo, energy, danceability, acousticness, key, mode, valence
+2. Combine with metadata features: genre tags, release year, artist popularity
+3. Build a 128-dimensional track embedding from these features
+4. For a target user, average the embeddings of their top-rated tracks
+5. Find tracks with high cosine similarity to this averaged embedding using approximate nearest neighbors (ANN) search
 
-    // Store playlist metadata locally
-    await localDb.put('playlists', playlistId, {
-      ...playlist,
-      downloadedAt: Date.now(),
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 // 30 days
-    })
-  }
+**Blending Strategy:**
+- 60% collaborative, 40% content-based for established users (> 50 tracks in history)
+- 80% content-based, 20% collaborative for newer users (cold start mitigation)
+- Diversification pass: max 2 tracks per artist, genre diversity target
 
-  async downloadTrack(trackId) {
-    // Check if already downloaded
-    if (await localDb.has('tracks', trackId)) return
+**Discovery Products:**
+- **For You**: Real-time blend refreshed hourly, personalized to current listening session
+- **Discover Weekly**: Batch-generated weekly playlist, 30 tracks, emphasizes novel discoveries (tracks from artists the user has never listened to)
+- **Artist Radio**: Seed artist's top tracks mixed with tracks from artists with similar listener overlap, shuffled
 
-    // Get download URL with DRM
-    const { url, license } = await api.getOfflineDownload(trackId)
+**Cold Start Problem:**
+New users with no listening history receive recommendations based on:
+1. Onboarding flow: user selects 3+ artists they like
+2. Registration demographics: age bracket and region inform genre priors
+3. Popular/trending tracks as a fallback
+4. Rapid adaptation: after just 10 plays, collaborative signals begin contributing
 
-    // Download encrypted audio
-    const audioData = await fetch(url).then(r => r.arrayBuffer())
+**Why hybrid CF+CB over pure collaborative:** Pure collaborative filtering fails completely for new users (cold start) and for tracks with few plays (long-tail content). Content-based filtering handles both cases by leveraging audio features, but misses serendipitous discoveries that collaborative filtering excels at (e.g., "users who like indie rock also enjoy this electronic artist"). The 60/40 blend captures both signals. The trade-off is engineering complexity: two separate ML pipelines must be maintained, and the blending weights require periodic tuning via A/B testing.
 
-    // Store locally
-    await localDb.put('tracks', trackId, {
-      audio: audioData,
-      license,
-      downloadedAt: Date.now()
-    })
-  }
+### 4. Playlist Management
 
-  async playOffline(trackId) {
-    const { audio, license } = await localDb.get('tracks', trackId)
+**Collaborative Playlists:**
 
-    // Verify license still valid
-    if (!this.verifyLicense(license)) {
-      throw new Error('License expired')
-    }
+Collaborative playlists allow multiple users to add, remove, and reorder tracks. Conflict resolution follows these rules:
+- **Concurrent additions**: Both tracks are added; positions are auto-incremented
+- **Concurrent deletions**: Idempotent (DELETE is safe to replay)
+- **Track reordering**: Last-write-wins for position updates
+- **Duplicate prevention**: `UNIQUE(playlist_id, track_id)` constraint with `ON CONFLICT DO NOTHING`
 
-    // Decrypt and play
-    return this.decryptAndPlay(audio, license)
-  }
-}
-```
+**Playlist Versioning:**
 
-### 4. Playback Analytics
+At production scale, playlists maintain a version history. Each modification increments a version counter, and the previous state is stored in a changelog table. This enables:
+- Undo/redo functionality
+- Audit trail for collaborative edits
+- Recovery from accidental bulk deletions
 
-**Stream Counting (for royalties):**
-```javascript
-// Client reports playback events
-async function reportPlayback(userId, trackId, event) {
-  await kafka.send('playback_events', {
-    userId,
-    trackId,
-    event, // 'start', 'progress', 'complete', 'skip'
-    timestamp: Date.now(),
-    position: event.position, // Seconds into track
-    deviceType: event.device
-  })
-}
+**Smart Playlists:**
 
-// Stream counted after 30 seconds or 50% of track (whichever is less)
-async function processPlaybackEvent(event) {
-  if (event.event === 'progress' && event.position >= 30) {
-    // Count as a stream
-    await incrementStreamCount(event.trackId)
-    await attributeRoyalty(event.trackId, event.userId)
-  }
-}
-```
+Generated playlists that auto-update based on rules:
+- "Recently Added" - tracks added to library in the last 30 days
+- "On Repeat" - tracks with highest play count in the last week
+- "Blend" - shared playlist between two users combining both tastes
+
+### 5. Social Features
+
+**Friend Activity:**
+- Real-time feed showing what friends are listening to
+- Uses WebSocket connections for live updates
+- Privacy controls: users can hide activity or go "private session"
+
+**Shared Listening:**
+- "Group Session" where multiple users control the same playback queue
+- One user is the host; others can add to queue but host controls playback
+- Synchronized playback with < 500ms skew tolerance
+
+**Artist Following:**
+- Follow notifications for new releases
+- Monthly listener counts aggregated daily (eventual consistency acceptable)
+
+### 6. Playback and Stream Counting
+
+**30-Second Rule:**
+
+A play is counted as a "stream" for royalty purposes when the user listens for at least 30 seconds. This is the industry standard adopted by all major streaming platforms.
+
+**Stream Counting Flow:**
+1. Client reports `play_started` event when playback begins
+2. Client tracks elapsed time locally
+3. At 30 seconds, client reports `stream_counted` event
+4. Server-side deduplication prevents double-counting (idempotency key = `userId_trackId_sessionTimestamp`)
+5. Stream count is persisted to the database and published to Kafka for downstream consumers
+6. `play_completed` or `skipped` events are sent when playback ends
+
+**Cross-Device Handoff:**
+
+Playback state (current track, position, queue, shuffle/repeat mode) is persisted to Redis with a 24-hour TTL. When a user opens Spotify on a different device, the state is restored. At production scale, this uses Spotify Connect protocol for seamless handoff without interruption.
+
+### 7. Ad Service (Free Tier)
+
+**Ad Insertion:**
+- Audio ads injected every 3-6 songs for free-tier users
+- Display ads shown on track change or during browse
+- Targeting based on: demographics, listening genres, time of day, geographic region
+
+**Frequency Capping:**
+- Per-user, per-campaign caps (e.g., max 3 impressions per campaign per day)
+- Redis counter per user-campaign pair with daily TTL
+- Prevents ad fatigue while maximizing fill rate
+
+**Revenue Attribution:**
+- Ad impressions and clicks published to Kafka
+- Joined with playback events for engagement metrics
+- CPM and CPC calculations for advertiser billing
+
+### 8. Royalty Calculation
+
+**Play Counting for Rights Holders:**
+
+Each stream is attributed to the track's rights holders (artist, songwriter, label, distributor) based on contractual splits stored in the catalog.
+
+**Pro-Rata Model:**
+1. Total platform streams in a period are calculated
+2. Each track's share = (track streams / total streams) * total royalty pool
+3. Track royalty is split among rights holders per contractual percentages
+4. Payments are batched monthly
+
+**Why pro-rata over user-centric:** Pro-rata distributes the entire subscription pool proportionally to total plays, meaning a user who only listens to niche artists still contributes some royalties to mainstream artists they never played. User-centric (where each user's subscription fee goes only to artists they listened to) is fairer but harder to implement because it requires per-user accounting. The trade-off: pro-rata favors popular artists disproportionately, but it is the industry standard and simpler to audit.
 
 ---
 
 ## Database Schema
 
 ```sql
+-- Users
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  username VARCHAR(100) UNIQUE NOT NULL,
+  display_name VARCHAR(255),
+  avatar_url TEXT,
+  is_premium BOOLEAN DEFAULT FALSE,
+  role VARCHAR(50) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Artists
 CREATE TABLE artists (
-  id UUID PRIMARY KEY,
-  name VARCHAR(200) NOT NULL,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) NOT NULL,
   bio TEXT,
-  image_url VARCHAR(500),
+  image_url TEXT,
   verified BOOLEAN DEFAULT FALSE,
   monthly_listeners INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT NOW()
@@ -256,94 +329,224 @@ CREATE TABLE artists (
 
 -- Albums
 CREATE TABLE albums (
-  id UUID PRIMARY KEY,
-  artist_id UUID REFERENCES artists(id),
-  title VARCHAR(200) NOT NULL,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id UUID REFERENCES artists(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
   release_date DATE,
-  cover_url VARCHAR(500),
-  album_type VARCHAR(20), -- 'album', 'single', 'ep'
-  total_tracks INTEGER,
+  cover_url TEXT,
+  album_type VARCHAR(50) DEFAULT 'album',  -- 'album', 'single', 'ep'
+  total_tracks INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Tracks
 CREATE TABLE tracks (
-  id UUID PRIMARY KEY,
-  album_id UUID REFERENCES albums(id),
-  title VARCHAR(200) NOT NULL,
-  duration_ms INTEGER,
-  track_number INTEGER,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  track_number INTEGER DEFAULT 1,
   disc_number INTEGER DEFAULT 1,
-  explicit BOOLEAN DEFAULT FALSE,
-  preview_url VARCHAR(500),
-  stream_count BIGINT DEFAULT 0,
-  audio_features JSONB,
+  audio_url TEXT,
+  stream_count INTEGER DEFAULT 0,
+  audio_features JSONB DEFAULT '{}',
   created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Track artists (many-to-many for collaborations)
+CREATE TABLE track_artists (
+  track_id UUID REFERENCES tracks(id) ON DELETE CASCADE,
+  artist_id UUID REFERENCES artists(id) ON DELETE CASCADE,
+  is_primary BOOLEAN DEFAULT TRUE,
+  PRIMARY KEY (track_id, artist_id)
 );
 
 -- Playlists
 CREATE TABLE playlists (
-  id UUID PRIMARY KEY,
-  owner_id UUID REFERENCES users(id),
-  name VARCHAR(200) NOT NULL,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
   description TEXT,
-  cover_url VARCHAR(500),
+  cover_url TEXT,
   is_public BOOLEAN DEFAULT TRUE,
   is_collaborative BOOLEAN DEFAULT FALSE,
   follower_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Playlist tracks (ordered)
 CREATE TABLE playlist_tracks (
-  playlist_id UUID REFERENCES playlists(id),
-  track_id UUID REFERENCES tracks(id),
+  playlist_id UUID REFERENCES playlists(id) ON DELETE CASCADE,
+  track_id UUID REFERENCES tracks(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,
   added_by UUID REFERENCES users(id),
   added_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (playlist_id, track_id)
 );
 
--- User library (saved tracks/albums)
+-- User library (liked songs, albums, artists, playlists)
 CREATE TABLE user_library (
-  user_id UUID REFERENCES users(id),
-  item_type VARCHAR(20), -- 'track', 'album', 'artist', 'playlist'
-  item_id UUID,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  item_type VARCHAR(50) NOT NULL,  -- 'track', 'album', 'artist', 'playlist'
+  item_id UUID NOT NULL,
   saved_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (user_id, item_type, item_id)
 );
+
+-- Listening history (for recommendations)
+CREATE TABLE listening_history (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  track_id UUID REFERENCES tracks(id) ON DELETE CASCADE,
+  duration_played_ms INTEGER DEFAULT 0,
+  completed BOOLEAN DEFAULT FALSE,
+  played_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Playback events (analytics)
+CREATE TABLE playback_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  track_id UUID REFERENCES tracks(id) ON DELETE CASCADE,
+  event_type VARCHAR(50) NOT NULL,
+  position_ms INTEGER DEFAULT 0,
+  device_type VARCHAR(50) DEFAULT 'web',
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Audit logs
+CREATE TABLE audit_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  timestamp TIMESTAMP DEFAULT NOW(),
+  actor_id UUID,
+  actor_ip INET,
+  action VARCHAR(100) NOT NULL,
+  resource_type VARCHAR(50) NOT NULL,
+  resource_id UUID,
+  details JSONB DEFAULT '{}',
+  success BOOLEAN DEFAULT TRUE,
+  request_id VARCHAR(100)
+);
+
+-- Indexes
+CREATE INDEX idx_albums_artist_id ON albums(artist_id);
+CREATE INDEX idx_tracks_album_id ON tracks(album_id);
+CREATE INDEX idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
+CREATE INDEX idx_user_library_user_id ON user_library(user_id);
+CREATE INDEX idx_listening_history_user_id ON listening_history(user_id);
+CREATE INDEX idx_listening_history_played_at ON listening_history(played_at DESC);
+CREATE INDEX idx_playback_events_user_id ON playback_events(user_id);
+CREATE INDEX idx_audit_logs_actor_id ON audit_logs(actor_id);
+CREATE INDEX idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
 ```
+
+**Production Database Selection:**
+
+| Database | Purpose | Why This Choice |
+|----------|---------|-----------------|
+| PostgreSQL | Catalog, users, playlists, royalties, audit logs | ACID transactions for financial data, complex JOINs for catalog queries |
+| Cassandra | Listening history, playback events | High write throughput (500K events/sec), time-ordered partitioning by user, no cross-user queries needed |
+| Redis/Valkey | Sessions, playback state, rate limits, caches, taste profiles | Sub-ms latency for hot data, TTL for ephemeral state |
+| Elasticsearch | Search index | Fuzzy matching, auto-complete, personalized ranking |
+| S3/Object Storage | Audio files, album art | Cost-effective at petabyte scale, CDN integration |
+
+**Why Cassandra for listening history over PostgreSQL:** Playback events are write-heavy (500K/sec at peak) and read patterns are strictly per-user (get my last 28 days of history). PostgreSQL would require horizontal sharding for this write volume, adding operational complexity. Cassandra handles this natively with its partition-key design (`user_id` as partition key, `played_at` as clustering column in DESC order). The trade-off is no cross-user JOINs, so analytics queries (e.g., "most played track globally") require a separate aggregation pipeline, not ad-hoc SQL.
+
+---
+
+## API Design
+
+### Catalog
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/catalog/artists` | List/search artists (paginated) |
+| GET | `/api/catalog/artists/:id` | Get artist details with top tracks |
+| GET | `/api/catalog/albums` | List/search albums (with optional `artistId` filter) |
+| GET | `/api/catalog/albums/:id` | Get album with track listing |
+| GET | `/api/catalog/tracks/:id` | Get track details |
+| GET | `/api/catalog/new-releases` | Get recently released albums |
+| GET | `/api/catalog/featured` | Get editorially featured tracks |
+| GET | `/api/catalog/search?q=&type=` | Search across artists, albums, tracks |
+
+### Playback
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/playback/stream/:trackId` | Get signed stream URL for a track |
+| POST | `/api/playback/event` | Record playback event (play, pause, skip, complete, stream_counted) |
+| GET | `/api/playback/recently-played` | Get user's recently played tracks |
+| PUT | `/api/playback/state` | Save playback state (cross-device sync) |
+| GET | `/api/playback/state` | Retrieve saved playback state |
+| GET | `/api/playback/stats/:trackId` | Get track play count and like count |
+
+### Library
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/library/tracks` | Get liked songs |
+| PUT | `/api/library/tracks/:id` | Like a track |
+| DELETE | `/api/library/tracks/:id` | Unlike a track |
+| GET | `/api/library/tracks/contains?ids=` | Check which tracks are liked |
+| GET | `/api/library/albums` | Get saved albums |
+| PUT/DELETE | `/api/library/albums/:id` | Save/unsave album |
+| GET | `/api/library/artists` | Get followed artists |
+| PUT/DELETE | `/api/library/artists/:id` | Follow/unfollow artist |
+
+### Playlists
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/playlists/me` | Get user's playlists |
+| GET | `/api/playlists/public` | Get public playlists |
+| POST | `/api/playlists` | Create playlist |
+| GET | `/api/playlists/:id` | Get playlist with tracks |
+| PATCH | `/api/playlists/:id` | Update playlist metadata |
+| DELETE | `/api/playlists/:id` | Delete playlist |
+| POST | `/api/playlists/:id/tracks` | Add track (idempotent) |
+| DELETE | `/api/playlists/:id/tracks/:trackId` | Remove track (idempotent) |
+| PUT | `/api/playlists/:id/tracks/reorder` | Reorder tracks |
+
+### Recommendations
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/recommendations/for-you` | Personalized recommendations |
+| GET | `/api/recommendations/discover-weekly` | Weekly discovery playlist |
+| GET | `/api/recommendations/popular` | Trending/popular tracks |
+| GET | `/api/recommendations/similar/:trackId` | Tracks similar to a given track |
+| GET | `/api/recommendations/radio/artist/:artistId` | Artist radio mix |
 
 ---
 
 ## Key Design Decisions
 
-### 1. CDN for Audio
+### 1. CDN for Audio Delivery
 
-**Decision**: Serve all audio through CDN with signed URLs
+**Decision**: Serve all audio through a globally distributed CDN with per-user signed URLs.
 
-**Rationale**:
-- Global low-latency delivery
-- Edge caching for popular tracks
-- Signed URLs for access control
+Audio files are the highest-bandwidth component of the system. At 20M concurrent streams, direct origin serving would require ~3.2 Tbps of bandwidth. A CDN distributes this across edge PoPs, with popular tracks cached at the edge achieving 95%+ hit rates. Signed URLs with 1-hour expiry provide access control without requiring the CDN to authenticate every request. The trade-off is that a user who shares a signed URL can grant temporary access to that track, but the short expiry and user-scoped analytics make this low risk.
 
-### 2. Hybrid Recommendations
+### 2. Kafka for Playback Event Pipeline
 
-**Decision**: Combine collaborative and content-based filtering
+**Decision**: Publish all playback events to Kafka for asynchronous processing rather than handling them synchronously.
 
-**Rationale**:
-- Collaborative: Catches hidden preferences
-- Content-based: Works for new users (cold start)
-- Blend provides best of both
+Synchronous processing of playback events would add latency to every play/pause/skip action and couple the playback service to all downstream consumers (analytics, royalties, recommendations, taste profiling). Kafka decouples producers and consumers, allowing the playback service to respond in < 5ms while downstream workers process at their own pace. If the royalty calculator goes down, events are durably stored in Kafka (7-day retention) and processed when the consumer recovers. The trade-off is eventual consistency: stream counts in the database may lag by seconds to minutes behind real-time, but this is acceptable for all downstream use cases.
 
 ### 3. 30-Second Stream Threshold
 
-**Decision**: Count stream after 30 seconds of playback
+**Decision**: Count a stream after 30 seconds of playback, following the industry standard.
 
-**Rationale**:
-- Industry standard for royalty attribution
-- Prevents accidental skips from counting
-- Balances artist/label interests
+This threshold balances artist and platform interests. A lower threshold (e.g., 10 seconds) would inflate stream counts from users quickly previewing tracks, artificially boosting royalty payments for tracks that users don't actually enjoy. A higher threshold (e.g., 60 seconds) would under-count legitimate listens of short songs. The 30-second standard is used by Spotify, Apple Music, and Tidal, making cross-platform comparisons meaningful for artists and labels.
+
+### 4. Session-Based Auth over JWT
+
+**Decision**: Use Redis-backed sessions with HTTP-only cookies rather than JWT tokens.
+
+Session-based auth enables immediate revocation (logout, account ban, password change) by deleting the session from Redis. JWT revocation requires either a blocklist (adding the same Redis dependency) or waiting for token expiry. For a music streaming app where premium subscriptions can be upgraded/downgraded instantly, the ability to change session state without token reissuance is valuable. The trade-off is that every API request requires a Redis lookup, but since Redis is already used for caching, rate limiting, and playback state, this adds no new infrastructure dependency.
 
 ---
 
@@ -354,100 +557,34 @@ CREATE TABLE user_library (
 **Strong Consistency (PostgreSQL):**
 - User account operations (registration, subscription changes)
 - Playlist ownership and permission changes
-- Financial transactions (subscription billing)
-- Stream count increments use `UPDATE tracks SET stream_count = stream_count + 1` with row-level locking
+- Financial transactions (subscription billing, royalty calculations)
+- Stream count increments: `UPDATE tracks SET stream_count = stream_count + 1` with row-level locking
 
 **Eventual Consistency (acceptable):**
-- Recommendation updates (regenerate Discover Weekly weekly)
+- Recommendation updates (regenerate hourly or weekly)
 - Monthly listener counts (batch aggregated)
-- Search index updates (lag of 1-5 seconds acceptable)
-- Playback analytics (processed through Kafka, eventual)
+- Search index updates (1-5 second lag)
+- Playback analytics (processed through Kafka)
 
 ### Idempotency for Core Writes
 
 **Playback Events:**
-```javascript
-// Client generates idempotency key per playback session
-const playbackEvent = {
-  idempotencyKey: `${userId}_${trackId}_${sessionStartTimestamp}`,
-  trackId,
-  event: 'stream_counted',
-  position: 32 // seconds
-}
 
-// Server-side deduplication
-async function processPlaybackEvent(event) {
-  // Check if already processed (Redis with 24h TTL)
-  const processed = await redis.get(`playback:${event.idempotencyKey}`)
-  if (processed) return { deduplicated: true }
-
-  // Mark as processing (atomic)
-  const acquired = await redis.set(
-    `playback:${event.idempotencyKey}`,
-    'processing',
-    'NX', 'EX', 86400
-  )
-  if (!acquired) return { deduplicated: true }
-
-  // Process the stream count
-  await incrementStreamCount(event.trackId)
-  await redis.set(`playback:${event.idempotencyKey}`, 'completed', 'EX', 86400)
-}
-```
+Each playback session generates an idempotency key from `userId + trackId + sessionStartTimestamp`. Server-side deduplication uses Redis with a 24-hour TTL to prevent double-counting from network retries. The key is checked atomically with `SET NX EX`, ensuring exactly-once semantics even under concurrent retry storms.
 
 **Playlist Modifications:**
-```javascript
-// Add track to playlist with idempotency
-async function addTrackToPlaylist(playlistId, trackId, requestId) {
-  // Use request ID for idempotency
-  const lockKey = `playlist_add:${requestId}`
-  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 300)
 
-  if (!acquired) {
-    // Return cached result from previous identical request
-    const cached = await redis.get(`playlist_result:${requestId}`)
-    return cached ? JSON.parse(cached) : { status: 'in_progress' }
-  }
+Adding a track to a playlist uses two-level idempotency protection:
+1. **Database level**: `UNIQUE(playlist_id, track_id)` with `ON CONFLICT DO NOTHING`
+2. **Application level**: `X-Idempotency-Key` header checked via Redis, with cached result returned for duplicate requests
 
-  // Upsert pattern for playlist_tracks
-  const result = await db.query(`
-    INSERT INTO playlist_tracks (playlist_id, track_id, position, added_by, added_at)
-    VALUES ($1, $2, (SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_tracks WHERE playlist_id = $1), $3, NOW())
-    ON CONFLICT (playlist_id, track_id) DO NOTHING
-    RETURNING *
-  `, [playlistId, trackId, userId])
-
-  await redis.set(`playlist_result:${requestId}`, JSON.stringify(result), 'EX', 300)
-  return result
-}
-```
+The middleware wraps the response to capture the result on first execution and returns it for subsequent identical requests within the 5-minute TTL window.
 
 **Conflict Resolution for Collaborative Playlists:**
 - Last-write-wins for track reordering (position updates)
-- Concurrent additions: Both tracks added, positions auto-incremented
-- Concurrent deletions: Idempotent (DELETE is safe to replay)
+- Concurrent additions: both tracks added, positions auto-incremented
+- Concurrent deletions: idempotent (DELETE is safe to replay)
 - Track already exists: `ON CONFLICT DO NOTHING` prevents duplicates
-
-### Replay Handling
-
-**Kafka Consumer Replay:**
-```javascript
-// Consumer tracks offset, but events are idempotent anyway
-consumer.on('message', async (message) => {
-  const event = JSON.parse(message.value)
-
-  // Idempotency check using event's unique key
-  const eventKey = `event:${event.type}:${event.idempotencyKey}`
-  if (await redis.exists(eventKey)) {
-    // Already processed, acknowledge and skip
-    return consumer.commit()
-  }
-
-  await processEvent(event)
-  await redis.set(eventKey, '1', 'EX', 7 * 24 * 3600) // 7 day TTL
-  consumer.commit()
-})
-```
 
 ---
 
@@ -455,197 +592,37 @@ consumer.on('message', async (message) => {
 
 ### Authentication
 
-**Session-Based Auth (for local development):**
-```javascript
-// Login endpoint
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body
-  const user = await db.query('SELECT * FROM users WHERE email = $1', [email])
-
-  if (!user || !await bcrypt.compare(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid credentials' })
-  }
-
-  // Create session in Redis (4 hour TTL, sliding)
-  const sessionId = crypto.randomUUID()
-  await redis.hset(`session:${sessionId}`, {
-    userId: user.id,
-    email: user.email,
-    isPremium: user.is_premium,
-    createdAt: Date.now()
-  })
-  await redis.expire(`session:${sessionId}`, 14400) // 4 hours
-
-  res.cookie('session', sessionId, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: 14400000
-  })
-
-  return res.json({ user: { id: user.id, email: user.email } })
-})
-
-// Session middleware
-async function requireAuth(req, res, next) {
-  const sessionId = req.cookies.session
-  if (!sessionId) return res.status(401).json({ error: 'Not authenticated' })
-
-  const session = await redis.hgetall(`session:${sessionId}`)
-  if (!session.userId) return res.status(401).json({ error: 'Session expired' })
-
-  // Sliding expiration
-  await redis.expire(`session:${sessionId}`, 14400)
-
-  req.user = session
-  next()
-}
-```
+Session-based auth using Redis-backed `express-session`:
+- Sessions stored in Redis with `spotify:session:` prefix and 7-day expiry
+- HTTP-only, secure cookies prevent XSS-based session theft
+- Sliding expiration refreshes the TTL on each request
 
 ### Authorization (RBAC)
 
-**Roles:**
 | Role | Description | Access |
 |------|-------------|--------|
-| `user` | Regular user | Own library, playlists, streaming |
-| `premium` | Premium subscriber | High quality, offline, no ads |
-| `artist` | Verified artist | Own artist page, analytics |
-| `admin` | Platform admin | All data, user management |
+| `user` | Regular user | Own library, playlists, streaming (160kbps max) |
+| `premium` | Premium subscriber | High quality (320kbps), offline downloads, no ads |
+| `artist` | Verified artist | Own artist page, analytics dashboard |
+| `admin` | Platform admin | All data, user management, audit logs |
 
-**Permission Checks:**
-```javascript
-// Middleware for role-based access
-function requireRole(...roles) {
-  return async (req, res, next) => {
-    const userRoles = await getUserRoles(req.user.userId)
-    const hasRole = roles.some(role => userRoles.includes(role))
-
-    if (!hasRole) {
-      return res.status(403).json({ error: 'Insufficient permissions' })
-    }
-    next()
-  }
-}
-
-// Playlist access control
-async function canEditPlaylist(userId, playlistId) {
-  const playlist = await db.query(
-    'SELECT owner_id, is_collaborative FROM playlists WHERE id = $1',
-    [playlistId]
-  )
-
-  if (!playlist) return false
-  if (playlist.owner_id === userId) return true
-  if (playlist.is_collaborative) {
-    // Check if user is a collaborator
-    const collaborator = await db.query(
-      'SELECT 1 FROM playlist_collaborators WHERE playlist_id = $1 AND user_id = $2',
-      [playlistId, userId]
-    )
-    return !!collaborator
-  }
-  return false
-}
-
-// Route example
-app.put('/api/playlists/:id', requireAuth, async (req, res) => {
-  if (!await canEditPlaylist(req.user.userId, req.params.id)) {
-    return res.status(403).json({ error: 'Cannot edit this playlist' })
-  }
-  // ... update playlist
-})
-```
-
-### Admin API Boundaries
-
-```javascript
-// Admin routes separated with prefix
-app.use('/api/admin', requireAuth, requireRole('admin'))
-
-// Admin endpoints
-app.get('/api/admin/users', async (req, res) => {
-  // Paginated user list
-  const users = await db.query(`
-    SELECT id, email, created_at, is_premium, last_login
-    FROM users ORDER BY created_at DESC
-    LIMIT $1 OFFSET $2
-  `, [req.query.limit || 50, req.query.offset || 0])
-  res.json(users)
-})
-
-app.post('/api/admin/users/:id/ban', async (req, res) => {
-  await db.query('UPDATE users SET banned = true WHERE id = $1', [req.params.id])
-  // Invalidate all sessions for this user
-  const sessions = await redis.keys(`session:*`)
-  for (const key of sessions) {
-    const session = await redis.hgetall(key)
-    if (session.userId === req.params.id) {
-      await redis.del(key)
-    }
-  }
-  res.json({ success: true })
-})
-```
+Playlist access control checks ownership first, then collaborative status, preventing unauthorized edits.
 
 ### Rate Limiting
 
-**Configuration (per endpoint category):**
+Redis sliding window rate limiting per endpoint category:
+
 | Endpoint Category | Limit | Window | Scope |
 |-------------------|-------|--------|-------|
 | Auth (login/register) | 5 | 15 min | IP |
-| Search | 60 | 1 min | User |
+| Search | 60 | 1 min | User/IP |
 | Playback (stream URLs) | 300 | 1 min | User |
 | Library writes | 100 | 1 min | User |
+| Playlist writes | 60 | 1 min | User |
 | Recommendations | 30 | 1 min | User |
 | Admin endpoints | 1000 | 1 min | User |
 
-**Implementation (Redis sliding window):**
-```javascript
-async function rateLimit(key, limit, windowSec) {
-  const now = Date.now()
-  const windowStart = now - (windowSec * 1000)
-
-  // Remove old entries, add new one, count
-  const multi = redis.multi()
-  multi.zremrangebyscore(key, 0, windowStart)
-  multi.zadd(key, now, `${now}:${crypto.randomUUID()}`)
-  multi.zcard(key)
-  multi.expire(key, windowSec)
-
-  const results = await multi.exec()
-  const count = results[2][1]
-
-  return {
-    allowed: count <= limit,
-    remaining: Math.max(0, limit - count),
-    resetAt: new Date(now + windowSec * 1000)
-  }
-}
-
-// Middleware
-function rateLimitMiddleware(limit, windowSec, keyFn) {
-  return async (req, res, next) => {
-    const key = `ratelimit:${keyFn(req)}`
-    const result = await rateLimit(key, limit, windowSec)
-
-    res.set('X-RateLimit-Limit', limit)
-    res.set('X-RateLimit-Remaining', result.remaining)
-    res.set('X-RateLimit-Reset', result.resetAt.toISOString())
-
-    if (!result.allowed) {
-      return res.status(429).json({
-        error: 'Rate limit exceeded',
-        retryAfter: Math.ceil((result.resetAt - Date.now()) / 1000)
-      })
-    }
-    next()
-  }
-}
-
-// Usage
-app.use('/api/search', rateLimitMiddleware(60, 60, req => req.user?.userId || req.ip))
-app.use('/api/auth', rateLimitMiddleware(5, 900, req => req.ip))
-```
+**Why sliding window over token bucket:** Sliding window provides consistent rate enforcement without allowing burst abuse. Token bucket would allow a user to accumulate tokens during inactivity and then fire 300 requests in 1 second, overwhelming downstream services. The trade-off is slightly higher Redis overhead (sorted set vs. simple counter), but the accuracy is worth it for protecting the search and recommendation services.
 
 ---
 
@@ -653,95 +630,36 @@ app.use('/api/auth', rateLimitMiddleware(5, 900, req => req.ip))
 
 ### Metrics (Prometheus)
 
-**Key Metrics to Collect:**
-```javascript
-const promClient = require('prom-client')
+Key metrics collected via `prom-client`:
 
-// Request latency histogram
-const httpRequestDuration = new promClient.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
-})
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `http_request_duration_seconds` | Histogram | method, route, status_code | Request latency SLI |
+| `http_requests_total` | Counter | method, route, status_code | Throughput tracking |
+| `playback_events_total` | Counter | event_type, device_type | Playback analytics |
+| `stream_counts_total` | Counter | - | Royalty calculation verification |
+| `active_streams` | Gauge | - | Current load |
+| `search_operations_total` | Counter | type | Search usage patterns |
+| `recommendation_generation_seconds` | Histogram | algorithm | Rec engine performance |
+| `cache_hits_total` / `cache_misses_total` | Counter | cache_type | Cache efficiency |
+| `rate_limit_hits_total` | Counter | endpoint, scope | Abuse detection |
+| `idempotency_deduplications_total` | Counter | operation | Retry detection |
+| `db_pool_connections` | Gauge | state | Pool health |
 
-// Playback events counter
-const playbackEvents = new promClient.Counter({
-  name: 'playback_events_total',
-  help: 'Total playback events',
-  labelNames: ['event_type', 'device_type']
-})
+### Health Checks
 
-// Active streams gauge
-const activeStreams = new promClient.Gauge({
-  name: 'active_streams',
-  help: 'Number of currently active streams'
-})
+Three-tier health check design:
+- `/health` - Full dependency check (PostgreSQL + Redis), returns `ok` or `degraded` with per-dependency status
+- `/health/live` - Simple liveness probe for Kubernetes (always returns 200 if process is running)
+- `/health/ready` - Readiness probe verifying database and cache connectivity
 
-// Recommendation latency
-const recLatency = new promClient.Histogram({
-  name: 'recommendation_generation_seconds',
-  help: 'Time to generate recommendations',
-  labelNames: ['algorithm'],
-  buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10]
-})
+### Structured Logging (Pino)
 
-// Cache hit rate
-const cacheHits = new promClient.Counter({
-  name: 'cache_hits_total',
-  help: 'Cache hits',
-  labelNames: ['cache_type']
-})
-const cacheMisses = new promClient.Counter({
-  name: 'cache_misses_total',
-  help: 'Cache misses',
-  labelNames: ['cache_type']
-})
-```
-
-**Express Middleware:**
-```javascript
-app.use((req, res, next) => {
-  const start = Date.now()
-  res.on('finish', () => {
-    const duration = (Date.now() - start) / 1000
-    httpRequestDuration.observe(
-      { method: req.method, route: req.route?.path || 'unknown', status_code: res.statusCode },
-      duration
-    )
-  })
-  next()
-})
-
-// Expose metrics endpoint
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', promClient.register.contentType)
-  res.send(await promClient.register.metrics())
-})
-```
-
-### SLI Dashboards (Grafana)
-
-**Dashboard Panels:**
-
-1. **Availability SLI**
-   - Query: `sum(rate(http_request_duration_seconds_count{status_code!~"5.."}[5m])) / sum(rate(http_request_duration_seconds_count[5m]))`
-   - Target: 99.99%
-
-2. **Latency SLI (p95)**
-   - Query: `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))`
-   - Target: < 200ms for streaming endpoints
-
-3. **Stream Start Latency**
-   - Query: `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{route="/api/playback/stream"}[5m])) by (le))`
-   - Target: < 200ms
-
-4. **Playback Events Throughput**
-   - Query: `sum(rate(playback_events_total[5m])) by (event_type)`
-
-5. **Cache Hit Ratio**
-   - Query: `sum(rate(cache_hits_total[5m])) / (sum(rate(cache_hits_total[5m])) + sum(rate(cache_misses_total[5m])))`
-   - Target: > 90%
+JSON-structured logs with request correlation:
+- Each request gets a `requestId` (from header or generated UUID)
+- Child loggers carry `userId` for request tracing
+- Log levels: `fatal`, `error`, `warn`, `info`, `debug`
+- Audit-tagged logs (`audit: true`) for filtering sensitive operation logs
 
 ### Alert Thresholds
 
@@ -750,303 +668,233 @@ app.get('/metrics', async (req, res) => {
 | High Error Rate | 5xx rate > 1% for 5 min | Critical | Page on-call |
 | Slow Playback Start | p95 > 500ms for 5 min | Warning | Investigate CDN |
 | Low Cache Hit Rate | < 70% for 15 min | Warning | Check cache config |
-| Kafka Consumer Lag | > 10000 for 10 min | Warning | Scale consumers |
-| Database Connections | > 80% pool used | Warning | Increase pool size |
-| Redis Memory | > 80% used | Warning | Review TTLs |
+| Kafka Consumer Lag | > 10,000 for 10 min | Warning | Scale consumers |
+| Database Pool Exhaustion | > 80% used | Warning | Increase pool size |
 
-**Alertmanager Rules (local development):**
-```yaml
-groups:
-  - name: spotify-alerts
-    rules:
-      - alert: HighErrorRate
-        expr: sum(rate(http_request_duration_seconds_count{status_code=~"5.."}[5m])) / sum(rate(http_request_duration_seconds_count[5m])) > 0.01
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High 5xx error rate"
-          description: "Error rate is {{ $value | humanizePercentage }}"
+---
 
-      - alert: SlowPlaybackStart
-        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{route="/api/playback/stream"}[5m])) by (le)) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Slow playback start latency"
-```
+## Failure Handling
 
-### Structured Logging
+### Kafka Producer Failure
 
-**Log Format:**
-```javascript
-const pino = require('pino')
+If the Kafka producer fails to connect at startup, the server continues operating. Playback events are still recorded to PostgreSQL directly, but the async Kafka pipeline is skipped. This is logged as a warning, and the producer attempts reconnection on the next event.
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'spotify-api',
-    version: process.env.APP_VERSION || 'dev'
-  }
-})
+### CDN/Origin Failover
 
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID()
-  req.log = logger.child({ requestId, userId: req.user?.userId })
+If the CDN edge node cannot serve a cached track, it falls back to the origin (MinIO/S3). If origin is also down, the client receives a 503 and retries with exponential backoff. The player UI shows a "Playback unavailable" message after 3 retries.
 
-  req.log.info({ method: req.method, path: req.path }, 'request started')
+### Redis Failure
 
-  res.on('finish', () => {
-    req.log.info({
-      method: req.method,
-      path: req.path,
-      statusCode: res.statusCode,
-      durationMs: Date.now() - req.startTime
-    }, 'request completed')
-  })
+Rate limiting fails open (allows the request) when Redis is unavailable, preventing a cache outage from blocking all API traffic. Session validation also fails open with a logged warning, accepting the risk of unauthenticated requests during the Redis recovery window.
 
-  next()
-})
-```
+### Database Connection Pool Exhaustion
 
-**Key Log Events:**
-```javascript
-// Authentication events
-logger.info({ userId, action: 'login', ip: req.ip }, 'user logged in')
-logger.warn({ email, action: 'login_failed', ip: req.ip, reason: 'invalid_password' }, 'login attempt failed')
+The pool is configured with 20 max connections and a 2-second connection timeout. If all connections are in use, new requests wait up to 2 seconds before receiving a 503 response. The `db_pool_connections` gauge enables proactive alerting before this happens.
 
-// Playback events
-logger.info({ userId, trackId, event: 'stream_started' }, 'playback started')
-logger.info({ userId, trackId, event: 'stream_counted', position: 32 }, 'stream counted for royalties')
+### Graceful Shutdown
 
-// Error logging
-logger.error({ err, userId, operation: 'playlist_update', playlistId }, 'failed to update playlist')
-```
+On `SIGTERM` or `SIGINT`, the server:
+1. Stops accepting new connections
+2. Disconnects the Kafka producer (flushes buffered messages)
+3. Closes Redis client
+4. Drains the PostgreSQL connection pool
+5. Exits with code 0
 
-### Distributed Tracing (OpenTelemetry)
+---
 
-```javascript
-const { trace, context, SpanStatusCode } = require('@opentelemetry/api')
+## Scalability Considerations
 
-const tracer = trace.getTracer('spotify-api')
+### What Breaks First
 
-// Trace a recommendation request
-async function getRecommendations(userId) {
-  return tracer.startActiveSpan('getRecommendations', async (span) => {
-    span.setAttribute('user.id', userId)
+1. **Playback event writes** (500K/sec): PostgreSQL cannot handle this write volume on a single instance. Solution: Cassandra for event storage, partitioned by `user_id`.
+2. **Stream count updates** (hot rows): Popular tracks receive millions of concurrent `UPDATE` queries. Solution: Batch stream counts in Redis and flush to PostgreSQL periodically (every 10 seconds).
+3. **Recommendation generation**: Computing CF+CB recommendations for 200M users is computationally expensive. Solution: Precompute recommendations in batch (Spark) and cache; only re-score in real-time for the active session context.
+4. **Search at scale**: PostgreSQL `ILIKE` searches degrade linearly with catalog size. Solution: Elasticsearch index with dedicated search replicas.
 
-    try {
-      // Child span for history fetch
-      const history = await tracer.startActiveSpan('fetchListeningHistory', async (historySpan) => {
-        const result = await db.query('SELECT * FROM listening_history WHERE user_id = $1', [userId])
-        historySpan.setAttribute('history.count', result.length)
-        historySpan.end()
-        return result
-      })
+### Horizontal Scaling Path
 
-      // Child span for ML inference
-      const recommendations = await tracer.startActiveSpan('mlInference', async (mlSpan) => {
-        const result = await recommendationEngine.generate(userId, history)
-        mlSpan.setAttribute('recommendations.count', result.length)
-        mlSpan.end()
-        return result
-      })
+| Component | Scaling Strategy |
+|-----------|-----------------|
+| API servers | Stateless, add instances behind load balancer |
+| PostgreSQL | Read replicas for catalog queries, sharding by user_id for user data |
+| Cassandra | Add nodes; data redistributes automatically |
+| Redis | Cluster mode for sharding, replicas for read scaling |
+| Kafka | Add partitions to topics, add consumer instances to groups |
+| CDN | Add PoPs, increase origin shield capacity |
+| Recommendation | Precompute in batch; cache per-user results |
 
-      span.setStatus({ code: SpanStatusCode.OK })
-      return recommendations
-    } catch (error) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-      span.recordException(error)
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
+### Multi-Region
 
-### Audit Logging
-
-**Sensitive Operations to Audit:**
-```javascript
-// Audit log table
-// CREATE TABLE audit_logs (
-//   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-//   timestamp TIMESTAMP DEFAULT NOW(),
-//   actor_id UUID REFERENCES users(id),
-//   actor_ip INET,
-//   action VARCHAR(100),
-//   resource_type VARCHAR(50),
-//   resource_id UUID,
-//   details JSONB,
-//   success BOOLEAN
-// );
-
-async function auditLog(req, action, resourceType, resourceId, details, success = true) {
-  await db.query(`
-    INSERT INTO audit_logs (actor_id, actor_ip, action, resource_type, resource_id, details, success)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
-  `, [
-    req.user?.userId,
-    req.ip,
-    action,
-    resourceType,
-    resourceId,
-    JSON.stringify(details),
-    success
-  ])
-}
-
-// Usage in routes
-app.post('/api/admin/users/:id/ban', requireAdmin, async (req, res) => {
-  try {
-    await db.query('UPDATE users SET banned = true WHERE id = $1', [req.params.id])
-    await auditLog(req, 'user.ban', 'user', req.params.id, { reason: req.body.reason }, true)
-    res.json({ success: true })
-  } catch (err) {
-    await auditLog(req, 'user.ban', 'user', req.params.id, { error: err.message }, false)
-    throw err
-  }
-})
-
-// Audit log for subscription changes
-app.post('/api/subscription/upgrade', requireAuth, async (req, res) => {
-  const before = await getSubscription(req.user.userId)
-  await upgradeSubscription(req.user.userId, req.body.plan)
-  const after = await getSubscription(req.user.userId)
-
-  await auditLog(req, 'subscription.upgrade', 'user', req.user.userId, {
-    before: before.plan,
-    after: after.plan
-  })
-})
-```
-
-**Audited Actions:**
-- User login/logout (success and failure)
-- Subscription changes
-- Admin actions (user bans, content removal)
-- Playlist permission changes (add/remove collaborators)
-- Account settings changes (email, password)
-- Data export requests (GDPR)
+At Spotify's scale, the system operates in multiple AWS/GCP regions:
+- User requests routed to nearest region via GeoDNS
+- Catalog data replicated across all regions (read-heavy, infrequent writes)
+- Listening history stays in the user's home region
+- CDN serves audio from edge nodes globally
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Audio delivery | CDN + signed URLs | Direct streaming | Scale, latency |
-| Recommendations | Hybrid CF + CB | Pure collaborative | Cold start |
-| Offline DRM | License + encryption | No DRM | Rights protection |
-| Analytics | Event streaming | Batch | Real-time royalties |
-| Consistency | Strong for writes, eventual for reads | Full strong consistency | Performance at scale |
-| Auth | Session-based (Redis) | JWT tokens | Simpler revocation, local dev friendly |
-| Rate limiting | Sliding window (Redis) | Token bucket | More accurate, prevents bursts |
-| Observability | Prometheus + Grafana + Pino | ELK stack | Lighter weight for local dev |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Audio delivery | CDN + signed URLs | Direct streaming | 95%+ cache hit for popular tracks, global low latency |
+| Playback events | Kafka async pipeline | Synchronous processing | Decouples producer/consumer, durable retry |
+| Recommendations | Hybrid CF + CB | Pure collaborative | Handles cold start and long-tail content |
+| Stream threshold | 30 seconds | 10s or 60s | Industry standard, balances accuracy |
+| Session storage | Redis + cookie | JWT | Immediate revocation, no blocklist needed |
+| Listening history | Cassandra (production) | PostgreSQL | Write-heavy, partition-key access pattern |
+| Search | Elasticsearch (production) | PostgreSQL FTS | Fuzzy matching, auto-complete, personalization |
+| Rate limiting | Sliding window (Redis) | Token bucket | Prevents burst abuse, smoother enforcement |
+| Royalty model | Pro-rata | User-centric | Industry standard, simpler auditing |
+| Consistency | Strong writes, eventual reads | Full strong | Performance at scale, acceptable for non-financial reads |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind key implementation decisions in the backend code.
+This section documents the local implementation: what was built, what was simplified, and what was omitted relative to the production architecture above.
 
-### Why Idempotency Prevents Duplicate Track Additions
+### Local Architecture
 
-**Problem**: Network retries, client bugs, or user double-clicks can send the same "add track to playlist" request multiple times. Without protection, this could result in duplicate entries or inconsistent playlist state.
-
-**Solution**: We implement idempotency at two levels:
-
-1. **Database-level**: The `playlist_tracks` table has a `UNIQUE (playlist_id, track_id)` constraint with `ON CONFLICT DO NOTHING`. This ensures a track can only appear once in a playlist, regardless of how many times the insert is attempted.
-
-2. **Application-level**: The `X-Idempotency-Key` header combined with Redis-based deduplication ensures that:
-   - If the same request is received while the first is still processing, we return a 409 (conflict) response
-   - If the same request is received after the first completed, we return the cached result
-   - The idempotency key is scoped to the user to prevent cross-user conflicts
-
-**Implementation**: See `/backend/src/shared/idempotency.js` and the playlist routes in `/backend/src/routes/playlists.js`.
-
-**Metrics**: The `idempotency_deduplications_total` counter tracks how often duplicate requests are detected, helping identify problematic clients or network issues.
-
-### Why Rate Limiting Protects Against Scraping
-
-**Problem**: The music catalog (artists, albums, tracks) and search endpoints are valuable targets for scraping. Automated bots could:
-- Harvest the entire catalog for competing services
-- Overwhelm the search infrastructure
-- Extract user playlist data at scale
-
-**Solution**: Sliding window rate limiting using Redis provides accurate, distributed rate limiting that:
-
-1. **Prevents catalog scraping**: Search is limited to 60 requests/minute per user/IP. At this rate, scraping 100M tracks would take over 3 years.
-
-2. **Protects authentication**: Auth endpoints are limited to 5 requests per 15 minutes per IP, making brute-force attacks impractical.
-
-3. **Allows legitimate use**: High limits for playback (300/min) and library operations (100/min) don't impact normal user behavior.
-
-**Implementation**: See `/backend/src/shared/rateLimit.js` for the sliding window algorithm using Redis sorted sets.
-
-**Why sliding window over token bucket**:
-- More accurate: No burst allowance that could be exploited
-- Smoother: Requests are evenly distributed
-- Simpler mental model: "60 requests in any 60-second window"
-
-### Why Audit Logging Enables Compliance and Debugging
-
-**Problem**: Music streaming platforms face regulatory requirements (GDPR, CCPA) and need to investigate user complaints, security incidents, and billing disputes.
-
-**Solution**: Comprehensive audit logging that persists to PostgreSQL provides:
-
-1. **Compliance**: GDPR requires logging of data access, exports, and deletions. Our audit log captures all sensitive operations with actor, timestamp, IP, and detailed context.
-
-2. **Security investigations**: Failed login attempts are logged with IP and email, enabling detection of brute-force attacks and account takeover attempts.
-
-3. **Debugging**: When a user reports "I didn't change my playlist", we can show exactly what happened, when, and from which IP.
-
-4. **Admin accountability**: All admin actions (bans, role changes, content removal) are logged, creating an audit trail for internal oversight.
-
-**Audited Actions** (from `/backend/src/shared/audit.js`):
-- Authentication: login, logout, failed login, registration
-- Account changes: profile updates, password changes, email changes
-- Subscription: upgrades, downgrades, cancellations
-- Admin actions: user bans, content removal, role changes
-- Data requests: export requests, deletion requests (GDPR)
-
-**Storage considerations**: Audit logs are stored in PostgreSQL with indexes on actor_id, action, timestamp, and resource. For high-volume systems, consider partitioning by month and archiving to cold storage after 90 days.
-
-### Why Metrics Enable Personalization Optimization
-
-**Problem**: Recommendation quality directly impacts user engagement and retention, but it's difficult to measure without proper instrumentation.
-
-**Solution**: Prometheus metrics capture the data needed to optimize personalization:
-
-1. **Recommendation latency** (`recommendation_generation_seconds`): Slow recommendations cause users to skip the feature. We track p50/p95/p99 latency by algorithm (for_you, discover_weekly) to identify performance regressions.
-
-2. **Playback events** (`playback_events_total`): By tracking play, skip, complete, and seek events by device type, we can:
-   - Measure recommendation quality (skip rate)
-   - Identify problematic content (high skip rate)
-   - Compare algorithm variants (A/B testing)
-
-3. **Stream counts** (`stream_counts_total`): The 30-second stream threshold is critical for royalty calculations. This metric helps verify accurate counting.
-
-4. **Search patterns** (`search_operations_total`): Understanding what users search for informs catalog gaps and recommendation improvements.
-
-**Dashboard queries** (for Grafana):
-```promql
-# Recommendation quality proxy: % of recommendations that result in 30+ second play
-rate(stream_counts_total[1h]) / rate(playback_events_total{event_type="play_started", source="recommendation"}[1h])
-
-# Skip rate by recommendation algorithm
-rate(playback_events_total{event_type="skipped", source="recommendation"}[1h])
-/ rate(playback_events_total{event_type="play_started", source="recommendation"}[1h])
+```
+┌──────────────────────────┐
+│    Frontend (Vite)       │
+│    localhost:5173         │
+│                          │
+│  React + TanStack Router │
+│  + Zustand + Tailwind    │
+└────────────┬─────────────┘
+             │ Proxy /api
+             ▼
+┌──────────────────────────┐
+│    Backend (Express)     │
+│    localhost:3001         │
+│                          │
+│  Routes: auth, catalog,  │
+│  library, playlists,     │
+│  playback, recommendations│
+│  admin                   │
+└──┬────┬────┬────┬────────┘
+   │    │    │    │
+   ▼    ▼    ▼    ▼
+┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐
+│Postgres│ │Valkey│ │MinIO │ │  Kafka   │
+│:5432  │ │:6379 │ │:9000 │ │  :9092   │
+│       │ │      │ │      │ │          │
+│spotify│ │sess. │ │audio │ │playback- │
+│  DB   │ │cache │ │covers│ │events    │
+└──────┘ └──────┘ └──────┘ └─────┬────┘
+                                  │
+                                  ▼
+                          ┌──────────────┐
+                          │  Analytics   │
+                          │  Worker      │
+                          │  (Kafka      │
+                          │   consumer)  │
+                          └──────────────┘
 ```
 
-**Feedback loop**: These metrics feed back into the recommendation system:
-- High-skip recommendations are deprioritized
-- Frequently-completed tracks are promoted
-- Search terms that don't yield results inform catalog expansion
+### Production-Grade Patterns Actually Implemented
 
+**1. Kafka Event Pipeline** (`backend/src/shared/kafka.ts`, `backend/src/workers/analytics-worker.ts`)
+
+Playback events are published to a Kafka topic (`playback-events`, 3 partitions) with `userId` as the message key for per-user ordering guarantees. A separate analytics worker process consumes events and updates:
+- Play session tracking in Redis (start time, duration, device type)
+- Daily listening statistics (plays, completions, skips)
+- User taste profiles (artist affinity and genre affinity as Redis sorted sets)
+- Artist stream counts and monthly listener aggregates
+
+This demonstrates the production pattern of decoupling event producers from consumers.
+
+**2. Prometheus Metrics** (`backend/src/shared/metrics.ts`)
+
+Thirteen custom metrics are registered and exposed at `/metrics`:
+- HTTP request duration and count (histograms/counters)
+- Playback events, stream counts, active streams
+- Search operations, playlist operations
+- Recommendation generation latency
+- Cache hit/miss ratios
+- Rate limit hits, auth events, idempotency deduplications
+- Database pool connection gauge
+
+**3. Idempotency Middleware** (`backend/src/shared/idempotency.ts`)
+
+Redis-backed idempotency for playlist track operations. Uses `SET NX EX` for atomic lock acquisition, wraps `res.json()` to capture and cache successful results, and returns cached results for duplicate requests. Supports both explicit `X-Idempotency-Key` headers and auto-generated keys from request parameters.
+
+**4. Rate Limiting** (`backend/src/shared/rateLimit.ts`)
+
+Sliding window rate limiting using Redis sorted sets. Seven pre-configured limiters protect different endpoint categories. On Redis failure, the limiter fails open to avoid blocking legitimate traffic.
+
+**5. Structured Logging** (`backend/src/shared/logger.ts`)
+
+Pino-based JSON logging with request correlation IDs, child loggers carrying `userId`, and `pino-pretty` for readable local development output.
+
+**6. Audit Logging** (`backend/src/shared/audit.ts`)
+
+PostgreSQL-persisted audit trail for sensitive operations. Defined action categories cover authentication, account changes, subscription management, admin actions, playlist permissions, and GDPR data requests. Queryable via the admin API with filtering by actor, action, time range, and resource.
+
+**7. Health Checks** (`backend/src/index.ts`)
+
+Three-tier health check (`/health`, `/health/live`, `/health/ready`) with per-dependency status and pool metrics reporting.
+
+**8. Graceful Shutdown** (`backend/src/index.ts`)
+
+Signal handlers for `SIGTERM` and `SIGINT` that cleanly disconnect Kafka, Redis, and PostgreSQL before exiting.
+
+### What Was Simplified
+
+| Production Component | Local Substitute | Why |
+|---------------------|-----------------|-----|
+| CDN audio delivery | MinIO presigned URLs | Single-node MinIO replaces global CDN; presigned URLs demonstrate the pattern |
+| Elasticsearch search | PostgreSQL `ILIKE` queries | Full-text search via SQL is adequate for ~100 seeded tracks |
+| Collaborative filtering ML | SQL-based "same artist" recommendations | Finds unlistened tracks from artists in listening history; popular tracks as fallback |
+| Cassandra listening history | PostgreSQL `listening_history` table | Single table handles the write volume at local scale |
+| DRM/encryption | No encryption | Audio served as plain files; license management omitted |
+| Multi-device Spotify Connect | Redis playback state | State saved/restored but no real-time push to other devices |
+| Ad insertion | Not implemented | No ad service, targeting, or frequency capping |
+| Royalty calculation pipeline | Direct `stream_count` increment | No rights holder attribution or payment distribution |
+
+### What Was Omitted
+
+- **CDN infrastructure** - No global edge caching; MinIO serves directly
+- **Multi-region deployment** - Single-machine Docker Compose
+- **Kubernetes orchestration** - No container orchestration
+- **ML recommendation pipeline** - No Spark, no model training, no vector embeddings
+- **Offline downloads** - No download manager, license handling, or sync
+- **Social features** - No friend activity feed, group sessions, or real-time WebSocket updates
+- **Ad service** - No ad targeting, insertion, or billing
+- **Royalty payment system** - No rights holder database, contractual splits, or payment processing
+- **A/B testing framework** - No experiment assignment or metric comparison
+- **Audio fingerprinting** - No content identification or duplicate detection
+
+### Frontend Implementation
+
+The React frontend (`frontend/src/`) provides a Spotify-like UI with:
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | Home page | New releases, featured, popular tracks, personalized "For You" |
+| `/search` | Search | Multi-entity search across artists, albums, tracks |
+| `/artist/:id` | Artist page | Artist details with albums |
+| `/album/:id` | Album page | Album details with track listing |
+| `/playlist/:id` | Playlist page | Playlist with track listing and management |
+| `/library` | Library | Saved albums, followed artists |
+| `/library/liked` | Liked Songs | Liked tracks collection |
+| `/login` | Login | Email/password authentication |
+| `/register` | Register | Account creation |
+
+**Player Architecture** (`frontend/src/stores/playerStore.ts`):
+
+A Zustand store manages all playback state:
+- Queue management with original queue preserved for shuffle restore
+- Shuffle (Fisher-Yates) and repeat modes (off, all, one)
+- 30-second stream count detection via `setCurrentTime` callback
+- Playback event reporting (play, pause, resume, skip, seek, complete) sent to the backend
+- HTML5 Audio element controlled via ref
+
+**Key UI Components:**
+- `AudioProvider` - Manages the shared `<audio>` element and event listeners
+- `Player` - Bottom-bar player with progress, volume, queue controls
+- `Sidebar` - Navigation with playlist listing
+- `Header` - Auth status and navigation
+- `TrackList` - Reusable track listing with play/like actions

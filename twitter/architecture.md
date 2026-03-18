@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Twitter is a real-time microblogging platform where the core challenge is delivering tweets to followers' timelines efficiently. With celebrity users having millions of followers, naive approaches fail at scale.
+Twitter is a real-time microblogging platform where the core challenge is delivering tweets to followers' timelines efficiently. With celebrity users having millions of followers, naive approaches fail at scale. The system must handle asymmetric follow graphs (one user followed by millions), real-time trend detection across hundreds of millions of daily tweets, and sub-second timeline delivery.
 
 **Learning Goals:**
 - Understand fanout strategies (push vs pull vs hybrid)
@@ -16,1493 +16,734 @@ Twitter is a real-time microblogging platform where the core challenge is delive
 
 ### Functional Requirements
 
-1. **Tweet**: Post 280-character messages with media
-2. **Follow**: Subscribe to other users' content
-3. **Timeline**: View chronological feed of followed users
-4. **Trending**: See popular topics in real-time
-5. **Notifications**: Alerts for mentions, likes, retweets
+1. **Tweet**: Post 280-character messages with optional media attachments
+2. **Follow**: Subscribe to other users' content (asymmetric relationship)
+3. **Timeline**: View chronological feed of followed users' tweets
+4. **Trending**: See popular topics computed in real-time
+5. **Engagement**: Like, retweet, and reply to tweets
+6. **Notifications**: Alerts for mentions, likes, retweets
 
 ### Non-Functional Requirements
 
-- **Latency**: < 200ms for timeline load
-- **Availability**: 99.99% uptime
-- **Scale**: 500M users, 500M tweets/day
-- **Consistency**: Eventual (users can tolerate slight delays)
+- **Latency**: < 200ms for timeline load (p99), < 50ms for tweet reads
+- **Availability**: 99.99% uptime (< 53 minutes downtime/year)
+- **Scale**: 500M users, 500M tweets/day, 150B timeline reads/day
+- **Consistency**: Eventual (users can tolerate slight delays in timeline propagation)
+- **Durability**: Zero tweet loss once acknowledged
 
 ---
 
-## Capacity Estimation (Learning Scale)
+## Capacity Estimation
+
+### Production Scale
+
+- **Daily Active Users**: 200M
+- **Tweets/day**: 500M (~5,800 tweets/second average, ~30K/s peak)
+- **Timeline reads/day**: 150B (~1.7M reads/second)
+- **Average followers**: 200
+- **Celebrity users** (>10K followers): ~500K users
+- **Media tweets**: ~30% of tweets include images/video
+
+**Storage (per year)**:
+- Tweet text: 500M/day * 280 bytes * 365 = ~50 TB
+- Media: 150M media tweets/day * 2 MB average = ~100 PB (with transcoded variants)
+- Timeline cache (Redis): 200M active users * 800 tweet IDs * 8 bytes = ~1.2 TB
+
+### Local Development Scale
 
 - **Users**: 1,000
 - **Tweets**: 10,000
 - **Follows**: 50,000 relationships
-- **Timeline reads**: 100/second
-
-**Storage**: ~50 MB
+- **Timeline reads**: ~100/second
+- **Storage**: ~50 MB
 
 ---
+
+# Layer 1: Production-Ready Architecture
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Layer                             │
-│              React + Tanstack Router + SSE/WebSocket            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway / Load Balancer                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Tweet Service │    │ Timeline Svc  │    │ Social Graph  │
-│               │    │               │    │               │
-│ - Create tweet│    │ - Build feed  │    │ - Follow/unf  │
-│ - Store media │    │ - Fanout      │    │ - Followers   │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Message Queue (Kafka)                        │
-│              tweet.created, follow.new, etc.                    │
-└─────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Fanout Workers │    │ Trend Service │    │ Notification  │
-│               │    │               │    │   Service     │
-│- Push to cache│    │- Count tags   │    │- Real-time    │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │
-        ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │    Valkey/Redis                               │
-│   - Users       │    - Timeline cache (lists)                   │
-│   - Tweets      │    - Social graph cache                       │
-│   - Follows     │    - Trend counters                           │
-└─────────────────┴───────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Client Layer                                    │
+│                  Web (React SPA)  /  Mobile (iOS, Android)                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           CDN (CloudFront/Akamai)                            │
+│              Static assets, media delivery, edge caching                     │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     API Gateway / Load Balancer (L7)                         │
+│            Rate limiting, auth validation, request routing                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+          ┌────────────┬────────────┼────────────┬────────────┐
+          ▼            ▼            ▼            ▼            ▼
+   ┌────────────┐┌────────────┐┌────────────┐┌────────────┐┌────────────┐
+   │   Tweet    ││  Timeline  ││   Social   ││   Trend    ││   Media    │
+   │  Service   ││  Service   ││   Graph    ││  Service   ││  Service   │
+   │            ││            ││  Service   ││            ││            │
+   │ Create/    ││ Build home ││ Follow/    ││ Real-time  ││ Upload,    │
+   │ read/      ││ timeline,  ││ unfollow,  ││ trending   ││ transcode, │
+   │ delete     ││ merge      ││ follower   ││ topics     ││ serve      │
+   └────────────┘└────────────┘│ lists      │└────────────┘└────────────┘
+          │            │       └────────────┘       │            │
+          ▼            ▼            │                ▼            ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Kafka Event Bus                                       │
+│     Topics: tweet.created, tweet.deleted, follow.new, like.created,          │
+│             notification.send, analytics.event                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+          │                    │                    │
+          ▼                    ▼                    ▼
+   ┌────────────┐       ┌────────────┐       ┌────────────┐
+   │  Fanout    │       │Notification│       │ Analytics  │
+   │  Workers   │       │  Service   │       │  Pipeline  │
+   │            │       │            │       │            │
+   │ Push to    │       │ Push notif │       │ Event      │
+   │ timeline   │       │ via SSE/   │       │ aggregation│
+   │ caches     │       │ WebSocket  │       │ & metrics  │
+   └────────────┘       └────────────┘       └────────────┘
+          │                                        │
+          ▼                                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Data Layer                                      │
+├──────────────┬──────────────┬──────────────┬──────────────┬──────────────────┤
+│  PostgreSQL  │    Redis     │Elasticsearch │  Object      │   ClickHouse     │
+│  (sharded)   │   Cluster    │              │  Storage     │                  │
+│              │              │              │  (S3)        │                  │
+│ Users,       │ Timeline     │ Full-text    │ Images,      │ Analytics,       │
+│ tweets,      │ cache,       │ tweet        │ videos,      │ engagement       │
+│ follows,     │ sessions,    │ search,      │ avatars      │ metrics          │
+│ likes        │ trend        │ hashtag      │              │                  │
+│              │ counters     │ indexing     │              │                  │
+└──────────────┴──────────────┴──────────────┴──────────────┴──────────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Timeline Fanout
+### 1. Tweet Ingestion Pipeline (Write Path)
 
-**The Core Problem**: User A tweets → All followers (could be millions) need to see it
+When a user posts a tweet, the write path must persist the tweet and eventually deliver it to all followers' timelines. The key insight is decoupling the write acknowledgment from the fanout -- the user sees "Tweet posted" immediately while fanout happens asynchronously.
 
-**Strategy Comparison**:
+**Write flow:**
+1. Client sends tweet to Tweet Service via API Gateway
+2. Tweet Service validates content (280 chars, media references), persists to PostgreSQL, returns 201 to client
+3. Tweet Service publishes `tweet.created` event to Kafka (partitioned by author_id for ordering)
+4. Fanout Workers consume from Kafka and push tweet IDs to followers' Redis timeline caches
+5. Trend Service consumes the same event to update hashtag counters
+6. Notification Service consumes to generate mention/reply alerts
 
-| Strategy | Write Cost | Read Cost | Best For |
-|----------|------------|-----------|----------|
-| Push (Fanout on Write) | O(followers) | O(1) | Normal users |
-| Pull (Fanout on Read) | O(1) | O(following) | Celebrity users |
-| Hybrid | Varies | Varies | Mixed audience |
+**Hybrid fanout strategy:**
 
-**Push Implementation**:
-```javascript
-// Fanout worker processes tweet.created events
-async function fanoutTweet(tweetId, authorId) {
-  const followers = await getFollowers(authorId)
+The fanout strategy depends on the author's follower count:
 
-  // Write to each follower's timeline cache
-  const pipeline = redis.pipeline()
-  for (const followerId of followers) {
-    pipeline.lpush(`timeline:${followerId}`, tweetId)
-    pipeline.ltrim(`timeline:${followerId}`, 0, 799) // Keep last 800
-  }
-  await pipeline.exec()
-}
-```
+| User Type | Followers | Fanout Strategy | Rationale |
+|-----------|-----------|-----------------|-----------|
+| Normal | < 10K | Push (fanout on write) | O(followers) writes, but O(1) reads |
+| Celebrity | >= 10K | Pull (fanout on read) | Avoids 50M-write storms |
 
-**Pull Implementation**:
-```javascript
-// Fetch timeline on demand
-async function getTimeline(userId) {
-  const following = await getFollowing(userId)
+For a normal user with 500 followers, the fanout worker writes 500 Redis `LPUSH` commands in a pipeline -- completing in < 50ms. For a celebrity with 50M followers, pushing would take 50M writes. At 100K writes/second, that is 8+ minutes per tweet. Instead, celebrity tweets are pulled at read time: when a user opens their timeline, the Timeline Service merges their cached timeline (pushed tweets) with the latest tweets from any celebrities they follow.
 
-  // Get recent tweets from all followed users
-  const tweets = await db.query(`
-    SELECT * FROM tweets
-    WHERE author_id = ANY($1)
-    ORDER BY created_at DESC
-    LIMIT 100
-  `, [following])
+**Fanout worker details:**
+- Consumer group of 50-100 worker instances
+- Each worker receives `tweet.created` events from Kafka
+- Checks if author is celebrity (via cached user metadata)
+- If not celebrity: fetches follower list, pipelines `LPUSH timeline:{followerId} tweetId` + `LTRIM` to cap at 800 entries
+- If celebrity: skips fanout, logs for monitoring
+- Circuit breaker protects against Redis overload; failed fanouts queue to a retry list
 
-  return tweets
-}
-```
+### 2. Timeline Service (Read Path)
 
-**Hybrid (Recommended)**:
-- Users with < 10K followers: Push (fanout on write)
-- Users with > 10K followers: Pull (merge at read time)
-- Timeline read: Merge cached timeline + pull from celebrities
+The Timeline Service assembles the home timeline for a given user. It is the most latency-sensitive path in the system.
 
-### 2. Social Graph
+**Read flow:**
+1. Client requests `GET /api/timeline/home`
+2. Timeline Service reads the user's cached tweet IDs from Redis (`LRANGE timeline:{userId} 0 99`)
+3. Fetches the followed celebrities list (cached in Redis or queried from Social Graph Service)
+4. Pulls latest 50 tweets from each celebrity from the Tweet Service (or directly from a per-celebrity Redis sorted set)
+5. Merges cached + celebrity tweets, deduplicates by tweet ID, sorts by `created_at` descending
+6. Hydrates tweet objects: fetches full tweet data, author info, engagement counts, and the requesting user's like/retweet status
+7. Returns paginated results with cursor for infinite scroll
 
-**Storage Options**:
+**Why materialized timelines in Redis:**
+- Timeline reads vastly outnumber writes (300:1 ratio)
+- Redis `LRANGE` on a pre-built list is O(1) amortized, versus building the timeline on every read from a follows+tweets join which would be O(following * tweets_per_user)
+- Redis lists with `LTRIM` naturally cap memory usage per user
+- 7-day TTL auto-expires timelines for inactive users, keeping memory bounded
 
-| Option | Pros | Cons |
-|--------|------|------|
-| PostgreSQL adjacency | Simple, transactional | Slow for deep queries |
-| Graph DB (Neo4j) | Fast traversals | Operational complexity |
-| Valkey Sets | Fast reads | Memory intensive |
+**Multi-layer caching:**
 
-**Chosen: PostgreSQL + Valkey Cache**
+| Layer | What | TTL | Hit Rate |
+|-------|------|-----|----------|
+| CDN edge | Static assets, profile images | 24h | ~95% |
+| Application cache (Redis) | Timeline lists, user metadata, follower sets | 7 days | ~90% |
+| Database cache (PgBouncer) | Connection pooling, prepared statement cache | Session | N/A |
 
-```sql
--- PostgreSQL for source of truth
-CREATE TABLE follows (
-  follower_id INTEGER REFERENCES users(id),
-  following_id INTEGER REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (follower_id, following_id)
-);
+### 3. Search (Elasticsearch)
 
-CREATE INDEX idx_follows_following ON follows(following_id);
-```
+Full-text search requires an inverted index, which PostgreSQL's GIN indexes can handle at small scale but not at 500M tweets/day.
 
-```javascript
-// Valkey for fast lookups
-// followers:123 = SET of user IDs who follow user 123
-// following:123 = SET of user IDs that user 123 follows
+**Search architecture:**
+- Tweet Service publishes `tweet.created` events to Kafka
+- Search indexer consumer writes to Elasticsearch with fields: `content`, `hashtags`, `author_username`, `created_at`, `engagement_score`
+- Hashtags are indexed as keywords (exact match), content uses a custom analyzer with stopword removal and stemming
+- Search queries fan out to multiple Elasticsearch shards in parallel, results merged by relevance score
+- Recent tweets are boosted (decay function on `created_at`) to prioritize fresh content
 
-await redis.sadd(`followers:${userId}`, followerId)
-await redis.sadd(`following:${followerId}`, userId)
-```
+**Hashtag indexing:**
+- Hashtags extracted at write time via regex (`/#\w+/g`)
+- Stored in the tweet's `hashtags` array column (PostgreSQL) and as keyword fields in Elasticsearch
+- Hashtag timeline queries (`/timeline/hashtag/:tag`) hit Elasticsearch for ranked results or PostgreSQL's GIN index for chronological results
 
-### 3. Trend Detection
+### 4. Trend Detection
 
-**Challenge**: Identify trending hashtags in real-time
+Trending topics must surface hashtags that are accelerating in usage, not just popular. A hashtag used 10K times/hour that was used 10K times last hour is not trending; one used 5K times this hour but only 100 last hour is.
 
-**Approach: Sliding Window with Decay**
+**Sliding window with exponential decay:**
+- Time is divided into 1-minute buckets
+- Each tweet increments `trend:{hashtag}:{bucket}` in Redis with `INCR` + `EXPIRE` (2-hour TTL)
+- Trend scoring: sum counts across the 60-minute window with exponential decay: `score = sum(count[i] * 0.95^i)` where `i` is the age in minutes
+- Trend velocity: `(current_hour_count - previous_hour_count) / previous_hour_count` -- rising velocity indicates emerging trends
 
-```javascript
-// Track hashtag counts in time buckets
-const BUCKET_SIZE = 60 // 1 minute
-const WINDOW_SIZE = 60 // 60 minutes
+**Count-Min Sketch (production optimization):**
+At production scale, tracking every hashtag as individual Redis keys is memory-expensive. A Count-Min Sketch provides approximate frequency counts in constant space. The sketch is maintained per time bucket and queried to filter hashtags above a minimum threshold before doing exact counting.
 
-async function recordHashtag(hashtag) {
-  const bucket = Math.floor(Date.now() / 1000 / BUCKET_SIZE)
-  const key = `trend:${hashtag}:${bucket}`
+**Trend worker:**
+- Runs every 60 seconds
+- Scans Redis for `trend:*:*` keys, calculates scores with decay
+- Stores top 50 trends in a `trending:current` sorted set (5-minute TTL for cache)
+- Cleans up expired buckets older than 2 hours
 
-  await redis.incr(key)
-  await redis.expire(key, WINDOW_SIZE * BUCKET_SIZE)
-}
+### 5. Kafka Event Processing
 
-async function getTrendScore(hashtag) {
-  const now = Math.floor(Date.now() / 1000 / BUCKET_SIZE)
-  let score = 0
+Kafka serves as the central nervous system, decoupling tweet creation from downstream effects.
 
-  for (let i = 0; i < WINDOW_SIZE; i++) {
-    const bucket = now - i
-    const count = await redis.get(`trend:${hashtag}:${bucket}`) || 0
-    // Recent buckets weighted more heavily
-    score += count * Math.pow(0.95, i)
-  }
+**Topics and consumers:**
 
-  return score
-}
-```
+| Topic | Producer | Consumers | Partitions |
+|-------|----------|-----------|------------|
+| `tweet.created` | Tweet Service | Fanout Workers, Trend Service, Search Indexer, Analytics | 64 (by author_id) |
+| `tweet.deleted` | Tweet Service | Fanout Workers (remove from caches), Search Indexer | 16 |
+| `follow.new` | Social Graph | Fanout Workers (backfill timeline), Notification | 32 |
+| `like.created` | Tweet Service | Notification, Analytics | 32 |
 
-**Trend Velocity**: Compare current hour vs previous hour
-```javascript
-function trendVelocity(currentCount, previousCount) {
-  if (previousCount === 0) return currentCount > 10 ? Infinity : 0
-  return (currentCount - previousCount) / previousCount
-}
-```
+**Partitioning by author_id** ensures all tweets from the same user are processed in order within a partition, preventing timeline ordering anomalies.
 
----
+**At-least-once delivery:** Kafka guarantees at-least-once delivery. Fanout operations are idempotent (LPUSH of the same tweet ID to a timeline list creates a duplicate, but deduplication at read time filters it). For non-idempotent operations (analytics counters), consumers use Kafka consumer offsets with manual commit after successful processing.
 
-## Database Schema
+### 6. Database Architecture
+
+**Sharding strategy:**
+- **Tweets**: Sharded by `tweet_id` (hash-based). This distributes write load evenly since tweet IDs are auto-incrementing. Timeline queries use the Redis cache (not the tweet shard directly), so cross-shard reads are limited to hydration.
+- **Users**: Sharded by `user_id`. Profile reads are single-shard lookups.
+- **Follows (Social Graph)**: Sharded by `follower_id`. This optimizes the common query "who does user X follow?" which drives timeline assembly. The reverse query "who follows user X?" requires a secondary index or a reverse-sharded replica.
+
+**Schema:**
 
 ```sql
--- Users
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
   username VARCHAR(50) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
   display_name VARCHAR(100),
   bio TEXT,
+  avatar_url TEXT,
   follower_count INTEGER DEFAULT 0,
   following_count INTEGER DEFAULT 0,
   tweet_count INTEGER DEFAULT 0,
-  is_celebrity BOOLEAN DEFAULT FALSE, -- > 10K followers
-  created_at TIMESTAMP DEFAULT NOW()
+  is_celebrity BOOLEAN DEFAULT FALSE,
+  role VARCHAR(20) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Tweets
 CREATE TABLE tweets (
   id BIGSERIAL PRIMARY KEY,
-  author_id INTEGER REFERENCES users(id),
+  author_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   content VARCHAR(280) NOT NULL,
   media_urls TEXT[],
   hashtags TEXT[],
-  mentions INTEGER[], -- User IDs mentioned
-  reply_to BIGINT REFERENCES tweets(id),
-  retweet_of BIGINT REFERENCES tweets(id),
+  mentions INTEGER[],
+  reply_to BIGINT REFERENCES tweets(id) ON DELETE SET NULL,
+  retweet_of BIGINT REFERENCES tweets(id) ON DELETE SET NULL,
+  quote_of BIGINT REFERENCES tweets(id) ON DELETE SET NULL,
   like_count INTEGER DEFAULT 0,
   retweet_count INTEGER DEFAULT 0,
   reply_count INTEGER DEFAULT 0,
+  is_deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMP DEFAULT NULL,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX idx_tweets_author ON tweets(author_id, created_at DESC);
 CREATE INDEX idx_tweets_hashtags ON tweets USING GIN(hashtags);
+CREATE INDEX idx_tweets_created_at ON tweets(created_at DESC);
+CREATE INDEX idx_tweets_reply_to ON tweets(reply_to) WHERE reply_to IS NOT NULL;
+CREATE INDEX idx_tweets_deleted ON tweets(deleted_at) WHERE deleted_at IS NOT NULL;
 
--- Follows
 CREATE TABLE follows (
-  follower_id INTEGER REFERENCES users(id),
-  following_id INTEGER REFERENCES users(id),
+  follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (follower_id, following_id)
 );
 
--- Likes
+CREATE INDEX idx_follows_following ON follows(following_id);
+
 CREATE TABLE likes (
-  user_id INTEGER REFERENCES users(id),
-  tweet_id BIGINT REFERENCES tweets(id),
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (user_id, tweet_id)
 );
+
+CREATE TABLE retweets (
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (user_id, tweet_id)
+);
+
+CREATE TABLE hashtag_activity (
+  id BIGSERIAL PRIMARY KEY,
+  hashtag VARCHAR(100) NOT NULL,
+  tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_hashtag_activity_hashtag ON hashtag_activity(hashtag, created_at DESC);
 ```
+
+**Denormalized counts via triggers:**
+Follower counts, tweet counts, like counts, and retweet counts are maintained by PostgreSQL triggers that fire on INSERT/DELETE to the respective tables. This avoids expensive `COUNT(*)` aggregations on every profile or tweet view. The `is_celebrity` flag is auto-set when `follower_count >= 10000`.
+
+### 7. Media Pipeline
+
+**Upload flow:**
+1. Client requests a pre-signed upload URL from the Media Service
+2. Client uploads directly to object storage (S3) -- bypasses API servers
+3. Client sends the media key to the Tweet Service when composing the tweet
+4. Media Service asynchronously transcodes images (thumbnails, WebP variants) and videos (HLS segments at multiple bitrates)
+5. CDN serves media from edge locations with long cache TTLs
+
+**Production considerations:**
+- Images: resize to 3 variants (thumb 150px, small 680px, large 1200px), convert to WebP
+- Videos: transcode to HLS with 3 quality levels (360p, 720p, 1080p), generate preview thumbnails
+- Content moderation: ML pipeline scans uploaded media for policy violations before the tweet becomes visible
+
+### 8. Rate Limiting and Abuse Detection
+
+**Rate limits (per user):**
+
+| Action | Limit | Window |
+|--------|-------|--------|
+| Tweet creation | 300 tweets | 3 hours |
+| Like/retweet | 1,000 actions | 24 hours |
+| Follow | 400 follows | 24 hours |
+| API reads | 900 requests | 15 minutes |
+
+**Implementation:** Token bucket algorithm in Redis. Each user has a key `ratelimit:{userId}:{action}` with an atomic `INCR` + `EXPIRE`. The API Gateway checks the counter before routing to backend services.
+
+**Abuse detection:**
+- Spam classifier on tweet content (ML model)
+- Velocity checks: accounts creating tweets faster than humanly possible
+- Bot detection: behavioral analysis (posting patterns, engagement ratios)
+- Content moderation: automated flagging + human review queue
 
 ---
 
 ## API Design
 
 ```
+# Authentication
+POST   /api/auth/register       - Create account
+POST   /api/auth/login          - Login, create session
+POST   /api/auth/logout         - Destroy session
+GET    /api/auth/me             - Current user profile
+
 # Tweets
-POST   /api/tweets              - Create tweet
+POST   /api/tweets              - Create tweet (with Idempotency-Key header)
 GET    /api/tweets/:id          - Get single tweet
-DELETE /api/tweets/:id          - Delete tweet
+DELETE /api/tweets/:id          - Soft-delete tweet
+
+# Engagement
+POST   /api/tweets/:id/like     - Like a tweet
+DELETE /api/tweets/:id/like     - Unlike a tweet
+POST   /api/tweets/:id/retweet  - Retweet
+DELETE /api/tweets/:id/retweet  - Undo retweet
+GET    /api/tweets/:id/replies  - List replies
 
 # Timeline
-GET    /api/timeline/home       - Home timeline
-GET    /api/timeline/user/:id   - User's tweets
+GET    /api/timeline/home       - Home timeline (hybrid fanout)
+GET    /api/timeline/user/:username - User's tweets
+GET    /api/timeline/explore    - Popular tweets (ranked by engagement)
+GET    /api/timeline/hashtag/:tag - Tweets with hashtag
 
 # Social
 POST   /api/users/:id/follow    - Follow user
 DELETE /api/users/:id/follow    - Unfollow user
 GET    /api/users/:id/followers - List followers
 GET    /api/users/:id/following - List following
-
-# Engagement
-POST   /api/tweets/:id/like     - Like tweet
-DELETE /api/tweets/:id/like     - Unlike tweet
-POST   /api/tweets/:id/retweet  - Retweet
+GET    /api/users/:username     - User profile
+GET    /api/users?q=term        - Search users
 
 # Trends
-GET    /api/trends              - Get trending topics
-GET    /api/trends/:location    - Location-based trends
+GET    /api/trends              - Current trending topics
+GET    /api/trends/all-time     - All-time popular hashtags
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. Hybrid Fanout
+### 1. Hybrid Fanout (Push for Normal Users, Pull for Celebrities)
 
-**Decision**: Push for normal users, pull for celebrities
+**Decision**: Push tweet IDs to follower timeline caches for users with < 10K followers; skip fanout for celebrities and pull their tweets at read time.
 
-**Rationale**:
-- Pure push: Celebrity tweets take too long (50M writes)
-- Pure pull: Normal timeline too slow (aggregate from 1000 users)
-- Hybrid: Best of both worlds
+**Why push fails for celebrities**: A user with 50M followers tweeting triggers 50M Redis writes. At 100K writes/second, that takes 8+ minutes. During that window, followers see a stale timeline, the fanout queue backs up, and subsequent tweets from other users are delayed. The entire system degrades because of one celebrity tweet.
 
-**Implementation**:
-- Flag users as `is_celebrity` when followers > 10K
-- Fanout workers skip celebrity tweets
-- Timeline service merges: cached + celebrity pulls
+**Why pull fails for normal users**: If we use pure pull, every timeline read must query tweets from all followed users. A user following 500 accounts requires 500 queries (or a massive IN clause), sorted and merged. At 1.7M timeline reads/second, this overwhelms the database.
 
-### 2. Valkey for Timelines
+**Hybrid trade-off**: The read path becomes more complex -- the Timeline Service must merge two data sources (cached list + celebrity pull). This merge adds ~10-20ms latency compared to a pure cache read. But the alternative (fanout storms or read-time aggregation) is unacceptable. The threshold (10K followers) is configurable and can be tuned based on observed fanout latency.
 
-**Decision**: Store timeline IDs in Valkey lists
+### 2. Kafka for Event Streaming
 
-**Rationale**:
-- O(1) push to front of list
-- O(1) retrieval of first N items
-- Automatic trimming (LTRIM)
-- Fast enough for real-time
+**Decision**: All mutations produce events to Kafka. Fanout, trending, notifications, and analytics consume from Kafka independently.
 
-**Trade-off**: If Valkey crashes, rebuild from database
+**Why not direct calls**: If the Tweet Service called the Fanout Service synchronously, a fanout failure would fail the tweet creation. The user would see an error even though the tweet was persisted. Kafka decouples the tweet write (which must succeed) from fanout (which can be retried).
 
-### 3. Kafka for Event Streaming
+**Why not RabbitMQ**: Kafka provides ordered, durable, replayable event logs. If a fanout worker crashes, it resumes from its last committed offset. RabbitMQ would require separate dead-letter handling and lacks replay capability. For a system processing 500M tweets/day across multiple consumer groups, Kafka's partitioned log model is a better fit.
 
-**Decision**: All mutations produce events to Kafka
+**Trade-off**: Kafka adds operational complexity (Zookeeper/KRaft, partition management, consumer group coordination). For a simpler system with lower throughput, RabbitMQ would be easier to operate.
 
-**Rationale**:
-- Decouples services (tweet service doesn't know about fanout)
-- Enables replay for debugging
-- Async processing for better latency
+### 3. Redis Lists for Timeline Cache
+
+**Decision**: Store tweet IDs (not full tweet objects) in Redis lists, capped at 800 entries with 7-day TTL.
+
+**Why IDs not objects**: Storing full tweet objects would consume ~10x more Redis memory. When a tweet's like count changes, we would need to update every timeline cache containing that tweet. With IDs, we hydrate at read time from a separate tweet cache, and engagement count updates are reflected automatically.
+
+**Why 800 entries**: Users rarely scroll past 100 tweets. 800 provides 4x buffer for power users and ensures the cache covers a few days of content for active followed accounts. At 8 bytes per tweet ID, 800 entries = 6.4 KB per user. For 200M active users, that is ~1.2 TB -- fits in a Redis cluster.
+
+**Trade-off**: If Redis is lost, timelines must be rebuilt from PostgreSQL. The `rebuildTimelineCache` function queries all followed non-celebrity users' tweets and reconstructs the list. This is slow (~5 seconds per user) but only needed after a Redis failure.
 
 ---
 
-## Scalability Considerations
+## Consistency and Idempotency
 
-### The Celebrity Problem
+**Idempotency for tweet creation**: The client generates a UUID and sends it as the `Idempotency-Key` header. The server checks Redis for the key before processing. If found, returns the cached response. If not found, processes the request and caches the response with a 24-hour TTL. This prevents duplicate tweets when the client retries after a network timeout.
 
-| User Type | Followers | Fanout Strategy |
-|-----------|-----------|-----------------|
-| Normal | < 10K | Push (cache on write) |
-| Influencer | 10K - 1M | Partial push + pull |
-| Celebrity | > 1M | Pull only |
+**Eventual consistency model**: A tweet may appear in some followers' timelines before others (fanout takes time). This is acceptable for a social feed. Users do not expect real-time consistency -- a few seconds of delay is imperceptible.
 
-### Sharding Strategy
-
-- **Tweets**: Shard by tweet_id (auto-increment)
-- **Users**: Shard by user_id
-- **Timeline**: Shard by user_id
-- **Follows**: Shard by follower_id
-
-### Caching Layers
-
-1. **CDN**: Profile images, media
-2. **Valkey**: Timelines, counters, trends
-3. **Local**: Parsed tweet cache
+**Engagement count consistency**: Like and retweet counts are maintained by PostgreSQL triggers (atomic). The counts shown on a tweet may differ slightly from the actual count if a concurrent update is in flight, but the database is the source of truth.
 
 ---
 
-## Trade-offs Summary
+## Observability
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Fanout | Hybrid push/pull | Pure push | Celebrity problem |
-| Timeline storage | Valkey lists | PostgreSQL | Speed of reads |
-| Graph storage | PostgreSQL + cache | Graph DB | Simplicity |
-| Events | Kafka | Direct calls | Decoupling |
+**Prometheus metrics exposed on `/metrics`:**
+- `twitter_tweets_created_total` (counter, by status: success/error)
+- `twitter_tweet_creation_duration_seconds` (histogram, by status)
+- `twitter_timeline_latency_seconds` (histogram, by timeline_type and cache_hit)
+- `twitter_fanout_operations_total` (counter, by status: success/error/skipped)
+- `twitter_fanout_duration_seconds` (histogram, by follower_count_bucket)
+- `twitter_fanout_queue_depth` (gauge)
+- `twitter_circuit_breaker_state` (gauge, by circuit_name: 0=closed, 1=half-open, 2=open)
+- `twitter_http_request_duration_seconds` (histogram, by method/route/status_code)
+- `twitter_idempotency_cache_hits_total` (counter)
+- `twitter_db_connection_pool_size` (gauge, by state: total/idle/waiting)
+- `twitter_redis_connection_status` (gauge)
 
----
+**Structured logging (Pino):**
+- JSON format for machine parsing (ELK/Datadog)
+- Request IDs for distributed tracing
+- Child loggers attach context (tweetId, userId, operation) throughout the request lifecycle
+- Log levels: debug (development), info (production), warn (degraded states), error (failures)
 
-## Local Multi-Instance Setup
-
-```bash
-# API Servers
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-
-# Fanout Workers
-npm run dev:fanout-worker
-
-# Trend Calculator
-npm run dev:trends
-
-# Infrastructure
-docker-compose up -d  # PostgreSQL, Valkey, Kafka
-```
+**Health check endpoints:**
+- `/live` -- liveness probe (is the process running?)
+- `/ready` -- readiness probe (can it serve traffic? checks PostgreSQL + Redis)
+- `/health` -- detailed status (all dependency checks, circuit breaker states, pool sizes, latencies)
 
 ---
 
 ## Failure Handling
 
-### Idempotency Keys
+### Circuit Breakers (Opossum)
 
-**Problem**: Network failures can cause duplicate requests (user clicks "Tweet" twice, or client retries after timeout).
+Circuit breakers protect the system when downstream dependencies fail.
 
-**Solution**: Idempotency keys for all write operations.
+**Redis fanout circuit breaker:**
+- Timeout: 30s (bulk operations are slow)
+- Error threshold: 60% failures before opening
+- Reset timeout: 60s before testing recovery
+- Fallback: queue failed fanouts to `fanout:retry_queue` in Redis for background processing
 
-```javascript
-// Client sends unique key with each request
-POST /api/tweets
-Headers: Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
-
-// Server tracks completed operations in Redis
-async function handleTweetCreate(req, res) {
-  const idempotencyKey = req.headers['idempotency-key']
-  const cacheKey = `idempotency:tweet:${req.user.id}:${idempotencyKey}`
-
-  // Check if we already processed this request
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return res.json(JSON.parse(cached)) // Return cached response
-  }
-
-  // Process the request
-  const tweet = await createTweet(req.body)
-
-  // Cache the result for 24 hours
-  await redis.setex(cacheKey, 86400, JSON.stringify(tweet))
-
-  return res.json(tweet)
-}
+**State transitions:**
+```
+CLOSED (normal) ──[60% failures]──▶ OPEN (fail fast)
+     ▲                                     │
+     │                                     ▼
+     └──[success after 60s]────── HALF_OPEN (testing)
 ```
 
-**Local Implementation**: Store idempotency keys in Redis with 24-hour TTL. For learning, focus on tweet creation and follow/unfollow operations.
+When the circuit is OPEN, tweet creation still succeeds (the tweet is persisted to PostgreSQL), but fanout is deferred. Users experience slightly delayed timeline updates rather than total failure.
 
 ### Retry Strategy
 
-**Exponential Backoff with Jitter**:
-```javascript
-const RETRY_CONFIG = {
-  maxAttempts: 3,
-  baseDelayMs: 100,
-  maxDelayMs: 5000,
-}
-
-async function withRetry(operation, context) {
-  for (let attempt = 1; attempt <= RETRY_CONFIG.maxAttempts; attempt++) {
-    try {
-      return await operation()
-    } catch (error) {
-      if (!isRetryable(error) || attempt === RETRY_CONFIG.maxAttempts) {
-        throw error
-      }
-
-      const delay = Math.min(
-        RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt - 1),
-        RETRY_CONFIG.maxDelayMs
-      )
-      const jitter = delay * 0.2 * Math.random()
-
-      console.log(`Retry ${attempt}/${RETRY_CONFIG.maxAttempts} for ${context} in ${delay + jitter}ms`)
-      await sleep(delay + jitter)
-    }
-  }
-}
-
-function isRetryable(error) {
-  // Retry on network errors, timeouts, 503s
-  // Do NOT retry on 4xx client errors
-  return error.code === 'ECONNRESET' ||
-         error.code === 'ETIMEDOUT' ||
-         error.status === 503
-}
-```
-
-### Circuit Breaker Pattern
-
-**Purpose**: Prevent cascading failures when a downstream service is unhealthy.
-
-```javascript
-class CircuitBreaker {
-  constructor(name, options = {}) {
-    this.name = name
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeoutMs = options.resetTimeoutMs || 30000
-    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
-    this.failures = 0
-    this.lastFailureTime = null
-  }
-
-  async call(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = 'HALF_OPEN'
-      } else {
-        throw new Error(`Circuit breaker ${this.name} is OPEN`)
-      }
-    }
-
-    try {
-      const result = await operation()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  onSuccess() {
-    this.failures = 0
-    this.state = 'CLOSED'
-  }
-
-  onFailure() {
-    this.failures++
-    this.lastFailureTime = Date.now()
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN'
-      console.error(`Circuit breaker ${this.name} tripped to OPEN`)
-    }
-  }
-}
-
-// Usage for fanout service
-const fanoutCircuit = new CircuitBreaker('fanout-service', {
-  failureThreshold: 5,
-  resetTimeoutMs: 30000,
-})
-
-async function fanoutWithProtection(tweetId, authorId) {
-  return fanoutCircuit.call(() => fanoutTweet(tweetId, authorId))
-}
-```
-
-**Local Circuit Breakers**:
-| Service | Failure Threshold | Reset Timeout | Fallback Behavior |
-|---------|-------------------|---------------|-------------------|
-| Redis timeline | 5 failures | 30s | Serve from PostgreSQL |
-| Trend service | 3 failures | 60s | Return cached/empty trends |
-| Fanout worker | 5 failures | 30s | Queue for retry |
+Exponential backoff with jitter for transient failures:
+- Max 3 attempts
+- Base delay: 100ms, max delay: 5s
+- Jitter: 20% randomization to prevent thundering herd
+- Only retry on retryable errors (network timeouts, 503s), never on 4xx
 
 ### Graceful Degradation
 
-When services fail, the system should degrade gracefully:
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Redis down | No cached timelines | Fall back to PostgreSQL timeline query (slower) |
+| Kafka down | No async fanout | Tweet creation still succeeds; fanout queued in Redis for later |
+| Elasticsearch down | No search | Return empty results; hashtag timeline falls back to PostgreSQL GIN index |
+| Trend service down | No trending topics | Return stale trends from cache or empty list |
 
-1. **Redis down**: Fall back to PostgreSQL for timeline queries (slower but works)
-2. **Kafka down**: Queue tweets in Redis list, process when Kafka recovers
-3. **Trend service down**: Return stale trends from cache or empty list
+### Data Retention
 
-```javascript
-async function getHomeTimeline(userId) {
-  try {
-    // Primary: Redis timeline cache
-    return await getTimelineFromRedis(userId)
-  } catch (redisError) {
-    console.warn('Redis unavailable, falling back to PostgreSQL', redisError)
-
-    // Fallback: Direct database query
-    return await getTimelineFromDatabase(userId)
-  }
-}
-```
-
-### Backup and Restore (Local Development)
-
-**PostgreSQL Backup Script** (`scripts/backup.sh`):
-```bash
-#!/bin/bash
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="./backups"
-
-mkdir -p $BACKUP_DIR
-
-# Dump PostgreSQL
-pg_dump -h localhost -U twitter -d twitter_dev \
-  --format=custom \
-  --file="${BACKUP_DIR}/twitter_${TIMESTAMP}.dump"
-
-# Keep last 7 backups
-ls -t ${BACKUP_DIR}/*.dump | tail -n +8 | xargs -r rm
-
-echo "Backup created: ${BACKUP_DIR}/twitter_${TIMESTAMP}.dump"
-```
-
-**Restore Script** (`scripts/restore.sh`):
-```bash
-#!/bin/bash
-BACKUP_FILE=$1
-
-if [ -z "$BACKUP_FILE" ]; then
-  echo "Usage: ./restore.sh <backup_file>"
-  exit 1
-fi
-
-# Restore PostgreSQL
-pg_restore -h localhost -U twitter -d twitter_dev \
-  --clean --if-exists \
-  "$BACKUP_FILE"
-
-echo "Restored from: $BACKUP_FILE"
-```
-
-**Testing Backups** (add to weekly dev routine):
-```bash
-# 1. Create backup
-./scripts/backup.sh
-
-# 2. Create test database
-createdb twitter_restore_test
-
-# 3. Restore to test database
-pg_restore -h localhost -U twitter -d twitter_restore_test backups/latest.dump
-
-# 4. Verify row counts
-psql -d twitter_restore_test -c "SELECT 'users', count(*) FROM users UNION ALL SELECT 'tweets', count(*) FROM tweets"
-
-# 5. Cleanup
-dropdb twitter_restore_test
-```
+| Data Type | Hot Storage | TTL | Rationale |
+|-----------|-------------|-----|-----------|
+| Active tweets | PostgreSQL | Forever | Core user content |
+| Soft-deleted tweets | PostgreSQL | 30 days | Allow recovery, then hard delete |
+| Timeline cache | Redis | 7 days | Users rarely scroll beyond a week |
+| Trend buckets | Redis | 2 hours | Trends are about recency |
+| Idempotency keys | Redis | 24 hours | Protect against same-day retries |
+| Sessions | Redis | 7 days | Auto-expire inactive sessions |
 
 ---
 
-## Data Lifecycle Policies
+## Scalability Considerations
 
-### Retention and TTL Configuration
+### What Breaks First
 
-| Data Type | Hot Storage | TTL | Archive Strategy |
-|-----------|-------------|-----|------------------|
-| Tweets | PostgreSQL | Forever (soft delete) | None for learning |
-| Timeline cache | Redis | 7 days | Auto-expires |
-| Trend buckets | Redis | 2 hours | Auto-expires |
-| Idempotency keys | Redis | 24 hours | Auto-expires |
-| Session data | Redis | 7 days | Auto-expires |
-| Deleted tweets | PostgreSQL | 30 days | Hard delete via cron |
+1. **Timeline read path** -- at 1.7M reads/second, Redis becomes the bottleneck. Solution: Redis Cluster with read replicas, shard timelines across nodes by `userId % num_shards`.
+2. **Fanout workers** -- celebrity follows compound write amplification. Solution: increase Kafka partitions and worker count; raise the celebrity threshold dynamically.
+3. **PostgreSQL writes** -- 5,800 tweet inserts/second on a single database. Solution: shard by `tweet_id`, use PgBouncer for connection pooling, batch inserts.
+4. **Social graph queries** -- "who follows user X?" on a billion-row follows table. Solution: shard by `follower_id`, maintain a reverse-indexed replica for follower lookups.
 
-**Redis TTL Configuration**:
-```javascript
-// Timeline entries: 7 days
-await redis.lpush(`timeline:${userId}`, tweetId)
-await redis.expire(`timeline:${userId}`, 7 * 24 * 60 * 60)
+### Horizontal Scaling Path
 
-// Trend buckets: 2 hours (auto-expire after window closes)
-await redis.incr(`trend:${hashtag}:${bucket}`)
-await redis.expire(`trend:${hashtag}:${bucket}`, 2 * 60 * 60)
-
-// Session: 7 days
-await redis.setex(`session:${sessionId}`, 7 * 24 * 60 * 60, userData)
-```
-
-### Soft Delete Pattern
-
-Tweets use soft delete to preserve timeline integrity:
-
-```sql
--- Soft delete column
-ALTER TABLE tweets ADD COLUMN deleted_at TIMESTAMP DEFAULT NULL;
-CREATE INDEX idx_tweets_deleted ON tweets(deleted_at) WHERE deleted_at IS NOT NULL;
-
--- Soft delete operation
-UPDATE tweets SET deleted_at = NOW() WHERE id = $1;
-
--- Query excludes deleted tweets
-SELECT * FROM tweets WHERE author_id = $1 AND deleted_at IS NULL;
-```
-
-**Hard Delete Cleanup Job** (run weekly):
-```sql
--- Delete tweets soft-deleted more than 30 days ago
-DELETE FROM likes WHERE tweet_id IN (
-  SELECT id FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days'
-);
-
-DELETE FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days';
-
--- Log count for monitoring
-SELECT 'Cleaned up', count(*) FROM tweets WHERE deleted_at < NOW() - INTERVAL '30 days';
-```
-
-### Archival to Cold Storage (Production Concept)
-
-For learning purposes, understand the pattern even if not implemented locally:
-
-```javascript
-// Conceptual: Archive old tweets to S3/MinIO
-async function archiveOldTweets(olderThanDays = 365) {
-  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
-
-  // 1. Export to JSONL file
-  const oldTweets = await db.query(`
-    SELECT * FROM tweets
-    WHERE created_at < $1
-    ORDER BY created_at
-  `, [cutoff])
-
-  const filename = `tweets_archive_${cutoff.toISOString().split('T')[0]}.jsonl`
-  await writeToMinIO('archives', filename, oldTweets.map(JSON.stringify).join('\n'))
-
-  // 2. Replace with tombstone reference
-  await db.query(`
-    UPDATE tweets
-    SET content = '[ARCHIVED]',
-        media_urls = NULL,
-        archived_at = NOW(),
-        archive_location = $2
-    WHERE created_at < $1
-  `, [cutoff, `s3://archives/${filename}`])
-}
-```
-
-### Backfill and Replay Procedures
-
-**Timeline Cache Rebuild** (if Redis data is lost):
-```javascript
-async function rebuildTimelineCache(userId) {
-  console.log(`Rebuilding timeline cache for user ${userId}`)
-
-  // 1. Get users this person follows (excluding celebrities)
-  const following = await db.query(`
-    SELECT f.following_id, u.is_celebrity
-    FROM follows f
-    JOIN users u ON f.following_id = u.id
-    WHERE f.follower_id = $1 AND u.is_celebrity = FALSE
-  `, [userId])
-
-  // 2. Get recent tweets from followed users
-  const followingIds = following.rows.map(r => r.following_id)
-  const tweets = await db.query(`
-    SELECT id FROM tweets
-    WHERE author_id = ANY($1)
-      AND deleted_at IS NULL
-    ORDER BY created_at DESC
-    LIMIT 800
-  `, [followingIds])
-
-  // 3. Rebuild Redis list
-  const tweetIds = tweets.rows.map(t => t.id)
-  if (tweetIds.length > 0) {
-    await redis.del(`timeline:${userId}`)
-    await redis.rpush(`timeline:${userId}`, ...tweetIds)
-    await redis.expire(`timeline:${userId}`, 7 * 24 * 60 * 60)
-  }
-
-  console.log(`Rebuilt timeline for user ${userId} with ${tweetIds.length} tweets`)
-}
-
-// Rebuild all timelines (run after Redis recovery)
-async function rebuildAllTimelines() {
-  const users = await db.query('SELECT id FROM users')
-  for (const user of users.rows) {
-    await rebuildTimelineCache(user.id)
-  }
-}
-```
-
-**Kafka Event Replay** (conceptual):
-```javascript
-// Replay events from a specific offset to reprocess
-async function replayEvents(topic, fromOffset, toOffset) {
-  const consumer = kafka.consumer({ groupId: 'replay-consumer' })
-  await consumer.connect()
-
-  await consumer.subscribe({ topic, fromBeginning: false })
-  consumer.seek({ topic, partition: 0, offset: fromOffset })
-
-  await consumer.run({
-    eachMessage: async ({ message, offset }) => {
-      if (parseInt(offset) > toOffset) {
-        await consumer.disconnect()
-        return
-      }
-
-      const event = JSON.parse(message.value)
-      await processEvent(event) // Same handler as normal processing
-    }
-  })
-}
-```
+- **API servers**: Stateless, scale horizontally behind load balancer
+- **Fanout workers**: Scale by adding Kafka consumer instances (up to partition count)
+- **Redis**: Redis Cluster with automatic resharding
+- **PostgreSQL**: Vitess or Citus for transparent sharding
+- **Elasticsearch**: Add data nodes and increase shard count per index
 
 ---
 
-## Deployment and Operations
+## Trade-offs Summary
 
-### Rollout Strategy
-
-**Blue-Green Deployment (Local Simulation)**:
-```bash
-# Run two versions simultaneously on different ports
-# Blue (current): Ports 3001, 3002
-# Green (new): Ports 3003, 3004
-
-# 1. Start green instances
-PORT=3003 npm run start &
-PORT=3004 npm run start &
-
-# 2. Run smoke tests against green
-curl -f http://localhost:3003/health
-curl -f http://localhost:3003/api/timeline/home -H "Cookie: session=..."
-
-# 3. Update load balancer to point to green
-# (In nginx.conf, change upstream servers)
-
-# 4. Drain and stop blue instances
-kill $(lsof -ti:3001)
-kill $(lsof -ti:3002)
-```
-
-**Canary Releases** (conceptual):
-```nginx
-# nginx.conf - Route 10% of traffic to canary
-upstream api_servers {
-    server localhost:3001 weight=45;
-    server localhost:3002 weight=45;
-    server localhost:3003 weight=10;  # Canary
-}
-```
-
-**Feature Flags**:
-```javascript
-// Simple feature flag check
-const FEATURES = {
-  NEW_TREND_ALGORITHM: process.env.FF_NEW_TREND_ALGO === 'true',
-  ASYNC_FANOUT: process.env.FF_ASYNC_FANOUT === 'true',
-}
-
-async function getTrends() {
-  if (FEATURES.NEW_TREND_ALGORITHM) {
-    return getNewTrends()  // New implementation
-  }
-  return getLegacyTrends()  // Safe fallback
-}
-```
-
-### Schema Migrations
-
-**Migration File Structure** (`backend/src/db/migrations/`):
-```
-001_initial_schema.sql
-002_add_is_celebrity.sql
-003_add_deleted_at.sql
-004_add_trend_indexes.sql
-```
-
-**Migration Runner** (`backend/src/db/migrate.js`):
-```javascript
-const fs = require('fs')
-const path = require('path')
-const pool = require('./pool')
-
-async function migrate() {
-  // Create migrations tracking table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version VARCHAR(50) PRIMARY KEY,
-      applied_at TIMESTAMP DEFAULT NOW()
-    )
-  `)
-
-  // Get applied migrations
-  const { rows: applied } = await pool.query(
-    'SELECT version FROM schema_migrations ORDER BY version'
-  )
-  const appliedVersions = new Set(applied.map(r => r.version))
-
-  // Get pending migrations
-  const migrationsDir = path.join(__dirname, 'migrations')
-  const files = fs.readdirSync(migrationsDir).sort()
-
-  for (const file of files) {
-    const version = file.replace('.sql', '')
-    if (appliedVersions.has(version)) continue
-
-    console.log(`Applying migration: ${file}`)
-
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8')
-
-    await pool.query('BEGIN')
-    try {
-      await pool.query(sql)
-      await pool.query(
-        'INSERT INTO schema_migrations (version) VALUES ($1)',
-        [version]
-      )
-      await pool.query('COMMIT')
-      console.log(`Applied: ${file}`)
-    } catch (error) {
-      await pool.query('ROLLBACK')
-      console.error(`Failed: ${file}`, error)
-      throw error
-    }
-  }
-
-  console.log('All migrations applied')
-}
-
-migrate().catch(console.error).finally(() => pool.end())
-```
-
-**Safe Migration Practices**:
-```sql
--- 003_add_deleted_at.sql
-
--- Always use IF NOT EXISTS for additive changes
-ALTER TABLE tweets ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP DEFAULT NULL;
-
--- Create indexes CONCURRENTLY to avoid locking (PostgreSQL)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tweets_deleted
-  ON tweets(deleted_at) WHERE deleted_at IS NOT NULL;
-
--- For column renames, use a multi-step process:
--- Step 1: Add new column
--- Step 2: Backfill data
--- Step 3: Update application to use new column
--- Step 4: Drop old column (in next release)
-```
-
-### Rollback Runbooks
-
-**Scenario 1: Bad Application Deploy**
-```bash
-# Symptoms: 5xx errors spike, latency increase
-
-# 1. Check recent deployments
-git log --oneline -5
-
-# 2. Identify the bad commit
-# Look for correlation between deploy time and error spike
-
-# 3. Revert to previous version
-git revert HEAD
-npm run build
-npm run start
-
-# OR restore from known-good tag
-git checkout v1.2.3
-npm run build
-npm run start
-
-# 4. Notify team and investigate root cause
-```
-
-**Scenario 2: Bad Database Migration**
-```bash
-# Symptoms: Application errors referencing schema
-
-# 1. Identify the failing migration
-psql -c "SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5"
-
-# 2. Check migration file for DOWN script
-cat backend/src/db/migrations/003_add_deleted_at.sql
-
-# 3. Apply rollback SQL manually
-psql -f backend/src/db/migrations/003_add_deleted_at.down.sql
-
-# 4. Remove from migrations table
-psql -c "DELETE FROM schema_migrations WHERE version = '003_add_deleted_at'"
-
-# 5. Fix migration and reapply
-npm run db:migrate
-```
-
-**Scenario 3: Redis Data Corruption**
-```bash
-# Symptoms: Timeline showing wrong tweets, trends broken
-
-# 1. Identify scope of corruption
-redis-cli KEYS "timeline:*" | wc -l
-redis-cli KEYS "trend:*" | wc -l
-
-# 2. Option A: Clear and rebuild specific keys
-redis-cli DEL timeline:123
-node -e "require('./src/db/rebuild').rebuildTimelineCache(123)"
-
-# 3. Option B: Full Redis flush and rebuild
-redis-cli FLUSHDB
-npm run rebuild:timelines
-npm run rebuild:trends
-
-# 4. Verify rebuild completed
-redis-cli KEYS "timeline:*" | wc -l
-```
-
-**Scenario 4: Kafka Consumer Lag**
-```bash
-# Symptoms: Fanout delayed, tweets not appearing in timelines
-
-# 1. Check consumer lag
-kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-  --describe --group fanout-workers
-
-# 2. If lag is high, scale up consumers temporarily
-PORT=3005 npm run dev:fanout-worker &
-PORT=3006 npm run dev:fanout-worker &
-
-# 3. Monitor until lag clears
-watch -n 5 'kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-  --describe --group fanout-workers'
-
-# 4. Scale back down once caught up
-```
-
-### Health Check Endpoints
-
-```javascript
-// Comprehensive health check for monitoring
-app.get('/health', async (req, res) => {
-  const checks = {
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    services: {}
-  }
-
-  // PostgreSQL check
-  try {
-    await pool.query('SELECT 1')
-    checks.services.postgres = { status: 'ok' }
-  } catch (error) {
-    checks.services.postgres = { status: 'error', message: error.message }
-    checks.status = 'degraded'
-  }
-
-  // Redis check
-  try {
-    await redis.ping()
-    checks.services.redis = { status: 'ok' }
-  } catch (error) {
-    checks.services.redis = { status: 'error', message: error.message }
-    checks.status = 'degraded'
-  }
-
-  // Kafka check (if applicable)
-  try {
-    const admin = kafka.admin()
-    await admin.connect()
-    await admin.listTopics()
-    await admin.disconnect()
-    checks.services.kafka = { status: 'ok' }
-  } catch (error) {
-    checks.services.kafka = { status: 'error', message: error.message }
-    checks.status = 'degraded'
-  }
-
-  const statusCode = checks.status === 'ok' ? 200 : 503
-  res.status(statusCode).json(checks)
-})
-
-// Readiness probe (for load balancer)
-app.get('/ready', async (req, res) => {
-  try {
-    await pool.query('SELECT 1')
-    await redis.ping()
-    res.status(200).send('ready')
-  } catch (error) {
-    res.status(503).send('not ready')
-  }
-})
-
-// Liveness probe (for process manager)
-app.get('/live', (req, res) => {
-  res.status(200).send('alive')
-})
-```
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Fanout strategy | Hybrid push/pull | Pure push | Celebrity problem: 50M writes per tweet |
+| Timeline storage | Redis lists (IDs only) | PostgreSQL materialized views | O(1) reads, bounded memory |
+| Event streaming | Kafka | RabbitMQ | Ordered replay, multiple consumer groups |
+| Graph storage | PostgreSQL + Redis cache | Neo4j | Simpler operations, sufficient for 2-hop queries |
+| Search | Elasticsearch | PostgreSQL FTS | Better relevance scoring, horizontal scaling |
+| Trend detection | Sliding window + decay | Batch MapReduce | Real-time detection, sub-minute latency |
+| Auth | Session + Redis | JWT | Immediate revocation, simpler |
+| Counts | Database triggers | Application-level updates | Atomic, consistent, no race conditions |
 
 ---
 
-## Implementation Notes
+# Layer 2: Pocket-Size Architecture (What We Actually Built)
 
-This section explains the reasoning behind key implementation decisions in the codebase.
-
-### Why Idempotency Prevents Duplicate Tweets on Retry
-
-**The Problem**: Network failures are inevitable. When a user clicks "Tweet" and experiences a timeout:
-- Did the server receive and process the request?
-- Did the server crash before persisting the tweet?
-- Did the response get lost on the way back?
-
-The user doesn't know, so they click "Tweet" again. Without idempotency, this creates duplicate tweets.
-
-**The Solution**: The client generates a unique idempotency key (UUID) and sends it with the request:
-
-```javascript
-// Client sends:
-POST /api/tweets
-Headers: Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
-Body: { content: "Hello world!" }
-```
-
-The server workflow:
-1. Check Redis for the idempotency key
-2. If found: return the cached response (request already processed)
-3. If not found: process the request, cache the response with 24-hour TTL
-
-**Why This Works**:
-- **Same key = same outcome**: Retries with the same key are idempotent
-- **User context isolation**: Keys are scoped to user ID, preventing cross-user conflicts
-- **TTL-based cleanup**: 24-hour TTL balances storage vs protection window
-- **Graceful degradation**: On Redis failure, we allow potential duplicates rather than blocking all requests
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/idempotency.js`
-
-### Why Circuit Breakers Protect the Timeline Service During Fanout Storms
-
-**The Problem**: When a popular user tweets, the fanout service must write to potentially millions of follower timelines. If Redis becomes slow or unresponsive:
-- Fanout operations queue up, consuming memory
-- Request threads block, reducing capacity for other requests
-- Timeouts cascade, causing user-facing latency spikes
-- Retry storms amplify the load when Redis partially recovers
-
-**The Solution**: Circuit breakers act like electrical fuses:
+## Local Architecture
 
 ```
-CLOSED (normal) --[failures exceed threshold]--> OPEN (fail fast)
-     ^                                              |
-     |                                              v
-     +--[success after reset timeout]------ HALF_OPEN (testing)
+┌──────────────────────────────────────────────────┐
+│            Frontend (React + Vite)                │
+│            http://localhost:5173                   │
+│                                                    │
+│  TanStack Router, Zustand, TanStack Virtual,      │
+│  Tailwind CSS (Twitter brand colors)              │
+└──────────────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────┐
+│         Backend (Express + TypeScript)             │
+│         http://localhost:3000                      │
+│                                                    │
+│  Single monolith with route modules:              │
+│  /api/auth, /api/tweets, /api/timeline,           │
+│  /api/users, /api/trends                          │
+│                                                    │
+│  Middleware: session auth, Pino logging,           │
+│  Prometheus metrics, idempotency                  │
+│                                                    │
+│  Endpoints: /health, /ready, /live, /metrics      │
+└──────────────────────────────────────────────────┘
+          │                │              │
+          ▼                ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  PostgreSQL  │ │ Valkey/Redis │ │    Kafka     │
+│  :5432       │ │ :6379        │ │ :9092        │
+│              │ │              │ │              │
+│ twitter_db   │ │ Timelines,   │ │ tweets,      │
+│ All tables   │ │ sessions,    │ │ likes        │
+│ + triggers   │ │ trends,      │ │ topics       │
+│              │ │ social graph │ │              │
+│              │ │ cache        │ │ + Zookeeper  │
+│              │ │              │ │   :2181      │
+└──────────────┘ └──────────────┘ └──────────────┘
+
+┌──────────────────────────────────────────────────┐
+│              Background Workers                    │
+│                                                    │
+│  Fanout Worker (npm run dev:fanout-worker)         │
+│  - Consumes tweet.created from Kafka               │
+│  - Calls fanoutTweet() to push to Redis caches     │
+│                                                    │
+│  Trending Worker (npm run dev:trending-worker)     │
+│  - Runs every 60s on a timer                       │
+│  - Scans Redis trend buckets, calculates scores    │
+│  - Updates trending:current sorted set             │
+└──────────────────────────────────────────────────┘
 ```
 
-When the circuit is OPEN:
-- Requests fail immediately without waiting for timeout
-- Failed fanouts are queued for later retry
-- System resources are preserved for healthy paths
-- Users still get their tweets created (fanout happens async)
+## What Actually Exists
 
-**Why This Works**:
-- **Fail fast**: OPEN circuit returns immediately, freeing resources
-- **Graceful degradation**: Tweet creation succeeds; fanout catches up later
-- **Automatic recovery**: HALF_OPEN state tests if service recovered
-- **Fallback behavior**: Failed fanouts queue in Redis for background processing
+### Backend (`backend/src/`)
 
-**Configuration**:
-```javascript
-// Fanout circuit breaker settings
-{
-  timeout: 30000,           // 30 second timeout for bulk operations
-  errorThresholdPercentage: 60,  // Trip after 60% failures
-  resetTimeout: 60000,      // Try again after 1 minute
-  volumeThreshold: 5,       // Minimum requests before tripping
-}
+The backend is a **single Express monolith** (not microservices), organized into route modules. All routes share the same PostgreSQL pool, Redis connection, and session store.
+
+**Route modules:**
+- `routes/auth.ts` -- Register, login, logout, current user (bcrypt password hashing, Redis session store)
+- `routes/tweets.ts` -- Create, read, delete tweets; like/unlike; retweet/unretweet; list replies. Tweet creation includes idempotency middleware and fires both synchronous fanout (`fanoutTweet()`) and async Kafka publish
+- `routes/timeline.ts` -- Home timeline (hybrid fanout: reads from Redis cache + pulls celebrity tweets), user timeline, explore (ranked by engagement), hashtag timeline
+- `routes/users.ts` -- Profile lookup, follow/unfollow, follower/following lists, user search (ILIKE query)
+- `routes/trends.ts` -- Current trending hashtags (exponential decay scoring), all-time popular hashtags
+
+**Services:**
+- `services/fanout.ts` -- Full hybrid fanout implementation: checks `is_celebrity` flag, pipelines `LPUSH`/`LTRIM`/`EXPIRE` to follower timeline caches, circuit breaker wrapping Redis operations, fallback to retry queue, timeline rebuild function
+
+**Shared modules (all fully implemented):**
+- `shared/kafka.ts` -- KafkaJS producer/consumer with `tweets` and `likes` topics, auto-reconnect, health check
+- `shared/circuitBreaker.ts` -- Opossum-based circuit breaker factory with Prometheus metrics integration (state gauge, trip counter), pre-configured options for Redis, fanout, and database
+- `shared/idempotency.ts` -- Middleware that checks `Idempotency-Key` header against Redis, caches successful responses with 24h TTL, degrades gracefully on Redis failure
+- `shared/metrics.ts` -- 15+ Prometheus metrics (tweet counters, timeline latency histograms, fanout gauges, circuit breaker state, HTTP duration, idempotency hit/miss, DB pool size)
+- `shared/logger.ts` -- Pino structured logging with child loggers, request ID tracking
+- `shared/retry.ts` -- Exponential backoff with jitter, configurable max attempts
+- `shared/retention.ts` -- Retention policy configuration, cleanup SQL queries, Redis TTL enforcement
+
+**Workers (separate processes):**
+- `workers/fanout-worker.ts` -- Kafka consumer that listens for `tweet.created` events and calls `fanoutTweet()`
+- `workers/trending-worker.ts` -- Timer-based worker (every 60s) that scans Redis trend buckets, calculates scores with exponential decay, updates `trending:current` sorted set, cleans up expired buckets
+
+**Database:**
+- `db/init.sql` -- Full schema with 6 tables (users, tweets, follows, likes, retweets, hashtag_activity), 15 indexes, and 5 trigger functions for count denormalization
+- `db/pool.ts` -- PostgreSQL connection pool (pg)
+- `db/redis.ts` -- ioredis connection
+- `db/seed.ts` -- Demo data seeder
+
+### Frontend (`frontend/src/`)
+
+React 19 + TypeScript + Vite with TanStack Router (file-based routing) and Zustand for state management.
+
+**Routes:**
+- `/login`, `/register` -- Auth pages
+- `/` (index) -- Home timeline with compose tweet box
+- `/explore` -- Popular tweets ranked by engagement
+- `/$username` -- User profile with their tweets
+- `/hashtag/$tag` -- Hashtag timeline
+
+**Components:**
+- `Timeline.tsx` -- Virtualized tweet list using `@tanstack/react-virtual` (estimateSize: 150px, overscan: 5, dynamic height measurement), infinite scroll with scroll position detection
+- `Tweet.tsx` -- Tweet card with author info, content, engagement counters, like/retweet actions
+- `ComposeTweet.tsx` -- Tweet composition form
+- `TrendingSidebar.tsx` -- Displays trending hashtags from `/api/trends`
+- `Sidebar.tsx` -- Navigation sidebar
+- `Layout.tsx` -- Three-column layout (sidebar, main content, trending)
+
+**Styling:** Tailwind CSS with Twitter brand colors configured (`twitter-blue: #1DA1F2`, `twitter-like: #F91880`, `twitter-retweet: #00BA7C`).
+
+### Infrastructure (docker-compose.yml)
+
+Three services:
+- **PostgreSQL 16** (Alpine) -- port 5432, user `twitter`, password `twitter_secret`, database `twitter_db`
+- **Valkey 7** (Alpine) -- port 6379, AOF persistence
+- **Kafka** (Confluent 7.5.0) -- port 9092, with Zookeeper on 2181
+
+## Production-Grade Patterns Actually Implemented
+
+| Pattern | Library | What It Does | File |
+|---------|---------|-------------|------|
+| Circuit breaker | Opossum | Wraps Redis fanout with CLOSED/OPEN/HALF_OPEN states; falls back to retry queue | `src/shared/circuitBreaker.ts`, `src/services/fanout.ts` |
+| Structured logging | Pino | JSON logs with request IDs, child loggers for context | `src/shared/logger.ts` |
+| Prometheus metrics | prom-client | 15+ custom metrics + default Node.js metrics, `/metrics` endpoint | `src/shared/metrics.ts` |
+| Idempotency | Custom + Redis | Prevents duplicate tweets on retry via `Idempotency-Key` header | `src/shared/idempotency.ts` |
+| Retry with backoff | Custom | Exponential backoff + jitter for transient failures | `src/shared/retry.ts` |
+| Health checks | Custom | Three-tier: `/live`, `/ready`, `/health` with dependency checks | `src/app.ts` |
+| Graceful shutdown | Custom | SIGTERM/SIGINT handlers drain connections before exit | `src/index.ts` |
+| Retention policies | Custom | Configurable TTLs, cleanup SQL, archival config | `src/shared/retention.ts` |
+| Event streaming | KafkaJS | Producer publishes tweets/likes, consumer drives fanout | `src/shared/kafka.ts` |
+| Hybrid fanout | Custom | Push for normal users, skip for celebrities, Redis pipeline | `src/services/fanout.ts` |
+| Trend detection | Custom | Sliding window with exponential decay, periodic recalculation | `src/workers/trending-worker.ts` |
+| List virtualization | @tanstack/react-virtual | Only renders visible tweets in viewport | `frontend/src/components/Timeline.tsx` |
+| Count denormalization | PostgreSQL triggers | Automatic follower/tweet/like/retweet count updates | `src/db/init.sql` |
+
+## What Was Simplified
+
+| Production Design | Local Implementation |
+|-------------------|---------------------|
+| Microservices (Tweet, Timeline, Social Graph, Trend, Media) | Single Express monolith with route modules |
+| Sharded PostgreSQL (Vitess/Citus) | Single PostgreSQL instance |
+| Redis Cluster with read replicas | Single Valkey instance |
+| CDN for media delivery | No media handling (media_urls stored but not served) |
+| Elasticsearch for search | PostgreSQL `ILIKE` for user search, GIN index for hashtag search |
+| ML-based spam/content moderation | No content moderation |
+| OAuth 2.0 / JWT with token refresh | Session-based auth with Redis store |
+| API Gateway (rate limiting, auth) | CORS middleware, inline auth checks |
+| Multi-region deployment | Single-machine Docker Compose |
+| Count-Min Sketch for trends | Individual Redis keys per hashtag per time bucket |
+
+## What Was Omitted
+
+- **CDN** -- no static asset or media edge caching
+- **Media upload/transcoding pipeline** -- media_urls field exists but no upload endpoint
+- **Elasticsearch** -- no full-text tweet search
+- **Notification service** -- no SSE/WebSocket push notifications
+- **Rate limiting** -- no token bucket or sliding window rate limiter
+- **Multi-region / geo-routing** -- single-machine deployment
+- **Kubernetes / container orchestration** -- Docker Compose only
+- **Algorithmic timeline ranking** -- chronological only (explore uses engagement sort)
+- **Protected/private accounts** -- all accounts are public
+- **DM / direct messaging** -- not implemented
+- **Analytics pipeline** -- Kafka events published but no ClickHouse analytics consumer
+
+## Local Multi-Instance Setup
+
+```bash
+# Infrastructure
+docker-compose up -d  # PostgreSQL, Valkey, Kafka + Zookeeper
+
+# API Servers (can run multiple instances)
+npm run dev:server1  # Port 3001
+npm run dev:server2  # Port 3002
+npm run dev:server3  # Port 3003
+
+# Background Workers
+npm run dev:fanout-worker    # Kafka consumer for fanout
+npm run dev:trending-worker  # Periodic trend calculation
+
+# Multiple fanout workers (separate consumer group instances)
+npm run dev:worker1  # FANOUT_CONSUMER_GROUP=fanout-workers-1
+npm run dev:worker2  # FANOUT_CONSUMER_GROUP=fanout-workers-2
+
+# Frontend
+cd frontend && npm run dev  # Port 5173
 ```
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/circuitBreaker.js`
-
-### Why Retention Policies Balance Storage Costs vs User Experience
-
-**The Problem**: Every tweet, timeline entry, and trend bucket consumes storage. At scale:
-- PostgreSQL storage costs increase with tweet volume
-- Redis memory is expensive (in-memory pricing)
-- Old data provides diminishing value to users
-- Compliance may require keeping or deleting specific data
-
-**The Solution**: Define retention policies that balance these concerns:
-
-| Data Type | Retention | Rationale |
-|-----------|-----------|-----------|
-| Active tweets | Forever | Core user content, never auto-delete |
-| Soft-deleted tweets | 30 days | Allow recovery, then hard delete |
-| Timeline cache | 7 days | Users rarely scroll beyond a week |
-| Trend buckets | 2 hours | Trends are about recency, not history |
-| Idempotency keys | 24 hours | Protect against same-day retries |
-| Hashtag activity | 90 days | Historical trend analysis |
-
-**Why These Numbers**:
-- **30-day soft delete**: Gives users time to request recovery (GDPR considerations)
-- **7-day timeline cache**: Covers typical user behavior while limiting Redis memory
-- **2-hour trend buckets**: Trends should be "what's happening now", not yesterday
-- **24-hour idempotency**: Covers retry scenarios without infinite storage
-
-**Storage Savings Calculation** (hypothetical 1M users):
-```
-Without retention:
-- Timeline cache: 1M users * 800 tweets * 8 bytes = 6.4 GB Redis
-
-With 7-day TTL:
-- Only active users have data in Redis
-- Inactive users auto-expire
-- Typical: 10% active = 640 MB Redis
-```
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/retention.js`
-
-### Why Health Checks Enable Zero-Downtime Deployments
-
-**The Problem**: During deployment, we need to:
-1. Start new instances without dropping traffic
-2. Drain old instances gracefully
-3. Detect unhealthy instances before routing traffic
-4. Recover from dependency failures
-
-**The Solution**: Three-tier health check strategy:
-
-| Endpoint | Purpose | Used By |
-|----------|---------|---------|
-| `/live` | Is the process alive? | Process manager (systemd, PM2) |
-| `/ready` | Can it accept traffic? | Load balancer |
-| `/health` | Detailed status | Monitoring, debugging |
-
-**Liveness Probe** (`/live`):
-```javascript
-app.get('/live', (req, res) => {
-  res.status(200).send('alive');
-});
-```
-- Always returns 200 if the process is running
-- Process manager restarts if this fails
-- No dependency checks (avoids false positives)
-
-**Readiness Probe** (`/ready`):
-```javascript
-app.get('/ready', async (req, res) => {
-  await pool.query('SELECT 1');  // Check PostgreSQL
-  await redis.ping();            // Check Redis
-  res.status(200).send('ready');
-});
-```
-- Returns 200 only if dependencies are healthy
-- Load balancer removes instance from rotation if 503
-- Instance can recover and re-enter rotation
-
-**Zero-Downtime Deployment Flow**:
-```
-1. Start new instance (green)
-2. Wait for /ready to return 200
-3. Load balancer adds green to rotation
-4. Drain old instance (blue):
-   - Stop sending new requests
-   - Wait for in-flight requests to complete (graceful shutdown)
-5. Terminate blue instance
-```
-
-**Graceful Shutdown**:
-```javascript
-const gracefulShutdown = async (signal) => {
-  server.close(async () => {
-    await pool.end();     // Close DB connections
-    await redis.quit();   // Close Redis connection
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(1), 30000);  // Force after 30s
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-```
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/index.js`
-
-### Why Structured Logging with Pino
-
-**The Problem**: `console.log` debugging doesn't scale:
-- No machine-parseable format for log aggregation
-- No log levels for filtering in production
-- No context (request ID, user ID) for tracing
-- Performance overhead from string concatenation
-
-**The Solution**: Structured JSON logging with Pino:
-
-```javascript
-logger.info({
-  requestId: 'abc-123',
-  userId: 42,
-  tweetId: 12345,
-  durationMs: 45,
-}, 'Tweet created successfully');
-```
-
-Output:
-```json
-{
-  "level": 30,
-  "time": "2024-01-15T10:30:00.000Z",
-  "requestId": "abc-123",
-  "userId": 42,
-  "tweetId": 12345,
-  "durationMs": 45,
-  "msg": "Tweet created successfully"
-}
-```
-
-**Why Pino**:
-- **Fastest**: 10x faster than Winston/Bunyan
-- **JSON by default**: Machine-readable for ELK, Datadog
-- **Pretty print in dev**: Human-readable during development
-- **Child loggers**: Attach context once, use everywhere
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/logger.js`
-
-### Why Prometheus Metrics for Observability
-
-**The Problem**: Without metrics, you're flying blind:
-- Is latency increasing gradually before users notice?
-- Are certain endpoints failing more than others?
-- Is the fanout queue backing up?
-
-**The Solution**: Export Prometheus metrics on `/metrics`:
-
-```
-# HELP twitter_timeline_latency_seconds Home timeline fetch latency
-# TYPE twitter_timeline_latency_seconds histogram
-twitter_timeline_latency_seconds_bucket{timeline_type="home",cache_hit="true",le="0.1"} 950
-twitter_timeline_latency_seconds_bucket{timeline_type="home",cache_hit="false",le="0.1"} 200
-
-# HELP twitter_fanout_queue_depth Current depth of the fanout queue
-# TYPE twitter_fanout_queue_depth gauge
-twitter_fanout_queue_depth 0
-
-# HELP twitter_circuit_breaker_state Circuit breaker state: 0=closed, 1=half-open, 2=open
-# TYPE twitter_circuit_breaker_state gauge
-twitter_circuit_breaker_state{circuit_name="redis-fanout"} 0
-```
-
-**Key Metrics**:
-- **Tweet throughput**: Tweets created per second, error rate
-- **Timeline latency**: P50, P95, P99 by timeline type and cache hit
-- **Fanout queue depth**: Detect backup before it causes problems
-- **Circuit breaker state**: Know when protection is active
-
-**Implementation**: See `/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/twitter/backend/src/shared/metrics.js`
-
----
-
-## Frontend Virtualization
-
-The Twitter timeline uses `@tanstack/react-virtual` for efficient rendering of tweet streams.
-
-### Why Virtualization for Timelines
-
-**The Problem:** Twitter timelines can have thousands of tweets. Each tweet contains:
-- Author info and avatar
-- Variable-length text content
-- Engagement counters and action buttons
-- Optional media embeds
-
-Without virtualization, scrolling through 100+ tweets causes significant performance issues.
-
-**The Solution:** The `Timeline` component virtualizes the tweet list with dynamic height measurement.
-
-**Implementation in `components/Timeline.tsx`:**
-
-```typescript
-import { useVirtualizer } from '@tanstack/react-virtual';
-
-const virtualizer = useVirtualizer({
-  count: tweets.length,
-  getScrollElement: () => parentRef.current,
-  estimateSize: () => 150, // Estimated tweet height
-  overscan: 5, // 5 extra tweets above/below for fast scrolling
-  measureElement: (element) => element.getBoundingClientRect().height,
-});
-```
-
-**Key Configuration:**
-
-| Setting | Value | Rationale |
-|---------|-------|-----------|
-| `estimateSize` | 150px | Average tweet without media |
-| `overscan` | 5 | Tweets are lightweight; more buffer = smoother scroll |
-| `measureElement` | Dynamic | Tweet heights vary with text length and media |
-
-**Reusable Component:**
-
-The `Timeline` component is used across multiple views:
-- Home timeline (`routes/index.tsx`)
-- User profile tweets
-- Hashtag search results
-
-**Props Interface:**
-```typescript
-interface TimelineProps {
-  tweets: Tweet[];
-  isLoading: boolean;
-  error: string | null;
-  onLoadMore?: () => void;
-  hasMore?: boolean;
-  emptyMessage?: string;
-}
-```
-
-**Performance Impact:**
-
-| Metric | Without Virtualization | With Virtualization |
-|--------|------------------------|---------------------|
-| DOM nodes (200 tweets) | 1200+ | ~80 |
-| Memory usage | 150MB+ | 60MB |
-| Scroll jank | Noticeable after 50 tweets | None |
-| Initial render | 400ms | 80ms |
-
----
-
-## Frontend Brand Identity
-
-### Why Brand Identity Matters for System Design Learning
-
-Matching the original Twitter brand identity serves several educational purposes:
-
-1. **Authenticity in Learning**: When building a system design project that mimics Twitter, the frontend should feel like Twitter. This creates a more immersive learning experience and helps students understand the full product, not just the backend systems.
-
-2. **Design as Documentation**: The visual design communicates product intent. A properly styled timeline immediately conveys "this is a microblogging platform" without explanation, making the system design more intuitive to understand.
-
-3. **Real-World Constraints**: Production systems must consider brand consistency. Understanding how design tokens (colors, typography, spacing) propagate through a large codebase is itself a system design lesson in maintainability and consistency.
-
-4. **Demo Quality**: When presenting system design work in interviews or portfolios, a polished UI demonstrates attention to detail and full-stack awareness. It shows you understand that system design serves user-facing products.
-
-### Twitter Brand Colors Applied
-
-| Color Role | Hex Value | Usage |
-|------------|-----------|-------|
-| Primary Blue | `#1DA1F2` | Classic Twitter blue for primary actions, links, active states |
-| Background (Light) | `#FFFFFF` | Main content area background |
-| Background (Dark) | `#15202B` | Dark mode background (future) |
-| Secondary Background | `#F7F9FA` | Sidebar, hover states, input backgrounds |
-| Primary Text | `#0F1419` | Main body text in light mode |
-| Secondary Text | `#536471` | Timestamps, metadata, placeholders |
-| Borders | `#EFF3F4` | Card borders, dividers |
-| Like Heart | `#F91880` | Pink heart for like action |
-| Retweet | `#00BA7C` | Green for retweet action |
-
-### Typography
-
-**Font Stack**:
-```css
-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-```
-
-This system font stack ensures:
-- Native feel on all platforms (Apple devices use SF Pro, Windows uses Segoe UI)
-- Fast loading (no web font downloads)
-- Optimal legibility at all sizes
-
-**Key Sizes**:
-| Element | Size | Weight |
-|---------|------|--------|
-| Tweet text | 15px | 400 (normal) |
-| Display names | 15px | 700 (bold) |
-| Usernames/handles | 15px | 400 |
-| Timestamps | 14px | 400 |
-| Action button labels | 13px | 400 |
-
-### Key UI Elements
-
-1. **Signature Twitter Blue**: The `#1DA1F2` primary blue is used for:
-   - "Tweet" button background
-   - Active navigation items
-   - Links within tweets
-   - Follow button (outline style for "Following", filled for "Follow")
-
-2. **Card-Based Timeline Layout**:
-   - Each tweet is a distinct card with subtle borders
-   - Consistent padding (16px) around content
-   - Avatar positioned left, content flows right
-   - Clear visual separation between tweets
-
-3. **Action Button Colors**:
-   - Reply: Default gray, blue on hover/active
-   - Retweet: Default gray, green (`#00BA7C`) when retweeted
-   - Like: Default gray, pink (`#F91880`) when liked
-   - Share: Default gray, blue on hover
-
-4. **Clean, Minimal Design**:
-   - Generous whitespace between elements
-   - Minimal use of borders and shadows
-   - Content-first approach with UI chrome receding
-   - Consistent 4px/8px spacing rhythm
-
-### Tailwind CSS Configuration
-
-The brand colors are configured in `tailwind.config.js`:
-
-```javascript
-module.exports = {
-  theme: {
-    extend: {
-      colors: {
-        twitter: {
-          blue: '#1DA1F2',
-          darkBlue: '#1A91DA',
-          black: '#0F1419',
-          gray: '#536471',
-          lightGray: '#EFF3F4',
-          extraLightGray: '#F7F9FA',
-          like: '#F91880',
-          retweet: '#00BA7C',
-        }
-      }
-    }
-  }
-}
-```
-
-Usage in components:
-```jsx
-<button className="bg-twitter-blue hover:bg-twitter-darkBlue text-white">
-  Tweet
-</button>
-
-<button className="text-twitter-gray hover:text-twitter-like">
-  <HeartIcon />
-</button>
-```
-
----
-
-## Future Optimizations
-
-1. **GraphQL** for flexible client queries
-2. **Algorithmic timeline** (ML-ranked content)
-3. **Geolocation** for local trends
-4. **Real-time streaming** via WebSocket
-5. **Tweet threading** for conversations

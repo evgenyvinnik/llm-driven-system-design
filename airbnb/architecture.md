@@ -2,13 +2,15 @@
 
 ## System Overview
 
-Airbnb is a two-sided marketplace connecting hosts with guests. Core challenges involve availability management, geographic search, and trust systems.
+Airbnb is a two-sided marketplace connecting hosts who have properties with guests looking for accommodation. The core engineering challenges involve availability calendar management, geographic search with real-time filtering, double-booking prevention under concurrency, a trust system with two-sided reviews, and payment orchestration across multiple parties.
 
 **Learning Goals:**
-- Design availability calendar systems
-- Build geographic search with PostGIS
-- Handle two-sided marketplace dynamics
-- Implement trust and review systems
+- Design availability calendar systems with efficient date-range storage
+- Build geographic search with PostGIS and faceted filtering
+- Handle concurrent booking attempts with double-booking prevention
+- Implement two-sided marketplace dynamics (host + guest personas)
+- Build trust and review systems with mutual-reveal semantics
+- Design payment escrow and payout workflows
 
 ---
 
@@ -16,223 +18,303 @@ Airbnb is a two-sided marketplace connecting hosts with guests. Core challenges 
 
 ### Functional Requirements
 
-1. **List**: Hosts create property listings
-2. **Search**: Guests find properties by location/dates
-3. **Book**: Reserve properties with payment
-4. **Review**: Two-way rating system
-5. **Message**: Host-guest communication
+1. **List**: Hosts create property listings with photos, amenities, pricing, and availability calendars
+2. **Search**: Guests find properties by location, dates, price range, property type, amenities, and guest count
+3. **Book**: Reserve properties with instant-book or request-to-book, preventing double-booking
+4. **Pay**: Process payments with escrow model -- hold guest payment, release to host after checkout
+5. **Review**: Two-sided review system where reviews are hidden until both parties submit
+6. **Message**: Host-guest communication linked to listings and bookings
+7. **Calendar**: Hosts manage availability with blocked dates, custom pricing, and minimum-stay rules
 
 ### Non-Functional Requirements
 
-- **Availability**: 99.9% for search
-- **Consistency**: Strong for bookings (no double-booking)
-- **Latency**: < 200ms for search results
-- **Scale**: 10M listings, 1M bookings/day
+| Requirement | Target |
+|-------------|--------|
+| **Availability** | 99.99% for search, 99.9% for bookings |
+| **Consistency** | Strong for bookings (no double-booking), eventual for search index |
+| **Search Latency** | p50 < 100ms, p99 < 300ms |
+| **Booking Latency** | p50 < 500ms, p99 < 2s (includes payment hold) |
+| **Scale** | 10M active listings, 1M bookings/day, 50M searches/day |
+| **Durability** | Zero lost bookings or payments |
 
 ---
+
+# Layer 1: Production-Ready Architecture
+
+This section describes how Airbnb would work at scale with millions of users, thousands of requests per second, and multi-region deployment.
 
 ## High-Level Architecture
 
 ```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              Client Layer                                        │
+│           React SPA / iOS / Android  ──  CDN (CloudFront/Fastly)                │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           API Gateway / Load Balancer                             │
+│               Rate limiting, auth, request routing, TLS termination              │
+└──────────────────────────────────────────────────────────────────────────────────┘
+         │              │              │              │              │
+         ▼              ▼              ▼              ▼              ▼
+┌──────────────┐ ┌─────────────┐ ┌──────────────┐ ┌─────────────┐ ┌──────────────┐
+│  Listing     │ │  Search     │ │  Booking     │ │  Payment    │ │  Messaging   │
+│  Service     │ │  Service    │ │  Service     │ │  Service    │ │  Service     │
+│              │ │             │ │              │ │             │ │              │
+│ - CRUD       │ │ - Geo query │ │ - Reserve    │ │ - Escrow    │ │ - Threads    │
+│ - Calendar   │ │ - Facets    │ │ - Lock/check │ │ - Payout    │ │ - Real-time  │
+│ - Photos     │ │ - Ranking   │ │ - Cancel     │ │ - Refund    │ │ - Unread     │
+│ - Pricing    │ │ - Suggest   │ │ - Complete   │ │ - Ledger    │ │   count      │
+└──────┬───────┘ └──────┬──────┘ └──────┬───────┘ └──────┬──────┘ └──────┬───────┘
+       │                │               │                │               │
+       ▼                ▼               ▼                ▼               ▼
+┌──────────────┐ ┌─────────────┐ ┌──────────────────────────────┐ ┌──────────────┐
+│  PostgreSQL  │ │Elasticsearch│ │        PostgreSQL             │ │  PostgreSQL  │
+│  + PostGIS   │ │   Cluster   │ │   (Bookings + Payments)      │ │  (Messages)  │
+│  (Listings)  │ │             │ │   Strong consistency          │ │              │
+└──────────────┘ └─────────────┘ └──────────────────────────────┘ └──────────────┘
+       │                ▲               │                │
+       │                │               ▼                ▼
+       │         ┌──────┴──────┐  ┌──────────┐    ┌──────────┐
+       │         │  CDC / Sync │  │  Redis    │    │  Stripe  │
+       │         │  Pipeline   │  │  (Cache)  │    │  (Ext.)  │
+       │         └─────────────┘  └──────────┘    └──────────┘
+       │
+       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Client Layer                                 │
-│        React + Search + Booking + Messaging                     │
+│                    Review Service                                │
+│  - Two-sided reviews, trust scoring, rating aggregation         │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
+       │
+       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
+│                    Message Queue (Kafka)                         │
+│  booking.created │ booking.confirmed │ availability.changed     │
+│  review.submitted │ payment.completed │ host.alert              │
 └─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Listing Service│    │Booking Service│    │ Search Service│
-│               │    │               │    │               │
-│ - CRUD        │    │ - Reserve     │    │ - Geo search  │
-│ - Calendar    │    │ - Payment     │    │ - Availability│
-│ - Pricing     │    │ - Cancellation│    │ - Ranking     │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │           Elasticsearch                       │
-│   + PostGIS     │           - Search index                      │
-│   - Listings    │           - Geo queries                       │
-│   - Bookings    │           - Facets                            │
-│   - Calendars   │                                               │
-└─────────────────┴───────────────────────────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+┌──────────────┐ ┌─────────────┐ ┌──────────────┐
+│ Notification │ │  Analytics  │ │  Search      │
+│ Worker       │ │  Worker     │ │  Indexer     │
+│ (email/push) │ │ (ClickHouse)│ │  (ES sync)   │
+└──────────────┘ └─────────────┘ └──────────────┘
 ```
-
----
 
 ## Core Components
 
-### 1. Availability Calendar
+### 1. Search Service (Elasticsearch + PostGIS)
 
-**Schema Options:**
+At production scale, search cannot rely solely on PostgreSQL. Elasticsearch provides the combination of geo queries, full-text search, faceted filtering, and sub-100ms latency that a marketplace search requires.
 
-**Option 1: Day-by-Day Rows**
-```sql
-CREATE TABLE calendar (
-  listing_id INTEGER REFERENCES listings(id),
-  date DATE,
-  available BOOLEAN DEFAULT TRUE,
-  price DECIMAL(10, 2),
-  PRIMARY KEY (listing_id, date)
-);
+**Search Pipeline:**
+1. Client sends search query with location, dates, guests, price range, amenities, property type
+2. API Gateway routes to Search Service
+3. Search Service queries Elasticsearch with a compound query combining:
+   - **Geo filter**: `geo_distance` query within the map viewport or radius
+   - **Date availability filter**: Check against an availability bitmap or inverted index
+   - **Faceted filters**: Price range, property type, room type, amenities (terms aggregation)
+   - **Full-text**: Match against listing title and description for keyword searches
+   - **Scoring**: Custom function_score combining distance, rating, review count, response rate, and recency
+
+**Availability in Search:**
+The hardest part of Airbnb search is filtering by date availability. Two approaches:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Query-time join** (ES query + PG availability check) | Always fresh | Slow at scale -- two hops per search |
+| **Pre-computed availability bitmap in ES** | Fast single-hop query | Requires real-time sync; stale by seconds |
+
+At production scale, use the bitmap approach: each listing document in Elasticsearch contains a 365-day availability bitmap updated via CDC (Change Data Capture) from PostgreSQL. When a booking is created or cancelled, the booking service publishes an `availability.changed` event, and the Search Indexer worker updates the ES document within seconds.
+
+**Ranking Algorithm:**
+Listings are scored using a weighted combination:
+- Distance to search center (inverse, weight 0.3)
+- Rating and review count (Bayesian average to avoid new-listing disadvantage, weight 0.25)
+- Price competitiveness within the area (weight 0.15)
+- Host response rate and superhost status (weight 0.15)
+- Recency boost for new listings (weight 0.1)
+- Conversion rate from search impressions (weight 0.05)
+
+### 2. Booking Service (Distributed Transaction)
+
+The booking flow is the most consistency-critical path in the system. A double-booking means two guests show up to the same property -- a trust-destroying event.
+
+**Booking Flow (Instant Book):**
+
 ```
-- Pros: Simple queries, easy updates
-- Cons: Many rows (365 × listings)
-
-**Option 2: Date Ranges (Chosen)**
-```sql
-CREATE TABLE availability_blocks (
-  id SERIAL PRIMARY KEY,
-  listing_id INTEGER REFERENCES listings(id),
-  start_date DATE NOT NULL,
-  end_date DATE NOT NULL,
-  status VARCHAR(20), -- 'available', 'blocked', 'booked'
-  price_per_night DECIMAL(10, 2),
-  booking_id INTEGER REFERENCES bookings(id)
-);
-
-CREATE INDEX idx_availability_listing_dates
-ON availability_blocks(listing_id, start_date, end_date);
-```
-- Pros: Fewer rows, efficient range queries
-- Cons: Complex overlap handling
-
-**Checking Availability:**
-```sql
--- Check if dates are available
-SELECT COUNT(*) = 0 as is_available
-FROM availability_blocks
-WHERE listing_id = $1
-  AND status != 'available'
-  AND (start_date, end_date) OVERLAPS ($2, $3);
-```
-
-### 2. Geographic Search
-
-**PostGIS for Location:**
-```sql
-CREATE TABLE listings (
-  id SERIAL PRIMARY KEY,
-  title VARCHAR(200),
-  description TEXT,
-  location GEOGRAPHY(POINT, 4326),
-  price_per_night DECIMAL(10, 2),
-  ...
-);
-
-CREATE INDEX idx_listings_location ON listings USING GIST(location);
-
--- Search within radius
-SELECT *, ST_Distance(location, ST_MakePoint($lon, $lat)::geography) as distance
-FROM listings
-WHERE ST_DWithin(location, ST_MakePoint($lon, $lat)::geography, $radius_meters)
-ORDER BY distance
-LIMIT 20;
-```
-
-**Combined Search with Availability:**
-```javascript
-async function searchListings({ location, checkIn, checkOut, guests, priceMax }) {
-  // Step 1: Geographic filter
-  const nearbyIds = await db.raw(`
-    SELECT id FROM listings
-    WHERE ST_DWithin(location, ST_MakePoint(?, ?)::geography, 25000)
-      AND max_guests >= ?
-      AND price_per_night <= ?
-  `, [location.lon, location.lat, guests, priceMax])
-
-  // Step 2: Availability filter
-  const availableIds = await db.raw(`
-    SELECT listing_id FROM (
-      SELECT listing_id
-      FROM availability_blocks
-      WHERE listing_id = ANY(?)
-        AND status = 'available'
-        AND start_date <= ? AND end_date >= ?
-    ) available
-    WHERE listing_id NOT IN (
-      SELECT listing_id FROM availability_blocks
-      WHERE status = 'booked'
-        AND (start_date, end_date) OVERLAPS (?, ?)
-    )
-  `, [nearbyIds, checkIn, checkOut, checkIn, checkOut])
-
-  // Step 3: Fetch and rank
-  return rankListings(availableIds)
-}
+Guest clicks "Reserve"
+        │
+        ▼
+┌───────────────────┐
+│ 1. Availability   │  SELECT ... FOR UPDATE on listing row
+│    Check + Lock   │  Check availability_blocks for conflicts
+└────────┬──────────┘
+         │ available
+         ▼
+┌───────────────────┐
+│ 2. Payment Hold   │  Stripe PaymentIntent with capture_method=manual
+│    (Authorize)    │  Hold the full amount on guest's card
+└────────┬──────────┘
+         │ authorized
+         ▼
+┌───────────────────┐
+│ 3. Create Booking │  INSERT booking + availability_block
+│    + Block Dates  │  within same DB transaction
+└────────┬──────────┘
+         │ committed
+         ▼
+┌───────────────────┐
+│ 4. Confirm Hold   │  Update PaymentIntent status
+│    + Notify       │  Publish booking.created event
+└───────────────────┘
 ```
 
-### 3. Booking Flow
+**Double-Booking Prevention:**
+The system uses pessimistic locking via `SELECT ... FOR UPDATE` on the listing row. This serializes concurrent booking attempts for the same listing. Within the transaction:
+1. Lock the listing row (prevents other transactions from proceeding)
+2. Check `availability_blocks` for date conflicts using PostgreSQL `OVERLAPS` operator
+3. If available, insert the booking and the corresponding `booked` availability block
+4. Commit the transaction (releases the lock)
 
-**Preventing Double-Booking:**
-```javascript
-async function createBooking(listingId, guestId, checkIn, checkOut) {
-  return await db.transaction(async (trx) => {
-    // Lock the listing row
-    await trx.raw('SELECT * FROM listings WHERE id = ? FOR UPDATE', [listingId])
+If two guests try to book overlapping dates simultaneously, the second transaction waits for the first to commit, then finds the dates are no longer available and returns an error.
 
-    // Check availability again (within transaction)
-    const conflicts = await trx('availability_blocks')
-      .where('listing_id', listingId)
-      .where('status', 'booked')
-      .whereRaw('(start_date, end_date) OVERLAPS (?, ?)', [checkIn, checkOut])
+**Why pessimistic over optimistic locking:** For high-demand listings (flash sales, popular destinations during holidays), optimistic locking would cause high retry rates. With pessimistic locking, the second request waits briefly (typically < 100ms) rather than doing all the work only to fail at commit time. The trade-off is reduced throughput for the same listing, but bookings for different listings proceed in parallel, and a single listing rarely receives more than a few concurrent booking attempts.
 
-    if (conflicts.length > 0) {
-      throw new Error('Dates no longer available')
-    }
+**Request-to-Book Flow:**
+For non-instant-book listings, the flow differs: step 2 (payment hold) is deferred until the host confirms. The booking is created in `pending` status, and the host has 24 hours to confirm or decline. If declined, the blocked dates are released.
 
-    // Create booking
-    const [booking] = await trx('bookings')
-      .insert({ listing_id: listingId, guest_id: guestId, check_in: checkIn, check_out: checkOut })
-      .returning('*')
+### 3. Calendar / Availability System
 
-    // Block the dates
-    await trx('availability_blocks').insert({
-      listing_id: listingId,
-      start_date: checkIn,
-      end_date: checkOut,
-      status: 'booked',
-      booking_id: booking.id
-    })
+**Storage Strategy -- Date Ranges vs Day-by-Day:**
 
-    return booking
-  })
-}
+| Approach | Row Count (10M listings) | Pros | Cons |
+|----------|--------------------------|------|------|
+| Day-by-day | 3.65B rows (365 x 10M) | Simple queries | Massive table, slow updates |
+| Date ranges | ~200M rows | 18x fewer rows, efficient range queries | Complex overlap/split logic |
+
+The date-range approach stores availability as `(listing_id, start_date, end_date, status)` tuples. When a host blocks specific dates within an existing range, the system splits the range: delete the overlapping block, insert up to three new blocks (before, blocked, after).
+
+**Pricing Rules:**
+The `availability_blocks` table supports custom `price_per_night` that overrides the listing default. This enables:
+- **Seasonal pricing**: Higher rates during holidays, events, peak season
+- **Weekend pricing**: Different rates for Friday-Sunday
+- **Length-of-stay discounts**: Calculated at booking time from listing rules
+- **Smart pricing** (production): ML model that adjusts prices based on demand, comparable listings, events, and seasonality
+
+**Minimum/Maximum Stay:**
+Enforced at booking time. The listing stores `minimum_nights` and `maximum_nights`. The booking service validates the requested stay duration before proceeding.
+
+### 4. Payment Service (Escrow Model)
+
+Airbnb operates as an escrow intermediary -- the guest pays Airbnb, and Airbnb pays the host after checkout. This protects both parties.
+
+**Payment Lifecycle:**
+
+```
+Guest books  ──▶  Payment authorized (hold on card)
+                          │
+                  Host confirms (or instant)
+                          │
+                          ▼
+              Payment captured (Airbnb holds funds)
+                          │
+                  Guest checks out
+                          │
+                          ▼
+              Payout to host (minus service fee)
+              ┌─────────────────────────────┐
+              │ Host receives:              │
+              │   subtotal + cleaning_fee   │
+              │   - host_service_fee (3%)   │
+              │                             │
+              │ Airbnb retains:             │
+              │   guest_service_fee (~14%)  │
+              │   + host_service_fee (3%)   │
+              └─────────────────────────────┘
 ```
 
-### 4. Two-Sided Reviews
+**Refund Handling:**
+Refund amount depends on `cancellation_policy`:
+- **Flexible**: Full refund if cancelled 24h+ before check-in
+- **Moderate**: Full refund if cancelled 5 days+ before check-in; 50% after
+- **Strict**: 50% refund if cancelled 7 days+ before check-in; none after
 
-**Review Visibility Rules:**
-```javascript
-// Reviews hidden until both parties submit
-async function getReviews(bookingId) {
-  const reviews = await db('reviews').where({ booking_id: bookingId })
+**Idempotency:**
+Every payment operation uses an idempotency key (booking ID + operation type) to prevent duplicate charges. If a network failure occurs mid-payment, the client retries with the same key and Stripe returns the existing PaymentIntent.
 
-  const hostReview = reviews.find(r => r.author_type === 'host')
-  const guestReview = reviews.find(r => r.author_type === 'guest')
+**Ledger:**
+A double-entry ledger tracks every money movement. Each booking creates entries:
+- Guest account: debit (payment captured)
+- Airbnb escrow: credit (funds held)
+- Host account: credit (payout released)
+- Airbnb revenue: credit (service fees retained)
 
-  // Only show if both submitted
-  if (hostReview && guestReview) {
-    return { hostReview, guestReview }
-  }
+### 5. Review Service (Two-Sided with Mutual Reveal)
 
-  // Otherwise, show nothing or placeholder
-  return { pending: true }
-}
-```
+**Review Window:**
+After checkout, both host and guest have 14 days to submit reviews. After 14 days, any submitted review becomes public even if the other party hasn't responded.
+
+**Mutual Reveal:**
+Reviews are hidden (`is_public = FALSE`) until both parties submit. This prevents retaliation -- neither party can read the other's review before writing their own. Once both submit, a database trigger sets `is_public = TRUE` on both reviews simultaneously.
+
+**Trust Scoring:**
+At production scale, reviews feed into a trust score that affects:
+- Search ranking (higher-rated listings rank higher)
+- Superhost eligibility (4.8+ rating, 90%+ response rate, 10+ stays/year)
+- Guest trust (hosts see guest review history before accepting requests)
+
+**Rating Aggregation:**
+Listing ratings are denormalized onto the `listings` table for fast reads. A PostgreSQL trigger recalculates the average rating and review count whenever a guest review becomes public. Sub-ratings (cleanliness, communication, location, value) are aggregated separately for the listing detail page.
+
+### 6. Media Pipeline (Photo Upload + CDN)
+
+**Upload Flow:**
+1. Client requests a pre-signed S3 upload URL from the Listing Service
+2. Client uploads directly to S3 (bypasses API server bandwidth)
+3. S3 triggers a Lambda/worker to:
+   - Validate image (format, size, content moderation)
+   - Generate thumbnails (150px, 300px, 600px, 1200px)
+   - Convert to WebP for modern browsers
+   - Store metadata in PostgreSQL (`listing_photos` table)
+4. CDN serves optimized images with cache headers
+
+**At production scale:**
+- CloudFront/Fastly CDN with edge caching
+- Responsive images with `srcset` for different screen sizes
+- Lazy loading for below-fold images
+- BlurHash placeholders during load
+
+### 7. Messaging Service
+
+**Host-Guest Communication:**
+Conversations are linked to listings and optionally to bookings. Messages support:
+- Pre-booking inquiries (guest asks host questions before booking)
+- Booking-linked threads (created automatically when a booking is made)
+- Unread count tracking per user
+
+**At production scale:**
+- WebSocket connections for real-time message delivery
+- Redis Pub/Sub for multi-instance message broadcasting
+- Push notifications for mobile (APNs/FCM)
+- Message persistence in PostgreSQL with read receipts
+- Rate limiting to prevent spam (10 messages/minute per user)
+
+### 8. Smart Pricing (Production Feature)
+
+At scale, Airbnb offers hosts a "Smart Pricing" feature that automatically adjusts nightly rates based on:
+- Local demand (search volume for the area + dates)
+- Comparable listings (similar properties, their pricing and occupancy)
+- Seasonality and day-of-week patterns
+- Local events (conferences, concerts, sports)
+- Listing-specific conversion data (views to bookings ratio)
+
+The pricing model runs as a batch ML pipeline, updating suggested prices daily. Hosts can set a minimum and maximum bound, and the system adjusts within that range.
 
 ---
 
 ## Database Schema
-
-The complete schema is located at: `backend/db/init.sql`
 
 ### Entity-Relationship Diagram
 
@@ -291,10 +373,10 @@ The complete schema is located at: `backend/db/init.sql`
                     │  conversations  │
                     ├─────────────────┤
                     │ PK id           │
-                    │ FK listing_id   │────► listings
-                    │ FK booking_id   │────► bookings
-                    │ FK host_id      │────► users (host)
-                    │ FK guest_id     │────► users (guest)
+                    │ FK listing_id   │────▶ listings
+                    │ FK booking_id   │────▶ bookings
+                    │ FK host_id      │────▶ users (host)
+                    │ FK guest_id     │────▶ users (guest)
                     └────────┬────────┘
                              │
                              ▼
@@ -304,7 +386,7 @@ The complete schema is located at: `backend/db/init.sql`
                     │ PK id           │
                     │ FK conversation_│
                     │    id           │
-                    │ FK sender_id    │────► users
+                    │ FK sender_id    │────▶ users
                     │    content      │
                     │    is_read      │
                     └─────────────────┘
@@ -313,7 +395,7 @@ The complete schema is located at: `backend/db/init.sql`
                     │   audit_logs    │
                     ├─────────────────┤
                     │ PK id           │
-                    │ FK user_id      │────► users (optional)
+                    │ FK user_id      │────▶ users (optional)
                     │    event_type   │
                     │    resource_type│
                     │    resource_id  │
@@ -323,1615 +405,584 @@ The complete schema is located at: `backend/db/init.sql`
                     └─────────────────┘
 ```
 
-### Complete Table Specifications
-
-#### 1. users
-
-**Purpose:** Central user table for both guests and hosts.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| email | VARCHAR(255) | NO | - | Unique email address |
-| password_hash | VARCHAR(255) | NO | - | Bcrypt hashed password |
-| name | VARCHAR(100) | NO | - | Display name |
-| avatar_url | TEXT | YES | NULL | Profile photo URL |
-| bio | TEXT | YES | NULL | User biography |
-| phone | VARCHAR(20) | YES | NULL | Phone number |
-| is_host | BOOLEAN | NO | FALSE | TRUE when user creates a listing |
-| is_verified | BOOLEAN | NO | FALSE | Email/phone verification status |
-| role | VARCHAR(20) | NO | 'user' | CHECK: 'user', 'admin' |
-| response_rate | DECIMAL(3,2) | NO | 1.00 | Host response rate (0.00-1.00) |
-| created_at | TIMESTAMP | NO | NOW() | Account creation time |
-| updated_at | TIMESTAMP | NO | NOW() | Last modification (auto-updated) |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- UNIQUE on `email`
-
-**Trigger:** `update_users_updated_at` - Auto-updates `updated_at` on row modification
-
----
-
-#### 2. listings
-
-**Purpose:** Core property listing with geographic location.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| host_id | INTEGER | YES | - | FK to users(id) |
-| title | VARCHAR(200) | NO | - | Listing title |
-| description | TEXT | YES | NULL | Full description |
-| location | GEOGRAPHY(POINT,4326) | YES | NULL | PostGIS point (lon, lat) |
-| address_line1 | VARCHAR(255) | YES | NULL | Street address |
-| address_line2 | VARCHAR(255) | YES | NULL | Apt/Suite number |
-| city | VARCHAR(100) | YES | NULL | City name |
-| state | VARCHAR(100) | YES | NULL | State/Province |
-| country | VARCHAR(100) | YES | NULL | Country |
-| postal_code | VARCHAR(20) | YES | NULL | ZIP/Postal code |
-| property_type | VARCHAR(50) | YES | NULL | CHECK: apartment, house, room, studio, villa, cabin, cottage, loft |
-| room_type | VARCHAR(50) | YES | NULL | CHECK: entire_place, private_room, shared_room |
-| max_guests | INTEGER | NO | 1 | Maximum guest count |
-| bedrooms | INTEGER | YES | 0 | Number of bedrooms |
-| beds | INTEGER | YES | 0 | Number of beds |
-| bathrooms | DECIMAL(2,1) | YES | 1 | Bathroom count (supports 1.5) |
-| amenities | TEXT[] | YES | '{}' | Array of amenity names |
-| house_rules | TEXT | YES | NULL | House rules text |
-| price_per_night | DECIMAL(10,2) | NO | - | Base nightly price |
-| cleaning_fee | DECIMAL(10,2) | YES | 0 | One-time cleaning fee |
-| service_fee_percent | DECIMAL(4,2) | YES | 10.00 | Platform fee percentage |
-| rating | DECIMAL(2,1) | YES | NULL | Average rating (trigger-updated) |
-| review_count | INTEGER | YES | 0 | Public review count (trigger-updated) |
-| instant_book | BOOLEAN | NO | FALSE | TRUE = no host approval needed |
-| minimum_nights | INTEGER | YES | 1 | Minimum stay requirement |
-| maximum_nights | INTEGER | YES | 365 | Maximum stay limit |
-| cancellation_policy | VARCHAR(50) | YES | 'flexible' | CHECK: flexible, moderate, strict |
-| is_active | BOOLEAN | NO | TRUE | FALSE = hidden from search |
-| created_at | TIMESTAMP | NO | NOW() | Creation timestamp |
-| updated_at | TIMESTAMP | NO | NOW() | Last modification (auto-updated) |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- GIST on `location` (spatial index for geo queries)
-- BTREE on `host_id` (find host's listings)
-- BTREE on `price_per_night` (price filtering)
-- BTREE on `is_active` (active listings filter)
-
-**Trigger:** `update_listings_updated_at` - Auto-updates `updated_at` on modification
-
----
-
-#### 3. listing_photos
-
-**Purpose:** Multiple photos per listing with ordering.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| listing_id | INTEGER | YES | - | FK to listings(id) |
-| url | TEXT | NO | - | Image URL (MinIO/S3) |
-| caption | VARCHAR(255) | YES | NULL | Photo caption |
-| display_order | INTEGER | YES | 0 | Display sequence (0 = primary) |
-| created_at | TIMESTAMP | NO | NOW() | Upload timestamp |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `listing_id`
-
----
-
-#### 4. availability_blocks
-
-**Purpose:** Date-range based availability tracking (more efficient than day-by-day).
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| listing_id | INTEGER | YES | - | FK to listings(id) |
-| start_date | DATE | NO | - | Block start (inclusive) |
-| end_date | DATE | NO | - | Block end (exclusive) |
-| status | VARCHAR(20) | NO | - | CHECK: available, blocked, booked |
-| price_per_night | DECIMAL(10,2) | YES | NULL | Custom pricing (NULL = use listing default) |
-| booking_id | INTEGER | YES | NULL | FK to bookings(id) when status='booked' |
-| created_at | TIMESTAMP | NO | NOW() | Creation timestamp |
-
-**Constraints:**
-- `valid_dates`: CHECK (end_date > start_date)
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `(listing_id, start_date, end_date)` (date range queries)
-- BTREE on `status`
-
----
-
-#### 5. bookings
-
-**Purpose:** Reservations linking guests to listings for specific dates.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| listing_id | INTEGER | YES | - | FK to listings(id) |
-| guest_id | INTEGER | YES | - | FK to users(id) |
-| check_in | DATE | NO | - | Check-in date |
-| check_out | DATE | NO | - | Check-out date |
-| guests | INTEGER | NO | 1 | Number of guests |
-| nights | INTEGER | NO | - | Stay duration (denormalized) |
-| price_per_night | DECIMAL(10,2) | NO | - | Captured at booking time |
-| cleaning_fee | DECIMAL(10,2) | YES | 0 | Captured at booking time |
-| service_fee | DECIMAL(10,2) | YES | 0 | Calculated service fee |
-| total_price | DECIMAL(10,2) | NO | - | Total amount |
-| status | VARCHAR(20) | YES | 'pending' | CHECK: pending, confirmed, cancelled, completed, declined |
-| guest_message | TEXT | YES | NULL | Initial message from guest |
-| host_response | TEXT | YES | NULL | Host reply |
-| cancelled_by | VARCHAR(10) | YES | NULL | CHECK: guest, host, NULL |
-| cancelled_at | TIMESTAMP | YES | NULL | Cancellation timestamp |
-| created_at | TIMESTAMP | NO | NOW() | Booking creation |
-| updated_at | TIMESTAMP | NO | NOW() | Last modification |
-
-**Constraints:**
-- `valid_booking_dates`: CHECK (check_out > check_in)
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `listing_id`
-- BTREE on `guest_id`
-- BTREE on `(check_in, check_out)`
-- BTREE on `status`
-
-**Trigger:** `update_bookings_updated_at` - Auto-updates `updated_at` on modification
-
----
-
-#### 6. reviews
-
-**Purpose:** Two-sided reviews (guest reviews listing, host reviews guest).
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| booking_id | INTEGER | YES | - | FK to bookings(id) |
-| author_id | INTEGER | YES | - | FK to users(id) |
-| author_type | VARCHAR(10) | NO | - | CHECK: 'host', 'guest' |
-| rating | INTEGER | NO | - | Overall rating 1-5 |
-| cleanliness_rating | INTEGER | YES | NULL | CHECK 1-5 (guest reviews only) |
-| communication_rating | INTEGER | YES | NULL | CHECK 1-5 (guest reviews only) |
-| location_rating | INTEGER | YES | NULL | CHECK 1-5 (guest reviews only) |
-| value_rating | INTEGER | YES | NULL | CHECK 1-5 (guest reviews only) |
-| content | TEXT | YES | NULL | Review text |
-| is_public | BOOLEAN | NO | FALSE | TRUE when both parties reviewed |
-| created_at | TIMESTAMP | NO | NOW() | Review submission time |
-
-**Constraints:**
-- UNIQUE on `(booking_id, author_type)` - One review per party per booking
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `booking_id`
-- BTREE on `author_id`
-
-**Triggers:**
-- `check_publish_reviews_trigger` - Sets `is_public = TRUE` when both parties review
-- `update_listing_rating_trigger` - Updates listing.rating and listing.review_count when guest review becomes public
-
----
-
-#### 7. conversations
-
-**Purpose:** Message threads between hosts and guests.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| listing_id | INTEGER | YES | NULL | FK to listings(id) |
-| booking_id | INTEGER | YES | NULL | FK to bookings(id) |
-| host_id | INTEGER | YES | NULL | FK to users(id) |
-| guest_id | INTEGER | YES | NULL | FK to users(id) |
-| created_at | TIMESTAMP | NO | NOW() | Thread creation |
-| updated_at | TIMESTAMP | NO | NOW() | Last message time |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `host_id`
-- BTREE on `guest_id`
-
-**Trigger:** `update_conversations_updated_at` - Auto-updates `updated_at` on modification
-
----
-
-#### 8. messages
-
-**Purpose:** Individual messages within conversation threads.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| conversation_id | INTEGER | YES | - | FK to conversations(id) |
-| sender_id | INTEGER | YES | - | FK to users(id) |
-| content | TEXT | NO | - | Message content |
-| is_read | BOOLEAN | NO | FALSE | Read status |
-| created_at | TIMESTAMP | NO | NOW() | Send timestamp |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `conversation_id`
-- BTREE on `sender_id`
-
----
-
-#### 9. sessions
-
-**Purpose:** Server-side session storage for authentication.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | VARCHAR(255) | NO | - | Primary key (session token) |
-| user_id | INTEGER | YES | - | FK to users(id) |
-| data | JSONB | YES | NULL | Session data |
-| expires_at | TIMESTAMP | NO | - | Session expiration |
-| created_at | TIMESTAMP | NO | NOW() | Session creation |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `user_id`
-- BTREE on `expires_at` (cleanup queries)
-
----
-
-#### 10. audit_logs
-
-**Purpose:** Comprehensive audit trail for all sensitive operations.
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| id | SERIAL | NO | auto | Primary key |
-| event_type | VARCHAR(100) | NO | - | e.g., 'booking.created' |
-| user_id | INTEGER | YES | NULL | FK to users(id) |
-| resource_type | VARCHAR(50) | NO | - | e.g., 'booking', 'listing' |
-| resource_id | INTEGER | YES | NULL | ID of affected resource |
-| action | VARCHAR(50) | NO | - | e.g., 'create', 'update', 'cancel' |
-| outcome | VARCHAR(20) | NO | 'success' | CHECK: success, failure, denied |
-| ip_address | VARCHAR(45) | YES | NULL | IPv4 or IPv6 |
-| user_agent | TEXT | YES | NULL | Browser/client info |
-| session_id | VARCHAR(255) | YES | NULL | Session reference |
-| request_id | VARCHAR(255) | YES | NULL | Distributed trace ID |
-| metadata | JSONB | YES | '{}' | Additional context |
-| before_state | JSONB | YES | NULL | State before change |
-| after_state | JSONB | YES | NULL | State after change |
-| created_at | TIMESTAMP | NO | NOW() | Event timestamp |
-
-**Indexes:**
-- PRIMARY KEY on `id`
-- BTREE on `event_type`
-- BTREE on `user_id`
-- BTREE on `(resource_type, resource_id)`
-- BTREE on `created_at` (time-range queries)
-- BTREE on `request_id` (trace correlation)
-
----
-
-### Foreign Key Relationships and Cascade Behaviors
-
-| Parent Table | Child Table | FK Column | ON DELETE | Rationale |
-|--------------|-------------|-----------|-----------|-----------|
-| users | listings | host_id | CASCADE | Delete host's listings when account deleted |
-| users | bookings | guest_id | SET NULL | Preserve booking history for accounting |
-| users | reviews | author_id | SET NULL | Keep reviews visible even if author deleted |
-| users | conversations | host_id, guest_id | SET NULL | Preserve conversation history |
-| users | messages | sender_id | SET NULL | Keep message history |
-| users | sessions | user_id | CASCADE | Clean up sessions when user deleted |
-| users | audit_logs | user_id | SET NULL | Preserve audit trail |
-| listings | bookings | listing_id | SET NULL | Preserve booking history if listing deleted |
-| listings | listing_photos | listing_id | CASCADE | Delete photos when listing deleted |
-| listings | availability_blocks | listing_id | CASCADE | Clean up availability data |
-| listings | conversations | listing_id | SET NULL | Preserve message history |
-| bookings | reviews | booking_id | CASCADE | Reviews meaningless without booking |
-| bookings | availability_blocks | booking_id | SET NULL | Keep availability structure |
-| bookings | conversations | booking_id | SET NULL | Preserve message history |
-| conversations | messages | conversation_id | CASCADE | Delete messages with conversation |
-
-**Cascade Behavior Rationale:**
-
-1. **CASCADE** - Used when child data is meaningless without parent:
-   - Listing photos without listing
-   - Availability blocks without listing
-   - Sessions without user
-   - Messages without conversation
-
-2. **SET NULL** - Used to preserve historical records:
-   - Bookings when listing/guest deleted (financial records)
-   - Reviews when author deleted (trust data)
-   - Audit logs (compliance requirement)
-   - Conversations/messages (communication history)
-
----
-
-### Data Flow for Key Operations
-
-#### 1. Creating a Booking
-
-```
-┌─────────────┐     ┌─────────────┐     ┌────────────────────┐     ┌─────────────┐
-│   Guest     │────►│  Bookings   │────►│ Availability_blocks│────►│  Listings   │
-│   (users)   │     │  (INSERT)   │     │     (INSERT)       │     │ (SELECT     │
-│             │     │             │     │  status='booked'   │     │  FOR UPDATE)│
-└─────────────┘     └─────────────┘     └────────────────────┘     └─────────────┘
-       │                   │                                              │
-       │                   │                                              │
-       ▼                   ▼                                              │
-┌─────────────┐     ┌─────────────┐                                       │
-│ Audit_logs  │◄────│Conversations│◄──────────────────────────────────────┘
-│  (INSERT)   │     │  (INSERT)   │
-└─────────────┘     └─────────────┘
-
-Transaction Flow:
-1. BEGIN TRANSACTION
-2. SELECT listing FOR UPDATE (row lock prevents double-booking)
-3. Check availability_blocks for conflicts using OVERLAPS
-4. INSERT booking record
-5. INSERT availability_block with status='booked'
-6. CREATE conversation between host and guest
-7. INSERT audit_log entry
-8. COMMIT TRANSACTION
+### Full SQL Schema
+
+The complete schema is located at `backend/src/db/init.sql`. Key tables:
+
+```sql
+-- PostGIS extension for geographic queries
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+-- Users (both guests and hosts in a single table)
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  avatar_url TEXT,
+  bio TEXT,
+  phone VARCHAR(20),
+  is_host BOOLEAN DEFAULT FALSE,
+  is_verified BOOLEAN DEFAULT FALSE,
+  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+  response_rate DECIMAL(3, 2) DEFAULT 1.00,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Listings with PostGIS geography for spatial queries
+CREATE TABLE listings (
+  id SERIAL PRIMARY KEY,
+  host_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(200) NOT NULL,
+  description TEXT,
+  location GEOGRAPHY(POINT, 4326),
+  address_line1 VARCHAR(255),
+  city VARCHAR(100),
+  state VARCHAR(100),
+  country VARCHAR(100),
+  property_type VARCHAR(50) CHECK (property_type IN (
+    'apartment', 'house', 'room', 'studio', 'villa', 'cabin', 'cottage', 'loft'
+  )),
+  room_type VARCHAR(50) CHECK (room_type IN (
+    'entire_place', 'private_room', 'shared_room'
+  )),
+  max_guests INTEGER NOT NULL DEFAULT 1,
+  bedrooms INTEGER DEFAULT 0,
+  beds INTEGER DEFAULT 0,
+  bathrooms DECIMAL(2, 1) DEFAULT 1,
+  amenities TEXT[] DEFAULT '{}',
+  price_per_night DECIMAL(10, 2) NOT NULL,
+  cleaning_fee DECIMAL(10, 2) DEFAULT 0,
+  service_fee_percent DECIMAL(4, 2) DEFAULT 10.00,
+  rating DECIMAL(2, 1),
+  review_count INTEGER DEFAULT 0,
+  instant_book BOOLEAN DEFAULT FALSE,
+  minimum_nights INTEGER DEFAULT 1,
+  maximum_nights INTEGER DEFAULT 365,
+  cancellation_policy VARCHAR(50) DEFAULT 'flexible'
+    CHECK (cancellation_policy IN ('flexible', 'moderate', 'strict')),
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Spatial index for geographic queries
+CREATE INDEX idx_listings_location ON listings USING GIST(location);
+CREATE INDEX idx_listings_host ON listings(host_id);
+CREATE INDEX idx_listings_price ON listings(price_per_night);
+
+-- Date-range availability (18x fewer rows than day-by-day)
+CREATE TABLE availability_blocks (
+  id SERIAL PRIMARY KEY,
+  listing_id INTEGER REFERENCES listings(id) ON DELETE CASCADE,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  status VARCHAR(20) NOT NULL CHECK (status IN ('available', 'blocked', 'booked')),
+  price_per_night DECIMAL(10, 2),
+  booking_id INTEGER,
+  created_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT valid_dates CHECK (end_date > start_date)
+);
+
+CREATE INDEX idx_availability_listing_dates
+  ON availability_blocks(listing_id, start_date, end_date);
+
+-- Bookings with full price capture
+CREATE TABLE bookings (
+  id SERIAL PRIMARY KEY,
+  listing_id INTEGER REFERENCES listings(id) ON DELETE SET NULL,
+  guest_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  check_in DATE NOT NULL,
+  check_out DATE NOT NULL,
+  guests INTEGER NOT NULL DEFAULT 1,
+  nights INTEGER NOT NULL,
+  price_per_night DECIMAL(10, 2) NOT NULL,
+  cleaning_fee DECIMAL(10, 2) DEFAULT 0,
+  service_fee DECIMAL(10, 2) DEFAULT 0,
+  total_price DECIMAL(10, 2) NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN (
+    'pending', 'confirmed', 'cancelled', 'completed', 'declined'
+  )),
+  guest_message TEXT,
+  host_response TEXT,
+  cancelled_by VARCHAR(10) CHECK (cancelled_by IN ('guest', 'host', NULL)),
+  cancelled_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT valid_booking_dates CHECK (check_out > check_in)
+);
+
+-- Two-sided reviews with mutual-reveal trigger
+CREATE TABLE reviews (
+  id SERIAL PRIMARY KEY,
+  booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+  author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  author_type VARCHAR(10) NOT NULL CHECK (author_type IN ('host', 'guest')),
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  cleanliness_rating INTEGER CHECK (cleanliness_rating >= 1 AND cleanliness_rating <= 5),
+  communication_rating INTEGER CHECK (communication_rating >= 1 AND communication_rating <= 5),
+  location_rating INTEGER CHECK (location_rating >= 1 AND location_rating <= 5),
+  value_rating INTEGER CHECK (value_rating >= 1 AND value_rating <= 5),
+  content TEXT,
+  is_public BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(booking_id, author_type)
+);
+
+-- Conversations and messages
+CREATE TABLE conversations (
+  id SERIAL PRIMARY KEY,
+  listing_id INTEGER REFERENCES listings(id) ON DELETE SET NULL,
+  booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL,
+  host_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  guest_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE messages (
+  id SERIAL PRIMARY KEY,
+  conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+  sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  content TEXT NOT NULL,
+  is_read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Audit trail for compliance and dispute resolution
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  event_type VARCHAR(100) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  resource_type VARCHAR(50) NOT NULL,
+  resource_id INTEGER,
+  action VARCHAR(50) NOT NULL,
+  outcome VARCHAR(20) NOT NULL DEFAULT 'success',
+  ip_address VARCHAR(45),
+  user_agent TEXT,
+  session_id VARCHAR(255),
+  request_id VARCHAR(255),
+  metadata JSONB DEFAULT '{}',
+  before_state JSONB,
+  after_state JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
 ```
 
-#### 2. Submitting Reviews (Two-Sided)
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Guest       │────►│  Reviews    │────►│  Trigger:   │────►│  Reviews    │
-│ submits     │     │ (INSERT     │     │  check_and_ │     │ is_public   │
-│ review      │     │ is_public   │     │  publish_   │     │ = TRUE      │
-│             │     │ = FALSE)    │     │  reviews    │     │ (for both)  │
-└─────────────┘     └─────────────┘     └──────┬──────┘     └──────┬──────┘
-                                               │                   │
-                                               │ Both parties     │
-                                               │ reviewed?        │
-                                               ▼                   ▼
-                                        ┌─────────────┐     ┌─────────────┐
-                                        │  Trigger:   │────►│  Listings   │
-                                        │  update_    │     │  rating,    │
-                                        │  listing_   │     │ review_count│
-                                        │  rating     │     │  updated    │
-                                        └─────────────┘     └─────────────┘
-
-Flow:
-1. Guest or Host submits review → is_public = FALSE
-2. Trigger checks if both parties have reviewed
-3. If both reviewed → SET is_public = TRUE for both
-4. If guest review now public → update listing.rating and listing.review_count
-```
-
-#### 3. Geographic Search with Availability
-
-```
-┌─────────────┐     ┌─────────────┐     ┌────────────────────┐     ┌─────────────┐
-│   Search    │────►│  Listings   │────►│ Availability_blocks│────►│  Results    │
-│   Request   │     │ (PostGIS    │     │  (check OVERLAPS)  │     │  (ranked)   │
-│  lat/lon,   │     │ ST_DWithin) │     │                    │     │             │
-│  dates      │     │             │     │                    │     │             │
-└─────────────┘     └─────────────┘     └────────────────────┘     └─────────────┘
-
-Query Flow:
-1. Filter by geography: ST_DWithin(location, point, radius)
-2. Filter by active: is_active = TRUE
-3. Filter by capacity: max_guests >= requested_guests
-4. Filter by price: price_per_night <= max_price
-5. Check availability: No conflicting availability_blocks with status != 'available'
-6. Rank by: distance, rating, price, instant_book
-```
-
-#### 4. Message Flow
-
-```
-┌─────────────┐     ┌─────────────────┐     ┌─────────────┐
-│   Sender    │────►│  Conversations  │────►│  Messages   │
-│   (users)   │     │  (find/create)  │     │  (INSERT)   │
-└─────────────┘     └─────────────────┘     └─────────────┘
-       │                    │                      │
-       │                    ▼                      ▼
-       │            ┌─────────────────┐     ┌─────────────┐
-       └───────────►│   Recipient     │◄────│ Notification│
-                    │   (users)       │     │  (async)    │
-                    └─────────────────┘     └─────────────┘
-
-Flow:
-1. Find or create conversation for (host, guest, listing)
-2. Insert message with sender_id
-3. Update conversation.updated_at
-4. Publish notification event to message queue
-5. Notification worker sends push/email to recipient
-```
+**Key Triggers:**
+- `check_and_publish_reviews()` -- Sets `is_public = TRUE` on both reviews when both host and guest have submitted for a booking
+- `update_listing_rating()` -- Recalculates listing `rating` and `review_count` when a guest review becomes public
+- `update_updated_at_column()` -- Auto-updates `updated_at` on row modification for users, listings, bookings, conversations
 
 ---
 
-### Why Tables Are Structured This Way
+## API Design
 
-#### Single Users Table for Both Roles
-- Most users are both guests AND hosts
-- Simplifies authentication and profile management
-- `is_host` flag tracks role capability
-- Avoids complex inheritance patterns
+### Listing Endpoints
 
-#### Date Ranges vs Day-by-Day Availability
-- 10M listings x 365 days = 3.65 billion rows (day-by-day)
-- Date ranges: ~200M rows (18x reduction)
-- PostgreSQL OVERLAPS operator handles range queries efficiently
-- Trade-off: Requires split/merge logic for partial updates
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/listings` | Create a new listing (host only) |
+| GET | `/api/listings` | List active listings (paginated) |
+| GET | `/api/listings/:id` | Get listing detail with photos and reviews |
+| PUT | `/api/listings/:id` | Update listing (host owner only) |
+| DELETE | `/api/listings/:id` | Delete listing (host owner only) |
+| POST | `/api/listings/:id/photos` | Upload photos (up to 10, multipart) |
+| DELETE | `/api/listings/:id/photos/:photoId` | Delete a photo |
+| GET | `/api/listings/:id/availability` | Get availability calendar |
+| PUT | `/api/listings/:id/availability` | Block/unblock dates with split logic |
+| GET | `/api/listings/host/my-listings` | Get authenticated host's listings |
 
-#### Denormalized Rating/Review Count
-- Listing rating is read on every search result
-- Calculating average on-the-fly would require JOIN on every search
-- Trigger-based updates maintain consistency
-- Trade-off: Slightly slower writes for much faster reads
+### Search Endpoints
 
-#### Separate Photos Table
-- Supports multiple images per listing
-- Allows ordering with `display_order`
-- Enables lazy loading of images
-- CASCADE delete keeps data consistent
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/search` | Search with geo, dates, price, amenities, property type |
+| GET | `/api/search/suggest` | Location autocomplete (city/state/country ILIKE) |
+| GET | `/api/search/popular-destinations` | Top 10 destinations by listing count |
 
-#### PostGIS Geography Type
-- Native spatial indexing (GIST)
-- Efficient radius queries (ST_DWithin)
-- Uses WGS84 (SRID 4326) - standard lat/long
-- Keeps all data in single database (no Elasticsearch sync)
+### Booking Endpoints
 
-#### Two-Sided Review Visibility
-- Reviews hidden until both submit prevents retaliation
-- Encourages honest feedback
-- Trigger automates the publication logic
-- Industry-standard approach (Airbnb, Uber, Lyft)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/bookings/check-availability` | Check dates + return pricing |
+| POST | `/api/bookings` | Create booking (with double-booking prevention) |
+| GET | `/api/bookings/:id` | Get booking detail |
+| GET | `/api/bookings/my-trips` | Guest's bookings |
+| GET | `/api/bookings/host-reservations` | Host's incoming reservations |
+| PUT | `/api/bookings/:id/respond` | Host confirm/decline pending booking |
+| PUT | `/api/bookings/:id/cancel` | Cancel booking (guest or host) |
+| PUT | `/api/bookings/:id/complete` | Mark booking as completed (host, after checkout) |
 
-#### Audit Logs with Before/After State
-- Full change history for dispute resolution
-- Captures who, what, when, from where
-- request_id links to distributed traces
-- JSONB for flexible metadata
+### Review Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/reviews` | Submit review for completed booking |
+| GET | `/api/reviews/listing/:listingId` | Get listing reviews with rating stats |
+| GET | `/api/reviews/user/:userId` | Get reviews about a user |
+| GET | `/api/reviews/booking/:bookingId/status` | Check who has reviewed |
+
+### Messaging Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/messages/start` | Create or get existing conversation |
+| GET | `/api/messages` | List user's conversations with last message |
+| GET | `/api/messages/unread/count` | Get unread message count |
+| GET | `/api/messages/:id` | Get conversation with messages (marks as read) |
+| POST | `/api/messages/:id/messages` | Send a message |
+
+### Auth Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/register` | Register new user |
+| POST | `/api/auth/login` | Login (returns session cookie) |
+| POST | `/api/auth/logout` | Logout (clears session) |
+| GET | `/api/auth/me` | Get current user |
+| PUT | `/api/auth/become-host` | Upgrade user to host status |
 
 ---
 
 ## Key Design Decisions
 
-### 1. Date Ranges vs Day-by-Day
+### 1. Date Ranges vs Day-by-Day Availability
 
-**Decision**: Store availability as date ranges
+**Chosen: Date Ranges**
 
-**Rationale**:
-- Fewer rows in database
-- Efficient overlap queries
-- Easier to bulk update (block entire month)
+With 10M listings and 365 days, day-by-day storage creates 3.65 billion rows. Date-range storage reduces this to approximately 200M rows (an 18x reduction). PostgreSQL's `OVERLAPS` operator handles range queries efficiently, and the composite index on `(listing_id, start_date, end_date)` makes lookups fast.
 
-### 2. PostGIS for Geographic Queries
+The trade-off is complexity: when a host blocks days 5-8 within an existing available range of days 1-15, the system must split the range into three blocks (1-5 available, 5-8 blocked, 8-15 available). This split/merge logic runs within a transaction to maintain consistency. The complexity is manageable and the storage/query savings justify it.
 
-**Decision**: Use PostgreSQL with PostGIS extension
+### 2. PostGIS vs Elasticsearch for Primary Geo Search
 
-**Rationale**:
-- Native spatial indexing
-- Efficient radius queries
-- Keep data in single database
+**Chosen for production: Elasticsearch (with PostGIS as source of truth)**
 
-### 3. Optimistic Locking for Bookings
+PostGIS is excellent for precise geographic queries, but at 50M searches/day with faceted filtering (price + amenities + dates + location), a single PostgreSQL instance cannot sustain the query load without extensive read replicas. Elasticsearch handles this workload natively with its inverted index, geo_distance queries, and aggregation framework.
 
-**Decision**: Use database transaction with row-level lock
+PostGIS remains the source of truth for listing location data. A CDC pipeline syncs listing changes to Elasticsearch. For the local implementation, PostGIS handles everything in a single database, which is a reasonable simplification.
 
-**Rationale**:
-- Prevents double-booking
-- Simple implementation
-- Acceptable contention at typical scale
+### 3. Pessimistic vs Optimistic Locking for Bookings
 
----
+**Chosen: Pessimistic Locking (SELECT ... FOR UPDATE)**
 
-## Caching and Edge Strategy
+For bookings, correctness is more important than throughput. A double-booking is a catastrophic failure that damages trust. Pessimistic locking serializes concurrent booking attempts for the same listing, which is acceptable because:
+- A single listing rarely gets more than 2-3 concurrent booking attempts
+- The lock is held only during the transaction (typically < 100ms)
+- Different listings are locked independently (no global bottleneck)
 
-### Cache Architecture
+Optimistic locking (version numbers) would let all attempts proceed in parallel but fail at commit time. For a booking that involves a payment hold, failing after the payment is authorized creates complexity around voiding the authorization. Pessimistic locking fails before any external calls.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CDN (CloudFront/nginx)                  │
-│     Static assets, listing images, search result pages         │
-│     TTL: 1 hour for images, 5 min for search pages             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Valkey/Redis Cluster                      │
-│     Session cache, listing details, availability snapshots     │
-│     TTL: 15 min listing, 1 min availability, 24h sessions      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   PostgreSQL + PostGIS                          │
-│                 Source of truth for all data                    │
-└─────────────────────────────────────────────────────────────────┘
-```
+### 4. Mutual-Reveal Reviews vs Immediate Publication
 
-### Cache Strategy by Data Type
+**Chosen: Mutual Reveal**
 
-| Data Type | Strategy | TTL | Invalidation |
-|-----------|----------|-----|--------------|
-| Listing details | Cache-aside | 15 min | On listing update |
-| Listing images | CDN with origin pull | 1 hour | Version in URL |
-| Search results | Cache-aside | 5 min | Time-based expiry |
-| Availability | Cache-aside | 1 min | On booking/update |
-| User sessions | Write-through | 24 hours | On logout/expiry |
-| Review aggregates | Cache-aside | 30 min | On new review |
+Reviews are hidden until both parties submit. This prevents retaliation: if a guest knows the host gave them 2 stars, they might leave a retaliatory 1-star review. The mutual-reveal pattern encourages honest feedback because neither party can condition their review on what the other wrote.
 
-### Cache-Aside Pattern (Read Path)
-
-```javascript
-async function getListingDetails(listingId) {
-  const cacheKey = `listing:${listingId}`
-
-  // 1. Try cache first
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  // 2. Cache miss - fetch from database
-  const listing = await db('listings')
-    .where('id', listingId)
-    .first()
-
-  // 3. Populate cache with TTL
-  await redis.setex(cacheKey, 900, JSON.stringify(listing)) // 15 min
-
-  return listing
-}
-```
-
-### Write-Through Pattern (Session Management)
-
-```javascript
-async function createSession(userId, sessionData) {
-  const sessionId = generateSecureId()
-  const session = { userId, ...sessionData, createdAt: Date.now() }
-
-  // Write to both cache and database atomically
-  await Promise.all([
-    redis.setex(`session:${sessionId}`, 86400, JSON.stringify(session)),
-    db('sessions').insert({ id: sessionId, user_id: userId, data: session })
-  ])
-
-  return sessionId
-}
-```
-
-### Cache Invalidation Rules
-
-```javascript
-// Invalidate on listing update
-async function updateListing(listingId, updates) {
-  await db('listings').where('id', listingId).update(updates)
-
-  // Invalidate listing cache
-  await redis.del(`listing:${listingId}`)
-
-  // Invalidate search cache for affected area (by geo hash)
-  const listing = await db('listings').where('id', listingId).first()
-  const geoHash = computeGeoHash(listing.location, 4) // 4-char precision
-  await redis.del(`search:${geoHash}:*`)
-}
-
-// Invalidate availability on booking
-async function onBookingCreated(booking) {
-  await redis.del(`availability:${booking.listing_id}`)
-
-  // Publish event for downstream caches
-  await redis.publish('booking:created', JSON.stringify(booking))
-}
-```
-
-### Local Development Setup
-
-```yaml
-# docker-compose.yml addition for caching
-services:
-  valkey:
-    image: valkey/valkey:8
-    ports:
-      - "6379:6379"
-    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - valkey_data:/data
-```
-
-```bash
-# Environment variables
-REDIS_URL=redis://localhost:6379
-CACHE_TTL_LISTING=900
-CACHE_TTL_AVAILABILITY=60
-CACHE_TTL_SEARCH=300
-```
+The trade-off is that some reviews never become public (if one party doesn't submit). The 14-day window with automatic publication after expiry mitigates this -- at least the review that was submitted becomes visible.
 
 ---
 
-## Async Processing and Message Queue
+## Consistency and Idempotency
 
-### Queue Architecture
+### Booking Idempotency
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       API Services                              │
-│            Listing / Booking / Search / Review                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     RabbitMQ Exchange                           │
-│                    (Topic Exchange)                             │
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│ booking.created │ listing.updated │ search.reindex              │
-│ booking.cancel  │ review.submitted│ notification.send           │
-└─────────────────┴─────────────────┴─────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Notification  │    │ Search Index  │    │  Analytics    │
-│   Worker      │    │   Worker      │    │   Worker      │
-│               │    │               │    │               │
-│ - Email       │    │ - ES update   │    │ - Metrics     │
-│ - Push        │    │ - Cache warm  │    │ - Reports     │
-│ - SMS         │    │               │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
+The booking creation endpoint uses the combination of `(listing_id, guest_id, check_in, check_out)` as a natural idempotency key. The `availability_blocks` table with a `booking_id` foreign key ensures that each booking corresponds to exactly one blocked date range.
 
-### Queue Configuration
+At production scale with payment integration, each booking attempt would carry an explicit idempotency key (UUID generated client-side). The payment service uses this key for the Stripe PaymentIntent, ensuring that network retries don't create duplicate charges.
 
-| Queue | Purpose | Delivery | DLQ Retention |
-|-------|---------|----------|---------------|
-| `booking.events` | Booking lifecycle | At-least-once | 7 days |
-| `notification.send` | Email/push/SMS | At-least-once | 3 days |
-| `search.reindex` | ES/cache updates | At-most-once | 1 day |
-| `analytics.events` | Metrics/reporting | At-most-once | 1 day |
+### Availability Consistency
 
-### Publishing Events
+Availability changes propagate through multiple systems:
+1. **Database**: Source of truth, updated within the booking transaction
+2. **Cache**: Redis cache invalidated immediately after booking
+3. **Search Index**: Updated asynchronously via message queue (eventual consistency, typically < 5 seconds)
 
-```javascript
-const amqp = require('amqplib')
+This means a search might show a listing as available for a few seconds after it's been booked. The availability check at booking time catches this -- the guest sees "dates no longer available" if they try to book. This is an acceptable trade-off for search performance.
 
-let channel
+---
 
-async function initQueue() {
-  const connection = await amqp.connect(process.env.RABBITMQ_URL)
-  channel = await connection.createChannel()
+## Security / Auth
 
-  // Declare exchanges
-  await channel.assertExchange('airbnb.events', 'topic', { durable: true })
+**Authentication:** Session-based with Redis-backed session store. Session IDs stored in HTTP-only cookies. PostgreSQL `sessions` table provides persistent backup.
 
-  // Declare queues with dead-letter exchange
-  await channel.assertQueue('booking.events', {
-    durable: true,
-    deadLetterExchange: 'airbnb.dlx',
-    messageTtl: 86400000 // 24 hours
-  })
+**Authorization Layers:**
+- `authenticate` middleware: Validates session cookie, attaches user to request
+- `optionalAuth` middleware: Attaches user if session exists, continues regardless
+- `requireHost` middleware: Requires `is_host = TRUE` for listing management
+- `requireAdmin` middleware: Requires `role = 'admin'` for admin operations
 
-  await channel.bindQueue('booking.events', 'airbnb.events', 'booking.*')
-}
+**Sensitive Field Redaction:** Pino logger redacts `password`, `token`, `authorization`, and `cookie` fields from log output.
 
-async function publishBookingEvent(eventType, booking) {
-  const message = {
-    eventId: generateUUID(),
-    eventType,
-    timestamp: new Date().toISOString(),
-    data: booking
-  }
-
-  channel.publish(
-    'airbnb.events',
-    `booking.${eventType}`,
-    Buffer.from(JSON.stringify(message)),
-    {
-      persistent: true,
-      messageId: message.eventId,
-      contentType: 'application/json'
-    }
-  )
-}
-```
-
-### Consumer with Idempotency
-
-```javascript
-async function startNotificationWorker() {
-  await channel.prefetch(10) // Process 10 messages concurrently
-
-  channel.consume('notification.send', async (msg) => {
-    const event = JSON.parse(msg.content.toString())
-
-    try {
-      // Idempotency check
-      const processed = await redis.get(`processed:${event.eventId}`)
-      if (processed) {
-        channel.ack(msg)
-        return
-      }
-
-      // Process notification
-      await sendNotification(event.data)
-
-      // Mark as processed (TTL 7 days)
-      await redis.setex(`processed:${event.eventId}`, 604800, '1')
-
-      channel.ack(msg)
-    } catch (error) {
-      console.error('Notification failed:', error)
-
-      // Retry up to 3 times, then dead-letter
-      const retries = (msg.properties.headers?.['x-retry-count'] || 0) + 1
-      if (retries < 3) {
-        channel.nack(msg, false, false) // Requeue with delay
-        await publishWithDelay(msg, retries)
-      } else {
-        channel.nack(msg, false, false) // Send to DLQ
-      }
-    }
-  })
-}
-```
-
-### Backpressure Handling
-
-```javascript
-// Producer-side rate limiting
-const Bottleneck = require('bottleneck')
-
-const limiter = new Bottleneck({
-  maxConcurrent: 100,
-  minTime: 10 // 100 messages per second max
-})
-
-async function publishWithBackpressure(exchange, routingKey, message) {
-  return limiter.schedule(() =>
-    channel.publish(exchange, routingKey, Buffer.from(JSON.stringify(message)))
-  )
-}
-
-// Consumer-side prefetch control
-async function startWorkerWithBackpressure() {
-  // Only fetch 5 messages at a time
-  await channel.prefetch(5)
-
-  // Monitor queue depth
-  const queueInfo = await channel.checkQueue('booking.events')
-  if (queueInfo.messageCount > 10000) {
-    console.warn('Queue backlog detected, scaling consumers')
-    metrics.gauge('queue.booking.depth', queueInfo.messageCount)
-  }
-}
-```
-
-### Background Jobs
-
-| Job | Trigger | Frequency | Purpose |
-|-----|---------|-----------|---------|
-| `cleanup-expired-bookings` | Cron | Every 15 min | Cancel unpaid pending bookings |
-| `aggregate-daily-stats` | Cron | Daily 3 AM | Roll up booking/revenue stats |
-| `warm-search-cache` | Queue | On listing update | Pre-populate popular searches |
-| `send-review-reminder` | Queue | 24h after checkout | Prompt guests to leave reviews |
-| `sync-elasticsearch` | Queue | On data change | Keep search index current |
-
-### Local Development Setup
-
-```yaml
-# docker-compose.yml addition for RabbitMQ
-services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI
-    environment:
-      RABBITMQ_DEFAULT_USER: airbnb
-      RABBITMQ_DEFAULT_PASS: airbnb_dev
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-```
-
-```bash
-# Environment variables
-RABBITMQ_URL=amqp://airbnb:airbnb_dev@localhost:5672
-QUEUE_PREFETCH=10
-QUEUE_RETRY_DELAY_MS=5000
-```
+**At production scale:**
+- Rate limiting per IP and per user (express-rate-limit or API Gateway)
+- CSRF protection for state-changing endpoints
+- Input validation and SQL injection prevention (parameterized queries throughout)
+- Content Security Policy headers
+- OAuth2 integration for social login (Google, Facebook, Apple)
 
 ---
 
 ## Observability
 
-### Metrics, Logs, and Traces Stack
+### Metrics (Prometheus via prom-client)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Grafana Dashboard                          │
-│     SLI visualization, alerts, service health                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Prometheus   │    │    Loki       │    │   Jaeger      │
-│   (Metrics)   │    │   (Logs)      │    │  (Traces)     │
-│               │    │               │    │               │
-│ - Counters    │    │ - Structured  │    │ - Spans       │
-│ - Gauges      │    │   JSON logs   │    │ - Service map │
-│ - Histograms  │    │ - Labels      │    │ - Latency     │
-└───────────────┘    └───────────────┘    └───────────────┘
-        ▲                     ▲                     ▲
-        │                     │                     │
-┌─────────────────────────────────────────────────────────────────┐
-│                    Application Services                         │
-│           prom-client + winston + opentelemetry                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+The system exposes a `/metrics` endpoint with these metric families:
 
-### Key Metrics
+**HTTP Metrics:**
+- `airbnb_http_request_duration_seconds` -- Histogram by method, route, status
+- `airbnb_http_requests_total` -- Counter by method, route, status
 
-```javascript
-const promClient = require('prom-client')
+**Business Metrics:**
+- `airbnb_search_latency_seconds` -- Histogram with labels: has_dates, has_location, result_count_bucket
+- `airbnb_searches_total` -- Counter with labels: has_dates, has_location
+- `airbnb_bookings_total` -- Counter by status, instant_book
+- `airbnb_booking_latency_seconds` -- Histogram by instant_book
+- `airbnb_booking_revenue_total` -- Counter in cents by property_type, city
+- `airbnb_booking_nights_total` -- Counter by property_type
+- `airbnb_availability_checks_total` -- Counter by available (true/false)
+- `airbnb_availability_check_latency_seconds` -- Histogram
 
-// Enable default metrics (CPU, memory, event loop)
-promClient.collectDefaultMetrics({ prefix: 'airbnb_' })
+**Infrastructure Metrics:**
+- `airbnb_cache_hits_total` / `airbnb_cache_misses_total` -- Counter by cache_type
+- `airbnb_cache_hit_ratio` -- Gauge by cache_type
+- `airbnb_queue_depth` -- Gauge by queue_name
+- `airbnb_queue_messages_published_total` / `airbnb_queue_messages_consumed_total` -- Counter
+- `airbnb_circuit_breaker_state` -- Gauge (0=closed, 1=open, 2=half-open) by service
+- `airbnb_db_query_duration_seconds` -- Histogram by operation, table
 
-// Custom business metrics
-const httpRequestDuration = new promClient.Histogram({
-  name: 'airbnb_http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
-})
+### Structured Logging (Pino)
 
-const bookingCounter = new promClient.Counter({
-  name: 'airbnb_bookings_total',
-  help: 'Total number of bookings',
-  labelNames: ['status', 'instant_book']
-})
+All logs are structured JSON with:
+- Request correlation IDs (`x-request-id` header, propagated through all log entries)
+- Module-scoped child loggers (`createModuleLogger('bookings')`)
+- Sensitive field redaction (passwords, tokens, cookies)
+- Performance warnings for slow operations (> 1 second)
+- Business event logging and security event logging
 
-const searchLatency = new promClient.Histogram({
-  name: 'airbnb_search_latency_seconds',
-  help: 'Search request latency',
-  labelNames: ['has_dates', 'has_guests'],
-  buckets: [0.05, 0.1, 0.2, 0.5, 1]
-})
+### Health Checks
 
-const cacheHitRatio = new promClient.Gauge({
-  name: 'airbnb_cache_hit_ratio',
-  help: 'Cache hit ratio by cache type',
-  labelNames: ['cache_type']
-})
+- `GET /health` -- Comprehensive check of PostgreSQL, Redis, RabbitMQ, and circuit breakers
+- `GET /ready` -- Kubernetes readiness probe (database connectivity)
+- `GET /live` -- Kubernetes liveness probe (process alive)
+- `GET /debug/circuit-breakers` -- Circuit breaker state inspection
 
-const queueDepth = new promClient.Gauge({
-  name: 'airbnb_queue_depth',
-  help: 'Number of messages in queue',
-  labelNames: ['queue_name']
-})
-```
+---
 
-### SLI Definitions and Targets
+## Failure Handling
 
-| SLI | Definition | Target | Alert Threshold |
-|-----|------------|--------|-----------------|
-| Availability | Successful requests / Total requests | 99.9% | < 99.5% for 5 min |
-| Search Latency | p95 of search response time | < 200ms | > 500ms for 5 min |
-| Booking Latency | p95 of booking confirmation time | < 1s | > 2s for 5 min |
-| Double-Booking Rate | Conflicting bookings / Total bookings | 0% | > 0 in 1 hour |
-| Cache Hit Rate | Cache hits / Total cache requests | > 80% | < 60% for 15 min |
-| Queue Lag | Time from publish to consume | < 30s | > 60s for 10 min |
+### Circuit Breakers (Opossum)
 
-### Structured Logging
+The system uses circuit breakers to prevent cascading failures:
 
-```javascript
-const winston = require('winston')
+| Circuit Breaker | Timeout | Error Threshold | Reset Timeout | Fallback |
+|-----------------|---------|-----------------|---------------|----------|
+| **Search** | 5s | 60% | 20s | Return empty results |
+| **Availability** | 3s | 40% | 15s | Assume unavailable (safe default) |
+| **Database** | 10s | 50% | 30s | No fallback (fail) |
+| **Notification** | 15s | 70% | 60s | Queue for later |
 
-const logger = winston.createLogger({
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  defaultMeta: { service: 'airbnb-api' },
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: 'logs/app.log' })
-  ]
-})
+The search circuit breaker is the most tolerant because search can gracefully degrade -- showing fewer results is better than showing an error page. The availability circuit breaker is stricter because falsely showing availability could lead to booking failures.
 
-// Request logging middleware
-function requestLogger(req, res, next) {
-  const start = Date.now()
-  const requestId = req.headers['x-request-id'] || generateUUID()
+### Queue Resilience (RabbitMQ)
 
-  req.requestId = requestId
-  res.setHeader('x-request-id', requestId)
+- **Dead-letter queues**: Messages that fail processing 3 times are routed to DLQ for manual inspection
+- **Idempotent consumers**: Each message has a unique `eventId`, and consumers track processed IDs in Redis (7-day TTL) to prevent duplicate processing
+- **Exponential backoff**: Failed message processing retries with delay: 5s, 10s, 20s (capped at 60s)
+- **Non-blocking publishing**: Booking creation succeeds even if queue publishing fails (logged as warning)
 
-  res.on('finish', () => {
-    const duration = Date.now() - start
-    logger.info('HTTP request', {
-      requestId,
-      method: req.method,
-      path: req.path,
-      status: res.statusCode,
-      duration,
-      userId: req.user?.id,
-      userAgent: req.headers['user-agent']
-    })
+### Graceful Shutdown
 
-    httpRequestDuration
-      .labels(req.method, req.route?.path || req.path, res.statusCode)
-      .observe(duration / 1000)
-  })
+The server handles `SIGTERM` and `SIGINT` by:
+1. Stopping acceptance of new connections
+2. Closing RabbitMQ connection
+3. Closing Redis connection
+4. Exiting process
 
-  next()
-}
-```
+---
 
-### Distributed Tracing
+## Scalability Considerations
 
-```javascript
-const { NodeSDK } = require('@opentelemetry/sdk-node')
-const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
-const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http')
-const { PgInstrumentation } = require('@opentelemetry/instrumentation-pg')
+### What Breaks First
 
-const sdk = new NodeSDK({
-  serviceName: 'airbnb-api',
-  traceExporter: new JaegerExporter({
-    endpoint: 'http://localhost:14268/api/traces'
-  }),
-  instrumentations: [
-    new HttpInstrumentation(),
-    new PgInstrumentation()
-  ]
-})
+| Component | Bottleneck | Solution |
+|-----------|-----------|----------|
+| **Search** | Single PostgreSQL can't handle 50M queries/day | Elasticsearch cluster with read replicas |
+| **Booking writes** | Hot listings under high demand | Pessimistic locking limits throughput per listing; acceptable since bookings are per-listing |
+| **Photo storage** | Disk space and bandwidth | S3 + CDN; direct upload bypasses API servers |
+| **Availability sync** | Stale search results after booking | CDC pipeline with < 5s latency |
+| **Message volume** | Large conversation tables | Partition messages by conversation_id; archive old messages |
 
-sdk.start()
+### Horizontal Scaling Path
 
-// Manual span for business logic
-const { trace } = require('@opentelemetry/api')
+1. **API servers**: Stateless, scale horizontally behind load balancer (already supports running on ports 3001-3003)
+2. **PostgreSQL**: Read replicas for search/listing reads, primary for writes. Consider partitioning listings by region at extreme scale
+3. **Redis**: Redis Cluster for session distribution across instances
+4. **Elasticsearch**: Multi-shard index with replicas per availability zone
+5. **Workers**: Scale consumer count per queue independently
 
-async function createBooking(listingId, guestId, dates) {
-  const tracer = trace.getTracer('booking-service')
+### Database Sharding Strategy (Extreme Scale)
 
-  return tracer.startActiveSpan('createBooking', async (span) => {
-    try {
-      span.setAttributes({
-        'booking.listing_id': listingId,
-        'booking.guest_id': guestId,
-        'booking.check_in': dates.checkIn,
-        'booking.check_out': dates.checkOut
-      })
-
-      const booking = await executeBookingTransaction(listingId, guestId, dates)
-
-      span.setAttributes({ 'booking.id': booking.id })
-      return booking
-    } catch (error) {
-      span.recordException(error)
-      span.setStatus({ code: 2, message: error.message })
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### Audit Logging
-
-```javascript
-// Audit log for sensitive operations
-const auditLogger = winston.createLogger({
-  format: winston.format.json(),
-  transports: [
-    new winston.transports.File({ filename: 'logs/audit.log' })
-  ]
-})
-
-async function logAuditEvent(event) {
-  const auditEntry = {
-    timestamp: new Date().toISOString(),
-    eventType: event.type,
-    actor: {
-      userId: event.userId,
-      ip: event.ip,
-      userAgent: event.userAgent
-    },
-    resource: {
-      type: event.resourceType,
-      id: event.resourceId
-    },
-    action: event.action,
-    outcome: event.outcome,
-    metadata: event.metadata
-  }
-
-  auditLogger.info('audit', auditEntry)
-
-  // Also persist to database for querying
-  await db('audit_logs').insert({
-    event_type: event.type,
-    user_id: event.userId,
-    resource_type: event.resourceType,
-    resource_id: event.resourceId,
-    action: event.action,
-    outcome: event.outcome,
-    metadata: JSON.stringify(event.metadata),
-    ip_address: event.ip,
-    created_at: new Date()
-  })
-}
-
-// Usage in booking flow
-async function createBookingWithAudit(req, listingId, guestId, dates) {
-  try {
-    const booking = await createBooking(listingId, guestId, dates)
-
-    await logAuditEvent({
-      type: 'booking.created',
-      userId: guestId,
-      ip: req.ip,
-      userAgent: req.headers['user-agent'],
-      resourceType: 'booking',
-      resourceId: booking.id,
-      action: 'create',
-      outcome: 'success',
-      metadata: { listingId, checkIn: dates.checkIn, checkOut: dates.checkOut }
-    })
-
-    return booking
-  } catch (error) {
-    await logAuditEvent({
-      type: 'booking.failed',
-      userId: guestId,
-      ip: req.ip,
-      userAgent: req.headers['user-agent'],
-      resourceType: 'listing',
-      resourceId: listingId,
-      action: 'create',
-      outcome: 'failure',
-      metadata: { error: error.message }
-    })
-
-    throw error
-  }
-}
-```
-
-### Alert Rules (Prometheus)
-
-```yaml
-# prometheus/alerts.yml
-groups:
-  - name: airbnb-slis
-    rules:
-      - alert: HighErrorRate
-        expr: |
-          sum(rate(airbnb_http_request_duration_seconds_count{status=~"5.."}[5m]))
-          / sum(rate(airbnb_http_request_duration_seconds_count[5m])) > 0.005
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: Error rate above 0.5% for 5 minutes
-
-      - alert: SearchLatencyHigh
-        expr: |
-          histogram_quantile(0.95,
-            sum(rate(airbnb_search_latency_seconds_bucket[5m])) by (le)
-          ) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: Search p95 latency above 500ms
-
-      - alert: BookingLatencyHigh
-        expr: |
-          histogram_quantile(0.95,
-            sum(rate(airbnb_http_request_duration_seconds_bucket{route="/api/bookings"}[5m])) by (le)
-          ) > 2
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: Booking p95 latency above 2s
-
-      - alert: CacheHitRateLow
-        expr: airbnb_cache_hit_ratio{cache_type="listing"} < 0.6
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: Cache hit rate below 60%
-
-      - alert: QueueBacklogHigh
-        expr: airbnb_queue_depth{queue_name="booking.events"} > 10000
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: Queue depth exceeds 10k messages
-```
-
-### Local Development Setup
-
-```yaml
-# docker-compose.yml addition for observability
-services:
-  prometheus:
-    image: prom/prometheus:v2.45.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus:/etc/prometheus
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-
-  grafana:
-    image: grafana/grafana:10.0.0
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./grafana/datasources:/etc/grafana/provisioning/datasources
-
-  loki:
-    image: grafana/loki:2.8.0
-    ports:
-      - "3100:3100"
-    volumes:
-      - loki_data:/loki
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.47
-    ports:
-      - "16686:16686" # UI
-      - "14268:14268" # Collector
-
-volumes:
-  prometheus_data:
-  grafana_data:
-  loki_data:
-```
-
-```bash
-# Environment variables
-PROMETHEUS_METRICS_PORT=9091
-JAEGER_ENDPOINT=http://localhost:14268/api/traces
-LOKI_URL=http://localhost:3100
-LOG_LEVEL=info
-ENABLE_AUDIT_LOGGING=true
-```
+At 100M+ listings, shard by geographic region:
+- **Listings**: Shard by country/region (searches are always geo-scoped)
+- **Bookings**: Shard by listing_id (co-locate with listing data)
+- **Users**: Keep in a single database or shard by user_id hash
+- **Messages**: Shard by conversation_id
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Calendar | Date ranges | Day-by-day | Storage efficiency |
-| Geo search | PostGIS | Elasticsearch geo | Simplicity |
-| Double-booking | Transaction lock | Distributed lock | Single DB is simpler |
-| Reviews | Hidden until both submit | Immediate | Fairness |
-| Caching | Cache-aside + write-through | Write-behind | Simpler invalidation, acceptable latency |
-| Cache store | Valkey/Redis | Memcached | Richer data types, pub/sub for invalidation |
-| Message queue | RabbitMQ | Kafka | Simpler setup, sufficient for booking throughput |
-| Delivery semantics | At-least-once + idempotency | Exactly-once | Simpler, reliable with dedup |
-| Tracing | OpenTelemetry + Jaeger | Zipkin | Vendor-neutral, better ecosystem |
-| Logging | Structured JSON | Plain text | Query-friendly, Loki/ELK compatible |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Availability storage | Date ranges | Day-by-day rows | 18x fewer rows; overlap queries efficient with OVERLAPS |
+| Search engine | Elasticsearch (prod) / PostGIS (local) | PostGIS only | ES handles faceted geo search at scale; PostGIS sufficient locally |
+| Booking concurrency | Pessimistic locking (FOR UPDATE) | Optimistic locking (version) | Correctness over throughput; prevents payment hold on doomed bookings |
+| Review visibility | Mutual reveal | Immediate publish | Prevents retaliation; encourages honest reviews |
+| Session storage | Redis + cookie | JWT | Immediate revocation, simpler token management |
+| Message queue | Kafka (prod) / RabbitMQ (local) | Direct calls | Decouples services; enables retry and dead-letter handling |
+| Photo upload | Pre-signed S3 URL (prod) / multer disk (local) | Proxy through API | Avoids API server bandwidth bottleneck |
+| Calendar pricing | Override per date range | Separate pricing table | Fewer joins; price_per_night on availability_blocks is simple |
+| Auth | Session-based | OAuth2/JWT | Simpler for learning; easy revocation via Redis |
 
 ---
 
-## Implementation Notes
+# Layer 2: Pocket-Size Architecture (What We Actually Built)
 
-This section explains the **why** behind each major implementation decision for the caching, queue, observability, and reliability features.
+This section documents the actual local implementation -- what runs on `localhost` with Docker Compose.
 
-### Why Cache-Aside Reduces Database Load for Search-Heavy Workloads
-
-Airbnb is fundamentally a **read-heavy application**: users search for listings 100x more than they book. The search-to-booking ratio is typically 100:1 or higher, meaning for every booking, there are hundreds of searches and listing views.
-
-**Problem Without Caching:**
-- Each listing detail page fetches from PostgreSQL (listing + photos + reviews = 3 queries)
-- Each search hits PostGIS spatial indexes (CPU-intensive)
-- At scale (10M listings, 1M daily searches), database becomes the bottleneck
-
-**Why Cache-Aside (Lazy Loading):**
-1. **Only caches what's actually accessed** - Popular listings in Manhattan get cached; rural Montana cabin that's viewed once/month doesn't waste cache memory
-2. **Naturally handles cold start** - No need to pre-warm the cache; it populates organically as users browse
-3. **Simple invalidation** - Delete the key when data changes; next read repopulates
-4. **Graceful degradation** - If Redis is down, requests fall back to database (slower but works)
-
-**TTL Strategy:**
-- Listings: 15 minutes - Property details change infrequently; stale data is acceptable
-- Availability: 1 minute - Must be fresh to prevent booking conflicts
-- Search: 5 minutes - Slightly stale results are fine; exact availability verified at booking
-
-**Cache Invalidation Triggers:**
-```javascript
-// On listing update: delete listing cache + all search caches for that area
-await invalidateListingCache(listingId);
-
-// On booking: delete availability cache for that listing
-await invalidateAvailabilityCache(listingId);
-```
-
-**Measured Impact (Expected):**
-- Cache hit rate: 80%+ for popular listings
-- Database query reduction: 60-70%
-- Search latency improvement: 3x faster for cached results
-
----
-
-### Why Async Queues Enable Reliable Notification Delivery
-
-When a guest books a listing, multiple things need to happen:
-1. Block the dates in the calendar
-2. Charge the payment (future)
-3. Email the guest confirmation
-4. Push notification to the host
-5. Update analytics/metrics
-6. Trigger review reminder scheduling
-
-**Problem With Synchronous Processing:**
-- Booking API becomes slow (waiting for email, push, etc.)
-- If email service is down, booking fails (bad UX)
-- No retry mechanism for transient failures
-- Traffic spikes overwhelm downstream services
-
-**Why RabbitMQ (Message Queue):**
-
-1. **Decoupling** - Booking service publishes event and returns immediately; notification workers consume asynchronously
-   ```javascript
-   // Booking completes in <500ms
-   await publishBookingCreated(booking, listing);
-   res.status(201).json({ booking }); // User sees success immediately
-
-   // Separately, workers process notifications (can take 5-10 seconds)
-   ```
-
-2. **Reliability (At-Least-Once Delivery)** - Messages persist until acknowledged
-   - If worker crashes mid-processing, message is redelivered
-   - Dead-letter queue captures permanently failed messages for investigation
-
-3. **Backpressure Handling** - Queue absorbs traffic spikes
-   - Black Friday: 10x normal booking volume
-   - Queue buffers the spike; workers process at sustainable rate
-   - Users see fast booking responses; notifications may be delayed 30 seconds
-
-4. **Retry with Exponential Backoff:**
-   ```javascript
-   // Retry 1: 5 seconds
-   // Retry 2: 10 seconds
-   // Retry 3: 20 seconds
-   // Then: Dead-letter queue
-   ```
-
-5. **Idempotency Protection:**
-   ```javascript
-   // Track processed message IDs in Redis (TTL 7 days)
-   if (await redis.get(`processed:${eventId}`)) {
-     channel.ack(msg); // Already processed, skip
-     return;
-   }
-   ```
-
-**Queue Design:**
-| Queue | Purpose | Consumers |
-|-------|---------|-----------|
-| `booking.events` | Booking lifecycle | Notification, Analytics |
-| `host.alerts` | Host notifications | Push, Email workers |
-| `notification.send` | All notification types | Email, SMS, Push workers |
-
----
-
-### Why Audit Logging Enables Dispute Resolution
-
-Airbnb handles money and trust. When disputes arise, clear evidence is essential:
-- "I never cancelled that booking!" - Audit log shows IP, timestamp, session
-- "The host changed the price after I booked!" - Audit log shows before/after state
-- "Someone hacked my account and booked!" - Audit log shows unusual IP/device
-
-**What We Log:**
-```javascript
-{
-  event_type: 'booking.cancelled',
-  user_id: 123,
-  resource_type: 'booking',
-  resource_id: 456,
-  action: 'cancel',
-  outcome: 'success',
-  ip_address: '192.168.1.1',
-  user_agent: 'Mozilla/5.0...',
-  session_id: 'sess_abc123',
-  request_id: 'req_xyz789',  // For tracing
-  metadata: { cancelledBy: 'guest', reason: 'schedule_change' },
-  before_state: { status: 'confirmed', ... },
-  after_state: { status: 'cancelled', cancelled_at: '2025-01-15T10:30:00Z' },
-  created_at: '2025-01-15T10:30:00.123Z'
-}
-```
-
-**Use Cases:**
-
-1. **Dispute Resolution** - Customer service can pull complete history:
-   ```sql
-   SELECT * FROM audit_logs
-   WHERE resource_type = 'booking' AND resource_id = 456
-   ORDER BY created_at;
-   ```
-
-2. **Fraud Detection** - Identify suspicious patterns:
-   ```sql
-   -- Multiple cancellations from same IP
-   SELECT ip_address, COUNT(*) FROM audit_logs
-   WHERE event_type = 'booking.cancelled'
-   GROUP BY ip_address HAVING COUNT(*) > 10;
-   ```
-
-3. **Compliance** - Required for financial regulations:
-   - Who approved the refund?
-   - When was personal data accessed?
-   - Who modified the listing price?
-
-4. **Debugging** - Trace issues through request_id:
-   ```sql
-   SELECT * FROM audit_logs WHERE request_id = 'req_xyz789';
-   ```
-
-**Storage Strategy:**
-- Hot data (30 days): PostgreSQL `audit_logs` table with indexes
-- Cold data (1+ year): Archive to S3/object storage for compliance
-
----
-
-### Why Metrics Enable Pricing Optimization
-
-Airbnb's business depends on understanding user behavior to optimize pricing, search ranking, and conversion rates.
-
-**Business Questions Metrics Answer:**
-
-1. **Are hosts pricing correctly?**
-   ```promql
-   # Average revenue per property type
-   sum(rate(airbnb_booking_revenue_total[24h])) by (property_type)
-   / sum(rate(airbnb_bookings_total{status="confirmed"}[24h])) by (property_type)
-   ```
-   If cabins have lower revenue/booking than apartments, recommend hosts adjust pricing.
-
-2. **What's our search-to-booking conversion?**
-   ```promql
-   rate(airbnb_bookings_total[1h]) / rate(airbnb_searches_total[1h])
-   ```
-   If conversion drops, investigate search ranking algorithm.
-
-3. **Where are users dropping off?**
-   ```promql
-   # Availability checks vs actual bookings
-   rate(airbnb_availability_checks_total{available="true"}[1h])
-   / rate(airbnb_bookings_total[1h])
-   ```
-   High availability check rate with low booking rate = pricing or UX issue.
-
-4. **Is the system healthy for users?**
-   ```promql
-   # Search latency p95
-   histogram_quantile(0.95, rate(airbnb_search_latency_seconds_bucket[5m]))
-
-   # Alert if > 500ms
-   ```
-
-**Metrics We Track:**
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `airbnb_bookings_total` | Counter | Conversion tracking, revenue |
-| `airbnb_booking_revenue_total` | Counter | Revenue by property type, city |
-| `airbnb_booking_nights_total` | Counter | Average stay length trends |
-| `airbnb_searches_total` | Counter | Demand patterns, geographic trends |
-| `airbnb_search_latency_seconds` | Histogram | Performance SLI |
-| `airbnb_availability_checks_total` | Counter | Demand/supply matching |
-| `airbnb_cache_hits_total` | Counter | Infrastructure efficiency |
-
-**Pricing Optimization Flow:**
-1. Collect booking/search metrics per location + property type
-2. Build demand model (searches per available night)
-3. Recommend price adjustments to hosts
-4. A/B test pricing suggestions
-5. Measure conversion rate changes
-
-**SLI/SLO Dashboard Example:**
-```
-| SLI | Target | Current | Alert |
-|-----|--------|---------|-------|
-| Search p95 | < 200ms | 145ms | OK |
-| Booking success rate | > 99% | 99.7% | OK |
-| Cache hit ratio | > 80% | 82% | OK |
-| Queue lag | < 30s | 5s | OK |
-```
-
----
-
-## Frontend Architecture
-
-The React frontend follows a modular architecture with clear separation of concerns. This section describes the component organization and patterns used.
-
-### Directory Structure
+## Local Architecture Diagram
 
 ```
-frontend/src/
-├── components/                    # Reusable UI components
-│   ├── BookingWidget.tsx          # Booking form with calendar
-│   ├── Calendar.tsx               # Date selection calendar
-│   ├── Header.tsx                 # Site navigation header
-│   ├── ListingCard.tsx            # Listing preview card
-│   ├── SearchBar.tsx              # Search input with filters
-│   └── listing-form/              # Multi-step listing creation wizard
-│       ├── index.ts               # Barrel export for all components
-│       ├── types.ts               # Shared types and constants
-│       ├── useListingForm.ts      # Form state management hook
-│       ├── ProgressIndicator.tsx  # Step progress visualization
-│       ├── StepBasicInfo.tsx      # Step 1: Property type, title
-│       ├── StepLocation.tsx       # Step 2: Address, coordinates
-│       ├── StepDetails.tsx        # Step 3: Capacity, amenities
-│       └── StepPricing.tsx        # Step 4: Price, booking settings
-├── hooks/                         # Custom React hooks
-├── routes/                        # Page components (Tanstack Router)
-│   ├── __root.tsx                 # Root layout with Header
-│   ├── index.tsx                  # Home page
-│   ├── search.tsx                 # Search results
-│   ├── listing.$id.tsx            # Listing detail page
-│   ├── trips.tsx                  # Guest trip history
-│   ├── messages.tsx               # Conversations
-│   └── host/                      # Host-specific pages
-│       ├── listings.tsx           # Manage listings
-│       ├── listings.new.tsx       # Create new listing (wizard)
-│       └── reservations.tsx       # Manage reservations
-├── services/                      # API client functions
-│   └── api.ts                     # Centralized API calls
-├── stores/                        # Zustand state stores
-│   └── authStore.ts               # Authentication state
-├── types/                         # TypeScript type definitions
-│   └── index.ts                   # Shared types (Listing, Booking, etc.)
-└── utils/                         # Helper functions
-    └── helpers.ts                 # Formatters, label mappers
+┌──────────────────────────────────────────────────────┐
+│           Frontend (React + Vite + TanStack Router)  │
+│                  localhost:5173                       │
+│                                                       │
+│  Routes: / (home), /search, /listing/:id,            │
+│  /booking/:id, /trips, /messages, /login, /register, │
+│  /host/listings, /host/reservations, /become-host,   │
+│  /host/listings/new                                   │
+└───────────────────────┬──────────────────────────────┘
+                        │ HTTP (fetch)
+                        ▼
+┌──────────────────────────────────────────────────────┐
+│        Backend (Express, single monolith)             │
+│              localhost:3000                            │
+│                                                       │
+│  Routes: /api/auth, /api/listings, /api/search,      │
+│          /api/bookings, /api/reviews, /api/messages   │
+│  Shared: cache, metrics, logger, queue, audit,       │
+│          circuitBreaker                               │
+│  Workers: booking, notification, analytics            │
+│  Endpoints: /health, /ready, /live, /metrics          │
+└──┬──────────────┬────────────────┬───────────────────┘
+   │              │                │
+   ▼              ▼                ▼
+┌──────────┐ ┌──────────┐  ┌─────────────┐
+│PostgreSQL│ │  Valkey   │  │  RabbitMQ   │
+│+ PostGIS │ │  (Redis)  │  │             │
+│ :5432    │ │  :6379    │  │ :5672/:15672│
+└──────────┘ └──────────┘  └─────────────┘
 ```
 
-### Component Organization Principles
+## What Actually Exists
 
-#### 1. Feature-Based Grouping
+### Backend (Node.js + Express + TypeScript)
 
-Related components are grouped into feature directories with barrel exports:
+A single Express monolith with route-based separation (not separate microservices):
 
-```typescript
-// Import from feature directory
-import {
-  StepBasicInfo,
-  StepLocation,
-  useListingForm,
-  PROPERTY_TYPES,
-} from '../components/listing-form';
-```
+- **Auth routes** (`src/routes/auth.ts`): Register, login, logout, session management with Redis-backed sessions and PostgreSQL backup
+- **Listing routes** (`src/routes/listings.ts`): Full CRUD, photo upload via multer to local disk, availability calendar with overlap-aware split/merge logic, cache-aside pattern for listing detail
+- **Search routes** (`src/routes/search.ts`): PostGIS `ST_DWithin` geo queries with faceted filtering (price, property type, room type, amenities, guest count, bedrooms, beds, bathrooms), availability date filtering via OVERLAPS, sort by relevance/price/rating/distance, circuit breaker wrapping, search result caching
+- **Booking routes** (`src/routes/bookings.ts`): Double-booking prevention via `SELECT ... FOR UPDATE` + availability OVERLAPS check within transaction, instant-book vs request-to-book, host confirm/decline, cancellation with date release, booking completion
+- **Review routes** (`src/routes/reviews.ts`): Two-sided review creation for completed bookings, review status checking, listing and user review queries
+- **Message routes** (`src/routes/messages.ts`): Conversation creation/retrieval, message sending, unread count, automatic read marking
 
-#### 2. Custom Hooks for State Logic
+**Shared modules** (`src/shared/`):
+- `cache.ts` -- Redis cache-aside pattern with TTL-based invalidation for listings (15m), availability (1m), search (5m)
+- `metrics.ts` -- Full Prometheus metric suite (HTTP, business, cache, queue, circuit breaker, database metrics)
+- `logger.ts` -- Pino structured JSON logging with request IDs, module scoping, field redaction
+- `circuitBreaker.ts` -- Opossum circuit breakers for search, availability, database, notifications
+- `queue.ts` -- RabbitMQ with topic exchange, dead-letter queues, idempotent consumers
+- `audit.ts` -- Comprehensive audit logging to PostgreSQL with before/after state capture
 
-Complex state management is extracted into custom hooks:
+**Workers** (`src/workers/`):
+- `booking-worker.ts` -- Processes booking lifecycle events (created, confirmed, cancelled, completed)
+- `notification-worker.ts` -- Handles notification delivery
+- `analytics-worker.ts` -- Processes analytics events
 
-```typescript
-// useListingForm.ts encapsulates:
-// - Multi-step navigation
-// - Form field state
-// - Validation logic
-// - API submission
-const { step, formData, updateField, submitForm } = useListingForm();
-```
+### Frontend (React + TypeScript + Vite + TanStack Router + Tailwind CSS)
 
-#### 3. Prop Interfaces with JSDoc
+- **Home page** (`routes/index.tsx`): Featured listings grid
+- **Search page** (`routes/search.tsx`): Search with filter bar (location, dates, guests, price, amenities)
+- **Listing detail** (`routes/listing.$id.tsx`): Photo gallery, booking widget, reviews, host info
+- **Booking detail** (`routes/booking.$id.tsx`): Booking confirmation/status page
+- **Guest trips** (`routes/trips.tsx`): Guest's booking history
+- **Messaging** (`routes/messages.tsx`): Conversation list and message thread
+- **Host dashboard** (`routes/host/listings.tsx`, `routes/host/reservations.tsx`): Manage listings and incoming reservations
+- **Create listing** (`routes/host/listings.new.tsx`): Multi-step listing creation form with progress indicator
+- **Become host** (`routes/become-host.tsx`): Host onboarding page
+- **Auth** (`routes/login.tsx`, `routes/register.tsx`): Login and registration forms
 
-All components have documented props:
+**State management**: Zustand for auth state (`stores/authStore.ts`) and search state (`stores/searchStore.ts`)
 
-```typescript
-interface StepBasicInfoProps extends StepNavigationProps {
-  /** Current form data */
-  formData: ListingFormData;
-  /** Callback to update form fields */
-  onUpdate: <K extends keyof ListingFormData>(field: K, value: ListingFormData[K]) => void;
-}
-```
+### Infrastructure (Docker Compose)
 
-#### 4. Component Size Guidelines
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| PostgreSQL | `postgis/postgis:16-3.4` | 5432 | Primary database with PostGIS extension |
+| Valkey | `valkey/valkey:7-alpine` | 6379 | Session cache, listing/search cache, idempotency tracking |
+| RabbitMQ | `rabbitmq:3-management` | 5672/15672 | Event queue with management UI |
 
-- **Route components**: < 150 lines, orchestration only
-- **Feature components**: < 200 lines, single responsibility
-- **Shared components**: < 100 lines, highly reusable
+## Production-Grade Patterns Actually Implemented
 
-### State Management Strategy
+1. **Double-booking prevention** -- `SELECT ... FOR UPDATE` pessimistic locking within a PostgreSQL transaction, followed by OVERLAPS conflict check and atomic booking + availability block insertion. This is the same pattern used in production. See `src/routes/bookings.ts`.
 
-| State Type | Solution | Example |
-|------------|----------|---------|
-| Server data | React Query / useEffect | Listings, bookings |
-| Auth state | Zustand store | Current user, session |
-| Form state | Custom hook / useState | Listing creation wizard |
-| UI state | Local useState | Modal open, tab selection |
+2. **Cache-aside with targeted invalidation** -- Listings, availability, and search results are cached in Redis with TTL. When a booking is created, both the availability cache for that listing and all search result caches are invalidated. See `src/shared/cache.ts`.
 
-### Multi-Step Form Pattern
+3. **Circuit breakers (Opossum)** -- Search queries are wrapped in a circuit breaker that returns empty results when the database is overloaded. Availability checks fail-safe (assume unavailable). Each breaker tracks state via Prometheus metrics. See `src/shared/circuitBreaker.ts`.
 
-The listing creation wizard demonstrates the pattern for complex forms:
+4. **Prometheus metrics (prom-client)** -- Full metric suite covering HTTP latency, search performance, booking counts/revenue, cache hit ratios, queue depths, and circuit breaker states. Scrapeable at `/metrics`. See `src/shared/metrics.ts`.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  NewListingPage                         │
-│  (Route component - orchestrates steps)                 │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │              useListingForm Hook                 │   │
-│  │  - step state                                    │   │
-│  │  - formData state                                │   │
-│  │  - navigation functions                          │   │
-│  │  - submit function                               │   │
-│  └─────────────────────────────────────────────────┘   │
-│                                                         │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
-│  │  Step 1  │ │  Step 2  │ │  Step 3  │ │  Step 4  │  │
-│  │ BasicInfo│ │ Location │ │ Details  │ │ Pricing  │  │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
-│       ▲            ▲            ▲            ▲         │
-│       │            │            │            │         │
-│       └────────────┴────────────┴────────────┘         │
-│              Shared: formData, onUpdate                 │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
+5. **Structured logging (Pino)** -- JSON logs with request correlation IDs, module-scoped loggers, automatic sensitive field redaction, performance warnings for slow queries. See `src/shared/logger.ts`.
 
-### Testing Strategy (Planned)
+6. **Async event processing (RabbitMQ)** -- Booking events are published to a topic exchange and consumed by background workers for analytics, notifications, and search reindexing. Dead-letter queues capture failed messages. Idempotent consumers prevent duplicate processing via Redis-tracked event IDs. See `src/shared/queue.ts` and `src/workers/`.
 
-| Layer | Tool | Coverage |
-|-------|------|----------|
-| Components | Vitest + Testing Library | User interactions |
-| Hooks | Vitest | State transitions |
-| API calls | MSW | Mock server responses |
-| E2E | Playwright | Critical user flows |
+7. **Audit trail** -- Every booking and listing operation is logged to the `audit_logs` table with before/after state, IP address, user agent, and request ID for distributed tracing correlation. See `src/shared/audit.ts`.
 
----
+8. **Health checks** -- Three-tier health checking: `/health` (comprehensive with PostgreSQL + Redis + RabbitMQ + circuit breakers), `/ready` (database connectivity for Kubernetes readiness), `/live` (process liveness). See `src/index.ts`.
 
-### Circuit Breaker for Resilience
+9. **Graceful shutdown** -- Signal handlers for SIGTERM/SIGINT that close RabbitMQ and Redis connections before exiting. See `src/index.ts`.
 
-The circuit breaker pattern prevents cascading failures when dependent services fail.
+10. **Availability split/merge logic** -- When a host blocks dates that overlap existing availability blocks, the system correctly splits ranges (handles before/after portions) within a transaction. See `src/routes/listings.ts`.
 
-**Problem Scenario:**
-1. PostgreSQL has high latency due to a slow query
-2. All API requests wait, connection pool exhausts
-3. Health checks fail, load balancer marks all instances unhealthy
-4. Complete outage
+## What Was Simplified or Substituted
 
-**Circuit Breaker Solution:**
-```javascript
-// If 50% of requests fail over 10 seconds, open the circuit
-const breaker = createCircuitBreaker('search', searchFn, {
-  errorThresholdPercentage: 50,
-  resetTimeout: 30000, // Try again after 30 seconds
-});
+| Production | Local Implementation |
+|------------|---------------------|
+| Elasticsearch for search | PostGIS queries directly on PostgreSQL |
+| S3 + CDN for photos | multer disk storage at `./uploads/listings/` |
+| Stripe payment integration | No payment processing; price calculated but not charged |
+| OAuth2 / social login | Session-based auth with bcrypt passwords |
+| WebSocket messaging | HTTP polling (no real-time push) |
+| Multi-service architecture | Single Express monolith with route separation |
+| Kafka for event streaming | RabbitMQ (simpler setup, sufficient for local) |
+| Pre-signed upload URLs | Direct multipart upload through API server |
+| Image optimization pipeline | Raw image storage, no thumbnails or format conversion |
 
-// When circuit is open, return fallback immediately
-breaker.fallback(() => ({ listings: [], fromFallback: true }));
-```
+## What Was Omitted
 
-**States:**
-- **CLOSED** - Normal operation, requests go through
-- **OPEN** - Too many failures, fail immediately with fallback
-- **HALF-OPEN** - Testing if service recovered
-
-**Configured Breakers:**
-| Service | Timeout | Threshold | Fallback |
-|---------|---------|-----------|----------|
-| Search | 5s | 60% failures | Empty results |
-| Availability | 3s | 40% failures | "Unavailable" |
-| Notifications | 15s | 70% failures | Queue for retry |
-
-This prevents one slow query from taking down the entire API.
+- **CDN**: No content delivery network; static files served directly from Vite dev server and Express
+- **Multi-region deployment**: Single instance, no geo-routing or cross-region replication
+- **Kubernetes**: No container orchestration; runs directly with `tsx watch`
+- **Database sharding**: Single PostgreSQL instance handles everything
+- **Smart pricing ML pipeline**: No dynamic pricing; hosts set flat rates with optional per-range overrides
+- **Full-text search**: Location search uses `ILIKE` pattern matching, not full-text indexing
+- **Content moderation**: No image or text moderation pipeline
+- **Push notifications**: No mobile push; workers log events but don't send real notifications
+- **Rate limiting**: No request rate limiting middleware
+- **Review window expiration**: No 14-day auto-publish for single-sided reviews
+- **Payment ledger**: No double-entry bookkeeping or financial reconciliation
+- **Admin dashboard**: Auth middleware exists (`requireAdmin`) but no admin UI

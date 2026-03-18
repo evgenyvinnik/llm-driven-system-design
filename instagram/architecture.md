@@ -2,157 +2,194 @@
 
 ## System Overview
 
-A photo and video sharing social platform supporting photo uploads, personalized feeds, ephemeral stories, and direct messaging.
+A photo and video sharing social platform supporting photo uploads with filters, personalized feeds, ephemeral stories, direct messaging, and social graph interactions. This document describes two layers: a production-ready architecture for hundreds of millions of users, and the pocket-size implementation that actually runs locally.
+
+---
+
+# Layer 1: Production-Ready Architecture
+
+This section describes how Instagram would work at production scale -- hundreds of millions of daily active users, petabytes of media, and millions of requests per second.
 
 ## Requirements
 
 ### Functional Requirements
 
-- **Photo upload**: Users upload photos with captions, tags, and location; images are processed into multiple resolutions
-- **Feed**: Personalized timeline of posts from followed users, sorted by relevance/recency
-- **Stories**: Ephemeral 24-hour photo/video content with view tracking
-- **Direct messaging**: Private photo/text messages between users
+- **Photo/video upload**: Users upload media with captions, tags, location, and filters; media is processed into multiple resolutions and formats
+- **Personalized feed**: Timeline of posts from followed users, ranked by relevance signals (recency, engagement, relationship closeness)
+- **Stories**: Ephemeral 24-hour photo/video content with view tracking and auto-expiration
+- **Direct messaging**: Private text and media messages between users with read receipts and typing indicators
+- **Social graph**: Follow/unfollow, followers/following lists, mutual connections
+- **Engagement**: Likes, comments (with threading), saves/bookmarks
+- **Search**: Full-text search for users, hashtags, and locations
+- **Explore**: Discovery feed based on engagement signals and content similarity
+- **Notifications**: Push and in-app notifications for likes, comments, follows, DMs
 
 ### Non-Functional Requirements
 
-- **Scalability**: Support 10K DAU for local dev, architecture should scale horizontally to 10M+
-- **Availability**: 99.9% uptime target (8.76 hours downtime/year)
-- **Latency**: Feed load <200ms p95, photo upload acknowledgment <500ms p95, image serving <50ms p95 (CDN)
-- **Consistency**: Eventual consistency for feeds (acceptable 2-5 second delay), strong consistency for follows/unfollows and message delivery order
+- **Availability**: 99.99% uptime (52 minutes downtime/year)
+- **Latency**: Feed load p99 < 200ms, photo upload acknowledgment p99 < 500ms, image serving p99 < 50ms via CDN, DM delivery p99 < 100ms
+- **Scalability**: 500M+ DAU, 100M+ photo uploads/day, 1B+ feed requests/day
+- **Consistency**: Eventual consistency for feeds (2-5s delay acceptable), strong consistency for follows and message delivery order
+- **Durability**: Zero data loss for user-generated content, 99.999999999% (11 nines) object storage durability
 
 ## Capacity Estimation
 
-### Local Development Scale (Target)
+### Production Scale
 
 | Metric | Value | Calculation |
 |--------|-------|-------------|
-| Daily Active Users (DAU) | 10,000 | Local testing scale |
-| Posts per day | 5,000 | 50% of DAU post daily |
-| Average post size (original) | 2 MB | High-quality photo |
-| Average post size (processed) | 500 KB | Thumbnail + 2 resolutions |
-| Feed requests/day | 100,000 | 10 feed loads per user |
-| Peak RPS (feed) | 50 | 100K/day with 3x peak factor |
-| Peak RPS (upload) | 5 | 5K/day with 8-hour active window |
+| Daily Active Users (DAU) | 500M | Global user base |
+| Posts per day | 100M | ~20% of DAU post daily |
+| Stories per day | 500M | Stories are more frequent than posts |
+| Average post size (original) | 3 MB | High-resolution photos |
+| Average post size (processed, all sizes) | 1.5 MB | Thumbnail + 4 resolutions + WebP |
+| Feed requests/day | 5B | ~10 feed loads per user |
+| Peak QPS (feed) | 150K | 5B/day with 3x peak factor, 86400s |
+| Peak QPS (upload) | 5K | 100M/day concentrated in active hours |
+| DM messages/day | 10B | Average 20 messages per active user |
+| Peak QPS (DM) | 300K | 10B/day with 2.5x peak factor |
 
-### Storage Growth (Local Dev)
+### Storage Growth
 
-| Component | Daily Growth | Monthly Growth |
-|-----------|--------------|----------------|
-| Original images | 10 GB | 300 GB |
-| Processed images | 2.5 GB | 75 GB |
-| Database (metadata) | 50 MB | 1.5 GB |
-| Message storage | 100 MB | 3 GB |
+| Component | Daily Growth | Annual Growth |
+|-----------|-------------|---------------|
+| Original media | 300 TB | 110 PB |
+| Processed media | 150 TB | 55 PB |
+| Database (metadata) | 5 TB | 1.8 PB |
+| Message storage (Cassandra) | 10 TB | 3.6 PB |
+| CDN cache | 50 TB (hot set) | N/A (eviction-based) |
 
-### Component Sizing (Local)
+### Bandwidth
 
-| Component | Instances | Memory | Storage |
-|-----------|-----------|--------|---------|
-| API Server | 2-3 | 512 MB each | - |
-| PostgreSQL | 1 | 1 GB | 50 GB |
-| Valkey/Redis | 1 | 512 MB | - |
-| MinIO | 1 | 512 MB | 500 GB |
-| RabbitMQ | 1 | 256 MB | 1 GB |
-
-**Total local resource requirement**: <4 GB RAM, <600 GB storage
+| Direction | Peak | Calculation |
+|-----------|------|-------------|
+| Ingress (uploads) | 15 Gbps | 5K uploads/s x 3 MB |
+| Egress (feed + images) | 2 Tbps | 150K feed req/s x ~2 MB media per load |
+| CDN offload | ~90% | CDN serves cached media, origin handles 10% |
 
 ## High-Level Architecture
 
 ```
-                                    +------------------+
-                                    |   Load Balancer  |
-                                    |   (nginx:3000)   |
-                                    +--------+---------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-     +--------v--------+          +----------v---------+          +---------v--------+
-     |  API Server 1   |          |   API Server 2     |          |  API Server 3    |
-     |    (:3001)      |          |     (:3002)        |          |    (:3003)       |
-     +--------+--------+          +----------+---------+          +---------+--------+
-              |                              |                              |
-              +------------------------------+------------------------------+
-                                             |
-         +-----------------------------------+-----------------------------------+
-         |                   |                   |                   |           |
-+--------v--------+ +--------v--------+ +--------v--------+ +--------v--------+  |
-|   PostgreSQL    | |  Valkey/Redis   | |     MinIO       | |   RabbitMQ      |  |
-|    (:5432)      | |    (:6379)      | |    (:9000)      | |    (:5672)      |  |
-|   Primary DB    | |   Cache/Session | |  Object Store   | |  Task Queue     |  |
-+-----------------+ +-----------------+ +-----------------+ +-----------------+  |
-                                                                                  |
-                                                          +-----------------------+
-                                                          |
-                                                 +--------v--------+
-                                                 |  Image Worker   |
-                                                 |  (background)   |
-                                                 +-----------------+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                                    Clients                                           │
+│                    (iOS / Android / Web / Progressive Web App)                        │
+└─────────────────────────────────┬────────────────────────────────────────────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │          CDN              │
+                    │  (CloudFront / Cloudflare) │
+                    │  Static assets + media     │
+                    └─────────────┬─────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │       API Gateway          │
+                    │   (Rate limiting, auth,     │
+                    │    routing, SSL termination)│
+                    └─────────────┬─────────────┘
+                                  │
+          ┌───────────────────────┼───────────────────────┐
+          │                       │                       │
+┌─────────▼─────────┐  ┌─────────▼─────────┐  ┌─────────▼─────────┐
+│   Load Balancer   │  │   Load Balancer   │  │   Load Balancer   │
+│   (Feed + Social) │  │   (Media + Story) │  │   (DM + Notif)    │
+└─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
+          │                       │                       │
+┌─────────▼─────────┐  ┌─────────▼─────────┐  ┌─────────▼─────────┐
+│                   │  │                   │  │                   │
+│   Feed Service    │  │   Media Service   │  │    DM Service     │
+│   Social Service  │  │   Story Service   │  │  Notification Svc │
+│   Search Service  │  │   Processing Svc  │  │  Presence Service │
+│                   │  │                   │  │                   │
+└────────┬──────────┘  └────────┬──────────┘  └────────┬──────────┘
+         │                      │                       │
+         │         ┌────────────┼────────────┐          │
+         │         │            │            │          │
+┌────────▼────┐ ┌──▼──────┐ ┌──▼──────┐ ┌───▼────┐ ┌──▼─────────┐
+│ PostgreSQL  │ │  Redis  │ │  S3 /   │ │ Kafka  │ │ Cassandra  │
+│  Cluster    │ │ Cluster │ │ Object  │ │Cluster │ │  Cluster   │
+│ (sharded)   │ │ (feed,  │ │ Storage │ │(events)│ │  (DMs)     │
+│             │ │ session,│ │         │ │        │ │            │
+│             │ │ cache)  │ │         │ │        │ │            │
+└─────────────┘ └─────────┘ └─────────┘ └────────┘ └────────────┘
 ```
 
-### Request Flows
+## Service Decomposition
 
-#### Photo Upload Flow
+### Feed Service
 
-```
-1. Client → API Server: POST /api/v1/posts (multipart: image + metadata)
-2. API Server → MinIO: Store original image with UUID
-3. API Server → PostgreSQL: Create post record (status: 'processing')
-4. API Server → RabbitMQ: Enqueue image processing job
-5. API Server → Client: 202 Accepted {post_id, status: 'processing'}
-6. Image Worker ← RabbitMQ: Dequeue job
-7. Image Worker ← MinIO: Fetch original image
-8. Image Worker: Generate resolutions (thumbnail: 150x150, small: 320x320, medium: 640x640, large: 1080x1080)
-9. Image Worker → MinIO: Store processed images
-10. Image Worker → PostgreSQL: Update post (status: 'published', image_urls)
-11. Image Worker → RabbitMQ: Enqueue feed fanout job (optional for push model)
-```
+Responsible for generating and serving personalized feeds. Uses a hybrid push/pull model:
 
-#### Feed Load Flow
+- **Fan-out on write** for users with < 10K followers: When a user posts, the post ID is pushed to each follower's precomputed timeline in Redis. This gives instant feed reads for the majority of users.
+- **Fan-out on read** for celebrities (> 10K followers): Celebrity posts are not fanned out. Instead, when a follower loads their feed, the system merges their precomputed timeline with recent posts from celebrities they follow. This avoids writing to millions of timelines on a single post.
 
-```
-1. Client → API Server: GET /api/v1/feed?cursor=<timestamp>&limit=20
-2. API Server → Valkey: Check feed cache (key: feed:{user_id})
-3. If cache hit:
-   API Server → Client: Return cached feed
-4. If cache miss:
-   API Server → PostgreSQL: Query posts from followed users (pull model)
-     SELECT p.*, u.username, u.avatar_url
-     FROM posts p
-     JOIN follows f ON f.following_id = p.user_id
-     JOIN users u ON u.id = p.user_id
-     WHERE f.follower_id = $1 AND p.status = 'published' AND p.created_at < $cursor
-     ORDER BY p.created_at DESC
-     LIMIT 20
-5. API Server → Valkey: Cache result (TTL: 60s)
-6. API Server → Client: Return feed JSON
-```
+Feed ranking applies lightweight ML scoring: `score = w1 * recency + w2 * engagement_prediction + w3 * relationship_closeness`. The ranker runs at read time on the merged candidate set.
 
-#### Story View Flow
+### Media Service
 
-```
-1. Client → API Server: GET /api/v1/stories/feed
-2. API Server → Valkey: Get active story IDs for followed users
-3. API Server → PostgreSQL: Fetch story metadata (created_at > NOW() - 24 hours)
-4. API Server → Client: Return story ring data
-5. Client → API Server: POST /api/v1/stories/{id}/view
-6. API Server → PostgreSQL: Insert view record (deduplicated by user_id, story_id)
-```
+Handles upload, processing, and serving of photos and videos:
 
-### Core Components
+1. **Upload flow**: Client uploads to a pre-signed S3 URL (bypassing the API for large files). The API server receives the metadata and enqueues a processing job.
+2. **Processing pipeline**: A fleet of GPU/CPU workers consumes from the processing queue:
+   - Validate format (JPEG, PNG, WebP, HEIC, AVIF)
+   - Strip EXIF data for privacy
+   - Auto-orient based on EXIF rotation
+   - Generate 5 sizes: thumbnail (150x150), small (320x320), medium (640x640), large (1080x1080), original-aspect (2048 max dimension)
+   - Convert to WebP and AVIF for 30-50% size savings with JPEG fallback
+   - Apply server-side filter effects when requested
+3. **Serving**: All processed media is served through CDN with cache headers (`Cache-Control: public, max-age=31536000, immutable`). Content-addressed keys ensure cache correctness.
 
-| Component | Responsibility | Technology |
-|-----------|----------------|------------|
-| API Server | REST endpoints, auth, request validation | Node.js + Express |
-| Image Worker | Resize images, generate thumbnails | Node.js + Sharp |
-| PostgreSQL | Users, posts, follows, stories | PostgreSQL 16 |
-| Cassandra | Direct messages, read receipts, typing indicators | Cassandra 4.1 |
-| Valkey | Session store, feed cache, rate limiting | Valkey 7.2 |
-| MinIO | Image storage (original + processed) | MinIO (S3-compatible) |
-| RabbitMQ | Async job queue for image processing | RabbitMQ 3.12 |
-| Load Balancer | Request distribution, health checks | nginx |
+### Story Service
 
-## Database Schema
+Manages ephemeral 24-hour content:
 
-### Database Schema
+- Stories have `expires_at = created_at + 24h` and are filtered at query time
+- Story tray (the ring of user avatars at the top) is cached per user with unseen stories sorted first
+- View tracking uses `INSERT ... ON CONFLICT DO NOTHING` for deduplication
+- A background cron job runs every 15 minutes to hard-delete expired stories and their media from S3
+- Story media uses the same processing pipeline as posts but with fewer sizes (medium + thumbnail only)
+
+### DM Service
+
+Real-time messaging service using WebSocket connections:
+
+- Persistent WebSocket connections (via Socket.io or custom WS layer) for message delivery, typing indicators, and read receipts
+- Messages stored in Cassandra, partitioned by `conversation_id` with `TimeUUID` clustering keys for natural time ordering
+- Cassandra's high write throughput handles the 300K+ QPS for DM writes
+- Typing indicators use Cassandra TTL (5 seconds) -- no explicit cleanup needed
+- Read receipts update a per-user-per-conversation counter
+- Fallback to HTTP polling when WebSocket connections drop
+
+### Notification Service
+
+Delivers push and in-app notifications:
+
+- Consumes events from Kafka (new_like, new_comment, new_follow, new_dm)
+- Deduplicates notifications (e.g., "alice and 5 others liked your post" instead of 6 separate notifications)
+- Routes to APNs (iOS), FCM (Android), and WebSocket (web) based on user device registration
+- Supports notification preferences (mute, DND schedules)
+- In-app notification feed stored in Redis sorted sets with 30-day retention
+
+### Search Service
+
+Full-text search powered by Elasticsearch:
+
+- User search by username, display name (fuzzy matching, prefix completion)
+- Hashtag search with trending aggregation
+- Location search with geo-queries
+- Index updates propagated via Kafka CDC (Change Data Capture) from PostgreSQL
+- Autocomplete uses edge-ngram tokenizers for sub-100ms response times
+
+## Database Design at Scale
+
+### PostgreSQL (Relational Metadata)
+
+PostgreSQL handles ACID-critical data: users, posts, follows, likes, comments, stories.
+
+**Sharding strategy**: Hash-based sharding by `user_id` across 256 logical shards mapped to physical database clusters. This ensures all data for a single user is co-located (posts, likes, follows where the user is the actor).
+
+**Read replicas**: Each shard has 2-3 read replicas. Feed generation queries hit replicas; writes go to the primary. Replication lag is monitored and queries requiring strong consistency are routed to the primary.
+
+**Key tables**:
 
 ```sql
 -- Users table
@@ -163,14 +200,15 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     display_name VARCHAR(100),
     bio TEXT,
-    avatar_url VARCHAR(500),
+    profile_picture_url VARCHAR(500),
     is_private BOOLEAN DEFAULT FALSE,
-    is_admin BOOLEAN DEFAULT FALSE,
+    follower_count INTEGER DEFAULT 0,
+    following_count INTEGER DEFAULT 0,
+    post_count INTEGER DEFAULT 0,
+    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_users_username ON users(username);
-CREATE INDEX idx_users_email ON users(email);
 
 -- Posts table
 CREATE TABLE posts (
@@ -178,35 +216,44 @@ CREATE TABLE posts (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     caption TEXT,
     location VARCHAR(255),
-    status VARCHAR(20) DEFAULT 'processing' CHECK (status IN ('processing', 'published', 'failed', 'deleted')),
-    original_url VARCHAR(500) NOT NULL,
-    thumbnail_url VARCHAR(500),
-    small_url VARCHAR(500),
-    medium_url VARCHAR(500),
-    large_url VARCHAR(500),
-    width INTEGER,
-    height INTEGER,
+    status VARCHAR(20) DEFAULT 'processing'
+        CHECK (status IN ('processing', 'published', 'failed')),
     like_count INTEGER DEFAULT 0,
     comment_count INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_posts_user_id ON posts(user_id);
-CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
-CREATE INDEX idx_posts_user_created ON posts(user_id, created_at DESC) WHERE status = 'published';
+CREATE INDEX idx_posts_user_created ON posts(user_id, created_at DESC);
 
--- Follows table (social graph)
+-- Post media (carousel support)
+CREATE TABLE post_media (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
+    media_url VARCHAR(500),
+    thumbnail_url VARCHAR(500),
+    original_key VARCHAR(500),
+    filter_applied VARCHAR(50),
+    width INTEGER,
+    height INTEGER,
+    order_index INTEGER DEFAULT 0,
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Social graph
 CREATE TABLE follows (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(follower_id, following_id)
+    UNIQUE(follower_id, following_id),
+    CHECK (follower_id != following_id)
 );
 CREATE INDEX idx_follows_follower ON follows(follower_id);
 CREATE INDEX idx_follows_following ON follows(following_id);
 
--- Likes table
+-- Likes with idempotency via UNIQUE constraint
 CREATE TABLE likes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -214,33 +261,34 @@ CREATE TABLE likes (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id, post_id)
 );
-CREATE INDEX idx_likes_post ON likes(post_id);
 
--- Comments table
+-- Comments with threading
 CREATE TABLE comments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    parent_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+    parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
     content TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    like_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_comments_post ON comments(post_id, created_at);
 
--- Stories table (ephemeral content)
+-- Stories (ephemeral, 24-hour)
 CREATE TABLE stories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     media_url VARCHAR(500) NOT NULL,
-    media_type VARCHAR(10) DEFAULT 'image' CHECK (media_type IN ('image', 'video')),
-    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
+    media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
+    thumbnail_url VARCHAR(500),
     view_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '24 hours')
 );
 CREATE INDEX idx_stories_user_expires ON stories(user_id, expires_at DESC);
-CREATE INDEX idx_stories_active ON stories(expires_at) WHERE expires_at > NOW();
 
--- Story views (for view tracking)
+-- Story views (deduplicated)
 CREATE TABLE story_views (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     story_id UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
@@ -248,34 +296,33 @@ CREATE TABLE story_views (
     viewed_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(story_id, viewer_id)
 );
-CREATE INDEX idx_story_views_story ON story_views(story_id);
 
--- Note: Direct Messages are stored in Cassandra, not PostgreSQL.
--- See Cassandra Schema section below for DM tables.
+-- Saved posts (bookmarks)
+CREATE TABLE saved_posts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, post_id)
+);
 ```
 
-### Cassandra Schema (Direct Messages)
+**Database triggers** maintain denormalized counts (follower_count, like_count, comment_count, post_count, story view_count) for efficient reads without expensive COUNT queries.
 
-Direct Messages are stored in Cassandra, not PostgreSQL. This design choice leverages Cassandra's strengths for high-write, time-ordered data while PostgreSQL handles the relational data (users, posts, follows).
+### Cassandra (Direct Messages)
 
-**Schema file:** `backend/db/cassandra-init.cql`
+Cassandra handles the write-heavy DM workload. Messages are partitioned by `conversation_id` with `TimeUUID` clustering keys for natural time ordering.
 
-**Why Cassandra for DMs?**
-- **High-write throughput**: Messages are write-heavy (100:1 write:read ratio)
-- **Time-ordered retrieval**: TimeUUID clustering keys provide natural ordering
-- **Partition isolation**: Each conversation is a partition, enabling horizontal scaling
-- **TTL support**: Automatic message expiration for ephemeral content
-
-**Keyspace**: `instagram_dm`
+**Keyspace**: `instagram_dm` with `NetworkTopologyStrategy`, replication factor 3 across data centers.
 
 ```cql
--- Messages by conversation (main message storage)
+-- Messages by conversation
 CREATE TABLE messages_by_conversation (
     conversation_id UUID,
-    message_id TIMEUUID,          -- TimeUUID for natural time ordering
+    message_id TIMEUUID,
     sender_id UUID,
     content TEXT,
-    content_type TEXT,             -- 'text', 'image', 'video', 'heart', 'story_reply'
+    content_type TEXT,       -- 'text', 'image', 'video', 'heart', 'story_reply'
     media_url TEXT,
     reply_to_message_id TIMEUUID,
     created_at TIMESTAMP,
@@ -283,7 +330,7 @@ CREATE TABLE messages_by_conversation (
 ) WITH CLUSTERING ORDER BY (message_id DESC)
   AND default_time_to_live = 31536000;  -- 1 year TTL
 
--- Conversations by user (inbox view)
+-- Conversations by user (inbox)
 CREATE TABLE conversations_by_user (
     user_id UUID,
     last_message_at TIMESTAMP,
@@ -292,12 +339,13 @@ CREATE TABLE conversations_by_user (
     other_username TEXT,           -- Denormalized for fast display
     other_profile_picture TEXT,
     last_message_preview TEXT,
+    last_message_sender_id UUID,
     unread_count INT,
     is_muted BOOLEAN,
     PRIMARY KEY (user_id, last_message_at, conversation_id)
 ) WITH CLUSTERING ORDER BY (last_message_at DESC);
 
--- Typing indicators (ephemeral, 5-second TTL)
+-- Typing indicators (5-second TTL, no cleanup needed)
 CREATE TABLE typing_indicators (
     conversation_id UUID,
     user_id UUID,
@@ -314,984 +362,609 @@ CREATE TABLE message_reactions (
     created_at TIMESTAMP,
     PRIMARY KEY ((conversation_id, message_id), user_id)
 );
+
+-- Read receipts
+CREATE TABLE message_read_receipts (
+    conversation_id UUID,
+    user_id UUID,
+    last_read_message_id TIMEUUID,
+    last_read_at TIMESTAMP,
+    PRIMARY KEY (conversation_id, user_id)
+);
 ```
 
-**Data Flow for DMs**:
-```
-1. User opens DM inbox
-   → Query: conversations_by_user WHERE user_id = ?
-   → Returns conversations sorted by last_message_at DESC
+**Why Cassandra for DMs?**
+- Write-heavy workload (100:1 write-to-read ratio) maps perfectly to Cassandra's log-structured merge trees
+- TimeUUID clustering provides natural chronological ordering without secondary indexes
+- Partition-per-conversation enables linear horizontal scaling -- each conversation is independent
+- Built-in TTL for typing indicators (5s) and message retention (1 year) with zero application logic
+- Denormalized `conversations_by_user` renders the inbox in a single partition read, avoiding cross-partition joins
 
-2. User opens a conversation
-   → Query: messages_by_conversation WHERE conversation_id = ?
-   → Returns messages sorted by message_id DESC (newest first)
+**Trade-off**: User info (username, profile_picture) is denormalized into `conversations_by_user`. On profile update, a background job propagates changes to all active conversations. This costs write amplification but avoids the latency of joining across databases at read time. The 2-5 second propagation lag is acceptable for display names.
 
-3. User sends a message
-   → INSERT into messages_by_conversation
-   → UPDATE conversations_by_user for all participants
-   → Cassandra MV handles auto-aggregation
+### Elasticsearch (Search)
 
-4. User reads messages
-   → INSERT/UPDATE message_read_receipts
-   → Reset unread_count in conversations_by_user
-```
+Indexes user profiles, hashtags, and locations for fast search and autocomplete. Updated via Kafka CDC from PostgreSQL with sub-second lag.
 
-**Why denormalize user info in conversations_by_user?**
-- Avoids cross-partition joins (not supported in Cassandra)
-- Single query to render inbox UI
-- Trade-off: Must update on profile picture/username changes
+## Caching Layers
 
-**Connection to PostgreSQL**:
-- User profiles (username, profile_picture) still live in PostgreSQL
-- On conversation creation, we copy user info to Cassandra
-- On profile update, background job syncs to active conversations
+### CDN (Media Delivery)
 
-### Storage Strategy
+All processed media is served through CDN (CloudFront/Cloudflare):
 
-#### Object Storage Layout (MinIO)
+- Content-addressed object keys (`images/{hash}/{size}.webp`) make cache invalidation unnecessary
+- `Cache-Control: public, max-age=31536000, immutable` for infinite caching
+- CDN offloads ~90% of media bandwidth from origin
+- Geographic edge nodes reduce latency to < 50ms globally
+- WebP/AVIF content negotiation based on `Accept` header
 
-```
-instagram-media/
-├── originals/
-│   └── {year}/{month}/{day}/{post_id}.{ext}
-├── processed/
-│   ├── thumbnails/{post_id}_150.jpg
-│   ├── small/{post_id}_320.jpg
-│   ├── medium/{post_id}_640.jpg
-│   └── large/{post_id}_1080.jpg
-├── stories/
-│   └── {year}/{month}/{day}/{story_id}.{ext}
-├── avatars/
-│   └── {user_id}.jpg
-└── messages/
-    └── {conversation_id}/{message_id}.{ext}
-```
-
-#### Caching Strategy (Valkey)
+### Redis Cluster (Application Cache)
 
 | Key Pattern | Value | TTL | Purpose |
 |-------------|-------|-----|---------|
-| `session:{session_id}` | User session JSON | 24h | Authentication |
-| `feed:{user_id}` | Cached feed JSON (20 posts) | 60s | Feed performance |
+| `session:{session_id}` | User session JSON | 7d | Authentication |
+| `timeline:{user_id}` | Sorted set of post IDs | None (managed) | Precomputed feed |
+| `feed:{user_id}:{cursor}` | Assembled feed JSON | 60s | Feed response cache |
 | `user:{user_id}` | User profile JSON | 5m | Profile lookups |
-| `followers:{user_id}` | Set of follower IDs | 5m | Social graph |
-| `following:{user_id}` | Set of following IDs | 5m | Social graph |
-| `ratelimit:{user_id}:{action}` | Counter | 1m | Rate limiting |
-| `story_ring:{user_id}` | Active story user IDs | 5m | Story feed |
+| `story_tray:{user_id}` | Story ring data | 5m | Story feed |
+| `ratelimit:{prefix}:{id}` | Counter | Varies | Rate limiting |
+| `notifications:{user_id}` | Sorted set of notification IDs | 30d | In-app notifications |
 
-**Cache invalidation strategy**: Write-through for critical data (follows), time-based expiry for feeds. On follow/unfollow, delete `feed:{user_id}` to trigger rebuild.
+**Cache invalidation**: Write-through for critical data (follows trigger `feed:{user_id}` deletion). Time-based expiry for non-critical caches. Redis Pub/Sub propagates invalidation across cache nodes.
 
-## API Design
+**Timeline cache**: Redis sorted sets store the last 500 post IDs per user. On post creation, the image processing worker fans out the post ID to all followers' timelines. Feed reads merge the cached timeline with celebrity posts fetched on demand.
 
-### Core Endpoints
-
-#### Authentication
+## Media Pipeline
 
 ```
-POST   /api/v1/auth/register     # Create account
-POST   /api/v1/auth/login        # Login, returns session cookie
-POST   /api/v1/auth/logout       # Destroy session
-GET    /api/v1/auth/me           # Get current user
+┌──────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐    ┌─────┐
+│  Client  │───▶│ Pre-signed   │───▶│  S3 / Object  │───▶│  Processing  │───▶│ CDN │
+│ (upload) │    │ Upload URL   │    │   Storage     │    │   Workers    │    │     │
+└──────────┘    └──────────────┘    └───────────────┘    └──────────────┘    └─────┘
+                                           │                    │
+                                    ┌──────▼──────┐     ┌──────▼──────┐
+                                    │  Original   │     │  Processed  │
+                                    │  (archive)  │     │  (5 sizes)  │
+                                    └─────────────┘     └─────────────┘
 ```
 
-#### Posts
+1. Client requests a pre-signed S3 URL from the API
+2. Client uploads directly to S3 (bypasses API servers for large files)
+3. API server creates a post record with `status: 'processing'` and enqueues a processing job
+4. Processing worker fetches the original from S3, generates 5 sizes in WebP + JPEG, uploads processed versions
+5. Worker updates the post to `status: 'published'` and fans out to follower timelines
+6. CDN serves processed images on first access, caches at edge for subsequent requests
+
+**Resolutions generated**:
+
+| Size | Dimensions | Use Case |
+|------|-----------|----------|
+| Thumbnail | 150x150 | Story rings, notifications, grid |
+| Small | 320x320 | Mobile grid view |
+| Medium | 640x640 | Mobile feed |
+| Large | 1080x1080 | Full-screen mobile, desktop feed |
+| XLarge | 2048 (max dim) | Desktop full-screen, zoom |
+
+## Feed Generation: Hybrid Push/Pull
 
 ```
-POST   /api/v1/posts             # Upload photo (multipart)
-GET    /api/v1/posts/{id}        # Get single post
-DELETE /api/v1/posts/{id}        # Delete own post
-POST   /api/v1/posts/{id}/like   # Like a post
-DELETE /api/v1/posts/{id}/like   # Unlike a post
-GET    /api/v1/posts/{id}/comments      # Get comments
-POST   /api/v1/posts/{id}/comments      # Add comment
+┌──────────────────────────────────────────────────────────────┐
+│                   Post Published Event                       │
+└─────────────────────────┬────────────────────────────────────┘
+                          │
+              ┌───────────▼───────────┐
+              │ Follower count > 10K? │
+              └───────┬───────┬───────┘
+                      │       │
+                No    │       │  Yes
+                      │       │
+         ┌────────────▼──┐  ┌─▼──────────────┐
+         │ Fan-out Write │  │ Celebrity table │
+         │ Push post ID  │  │ (fetched at     │
+         │ to each       │  │  read time)     │
+         │ follower's    │  │                 │
+         │ Redis timeline│  │                 │
+         └───────────────┘  └─────────────────┘
+
+                    Feed Read Request
+                          │
+              ┌───────────▼───────────┐
+              │  1. Get timeline from │
+              │     Redis sorted set  │
+              │  2. Fetch celebrity   │
+              │     posts on demand   │
+              │  3. Merge + rank      │
+              │  4. Hydrate with      │
+              │     post metadata     │
+              └───────────────────────┘
 ```
 
-#### Feed
+**Why hybrid?** Pure push would mean a celebrity with 100M followers triggers 100M Redis writes per post, taking minutes and wasting storage for inactive users. Pure pull means every feed load queries all followed users' posts, creating hot partitions. The hybrid approach handles 99% of users with O(1) feed reads (push) while bounding the worst case for celebrities to O(celebrity_count) per read.
 
-```
-GET    /api/v1/feed              # Get personalized feed (cursor pagination)
-GET    /api/v1/users/{id}/posts  # Get user's posts
-```
+## Real-Time Communication
 
-#### Stories
-
-```
-POST   /api/v1/stories           # Create story
-GET    /api/v1/stories/feed      # Get stories from followed users
-GET    /api/v1/stories/{id}      # Get single story
-POST   /api/v1/stories/{id}/view # Record story view
-DELETE /api/v1/stories/{id}      # Delete own story
-```
-
-#### Social
-
-```
-POST   /api/v1/users/{id}/follow    # Follow user
-DELETE /api/v1/users/{id}/follow    # Unfollow user
-GET    /api/v1/users/{id}/followers # Get followers
-GET    /api/v1/users/{id}/following # Get following
-```
-
-#### Direct Messages
-
-```
-GET    /api/v1/conversations              # List conversations
-POST   /api/v1/conversations              # Start conversation
-GET    /api/v1/conversations/{id}/messages # Get messages
-POST   /api/v1/conversations/{id}/messages # Send message
-```
-
-#### Admin Endpoints
-
-```
-GET    /api/v1/admin/users       # List users (paginated)
-DELETE /api/v1/admin/users/{id}  # Ban/delete user
-GET    /api/v1/admin/posts       # List all posts (with filters)
-DELETE /api/v1/admin/posts/{id}  # Remove post
-GET    /api/v1/admin/stats       # System statistics
-```
-
-## Key Design Decisions
-
-### Image Processing
-
-**Approach**: Async processing with Sharp library
-
-1. Accept upload, store original immediately, return 202 Accepted
-2. Background worker processes image:
-   - Validate image format (JPEG, PNG, WebP, HEIC)
-   - Strip EXIF data (privacy)
-   - Auto-orient based on EXIF
-   - Generate 4 sizes: 150x150 (thumbnail), 320x320 (small), 640x640 (medium), 1080x1080 (large)
-   - Convert to WebP for 30% size reduction (with JPEG fallback)
-3. Store processed images in MinIO with appropriate cache headers
-4. Update post status to 'published'
-
-**Why async?** Image processing takes 2-5 seconds. Synchronous processing would block the API and timeout on slow networks.
-
-### Feed Generation
-
-**Approach**: Pull model with caching (simpler for local dev)
-
-- On feed request, query posts from followed users with cursor pagination
-- Cache assembled feed for 60 seconds
-- For production scale, would switch to push model with pre-computed feeds in Valkey
-
-**Trade-off**: Pull model is simpler but O(n) where n = following count. Acceptable for 10K DAU. Push model pre-computes feeds on post creation but requires more storage and fanout complexity.
-
-### Story Expiration
-
-**Approach**: Soft delete with scheduled cleanup
-
-- Stories have `expires_at` timestamp set to `created_at + 24 hours`
-- Active story queries filter by `WHERE expires_at > NOW()`
-- Background job runs hourly to hard-delete expired stories and their media files
-
-```javascript
-// Cleanup job (runs every hour)
-async function cleanupExpiredStories() {
-  const expired = await db.query(`
-    SELECT id, media_url FROM stories
-    WHERE expires_at < NOW() - INTERVAL '1 hour'
-  `);
-  for (const story of expired) {
-    await minio.removeObject('instagram-media', story.media_url);
-    await db.query('DELETE FROM stories WHERE id = $1', [story.id]);
-  }
-}
-```
-
-## Technology Stack
-
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Application** | Node.js + Express | Fast development, good ecosystem, async I/O for file uploads |
-| **Primary Database** | PostgreSQL 16 | ACID transactions for follows/likes, JSON support, excellent indexing |
-| **Message Database** | Cassandra 4.1 | High-write throughput for DMs, TimeUUID ordering, partition isolation |
-| **Cache** | Valkey 7.2 | Redis-compatible, sessions, rate limiting, feed cache |
-| **Object Storage** | MinIO | S3-compatible, local development, unlimited storage |
-| **Message Queue** | RabbitMQ 3.12 | Simple queue semantics, dead letter handling, management UI |
-| **Image Processing** | Sharp | Fastest Node.js image library, WebP support |
-| **Load Balancer** | nginx | Proven, simple config, WebSocket support for future DMs |
-
-## Frontend Brand Identity
-
-Matching the original Instagram brand identity is intentional and serves important purposes for a system design learning project:
-
-### Why Brand Fidelity Matters
-
-1. **Familiarity reduces cognitive load**: Users already know Instagram's patterns. Matching the visual language means they instantly understand how the app works without a learning curve. This lets learners focus on the technical implementation rather than UX design.
-
-2. **Battle-tested UX patterns**: Instagram's interface has been refined through billions of user interactions. Their story ring placement, double-tap to like, and grid layouts represent mature solutions to common social media UX problems.
-
-3. **Realistic system design context**: In interviews and real-world scenarios, you often build systems that need to match existing brands or work alongside established products. Practicing with authentic styling prepares you for these constraints.
-
-4. **Visual feedback validates functionality**: When the app looks like Instagram and behaves like Instagram, it is immediately obvious when something is wrong. Misaligned colors or broken layouts become apparent because users have strong expectations.
-
-### Brand Colors
-
-| Usage | Color | Hex Code |
-|-------|-------|----------|
-| Story ring gradient (start) | Purple | `#833AB4` |
-| Story ring gradient (middle) | Red | `#FD1D1D` |
-| Story ring gradient (end) | Orange/Yellow | `#FCB045` |
-| Background (light mode) | Off-white | `#FAFAFA` |
-| Background (dark mode) | True black | `#000000` |
-| Primary text | Dark gray | `#262626` |
-| Secondary text | Medium gray | `#8E8E8E` |
-| Links and buttons | Instagram blue | `#0095F6` |
-| Heart/like icon | Instagram red | `#ED4956` |
-
-### Typography
-
-**Font stack** (matching Instagram's system fonts):
-```css
-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-```
-
-- **Logo**: Script/cursive style reminiscent of Instagram's wordmark
-- **Body text**: 14px base size, clean and readable
-- **Usernames**: Semi-bold weight for emphasis
-- **Timestamps**: Secondary text color, smaller size
-
-### Key UI Elements
-
-#### Story Ring Gradient
-
-The signature Instagram story indicator uses a conic gradient around profile pictures:
-
-```css
-.story-ring {
-  background: conic-gradient(
-    from 180deg,
-    #833AB4,  /* Purple */
-    #FD1D1D,  /* Red */
-    #FCB045,  /* Orange */
-    #833AB4   /* Back to purple for seamless loop */
-  );
-  border-radius: 50%;
-  padding: 3px;
-}
-```
-
-#### Photo Card Layout
-
-- Clean, photo-focused design with minimal chrome
-- Full-width images with consistent aspect ratios
-- Action buttons (like, comment, share, save) positioned below image
-- Like count and caption below action bar
-
-#### Dark Mode Support
-
-- True black background (`#000000`) for OLED power savings
-- Inverted text colors maintaining contrast ratios
-- Gradient elements remain consistent across themes
-- Seamless toggle without page refresh
-
-#### Interactive Elements
-
-- **Primary buttons**: Instagram blue (`#0095F6`) with white text
-- **Secondary buttons**: Outlined style with blue border
-- **Like animation**: Heart scales up briefly when tapped
-- **Follow button**: Blue when not following, outlined when following
-
-### Feed Virtualization
-
-The post feed uses `@tanstack/react-virtual` for efficient rendering of large feeds.
-
-**Why Virtualization:**
-- Users can scroll through hundreds of posts in a session
-- Each post contains images, text, and interactive elements
-- Without virtualization, DOM size grows unbounded, causing memory issues and lag
-
-**Implementation in `routes/index.tsx`:**
-
-```typescript
-import { useVirtualizer } from '@tanstack/react-virtual';
-
-const virtualizer = useVirtualizer({
-  count: posts.length,
-  getScrollElement: () => containerRef.current,
-  estimateSize: () => 400, // Estimated post height
-  overscan: 3, // 3 extra posts above/below for smooth scrolling
-  measureElement: (element) => element.getBoundingClientRect().height,
-});
-```
-
-**Key Features:**
-
-| Feature | Implementation | Purpose |
-|---------|---------------|---------|
-| Dynamic heights | `measureElement` callback | Posts vary in height (text length, images) |
-| Smooth scrolling | `overscan: 3` | Prevents blank areas during fast scroll |
-| Infinite scroll | Scroll position detection | Loads more posts near bottom |
-
-**Performance Impact:**
-
-| Metric | Without Virtualization | With Virtualization |
-|--------|------------------------|---------------------|
-| DOM nodes (100 posts) | 800+ | ~50 |
-| Memory usage | 200MB+ | ~80MB |
-| Scroll performance | Degrades over time | Constant 60fps |
-
-### Tailwind CSS Configuration
-
-The brand colors are configured in `tailwind.config.js` for consistent usage:
-
-```javascript
-colors: {
-  instagram: {
-    blue: '#0095F6',
-    red: '#ED4956',
-    purple: '#833AB4',
-    orange: '#FCB045',
-    background: '#FAFAFA',
-    text: '#262626',
-    'text-secondary': '#8E8E8E',
-  }
-}
-```
-
-Usage in components:
-```jsx
-<button className="bg-instagram-blue text-white">Follow</button>
-<span className="text-instagram-text-secondary">2 hours ago</span>
-```
-
-## Security Considerations
-
-### Authentication and Authorization
-
-**Session-based authentication** (simpler for learning, avoids JWT complexity):
-
-```javascript
-// Session stored in Valkey
-{
-  "user_id": "uuid",
-  "username": "johndoe",
-  "is_admin": false,
-  "created_at": "2024-01-15T10:00:00Z",
-  "expires_at": "2024-01-16T10:00:00Z"
-}
-```
-
-**Session configuration**:
-- Cookie: `HttpOnly`, `Secure` (in production), `SameSite=Lax`
-- TTL: 24 hours, sliding expiration on activity
-- Stored in Valkey with `session:{session_id}` key
-
-### Role-Based Access Control (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| **anonymous** | View public profiles, view public posts |
-| **user** | All anonymous + create posts, follow users, like, comment, DM |
-| **admin** | All user + delete any post, ban users, view system stats |
-
-**Middleware example**:
-```javascript
-const requireAuth = (req, res, next) => {
-  if (!req.session?.user_id) return res.status(401).json({ error: 'Unauthorized' });
-  next();
-};
-
-const requireAdmin = (req, res, next) => {
-  if (!req.session?.is_admin) return res.status(403).json({ error: 'Forbidden' });
-  next();
-};
-
-// Route protection
-app.delete('/api/v1/admin/posts/:id', requireAuth, requireAdmin, deletePost);
-app.post('/api/v1/posts', requireAuth, createPost);
-```
-
-### Rate Limiting
-
-Implemented with Valkey sliding window:
-
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| POST /auth/login | 5 | 1 minute |
-| POST /posts | 10 | 1 hour |
-| POST /*/like | 100 | 1 hour |
-| POST /*/comment | 50 | 1 hour |
-| GET /feed | 60 | 1 minute |
-
-```javascript
-async function rateLimit(userId, action, limit, windowSeconds) {
-  const key = `ratelimit:${userId}:${action}`;
-  const current = await valkey.incr(key);
-  if (current === 1) await valkey.expire(key, windowSeconds);
-  return current <= limit;
-}
-```
-
-### Input Validation
-
-- **File uploads**: Max 10MB, allowed types: image/jpeg, image/png, image/webp, image/heic
-- **Captions**: Max 2200 characters, sanitize HTML
-- **Usernames**: 3-30 alphanumeric + underscore, lowercase
-- **UUIDs**: Validate format before database queries
+- **WebSocket** connections for DMs: persistent bidirectional channel for message delivery, typing indicators, read receipts, presence
+- **Server-Sent Events (SSE)** for notifications: unidirectional push for likes, comments, follows, story views
+- **Connection management**: WebSocket connections are load-balanced using sticky sessions (hashed by user ID). Each WS server maintains a local connection registry. Cross-server message delivery uses Redis Pub/Sub -- when user A sends a message to user B who is connected to a different WS server, the message is published to a Redis channel that the target server subscribes to.
 
 ## Observability
 
-### Metrics (Prometheus)
+### Distributed Tracing
+
+Every request receives a `trace_id` (propagated via `x-trace-id` header) that follows the request across services, message queues, and background workers. This enables end-to-end latency analysis: "This feed load took 450ms -- 200ms in PostgreSQL, 150ms in Redis, 100ms in service logic."
+
+### Prometheus Metrics
 
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
-| `http_requests_total` | Counter | method, path, status | Request volume |
-| `http_request_duration_seconds` | Histogram | method, path | Latency tracking |
-| `image_processing_duration_seconds` | Histogram | - | Worker performance |
+| `http_requests_total` | Counter | method, route, status_code | Request volume |
+| `http_request_duration_seconds` | Histogram | method, route | Latency percentiles |
+| `feed_generation_seconds` | Histogram | cache_status | Feed performance |
+| `image_processing_seconds` | Histogram | size | Worker throughput |
 | `image_processing_errors_total` | Counter | error_type | Processing failures |
-| `active_sessions` | Gauge | - | Logged-in users |
-| `feed_cache_hit_ratio` | Gauge | - | Cache effectiveness |
-| `queue_depth` | Gauge | queue_name | RabbitMQ backlog |
-| `storage_bytes_total` | Gauge | bucket | MinIO usage |
+| `posts_created_total` | Counter | - | Content velocity |
+| `likes_total` | Counter | action | Engagement rate |
+| `follows_total` | Counter | action | Growth metrics |
+| `circuit_breaker_state` | Gauge | name | Service health |
+| `circuit_breaker_events_total` | Counter | name, event | Failure patterns |
+| `db_query_duration_seconds` | Histogram | operation | Database performance |
+| `db_connection_pool_size` | Gauge | state | Pool saturation |
+| `rate_limit_hits_total` | Counter | action | Abuse detection |
+| `active_sessions` | Gauge | - | Concurrent users |
 
-### Logging (Structured JSON)
+### Structured Logging (JSON)
 
-```javascript
-// Request logging
-{
-  "level": "info",
-  "timestamp": "2024-01-15T10:00:00.000Z",
-  "request_id": "uuid",
-  "method": "POST",
-  "path": "/api/v1/posts",
-  "user_id": "uuid",
-  "status": 202,
-  "duration_ms": 45,
-  "content_length": 2048576
-}
-
-// Error logging
-{
-  "level": "error",
-  "timestamp": "2024-01-15T10:00:01.000Z",
-  "request_id": "uuid",
-  "error": "ImageProcessingError",
-  "message": "Failed to decode image",
-  "post_id": "uuid",
-  "stack": "..."
-}
-```
-
-### Distributed Tracing
-
-For local development, simple request ID propagation:
-
-```javascript
-// Middleware to assign trace ID
-app.use((req, res, next) => {
-  req.traceId = req.headers['x-trace-id'] || uuidv4();
-  res.setHeader('x-trace-id', req.traceId);
-  next();
-});
-
-// Pass trace ID to background jobs
-await channel.sendToQueue('image-processing', Buffer.from(JSON.stringify({
-  post_id: postId,
-  trace_id: req.traceId
-})));
-```
+All services emit structured JSON logs via Pino with:
+- `trace_id` for request correlation
+- `user_id` for user-scoped debugging
+- `duration_ms` for performance tracking
+- Log levels: error (5xx, failures), warn (4xx, rate limits, circuit breakers), info (request completion, business events), debug (cache operations, query details)
 
 ### Alert Thresholds
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| High error rate | 5xx rate > 1% for 5 minutes | Critical |
-| Slow responses | p95 latency > 500ms for 5 minutes | Warning |
-| Queue buildup | queue_depth > 100 for 10 minutes | Warning |
-| Storage full | storage_bytes > 90% capacity | Critical |
-| Worker down | No heartbeat for 2 minutes | Critical |
+| High error rate | 5xx rate > 0.1% for 5 minutes | Critical |
+| Feed latency | p99 > 500ms for 5 minutes | Warning |
+| Image processing backlog | Queue depth > 10K for 10 minutes | Warning |
+| Circuit breaker open | Any breaker in OPEN state | Critical |
+| Storage capacity | S3 bucket > 90% quota | Critical |
+| Replication lag | PostgreSQL replica > 30s behind primary | Warning |
 
 ## Failure Handling
+
+### Circuit Breakers
+
+Using the circuit breaker pattern (Opossum library in production):
+
+- **CLOSED**: Normal operation, requests flow through
+- **OPEN**: Too many failures (> 50% error rate with minimum 5 requests), requests fail fast with fallback
+- **HALF-OPEN**: After 30-second cooldown, allow one test request to check recovery
+
+| Service | Timeout | Fallback |
+|---------|---------|----------|
+| Image processing | 30s | Return 503 "temporarily unavailable" |
+| Feed generation | 10s | Return empty feed `{ posts: [] }` |
+| Cassandra (DMs) | 5s | Return 503, DMs degraded |
+| Elasticsearch (search) | 3s | Return empty results |
 
 ### Retry Strategy
 
 | Operation | Max Retries | Backoff | Idempotency |
 |-----------|-------------|---------|-------------|
-| Image processing | 3 | Exponential (1s, 2s, 4s) | Safe (same output) |
-| MinIO upload | 3 | Exponential | Safe (overwrite) |
-| Database write | 0 | N/A | Use transactions |
-| External API | 3 | Exponential | Idempotency key |
+| Image processing | 3 | Exponential (1s, 2s, 4s) | Safe (deterministic output) |
+| S3 upload | 3 | Exponential | Safe (overwrite by key) |
+| Database write | 0 | N/A | ACID transactions |
+| Kafka publish | 5 | Exponential | Idempotent producer |
 
-```javascript
-// RabbitMQ dead letter handling
-const queueOptions = {
-  durable: true,
-  arguments: {
-    'x-dead-letter-exchange': 'dlx',
-    'x-dead-letter-routing-key': 'image-processing-failed'
-  }
-};
+### Dead Letter Queues
 
-// Failed jobs go to DLQ for manual inspection
-```
-
-### Circuit Breaker Pattern
-
-```javascript
-// Simple circuit breaker for MinIO
-const circuitBreaker = {
-  failures: 0,
-  lastFailure: null,
-  state: 'closed', // closed, open, half-open
-
-  async call(fn) {
-    if (this.state === 'open') {
-      if (Date.now() - this.lastFailure > 30000) {
-        this.state = 'half-open';
-      } else {
-        throw new Error('Circuit breaker is open');
-      }
-    }
-    try {
-      const result = await fn();
-      this.failures = 0;
-      this.state = 'closed';
-      return result;
-    } catch (error) {
-      this.failures++;
-      this.lastFailure = Date.now();
-      if (this.failures >= 5) this.state = 'open';
-      throw error;
-    }
-  }
-};
-```
+Failed image processing jobs (after 3 retries) are routed to a dead letter queue for manual inspection. The DLQ is monitored and alerts fire when depth > 0. Failed posts are marked `status: 'failed'` in PostgreSQL so users see "Upload failed, tap to retry."
 
 ### Graceful Degradation
 
 | Failure | Degradation Strategy |
 |---------|---------------------|
-| Valkey down | Bypass cache, serve from PostgreSQL (slower) |
-| RabbitMQ down | Inline image processing (blocking, with timeout) |
-| MinIO down | Return 503, queue uploads for retry |
-| PostgreSQL down | Return 503 for writes, serve cached reads |
+| Redis cluster down | Bypass cache, serve from PostgreSQL replicas (higher latency) |
+| Kafka down | Buffer events in-memory, flush when recovered |
+| Cassandra down | DMs unavailable, core features (feed, posts) unaffected |
+| S3 down | New uploads queued, existing media served from CDN cache |
+| Elasticsearch down | Search unavailable, autocomplete falls back to PostgreSQL LIKE |
+| PostgreSQL replica down | Route reads to remaining replicas or primary |
 
-### Backup and Recovery
+## Security
 
-**Local development backup strategy**:
+### Authentication and Authorization
 
-```bash
-# PostgreSQL backup (daily)
-pg_dump instagram > backup/instagram_$(date +%Y%m%d).sql
+- **OAuth 2.0 + OIDC** for third-party login (Google, Facebook, Apple)
+- **JWT access tokens** (15-minute expiry) + **refresh tokens** (90-day, stored in Redis for revocation)
+- **Session revocation**: Revoking a refresh token immediately invalidates all access tokens derived from it
+- **Device management**: Users can see and revoke sessions from specific devices
 
-# MinIO sync to local backup
-mc mirror minio/instagram-media backup/media/
+### Role-Based Access Control
 
-# Recovery
-psql instagram < backup/instagram_20240115.sql
-mc mirror backup/media/ minio/instagram-media
-```
+| Role | Permissions |
+|------|-------------|
+| anonymous | View public profiles and posts |
+| user | Create content, follow, like, comment, DM |
+| verified | All user + verification badge, priority support |
+| admin | All + delete any content, ban users, view system stats |
 
-## Cost Tradeoffs
+### Rate Limiting
 
-### Storage vs Compute
+Distributed rate limiting via Redis sliding window:
 
-| Decision | Trade-off |
-|----------|-----------|
-| Store 4 image sizes | More storage (4x), but faster serving (no resize on request) |
-| Cache feeds in Valkey | Memory cost (~500 bytes/user), but 10x faster feed loads |
-| Keep originals | 2x storage, but allows re-processing with new algorithms |
+| Action | Limit | Window | Rationale |
+|--------|-------|--------|-----------|
+| Login | 5 | 1 minute | Brute force prevention |
+| Post creation | 10 | 1 hour | Content spam prevention |
+| Follow | 30 | 1 hour | Follow-bot prevention |
+| Like | 100 | 1 hour | Engagement spam prevention |
+| Comment | 50 | 1 hour | Comment spam prevention |
+| Story creation | 20 | 1 hour | Story spam prevention |
+| Feed requests | 60 | 1 minute | Scraping prevention |
+| General API | 1000 | 1 minute | DDoS mitigation |
 
-### Recommended for local dev
+### Content Moderation
 
-- **DO**: Cache aggressively (Valkey is cheap)
-- **DO**: Store processed images (disk is cheap)
-- **DON'T**: Pre-compute feeds for all users (unnecessary at this scale)
-- **DON'T**: Shard PostgreSQL (single instance is fine for 10K DAU)
+- Pre-upload: Client-side NSFW detection (on-device ML)
+- Post-upload: Automated content scanning pipeline (image classification, text toxicity scoring)
+- Flagged content enters human review queue
+- Repeat offenders trigger progressive enforcement (warning, shadow ban, account suspension)
 
-### Production Scaling Costs (Reference)
+### Input Validation
 
-| Component | 10K DAU (Local) | 1M DAU (Cloud) |
-|-----------|-----------------|----------------|
-| Compute | $0 (local) | $2,000/mo (10 app servers) |
-| PostgreSQL | $0 (local) | $500/mo (RDS medium) |
-| Object Storage | $0 (local) | $1,000/mo (100TB S3) |
-| CDN | N/A | $2,000/mo (bandwidth) |
-| Cache | $0 (local) | $300/mo (ElastiCache) |
+- File uploads: Max 10 MB images, 100 MB videos; allowed types: image/jpeg, image/png, image/webp, image/heic, video/mp4
+- Captions: Max 2200 characters, HTML sanitized
+- Usernames: 3-30 chars, alphanumeric + underscore, case-insensitive
+- All UUID parameters validated before database queries
+
+## Consistency and Idempotency
+
+### Idempotency for Uploads
+
+Post creation uses an idempotency key (`X-Idempotency-Key` header). If the client retries a failed upload, the server returns the existing post instead of creating a duplicate. Keys are stored in Redis with 24-hour TTL.
+
+### Idempotent Likes
+
+The `likes` table has a `UNIQUE(user_id, post_id)` constraint. `INSERT ... ON CONFLICT DO NOTHING` ensures duplicate like requests are silently absorbed. The `like_count` trigger only fires on actual inserts, preventing double-counting.
+
+### Exactly-Once DM Delivery
+
+Messages use `TimeUUID` as the message ID (generated server-side). The combination of `(conversation_id, message_id)` primary key in Cassandra ensures idempotent writes. Client retries with the same message ID result in an upsert, not a duplicate.
+
+### Feed Consistency
+
+Feeds are eventually consistent by design. A new post may take 2-5 seconds to appear in all followers' feeds due to:
+1. Async image processing (2-5s)
+2. Timeline fanout latency (< 1s for users with < 10K followers)
+3. Feed cache TTL (60s worst case)
+
+This is acceptable for a social media feed. Users see their own posts immediately (optimistic UI + self-timeline injection).
 
 ## Scalability Considerations
 
 ### Horizontal Scaling Path
 
-1. **Current (local dev)**: 2-3 API servers, single PostgreSQL, single Valkey
-2. **10x scale**: Add read replicas for PostgreSQL, Valkey cluster
-3. **100x scale**: Shard by user_id, CDN for images, push-based feeds
-4. **1000x scale**: Separate services (feed service, messaging service, etc.)
+| Scale | Architecture Changes |
+|-------|---------------------|
+| 1M DAU | Single PostgreSQL with read replicas, Redis cluster, S3 + CDN |
+| 10M DAU | Shard PostgreSQL by user_id, separate feed/media/DM services |
+| 100M DAU | Multi-region deployment, geo-routing, Cassandra multi-DC |
+| 500M+ DAU | Cell-based architecture, dedicated celebrity feed path, edge compute |
 
-### Database Scaling Strategy
+### What Breaks First
 
-```
-Phase 1 (local): Single PostgreSQL instance + Cassandra for DMs ✅
-Phase 2: Add read replica for feed queries
-Phase 3: Shard follows table by follower_id (range or hash)
-Phase 4: Cassandra cluster for messages (already using Cassandra)
-```
+1. **Feed generation** -- the JOIN across follows and posts becomes slow as the social graph grows. Solution: precomputed timelines in Redis (push model).
+2. **PostgreSQL follows table** -- the social graph is the hottest table. Solution: shard by follower_id, cache in Redis.
+3. **Image serving bandwidth** -- egress costs and latency. Solution: CDN with long cache TTLs.
+4. **DM write throughput** -- PostgreSQL cannot handle 300K writes/sec. Solution: Cassandra (already chosen).
+5. **Hot partitions** -- celebrity followers all query the same data. Solution: fan-out on read for celebrities, Redis caching.
+
+## Key Design Decisions
+
+### Decision 1: Pull vs Push vs Hybrid Feed
+
+| Strategy | Pros | Cons |
+|----------|------|------|
+| Push (fanout on write) | O(1) reads, instant feed | Expensive for celebrities, wasted writes for inactive users |
+| Pull (fanout on read) | Simple, no wasted work | O(following_count) per read, slow for users following many accounts |
+| Hybrid (chosen) | Best of both, bounded worst case | Implementation complexity, two code paths |
+
+The hybrid approach handles 99% of cases with the push model's speed while bounding celebrity post fanout. The read-time merge adds ~20ms latency for users who follow celebrities -- negligible compared to network round-trip.
+
+### Decision 2: PostgreSQL + Cassandra Dual Database
+
+| Database | Use Case | Why |
+|----------|----------|-----|
+| PostgreSQL | Users, posts, follows, stories | ACID for social graph mutations, complex JOINs for feed assembly |
+| Cassandra | Direct messages, typing, reactions | 300K writes/sec, TimeUUID ordering, partition-per-conversation scaling |
+
+The alternative (PostgreSQL for everything) would require sharding DMs across PostgreSQL instances, losing the natural partition isolation Cassandra provides. Cassandra's TimeUUID clustering gives free chronological ordering without maintaining a separate index.
+
+### Decision 3: Async Image Processing
+
+Synchronous processing would block the API server for 2-5 seconds per upload, consuming a thread/connection and degrading throughput. The async model (return 202 immediately, process in background) allows the API to handle 100x more concurrent uploads. The trade-off is UI complexity: the client must poll or receive a push notification when processing completes.
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Why |
-|----------|--------|-------------|-----|
-| Session auth | Valkey sessions | JWT tokens | Simpler, revocable, learning focus |
-| Feed model | Pull with cache | Push (fanout on write) | Simpler, sufficient for 10K DAU |
-| Message queue | RabbitMQ | Kafka | Simpler ops, sufficient throughput |
-| Image storage | MinIO | Local filesystem | S3-compatible, easier migration |
-| Relational data | PostgreSQL | MongoDB | Strong consistency for social graph |
-| Direct messages | Cassandra | PostgreSQL | High-write throughput, TimeUUID ordering, partition isolation |
-
-## Future Optimizations
-
-1. **WebSocket for real-time**: Live notifications, typing indicators in DMs
-2. **Push-based feeds**: Pre-compute feeds for active users
-3. **Video support**: Transcoding pipeline with FFmpeg workers
-4. **Search**: Elasticsearch for user/hashtag search
-5. **Recommendations**: ML-based explore feed
-6. **CDN integration**: CloudFront/Cloudflare for image serving
-7. **Read replicas**: Separate read/write database connections
-
-## Implementation Notes
-
-This section documents the reasoning behind key implementation decisions in the backend codebase. Understanding the "why" is critical for maintaining and evolving the system.
-
-### WHY Idempotency Prevents Duplicate Likes
-
-**Problem**: Without idempotency, a user could accidentally like a post multiple times, inflating engagement metrics and creating inconsistent state.
-
-**Scenario**:
-1. User clicks "like" button on a post
-2. Network is slow, UI doesn't respond immediately
-3. User clicks "like" again (or network retries automatically)
-4. Without protection: Two `INSERT` statements execute, creating duplicate likes
-5. Post's `like_count` is incremented twice incorrectly
-
-**Solution**: PostgreSQL's `ON CONFLICT DO NOTHING` clause
-
-```sql
-INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id
-```
-
-**How it works**:
-1. The `likes` table has a `UNIQUE` constraint on `(user_id, post_id)`
-2. `ON CONFLICT DO NOTHING` silently ignores duplicate insertions
-3. `RETURNING id` tells us if an insert actually happened (rows returned) or not (no rows)
-4. The API response includes `idempotent: true/false` so clients know if their action was new
-
-**Benefits**:
-- **Safe retries**: Clients can retry failed requests without side effects
-- **No double-counting**: Like counts remain accurate
-- **Simpler client logic**: No need for complex deduplication on the frontend
-- **Race condition safe**: Concurrent requests from the same user are handled correctly
-
-**Implementation location**: `/instagram/backend/src/routes/posts.js`
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Feed model | Hybrid push/pull | Pure push or pull | Bounded fanout for celebrities, instant reads for normal users |
+| Auth | OAuth 2.0 + JWT | Session cookies | Mobile-friendly, stateless validation, token refresh |
+| DM storage | Cassandra | PostgreSQL | 300K writes/sec, TimeUUID ordering, partition isolation |
+| Message queue | Kafka | RabbitMQ | Event sourcing, replay capability, higher throughput |
+| Image storage | S3 + CDN | Self-hosted | 11 nines durability, global CDN, pay-per-use |
+| Search | Elasticsearch | PostgreSQL full-text | Fuzzy matching, autocomplete, relevance scoring |
+| Notifications | SSE + push | WebSocket | Unidirectional suffices, simpler connection management |
+| DM real-time | WebSocket | Polling | Sub-100ms delivery, bidirectional for typing/presence |
 
 ---
 
-### WHY Feed Caching Reduces Database Load
+# Layer 2: Pocket-Size Architecture (What We Actually Built)
 
-**Problem**: Feed generation is the most expensive operation in social media applications, requiring joins across users, posts, follows, media, likes, and saved posts.
+This section documents the actual local implementation -- what runs on a single developer machine with Docker Compose. The goal is to learn production patterns at a human-debuggable scale.
 
-**Without caching (per feed request)**:
+## Actual Local Architecture
+
 ```
-Query 1: Get followed users (follows table)
-Query 2: Get posts from followed users (posts + users join)
-Query 3-N: Get media for each post (post_media table)
-Query N+1-2N: Check like status for each post
-Query 2N+1-3N: Check save status for each post
-```
-
-For a user following 100 accounts with 20 posts in feed:
-- ~60 database queries per feed load
-- With 10K DAU making 10 feed requests/day = 6 million queries/day just for feeds
-
-**Solution**: Two-layer caching with Redis/Valkey
-
-**Layer 1 - Timeline Cache (Redis Sorted Sets)**:
-```javascript
-// Key: timeline:{userId}
-// Value: Sorted set of post IDs ordered by timestamp
-// TTL: None (updated on post create/delete)
-ZADD timeline:user123 1704067200 post-uuid-1
-ZADD timeline:user123 1704070800 post-uuid-2
-```
-
-**Layer 2 - Feed Response Cache**:
-```javascript
-// Key: feed:{userId}:{offset}:{limit}
-// Value: Complete JSON response with posts and media
-// TTL: 60 seconds
-```
-
-**Cache hit flow**:
-1. Check `feed:user123:0:20` in Redis
-2. If hit: Return immediately (~1ms)
-3. If miss: Generate from database, cache result
-
-**Measured impact**:
-| Metric | Without Cache | With Cache |
-|--------|---------------|------------|
-| Avg latency | 200-500ms | 5-50ms |
-| DB queries/feed | ~60 | 0 (hit) or ~60 (miss) |
-| Cache hit rate | N/A | 80-90% during active use |
-| DB CPU reduction | Baseline | 80%+ reduction |
-
-**Why 60-second TTL?**
-- Short enough to show new posts quickly
-- Long enough to absorb repeated scroll/refresh
-- Balance between freshness and performance
-
-**Implementation locations**:
-- `/instagram/backend/src/routes/feed.js` - Cache check and population
-- `/instagram/backend/src/services/redis.js` - Timeline sorted sets
-
----
-
-### WHY Rate Limiting Prevents Follow Spam
-
-**Problem**: Follow spam is a manipulation technique where users or bots rapidly follow many accounts to:
-1. Get follow-backs (inflating follower counts)
-2. Trigger notification spam (forcing brand awareness)
-3. Unfollow later (maintaining a high follower-to-following ratio)
-
-**Without rate limiting**:
-- A bot can follow 1000+ users per hour
-- Creates notification spam for all targeted users
-- Degrades platform trust (users see fake engagement)
-- Enables mass harassment campaigns
-
-**Solution**: Redis-backed sliding window rate limiting
-
-**Configuration**:
-```javascript
-{
-  keyPrefix: 'follows',
-  max: 30,           // Maximum 30 follows
-  windowMs: 3600000, // Per 1 hour window
-}
+┌─────────────────────────────────────────────────────────────────┐
+│                     Frontend (Vite + React)                      │
+│                      http://localhost:5173                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTP (REST API)
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                   Express API Server                             │
+│                    http://localhost:3000                          │
+│                                                                  │
+│  Routes: auth, posts, feed, stories, users, comments, messages   │
+│  Middleware: session (Redis), rate limiting, metrics, logging     │
+└───┬──────────┬──────────┬───────────┬───────────┬───────────────┘
+    │          │          │           │           │
+    │          │          │           │           │
+┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌─────▼────┐ ┌───▼──────┐
+│ Pg    │ │Valkey │ │ MinIO │ │ RabbitMQ │ │Cassandra │
+│:5432  │ │:6379  │ │:9000  │ │  :5672   │ │  :9042   │
+│       │ │       │ │       │ │          │ │          │
+│users  │ │session│ │images │ │image jobs│ │DM msgs   │
+│posts  │ │feed   │ │stories│ │          │ │typing    │
+│follows│ │cache  │ │avatars│ │          │ │reactions │
+│stories│ │rate   │ │       │ │          │ │receipts  │
+│likes  │ │limits │ │       │ │          │ │          │
+│etc.   │ │       │ │       │ │          │ │          │
+└───────┘ └───────┘ └───────┘ └─────┬────┘ └──────────┘
+                                    │
+                              ┌─────▼─────┐
+                              │  Image    │
+                              │  Worker   │
+                              │ (separate │
+                              │  process) │
+                              └───────────┘
 ```
 
-**How it works**:
-1. On each follow request, increment `ratelimit:follows:{userId}`
-2. If counter reaches 30, reject with 429 Too Many Requests
-3. Counter expires after 1 hour (sliding window)
-4. Distributed across all API servers via Redis
+## What Actually Runs
 
-**Why 30 follows/hour?**
-- Normal users: Follow 5-10 accounts when exploring
-- Power users: May follow 20-30 when discovering new interests
-- Bots: Need 100s/hour to be effective - now blocked
+### Single Express Server (Not Microservices)
 
-**Rate limit categories**:
+The production architecture splits into Feed, Media, Story, DM, and Notification services. Locally, everything runs as a single Express server (`backend/src/index.ts`) with route modules:
 
-| Action | Limit | Window | Rationale |
-|--------|-------|--------|-----------|
-| Follow | 30 | 1 hour | Prevent follow-bots |
-| Post | 10 | 1 hour | Prevent content spam |
-| Like | 100 | 1 hour | Allow engagement while limiting bots |
-| Comment | 50 | 1 hour | Prevent comment spam |
-| Login | 5 | 1 minute | Prevent brute force attacks |
-| General API | 1000 | 1 minute | Prevent scraping |
+- `routes/auth.ts` -- register, login, logout, current user
+- `routes/posts.ts` -- CRUD + like/unlike with idempotency
+- `routes/feed.ts` -- pull-model feed with Redis caching
+- `routes/stories.ts` -- create, view, story tray with cache
+- `routes/users.ts` -- profile, follow/unfollow, followers/following
+- `routes/comments.ts` -- threaded comments with like support
+- `routes/messages.ts` -- DM conversations and messages via Cassandra
 
-**Metrics tracked**:
-- `instagram_rate_limit_hits_total{action="follow"}` - Prometheus counter
-- Logged as warnings for security monitoring
+The server can run as multiple instances on ports 3001-3003 (`npm run dev:server1`, `dev:server2`, `dev:server3`) for testing distributed behavior, though no load balancer is wired up by default.
 
-**Implementation location**: `/instagram/backend/src/services/rateLimiter.js`
+### Separate Image Worker
 
----
+The one piece that does run as a separate process: `backend/src/workers/image-worker.ts`. It consumes from a RabbitMQ queue, processes images with Sharp (resize to 4 sizes: 150x150, 320x320, 640x640, 1080x1080), and updates the database. This demonstrates the async processing pattern from the production architecture.
 
-### WHY Metrics Enable Engagement Optimization
+After processing, the worker fans out the post to followers' Redis timelines (`ZADD timeline:{userId} {timestamp} {postId}`), implementing a simplified version of the push model.
 
-**Problem**: Without metrics, you're operating blind. You can't:
-- Know if the service is healthy
-- Identify performance bottlenecks
-- Understand user behavior patterns
-- Detect anomalies (attacks, bugs, infrastructure issues)
+### Infrastructure (Docker Compose)
 
-**Solution**: Prometheus metrics with `/metrics` endpoint
+The `docker-compose.yml` starts 5 services:
 
-**Key metrics categories**:
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| PostgreSQL 16 | `postgres:16-alpine` | 5432 | All relational data |
+| Valkey 7 | `valkey/valkey:7-alpine` | 6379 | Sessions, feed cache, rate limiting, timelines |
+| RabbitMQ 3 | `rabbitmq:3-management-alpine` | 5672 / 15672 | Image processing queue + management UI |
+| Cassandra 4.1 | `cassandra:4.1` | 9042 | Direct messages |
+| MinIO | `minio/minio:latest` | 9000 / 9001 | Object storage + console |
 
-#### 1. Infrastructure Health
-```prometheus
-# Are requests succeeding?
-instagram_http_requests_total{status_code="200|500"}
+Initialization containers handle Cassandra schema (`cassandra-init.cql`) and MinIO bucket creation.
 
-# How long do requests take?
-instagram_http_request_duration_seconds_bucket
+### Frontend
 
-# Is the database healthy?
-instagram_db_query_duration_seconds
-instagram_db_connection_pool_size{state="idle|total"}
+React + TypeScript + Vite with TanStack Router. Key routes:
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | `index.tsx` | Home feed with virtualized list (@tanstack/react-virtual) |
+| `/login`, `/register` | auth routes | Session-based authentication |
+| `/create` | `create.tsx` | Post creation with filter preview |
+| `/profile/:username` | `profile.$username.tsx` | User profile with post grid |
+| `/post/:postId` | `post.$postId.tsx` | Single post detail view |
+| `/explore` | `explore.tsx` | Discover content |
+| `/settings` | `settings.tsx` | User settings |
+
+State management: Zustand (`authStore.ts`). API client: centralized in `services/api.ts`.
+
+## What's Simplified
+
+| Production | Local Implementation |
+|------------|---------------------|
+| S3 + CDN | MinIO (S3-compatible, no CDN) |
+| OAuth 2.0 + JWT | Session cookies in Valkey (simpler, web-only) |
+| Hybrid push/pull feed | Pull model with Redis cache (60s TTL) |
+| Sharded PostgreSQL | Single instance, no replicas |
+| Kafka event bus | RabbitMQ (simpler, sufficient for single-machine) |
+| WebSocket for DMs | HTTP polling (no real-time push) |
+| Elasticsearch search | PostgreSQL LIKE queries |
+| Push notifications | Not implemented |
+| Content moderation | Not implemented |
+| Pre-signed upload URLs | Multipart upload through API server |
+| 5 image sizes + WebP/AVIF | 4 JPEG sizes (thumbnail, small, medium, large) |
+| Multi-region deployment | Single machine |
+| Auto-scaling | Fixed process count |
+
+## Production Patterns Actually Implemented
+
+The following production-grade patterns are wired into the running code, not just listed as dependencies.
+
+### Circuit Breakers (Opossum)
+
+**File**: `backend/src/services/circuitBreaker.ts`
+
+The `createCircuitBreaker` factory wraps async functions with three-state protection (CLOSED / OPEN / HALF-OPEN). Configuration: 10s timeout, 50% error threshold, 30s reset timeout, minimum 5 requests before tripping.
+
+Circuit breakers are used in feed generation and image processing routes. When a downstream service fails repeatedly, the breaker opens and returns a fallback immediately (503 for processing, empty feed for feeds), preventing cascade failures.
+
+All state transitions emit Prometheus metrics (`instagram_circuit_breaker_state`, `instagram_circuit_breaker_events_total`) and structured log entries.
+
+### Prometheus Metrics (prom-client)
+
+**File**: `backend/src/services/metrics.ts`
+
+30+ metrics are defined and actively collected:
+
+- HTTP request duration and count (histogram + counter with method/route/status labels)
+- Business metrics: posts created, likes (with duplicate detection), follows, stories, story views
+- Feed performance: generation duration by cache hit/miss, cache hit/miss counters
+- Image processing: duration histogram, error counter by type
+- Circuit breaker: state gauge, event counter
+- Database: query duration, connection pool size
+- Auth: login/register attempts by result
+- Rate limiting: hits by action
+
+Metrics are exposed at `GET /metrics` in Prometheus text format and collected via the `metricsMiddleware` on every request.
+
+### Structured Logging (Pino)
+
+**File**: `backend/src/services/logger.ts`
+
+JSON-structured logging with:
+- Service context (name, env, port) on every log line
+- Request correlation via `traceId` (UUID assigned per request, propagated via `x-trace-id` header)
+- Child loggers with user context (`createRequestLogger`)
+- Specialized log functions: `logRequest` (with timing), `logError` (with stack), `logQuery` (with slow query warnings > 1s), `logCache` (hit/miss tracking)
+- Log level routing: 5xx = error, 4xx = warn, 2xx = info
+
+### Rate Limiting (express-rate-limit + Redis)
+
+**File**: `backend/src/services/rateLimiter.ts`
+
+Distributed rate limiting backed by Redis (works across multiple API server instances). Seven endpoint-specific limiters are configured:
+- Post creation: 10/hour
+- Follow: 30/hour
+- Login: 5/minute (skips successful requests)
+- Like: 100/hour
+- Comment: 50/hour
+- Story: 20/hour
+- Feed: 60/minute
+- General: 1000/minute (catch-all)
+
+Each limiter logs warnings on hits, increments Prometheus counters, and returns `429` with informative error messages. Key generation uses user ID when authenticated, IP when anonymous.
+
+### Health Checks
+
+**File**: `backend/src/app.ts`
+
+Four health endpoints are implemented:
+- `GET /api/health` -- simple liveness (200 if process is running)
+- `GET /api/health/live` -- Kubernetes-style liveness probe
+- `GET /api/health/ready` -- readiness probe (checks PostgreSQL + Redis connectivity)
+- `GET /api/health/detailed` -- comprehensive check of all 5 dependencies (PostgreSQL, Redis, MinIO, Cassandra, RabbitMQ) with latency measurements, memory usage, and uptime
+
+### Request Tracing
+
+Every request gets a `traceId` (from `x-trace-id` header or auto-generated UUID). This ID is returned in the response header, logged with every request, and passed to background jobs via RabbitMQ message payloads. This enables end-to-end request tracking across the API server and image worker.
+
+### Graceful Shutdown
+
+**File**: `backend/src/index.ts`
+
+On SIGTERM/SIGINT, the server closes connections in order: PostgreSQL pool, Redis, Cassandra, RabbitMQ. This prevents in-flight requests from failing and ensures clean resource cleanup.
+
+### Idempotent Likes
+
+Likes use `INSERT ... ON CONFLICT DO NOTHING RETURNING id` with a `UNIQUE(user_id, post_id)` constraint. Duplicate like attempts are silently absorbed, and the `like_count` trigger only fires on actual inserts. A Prometheus counter (`instagram_likes_duplicate_total`) tracks idempotent hits.
+
+### Dead Letter Queue
+
+**File**: `backend/src/services/queue.ts`
+
+Failed image processing jobs (after worker failure) are nacked without requeue, routing them to the `image-processing-dlq` dead letter queue via the `instagram-dlx` exchange. This prevents poison messages from blocking the queue.
+
+### Database Triggers
+
+**File**: `backend/src/db/init.sql`
+
+PostgreSQL triggers maintain denormalized counts:
+- `follow_count` / `following_count` on users (on follows INSERT/DELETE)
+- `post_count` on users (on posts INSERT/DELETE)
+- `like_count` on posts (on likes INSERT/DELETE)
+- `comment_count` on posts (on comments INSERT/DELETE)
+- `view_count` on stories (on story_views INSERT)
+
+This avoids expensive COUNT queries on every profile/post load.
+
+## What's Omitted
+
+These production features are not implemented:
+
+- CDN and edge caching
+- Multi-region deployment and geo-routing
+- Kubernetes orchestration
+- Database sharding and read replicas
+- ML-based feed ranking
+- Real-time WebSocket for DMs (uses HTTP polling)
+- Push notifications (APNs, FCM)
+- Content moderation pipeline
+- Video transcoding
+- Explore/discovery algorithm
+- Full-text search (Elasticsearch)
+- Pre-signed upload URLs (uploads go through the API server)
+- OAuth 2.0 / JWT (uses session cookies)
+
+## How to Run
+
+```bash
+# Terminal 1: Start infrastructure
+cd instagram
+docker-compose up -d
+
+# Terminal 2: Start backend API
+cd instagram/backend
+npm run dev          # Starts on port 3000
+
+# Terminal 3: Start image worker
+cd instagram/backend
+npm run dev:worker   # Consumes from RabbitMQ
+
+# Terminal 4: Start frontend
+cd instagram/frontend
+npm run dev          # Starts on port 5173
 ```
 
-#### 2. Business Metrics (Engagement)
-```prometheus
-# Content creation velocity
-instagram_posts_created_total
-instagram_stories_created_total
+**Default credentials**:
 
-# Engagement metrics
-instagram_likes_total{action="like|unlike"}
-instagram_follows_total{action="follow|unfollow"}
-instagram_story_views_total
+| Service | User | Password | Database |
+|---------|------|----------|----------|
+| PostgreSQL | instagram | instagram123 | instagram |
+| RabbitMQ | instagram | instagram123 | - |
+| MinIO | minioadmin | minioadmin123 | bucket: instagram-media |
+| Cassandra | - | - | keyspace: instagram_dm |
 
-# Duplicate detection (idempotency working?)
-instagram_likes_duplicate_total
-```
-
-#### 3. Performance Optimization
-```prometheus
-# Feed performance
-instagram_feed_generation_seconds{cache_status="hit|miss"}
-instagram_feed_cache_hits_total
-instagram_feed_cache_misses_total
-
-# Image processing
-instagram_image_processing_seconds{size="all|story"}
-instagram_image_processing_errors_total{error_type="..."}
-```
-
-#### 4. Reliability (Circuit Breakers)
-```prometheus
-# Circuit breaker health
-instagram_circuit_breaker_state{name="feed_generation|image_processing"}
-instagram_circuit_breaker_events_total{name="...",event="success|failure|open"}
-```
-
-**How metrics enable optimization**:
-
-| Metric Pattern | Action |
-|----------------|--------|
-| Feed cache miss rate > 50% | Increase cache TTL or pre-warm caches |
-| Image processing p99 > 5s | Add more processing workers or resize on client |
-| Likes duplicate rate > 10% | Frontend is retrying too aggressively |
-| Circuit breaker opening frequently | Underlying service unstable, investigate |
-| Follow rate limit hits increasing | Potential bot attack, review IP patterns |
-
-**Alerting thresholds** (configure in Prometheus/Grafana):
-```yaml
-# High error rate
-alert: HighErrorRate
-expr: rate(instagram_http_requests_total{status_code=~"5.."}[5m]) / rate(instagram_http_requests_total[5m]) > 0.01
-
-# Slow feeds
-alert: SlowFeedGeneration
-expr: histogram_quantile(0.95, instagram_feed_generation_seconds_bucket) > 0.5
-
-# Circuit breaker open
-alert: CircuitBreakerOpen
-expr: instagram_circuit_breaker_state == 1
-```
-
-**Implementation locations**:
-- `/instagram/backend/src/services/metrics.js` - All metric definitions
-- `/instagram/backend/src/index.js` - `/metrics` endpoint and middleware
-
----
-
-### WHY Circuit Breakers Prevent Cascading Failures
-
-**Problem**: When a downstream service (MinIO, image processing) fails, continued attempts can:
-1. Pile up requests, exhausting connection pools
-2. Create timeout storms that affect healthy operations
-3. Prevent the failing service from recovering
-4. Cascade failures to upstream services
-
-**Scenario without circuit breaker**:
-1. MinIO becomes slow (network issue, disk I/O)
-2. Image processing requests timeout after 30 seconds each
-3. Users keep uploading, API server threads are blocked waiting
-4. Thread pool exhausted, all endpoints become unresponsive
-5. Health checks fail, load balancer marks server as dead
-6. Cascading failure across the cluster
-
-**Solution**: Opossum circuit breaker library
-
-**States**:
-- **CLOSED** (0): Normal operation, requests flow through
-- **OPEN** (1): Too many failures, requests fail immediately with fallback
-- **HALF-OPEN** (2): Testing recovery, allowing limited requests
-
-**Configuration for image processing**:
-```javascript
-{
-  timeout: 30000,              // Fail after 30 seconds
-  errorThresholdPercentage: 50, // Open if 50% of requests fail
-  resetTimeout: 60000,          // Try again after 1 minute
-  volumeThreshold: 3,           // Need 3 requests before evaluating
-}
-```
-
-**Flow**:
-```
-Request → Circuit Breaker → [CLOSED?] → Execute function → Success/Failure
-                          → [OPEN?] → Return fallback immediately (503)
-                          → [HALF-OPEN?] → Try one request, evaluate
-```
-
-**Fallback strategies**:
-
-| Operation | Fallback Behavior |
-|-----------|-------------------|
-| Image Processing | Return 503 "temporarily unavailable" |
-| Feed Generation | Return empty feed `{ posts: [] }` |
-
-**Why fallbacks matter**:
-- Users see degraded experience, not error pages
-- System remains responsive for other operations
-- Failed service has time to recover
-- Monitoring alerts on circuit state changes
-
-**Implementation locations**:
-- `/instagram/backend/src/services/circuitBreaker.js` - Factory function
-- `/instagram/backend/src/routes/posts.js` - Image processing breaker
-- `/instagram/backend/src/routes/feed.js` - Feed generation breaker
-- `/instagram/backend/src/routes/stories.js` - Story image breaker
-
----
-
-### RBAC (Role-Based Access Control) Implementation
-
-**Roles hierarchy**:
-```
-admin (3) > verified (2) > user (1) > anonymous (0)
-```
-
-**Role capabilities**:
-
-| Role | Create Content | Delete Own | Delete Any | View Private | Admin Panel |
-|------|---------------|------------|------------|--------------|-------------|
-| anonymous | No | No | No | No | No |
-| user | Yes | Yes | No | If following | No |
-| verified | Yes | Yes | No | If following | No |
-| admin | Yes | Yes | Yes | Yes | Yes |
-
-**Session structure** (stored in Valkey):
-```javascript
-{
-  userId: "uuid",
-  username: "johndoe",
-  role: "user" | "verified" | "admin",
-  isVerified: false | true
-}
-```
-
-**Middleware usage**:
-```javascript
-// Any authenticated user
-router.post('/posts', requireAuth, createPost);
-
-// Only verified users (e.g., for premium features)
-router.post('/live', requireVerified, startLiveStream);
-
-// Only admins
-router.delete('/admin/posts/:id', requireAdmin, deleteAnyPost);
-
-// Owner or admin
-router.delete('/posts/:id', requireAuth, requireOwnership(getPostOwner), deletePost);
-```
-
-**Implementation location**: `/instagram/backend/src/middleware/auth.js`
+**Useful URLs**:
+- Frontend: http://localhost:5173
+- API: http://localhost:3000/api/v1/
+- Metrics: http://localhost:3000/metrics
+- Health: http://localhost:3000/api/health/detailed
+- RabbitMQ UI: http://localhost:15672
+- MinIO Console: http://localhost:9001

@@ -2,13 +2,14 @@
 
 ## System Overview
 
-Slack is a team communication platform with real-time messaging. Core challenges involve message delivery, workspace isolation, threading, and integrations.
+Slack is a team communication platform built around real-time messaging within isolated workspaces. Core challenges include low-latency message delivery across millions of concurrent connections, workspace tenant isolation, threading and conversation models, full-text search across message history, and an extensible integration platform.
 
 **Learning Goals:**
-- Build real-time messaging at scale
-- Design threading/reply models
-- Implement workspace isolation
-- Create integration/bot platform
+- Build real-time messaging with WebSocket + Redis pub/sub fan-out
+- Design threading/reply models with atomic counters
+- Implement multi-tenant workspace isolation with RBAC
+- Handle search at scale with Elasticsearch and PostgreSQL FTS fallback
+- Apply production-grade patterns: idempotency, rate limiting, caching, structured logging, Prometheus metrics
 
 ---
 
@@ -16,410 +17,477 @@ Slack is a team communication platform with real-time messaging. Core challenges
 
 ### Functional Requirements
 
-1. **Workspace**: Isolated team environments
-2. **Channels**: Organized conversations
-3. **Messages**: Send, edit, delete, react
-4. **Threads**: Reply to specific messages
-5. **Search**: Find messages across workspace
+1. **Workspaces**: Isolated team environments with role-based membership (owner, admin, member, guest)
+2. **Channels**: Public and private organized conversations within a workspace
+3. **Direct Messages**: One-on-one and group private conversations
+4. **Messages**: Send, edit, delete with real-time delivery to all channel members
+5. **Threads**: Reply to specific messages with reply count tracking
+6. **Reactions**: Add/remove emoji reactions on messages
+7. **Search**: Full-text search across messages with filters (channel, user, date range)
+8. **Presence**: Online/away/offline status with real-time updates
+9. **Typing Indicators**: Real-time typing notifications within channels
+10. **File Sharing**: Upload and attach files to messages
+11. **Notifications**: Push notifications, email digests, @mention tracking
+12. **Integrations**: Incoming webhooks, slash commands, bot users
 
 ### Non-Functional Requirements
 
-- **Latency**: < 200ms message delivery
-- **Availability**: 99.99% for messaging
-- **Scale**: 10M workspaces, 1B messages/day
-- **Ordering**: Messages appear in order
+- **Latency**: < 200ms message delivery end-to-end (p99)
+- **Availability**: 99.99% for messaging pipeline
+- **Scale**: 10M workspaces, 500M daily active users, 1B messages/day
+- **Ordering**: Messages appear in consistent order across all clients
+- **Durability**: Zero message loss once acknowledged by server
+- **Consistency**: Strong consistency for message ordering within a channel; eventual consistency acceptable for search indexing, presence, and read receipts
+
+---
+
+# Layer 1: Production-Ready Architecture
+
+This section describes how Slack would work at production scale with millions of concurrent users, billions of messages, and multi-region deployments.
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│       Desktop App │ Web │ Mobile (React Native)                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │ WebSocket
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Gateway Cluster                              │
-│         (WebSocket management, presence, routing)               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Message Service                              │
-│              - Send - Threads - Reactions                       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  PostgreSQL   │    │   Valkey      │    │ Elasticsearch │
-│  - Messages   │    │ - Connections │    │ - Search index│
-│  - Channels   │    │ - Presence    │    │               │
-│  - Workspaces │    │ - Pub/Sub     │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Client Layer                                       │
+│          Desktop App │ Web (React) │ Mobile (React Native)                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                    │ HTTPS / WSS                │ HTTPS
+                    ▼                            ▼
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│         CDN (CloudFront)     │    │     Global Load Balancer     │
+│   Static assets, emoji,     │    │   (Route 53 / GeoDNS)        │
+│   avatars, file thumbnails  │    │                              │
+└──────────────────────────────┘    └──────────────┬───────────────┘
+                                                   │
+                              ┌────────────────────┼────────────────────┐
+                              ▼                    ▼                    ▼
+                  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+                  │  WebSocket GW   │  │  WebSocket GW   │  │  WebSocket GW   │
+                  │  (Region A)     │  │  (Region B)     │  │  (Region C)     │
+                  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                           │                    │                    │
+                           └────────────────────┼────────────────────┘
+                                                │
+                              ┌─────────────────┼─────────────────┐
+                              ▼                 ▼                 ▼
+                  ┌─────────────────┐  ┌────────────────┐  ┌──────────────┐
+                  │  API Gateway    │  │  API Gateway   │  │  API Gateway │
+                  │  (Auth, Rate    │  │                │  │              │
+                  │   Limit, Route) │  │                │  │              │
+                  └────────┬────────┘  └────────┬───────┘  └──────┬───────┘
+                           │                    │                 │
+          ┌────────────────┼──────────┬─────────┼─────────────────┤
+          ▼                ▼          ▼         ▼                 ▼
+┌──────────────┐ ┌──────────────┐ ┌─────────┐ ┌──────────┐ ┌──────────────┐
+│  Message     │ │  Channel     │ │ Presence│ │  Search  │ │  File        │
+│  Service     │ │  Service     │ │ Service │ │  Service │ │  Service     │
+│              │ │              │ │         │ │          │ │              │
+│ - Send/Recv  │ │ - CRUD       │ │ - Track │ │ - Index  │ │ - Upload     │
+│ - Thread     │ │ - Membership │ │ - Heart │ │ - Query  │ │ - Virus Scan │
+│ - React      │ │ - DMs        │ │ - Broad │ │ - Filter │ │ - Thumbnail  │
+│ - Edit/Del   │ │ - Unread     │ │   cast  │ │          │ │ - CDN link   │
+└──────┬───────┘ └──────┬───────┘ └────┬────┘ └────┬─────┘ └──────┬───────┘
+       │                │              │           │               │
+       ▼                ▼              ▼           ▼               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Kafka Event Bus                                     │
+│                                                                             │
+│  Topics: messages.created │ messages.updated │ messages.deleted              │
+│          presence.changed │ reactions.changed │ files.uploaded               │
+│          notifications │ audit.log │ webhooks.deliver                        │
+└──────────┬───────────────┬──────────────────┬──────────────┬────────────────┘
+           ▼               ▼                  ▼              ▼
+┌──────────────┐ ┌──────────────┐  ┌──────────────┐ ┌──────────────────┐
+│  Notification│ │  Webhook     │  │  Audit Log   │ │  Analytics       │
+│  Worker      │ │  Delivery    │  │  Writer      │ │  Pipeline        │
+│              │ │  Worker      │  │              │ │                  │
+│ Push/Email   │ │ Retry + DLQ  │  │ Compliance   │ │ Usage metrics    │
+└──────────────┘ └──────────────┘  └──────────────┘ └──────────────────┘
+           │               │                  │              │
+           ▼               ▼                  ▼              ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Data Layer                                          │
+│                                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  PostgreSQL   │  │   Redis      │  │Elasticsearch │  │     S3       │     │
+│  │  (Sharded)   │  │  Cluster     │  │  Cluster     │  │              │     │
+│  │              │  │              │  │              │  │  Files,      │     │
+│  │  Messages    │  │  Sessions    │  │  Message     │  │  Avatars,    │     │
+│  │  Channels    │  │  Presence    │  │  Full-text   │  │  Thumbnails  │     │
+│  │  Users       │  │  Pub/Sub     │  │  Search      │  │              │     │
+│  │  Workspaces  │  │  Cache       │  │              │  │              │     │
+│  │              │  │  Rate Limits │  │              │  │              │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Message Model
+### 1. WebSocket Gateway
 
-**Messages and Threads:**
-```sql
-CREATE TABLE messages (
-  id BIGSERIAL PRIMARY KEY,
-  workspace_id UUID NOT NULL,
-  channel_id UUID REFERENCES channels(id),
-  user_id UUID REFERENCES users(id),
+The WebSocket Gateway manages millions of persistent client connections and is the primary path for real-time message delivery.
 
-  -- Threading support
-  thread_ts BIGINT, -- NULL for top-level, parent ID for replies
-  reply_count INTEGER DEFAULT 0,
-  latest_reply TIMESTAMP,
-  reply_users UUID[], -- Users who replied
+**Connection Lifecycle:**
+1. Client opens WSS connection with authentication token
+2. Gateway validates token against session store (Redis)
+3. Gateway verifies workspace membership
+4. Gateway subscribes to the user's personal Redis pub/sub channel (`user:{userId}:messages`)
+5. All messages for that user are pushed through this channel
+6. Heartbeat pings every 30 seconds detect stale connections
+7. On disconnect, presence is removed and workspace members are notified
 
-  content TEXT NOT NULL,
-  attachments JSONB,
-  edited_at TIMESTAMP,
+**Multi-Instance Fan-Out:**
+When a user sends a message, the Message Service publishes it to each channel member's personal Redis pub/sub channel. Regardless of which Gateway instance a member is connected to, that instance's subscriber receives the message and forwards it over the WebSocket. This decouples message storage from delivery, allowing Gateway instances to scale independently.
 
-  created_at TIMESTAMP DEFAULT NOW()
-);
+**Multiple Connections Per User:**
+Users may have multiple browser tabs or devices. The Gateway maintains a `Map<userId, Set<WebSocket>>` and delivers to all active connections. Presence is only removed when the last connection closes.
 
--- Indexes for common queries
-CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
-CREATE INDEX idx_messages_thread ON messages(thread_ts) WHERE thread_ts IS NOT NULL;
-```
+### 2. Message Service
 
-**Thread Query:**
-```javascript
-async function getThread(messageTs) {
-  // Get parent message
-  const parent = await db('messages').where({ id: messageTs }).first()
+Handles message CRUD with transactional guarantees.
 
-  // Get all replies
-  const replies = await db('messages')
-    .where({ thread_ts: messageTs })
-    .orderBy('created_at', 'asc')
+**Send Flow:**
+1. Validate channel membership (cached in Redis for performance)
+2. Begin PostgreSQL transaction
+3. Insert message with server-assigned `created_at` timestamp
+4. If thread reply: atomically increment parent's `reply_count` and append user to `reply_users`
+5. Commit transaction
+6. Publish to each channel member's Redis pub/sub channel (using cached member list)
+7. Index message in Elasticsearch asynchronously (non-blocking)
+8. Record Prometheus metrics (message count by workspace and channel type)
 
-  return { parent, replies }
-}
-```
+**Idempotency Protection:**
+Clients include an `X-Idempotency-Key` header. The middleware checks Redis for prior processing of this key. A distributed lock (Redis `SET NX EX`) prevents race conditions from parallel retries. Responses are cached for 24 hours, ensuring that network retries never create duplicate messages.
 
-### 2. Real-Time Delivery
+**Message Ordering:**
+Server-assigned timestamps (`TIMESTAMPTZ DEFAULT NOW()`) provide total ordering within a channel. The `BIGSERIAL` primary key provides a monotonically increasing sequence for efficient cursor-based pagination. Clients fetch messages with `WHERE id < :cursor ORDER BY created_at DESC LIMIT 50`, then reverse for chronological display.
 
-**Fan-Out to Channel Members:**
-```javascript
-async function sendMessage(workspaceId, channelId, userId, content) {
-  // 1. Store message
-  const message = await db('messages').insert({
-    workspace_id: workspaceId,
-    channel_id: channelId,
-    user_id: userId,
-    content
-  }).returning('*')
+### 3. Channel Architecture
 
-  // 2. Get channel members
-  const members = await db('channel_members')
-    .where({ channel_id: channelId })
-    .pluck('user_id')
+Three channel types share the same underlying table with boolean flags:
 
-  // 3. Publish to each member's subscription
-  for (const memberId of members) {
-    await redis.publish(
-      `user:${memberId}:messages`,
-      JSON.stringify(message)
-    )
-  }
+- **Public channels** (`is_private=false, is_dm=false`): Any workspace member can join
+- **Private channels** (`is_private=true, is_dm=false`): Invitation-only, hidden from non-members
+- **Direct messages** (`is_private=true, is_dm=true`): 1:1 or group DMs with exact-member matching
 
-  // 4. Index for search (async)
-  await searchQueue.add({ type: 'index_message', message })
+DMs are implemented as channels with `is_dm=true`. Creating a DM checks for an existing channel with the exact same member set (using `array_agg` with sorted user IDs) to prevent duplicates.
 
-  return message
-}
+Each workspace auto-creates `#general` and `#random` channels. New workspace members are automatically added to both.
 
-// Gateway subscribes to user's channel
-gateway.on('connection', async (ws, userId) => {
-  const subscriber = redis.duplicate()
-  await subscriber.subscribe(`user:${userId}:messages`)
+### 4. Real-Time Messaging: Presence and Typing
 
-  subscriber.on('message', (channel, data) => {
-    ws.send(data)
-  })
-})
-```
+**Presence System:**
+- Each online user has a Redis key `presence:{workspaceId}:{userId}` with 60-second TTL
+- The WebSocket heartbeat refreshes this TTL every 30 seconds
+- When the key expires (no heartbeat), the user is implicitly offline
+- On explicit disconnect, the key is deleted immediately
+- Presence changes are broadcast to all workspace members via Redis pub/sub
 
-### 3. Presence System
+**Typing Indicators:**
+- When a user starts typing, a Redis key `typing:{channelId}:{userId}` is set with 5-second TTL
+- The typing event is published to all other channel members
+- No explicit "stopped typing" -- the TTL handles cleanup
 
-**Tracking Online Status:**
-```javascript
-// Client sends heartbeat every 30 seconds
-async function heartbeat(userId, workspaceId) {
-  // Update presence with TTL
-  await redis.setex(
-    `presence:${workspaceId}:${userId}`,
-    60, // Expires in 60s if no heartbeat
-    JSON.stringify({ status: 'online', lastSeen: Date.now() })
-  )
+### 5. Message Storage at Scale
 
-  // Broadcast presence change
-  await broadcastPresence(workspaceId, userId, 'online')
-}
+**Sharding Strategy:**
+At production scale, messages are sharded by `workspace_id`. This ensures all messages for a workspace live on the same shard, enabling efficient channel queries without cross-shard joins. The schema includes `workspace_id` on every message for this purpose.
 
-// Check if user is online
-async function isOnline(workspaceId, userId) {
-  const presence = await redis.get(`presence:${workspaceId}:${userId}`)
-  return presence !== null
-}
+**Key Indexes:**
+- `(channel_id, created_at DESC)` -- primary query path for channel message history
+- `(thread_ts) WHERE thread_ts IS NOT NULL` -- partial index for thread reply lookups
+- `(workspace_id)` -- shard-key queries
+- `(user_id)` -- user message history
+- GIN index on `to_tsvector('english', content)` -- PostgreSQL full-text search fallback
 
-// Get all online users in workspace
-async function getOnlineUsers(workspaceId) {
-  const keys = await redis.keys(`presence:${workspaceId}:*`)
-  return keys.map(k => k.split(':')[2])
-}
-```
+**Thread Model:**
+Threads are replies referencing a parent message's `id` via `thread_ts`. The parent message maintains:
+- `reply_count` (atomically incremented in the same transaction as the reply insert)
+- `latest_reply` timestamp
+- `reply_users` array (deduplicated list of users who replied)
 
-### 4. Search
+This denormalization avoids aggregation queries when displaying thread metadata in the channel view.
 
-**Message Indexing:**
-```javascript
-async function indexMessage(message) {
-  await es.index({
-    index: 'messages',
-    id: message.id,
-    body: {
-      workspace_id: message.workspace_id,
-      channel_id: message.channel_id,
-      user_id: message.user_id,
-      content: message.content,
-      created_at: message.created_at
-    }
-  })
-}
+### 6. Search
 
-async function searchMessages(workspaceId, query, filters) {
-  return await es.search({
-    index: 'messages',
-    body: {
-      query: {
-        bool: {
-          must: [
-            { term: { workspace_id: workspaceId } },
-            { match: { content: query } }
-          ],
-          filter: [
-            filters.channelId && { term: { channel_id: filters.channelId } },
-            filters.userId && { term: { user_id: filters.userId } },
-            filters.dateRange && {
-              range: { created_at: { gte: filters.from, lte: filters.to } }
-            }
-          ].filter(Boolean)
-        }
-      },
-      highlight: {
-        fields: { content: {} }
-      }
-    }
-  })
-}
-```
+**Primary: Elasticsearch**
+- Custom `message_analyzer` with standard tokenizer + lowercase + Porter stemming
+- Messages indexed asynchronously after storage (1-5 second lag acceptable)
+- Query filters: workspace_id (mandatory), channel_id, user_id, date range
+- Results include highlighted snippets for matching terms
+- Workspace isolation enforced at query time via `term` filter
 
-### 5. Integrations
+**Fallback: PostgreSQL Full-Text Search**
+When Elasticsearch is unavailable, search falls back to PostgreSQL `tsvector` with `plainto_tsquery`. The GIN index on `to_tsvector('english', content)` enables this. `ts_headline` provides keyword highlighting. Less feature-rich than Elasticsearch (no stemming variants, no relevance tuning) but ensures search never goes fully offline.
 
-**Incoming Webhooks:**
-```javascript
-// Generate webhook URL for channel
-async function createWebhook(workspaceId, channelId) {
-  const token = crypto.randomBytes(32).toString('hex')
+### 7. File Sharing (Production Design)
 
-  await db('webhooks').insert({
-    workspace_id: workspaceId,
-    channel_id: channelId,
-    token,
-    created_at: new Date()
-  })
+At production scale, file sharing involves:
+1. Client requests a pre-signed S3 upload URL from the File Service
+2. Client uploads directly to S3 (avoiding API server bandwidth)
+3. S3 triggers a Lambda for virus scanning (ClamAV)
+4. After scanning, a thumbnail generator creates previews for images/documents
+5. File metadata is stored in PostgreSQL with references to S3 keys
+6. CDN serves thumbnails and file downloads with signed URLs
+7. Message `attachments` JSONB field references file metadata
 
-  return `https://hooks.slack.com/services/${workspaceId}/${channelId}/${token}`
-}
+### 8. Notifications (Production Design)
 
-// Handle incoming webhook
-app.post('/services/:workspace/:channel/:token', async (req, res) => {
-  const webhook = await db('webhooks')
-    .where({
-      workspace_id: req.params.workspace,
-      channel_id: req.params.channel,
-      token: req.params.token
-    })
-    .first()
+- **Kafka topic** `notifications` receives events: mentions, DM messages, thread replies
+- **Notification Worker** fans out to delivery channels:
+  - Push notifications via APNs/FCM for mobile
+  - Desktop notifications via WebSocket for web/desktop clients
+  - Email digest batching (configurable: immediate, hourly, daily)
+- **@mention tracking**: Message content is parsed for `@username` and `@channel` patterns
+- Users configure notification preferences per channel (all, mentions, nothing)
 
-  if (!webhook) {
-    return res.status(404).send('Webhook not found')
-  }
+### 9. Workspace Management and RBAC
 
-  await sendMessage(
-    webhook.workspace_id,
-    webhook.channel_id,
-    SYSTEM_USER_ID,
-    req.body.text
-  )
+**Role Hierarchy:** `owner (3) > admin (2) > member (1) > guest (0)`
 
-  res.status(200).send('ok')
-})
-```
+| Permission | Guest | Member | Admin | Owner |
+|------------|-------|--------|-------|-------|
+| Read public channels | Yes | Yes | Yes | Yes |
+| Send messages | Yes | Yes | Yes | Yes |
+| Create channels | No | Yes | Yes | Yes |
+| Delete own messages | Yes | Yes | Yes | Yes |
+| Delete any message | No | No | Yes | Yes |
+| Manage channel settings | No | No | Yes | Yes |
+| Invite/remove members | No | No | Yes | Yes |
+| Manage workspace settings | No | No | No | Yes |
+| Delete workspace | No | No | No | Yes |
+| Manage integrations | No | No | Yes | Yes |
+
+**SSO/SAML Integration (Production):**
+At scale, workspaces integrate with identity providers (Okta, Azure AD) via SAML 2.0. The API Gateway handles SAML assertion validation and maps external identities to workspace members. This is simplified to session-based auth in the local implementation.
 
 ---
 
 ## Database Schema
 
-**Schema file:** `backend/src/db/migrate.ts`
+**Schema file:** `backend/src/db/init.sql`
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  username VARCHAR(100) NOT NULL,
-  display_name VARCHAR(200) NOT NULL,
-  avatar_url TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS users (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    username    VARCHAR(50)  NOT NULL,
+    display_name VARCHAR(100),
+    avatar_url  TEXT,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_users_email    ON users (email);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
 
 -- Workspaces
-CREATE TABLE workspaces (
-  id UUID PRIMARY KEY,
-  name VARCHAR(200) NOT NULL,
-  domain VARCHAR(100) UNIQUE,
-  settings JSONB,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS workspaces (
+    id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name       VARCHAR(100) NOT NULL,
+    domain     VARCHAR(100) NOT NULL UNIQUE,
+    settings   JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- Workspace members (role-based access)
-CREATE TABLE workspace_members (
-  workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  role VARCHAR(20) DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
-  joined_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (workspace_id, user_id)
+CREATE INDEX IF NOT EXISTS idx_workspaces_domain ON workspaces (domain);
+
+-- Workspace Members (role-based access)
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id UUID        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role         VARCHAR(20) NOT NULL DEFAULT 'member',
+    joined_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (workspace_id, user_id)
 );
 
--- Channels
-CREATE TABLE channels (
-  id UUID PRIMARY KEY,
-  workspace_id UUID REFERENCES workspaces(id),
-  name VARCHAR(100) NOT NULL,
-  topic TEXT,
-  description TEXT,
-  is_private BOOLEAN DEFAULT FALSE,
-  is_archived BOOLEAN DEFAULT FALSE,
-  is_dm BOOLEAN DEFAULT FALSE,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(workspace_id, name)
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members (user_id);
+
+-- Channels (public, private, DMs share the same table)
+CREATE TABLE IF NOT EXISTS channels (
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID         NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name         VARCHAR(100) NOT NULL,
+    topic        TEXT,
+    description  TEXT,
+    is_private   BOOLEAN      NOT NULL DEFAULT false,
+    is_archived  BOOLEAN      NOT NULL DEFAULT false,
+    is_dm        BOOLEAN      NOT NULL DEFAULT false,
+    created_by   UUID         REFERENCES users(id) ON DELETE SET NULL,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (workspace_id, name)
 );
 
--- Channel membership
-CREATE TABLE channel_members (
-  channel_id UUID REFERENCES channels(id),
-  user_id UUID REFERENCES users(id),
-  joined_at TIMESTAMP DEFAULT NOW(),
-  last_read_at TIMESTAMP,
-  PRIMARY KEY (channel_id, user_id)
+CREATE INDEX IF NOT EXISTS idx_channels_workspace    ON channels (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_channels_workspace_dm ON channels (workspace_id, is_dm);
+
+-- Channel Members
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id   UUID        NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_read_at TIMESTAMPTZ,
+    PRIMARY KEY (channel_id, user_id)
 );
 
--- Messages
-CREATE TABLE messages (
-  id BIGSERIAL PRIMARY KEY,
-  workspace_id UUID REFERENCES workspaces(id),
-  channel_id UUID REFERENCES channels(id),
-  user_id UUID REFERENCES users(id),
-  thread_ts BIGINT REFERENCES messages(id),
-  content TEXT NOT NULL,
-  attachments JSONB,
-  reply_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW(),
-  edited_at TIMESTAMP
+CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members (user_id);
+
+-- Messages (threads are self-referencing via thread_ts)
+CREATE TABLE IF NOT EXISTS messages (
+    id           BIGSERIAL   PRIMARY KEY,
+    workspace_id UUID        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    channel_id   UUID        NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+    thread_ts    BIGINT      REFERENCES messages(id) ON DELETE CASCADE,
+    content      TEXT        NOT NULL,
+    attachments  JSONB,
+    reply_count  INT         NOT NULL DEFAULT 0,
+    latest_reply TIMESTAMPTZ,
+    reply_users  UUID[],
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at    TIMESTAMPTZ
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_channel       ON messages (channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_thread        ON messages (thread_ts) WHERE thread_ts IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_workspace     ON messages (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_messages_user          ON messages (user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_content_fts   ON messages USING gin(to_tsvector('english', content));
 
 -- Reactions
-CREATE TABLE reactions (
-  message_id BIGINT REFERENCES messages(id),
-  user_id UUID REFERENCES users(id),
-  emoji VARCHAR(50) NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (message_id, user_id, emoji)
+CREATE TABLE IF NOT EXISTS reactions (
+    id         BIGSERIAL   PRIMARY KEY,
+    message_id BIGINT      NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji      VARCHAR(50) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (message_id, user_id, emoji)
 );
 
--- Direct messages (separate from channels for workspace isolation)
-CREATE TABLE direct_messages (
-  id UUID PRIMARY KEY,
-  workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions (message_id);
+```
 
--- Direct message members
-CREATE TABLE direct_message_members (
-  dm_id UUID REFERENCES direct_messages(id) ON DELETE CASCADE,
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  PRIMARY KEY (dm_id, user_id)
-);
+---
 
--- Indexes
-CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
-CREATE INDEX idx_messages_thread ON messages(thread_ts) WHERE thread_ts IS NOT NULL;
-CREATE INDEX idx_messages_workspace ON messages(workspace_id);
-CREATE INDEX idx_channel_members_user ON channel_members(user_id);
-CREATE INDEX idx_workspace_members_user ON workspace_members(user_id);
-CREATE INDEX idx_reactions_message ON reactions(message_id);
-CREATE INDEX idx_messages_content_fts ON messages USING gin(to_tsvector('english', content));
+## API Design
+
+### User API (`/api/*`)
+
+```
+POST   /api/auth/register           → Create account
+POST   /api/auth/login              → Login (creates session)
+POST   /api/auth/logout             → Logout (destroys session)
+GET    /api/auth/me                 → Get current user profile
+
+GET    /api/workspaces              → List user's workspaces
+POST   /api/workspaces              → Create workspace
+POST   /api/workspaces/:id/join     → Join workspace
+POST   /api/workspaces/:id/select   → Set active workspace in session
+GET    /api/workspaces/:id/members  → List workspace members
+GET    /api/workspaces/domain/:d    → Find workspace by domain
+
+GET    /api/channels                → List channels in current workspace
+POST   /api/channels                → Create channel
+GET    /api/channels/:id            → Get channel details
+PUT    /api/channels/:id            → Update channel topic/description
+POST   /api/channels/:id/join       → Join public channel
+POST   /api/channels/:id/leave      → Leave channel
+GET    /api/channels/:id/members    → List channel members
+POST   /api/channels/:id/members    → Invite user to channel
+POST   /api/channels/:id/read       → Mark channel as read
+
+GET    /api/dms                     → List DM conversations
+POST   /api/dms                     → Create or get DM channel
+GET    /api/dms/:id                 → Get DM conversation details
+
+GET    /api/messages/channel/:id    → Get messages (paginated)
+POST   /api/messages/channel/:id    → Send message (rate limited, idempotent)
+PUT    /api/messages/:id            → Edit message (author only)
+DELETE /api/messages/:id            → Delete message (author or admin)
+GET    /api/messages/:id/thread     → Get thread with replies
+POST   /api/messages/:id/reactions  → Add reaction
+DELETE /api/messages/:id/reactions/:emoji → Remove reaction
+
+GET    /api/search?q=...            → Search messages (ES with PG fallback)
+```
+
+### Admin API (`/api/workspaces/:id/*`)
+
+```
+PUT    /api/workspaces/:id                    → Update workspace settings (owner)
+PUT    /api/workspaces/:id/members/:userId    → Change member role (owner)
+DELETE /api/workspaces/:id/members/:userId    → Remove member (admin+)
+DELETE /api/channels/:id                      → Archive channel (owner)
+DELETE /api/channels/:id/members/:userId      → Remove from channel (admin+)
+```
+
+### WebSocket Protocol (`/ws`)
+
+```
+Connection: ws://host/ws?userId=...&workspaceId=...
+
+Server → Client Events:
+  { type: "connected",       payload: { userId, workspaceId } }
+  { type: "message",         payload: { id, channel_id, content, user_id, ... } }
+  { type: "message_update",  payload: { id, channel_id, content, edited_at, ... } }
+  { type: "message_delete",  payload: { id, channel_id } }
+  { type: "reaction_add",    payload: { message_id, user_id, emoji } }
+  { type: "reaction_remove", payload: { message_id, user_id, emoji } }
+  { type: "typing",          payload: { channelId, userId } }
+  { type: "presence",        payload: { userId, status, user } }
+  { type: "pong" }
+
+Client → Server Events:
+  { type: "ping" }
+  { type: "typing",   payload: { channelId } }
+  { type: "presence",  payload: { status: "online" | "away" } }
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. Thread as Attribute
+### 1. Thread as Message Attribute vs. Separate Table
 
-**Decision**: Threads are replies referencing parent message ID
+**Decision:** Threads are replies stored in the `messages` table with a `thread_ts` foreign key to the parent message.
 
-**Rationale**:
-- Simple query for thread
-- Parent message contains reply metadata
-- Compatible with existing message table
+**Why this works:** A single table simplifies queries -- fetching a thread is `WHERE thread_ts = :parentId ORDER BY created_at ASC`. The parent message carries denormalized metadata (`reply_count`, `latest_reply`, `reply_users`) so the channel view can show thread previews without aggregation queries. The `reply_count` increment happens atomically in the same transaction as the reply insert, preventing count drift.
 
-### 2. Valkey Pub/Sub for Delivery
+**Why a separate `threads` table fails:** It would require JOIN queries for every channel view to get thread metadata, and two-table transactions for every reply. The thread is not a separate entity -- it is a property of messages. Separating them adds complexity without improving query patterns.
 
-**Decision**: Publish messages to user-specific channels
+**What we give up:** Thread-specific metadata (title, pinned status) would require schema changes. For Slack's model where threads are lightweight reply chains, this is acceptable.
 
-**Rationale**:
-- Decouples message store from delivery
-- Scales to millions of connections
-- Gateway clusters subscribe independently
+### 2. Redis Pub/Sub for Message Delivery vs. Kafka
 
-### 3. Workspace Isolation
+**Decision:** Use Redis pub/sub for real-time WebSocket delivery; Kafka for async event processing.
 
-**Decision**: All tables have workspace_id foreign key
+**Why Redis pub/sub works for delivery:** Message delivery must be sub-200ms. Redis pub/sub adds ~1ms latency. Each user subscribes to their personal channel (`user:{userId}:messages`). When a message is sent, it is published to each channel member's personal channel. Regardless of which Gateway instance the member connects to, the subscriber picks it up. Redis pub/sub is fire-and-forget, which is acceptable because the message is already persisted in PostgreSQL -- the pub/sub is for real-time notification only.
 
-**Rationale**:
-- Clear data separation
-- Efficient queries within workspace
-- Supports sharding by workspace
+**Why Kafka fails for real-time delivery:** Kafka's consumer group model requires polling with configurable intervals. Even with low poll intervals (50ms), the batching and partition assignment overhead adds 100-500ms of latency. Kafka is designed for durable event streaming, not low-latency push. It excels at event processing (indexing, notifications, webhooks, audit logs) where 1-5 second lag is acceptable.
 
----
+**What we give up:** Redis pub/sub is at-most-once -- if no subscriber is listening when a message is published, it is lost. This is mitigated by the reconnection sync mechanism: when a client reconnects, it fetches missed messages from PostgreSQL using the last-seen timestamp.
 
-## Trade-offs Summary
+### 3. Workspace-Scoped Data Model for Tenant Isolation
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Threading | Parent reference | Separate table | Simplicity |
-| Delivery | Valkey pub/sub | Direct push | Scale |
-| Presence | Valkey with TTL | Database | Speed |
-| Search | Elasticsearch | PostgreSQL FTS | Scale, features |
+**Decision:** Every table includes `workspace_id` as a foreign key, and all queries filter by workspace.
+
+**Why this works:** It provides clear data isolation at the application level. Queries within a workspace are efficient because indexes include `workspace_id`. At scale, the workspace_id becomes the natural sharding key -- all data for a workspace lives on the same shard, avoiding cross-shard joins.
+
+**Why per-workspace databases fail:** They multiply operational complexity (migrations across thousands of databases), prevent cross-workspace features (enterprise search), and make user accounts that span workspaces (same email in multiple workspaces) awkward to manage.
+
+**What we give up:** Global queries (admin dashboards, cross-workspace analytics) require scatter-gather across shards. Mitigated by streaming events to a separate analytics pipeline.
 
 ---
 
@@ -427,93 +495,56 @@ CREATE INDEX idx_messages_content_fts ON messages USING gin(to_tsvector('english
 
 ### Write Consistency Model
 
-**Messages**: Strong consistency within a channel using PostgreSQL transactions.
+**Messages:** Strong consistency within a channel via PostgreSQL transactions. The `BIGSERIAL` primary key provides total ordering. Server-assigned `created_at` timestamps ensure consistent ordering regardless of client clock skew.
 
-```javascript
-// Message creation with idempotency key
-async function sendMessage(workspaceId, channelId, userId, content, idempotencyKey) {
-  // Check for duplicate request (client retry protection)
-  const existing = await redis.get(`idem:${idempotencyKey}`)
-  if (existing) {
-    return JSON.parse(existing) // Return cached response
-  }
+**Thread Reply Counts:** Atomically incremented in the same transaction as the reply insert:
 
-  const message = await db.transaction(async (trx) => {
-    // Insert message with server-assigned ordering
-    const [msg] = await trx('messages').insert({
-      workspace_id: workspaceId,
-      channel_id: channelId,
-      user_id: userId,
-      content,
-      created_at: new Date()
-    }).returning('*')
-
-    // If this is a thread reply, update parent reply count atomically
-    if (msg.thread_ts) {
-      await trx('messages')
-        .where({ id: msg.thread_ts })
-        .increment('reply_count', 1)
-    }
-
-    return msg
-  })
-
-  // Cache idempotency key for 24 hours
-  await redis.setex(`idem:${idempotencyKey}`, 86400, JSON.stringify(message))
-
-  return message
-}
+```sql
+BEGIN;
+INSERT INTO messages (workspace_id, channel_id, user_id, content, thread_ts) VALUES (...);
+UPDATE messages SET reply_count = reply_count + 1, latest_reply = NOW(),
+       reply_users = array_append(array_remove(COALESCE(reply_users, ARRAY[]::uuid[]), $1), $1)
+WHERE id = $2;
+COMMIT;
 ```
+
+### Idempotency
+
+The idempotency middleware prevents duplicate messages from network retries:
+
+1. Client includes `X-Idempotency-Key` header (e.g., `msg:{channelId}:{contentHash}:{timestamp}`)
+2. Middleware checks Redis for this key (scoped to user: `idem:{userId}:{key}`)
+3. If found, return cached response (no database write)
+4. If not found, acquire distributed lock (`SET NX EX 30`), process request, cache response for 24 hours
+5. Lock prevents race conditions from parallel retries
 
 ### Consistency Semantics by Operation
 
 | Operation | Consistency | Idempotency | Conflict Resolution |
 |-----------|-------------|-------------|---------------------|
-| Send message | Strong (PostgreSQL) | Client idempotency key | Server-assigned timestamp wins |
-| Edit message | Strong | Last-write-wins | `edited_at` timestamp comparison |
-| Delete message | Strong | Idempotent (no error on re-delete) | Soft delete with `deleted_at` |
-| Add reaction | Strong | Natural (upsert on PK) | No conflict possible |
-| Remove reaction | Strong | Idempotent | No-op if not exists |
-| Join channel | Strong | Natural (PK constraint) | No conflict possible |
+| Send message | Strong (PostgreSQL tx) | Client idempotency key | Server-assigned ID wins |
+| Edit message | Strong | Last-write-wins | `edited_at` timestamp |
+| Delete message | Strong | Idempotent (no error on re-delete) | Cascade deletes reactions/replies |
+| Add reaction | Strong | Natural (`UNIQUE` constraint + `ON CONFLICT DO NOTHING`) | No conflict possible |
+| Remove reaction | Strong | Idempotent (no-op if not exists) | No conflict possible |
+| Join channel | Strong | Natural (PK constraint + `ON CONFLICT DO NOTHING`) | No conflict possible |
 
-### Message Ordering
+### Reconnection Sync
 
-**Server-assigned timestamps** ensure ordering consistency:
+When a client reconnects after a network interruption, it fetches missed messages from PostgreSQL:
 
-```javascript
-// Messages ordered by database-assigned created_at
-async function getChannelMessages(channelId, cursor, limit = 50) {
-  return db('messages')
-    .where({ channel_id: channelId })
-    .where('created_at', '<', cursor || new Date())
-    .orderBy('created_at', 'desc')
-    .limit(limit)
-}
+```sql
+SELECT * FROM messages
+WHERE channel_id = $1 AND created_at > $2
+ORDER BY created_at ASC
+LIMIT 1000;
 ```
 
-**Eventual consistency for derived data:**
-- Search index: Async indexing with 1-5 second lag acceptable
-- Reply count: Atomic increment in same transaction
-- Presence: Eventually consistent across gateway nodes (60s TTL)
-
-### Replay Handling
-
-```javascript
-// Client reconnection - fetch missed messages
-async function syncMessages(channelId, lastSeenTs) {
-  const missed = await db('messages')
-    .where({ channel_id: channelId })
-    .where('created_at', '>', lastSeenTs)
-    .orderBy('created_at', 'asc')
-    .limit(1000)
-
-  return { messages: missed, hasMore: missed.length === 1000 }
-}
-```
+This bridges the gap between Redis pub/sub (at-most-once) and the durable message store.
 
 ---
 
-## Caching and Edge Strategy
+## Caching
 
 ### Cache Architecture
 
@@ -531,632 +562,345 @@ async function syncMessages(channelId, lastSeenTs) {
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Valkey Cache Layer                          │
-│                                                                  │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
-│  │ User Cache  │  │Channel Cache│  │ Workspace   │              │
-│  │ TTL: 5min   │  │ TTL: 2min   │  │ TTL: 10min  │              │
-│  └─────────────┘  └─────────────┘  └─────────────┘              │
-│                                                                  │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
-│  │  Presence   │  │  Sessions   │  │ Rate Limits │              │
-│  │  TTL: 60s   │  │ TTL: 24hr   │  │  TTL: 1min  │              │
-│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│                    Redis Cache Layer                             │
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │ User Cache  │  │Channel Cache│  │ Workspace   │             │
+│  │ TTL: 5min   │  │ TTL: 2min   │  │ TTL: 10min  │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  Presence   │  │  Sessions   │  │ Rate Limits │             │
+│  │  TTL: 60s   │  │ TTL: 7 days │  │  TTL: 1min  │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        PostgreSQL                                │
+│                        PostgreSQL                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Cache-Aside Pattern (Read Path)
+### Cache-Aside Pattern
 
-```javascript
-// Cache-aside for user profile
-async function getUser(userId) {
-  const cacheKey = `user:${userId}`
+The application uses cache-aside (lazy loading) for all cached data:
 
-  // 1. Check cache first
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  // 2. Cache miss - fetch from database
-  const user = await db('users').where({ id: userId }).first()
-
-  // 3. Populate cache
-  if (user) {
-    await redis.setex(cacheKey, 300, JSON.stringify(user)) // 5 min TTL
-  }
-
-  return user
-}
-
-// Cache-aside for channel members (frequently accessed)
-async function getChannelMembers(channelId) {
-  const cacheKey = `channel:${channelId}:members`
-
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  const members = await db('channel_members')
-    .where({ channel_id: channelId })
-    .join('users', 'users.id', 'channel_members.user_id')
-    .select('users.id', 'users.name', 'users.avatar_url')
-
-  await redis.setex(cacheKey, 120, JSON.stringify(members)) // 2 min TTL
-
-  return members
-}
-```
-
-### Write-Through for Critical Data
-
-```javascript
-// Write-through for workspace settings (rarely updated, frequently read)
-async function updateWorkspaceSettings(workspaceId, settings) {
-  // 1. Update database
-  await db('workspaces')
-    .where({ id: workspaceId })
-    .update({ settings })
-
-  // 2. Immediately update cache
-  const workspace = await db('workspaces').where({ id: workspaceId }).first()
-  await redis.setex(`workspace:${workspaceId}`, 600, JSON.stringify(workspace))
-
-  return workspace
-}
-```
+1. **Read path:** Check Redis first. On cache hit, return immediately. On miss, query PostgreSQL, populate cache with TTL, return result.
+2. **Write path:** Update PostgreSQL first. Then invalidate (delete) the cache key. Do not update the cache -- let the next read repopulate it.
+3. **Failure handling:** If Redis is unavailable, fall back directly to PostgreSQL. Cache errors never break the application.
 
 ### Cache Invalidation Rules
 
 | Cache Key Pattern | TTL | Invalidation Trigger |
 |-------------------|-----|----------------------|
-| `user:{id}` | 5 min | Profile update, avatar change |
-| `channel:{id}` | 2 min | Channel settings update |
-| `channel:{id}:members` | 2 min | Member join/leave |
-| `workspace:{id}` | 10 min | Workspace settings update |
-| `presence:{workspace}:{user}` | 60 sec | Heartbeat timeout |
-| `session:{token}` | 24 hr | Logout, password change |
-| `idem:{key}` | 24 hr | No invalidation (expires) |
-
-```javascript
-// Explicit invalidation on write
-async function addChannelMember(channelId, userId) {
-  await db('channel_members').insert({ channel_id: channelId, user_id: userId })
-
-  // Invalidate members cache
-  await redis.del(`channel:${channelId}:members`)
-
-  // Publish for real-time update
-  await redis.publish(`channel:${channelId}:events`, JSON.stringify({
-    type: 'member_joined',
-    user_id: userId
-  }))
-}
-```
-
-### CDN Configuration (Static Assets)
-
-```yaml
-# Local development: serve from Express static
-# Production concept for learning:
-cdn_config:
-  static_assets:
-    path: /static/*
-    ttl: 31536000  # 1 year
-    headers:
-      Cache-Control: "public, max-age=31536000, immutable"
-
-  emoji_sprites:
-    path: /emoji/*
-    ttl: 604800  # 1 week
-    headers:
-      Cache-Control: "public, max-age=604800"
-
-  user_avatars:
-    path: /avatars/*
-    ttl: 86400  # 1 day
-    headers:
-      Cache-Control: "public, max-age=86400"
-    invalidation: on_avatar_upload
-```
+| `cache:user:{id}` | 5 min | Profile update, avatar change |
+| `cache:channel:{id}` | 2 min | Channel settings update, membership change |
+| `cache:channel:{id}:members` | 2 min | Member join/leave/invite |
+| `cache:workspace:{id}` | 10 min | Workspace settings update |
+| `presence:{workspace}:{user}` | 60 sec | Heartbeat timeout (auto-expire) |
+| `session:{token}` | 7 days | Logout |
+| `idem:{user}:{key}` | 24 hr | No invalidation (auto-expire) |
+| `ratelimit:{user}:{op}` | 1 min | No invalidation (auto-expire) |
+| `typing:{channel}:{user}` | 5 sec | No invalidation (auto-expire) |
 
 ---
 
-## Authentication, Authorization, and Rate Limiting
-
-### Authentication Flow
-
-**Session-Based Auth** (simpler than JWT for learning):
-
-```javascript
-// Login - create session
-async function login(email, password) {
-  const user = await db('users').where({ email }).first()
-
-  if (!user || !await bcrypt.compare(password, user.password_hash)) {
-    throw new AuthError('Invalid credentials')
-  }
-
-  // Generate session token
-  const sessionToken = crypto.randomBytes(32).toString('hex')
-
-  // Store session in Valkey with 24hr TTL
-  await redis.setex(
-    `session:${sessionToken}`,
-    86400,
-    JSON.stringify({
-      user_id: user.id,
-      email: user.email,
-      created_at: Date.now()
-    })
-  )
-
-  return { token: sessionToken, user: { id: user.id, name: user.name } }
-}
-
-// Middleware - validate session
-async function authMiddleware(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '')
-
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' })
-  }
-
-  const session = await redis.get(`session:${token}`)
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired session' })
-  }
-
-  req.user = JSON.parse(session)
-  next()
-}
-
-// Logout - invalidate session
-async function logout(token) {
-  await redis.del(`session:${token}`)
-}
-```
-
-### Role-Based Access Control (RBAC)
-
-**Roles per workspace:**
-
-```sql
-CREATE TABLE workspace_members (
-  workspace_id UUID REFERENCES workspaces(id),
-  user_id UUID REFERENCES users(id),
-  role VARCHAR(20) NOT NULL DEFAULT 'member',
-  -- Roles: owner, admin, member, guest
-  joined_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (workspace_id, user_id)
-);
-```
-
-**Permission Matrix:**
-
-| Permission | Guest | Member | Admin | Owner |
-|------------|-------|--------|-------|-------|
-| Read public channels | Yes | Yes | Yes | Yes |
-| Send messages | Yes | Yes | Yes | Yes |
-| Create channels | No | Yes | Yes | Yes |
-| Delete own messages | Yes | Yes | Yes | Yes |
-| Delete any message | No | No | Yes | Yes |
-| Manage channel settings | No | No | Yes | Yes |
-| Invite members | No | No | Yes | Yes |
-| Remove members | No | No | Yes | Yes |
-| Manage workspace settings | No | No | No | Yes |
-| Delete workspace | No | No | No | Yes |
-| Manage integrations | No | No | Yes | Yes |
-
-```javascript
-// Authorization middleware
-async function requireRole(minRole) {
-  const roleHierarchy = { guest: 0, member: 1, admin: 2, owner: 3 }
-
-  return async (req, res, next) => {
-    const { workspaceId } = req.params
-
-    const membership = await db('workspace_members')
-      .where({ workspace_id: workspaceId, user_id: req.user.user_id })
-      .first()
-
-    if (!membership) {
-      return res.status(403).json({ error: 'Not a workspace member' })
-    }
-
-    if (roleHierarchy[membership.role] < roleHierarchy[minRole]) {
-      return res.status(403).json({ error: 'Insufficient permissions' })
-    }
-
-    req.membership = membership
-    next()
-  }
-}
-
-// Usage in routes
-app.delete('/api/workspaces/:workspaceId/members/:userId',
-  authMiddleware,
-  requireRole('admin'),
-  async (req, res) => {
-    // Admin can remove members
-    await db('workspace_members')
-      .where({
-        workspace_id: req.params.workspaceId,
-        user_id: req.params.userId
-      })
-      .del()
-
-    res.status(204).send()
-  }
-)
-```
-
-### Channel-Level Permissions
-
-```javascript
-// Private channel access check
-async function requireChannelAccess(req, res, next) {
-  const { channelId } = req.params
-
-  const channel = await db('channels').where({ id: channelId }).first()
-
-  if (!channel) {
-    return res.status(404).json({ error: 'Channel not found' })
-  }
-
-  if (channel.is_private) {
-    const membership = await db('channel_members')
-      .where({ channel_id: channelId, user_id: req.user.user_id })
-      .first()
-
-    if (!membership) {
-      return res.status(403).json({ error: 'Not a channel member' })
-    }
-  }
-
-  req.channel = channel
-  next()
-}
-```
-
-### Rate Limiting
-
-```javascript
-// Sliding window rate limiter using Valkey
-async function rateLimit(key, limit, windowSec) {
-  const now = Date.now()
-  const windowStart = now - (windowSec * 1000)
-
-  // Use sorted set with timestamp as score
-  const multi = redis.multi()
-  multi.zremrangebyscore(key, 0, windowStart)  // Remove old entries
-  multi.zadd(key, now, `${now}:${Math.random()}`)  // Add current request
-  multi.zcard(key)  // Count requests in window
-  multi.expire(key, windowSec)  // Set TTL
-
-  const results = await multi.exec()
-  const count = results[2][1]
-
-  return { allowed: count <= limit, remaining: Math.max(0, limit - count) }
-}
-
-// Rate limit middleware
-function rateLimitMiddleware(limit, windowSec) {
-  return async (req, res, next) => {
-    const key = `ratelimit:${req.user.user_id}:${req.path}`
-    const { allowed, remaining } = await rateLimit(key, limit, windowSec)
-
-    res.set('X-RateLimit-Limit', limit)
-    res.set('X-RateLimit-Remaining', remaining)
-
-    if (!allowed) {
-      return res.status(429).json({ error: 'Rate limit exceeded' })
-    }
-
-    next()
-  }
-}
-```
-
-**Rate Limits by Endpoint:**
-
-| Endpoint | User Limit | Window | Admin Multiplier |
-|----------|------------|--------|------------------|
-| POST /messages | 60 | 1 min | 2x |
-| POST /channels | 10 | 1 min | 5x |
-| POST /reactions | 30 | 1 min | 2x |
-| GET /search | 20 | 1 min | 3x |
-| POST /webhooks | 5 | 1 min | 10x |
-| POST /files (upload) | 20 | 1 min | 5x |
-
-```javascript
-// Apply rate limits in routes
-app.post('/api/workspaces/:workspaceId/channels/:channelId/messages',
-  authMiddleware,
-  requireChannelAccess,
-  rateLimitMiddleware(60, 60),  // 60 requests per minute
-  async (req, res) => {
-    // Send message logic
-  }
-)
-
-// Admin routes with higher limits
-app.get('/api/admin/workspaces/:workspaceId/analytics',
-  authMiddleware,
-  requireRole('admin'),
-  rateLimitMiddleware(100, 60),  // 100 requests per minute for admins
-  async (req, res) => {
-    // Analytics logic
-  }
-)
-```
-
-### API Boundaries (User vs Admin)
-
-```
-User API (/api/v1/*)
-├── /workspaces                    # List user's workspaces
-├── /workspaces/:id/channels       # List channels in workspace
-├── /channels/:id/messages         # CRUD messages
-├── /channels/:id/members          # View channel members
-├── /users/:id                     # Get user profile
-└── /search                        # Search messages
-
-Admin API (/api/v1/admin/*)
-├── /workspaces/:id/settings       # Workspace settings
-├── /workspaces/:id/members        # Manage all members
-├── /workspaces/:id/analytics      # Usage analytics
-├── /workspaces/:id/integrations   # Manage webhooks/bots
-├── /workspaces/:id/audit-log      # View audit trail
-└── /workspaces/:id/export         # Data export
-```
-
----
-
-## Implementation Notes
-
-This section documents the implementation of key middleware and patterns in the backend codebase.
-
-### Idempotency for Message Sending
-
-**Location:** `backend/src/middleware/idempotency.ts`
-
-**WHY idempotency prevents duplicate messages on network retry:**
-
-When a client sends a message and the network fails after the server processes the request but before the response reaches the client, the client will retry. Without idempotency, this creates duplicate messages in the database.
-
-**How it works:**
-1. Client includes an `X-Idempotency-Key` header with a unique identifier (e.g., `msg:channel123:abc:1234567890`)
-2. Middleware checks Redis for this key before processing
-3. If found, returns the cached response (no database write)
-4. If not found, processes the request and caches the response for 24 hours
-5. A distributed lock prevents race conditions when parallel retries arrive
-
-```typescript
-// Client retry scenario without idempotency:
-POST /messages { content: "Hello" }  → Server saves message #1
-                                      → Response lost in network
-POST /messages { content: "Hello" }  → Server saves message #2 (DUPLICATE!)
-
-// With idempotency:
-POST /messages + X-Idempotency-Key: abc123  → Server saves message #1, caches response
-                                             → Response lost in network
-POST /messages + X-Idempotency-Key: abc123  → Cache hit, returns cached response (NO DUPLICATE)
-```
-
-**Benefits:**
-- At-least-once delivery becomes effectively exactly-once for writes
-- Safe for clients to retry without coordination
-- 24-hour TTL balances memory usage vs retry window
-
----
-
-### Cache-Aside Pattern for Channels/Users
-
-**Location:** `backend/src/services/cache.ts`
-
-**WHY cache-aside pattern reduces database load for read-heavy workloads:**
-
-Slack-like applications are extremely read-heavy. Every message sent requires looking up channel members to fan out via WebSocket. User profiles are fetched on every message display. Without caching, the database becomes the bottleneck.
-
-**How it works:**
-1. On read: Check Redis cache first
-2. On cache miss: Query PostgreSQL, then populate cache with TTL
-3. On write: Invalidate cache (not update) to ensure consistency
-4. Application controls all cache population (flexibility)
-
-```typescript
-// Cache-aside read flow:
-async function getCachedUser(userId: string) {
-  // 1. Check cache first
-  const cached = await redis.get(`cache:user:${userId}`);
-  if (cached) return JSON.parse(cached);  // Cache HIT
-
-  // 2. Cache miss - fetch from database
-  const user = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
-
-  // 3. Populate cache for future reads
-  await redis.setex(`cache:user:${userId}`, 300, JSON.stringify(user));
-
-  return user;
-}
-```
-
-**TTL Configuration:**
-| Cache Key | TTL | Rationale |
-|-----------|-----|-----------|
-| `cache:user:{id}` | 5 min | Profiles change infrequently |
-| `cache:channel:{id}` | 2 min | Channel metadata accessed often |
-| `cache:channel:{id}:members` | 2 min | Critical for message fan-out |
-| `cache:workspace:{id}` | 10 min | Settings rarely change |
-
-**Why cache-aside over write-through:**
-- Only caches data that's actually accessed (memory efficient)
-- Handles cache failures gracefully (falls back to database)
-- Simple invalidation model (just delete the key)
-
----
-
-### RBAC for Workspace Isolation
-
-**Location:** `backend/src/middleware/rbac.ts`
-
-**WHY RBAC enables workspace isolation:**
-
-Each Slack workspace is an isolated tenant with its own members, channels, and messages. RBAC ensures:
-1. Users can only access workspaces they belong to
-2. Different permission levels within each workspace
-3. Admins can manage their workspace without affecting others
-4. Owners have full control without needing system-wide admin access
-
-**Role Hierarchy:**
-```
-owner (3) → Can delete workspace, manage all settings
-  ↓
-admin (2) → Can manage channels, remove members
-  ↓
-member (1) → Can create channels, send messages
-  ↓
-guest (0) → Can only send messages in allowed channels
-```
-
-**Permission Matrix:**
-| Permission | Guest | Member | Admin | Owner |
-|------------|-------|--------|-------|-------|
-| Send messages | Yes | Yes | Yes | Yes |
-| Create channels | No | Yes | Yes | Yes |
-| Delete any message | No | No | Yes | Yes |
-| Remove members | No | No | Yes | Yes |
-| Update workspace settings | No | No | No | Yes |
-
-**Implementation:**
-```typescript
-// Middleware checks role hierarchy
-export function requireRole(minRole: WorkspaceRole) {
-  return async (req, res, next) => {
-    const membership = await db.query(
-      'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
-      [workspaceId, userId]
-    );
-
-    if (ROLE_HIERARCHY[membership.role] < ROLE_HIERARCHY[minRole]) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
-    }
-
-    req.membership = membership;
-    next();
-  };
-}
-```
-
-**Benefits:**
-- Single authorization check handles all role-based restrictions
-- Workspace isolation is enforced at the middleware level
-- Easy to add new roles or permissions
-- Membership data available to route handlers for business logic
-
----
-
-### Rate Limiting for Abuse Prevention
-
-**Location:** `backend/src/middleware/rateLimit.ts`
-
-**WHY rate limiting prevents abuse:**
-
-Without rate limiting, a single user could:
-- Spam thousands of messages overwhelming the database
-- Exhaust server resources causing slowdowns for everyone
-- Create denial-of-service conditions for their workspace
-- Abuse search functionality to scan all content
-
-**How it works (Sliding Window Algorithm):**
-```typescript
-async function checkRateLimit(key: string, limit: number, windowSec: number) {
-  const now = Date.now();
-  const windowStart = now - windowSec * 1000;
-
-  const pipeline = redis.pipeline();
-  pipeline.zremrangebyscore(key, 0, windowStart);  // Remove old entries
-  pipeline.zadd(key, now, `${now}:${random()}`);   // Add current request
-  pipeline.zcard(key);                              // Count in window
-  pipeline.expire(key, windowSec);                  // Set TTL
-
-  const count = (await pipeline.exec())[2][1];
-  return { allowed: count <= limit, remaining: limit - count };
-}
-```
-
-**Rate Limits by Operation:**
-| Endpoint | Limit | Window | Admin Multiplier |
-|----------|-------|--------|------------------|
-| POST /messages | 60 | 1 min | 2x (120) |
-| POST /channels | 10 | 1 min | 2x (20) |
-| POST /reactions | 30 | 1 min | 2x (60) |
-| GET /search | 20 | 1 min | 3x (60) |
-
-**Why sliding window over fixed window:**
-- Fixed window allows burst at window boundaries (e.g., 60 requests at 0:59, 60 more at 1:00)
-- Sliding window provides smooth rate limiting with no boundary effects
-- Uses Redis sorted sets for O(1) operations
-
-**Response Headers:**
-```
-X-RateLimit-Limit: 60
-X-RateLimit-Remaining: 45
-X-RateLimit-Reset: 1642934400
-```
-
----
+## Observability
 
 ### Prometheus Metrics
 
-**Location:** `backend/src/services/metrics.ts`
-
-**Available Metrics:**
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
 | `slack_messages_sent_total` | Counter | workspace_id, channel_type | Message throughput |
-| `slack_websocket_connections_active` | Gauge | - | Real-time connection health |
-| `slack_http_request_duration_seconds` | Histogram | method, route, status_code | API latency monitoring |
+| `slack_messages_delivered_total` | Counter | - | WebSocket delivery confirmation |
+| `slack_websocket_connections_active` | Gauge | - | Connection pool size |
+| `slack_websocket_users_active` | Gauge | - | Unique connected users |
+| `slack_http_request_duration_seconds` | Histogram | method, route, status_code | API latency (p50, p95, p99) |
+| `slack_http_requests_total` | Counter | method, route, status_code | Request volume |
 | `slack_cache_operations_total` | Counter | cache_name, result | Cache hit/miss ratio |
 | `slack_rate_limit_hits_total` | Counter | endpoint | Abuse detection |
+| `slack_idempotency_hits_total` | Counter | - | Duplicate request detection |
+| `slack_db_query_duration_seconds` | Histogram | query_type | Database latency |
 
-**Endpoints:**
-- `GET /metrics` - Prometheus text format
-- `GET /health` - Basic health check
-- `GET /health/detailed` - Service-by-service status
-- `GET /ready` - Readiness probe for K8s
-- `GET /live` - Liveness probe for K8s
+### Health Checks
 
----
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `GET /health` | Basic liveness | Server is running |
+| `GET /health/detailed` | Service status | Redis latency, PostgreSQL latency, Elasticsearch status, WebSocket connections |
+| `GET /ready` | Readiness probe | Redis + PostgreSQL both responding |
+| `GET /live` | Liveness probe | Process is running |
+| `GET /metrics` | Prometheus scrape | All registered metrics |
 
 ### Structured Logging
 
-**Location:** `backend/src/services/logger.ts`
+Pino-based structured JSON logging with request-scoped context:
+- **Fields:** `requestId`, `userId`, `workspaceId`, `method`, `path`, `statusCode`, `duration`
+- **Development:** Pretty-printed with `pino-pretty`
+- **Production:** Raw JSON for log aggregation (ELK stack, Datadog)
+- **Log levels:** trace, debug, info, warn, error, fatal
 
-**Features:**
-- JSON output in production for log aggregation
-- Pretty-printed output in development
-- Request-scoped context (request ID, user ID, workspace ID)
-- Log levels: trace, debug, info, warn, error, fatal
+---
 
-**Example Log Output:**
-```json
-{
-  "level": "info",
-  "time": "2024-01-15T10:30:00.000Z",
-  "service": "slack-backend",
-  "requestId": "abc123",
-  "userId": "user-456",
-  "workspaceId": "ws-789",
-  "msg": "Message sent",
-  "messageId": 12345,
-  "channelId": "ch-101"
-}
+## Failure Handling
+
+### Graceful Degradation
+
+| Component | Failure Mode | Degradation Behavior |
+|-----------|-------------|----------------------|
+| Elasticsearch | Down/unreachable | Search falls back to PostgreSQL `tsvector` FTS |
+| Redis cache | Down/unreachable | Cache reads fall back to PostgreSQL directly |
+| Redis pub/sub | Down/unreachable | Real-time delivery stops; clients use reconnection sync |
+| PostgreSQL | Down | Server returns 503; readiness probe fails; traffic rerouted |
+| WebSocket | Connection dropped | Client auto-reconnects; fetches missed messages via REST |
+
+### Rate Limiting
+
+Sliding window rate limiter using Redis sorted sets:
+- Per-user limits by operation type (60 messages/min, 10 channel creates/min, 20 searches/min)
+- Admin role gets 2x multiplier on all limits
+- Per-workspace limits at 10x individual limits (prevents workspace-wide abuse)
+- Fails open -- if Redis is down, requests are allowed (prevents rate limiter from becoming a single point of failure)
+- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+
+### Graceful Shutdown
+
+On `SIGTERM`:
+1. Stop accepting new HTTP connections
+2. Close WebSocket connections (clients will reconnect)
+3. Drain the PostgreSQL connection pool
+4. Close Redis connections
+5. Exit process
+
+---
+
+## Scalability Considerations
+
+### What Breaks First
+
+1. **WebSocket connections** -- Each Gateway instance is limited by file descriptors (~65K connections). Scale horizontally behind a load balancer with sticky sessions (or use the Redis pub/sub pattern that makes stickiness unnecessary).
+
+2. **Message fan-out** -- A channel with 10K members means 10K Redis publishes per message. Mitigate with batched publishing and by capping channel membership (or switching to a broadcast topic for large channels).
+
+3. **PostgreSQL writes** -- At 1B messages/day (~12K writes/sec), a single PostgreSQL instance becomes the bottleneck. Shard by `workspace_id` to distribute writes across multiple instances.
+
+4. **Search indexing lag** -- Elasticsearch indexing is async. Under high load, the indexing backlog grows. Add more Elasticsearch nodes and increase indexing workers.
+
+### Horizontal Scaling Path
+
+| Component | Scaling Strategy |
+|-----------|-----------------|
+| WebSocket Gateway | Stateless; add instances behind LB |
+| API Servers | Stateless; add instances behind LB |
+| PostgreSQL | Shard by workspace_id; read replicas for search/analytics |
+| Redis | Redis Cluster for cache; dedicated instances for pub/sub |
+| Elasticsearch | Add data nodes; shard by workspace_id |
+| Kafka | Add partitions per topic |
+
+### Multi-Region
+
+- **Active-active** in 3+ regions with GeoDNS routing
+- PostgreSQL uses cross-region replication with conflict-free CRDT-inspired merge for messages
+- Redis Cluster per region with independent pub/sub (messages replicated via Kafka)
+- Eventual consistency between regions (users in different regions may see 1-2 second ordering differences)
+
+---
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Threading | Parent reference in messages table | Separate threads table | Simplicity; avoids JOINs for channel view thread previews |
+| Real-time delivery | Redis pub/sub | Kafka consumer groups | Sub-200ms latency; Kafka adds 100-500ms from polling |
+| Message storage | PostgreSQL (sharded by workspace) | Cassandra | ACID transactions for thread reply counts; familiar tooling |
+| Presence | Redis keys with TTL | Database polling | Automatic cleanup; sub-millisecond reads; no periodic queries |
+| Search | Elasticsearch + PG FTS fallback | PostgreSQL FTS only | Stemming, relevance tuning, highlighting; fallback ensures availability |
+| Session auth | Redis-backed express-session | JWT | Immediate revocation on logout; no token expiry management |
+| Caching | Cache-aside (lazy) | Write-through | Only caches accessed data; handles cache failure gracefully |
+| Rate limiting | Sliding window (sorted sets) | Fixed window (counter) | No burst at window boundaries; smooth enforcement |
+| Channel types | Single table with boolean flags | Separate tables per type | Shared message delivery pipeline; simpler queries |
+
+---
+
+# Layer 2: Pocket-Size Architecture (What We Actually Built)
+
+This section documents the local implementation -- a fully functional Slack clone running on Docker Compose with a single Node.js process.
+
+---
+
+## Local Architecture Diagram
+
 ```
+┌───────────────────────────────────────────────────────────────┐
+│                    Browser (React)                             │
+│                  http://localhost:5173                         │
+│                                                               │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
+│  │ Sidebar  │ │ Message  │ │ Thread   │ │ Search Modal     │ │
+│  │ Channels │ │ List     │ │ Panel    │ │                  │ │
+│  │ DMs      │ │          │ │          │ │                  │ │
+│  │ Presence │ │ Compose  │ │ Replies  │ │ ES + PG fallback │ │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘ │
+└──────────────────────────┬──────────────────┬────────────────┘
+                           │ REST             │ WebSocket
+                           ▼                  ▼
+              ┌────────────────────────────────────────┐
+              │     Node.js + Express (Port 3001)      │
+              │                                        │
+              │  ┌──────────────────────────────────┐  │
+              │  │         Middleware Stack          │  │
+              │  │ Session │ RBAC │ Rate Limit │     │  │
+              │  │ Idempotency │ Request Logging    │  │
+              │  └──────────────────────────────────┘  │
+              │                                        │
+              │  ┌──────────────┐ ┌──────────────┐     │
+              │  │ REST Routes  │ │ WebSocket    │     │
+              │  │ /api/auth    │ │ Server /ws   │     │
+              │  │ /api/channels│ │              │     │
+              │  │ /api/messages│ │ Presence     │     │
+              │  │ /api/dms     │ │ Typing       │     │
+              │  │ /api/search  │ │ Message push │     │
+              │  │ /api/works.. │ │              │     │
+              │  └──────────────┘ └──────────────┘     │
+              │                                        │
+              │  ┌──────────────────────────────────┐  │
+              │  │         Services Layer           │  │
+              │  │ Cache │ Redis │ Elasticsearch    │  │
+              │  │ Metrics │ Logger                 │  │
+              │  └──────────────────────────────────┘  │
+              │                                        │
+              │  GET /metrics  GET /health/detailed     │
+              │  GET /ready    GET /live                │
+              └──────┬──────────┬──────────┬───────────┘
+                     │          │          │
+                     ▼          ▼          ▼
+          ┌──────────────┐ ┌────────┐ ┌───────────────┐
+          │  PostgreSQL  │ │ Valkey │ │ Elasticsearch │
+          │  Port 5432   │ │  6379  │ │    9200       │
+          │              │ │        │ │               │
+          │  slack DB    │ │Sessions│ │ slack_messages │
+          │  7 tables    │ │Cache   │ │ index          │
+          │  9 indexes   │ │Pub/Sub │ │               │
+          │              │ │Presence│ │ Custom         │
+          │              │ │Typing  │ │ analyzer       │
+          │              │ │Rate    │ │ (stemming)     │
+          │              │ │Limits  │ │               │
+          └──────────────┘ └────────┘ └───────────────┘
+```
+
+---
+
+## Infrastructure (Docker Compose)
+
+Three services in `docker-compose.yml`:
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| PostgreSQL 16 | `postgres:16-alpine` | 5432 | Relational data (users, workspaces, channels, messages, reactions) |
+| Valkey 7 | `valkey/valkey:7-alpine` | 6379 | Sessions, cache, pub/sub, presence, typing indicators, rate limiting |
+| Elasticsearch 8.11 | `elasticsearch:8.11.0` | 9200 | Full-text message search with custom analyzer |
+
+All services have health checks configured. Elasticsearch runs in single-node mode with security disabled and 512MB heap.
+
+---
+
+## What Is Actually Implemented
+
+### Production-Grade Patterns (Fully Implemented)
+
+**Idempotency Middleware** (`backend/src/middleware/idempotency.ts`):
+Message sending is protected by client-provided `X-Idempotency-Key` headers. Redis caches the response for 24 hours with a distributed lock (`SET NX EX 30`) to prevent race conditions from parallel retries. This ensures network failures never create duplicate messages.
+
+**Cache-Aside Pattern** (`backend/src/services/cache.ts`):
+Cached lookups for users (5min TTL), channels (2min), channel members (2min), and workspaces (10min). Every cached read falls back to PostgreSQL on cache miss or Redis failure. Cache invalidation on writes uses explicit key deletion. Prometheus counters track hit/miss ratios per cache name.
+
+**RBAC Middleware** (`backend/src/middleware/rbac.ts`):
+Full role hierarchy (owner > admin > member > guest) with numeric comparison. Explicit permission matrix covering 13 operations. Both `requireRole()` (minimum role check) and `requirePermission()` (specific permission check) middleware. Membership data attached to `req.membership` for route handlers.
+
+**Rate Limiting** (`backend/src/middleware/rateLimit.ts`):
+Sliding window algorithm using Redis sorted sets. Per-user limits by operation type (60 messages/min, 10 channel creates/min, 20 searches/min). Admin 2x multiplier. Workspace-scoped rate limiter available. Response headers for client awareness. Fails open on Redis errors.
+
+**Prometheus Metrics** (`backend/src/services/metrics.ts`):
+11 custom metrics covering messages sent, WebSocket connections, HTTP duration/count, cache operations, rate limit hits, idempotency hits, and database query duration. All exposed via `GET /metrics` in Prometheus text format. Default Node.js metrics (CPU, memory, event loop) also collected.
+
+**Structured Logging** (`backend/src/services/logger.ts`):
+Pino-based with request-scoped child loggers carrying `requestId`, `userId`, `workspaceId`. Pretty-printed in development, JSON in production. Every route handler uses the logger for structured error reporting.
+
+**Health Checks** (`backend/src/index.ts`):
+Four endpoints: `/health` (basic), `/health/detailed` (Redis/PG/ES latency), `/ready` (K8s readiness), `/live` (K8s liveness). The detailed check reports per-service status with millisecond latency measurements.
+
+**Graceful Shutdown** (`backend/src/index.ts`):
+SIGTERM handler closes HTTP server, drains PostgreSQL pool, and disconnects Redis before exiting.
+
+### Features Implemented
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| User registration/login | Done | bcrypt password hashing, session-based auth |
+| Workspace CRUD | Done | Create, join, select, member management, role changes |
+| Public/private channels | Done | CRUD, join/leave, invite, archive |
+| Direct messages | Done | 1:1 and group DMs, exact-member duplicate detection |
+| Send/receive messages | Done | WebSocket real-time delivery via Redis pub/sub |
+| Message editing | Done | Author-only, real-time update broadcast |
+| Message deletion | Done | Author or admin, cascades to reactions/thread replies |
+| Threading | Done | Self-referencing FK, atomic reply_count, reply_users array |
+| Reactions | Done | Add/remove emoji, idempotent via UNIQUE constraint |
+| Presence | Done | Redis TTL-based, broadcast to workspace members |
+| Typing indicators | Done | Redis TTL-based, broadcast to channel members |
+| Full-text search | Done | Elasticsearch primary with PostgreSQL tsvector fallback |
+| Unread tracking | Done | `last_read_at` per channel member, unread count in channel list |
+| Cursor-based pagination | Done | `WHERE id < :cursor` for message history |
+| Multiple server instances | Done | `dev:server1/2/3` scripts on ports 3001-3003 |
+
+### Frontend (React + TypeScript + Vite)
+
+The frontend uses TanStack Router for file-based routing and Zustand for state management across six stores:
+- **AuthStore**: Current user, loading state
+- **WorkspaceStore**: Workspace list, current workspace, member cache
+- **ChannelStore**: Channels, DMs, current channel, unread counts
+- **MessageStore**: Messages by channel, active thread, typing users, reactions
+- **PresenceStore**: Online/offline status by user ID
+- **UIStore**: Sidebar, thread panel, search modal visibility
+
+Key components: `Sidebar` (channels + DMs + presence), `MessageList` (message display + compose), `ThreadPanel` (thread view + reply), `SearchModal` (full-text search with filters), `WorkspaceSelect` (workspace picker), `LoginForm` (auth).
+
+WebSocket hook (`useWebSocket.ts`) manages the connection lifecycle, handles incoming events (message, update, delete, reaction, typing, presence), and dispatches to the appropriate Zustand store.
+
+---
+
+## What Was Simplified or Substituted
+
+| Production Component | Local Substitute | Why |
+|---------------------|------------------|-----|
+| CDN (CloudFront) | Vite dev server | No static asset distribution needed locally |
+| API Gateway (rate limit, auth, routing) | Express middleware | Single process handles everything |
+| Kafka event bus | Direct Redis pub/sub | No async event processing pipeline needed |
+| Multiple microservices | Single Express app | All routes in one process |
+| S3 file storage | Not implemented | `attachments` JSONB column exists but no upload flow |
+| Virus scanning + thumbnail generation | Not implemented | No file processing pipeline |
+| Push notifications (APNs/FCM) | WebSocket only | No mobile clients |
+| Email digest batching | Not implemented | No email delivery |
+| @mention parsing + notification | Not implemented | Content stored as plain text |
+| SSO/SAML integration | Session + bcrypt | Simple username/password auth |
+| PostgreSQL sharding | Single instance | One database handles all workspaces |
+| Redis Cluster | Single Valkey instance | All cache/pub-sub/sessions in one instance |
+| Elasticsearch cluster | Single node (512MB) | Development-scale search |
+
+---
+
+## What Was Omitted
+
+- **CDN** for static assets and file delivery
+- **Multi-region deployment** and cross-region replication
+- **Kubernetes** orchestration and auto-scaling
+- **Database sharding** by workspace_id
+- **File upload/download** pipeline (S3, virus scanning, thumbnails)
+- **Push notifications** (APNs, FCM)
+- **Email notifications** and digest batching
+- **@mention parsing** and notification routing
+- **Webhooks and integrations** platform (incoming/outgoing webhooks, slash commands, bot users)
+- **Audit logging** to a compliance store
+- **Analytics pipeline** for usage metrics
+- **Circuit breakers** (Opossum) around external service calls
+- **Message retention policies** and data export
+- **Enterprise features**: SSO/SAML, data loss prevention, e-discovery

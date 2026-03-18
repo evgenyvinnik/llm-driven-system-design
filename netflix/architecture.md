@@ -18,7 +18,7 @@ Netflix is a video streaming platform with personalized content discovery. Core 
 
 1. **Stream**: Watch video with adaptive quality
 2. **Browse**: Personalized homepage and search
-3. **Profiles**: Multiple viewing profiles
+3. **Profiles**: Multiple viewing profiles per account
 4. **Resume**: Continue watching across devices
 5. **Experiment**: A/B test features and content
 
@@ -26,1484 +26,850 @@ Netflix is a video streaming platform with personalized content discovery. Core 
 
 - **Latency**: < 2 seconds to start playback
 - **Availability**: 99.99% for streaming
-- **Scale**: 200M subscribers, 15% of internet traffic
+- **Scale**: 200M subscribers, 15% of global internet traffic
 - **Quality**: Up to 4K HDR streaming
+- **Storage**: Petabytes of encoded video across thousands of titles
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value |
+|--------|-------|
+| Subscribers | 200M+ |
+| Concurrent streams | ~10M peak |
+| Titles in catalog | ~15,000 |
+| Encoding variants per title | ~1,200 (resolutions x bitrates x codecs x audio tracks) |
+| Total stored video | ~10 PB |
+| Bandwidth served | ~15% of downstream internet traffic in US |
+| Viewing hours/day | ~160M hours |
+| API requests/sec | ~500K |
+| Homepage generates/sec | ~100K |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Accounts | 1-5 |
+| Profiles | 1-10 |
+| Catalog titles | 10-50 (seeded) |
+| Concurrent streams | 1-3 |
+| API requests/sec | < 10 |
+
+---
+
+# Layer 1: Production-Ready Architecture
+
+This layer describes how Netflix works at scale -- the ideal architecture that handles 200M subscribers, petabytes of video, and 15% of global internet traffic.
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│    Smart TV │ Mobile │ Web │ Gaming Console │ Set-top Box       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Open Connect CDN                             │
-│         (Netflix's custom CDN, ISP-embedded appliances)         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Playback Service│    │Personalization│    │Experiment Svc │
-│               │    │               │    │               │
-│ - Manifest    │    │ - Homepage    │    │ - A/B tests   │
-│ - Resume      │    │ - Rows        │    │ - Allocation  │
-│ - DRM         │    │ - Ranking     │    │ - Analysis    │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │         Cassandra + Kafka                     │
-│   - Catalog     │         - Viewing history                     │
-│   - Accounts    │         - Events                              │
-└─────────────────┴───────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Client Layer                                │
+│     Smart TV │ Mobile │ Web │ Gaming Console │ Set-top Box          │
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │ ABR Player   │  │ UI Shell     │  │ DRM Module   │              │
+│  │ (DASH/HLS)   │  │ (React/      │  │ (Widevine/   │              │
+│  │              │  │  Native)     │  │  FairPlay)   │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└─────────────────────────────────────────────────────────────────────┘
+         │ Video Streams                    │ API Calls
+         ▼                                  ▼
+┌──────────────────┐              ┌──────────────────────────┐
+│  Open Connect    │              │      API Gateway         │
+│  CDN (OCA)       │              │  (Zuul / Spring Cloud)   │
+│                  │              │                          │
+│  ISP-embedded    │              │  - Rate limiting         │
+│  appliances      │              │  - Auth validation       │
+│  ~16,000 servers │              │  - Request routing       │
+│  in ~6,000 ISPs  │              │  - A/B test headers      │
+└──────────────────┘              └──────────────────────────┘
+                                            │
+                    ┌───────────────────────┬┴──────────────────────┐
+                    ▼                       ▼                       ▼
+        ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+        │  Playback        │   │  Personalization  │   │  Account         │
+        │  Service         │   │  Service          │   │  Service         │
+        │                  │   │                  │   │                  │
+        │  - Manifest gen  │   │  - Homepage rows  │   │  - Auth/Sessions │
+        │  - DRM license   │   │  - Recommendations│  │  - Profiles      │
+        │  - Stream URL    │   │  - Search/Browse  │   │  - Billing       │
+        │  - Progress      │   │  - A/B testing    │   │  - Preferences   │
+        └────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘
+                 │                      │                       │
+     ┌───────────┴───────────┐         │              ┌────────┴────────┐
+     ▼                       ▼         ▼              ▼                 ▼
+┌──────────┐        ┌──────────┐  ┌──────────┐  ┌──────────┐   ┌──────────┐
+│ Cassandra│        │ S3/Open  │  │ EVCache  │  │PostgreSQL│   │  Redis   │
+│ (viewing │        │ Connect  │  │ (Memcache│  │ (accounts│   │ (sessions│
+│  history)│        │ Origin   │  │  cluster)│  │  billing)│   │  locks)  │
+└──────────┘        └──────────┘  └──────────┘  └──────────┘   └──────────┘
+```
+
+```
+                        Video Pipeline (Offline)
+
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Content     │───▶│  Transcoding │───▶│  Packaging   │───▶│  CDN         │
+│  Ingestion   │    │  (Cosmos)    │    │  (DASH/HLS)  │    │  Distribution│
+│              │    │              │    │              │    │              │
+│  Mezzanine   │    │  Parallel    │    │  DRM encrypt │    │  Push to     │
+│  file upload │    │  per-shot    │    │  Manifest    │    │  Open Connect│
+│  QC checks   │    │  encoding    │    │  generation  │    │  appliances  │
+│              │    │  ~1200       │    │              │    │              │
+│              │    │  variants    │    │              │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Adaptive Bitrate Streaming
+### 1. Video Pipeline: Ingestion to CDN
 
-**Encoding Ladder:**
-```
-Each video encoded at multiple bitrates:
-├── 4K HDR:   15 Mbps
-├── 1080p:    5.8 Mbps
-├── 1080p:    4.3 Mbps
-├── 720p:     3 Mbps
-├── 720p:     2.35 Mbps
-├── 480p:     1.05 Mbps
-├── 360p:     560 kbps
-└── 240p:     235 kbps
-```
+The video pipeline is Netflix's most distinctive infrastructure component. Content moves through four stages:
 
-**DASH Manifest:**
-```xml
-<MPD>
-  <Period>
-    <AdaptationSet>
-      <Representation bandwidth="15000000" width="3840" height="2160">
-        <SegmentTemplate media="4k/seg-$Number$.m4s"/>
-      </Representation>
-      <Representation bandwidth="5800000" width="1920" height="1080">
-        <SegmentTemplate media="1080p/seg-$Number$.m4s"/>
-      </Representation>
-      <!-- More quality levels -->
-    </AdaptationSet>
-  </Period>
-</MPD>
-```
+**Ingestion**: Studios upload mezzanine files (uncompressed or high-bitrate masters, often 4K HDR at 100+ Mbps). Automated quality-control checks validate resolution, color space, audio tracks, and subtitle sync before accepting content into the pipeline.
 
-**Client ABR Logic:**
-```javascript
-class ABRController {
-  selectQuality(bandwidthEstimate, bufferLevel) {
-    // Find highest quality we can sustain
-    const qualities = this.manifest.representations
+**Transcoding (Cosmos)**: Netflix's per-title encoding optimizes bitrate ladders individually for each title. A cartoon requires fewer bits at 1080p than a visually complex action film. The encoding system:
+- Analyzes each shot for complexity (motion, texture, color depth)
+- Runs parallel encodes across resolutions (240p through 4K HDR)
+- Tests multiple codecs: H.264 (broadest compatibility), H.265/HEVC (better compression), VP9 (royalty-free), AV1 (best compression, growing device support)
+- Produces ~1,200 variants per title (resolution x bitrate x codec x audio format)
 
-    for (const quality of qualities.sortByBandwidth('desc')) {
-      // Need bandwidth headroom (80% rule)
-      if (quality.bandwidth < bandwidthEstimate * 0.8) {
-        // Also check buffer level for safety
-        if (bufferLevel > 10 || quality.bandwidth < bandwidthEstimate * 0.5) {
-          return quality
-        }
-      }
-    }
+**Packaging**: Encoded files are segmented into 2-4 second chunks for adaptive streaming. Each segment is independently decodable, enabling mid-stream quality switches. DRM encryption (Widevine for Android/Chrome, FairPlay for Apple, PlayReady for Windows) is applied per-segment. DASH and HLS manifests are generated listing all available quality levels with their segment URLs.
 
-    // Fallback to lowest quality
-    return qualities[qualities.length - 1]
-  }
+**CDN Distribution**: Encoded content is pushed to Open Connect Appliances (OCAs) -- custom-built servers embedded inside ISP networks worldwide. Netflix operates ~16,000 OCAs in ~6,000 ISP locations. Content popularity algorithms predict what to cache where, pre-filling OCAs during off-peak hours.
 
-  estimateBandwidth(downloadTime, segmentSize) {
-    const instantBandwidth = (segmentSize * 8) / downloadTime
-    // Exponential moving average
-    this.bandwidthEstimate = 0.7 * this.bandwidthEstimate + 0.3 * instantBandwidth
-    return this.bandwidthEstimate
-  }
-}
-```
+### 2. Adaptive Bitrate Streaming
 
-### 2. Personalization
+The client player manages quality selection using bandwidth estimation and buffer management:
 
-**Homepage Row Generation:**
-```javascript
-async function generateHomepage(profileId) {
-  const profile = await getProfile(profileId)
-  const viewingHistory = await getViewingHistory(profileId)
+**Bandwidth estimation** uses a hybrid approach:
+- Measures download time for each video segment
+- Applies exponential weighted moving average (EWMA) to smooth short-term fluctuations
+- Factors in buffer level -- if buffer is healthy (>30 seconds), can be more aggressive with quality
 
-  const rows = []
+**Quality selection algorithm**:
+1. Estimate available bandwidth from recent segment downloads
+2. Select highest quality whose bitrate is below estimated bandwidth (with safety margin)
+3. If buffer is low (<10 seconds), drop quality aggressively to prevent rebuffering
+4. If buffer is full (>60 seconds), allow gradual quality increase
+5. Avoid rapid oscillation by requiring sustained bandwidth improvement before upgrading
 
-  // Continue Watching (always first)
-  const continueWatching = await getContinueWatching(profileId)
-  if (continueWatching.length > 0) {
-    rows.push({ title: 'Continue Watching', items: continueWatching })
-  }
+**Buffer management** targets a 60-second buffer. The player pre-fetches segments during stable playback but reduces buffer targets on mobile (to save data) and increases them on TVs (more stable connections).
 
-  // Trending Now
-  rows.push({
-    title: 'Trending Now',
-    items: await getTrending(profile.country)
-  })
+### 3. Recommendation Engine
 
-  // Personalized rows based on viewing history
-  const genres = extractTopGenres(viewingHistory)
-  for (const genre of genres.slice(0, 3)) {
-    rows.push({
-      title: `${genre} Movies`,
-      items: await getTopByGenre(genre, profileId)
-    })
-  }
+Netflix's personalization system generates unique homepages for each of 200M+ subscriber profiles. The system uses multiple algorithmic approaches:
 
-  // "Because you watched X"
-  const recentlyWatched = viewingHistory.slice(0, 3)
-  for (const item of recentlyWatched) {
-    const similar = await getSimilar(item.videoId)
-    rows.push({
-      title: `Because you watched ${item.title}`,
-      items: similar
-    })
-  }
+**Collaborative filtering**: Identifies users with similar viewing patterns. If users A and B both watched and rated shows 1, 2, 3 similarly, and user A also watched show 4, recommend show 4 to user B. Netflix uses matrix factorization techniques on implicit signals (watch duration, completion rate) rather than explicit ratings.
 
-  // Apply A/B test treatments
-  return applyExperiments(profileId, rows)
-}
-```
+**Content-based filtering**: Analyzes metadata (genre, cast, director, themes, mood, pacing) and visual features extracted by computer vision models. Recommends content with similar attributes to what the user has enjoyed.
 
-**Ranking Within Rows:**
-```javascript
-function rankItems(items, profileId) {
-  const userVector = getUserEmbedding(profileId)
+**Deep learning models**: Transformer-based models process a user's viewing sequence to predict the next likely watch. These models capture temporal patterns (what people watch after documentaries, viewing patterns by time of day, seasonal preferences).
 
-  return items
-    .map(item => ({
-      ...item,
-      score: cosineSimilarity(userVector, item.embedding) *
-             item.popularityScore *
-             item.recencyBoost
-    }))
-    .sort((a, b) => b.score - a.score)
-}
-```
+**Homepage row generation** produces 40-75 rows per profile, each a horizontal carousel:
+- "Continue Watching" -- in-progress content ranked by recency and predicted completion probability
+- "Because You Watched [Title]" -- similar content based on the specific title
+- "Trending Now" -- popularity-weighted by region and time
+- Genre rows personalized by affinity (a user who watches lots of thrillers sees Thriller rows higher)
+- "Top 10" -- regional popularity rankings
+- "New Releases" -- recency-weighted with personalized ordering within the row
 
-### 3. A/B Testing Framework
+Recommendations are precomputed offline (batch ML pipelines running hourly) and cached. Real-time re-ranking happens at request time based on context (time of day, device, recent activity).
 
-**Experiment Configuration:**
-```typescript
-interface Experiment {
-  id: string
-  name: string
-  description: string
-  variants: Variant[]
-  allocation: number // Percentage of traffic
-  targetGroups: TargetGroup[] // Country, device, etc.
-  metrics: Metric[] // What to measure
-  startDate: Date
-  endDate: Date
-}
+### 4. Profile Management
 
-interface Variant {
-  id: string
-  name: string
-  weight: number // Within experiment
-  config: Record<string, any>
-}
-```
+Each account supports up to 5 profiles with independent:
+- Viewing history and recommendations
+- Maturity settings (kids profiles restrict content to age-appropriate ratings)
+- Language and subtitle preferences
+- My List (watchlist)
+- Playback settings (autoplay next episode, data usage preferences)
 
-**Allocation Algorithm:**
-```javascript
-function allocateToExperiment(userId, experimentId) {
-  // Consistent hashing for stable allocation
-  const hash = murmurhash3(`${userId}:${experimentId}`)
-  const bucket = hash % 100
+Kids profiles enforce strict content filtering at the API level -- maturity-restricted content never appears in responses, regardless of how the request is formed.
 
-  const experiment = getExperiment(experimentId)
+### 5. Content Catalog (Metadata Service)
 
-  // Check if user is in experiment population
-  if (bucket >= experiment.allocation) {
-    return null // Control (not in experiment)
-  }
+The metadata service manages all non-video content data:
+- Titles, descriptions, cast, crew, genres (structured and tag-based)
+- Artwork: Netflix generates and A/B tests multiple poster images per title, selecting the most clicked variant per user segment
+- Availability: Region-locked content based on licensing agreements
+- Maturity ratings mapped to country-specific systems
 
-  // Determine variant
-  let accumulated = 0
-  for (const variant of experiment.variants) {
-    accumulated += variant.weight
-    if (bucket < (experiment.allocation * accumulated / 100)) {
-      return variant.id
-    }
-  }
+This service handles ~500K reads/sec with aggressive caching (EVCache/Memcached clusters). Writes are infrequent (content catalog changes slowly) and propagate through eventual consistency.
 
-  return experiment.variants[0].id
-}
+### 6. Search
 
-// Usage in code
-function getArtwork(videoId, profileId) {
-  const variant = allocateToExperiment(profileId, 'artwork_test_123')
+Search uses Elasticsearch with custom analyzers for:
+- **Title matching**: Fuzzy matching to handle typos ("Straner Things" finds "Stranger Things")
+- **Auto-suggest**: Prefix completion with personalized ranking (user's genre preferences influence ordering)
+- **Faceted search**: Filter by genre, year, rating, availability
+- **Relevance scoring**: Combines text match score with personalization score (a thriller fan's search for "dark" ranks thriller results higher)
 
-  if (variant === 'treatment_a') {
-    return getPersonalizedArtwork(videoId, profileId)
-  } else {
-    return getDefaultArtwork(videoId)
-  }
-}
-```
+At production scale, the search cluster handles ~50K queries/sec with p99 latency under 200ms. Elasticsearch indexes are sharded by language/region.
 
-### 4. Continue Watching
+### 7. A/B Testing (Experimentation Platform)
 
-**Tracking Progress:**
-```javascript
-async function updateProgress(profileId, videoId, position, duration) {
-  await cassandra.execute(`
-    INSERT INTO viewing_progress (profile_id, video_id, position, duration, updated_at)
-    VALUES (?, ?, ?, ?, ?)
-  `, [profileId, videoId, position, duration, Date.now()])
+Netflix runs hundreds of concurrent experiments affecting every aspect of the product. The experimentation platform provides:
 
-  // If near end, mark as completed
-  if (position / duration > 0.95) {
-    await markCompleted(profileId, videoId)
-  }
-}
+**Consistent allocation**: Users are assigned to experiment variants using deterministic hashing (murmurhash of userId + experimentId). This ensures the same user always sees the same variant, even across devices and sessions.
 
-async function getContinueWatching(profileId) {
-  const progress = await cassandra.execute(`
-    SELECT video_id, position, duration, updated_at
-    FROM viewing_progress
-    WHERE profile_id = ?
-    AND completed = false
-    ORDER BY updated_at DESC
-    LIMIT 20
-  `, [profileId])
+**Orthogonal experiment layers**: Multiple experiments run simultaneously without interference. Each experiment operates in its own "layer," so a user can be in variant A of experiment 1 and variant B of experiment 2 without correlation.
 
-  return progress.rows
-    .filter(p => p.position / p.duration > 0.05) // Started watching
-    .map(p => ({
-      videoId: p.video_id,
-      resumePosition: p.position,
-      percentComplete: Math.round(p.position / p.duration * 100)
-    }))
-}
-```
+**Feature flags**: Experiments gate feature rollouts. A new UI component starts at 1% rollout, increases to 5%, 25%, 50%, then 100% over weeks, with automatic rollback if error metrics spike.
+
+**Metrics pipeline**: Every experiment tracks key metrics -- streaming hours, search success rate, title-level engagement, member retention. Statistical significance is computed using sequential testing to allow early stopping.
+
+### 8. Playback: Progress Tracking and Resume
+
+Viewing progress is tracked at per-profile, per-content granularity:
+- Position updates sent every 30 seconds during playback
+- Progress persisted to Cassandra (high-write throughput, partition key = profileId)
+- Resume position served from cache (Redis/EVCache) for fast playback start
+- Content marked "completed" at >95% progress
+- Series advance to next episode automatically
+
+The "Continue Watching" row requires merging progress data with content metadata and applying recency/completion-probability ranking -- a computationally expensive operation that is precomputed and cached.
+
+### 9. DRM and Content Protection
+
+Content protection operates at multiple levels:
+
+**Device registration**: Each account has a limit on registered devices (varies by subscription tier). Device attestation verifies the client is a genuine Netflix application.
+
+**Concurrent stream limits**: Basic plan allows 1 simultaneous stream, Standard allows 2, Premium allows 4. Enforced by a distributed counter service with eventual consistency (brief overages are tolerated for availability).
+
+**DRM licensing**: When playback starts, the client requests a DRM license from the license server. The license contains decryption keys for the content, bound to the specific device. Licenses have short TTLs (hours) and are renewed during playback.
+
+**Watermarking**: Invisible forensic watermarks embedded in video streams allow Netflix to trace leaked content back to the specific account and device.
+
+### 10. Observability and Chaos Engineering
+
+**Observability** at Netflix scale requires:
+- Atlas (custom time-series database) for metrics -- handles billions of data points/sec
+- Distributed tracing across hundreds of microservices
+- Real-time anomaly detection on streaming quality metrics
+- Per-title, per-region, per-device-type dashboards
+- Alerting on SLO violations (rebuffer rate > 0.5%, start-up time > 3s)
+
+**Chaos engineering** (Simian Army / Chaos Monkey) continuously tests resilience:
+- Chaos Monkey: Randomly terminates instances in production to verify redundancy
+- Chaos Kong: Simulates entire region failures
+- FIT (Failure Injection Testing): Introduces specific failure modes (latency, errors) between services
+- The philosophy: "If Netflix can't handle random failures in production, it will certainly fail during real outages"
+
+### 11. Failure Handling
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| CDN appliance down | Users on that ISP lose local cache | Fallback to upstream OCA or origin; peer OCAs in same ISP |
+| Recommendation service timeout | Homepage shows stale data | Precomputed fallback rows cached per-profile; generic "Popular" rows as last resort |
+| Playback service down | Cannot start new streams | Circuit breaker; client retries with backoff; cached manifest allows continued playback of already-started content |
+| Database partition | Writes may fail | Cassandra multi-DC replication; eventual consistency acceptable for viewing history |
+| Region failure | All services in region down | Zuul routes traffic to surviving regions; stateless services enable cross-region failover |
 
 ---
 
 ## Database Schema
 
+### Production Database Strategy
+
+| Store | Technology | Data | Access Pattern |
+|-------|-----------|------|----------------|
+| Account/billing data | PostgreSQL (multi-region) | accounts, profiles, subscriptions | Low-write, strong consistency, ACID transactions |
+| Viewing history | Cassandra | watch history, progress | High-write, time-ordered, partition by profileId |
+| Content metadata | PostgreSQL + EVCache | titles, seasons, episodes, genres | Read-heavy, heavily cached |
+| Sessions | Redis cluster | auth tokens, device sessions | High-read/write, TTL-based expiry |
+| Recommendations | Redis + offline storage | precomputed row data | Read-heavy, refreshed hourly |
+| Search index | Elasticsearch | title, description, cast, genre | Full-text search, faceted queries |
+| Experiment allocations | Cassandra or DynamoDB | experiment-profile-variant mappings | High-read, consistent hashing for allocation |
+| Analytics/metrics | Kafka + Druid/Spark | streaming events, QoE metrics | Write-heavy, batch + real-time processing |
+
+### Schema (Used in Both Layers)
+
+The SQL schema below runs locally in PostgreSQL but is designed with production-ready constraints and indexes.
+
 ```sql
+-- Accounts (main user accounts)
+CREATE TABLE accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    subscription_tier VARCHAR(50) DEFAULT 'standard',
+    country VARCHAR(10) DEFAULT 'US',
+    is_admin BOOLEAN DEFAULT FALSE,
+    role VARCHAR(50) DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Profiles (multiple per account)
+CREATE TABLE profiles (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    avatar_url VARCHAR(500),
+    is_kids BOOLEAN DEFAULT FALSE,
+    maturity_level INTEGER DEFAULT 4,  -- 1-4, 4 = all content
+    language VARCHAR(10) DEFAULT 'en',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Videos (movies and series)
 CREATE TABLE videos (
-  id UUID PRIMARY KEY,
-  title VARCHAR(500) NOT NULL,
-  type VARCHAR(20), -- 'movie', 'series'
-  release_year INTEGER,
-  duration_minutes INTEGER, -- For movies
-  rating VARCHAR(10), -- 'TV-MA', 'PG-13', etc.
-  genres TEXT[],
-  description TEXT,
-  poster_url VARCHAR(500),
-  backdrop_url VARCHAR(500),
-  created_at TIMESTAMP DEFAULT NOW()
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title VARCHAR(500) NOT NULL,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('movie', 'series')),
+    release_year INTEGER,
+    duration_minutes INTEGER,
+    rating VARCHAR(10),
+    maturity_level INTEGER DEFAULT 4,
+    genres TEXT[] DEFAULT '{}',
+    description TEXT,
+    poster_url VARCHAR(500),
+    backdrop_url VARCHAR(500),
+    trailer_url VARCHAR(500),
+    popularity_score FLOAT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Seasons (for series)
 CREATE TABLE seasons (
-  id UUID PRIMARY KEY,
-  video_id UUID REFERENCES videos(id),
-  season_number INTEGER,
-  title VARCHAR(200),
-  episode_count INTEGER
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    season_number INTEGER NOT NULL,
+    title VARCHAR(200),
+    description TEXT,
+    release_year INTEGER,
+    episode_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Episodes
 CREATE TABLE episodes (
-  id UUID PRIMARY KEY,
-  season_id UUID REFERENCES seasons(id),
-  episode_number INTEGER,
-  title VARCHAR(200),
-  duration_minutes INTEGER,
-  description TEXT
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    season_id UUID NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    duration_minutes INTEGER,
+    description TEXT,
+    thumbnail_url VARCHAR(500),
+    video_key VARCHAR(500),
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Profiles (per account)
-CREATE TABLE profiles (
-  id UUID PRIMARY KEY,
-  account_id UUID REFERENCES accounts(id),
-  name VARCHAR(100) NOT NULL,
-  avatar_url VARCHAR(500),
-  is_kids BOOLEAN DEFAULT FALSE,
-  maturity_level INTEGER DEFAULT 4,
-  language VARCHAR(10) DEFAULT 'en',
-  created_at TIMESTAMP DEFAULT NOW()
+-- Video files (multiple quality versions per content)
+CREATE TABLE video_files (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    video_id UUID REFERENCES videos(id) ON DELETE CASCADE,
+    episode_id UUID REFERENCES episodes(id) ON DELETE CASCADE,
+    quality VARCHAR(20) NOT NULL,     -- 240p, 360p, 480p, 720p, 1080p, 4k
+    bitrate INTEGER,                   -- in kbps
+    width INTEGER,
+    height INTEGER,
+    video_key VARCHAR(500) NOT NULL,   -- S3/MinIO key
+    file_size_bytes BIGINT,
+    codec VARCHAR(50) DEFAULT 'h264',
+    container VARCHAR(20) DEFAULT 'mp4',
+    created_at TIMESTAMP DEFAULT NOW(),
+    CHECK (video_id IS NOT NULL OR episode_id IS NOT NULL)
 );
 
--- Experiments
-CREATE TABLE experiments (
-  id UUID PRIMARY KEY,
-  name VARCHAR(200) NOT NULL,
-  description TEXT,
-  allocation_percent INTEGER,
-  variants JSONB,
-  target_groups JSONB,
-  metrics TEXT[],
-  status VARCHAR(20) DEFAULT 'draft',
-  start_date TIMESTAMP,
-  end_date TIMESTAMP
-);
-```
-
-### Cassandra Schema (Viewing History)
-
-While PostgreSQL handles the core relational data (videos, profiles, experiments), Cassandra is used for high-write viewing history data. This hybrid approach leverages each database's strengths.
-
-**Why Cassandra for Viewing History?**
-- **High-write throughput**: Every play/pause/seek generates writes (100:1 write:read ratio)
-- **Time-ordered retrieval**: TimeUUID clustering keys provide natural ordering
-- **TTL for data lifecycle**: Automatic cleanup of old viewing progress
-- **Horizontal scalability**: Easily partition by profile_id for billions of users
-
-```cql
--- Keyspace configuration
-CREATE KEYSPACE netflix_viewing WITH REPLICATION = {
-  'class': 'SimpleStrategy',
-  'replication_factor': 1
-};
-
--- Viewing progress (for "Continue Watching")
--- Partition key: profile_id (all progress for a user together)
+-- Viewing progress (for continue watching / resume)
 CREATE TABLE viewing_progress (
-    profile_id UUID,
-    content_id UUID,           -- video_id or episode_id
-    content_type TEXT,         -- 'movie' or 'episode'
-    video_id UUID,
-    episode_id UUID,
-    position_seconds INT,
-    duration_seconds INT,
-    progress_percent FLOAT,
-    completed BOOLEAN,
-    last_watched_at TIMESTAMP,
-    PRIMARY KEY (profile_id, last_watched_at, content_id)
-) WITH CLUSTERING ORDER BY (last_watched_at DESC)
-  AND default_time_to_live = 7776000;  -- 90 days TTL
-
--- Watch history (for recommendations)
-CREATE TABLE watch_history (
-    profile_id UUID,
-    content_id UUID,
-    content_type TEXT,
-    video_id UUID,
-    title TEXT,                -- Denormalized for display
-    genres SET<TEXT>,          -- Denormalized for recommendations
-    watched_at TIMESTAMP,
-    PRIMARY KEY (profile_id, watched_at, content_id)
-) WITH CLUSTERING ORDER BY (watched_at DESC)
-  AND default_time_to_live = 31536000;  -- 1 year TTL
-
--- Genre preferences (counter table for personalization)
-CREATE TABLE genre_preferences (
-    profile_id UUID,
-    genre TEXT,
-    watch_count COUNTER,
-    PRIMARY KEY (profile_id, genre)
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    video_id UUID REFERENCES videos(id) ON DELETE CASCADE,
+    episode_id UUID REFERENCES episodes(id) ON DELETE CASCADE,
+    position_seconds INTEGER NOT NULL DEFAULT 0,
+    duration_seconds INTEGER NOT NULL,
+    completed BOOLEAN DEFAULT FALSE,
+    last_watched_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW(),
+    CHECK (video_id IS NOT NULL OR episode_id IS NOT NULL)
 );
+
+-- Unique partial indexes for upsert on progress
+CREATE UNIQUE INDEX idx_viewing_progress_movie
+  ON viewing_progress(profile_id, video_id) WHERE episode_id IS NULL;
+CREATE UNIQUE INDEX idx_viewing_progress_episode
+  ON viewing_progress(profile_id, episode_id) WHERE video_id IS NULL;
+
+-- Watch history (completed views)
+CREATE TABLE watch_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    video_id UUID REFERENCES videos(id) ON DELETE CASCADE,
+    episode_id UUID REFERENCES episodes(id) ON DELETE CASCADE,
+    watched_at TIMESTAMP DEFAULT NOW()
+);
+
+-- My List (user's watchlist)
+CREATE TABLE my_list (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    added_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(profile_id, video_id)
+);
+
+-- Experiments (A/B testing)
+CREATE TABLE experiments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
+    allocation_percent INTEGER DEFAULT 100,
+    variants JSONB NOT NULL DEFAULT '[]',
+    target_groups JSONB DEFAULT '{}',
+    metrics TEXT[] DEFAULT '{}',
+    status VARCHAR(20) DEFAULT 'draft'
+      CHECK (status IN ('draft', 'active', 'paused', 'completed')),
+    start_date TIMESTAMP,
+    end_date TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Experiment allocations
+CREATE TABLE experiment_allocations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    experiment_id UUID NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    variant_id VARCHAR(100) NOT NULL,
+    allocated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(experiment_id, profile_id)
+);
+
+-- Sessions
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
+    token VARCHAR(500) NOT NULL UNIQUE,
+    device_info JSONB,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Performance indexes
+CREATE INDEX idx_profiles_account ON profiles(account_id);
+CREATE INDEX idx_seasons_video ON seasons(video_id);
+CREATE INDEX idx_episodes_season ON episodes(season_id);
+CREATE INDEX idx_video_files_video ON video_files(video_id);
+CREATE INDEX idx_video_files_episode ON video_files(episode_id);
+CREATE INDEX idx_viewing_progress_profile ON viewing_progress(profile_id);
+CREATE INDEX idx_viewing_progress_last_watched
+  ON viewing_progress(profile_id, last_watched_at DESC);
+CREATE INDEX idx_watch_history_profile ON watch_history(profile_id);
+CREATE INDEX idx_my_list_profile ON my_list(profile_id);
+CREATE INDEX idx_videos_genres ON videos USING GIN(genres);
+CREATE INDEX idx_videos_popularity ON videos(popularity_score DESC);
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_account ON sessions(account_id);
 ```
 
-**Data Flow:**
-```
-1. User plays video
-   → UPDATE viewing_progress SET position_seconds = X, last_watched_at = now()
+---
 
-2. User completes video
-   → INSERT into watch_history (denormalized from PostgreSQL video data)
-   → UPDATE genre_preferences (increment counters)
+## API Design
 
-3. Homepage generation
-   → SELECT * FROM viewing_progress WHERE profile_id = ? LIMIT 10
-   → JOIN with PostgreSQL for video metadata
-```
+### Authentication
 
-**Why denormalize title/genres in watch_history?**
-- Avoids cross-database joins on every recommendation query
-- Cassandra doesn't support joins; data must be self-contained
-- Trade-off: Must handle video metadata updates (rare for historical data)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/register` | Create account with default profile |
+| POST | `/api/auth/login` | Authenticate, create session, set httpOnly cookie |
+| POST | `/api/auth/logout` | Invalidate session, clear cookie |
+| GET | `/api/auth/me` | Return current session info (account + profile) |
+
+### Profiles
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/profiles` | List all profiles for account |
+| POST | `/api/profiles` | Create profile (max 5 per account) |
+| PUT | `/api/profiles/:id` | Update profile settings |
+| DELETE | `/api/profiles/:id` | Delete profile (not the last one) |
+| POST | `/api/profiles/:id/select` | Select profile for current session |
+
+### Video Catalog
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/videos` | List videos with type/genre/search filters |
+| GET | `/api/videos/genres` | List all unique genres (cached 1hr) |
+| GET | `/api/videos/trending` | Top 20 by popularity score |
+| GET | `/api/videos/:id` | Video details (includes seasons/episodes for series) |
+| GET | `/api/videos/:id/similar` | Genre-overlap recommendations |
+
+### Personalized Browsing
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/browse/homepage` | Personalized homepage rows (cached 5min per profile) |
+| GET | `/api/browse/continue-watching` | In-progress content (5-95% complete) |
+| GET | `/api/browse/my-list` | User's saved content |
+| POST | `/api/browse/my-list/:videoId` | Add to My List |
+| DELETE | `/api/browse/my-list/:videoId` | Remove from My List |
+| GET | `/api/browse/my-list/:videoId/check` | Check if in My List |
+| GET | `/api/browse/search` | Search by title, description, genre |
+
+### Streaming
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/stream/:videoId/manifest` | Streaming manifest with quality levels + resume position |
+| GET | `/api/stream/:videoId/play` | Redirect to presigned MinIO/S3 stream URL |
+| POST | `/api/stream/:videoId/progress` | Update viewing progress (marks completed at >95%) |
+| GET | `/api/stream/:videoId/progress` | Get current progress for video/episode |
+| POST | `/api/stream/:videoId/buffer` | Record buffer event (QoE metric) |
+| POST | `/api/stream/:videoId/error` | Record playback error (QoE metric) |
+
+### Experimentation
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/experiments` | List all experiments |
+| GET | `/api/experiments/:id` | Get experiment details |
+| POST | `/api/experiments` | Create experiment (min 2 variants, weights sum to 100) |
+| PUT | `/api/experiments/:id/status` | Update status (draft/active/paused/completed) |
+| GET | `/api/experiments/:id/allocation` | Get/create variant allocation for profile |
+| POST | `/api/experiments/allocations` | Get all active experiment allocations for profile |
 
 ---
 
 ## Key Design Decisions
 
-### 1. Open Connect (Custom CDN)
+### CDN Strategy: Open Connect vs Third-Party CDN
 
-**Decision**: Build custom CDN with ISP-embedded appliances
+Netflix built its own CDN (Open Connect) rather than using Akamai/CloudFront because video streaming has unique requirements that general-purpose CDNs handle poorly. Video segments are large (2-10 MB each), access patterns are predictable (popularity follows a power law), and bandwidth costs at Netflix's scale make per-GB pricing unsustainable.
 
-**Rationale**:
-- Lower latency (content at ISP edge)
-- Cost savings (no third-party CDN fees)
-- Better quality control
+Open Connect appliances are placed inside ISP networks, meaning video traffic never traverses expensive peering links. This reduces Netflix's bandwidth costs by an estimated 90% compared to commercial CDN pricing, while simultaneously improving quality for users (fewer network hops = lower latency and jitter). The trade-off is massive operational complexity: Netflix must manage hardware deployments across thousands of ISPs worldwide, handle appliance failures, and coordinate content pre-positioning. For a company where streaming quality directly drives subscriber retention, this investment is justified.
 
-### 2. Cassandra for Viewing History
+### Per-Title Encoding vs Fixed Bitrate Ladder
 
-**Decision**: Use Cassandra for time-series viewing data
+Traditional streaming uses a fixed bitrate ladder (e.g., 720p always at 2350 kbps). Netflix's per-title encoding analyzes each title's visual complexity to determine the optimal bitrate for each resolution. A simple animated show might look perfect at 720p/1500 kbps, while a visually dense action film needs 720p/3000 kbps.
 
-**Rationale**:
-- High write throughput
-- Time-series friendly
-- Scales horizontally
+This approach reduces total storage and bandwidth by ~20% without quality loss -- substantial savings at petabyte scale. The trade-off is encoding time: per-title analysis requires multiple encode passes with quality metrics computation, making the encoding pipeline 5-10x slower than fixed-ladder encoding. Since content is encoded once and served millions of times, this is a clear win. The complexity cost is in the encoding orchestration system (Cosmos), which must manage thousands of parallel encoding jobs with dependency tracking.
 
-### 3. Per-Title Encoding
+### Cassandra for Viewing History vs PostgreSQL
 
-**Decision**: Custom encoding ladder per title
+Viewing history writes are extremely high-volume (~10M concurrent viewers, each sending progress updates every 30 seconds = ~300K writes/sec). PostgreSQL can handle this with connection pooling and write batching, but scaling becomes expensive (vertical scaling + read replicas).
 
-**Rationale**:
-- Animation needs different bitrates than action
-- Dark scenes compress differently
-- Optimizes storage and quality
+Cassandra is purpose-built for this access pattern: writes are append-only (no read-before-write), data is partitioned by profileId (natural partition key), queries are always by profileId + time range, and multi-datacenter replication is built in. The trade-off is query flexibility -- Cassandra requires knowing the partition key upfront, making ad-hoc analytics queries impossible without a separate analytics pipeline. For viewing progress, where the only access pattern is "get recent progress for profile X," this limitation is acceptable.
+
+### Precomputed Recommendations vs Real-Time
+
+Homepage generation involves running ML models, aggregating viewing history, fetching content metadata, and ranking results -- operations that take 100ms-1s. With 100K+ homepage requests/sec, computing recommendations in real-time for every request is infeasible.
+
+Netflix precomputes recommendations offline (hourly batch jobs) and stores results in cache. When a user opens the app, the homepage loads from cache in <50ms. Real-time signals (what the user just watched) are applied as lightweight re-ranking on top of precomputed results, not full recomputation. The trade-off is freshness: a title the user just completed might still appear in recommendations for up to an hour. Netflix accepts this because the cost of stale recommendations (minor user annoyance) is far less than the cost of real-time computation (either massive infrastructure or degraded latency).
 
 ---
 
-## Authentication, Authorization, and Rate Limiting
+## Consistency and Idempotency
 
-### Authentication Strategy
+**Viewing progress updates** are idempotent by design -- the same position update applied twice produces the same result (upsert on profile_id + content_id). This is critical because clients retry progress updates on network failures.
 
-**Session-Based Authentication (Local Development):**
+**Experiment allocation** uses deterministic hashing (murmurhash of profileId + experimentId). The same input always produces the same variant assignment, making allocation inherently idempotent. This also ensures consistency across devices -- a user sees the same experiment variant on their phone and TV.
 
-For this learning project, we use session-based auth stored in Redis for simplicity and statefulness visibility.
+**My List operations** use `ON CONFLICT DO NOTHING` for adds and are naturally idempotent for deletes.
 
-```javascript
-// Session configuration
-const sessionConfig = {
-  store: new RedisStore({ client: redisClient }),
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-    sameSite: 'lax'
-  }
-}
+**Session creation** generates a UUID token on each login. If a login request is retried, a new session is created (the old one eventually expires). This is acceptable because session storage is cheap and multiple active sessions per account are allowed.
 
-// Session structure
-interface UserSession {
-  accountId: string
-  email: string
-  activeProfileId: string | null
-  loginAt: Date
-  lastActivity: Date
-}
-```
+---
 
-**Production Alternative (JWT + Refresh Tokens):**
+## Security / Auth
 
-In production Netflix, stateless JWTs enable global scale:
+**Authentication**: Session-based with httpOnly cookies. Tokens stored in Redis with 7-day TTL. Sessions include device metadata for audit trails.
 
-```typescript
-// Access token (short-lived, 15 minutes)
-interface AccessToken {
-  sub: string         // account_id
-  profile_id: string  // active profile
-  exp: number         // expiration
-  iat: number         // issued at
-  device_id: string   // client device fingerprint
-}
+**Authorization**: Role-based access control (RBAC) with 6 roles:
+- `viewer` -- browse, watch, manage own profiles
+- `kids_viewer` -- browse/watch kids content only (enforced at query level)
+- `account_owner` -- all viewer + billing and profile management
+- `admin` -- full access
+- `content_admin` -- video upload and metadata management
+- `experiment_admin` -- A/B test creation and analysis
 
-// Refresh token (long-lived, 30 days, stored in DB)
-interface RefreshToken {
-  token_id: string
-  account_id: string
-  device_id: string
-  expires_at: Date
-  revoked: boolean
-}
-```
+**Rate limiting**: Redis-based sliding window rate limiting, tiered by endpoint category:
 
-### Authorization and RBAC
+| Category | Limit | Window |
+|----------|-------|--------|
+| Browse/Search | 100 req | 1 min |
+| Playback Start | 30 req | 1 min |
+| Profile Updates | 20 req | 1 min |
+| Progress Updates | 60 req | 1 min |
+| Auth (login) | 5 req | 5 min |
 
-**Role Definitions:**
+Auth endpoints use strict rate limiting (both IP-based and account-based). Rate limit fails open (allows requests) when Redis is unavailable -- availability over security for non-auth endpoints.
 
-| Role | Description | Permissions |
-|------|-------------|-------------|
-| `viewer` | Standard subscriber | Browse, watch, manage own profiles, rate content |
-| `kids_viewer` | Kids profile | Browse/watch kids content only, no ratings |
-| `account_owner` | Primary account holder | All viewer permissions + billing, add/remove profiles |
-| `admin` | Netflix staff | Content management, experiments, analytics |
-| `content_admin` | Content team | Upload videos, edit metadata, manage catalog |
-| `experiment_admin` | Data science | Create/manage A/B tests, view experiment results |
+**Content protection**: At production scale, DRM (Widevine/FairPlay/PlayReady) encrypts video segments, device attestation validates clients, concurrent stream limits are enforced by distributed counters, and forensic watermarks trace leaks.
 
-**Permission Enforcement:**
+---
 
-```javascript
-// Middleware for route protection
-function requireRole(...allowedRoles) {
-  return (req, res, next) => {
-    const userRole = req.session?.role || 'anonymous'
+## Observability
 
-    if (!allowedRoles.includes(userRole)) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        required: allowedRoles,
-        current: userRole
-      })
-    }
-    next()
-  }
-}
+**Prometheus metrics** (implemented with prom-client):
+- HTTP request duration and count (by method, route, status code)
+- Streaming QoE: starts, buffer events, playback errors, bitrate distribution, active sessions
+- Circuit breaker state (closed/half-open/open), failures, successes per service
+- Database query duration and connection pool status
+- Cache hit/miss rates
+- Rate limit exceeded counts
+- Background job executions and duration
 
-// Maturity-based content filtering
-function filterByMaturityLevel(content, profile) {
-  const maturityMap = {
-    'G': 1, 'PG': 2, 'PG-13': 3, 'R': 4, 'NC-17': 5, 'TV-MA': 5
-  }
+**Structured logging** (implemented with Pino):
+- Domain-specific child loggers: auth, streaming, circuit breaker, job execution
+- Log levels: error for failures, warn for rate limits and circuit breaker events, info for significant operations, debug for routine events
+- Request context (accountId, profileId, path) attached to all log entries
 
-  return content.filter(item =>
-    maturityMap[item.rating] <= profile.maturityLevel
-  )
-}
-
-// API route examples
-app.get('/api/browse', requireRole('viewer', 'kids_viewer'))
-app.post('/api/admin/videos', requireRole('admin', 'content_admin'))
-app.post('/api/admin/experiments', requireRole('admin', 'experiment_admin'))
-app.get('/api/admin/analytics', requireRole('admin'))
-```
-
-**Profile-Level Isolation:**
-
-```javascript
-// Ensure users can only access their own profiles
-async function validateProfileAccess(req, res, next) {
-  const { profileId } = req.params
-  const { accountId } = req.session
-
-  const profile = await db.query(
-    'SELECT account_id FROM profiles WHERE id = $1',
-    [profileId]
-  )
-
-  if (!profile.rows[0] || profile.rows[0].account_id !== accountId) {
-    return res.status(404).json({ error: 'Profile not found' })
-  }
-
-  req.profile = profile.rows[0]
-  next()
-}
-```
-
-### Rate Limiting
-
-**Tier-Based Limits (per endpoint category):**
-
-| Endpoint Category | Limit | Window | Burst |
-|-------------------|-------|--------|-------|
-| Browse/Search | 100 | 1 minute | 20 |
-| Playback Start | 30 | 1 minute | 5 |
-| Profile Updates | 20 | 1 minute | 5 |
-| Progress Updates | 60 | 1 minute | 10 |
-| Admin APIs | 200 | 1 minute | 50 |
-| Auth (login/register) | 5 | 5 minutes | 2 |
-
-**Implementation (Redis-based sliding window):**
-
-```javascript
-const rateLimiter = {
-  async checkLimit(key, limit, windowSeconds) {
-    const now = Date.now()
-    const windowStart = now - (windowSeconds * 1000)
-
-    const multi = redis.multi()
-    multi.zremrangebyscore(key, 0, windowStart)  // Remove old entries
-    multi.zadd(key, now, `${now}:${Math.random()}`)  // Add current request
-    multi.zcard(key)  // Count requests in window
-    multi.expire(key, windowSeconds)  // Set TTL
-
-    const [,, count] = await multi.exec()
-
-    return {
-      allowed: count <= limit,
-      remaining: Math.max(0, limit - count),
-      resetAt: new Date(now + windowSeconds * 1000)
-    }
-  }
-}
-
-// Middleware
-function rateLimit(category, limit, windowSeconds) {
-  return async (req, res, next) => {
-    const key = `ratelimit:${category}:${req.session?.accountId || req.ip}`
-    const result = await rateLimiter.checkLimit(key, limit, windowSeconds)
-
-    res.set({
-      'X-RateLimit-Limit': limit,
-      'X-RateLimit-Remaining': result.remaining,
-      'X-RateLimit-Reset': result.resetAt.toISOString()
-    })
-
-    if (!result.allowed) {
-      return res.status(429).json({
-        error: 'Too many requests',
-        retryAfter: Math.ceil((result.resetAt - Date.now()) / 1000)
-      })
-    }
-    next()
-  }
-}
-```
+**Health checks** (three levels):
+- `/health` -- liveness probe (is the process running?)
+- `/health/ready` -- readiness probe (all dependencies healthy?)
+- `/health/details` -- detailed status including circuit breaker states, connection pool stats, process memory
 
 ---
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
+**Circuit breakers** (implemented with Opossum) protect against cascade failures:
 
-**Idempotency Key Pattern:**
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| Storage (MinIO/S3) | 8s | 50% | 30s |
+| Redis | 2s | 50% | 15s |
+| Cassandra/DB | 5s | 50% | 30s |
+| CDN | 10s | 40% | 60s |
 
-```javascript
-// Client sends idempotency key in header
-async function handleIdempotentRequest(req, res, next) {
-  const idempotencyKey = req.headers['x-idempotency-key']
+When a circuit opens, requests fail immediately without calling the downstream service, giving it time to recover. The half-open state allows a single probe request to test recovery.
 
-  if (!idempotencyKey) {
-    return next() // Non-idempotent request
-  }
+**Retry with exponential backoff** (implemented in `utils/retry.ts`):
+- Configurable max retries, base delay, maximum delay, and backoff multiplier
+- Jitter (random 0-100ms) prevents thundering herd on recovery
+- Retryable error classification (ECONNRESET, ETIMEDOUT, 429, 5xx)
+- Idempotency key support for safe retries of non-idempotent operations
 
-  const cacheKey = `idempotency:${req.session.accountId}:${idempotencyKey}`
+**Graceful shutdown**: SIGTERM/SIGINT handlers stop accepting new connections, allow in-flight requests 10 seconds to complete, then exit.
 
-  // Check for cached response
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    const { status, body } = JSON.parse(cached)
-    return res.status(status).json(body)
-  }
-
-  // Store response after processing
-  const originalJson = res.json.bind(res)
-  res.json = async (body) => {
-    await redis.setex(cacheKey, 86400, JSON.stringify({
-      status: res.statusCode,
-      body
-    }))
-    return originalJson(body)
-  }
-
-  next()
-}
-
-// Operations that need idempotency keys
-// - Adding to My List
-// - Creating profiles
-// - Starting playback (prevents double-counting)
-// - Rating content
-```
-
-**Retry with Exponential Backoff:**
-
-```javascript
-async function retryWithBackoff(operation, options = {}) {
-  const {
-    maxRetries = 3,
-    baseDelayMs = 100,
-    maxDelayMs = 5000,
-    retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED']
-  } = options
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await operation()
-    } catch (error) {
-      const isRetryable = retryableErrors.includes(error.code) ||
-                          (error.status >= 500 && error.status < 600)
-
-      if (!isRetryable || attempt === maxRetries) {
-        throw error
-      }
-
-      const delay = Math.min(
-        baseDelayMs * Math.pow(2, attempt) + Math.random() * 100,
-        maxDelayMs
-      )
-
-      console.log(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`)
-      await sleep(delay)
-    }
-  }
-}
-
-// Usage
-const manifest = await retryWithBackoff(
-  () => fetchPlaybackManifest(videoId),
-  { maxRetries: 3, baseDelayMs: 200 }
-)
-```
-
-### Circuit Breaker Pattern
-
-**Circuit Breaker for External Services:**
-
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.recoveryTimeout = options.recoveryTimeout || 30000
-    this.monitorWindow = options.monitorWindow || 60000
-
-    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
-    this.failures = []
-    this.lastFailure = null
-  }
-
-  async execute(operation) {
-    // Reject immediately if circuit is open
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailure > this.recoveryTimeout) {
-        this.state = 'HALF_OPEN'
-      } else {
-        throw new Error('Circuit breaker is OPEN')
-      }
-    }
-
-    try {
-      const result = await operation()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  onSuccess() {
-    if (this.state === 'HALF_OPEN') {
-      this.state = 'CLOSED'
-      this.failures = []
-    }
-  }
-
-  onFailure() {
-    this.failures.push(Date.now())
-    this.lastFailure = Date.now()
-
-    // Count failures in monitoring window
-    const recentFailures = this.failures.filter(
-      t => Date.now() - t < this.monitorWindow
-    )
-
-    if (recentFailures.length >= this.failureThreshold) {
-      this.state = 'OPEN'
-      console.log('Circuit breaker OPENED')
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      recentFailures: this.failures.length,
-      lastFailure: this.lastFailure
-    }
-  }
-}
-
-// Service-specific circuit breakers
-const circuitBreakers = {
-  personalization: new CircuitBreaker({ failureThreshold: 5 }),
-  recommendations: new CircuitBreaker({ failureThreshold: 3 }),
-  experimentService: new CircuitBreaker({ failureThreshold: 10 })
-}
-
-// Fallback when circuit opens
-async function getHomepageRows(profileId) {
-  try {
-    return await circuitBreakers.personalization.execute(
-      () => personalizationService.getRows(profileId)
-    )
-  } catch (error) {
-    // Graceful degradation: return cached or generic rows
-    const cached = await redis.get(`homepage:${profileId}`)
-    if (cached) return JSON.parse(cached)
-
-    return getGenericHomepage() // Trending content for all users
-  }
-}
-```
-
-### Disaster Recovery (Local Development Simulation)
-
-**Multi-Region Simulation (3 Local Instances):**
-
-For learning purposes, simulate multi-region by running services on different ports:
-
-```bash
-# Simulate 3 "regions" locally
-PORT=3001 REGION=us-east npm run dev   # Primary
-PORT=3002 REGION=us-west npm run dev   # Secondary
-PORT=3003 REGION=eu-west npm run dev   # Tertiary
-```
-
-**Failover Configuration:**
-
-```javascript
-// Load balancer configuration (nginx or HAProxy simulation)
-const regions = [
-  { name: 'us-east', url: 'http://localhost:3001', priority: 1, healthy: true },
-  { name: 'us-west', url: 'http://localhost:3002', priority: 2, healthy: true },
-  { name: 'eu-west', url: 'http://localhost:3003', priority: 3, healthy: true }
-]
-
-async function healthCheck() {
-  for (const region of regions) {
-    try {
-      const response = await fetch(`${region.url}/health`, { timeout: 2000 })
-      region.healthy = response.ok
-    } catch {
-      region.healthy = false
-    }
-  }
-}
-
-function getActiveRegion() {
-  return regions
-    .filter(r => r.healthy)
-    .sort((a, b) => a.priority - b.priority)[0]
-}
-```
-
-### Backup and Restore Testing
-
-**Automated Backup Schedule:**
-
-```sql
--- PostgreSQL backup script (run daily via cron)
--- For local development, use pg_dump
-
--- backup.sh
-#!/bin/bash
-BACKUP_DIR="/backups/postgres"
-DATE=$(date +%Y%m%d_%H%M%S)
-
-pg_dump -Fc netflix_db > "$BACKUP_DIR/netflix_$DATE.dump"
-
-# Keep last 7 daily backups locally
-find "$BACKUP_DIR" -name "*.dump" -mtime +7 -delete
-```
-
-**Restore Verification Script:**
-
-```bash
-#!/bin/bash
-# restore-test.sh - Run weekly to verify backups work
-
-# 1. Create test database
-createdb netflix_restore_test
-
-# 2. Restore from latest backup
-LATEST=$(ls -t /backups/postgres/*.dump | head -1)
-pg_restore -d netflix_restore_test "$LATEST"
-
-# 3. Run verification queries
-psql netflix_restore_test << EOF
-  SELECT COUNT(*) as video_count FROM videos;
-  SELECT COUNT(*) as profile_count FROM profiles;
-  SELECT COUNT(*) as experiment_count FROM experiments;
-  -- Verify referential integrity
-  SELECT COUNT(*) FROM seasons s
-    LEFT JOIN videos v ON s.video_id = v.id
-    WHERE v.id IS NULL;
-EOF
-
-# 4. Cleanup
-dropdb netflix_restore_test
-
-echo "Backup verification complete"
-```
-
-**Cassandra Snapshot (for viewing history):**
-
-```bash
-# Take snapshot
-nodetool snapshot viewing_keyspace -t daily_$(date +%Y%m%d)
-
-# Verify snapshot exists
-ls /var/lib/cassandra/data/viewing_keyspace/viewing_progress-*/snapshots/
-```
+**Data retention**: Background job runs every 24 hours to clean up old viewing data:
+- Completed viewing progress older than 90 days: deleted
+- Watch history older than 2 years: archived to cold storage, then deleted
+- Archived data older than 5 years: permanently deleted
+- Profile data deletion for GDPR/CCPA requests
 
 ---
 
-## Data Lifecycle Policies
+## Scalability Considerations
 
-### Retention and TTL Policies
+### What Breaks First
 
-| Data Type | Retention Period | Storage Tier | Notes |
-|-----------|------------------|--------------|-------|
-| Viewing progress | 2 years | Hot (Cassandra/Redis) | Active "continue watching" data |
-| Completed views | 5 years | Warm (PostgreSQL) | Used for recommendations |
-| Playback events | 90 days | Hot (Kafka) | Real-time analytics |
-| Playback events | 2 years | Cold (S3/MinIO) | Historical analysis |
-| Experiment allocations | Duration + 30 days | Hot (Redis) | Stable bucketing |
-| Experiment results | Indefinite | Cold (S3/MinIO) | Decision auditing |
-| Session data | 30 days | Hot (Redis) | Auto-expires via TTL |
-| Audit logs | 7 years | Cold (S3/MinIO) | Compliance |
+1. **Homepage generation** -- personalization queries are expensive. Solution: precompute and cache per-profile, invalidate on significant events (new watch, new content).
 
-**TTL Implementation:**
+2. **Viewing progress writes** -- 300K writes/sec overwhelms PostgreSQL. Solution: Cassandra with profileId partition key, eventual consistency.
 
-```javascript
-// Redis TTLs (set at write time)
-const TTL = {
-  session: 30 * 24 * 60 * 60,           // 30 days
-  homepage_cache: 5 * 60,                // 5 minutes
-  experiment_allocation: 90 * 24 * 60 * 60, // 90 days
-  rate_limit: 60,                        // 1 minute
-  idempotency: 24 * 60 * 60              // 24 hours
-}
+3. **CDN cache misses** -- long-tail content not cached on local OCA. Solution: tiered caching (local OCA -> regional OCA -> origin), popularity-based pre-filling.
 
-await redis.setex(`session:${sessionId}`, TTL.session, sessionData)
+4. **Search at scale** -- 50K queries/sec with personalized ranking. Solution: Elasticsearch cluster sharded by language/region, separate personalization re-ranking layer.
 
-// Cassandra TTL (viewing history cleanup)
-// Automatically expire completed views after 2 years
-INSERT INTO viewing_progress (profile_id, video_id, position, completed)
-VALUES (?, ?, ?, true)
-USING TTL 63072000; -- 2 years in seconds
+### Horizontal Scaling Path
 
-// PostgreSQL cleanup job (run nightly)
-DELETE FROM playback_events
-WHERE created_at < NOW() - INTERVAL '90 days';
-```
+- **API servers**: Stateless (sessions in Redis), scale horizontally behind load balancer
+- **PostgreSQL**: Read replicas for catalog queries, separate write primary for accounts
+- **Cassandra**: Add nodes to ring, data rebalances automatically
+- **Redis**: Redis Cluster for sharding sessions across nodes
+- **Elasticsearch**: Add shards/replicas as query volume grows
+- **CDN**: Deploy more OCAs to ISPs based on regional demand
 
-### Archival to Cold Storage
+### Sharding Strategy
 
-**Archive Pipeline:**
-
-```javascript
-// Archive old playback events to MinIO (S3-compatible)
-async function archiveOldEvents() {
-  const batchSize = 10000
-  const cutoffDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
-
-  while (true) {
-    // Fetch batch of old events
-    const events = await db.query(`
-      SELECT * FROM playback_events
-      WHERE created_at < $1
-      ORDER BY created_at
-      LIMIT $2
-    `, [cutoffDate, batchSize])
-
-    if (events.rows.length === 0) break
-
-    // Write to MinIO as Parquet (or JSON for simplicity)
-    const datePrefix = events.rows[0].created_at.toISOString().slice(0, 10)
-    const key = `archives/playback_events/${datePrefix}/${Date.now()}.json`
-
-    await minioClient.putObject(
-      'netflix-archives',
-      key,
-      JSON.stringify(events.rows),
-      { 'Content-Type': 'application/json' }
-    )
-
-    // Delete archived events from hot storage
-    const ids = events.rows.map(e => e.id)
-    await db.query(
-      'DELETE FROM playback_events WHERE id = ANY($1)',
-      [ids]
-    )
-
-    console.log(`Archived ${events.rows.length} events to ${key}`)
-  }
-}
-
-// Schedule nightly
-// cron: 0 3 * * * node scripts/archive-events.js
-```
-
-**Storage Tiering:**
-
-```
-Hot Storage (Immediate Access)
-├── Redis: Sessions, caches, rate limits
-├── PostgreSQL: Active catalog, profiles, experiments
-└── Cassandra: Recent viewing history (< 90 days)
-
-Warm Storage (Minutes to Access)
-├── PostgreSQL Archive Tables: Completed experiments, old profiles
-└── Cassandra: Historical viewing data (90 days - 2 years)
-
-Cold Storage (Hours to Access - MinIO/S3)
-├── Playback event archives (Parquet/JSON)
-├── Experiment result datasets
-├── Audit logs
-└── Database backups
-```
-
-### Backfill and Replay Procedures
-
-**Kafka Event Replay:**
-
-```javascript
-// Replay events from a specific offset for reprocessing
-async function replayEvents(topic, fromOffset, handler) {
-  const consumer = kafka.consumer({ groupId: 'replay-consumer' })
-  await consumer.connect()
-
-  await consumer.subscribe({
-    topic,
-    fromBeginning: false
-  })
-
-  // Seek to specific offset
-  consumer.on('consumer.connect', async () => {
-    const partitions = await admin.fetchTopicOffsets(topic)
-    for (const partition of partitions) {
-      consumer.seek({
-        topic,
-        partition: partition.partition,
-        offset: fromOffset
-      })
-    }
-  })
-
-  await consumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
-      await handler(JSON.parse(message.value.toString()))
-    }
-  })
-}
-
-// Example: Replay viewing events to rebuild recommendations
-await replayEvents('viewing-events', '1704067200000', async (event) => {
-  await recommendationService.processViewingEvent(event)
-})
-```
-
-**Database Backfill from Archives:**
-
-```javascript
-// Restore archived data for analysis
-async function backfillFromArchive(dateRange) {
-  const { startDate, endDate } = dateRange
-
-  // List archived files in date range
-  const objects = await minioClient.listObjects(
-    'netflix-archives',
-    `archives/playback_events/`,
-    true
-  )
-
-  for await (const obj of objects) {
-    const fileDate = obj.name.split('/')[2] // Extract date from path
-    if (fileDate >= startDate && fileDate <= endDate) {
-      // Download and insert into analysis table
-      const data = await minioClient.getObject('netflix-archives', obj.name)
-      const events = JSON.parse(await streamToString(data))
-
-      await db.query(`
-        INSERT INTO playback_events_analysis
-        SELECT * FROM json_populate_recordset(null::playback_events, $1)
-        ON CONFLICT (id) DO NOTHING
-      `, [JSON.stringify(events)])
-
-      console.log(`Backfilled ${events.length} events from ${obj.name}`)
-    }
-  }
-}
-
-// Usage: Backfill Q4 2024 data for year-end analysis
-await backfillFromArchive({
-  startDate: '2024-10-01',
-  endDate: '2024-12-31'
-})
-```
-
-**Viewing History Rebuild:**
-
-```javascript
-// Rebuild continue-watching from event log
-async function rebuildContinueWatching(profileId) {
-  // Query raw events from Cassandra
-  const events = await cassandra.execute(`
-    SELECT video_id, position, duration, event_time
-    FROM viewing_events
-    WHERE profile_id = ?
-    AND event_time > ?
-    ORDER BY event_time DESC
-  `, [profileId, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)])
-
-  // Aggregate to get latest position per video
-  const progressMap = new Map()
-  for (const event of events.rows) {
-    if (!progressMap.has(event.video_id)) {
-      progressMap.set(event.video_id, {
-        videoId: event.video_id,
-        position: event.position,
-        duration: event.duration,
-        updatedAt: event.event_time
-      })
-    }
-  }
-
-  // Write to viewing_progress table
-  for (const [videoId, progress] of progressMap) {
-    await cassandra.execute(`
-      INSERT INTO viewing_progress
-      (profile_id, video_id, position, duration, updated_at, completed)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `, [
-      profileId,
-      videoId,
-      progress.position,
-      progress.duration,
-      progress.updatedAt,
-      progress.position / progress.duration > 0.95
-    ])
-  }
-
-  console.log(`Rebuilt ${progressMap.size} continue-watching entries for profile ${profileId}`)
-}
-```
-
----
-
-## Implementation Notes
-
-This section explains the rationale behind key implementation decisions in the codebase, focusing on patterns that might differ from production Netflix but are appropriate for a learning project.
-
-### Why Session-Based Auth Instead of JWT
-
-**Decision**: Use Redis-backed sessions with httpOnly cookies instead of JWTs for this learning project.
-
-**Rationale**:
-
-1. **Visibility and Debugging**: Sessions stored in Redis are easily inspectable (`redis-cli KEYS "session:*"`). You can view, modify, or revoke any session instantly. With JWTs, the token is opaque to the server until decoded, and revocation requires maintaining a blocklist anyway.
-
-2. **Simpler Mental Model**: Sessions follow a straightforward request-response pattern:
-   - User logs in → Server creates session in Redis → Cookie sent to client
-   - Each request → Server looks up session in Redis → User identity confirmed
-   - Logout → Server deletes session from Redis
-
-   JWTs require understanding cryptographic signatures, token refresh flows, and the stateless vs. stateful tradeoffs.
-
-3. **Immediate Revocation**: When a user logs out or an admin needs to terminate a session, deletion is immediate and atomic. With JWTs, you either wait for expiration or maintain a revocation list (which reintroduces statefulness).
-
-4. **Learning Value**: The session approach teaches core concepts (cookies, server-side state, TTLs) that transfer to understanding JWTs. Production Netflix uses JWTs for global scale, but the concepts learned here (identity, authorization, session lifecycle) apply directly.
-
-**When to Use JWTs Instead**:
-- Multi-region deployments where session replication latency is problematic
-- Third-party API access requiring self-contained credentials
-- Mobile apps that need offline token validation
-
-```typescript
-// Our session approach (simpler for learning)
-const session = await redis.get(`session:${token}`);
-if (!session) return res.status(401).json({ error: 'Unauthorized' });
-
-// Production JWT approach (more complex but scales globally)
-const decoded = jwt.verify(token, publicKey, { algorithms: ['RS256'] });
-// Still need Redis for revocation list...
-```
-
-### Why Circuit Breakers Prevent Cascade Failures
-
-**Decision**: Implement circuit breakers for Cassandra, CDN, and storage operations using the Opossum library.
-
-**Rationale**:
-
-1. **Cascade Failure Prevention**: In microservices, one failing service can bring down the entire system. Without circuit breakers:
-   - Storage service slows down → API threads wait → Thread pool exhausted → All requests fail
-   - This "cascading failure" can take down healthy services that depend on the failing one
-
-2. **Fail Fast, Recover Gracefully**: The circuit breaker pattern provides three states:
-   - **CLOSED**: Normal operation, requests pass through
-   - **OPEN**: Service is failing, immediately return error without trying (fail fast)
-   - **HALF-OPEN**: Test recovery with limited requests before fully reopening
-
-3. **Resource Protection**: By failing fast when a dependency is unhealthy, circuit breakers prevent:
-   - Connection pool exhaustion
-   - Memory pressure from queued requests
-   - CPU waste on retries that will fail
-   - User-facing latency from waiting on timeouts
-
-4. **Graceful Degradation**: Combined with fallbacks, circuit breakers enable degraded but functional experiences:
-   - CDN fails → Return cached content or lower quality
-   - Recommendation service fails → Show generic trending content
-   - Storage fails → Disable upload but continue browsing
-
-```typescript
-// Without circuit breaker: cascade failure
-const manifest = await fetchFromCDN(videoId); // Times out after 30s
-// Thread blocked, other requests queue up...
-
-// With circuit breaker: fail fast, protect resources
-const manifest = await cdnCircuitBreaker.fire(videoId);
-// Circuit open? Returns immediately with fallback/error
-// Healthy? Monitors success/failure for state transitions
-```
-
-**Metrics to Monitor**:
-- `circuit_breaker_state`: Current state per service (0=closed, 1=half_open, 2=open)
-- `circuit_breaker_failures_total`: Failure count (triggers opening)
-- `circuit_breaker_successes_total`: Success count (triggers closing)
-
-### Why Streaming Metrics Enable QoE Optimization
-
-**Decision**: Implement Prometheus metrics for streaming starts, buffer events, playback errors, and bitrate distribution.
-
-**Rationale**:
-
-1. **Quality of Experience (QoE)**: Netflix's primary user experience metric isn't uptime—it's viewing quality. Metrics like rebuffering ratio (time spent buffering / total watch time) directly correlate with user satisfaction and churn.
-
-2. **Adaptive Bitrate Insights**: Tracking bitrate distribution helps optimize the encoding ladder:
-   - If 90% of plays are at 720p, investing in more 720p quality levels pays off
-   - If 4K adoption is low, investigate whether it's device capability or bandwidth limits
-
-3. **Problem Detection**: Streaming metrics enable rapid problem detection:
-   - Spike in buffer events → CDN issue or ISP peering problem
-   - Increased playback errors in specific regions → Regional infrastructure issue
-   - Bitrate downgrades → Network congestion or ABR algorithm issues
-
-4. **Business Metrics**: Streaming metrics connect technical performance to business outcomes:
-   - Streaming starts → Engagement metric
-   - Buffer events → Frustration indicator
-   - Error rate → Service quality SLA
-
-```typescript
-// Key streaming metrics we track
-streamingStarts.labels(quality, contentType).inc();  // User engagement
-bufferEvents.labels(quality, contentType).inc();      // User frustration
-playbackErrors.labels(errorType, contentType).inc(); // Service quality
-streamingBitrate.labels(quality).observe(bitrateKbps); // Quality distribution
-```
-
-**Dashboard Queries** (Prometheus/Grafana):
-```promql
-# Rebuffering ratio (should be < 0.5%)
-rate(streaming_buffer_events_total[5m]) / rate(streaming_starts_total[5m])
-
-# Error rate by content type
-rate(streaming_playback_errors_total[5m]) / rate(streaming_starts_total[5m])
-
-# Quality distribution
-histogram_quantile(0.5, rate(streaming_bitrate_kbps_bucket[5m]))
-```
-
-### Why Watch History Retention Balances Personalization vs. Privacy
-
-**Decision**: Implement data lifecycle policies with 90-day viewing progress retention and 2-year watch history retention.
-
-**Rationale**:
-
-1. **Personalization Value Decay**: Older viewing data provides diminishing returns for recommendations:
-   - Last 30 days: Strong signal for current interests
-   - 30-90 days: Useful for understanding viewing patterns
-   - 90+ days: Genre preferences, but specific titles less relevant
-   - 2+ years: Minimal recommendation value
-
-2. **Privacy by Design**: Data minimization is a core privacy principle (GDPR Article 5):
-   - Collect only what's needed
-   - Retain only as long as necessary
-   - Provide deletion mechanisms (Right to Erasure)
-
-3. **Storage Cost Management**: Viewing events accumulate rapidly:
-   - 200M subscribers × 2 hours/day × 1 event/minute = 24B events/day
-   - Without retention policies, storage costs grow unboundedly
-
-4. **Tiered Storage Strategy**: Different data needs different access patterns:
-   - **Hot (Redis/Cassandra)**: Active viewing progress for Continue Watching
-   - **Warm (PostgreSQL)**: Recent watch history for recommendations
-   - **Cold (S3/MinIO)**: Archived history for auditing and analytics
-
-```typescript
-// Retention configuration
-const RETENTION_CONFIG = {
-  completedProgressRetentionDays: 90,   // "Continue Watching" cleanup
-  watchHistoryRetentionDays: 730,       // 2 years for recommendations
-  archiveBeforeDelete: true,            // Audit trail
-};
-
-// Archive pipeline: Hot → Cold
-await archiveWatchHistory(cutoffDate, batchSize);
-
-// GDPR deletion support
-await deleteProfileData(profileId);
-```
-
-**Compliance Considerations**:
-- GDPR: Right to erasure (Article 17), data minimization (Article 5)
-- CCPA: Right to delete personal information
-- Retention schedule documentation for audits
-
-### Rate Limiting Strategy
-
-**Decision**: Implement Redis-based sliding window rate limiting with tiered limits by endpoint category.
-
-**Rationale**:
-
-1. **Protection Against Abuse**: Rate limits prevent:
-   - Credential stuffing attacks on login endpoints
-   - Scraping of video catalog data
-   - Resource exhaustion from runaway clients
-
-2. **Fair Usage**: Per-user limits ensure no single user degrades service for others.
-
-3. **Sliding Window Algorithm**: Provides smoother limiting than fixed windows:
-   - Fixed window: 100 requests allowed, user sends 100 at minute boundary, then 100 more at next minute = 200 in 2 seconds
-   - Sliding window: Tracks requests over a rolling window, preventing burst abuse
-
-**Tier Configuration**:
-| Endpoint Category | Limit | Window | Rationale |
-|-------------------|-------|--------|-----------|
-| Browse/Search | 100/min | 60s | Normal browsing patterns |
-| Playback Start | 30/min | 60s | Streaming is expensive |
-| Auth (login) | 5/5min | 300s | Prevent credential stuffing |
-| Admin APIs | 200/min | 60s | Tools need higher limits |
+| Data | Shard Key | Rationale |
+|------|-----------|-----------|
+| Viewing history | profileId | All queries scoped to one profile |
+| Experiment allocations | experimentId + profileId | Consistent hashing per experiment |
+| Content metadata | Not sharded (fits in memory with caching) | Read-heavy, small dataset (~15K titles) |
+| Sessions | token hash | Uniform distribution across Redis cluster |
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| CDN | Custom (Open Connect) | Third-party | Cost, control |
-| Streaming | DASH | HLS | Flexibility |
-| History storage | Cassandra | PostgreSQL | Write scale |
-| Experiments | In-house | Third-party | Scale, control |
-| Auth (local dev) | Session + Redis | JWT | Simpler debugging |
-| Rate limiting | Sliding window | Token bucket | Smoother limiting |
-| Backups | pg_dump + snapshots | Logical replication | Simpler for learning |
-| Archives | MinIO (S3-compat) | Glacier | Local development friendly |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| CDN | Open Connect (custom) | Akamai/CloudFront | 90% cost reduction, ISP-level proximity, control over hardware |
+| Encoding | Per-title bitrate ladder | Fixed bitrate ladder | ~20% bandwidth savings, better quality per bit |
+| Viewing history store | Cassandra | PostgreSQL | Handles 300K writes/sec, natural partition by profileId |
+| Recommendations | Precomputed + cache | Real-time ML inference | <50ms homepage load vs 100ms-1s computation |
+| Session storage | Redis + httpOnly cookies | JWT | Immediate revocation, server-side control |
+| Search | Elasticsearch | PostgreSQL full-text | Fuzzy matching, faceted search, relevance tuning |
+| A/B allocation | Deterministic hash | Random assignment | Consistent across devices, reproducible |
+| DRM | Multi-DRM (Widevine/FairPlay/PlayReady) | Single DRM | Required for cross-platform device support |
+| Streaming protocol | DASH + HLS | Single protocol | DASH for most devices, HLS required for Apple |
+| Rate limiting | Redis sliding window | In-memory token bucket | Distributed, consistent across server instances |
 
 ---
 
-## Frontend Architecture
+# Layer 2: Pocket-Size Architecture (Local Implementation)
 
-The frontend is built with React, TypeScript, and Tailwind CSS, following a component-based architecture with clear separation of concerns.
+This layer documents what we actually built with Docker + Node.js + Express + React, how it maps to the production design above, and what was simplified or omitted.
 
-### Directory Structure
+---
+
+## Local Architecture Diagram
 
 ```
-frontend/src/
-├── components/          # Reusable UI components
-│   ├── VideoPlayer/     # Video player sub-components
-│   │   ├── index.ts           # Barrel exports
-│   │   ├── TopBar.tsx         # Title and back navigation
-│   │   ├── CenterPlayButton.tsx # Large play/pause overlay
-│   │   ├── ProgressBar.tsx    # Seek slider with time display
-│   │   ├── VolumeControl.tsx  # Volume slider and mute toggle
-│   │   ├── QualitySelector.tsx # Quality/bitrate selection menu
-│   │   ├── ControlBar.tsx     # Bottom controls container
-│   │   ├── useVideoPlayerControls.ts # Keyboard and control logic hook
-│   │   └── utils.ts           # Shared utilities (formatTime, etc.)
-│   ├── VideoPlayer.tsx  # Main player component (orchestrates sub-components)
-│   ├── Navbar.tsx       # Global navigation bar
-│   ├── HeroBanner.tsx   # Featured content banner
-│   ├── VideoCard.tsx    # Content card with hover preview
-│   ├── VideoRow.tsx     # Horizontal scrollable content row
-│   └── ContinueWatchingRow.tsx # Continue watching with progress
-├── stores/              # Zustand state management
-│   ├── authStore.ts     # Authentication state
-│   ├── browseStore.ts   # Content browsing state
-│   └── playerStore.ts   # Video playback state
-├── services/            # API service layer
-│   └── streaming.ts     # Streaming API client
-├── types/               # TypeScript type definitions
-└── routes/              # TanStack Router pages
+┌────────────────────────────┐
+│      React Frontend        │
+│    (Vite, port 5173)       │
+│                            │
+│  ┌──────────┐ ┌──────────┐│
+│  │ Browse   │ │ Video    ││
+│  │ Page     │ │ Player   ││
+│  │          │ │          ││
+│  │ HeroBnr  │ │ Quality  ││
+│  │ VideoRow │ │ Selector ││
+│  │ CntWatch │ │ Progress ││
+│  └──────────┘ └──────────┘│
+│  Zustand stores (auth,    │
+│   browse, player)          │
+└────────────┬───────────────┘
+             │ HTTP (fetch)
+             ▼
+┌────────────────────────────┐
+│    Express API Server      │
+│    (Node.js, port 3001)    │
+│                            │
+│  Routes:                   │
+│   /api/auth/*              │
+│   /api/profiles/*          │
+│   /api/videos/*            │
+│   /api/browse/*            │
+│   /api/stream/*            │
+│   /api/experiments/*       │
+│                            │
+│  Middleware:               │
+│   rate-limit, rbac, auth   │
+│                            │
+│  Services:                 │
+│   circuit-breaker, metrics │
+│   health, logger, retry    │
+│                            │
+│  /health    /metrics       │
+└─────┬──────┬──────┬────────┘
+      │      │      │
+      ▼      ▼      ▼
+┌────────┐┌───────┐┌────────┐
+│Postgres││ Redis ││ MinIO  │
+│ :5432  ││ :6379 ││ :9000  │
+│        ││(Valk.)││        │
+│accounts││session││videos  │
+│profiles││cache  ││thumbs  │
+│videos  ││rate   ││        │
+│progress││limits ││        │
+│history ││       ││        │
+│a/b test││       ││        │
+└────────┘└───────┘└────────┘
 ```
 
-### Component Organization Principles
+All three infrastructure services run via `docker-compose up -d`. The backend runs as a single Express process (can be started on ports 3001-3003 for distributed testing). The frontend is served by Vite's dev server.
 
-1. **Component Size Limit**: Components exceeding ~150 lines are split into sub-components
-2. **Colocation**: Related components are grouped in subdirectories (e.g., `VideoPlayer/`)
-3. **Barrel Exports**: Each component directory has an `index.ts` for clean imports
-4. **Custom Hooks**: Complex logic is extracted into custom hooks (e.g., `useVideoPlayerControls`)
-5. **Utility Functions**: Shared helpers live in `utils.ts` files within component directories
+---
 
-### VideoPlayer Component Architecture
+## What Was Actually Built
 
-The VideoPlayer is the most complex component, split into focused sub-components:
+### Frontend (React + TypeScript + Vite + Tailwind)
 
-| Component | Responsibility | Lines |
-|-----------|----------------|-------|
-| `VideoPlayer.tsx` | Orchestration, video element, effects | ~200 |
-| `TopBar.tsx` | Title display, back navigation | ~45 |
-| `CenterPlayButton.tsx` | Large play/pause overlay | ~40 |
-| `ControlBar.tsx` | Bottom controls container | ~130 |
-| `ProgressBar.tsx` | Seek slider with time display | ~60 |
-| `VolumeControl.tsx` | Volume slider and mute | ~75 |
-| `QualitySelector.tsx` | Quality selection dropdown | ~85 |
-| `useVideoPlayerControls.ts` | Keyboard shortcuts, control logic | ~175 |
-| `utils.ts` | Time formatting utilities | ~25 |
+**Pages implemented**:
+- `LoginPage` -- email/password authentication
+- `ProfilesPage` -- profile selection grid (Netflix-style "Who's watching?")
+- `BrowsePage` -- personalized homepage with hero banner + horizontal rows
+- `VideoDetailPage` -- title details with seasons/episodes for series
+- `WatchPage` -- video player with quality selection and progress tracking
+- `SearchPage` -- search with real-time results
+- `MyListPage` -- user's saved content
 
-**Benefits of this structure:**
-- Each component has a single responsibility
-- Easy to test individual components
-- Improved code navigation and maintainability
-- Enables parallel development by multiple developers
+**Key components**:
+- `HeroBanner` -- featured content with backdrop image and action buttons
+- `VideoRow` -- horizontal scrollable carousel of video cards
+- `ContinueWatchingRow` -- special row showing progress bars
+- `VideoCard` -- thumbnail card with hover state
+- `VideoPlayer` -- full-screen player with control bar, quality selector, volume control, progress bar, and center play button
+- `Navbar` -- top navigation with profile switcher and search
 
-### State Management
+**State management**: Three Zustand stores (`authStore`, `browseStore`, `playerStore`) handle global state. API calls are centralized in `services/` directory.
 
-The frontend uses Zustand stores organized by domain:
+### Backend (Node.js + Express + TypeScript)
 
-| Store | Purpose | Key State |
-|-------|---------|-----------|
-| `authStore` | Authentication | User session, profile selection |
-| `browseStore` | Content browsing | Homepage rows, My List, search |
-| `playerStore` | Video playback | Play state, volume, quality, progress |
+**All 6 route modules implemented**:
+- `auth` -- login, register, logout, session restore
+- `profiles` -- CRUD with max-5 limit, profile selection stored in Redis session
+- `videos` -- catalog with filtering, genre listing, similar-content recommendations
+- `browse` -- personalized homepage generation with 8 row types (continue watching, my list, trending, genre rows, "because you watched," new releases, TV shows, movies)
+- `streaming` -- manifest generation with quality list, presigned URL playback via MinIO, progress tracking with completion detection
+- `experiments` -- A/B test CRUD, consistent hash allocation (MD5-based murmurhash), bulk allocation retrieval
 
-**Store Design Pattern:**
-```typescript
-// Each store follows this pattern
-interface PlayerState {
-  // State
-  isPlaying: boolean;
-  currentTime: number;
-  // ...
+**Production-grade patterns actually implemented**:
 
-  // Actions
-  setPlaying: (playing: boolean) => void;
-  loadManifest: (videoId: string) => Promise<void>;
-  // ...
-}
-```
+1. **Circuit breakers** (Opossum, `services/circuit-breaker.ts`) -- wraps storage, Redis, and database calls. Tracks state transitions in Prometheus metrics. Provides pre-configured breakers per service with appropriate timeouts. The `withFallback` helper enables graceful degradation.
 
-### Keyboard Shortcuts (VideoPlayer)
+2. **Prometheus metrics** (prom-client, `services/metrics.ts`) -- 15 custom metrics covering HTTP requests, streaming QoE (starts, buffers, errors, bitrate, active sessions), circuit breaker state, database queries, cache operations, rate limiting, and background jobs. Exposed at `/metrics` for scraping.
 
-| Key | Action |
-|-----|--------|
-| Space | Play/Pause |
-| Arrow Left | Skip back 10 seconds |
-| Arrow Right | Skip forward 10 seconds |
-| Arrow Up | Increase volume |
-| Arrow Down | Decrease volume |
-| M | Toggle mute |
-| F | Toggle fullscreen |
-| Escape | Exit fullscreen or navigate back |
+3. **Structured logging** (Pino, `services/logger.ts`) -- domain-specific child loggers for auth, streaming, circuit breaker, and job execution. Context-enriched log entries with accountId, profileId, and error details. HTTP request logging via pino-http.
 
-### JSDoc Documentation Standards
+4. **Health checks** (`services/health.ts`) -- three-tier health checking (liveness, readiness, detailed). Readiness probe checks PostgreSQL, Redis, and MinIO in parallel. Detailed endpoint includes circuit breaker states and connection pool stats. Results cached for 5 seconds to prevent health check storms.
 
-All components and significant functions include JSDoc comments:
+5. **Rate limiting** (`middleware/rate-limit.ts`) -- Redis-based sliding window algorithm with tiered limits per endpoint category. Strict rate limiting (IP + account based) for auth endpoints. Fails open when Redis is unavailable. Sets standard `X-RateLimit-*` headers. Supports tiered limits based on subscription level.
 
-```typescript
-/**
- * Component description.
- * Additional context about behavior and usage.
- *
- * @param props - Component properties
- * @returns JSX element description
- */
-export function ComponentName({ prop1, prop2 }: ComponentProps) {
-  // ...
-}
-```
+6. **RBAC** (`middleware/rbac.ts`) -- 6-role permission system with hierarchical permission checking. Kids profile enforcement at the middleware level. Profile ownership validation. Generic resource ownership middleware.
 
-### Testing Strategy
+7. **Retry with backoff** (`utils/retry.ts`) -- exponential backoff with jitter, retryable error classification, idempotency key support with in-memory cache and TTL-based expiry.
 
-Components are designed for testability:
-- Props-based components can be rendered in isolation
-- Custom hooks can be tested with `@testing-library/react-hooks`
-- Zustand stores can be mocked for component testing
+8. **Data retention** (`jobs/watch-history-retention.ts`) -- background job for cleaning old viewing progress, archiving watch history with batch processing and `SKIP LOCKED` for concurrent safety, GDPR/CCPA profile data deletion.
+
+9. **Graceful shutdown** -- SIGTERM/SIGINT handlers in `index.ts` stop the server, cancel background jobs, and allow 10 seconds for in-flight requests.
+
+---
+
+## What Was Simplified or Substituted
+
+| Production | Local | Simplification |
+|-----------|-------|----------------|
+| Open Connect CDN (~16K servers) | MinIO (single instance) | Videos served via presigned URLs from local MinIO |
+| DASH/HLS adaptive streaming | JSON manifest listing qualities | No actual segment-based streaming; manifest lists available bitrates with direct file URLs |
+| Per-title video encoding (Cosmos) | Pre-encoded sample videos uploaded manually | No transcoding pipeline; video_files table lists qualities but files are manually placed |
+| Cassandra for viewing history | PostgreSQL | Single PostgreSQL handles all data; fine for dev scale |
+| EVCache (distributed Memcached) | Redis (single instance) | Redis handles sessions, caching, and rate limiting |
+| Elasticsearch for search | PostgreSQL ILIKE queries | `WHERE title ILIKE '%term%'` -- no fuzzy matching, no relevance tuning |
+| Collaborative/deep learning recommendations | Genre-overlap similarity | "Similar" = shares genres, ranked by overlap count. "Because you watched" = same query. No ML. |
+| DRM (Widevine/FairPlay/PlayReady) | None | Videos served unencrypted via presigned URLs |
+| Device registration + concurrent stream limits | None | No device tracking or stream limit enforcement |
+| Multi-region deployment | Single machine | Everything runs on localhost |
+| API Gateway (Zuul) | Express middleware | Rate limiting, auth, and routing in the same process |
+| Murmurhash for experiment allocation | MD5-based hash | `crypto.createHash('md5')` used as deterministic hash function |
+| Artwork personalization (A/B tested posters) | Static poster URLs | Single poster per title |
+| Real-time metrics pipeline (Atlas) | Prometheus endpoint | Metrics collected but no Grafana dashboards or alerting configured |
+| Chaos engineering (Simian Army) | None | No fault injection testing |
+
+---
+
+## What Was Omitted
+
+- **Video transcoding pipeline** -- no encoding, segmenting, or codec support
+- **Actual adaptive bitrate switching** -- player UI has quality selector but no ABR algorithm
+- **DRM and content protection** -- no encryption, device attestation, or watermarking
+- **Multi-region / multi-datacenter** -- single machine deployment
+- **CDN content positioning** -- no popularity-based cache filling
+- **ML recommendation models** -- no collaborative filtering, embedding vectors, or deep learning
+- **Artwork personalization** -- no per-user poster selection
+- **Real-time experiment metrics** -- allocation works but no metrics collection pipeline
+- **Admin dashboard** -- RBAC middleware exists but no admin UI
+- **Kubernetes / container orchestration** -- Docker Compose only
+- **Billing / subscription management** -- subscription_tier column exists but not enforced
+- **Chaos engineering** -- no Chaos Monkey or fault injection
+- **Analytics pipeline** -- no Kafka, Spark, or Druid for event processing
