@@ -2,134 +2,143 @@
 
 ## System Overview
 
-A collaborative real-time pixel art canvas where users can place colored pixels with rate limiting. Inspired by Reddit's r/place experiment, this system allows thousands of users to collaboratively create pixel art on a shared canvas, with each user limited to placing one pixel every few seconds.
+A collaborative real-time pixel art canvas where millions of users place colored pixels on a shared grid, with per-user rate limiting enforcing fairness. Inspired by Reddit's r/place experiment, the system handles high-throughput concurrent writes, low-latency broadcasts, and canvas history for timelapse generation.
+
+**Learning Goals:**
+- Real-time pixel synchronization at scale via WebSockets + Pub/Sub
+- Distributed rate limiting with Redis atomic operations
+- Canvas state management with compact binary representations
+- Horizontal scaling of stateful WebSocket connections
 
 ## Requirements
 
 ### Functional Requirements
 
-- **Shared pixel canvas**: A grid of pixels (500x500 for local dev) that all users see and modify
+- **Shared pixel canvas**: A grid of pixels visible and modifiable by all authenticated users
 - **Real-time pixel placement**: Users click to place a colored pixel at any coordinate
-- **Rate limiting per user**: Cooldown of 5 seconds between pixel placements
+- **Per-user rate limiting**: Configurable cooldown (default 5 seconds) between pixel placements
 - **Live canvas updates**: All connected users see pixel changes within 100ms
-- **Canvas history**: Store all pixel placement events for audit and timelapse
-- **Timelapse generation**: Replay canvas evolution from snapshots
-- **Color palette**: Fixed 16-color palette for consistency
-- **Admin controls**: Ability to reset canvas, ban users, change cooldown settings
+- **Canvas history**: Append-only log of all pixel placement events
+- **Timelapse generation**: Replay canvas evolution from periodic snapshots
+- **16-color palette**: Fixed palette for visual consistency
+- **Admin controls**: Reset canvas, ban users, change cooldown settings
+- **Anonymous and registered users**: Both can place pixels; registered users have persistent identity
 
 ### Non-Functional Requirements
 
-- **Scalability**: Support 1,000 concurrent users locally; architecture designed for 100K+ with horizontal scaling
-- **Availability**: 99.9% uptime target (8.7 hours downtime/year)
-- **Latency**: Pixel placement acknowledgment < 50ms; broadcast to other users < 100ms (p95)
-- **Consistency**: Eventual consistency acceptable; last-write-wins for pixel conflicts (rare at 5s cooldown)
+- **Scalability**: 100,000+ concurrent users with horizontal scaling
+- **Availability**: 99.9% uptime (8.7 hours downtime/year)
+- **Latency**: Pixel placement acknowledgment < 50ms (p95); broadcast to all users < 100ms (p95)
+- **Consistency**: Eventual consistency with last-write-wins for pixel conflicts
+- **Throughput**: 20,000 pixel placements/second at 100K concurrent users (limited by 5-second cooldown)
 
 ## Capacity Estimation
 
-### Local Development Targets (500x500 canvas, ~100 concurrent users)
+### Production Scale (2000x2000 canvas, 100K concurrent users)
 
 | Metric | Value | Calculation |
 |--------|-------|-------------|
-| Canvas size | 500 x 500 = 250,000 pixels | - |
-| Canvas memory | 250 KB (1 byte per pixel for color index) | 250,000 pixels x 1 byte |
-| Concurrent users | 100 | Local dev target |
-| Peak pixel placements | 20 RPS | 100 users / 5s cooldown |
-| WebSocket connections | 100 | 1 per user |
-| WebSocket messages/sec | 2,000 | 20 placements x 100 recipients |
-| Bandwidth (outbound) | ~200 KB/s | 20 msg/s x 10 bytes x 100 users |
-| Event storage growth | ~1.7 MB/hour | 20 events/s x 24 bytes/event x 3600s |
-
-### Production Scale Estimates (2000x2000 canvas, 100K concurrent users)
-
-| Metric | Value | Calculation |
-|--------|-------|-------------|
-| Canvas size | 2000 x 2000 = 4M pixels | - |
-| Canvas memory | 4 MB | 4M pixels x 1 byte |
+| Canvas size | 2000 x 2000 = 4M pixels | -- |
+| Canvas memory | 4 MB | 4M pixels x 1 byte (color index 0-15) |
 | Peak pixel placements | 20,000 RPS | 100K users / 5s cooldown |
-| WebSocket messages/sec | 2 billion | Would require geographic sharding |
-| Solution | Regional broadcast zones | Users only see updates in viewport |
+| WebSocket connections | 100,000 | 1 per user |
+| Naive broadcast messages/sec | 2 billion | 20K placements x 100K recipients |
+| Mitigation | Viewport-based updates + batching | Users only receive updates for visible area |
+| Event storage growth | ~1.7 GB/day | 20K events/s x 24 bytes/event x 86,400s |
+
+### Local Development Scale (500x500 canvas, ~100 concurrent users)
+
+| Metric | Value |
+|--------|-------|
+| Canvas size | 500 x 500 = 250,000 pixels |
+| Canvas memory (Redis) | 250 KB |
+| Peak pixel placements | 20 RPS |
+| WebSocket messages/sec | ~2,000 |
+| Event storage growth | ~1.7 MB/hour |
 
 ### Storage Sizing
 
 | Data Type | Size | Growth Rate | Retention |
 |-----------|------|-------------|-----------|
-| Canvas state (Redis) | 250 KB | Static | Always in memory |
-| Session data (Redis) | ~500 bytes/user | With active users | 24 hour TTL |
-| Rate limit keys (Redis) | ~50 bytes/user | With active users | 5 second TTL |
-| Pixel events (PostgreSQL) | 24 bytes/event | ~1.7 MB/hour | 30 days |
+| Canvas state (Redis) | 250 KB - 4 MB | Static | Always in memory |
+| Session data (Redis) | ~500 bytes/user | With active users | 24-hour TTL |
+| Rate limit keys (Redis) | ~50 bytes/user | With active users | 5-second TTL |
+| Pixel events (PostgreSQL) | 48 bytes/event | ~82 MB/day (100 users) | 30 days |
 | Canvas snapshots (PostgreSQL) | 250 KB/snapshot | ~6 MB/day (1/hour) | 90 days |
 
 ## High-Level Architecture
 
 ```
-                                    +------------------+
-                                    |   Load Balancer  |
-                                    |   (nginx/HAProxy)|
-                                    +--------+---------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-    +---------v---------+        +-----------v---------+        +-----------v---------+
-    |   API Server 1    |        |   API Server 2      |        |   API Server 3      |
-    |   (Express + WS)  |        |   (Express + WS)    |        |   (Express + WS)    |
-    |   Port 3001       |        |   Port 3002         |        |   Port 3003         |
-    +---------+---------+        +-----------+---------+        +-----------+---------+
-              |                              |                              |
-              +------------------------------+------------------------------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-    +---------v---------+        +-----------v---------+        +-----------v---------+
-    |   Redis           |        |   PostgreSQL        |        |   RabbitMQ          |
-    |   - Canvas state  |        |   - Pixel events    |        |   - Snapshot jobs   |
-    |   - Sessions      |        |   - Snapshots       |        |   - Timelapse gen   |
-    |   - Rate limits   |        |   - User accounts   |        |                     |
-    |   - Pub/Sub       |        |                     |        |                     |
-    +---------+---------+        +---------------------+        +---------------------+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Client Browsers                              │
+│                (React + Canvas API + WebSocket client)                  │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │ HTTPS + WSS
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Load Balancer (nginx)                          │
+│              Sticky sessions (IP hash for WebSocket affinity)          │
+└──────┬───────────────────────┬───────────────────────┬──────────────────┘
+       │                       │                       │
+       ▼                       ▼                       ▼
+┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+│ API Server 1 │       │ API Server 2 │       │ API Server N │
+│              │       │              │       │              │
+│ Express +    │       │ Express +    │       │ Express +    │
+│ WebSocket    │       │ WebSocket    │       │ WebSocket    │
+│ Server       │       │ Server       │       │ Server       │
+│              │       │              │       │              │
+│ ┌──────────┐ │       │ ┌──────────┐ │       │ ┌──────────┐ │
+│ │ WS Conns │ │       │ │ WS Conns │ │       │ │ WS Conns │ │
+│ │ (local)  │ │       │ │ (local)  │ │       │ │ (local)  │ │
+│ └──────────┘ │       │ └──────────┘ │       │ └──────────┘ │
+└──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+       │                       │                       │
+       └───────────┬───────────┴───────────┬───────────┘
+                   │                       │
+       ┌───────────┴───────────┐   ┌───────┴───────────┐
+       ▼                       ▼   ▼                   ▼
+┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+│   Redis /    │       │  PostgreSQL  │       │  RabbitMQ    │
+│   Valkey     │       │              │       │              │
+│              │       │ pixel_events │       │ Snapshot     │
+│ Canvas state │       │ snapshots    │       │ jobs         │
+│ Sessions     │       │ users        │       │ Timelapse    │
+│ Rate limits  │       │ sessions     │       │ generation   │
+│ Pub/Sub      │       │              │       │              │
+└──────────────┘       └──────────────┘       └──────────────┘
 ```
 
 ### Core Components
 
-| Component | Purpose | Technology | Port |
-|-----------|---------|------------|------|
-| API Server | HTTP REST + WebSocket server | Express.js + ws | 3001-3003 |
-| Canvas Store | Real-time canvas state, rate limits | Redis/Valkey | 6379 |
-| Event Store | Pixel history, snapshots, users | PostgreSQL | 5432 |
-| Message Queue | Background jobs (snapshots, timelapse) | RabbitMQ | 5672 |
-| Load Balancer | Distribute traffic across servers | nginx | 3000 |
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| API Server | HTTP REST + WebSocket server for pixel placement and canvas state | Express.js + ws library |
+| Canvas Store | Real-time canvas state, rate limits, sessions, pub/sub for cross-server broadcast | Redis/Valkey |
+| Event Store | Append-only pixel history, canvas snapshots, user accounts | PostgreSQL |
+| Message Queue | Background jobs for snapshot creation and timelapse generation | RabbitMQ |
+| Load Balancer | Distribute traffic across API servers with WebSocket affinity | nginx |
+| Persistence Worker | Consumes RabbitMQ jobs for periodic canvas snapshots | Node.js background process |
 
 ### Request Flow: Placing a Pixel
 
 ```
 1. User clicks canvas at (x=100, y=200) with color=5
-   |
 2. Frontend sends WebSocket message: { type: "place", x: 100, y: 200, color: 5 }
-   |
-3. API Server receives message
-   |
-4. Rate limit check (Redis):
-   - GET ratelimit:user:{userId}
-   - If exists -> reject with remaining cooldown time
-   - If not exists -> continue
-   |
-5. Update canvas (Redis):
-   - SETRANGE canvas:main (100 + 200*500) "\x05"  // atomic byte update
-   |
-6. Set cooldown (Redis):
-   - SET ratelimit:user:{userId} "1" EX 5 NX
-   |
-7. Record event (PostgreSQL):
-   - INSERT INTO pixel_events (x, y, color, user_id, created_at)
-   |
-8. Publish update (Redis Pub/Sub):
-   - PUBLISH canvas:updates "{x:100,y:200,color:5,userId:...}"
-   |
-9. All API servers receive pub/sub message
-   |
-10. Each server broadcasts to connected WebSocket clients:
-    - ws.send({ type: "update", x: 100, y: 200, color: 5 })
-   |
-11. Frontend updates local canvas state immediately
+3. API Server receives message, generates idempotency key
+4. Idempotency check (Redis): GET idempotency:pixel:{userId}:{x}:{y}:{color}
+   ├─ If exists → return cached result (duplicate request)
+   └─ If not → continue
+5. Rate limit check (Redis): SET ratelimit:user:{userId} "1" NX EX 5
+   ├─ If nil (key exists) → reject with remaining cooldown
+   └─ If OK → continue
+6. Update canvas (Redis): SETRANGE canvas:main (x + y*500) colorByte
+7. Record event (PostgreSQL): INSERT INTO pixel_events (x, y, color, user_id)
+8. Store idempotency result (Redis): SET idempotency key with 10s TTL
+9. Publish update (Redis Pub/Sub): PUBLISH canvas:updates {x, y, color, userId}
+10. All API servers receive pub/sub message
+11. Each server broadcasts to its connected WebSocket clients
+12. Frontend updates local canvas immediately
 ```
 
 ## Database Schema
@@ -137,82 +146,72 @@ A collaborative real-time pixel art canvas where users can place colored pixels 
 ### Redis Data Structures
 
 ```
-# Canvas State (byte string, 1 byte per pixel)
+# Canvas State (compact byte string, 1 byte per pixel)
 canvas:main = <250KB binary string>
-# Access: offset = x + y * width
-# Update: SETRANGE canvas:main offset colorByte
+# Access: offset = x + y * CANVAS_WIDTH
+# Update: SETRANGE canvas:main offset colorByte (atomic)
 
 # Rate Limit Keys (auto-expiring)
 ratelimit:user:{userId} = "1"
-# TTL: 5 seconds
-# Check: SET ... NX EX 5 (returns OK if allowed, nil if blocked)
+# SET ... NX EX 5 → returns OK if allowed, nil if on cooldown
 
 # Session Storage
-session:{sessionId} = {
-  "userId": "uuid",
-  "username": "string",
-  "isGuest": true/false,
-  "isAdmin": false,
-  "createdAt": "ISO timestamp"
-}
+session:{sessionId} = { userId, username, isGuest, isAdmin, createdAt }
 # TTL: 24 hours
 
+# Idempotency Keys (prevent duplicate placements)
+idempotency:pixel:{userId}:{x}:{y}:{color} = { success, nextPlacement }
+# TTL: 10 seconds
+
 # Pub/Sub Channel
-canvas:updates -> { x: int, y: int, color: int, userId: string, ts: int }
+canvas:updates → { x, y, color, userId, timestamp }
 ```
 
 ### PostgreSQL Schema
 
 ```sql
--- Users table (for registered users, not guests)
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  username VARCHAR(32) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  is_admin BOOLEAN DEFAULT FALSE,
-  is_banned BOOLEAN DEFAULT FALSE,
-  pixels_placed INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_users_username ON users(username);
-
 -- Pixel placement events (append-only log)
 CREATE TABLE pixel_events (
-  id BIGSERIAL PRIMARY KEY,
-  x SMALLINT NOT NULL CHECK (x >= 0 AND x < 2000),
-  y SMALLINT NOT NULL CHECK (y >= 0 AND y < 2000),
-  color SMALLINT NOT NULL CHECK (color >= 0 AND color < 16),
-  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-  session_id VARCHAR(64),  -- For anonymous users
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  id              BIGSERIAL PRIMARY KEY,
+  x               SMALLINT NOT NULL,
+  y               SMALLINT NOT NULL,
+  color           SMALLINT NOT NULL,
+  user_id         VARCHAR(36) NOT NULL,
+  placed_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
--- Partition by time for efficient cleanup
-CREATE INDEX idx_pixel_events_created_at ON pixel_events(created_at);
-CREATE INDEX idx_pixel_events_coords ON pixel_events(x, y, created_at DESC);
+CREATE INDEX idx_pixel_events_time ON pixel_events(placed_at);
+CREATE INDEX idx_pixel_events_user ON pixel_events(user_id);
 
 -- Canvas snapshots for timelapse
 CREATE TABLE canvas_snapshots (
-  id SERIAL PRIMARY KEY,
-  canvas_data BYTEA NOT NULL,  -- 250KB compressed
-  width SMALLINT NOT NULL,
-  height SMALLINT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  id              SERIAL PRIMARY KEY,
+  captured_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  canvas_data     BYTEA NOT NULL,
+  pixel_count     BIGINT DEFAULT 0
 );
 
-CREATE INDEX idx_snapshots_created_at ON canvas_snapshots(created_at);
+CREATE INDEX idx_canvas_snapshots_time ON canvas_snapshots(captured_at);
 
--- Admin audit log
-CREATE TABLE admin_actions (
-  id SERIAL PRIMARY KEY,
-  admin_user_id UUID REFERENCES users(id),
-  action_type VARCHAR(32) NOT NULL,  -- 'reset_canvas', 'ban_user', 'change_cooldown'
-  target_user_id UUID REFERENCES users(id),
-  details JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+-- Users (for registered accounts)
+CREATE TABLE users (
+  id              VARCHAR(36) PRIMARY KEY,
+  username        VARCHAR(50) UNIQUE NOT NULL,
+  password_hash   VARCHAR(255) NOT NULL,
+  role            VARCHAR(20) DEFAULT 'user',
+  created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
+
+-- Sessions
+CREATE TABLE sessions (
+  id              VARCHAR(36) PRIMARY KEY,
+  user_id         VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+  expires_at      TIMESTAMP WITH TIME ZONE NOT NULL,
+  created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 ```
 
 ### Data Size Estimates
@@ -222,7 +221,6 @@ CREATE TABLE admin_actions (
 | pixel_events | ~48 bytes | ~1.7M | ~82 MB |
 | canvas_snapshots | ~250 KB | 24 | ~6 MB |
 | users | ~300 bytes | 10 new | ~3 KB |
-| admin_actions | ~200 bytes | 5 | ~1 KB |
 
 ## API Design
 
@@ -230,264 +228,188 @@ CREATE TABLE admin_actions (
 
 ```
 # Authentication
-POST   /api/v1/auth/register     - Create account { username, password }
-POST   /api/v1/auth/login        - Login { username, password }
-POST   /api/v1/auth/logout       - End session
-POST   /api/v1/auth/guest        - Create anonymous session
-GET    /api/v1/auth/me           - Get current user info
+POST   /api/v1/auth/register     → Create account { username, password }
+POST   /api/v1/auth/login        → Login { username, password }
+POST   /api/v1/auth/logout       → End session
+POST   /api/v1/auth/guest        → Create anonymous session
+GET    /api/v1/auth/me           → Get current user info
 
 # Canvas
-GET    /api/v1/canvas            - Get full canvas state (binary)
-GET    /api/v1/canvas/info       - Get canvas metadata { width, height, cooldown }
+GET    /api/v1/canvas            → Get full canvas state (binary response)
+GET    /api/v1/canvas/info       → Canvas metadata { width, height, cooldown }
 
 # History
-GET    /api/v1/history/pixel?x=&y=        - Get placement history for pixel
-GET    /api/v1/history/user/:userId       - Get user's placement history
-GET    /api/v1/history/recent?limit=100   - Recent placements
+GET    /api/v1/history/pixel?x=&y=       → Placement history for pixel
+GET    /api/v1/history/user/:userId      → User's placement history
+GET    /api/v1/history/recent?limit=100  → Recent placements
 
 # Timelapse
-GET    /api/v1/timelapse/snapshots        - List available snapshots
-GET    /api/v1/timelapse/snapshot/:id     - Get specific snapshot
+GET    /api/v1/timelapse/snapshots       → List available snapshots
+GET    /api/v1/timelapse/snapshot/:id    → Get specific snapshot
 
 # Admin (requires admin role)
-POST   /api/v1/admin/reset-canvas         - Clear canvas to white
-POST   /api/v1/admin/ban-user             - Ban user { userId }
-POST   /api/v1/admin/unban-user           - Unban user { userId }
-PUT    /api/v1/admin/settings             - Update settings { cooldownSeconds }
-GET    /api/v1/admin/stats                - Get system statistics
+POST   /api/v1/admin/reset-canvas        → Clear canvas to white
+POST   /api/v1/admin/ban-user            → Ban user { userId }
+POST   /api/v1/admin/unban-user          → Unban user { userId }
+PUT    /api/v1/admin/settings            → Update settings { cooldownSeconds }
+GET    /api/v1/admin/stats               → System statistics
+
+# Observability
+GET    /health                           → Liveness check
+GET    /health/ready                     → Readiness (Redis + PostgreSQL)
+GET    /metrics                          → Prometheus metrics
 ```
 
 ### WebSocket Protocol
 
-```javascript
-// Client -> Server
-{ type: "place", x: number, y: number, color: number }
-{ type: "ping" }
+```
+Client → Server:
+  { type: "place", x: number, y: number, color: number }
+  { type: "ping" }
 
-// Server -> Client
-{ type: "update", x: number, y: number, color: number, userId?: string }
-{ type: "error", code: string, message: string, cooldownRemaining?: number }
-{ type: "pong" }
-{ type: "welcome", userId: string, cooldown: number, canvasInfo: {...} }
+Server → Client:
+  { type: "update", x: number, y: number, color: number, userId?: string }
+  { type: "error", code: string, message: string, cooldownRemaining?: number }
+  { type: "pong" }
+  { type: "welcome", userId: string, cooldown: number, canvasInfo: {...} }
 
-// Error codes
-"RATE_LIMITED"     - User must wait before placing another pixel
-"INVALID_COORDS"   - x/y out of canvas bounds
-"INVALID_COLOR"    - Color index not in palette
-"UNAUTHORIZED"     - No valid session
-"BANNED"           - User is banned
+Error codes:
+  RATE_LIMITED   → User must wait before placing another pixel
+  INVALID_COORDS → x/y out of canvas bounds
+  INVALID_COLOR  → Color index not in palette (0-15)
+  UNAUTHORIZED   → No valid session
+  BANNED         → User is banned
 ```
 
 ## Key Design Decisions
 
-### Real-time Pixel Synchronization
+### Real-time Pixel Synchronization: WebSocket + Redis Pub/Sub
 
-**Approach**: WebSocket connections with Redis Pub/Sub for cross-server broadcast.
+**Chosen**: Each API server maintains WebSocket connections to its clients. On pixel placement, the server publishes to Redis channel `canvas:updates`. All servers subscribe and broadcast to their local clients.
 
-**How it works**:
-1. Each API server maintains WebSocket connections to its clients
-2. On pixel placement, server publishes to Redis channel `canvas:updates`
-3. All servers subscribe to this channel and broadcast to their clients
-4. Clients apply updates immediately to their local canvas state
+**Why this works**: Redis Pub/Sub is fire-and-forget with sub-millisecond latency. At 20 RPS pixel placements with 100 connected users per server, each server processes ~20 broadcast messages per second -- trivial overhead. Adding servers is linear: each new server subscribes to the same channel and handles its own WebSocket connections.
 
-**Why this works for our scale**:
-- 100 users x 20 updates/sec = 2,000 messages/sec - easily handled
-- Redis Pub/Sub is fire-and-forget (low latency)
-- Horizontal scaling: add more API servers behind load balancer
+**Why not polling**: HTTP polling at 1-second intervals means average 500ms latency for seeing updates -- users would perceive the canvas as laggy, undermining the collaborative experience. Polling at 100ms intervals creates 600 requests/minute per user. At 100K users, that is 1 million requests/second hitting the API servers, the vast majority returning "no updates." WebSocket eliminates this waste by pushing only when data changes.
 
-**Trade-offs**:
-- No message persistence (if client disconnects, misses updates)
-- Mitigation: Client fetches full canvas on reconnect
-- At extreme scale (100K+ users), would need geographic sharding or viewport-based updates
+**Why not Kafka**: Kafka provides durable message streams with consumer groups, but pixel updates are ephemeral -- if a client misses an update while disconnected, it fetches the full canvas on reconnect. Kafka's durability guarantee adds operational complexity (broker management, partition assignment, offset tracking) with no benefit for this use case.
 
-### Rate Limiting Strategy
+**What we give up**: Redis Pub/Sub has no message persistence. If a client disconnects and reconnects, it misses updates during the gap. Mitigation: client fetches the full canvas state on reconnect (250 KB, gzip-compressible to ~50 KB).
 
-**Approach**: Redis SET with NX (not exists) and EX (expire) flags.
+### Rate Limiting: Redis SET NX EX
 
-```javascript
-// Pseudo-code
-const key = `ratelimit:user:${userId}`;
-const result = await redis.set(key, "1", { NX: true, EX: 5 });
-if (result === null) {
-  const ttl = await redis.ttl(key);
-  throw new RateLimitError(ttl);
-}
-// Proceed with pixel placement
-```
+**Chosen**: Atomic `SET ratelimit:user:{userId} "1" NX EX 5` for per-user cooldown enforcement.
 
-**Why this approach**:
-- Atomic: no race conditions between check and set
-- Automatic cleanup: TTL expires the key
-- Distributed: works across multiple API servers
-- Simple: single Redis command
+**Why atomic SET NX EX**: This single Redis command atomically checks if a cooldown exists and sets a new one. There is zero race condition window -- even if two requests arrive on different servers within the same millisecond, only one succeeds. The TTL auto-expires the key, eliminating cleanup jobs.
 
-**Trade-offs**:
-- Fixed window, not sliding window (slightly less fair at boundaries)
-- For premium tiers with different cooldowns, use per-tier TTL values
+**Why not sliding window**: A sliding window rate limiter (e.g., Redis sorted sets with timestamps) provides smoother limiting but adds complexity. For a fixed per-user cooldown, the binary "can place / cannot place" semantics of SET NX EX are a perfect fit. Sliding window would be appropriate for API rate limiting (e.g., 100 requests/minute) but overkill for a single-action cooldown.
 
-### Canvas State Management
+**What we give up**: Fixed window means a user could theoretically place at t=4.9s and again at t=5.0s (back-to-back within 100ms). This is acceptable for collaborative art -- the 5-second cooldown exists for fairness, not millisecond precision.
 
-**Approach**: Single Redis key with byte array, using SETRANGE for atomic updates.
+### Canvas State: Redis Byte Array with SETRANGE
 
-```javascript
-// Canvas stored as single binary string
-// 500x500 = 250,000 bytes, each byte is a color index (0-15)
-const offset = x + y * CANVAS_WIDTH;
-await redis.setRange("canvas:main", offset, Buffer.from([colorIndex]));
-```
+**Chosen**: Single Redis key containing a binary string where each byte represents one pixel's color index (0-15).
 
-**Why this approach**:
-- Memory efficient: 250KB for entire canvas
-- Atomic updates: SETRANGE is atomic
-- Fast reads: GET returns entire canvas in one call
-- Simple addressing: offset = x + y * width
+**Why byte array**: A 500x500 canvas is 250 KB -- fits in a single Redis value with room to spare. `SETRANGE` provides atomic byte-level updates without read-modify-write cycles. `GET` returns the entire canvas in one call. Addressing is simple: `offset = x + y * width`.
 
-**Trade-offs**:
-- Single key can't be sharded (fine for 500x500, needs tiles for larger)
-- Full canvas download on connect (~250KB, gzip compresses to ~50KB)
+**Why not Redis hash (one key per pixel)**: A hash with 250,000 fields consumes ~10x more memory due to per-field overhead. Fetching the full canvas requires `HGETALL` which is slower than a single `GET`. Individual pixel reads are faster with a hash, but the whole-canvas-on-connect use case dominates.
 
-### Consistency Model
+**What we give up**: A single key cannot be sharded across Redis nodes. For a 2000x2000 canvas (4 MB), this is fine for a single Redis instance. At larger scales (10,000x10,000), the canvas would need tile-based storage with multiple keys, adding addressing complexity.
 
-**Approach**: Last-write-wins with eventual consistency.
+### Consistency: Last-Write-Wins
 
-**Rationale**:
-- Conflicts are rare: 5-second cooldown means low contention per pixel
-- Visual consistency is achieved within 100ms (broadcast latency)
-- Audit trail in PostgreSQL preserves complete history
+**Chosen**: No locking, no CRDTs, no vector clocks. The last SET to Redis wins.
 
-**Trade-offs**:
-- If two users place on same pixel within milliseconds, one "wins" arbitrarily
-- Acceptable for collaborative art (not financial transactions)
+**Why this is acceptable**: The 5-second per-user cooldown makes pixel-level contention extremely rare. Two users placing on the exact same pixel within the same second is unlikely and harmless when it happens -- collaborative art tolerates this. The full event log in PostgreSQL preserves attribution for audit purposes.
 
-## Technology Stack
+**What we give up**: In the astronomically unlikely case of a true write-write conflict on the same pixel, one user's placement is silently overwritten. Both users see the "winner" within 100ms via the broadcast. For financial transactions this would be unacceptable; for pixel art, it is invisible.
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Frontend** | React 19 + Zustand + Tailwind | Standard stack per CLAUDE.md guidelines |
-| **API Server** | Express.js + TypeScript | Simple, familiar, good WebSocket support |
-| **WebSocket** | ws library | Native Node.js WebSocket, lightweight |
-| **Canvas Store** | Redis/Valkey | Sub-millisecond reads, pub/sub built-in |
-| **Event Store** | PostgreSQL | Reliable, queryable event history |
-| **Message Queue** | RabbitMQ | Background jobs (snapshots, cleanup) |
-| **Load Balancer** | nginx | WebSocket support, health checks |
-
-## Security Considerations
+## Security
 
 ### Authentication and Authorization
 
 | User Type | Auth Method | Capabilities |
 |-----------|-------------|--------------|
 | Anonymous Guest | Session cookie (Redis) | Place pixels, view canvas |
-| Registered User | Session cookie + password | Place pixels, view history, profile |
-| Admin | Session + admin flag | All above + ban users, reset canvas, change settings |
+| Registered User | Session cookie + bcrypt password | Place pixels, view history, persistent identity |
+| Admin | Session + admin role in DB | All above + ban users, reset canvas, change settings |
 
-**Session Security**:
-- Session ID: 32-byte random, stored in HTTP-only cookie
+**Session security**:
+- Session ID: UUID v4, stored in HTTP-only cookie
 - Session data: stored in Redis with 24-hour TTL
-- CSRF protection: Origin header validation for WebSocket
-- Rate limit on auth endpoints: 5 attempts per minute per IP
+- Passwords: bcrypt with cost factor 12
+- CSRF: Origin header validation for WebSocket upgrade requests
 
-### Rate Limiting
+### Rate Limiting Summary
 
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| Pixel placement | 1 per 5 seconds | Per user |
-| Auth attempts | 5 per minute | Per IP |
-| Canvas download | 10 per minute | Per IP |
-| API requests | 100 per minute | Per user |
+| Endpoint/Action | Limit | Window | Scope |
+|-----------------|-------|--------|-------|
+| Pixel placement | 1 per 5 seconds | Per user | Redis TTL key |
+| Auth attempts | 5 per minute | Per IP | In-memory counter |
+| Canvas download | 10 per minute | Per IP | In-memory counter |
+| API requests | 100 per minute | Per user | In-memory counter |
 
 ### Input Validation
 
-```javascript
-// All pixel placements validated
-const schema = {
-  x: { type: 'integer', min: 0, max: CANVAS_WIDTH - 1 },
-  y: { type: 'integer', min: 0, max: CANVAS_HEIGHT - 1 },
-  color: { type: 'integer', min: 0, max: 15 }
-};
-```
-
-### Data Protection
-
-- Passwords: bcrypt with cost factor 12
-- Sessions: secure, HTTP-only cookies
-- HTTPS: required in production (local dev uses HTTP)
-- No PII stored for anonymous users
+All pixel placements are validated before processing:
+- `x`: integer, 0 to CANVAS_WIDTH - 1
+- `y`: integer, 0 to CANVAS_HEIGHT - 1
+- `color`: integer, 0 to 15
 
 ## Observability
 
-### Metrics (Prometheus format)
+### Prometheus Metrics
 
-```
-# Application metrics
-rplace_pixels_placed_total{color}          - Counter: total pixels placed by color
-rplace_active_connections                  - Gauge: current WebSocket connections
-rplace_http_requests_total{method,path,status}
-rplace_http_request_duration_seconds{method,path}
+**Pixel placement**:
+- `rplace_pixels_placed_total{color}` -- Counter by color index
+- `rplace_pixel_placement_duration_seconds` -- Histogram [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
 
-# Business metrics
-rplace_active_users                        - Gauge: users who placed pixel in last 5 min
-rplace_rate_limit_hits_total               - Counter: rate limit rejections
+**WebSocket connections**:
+- `rplace_active_websocket_connections` -- Current connection gauge
+- `rplace_active_users` -- Users who placed a pixel in last 5 minutes
+- `rplace_canvas_updates_total` -- Broadcast message counter
 
-# Infrastructure metrics
-redis_connection_pool_size
-redis_commands_total{command}
-postgres_connection_pool_size
-postgres_query_duration_seconds{query}
-```
+**Rate limiting**:
+- `rplace_rate_limit_hits_total` -- Rejected placement attempts
 
-### Logging
+**HTTP**:
+- `rplace_http_requests_total{method,path,status}` -- Request counter
+- `rplace_http_request_duration_seconds{method,path,status}` -- Latency histogram
 
-```javascript
-// Structured JSON logging
-{
-  "level": "info",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "service": "api-server",
-  "instance": "server-1",
-  "event": "pixel_placed",
-  "userId": "uuid",
-  "x": 100,
-  "y": 200,
-  "color": 5,
-  "latencyMs": 12
-}
-```
+**Infrastructure**:
+- `rplace_redis_operations_total{operation,status}` -- Redis command counter
+- `rplace_redis_operation_duration_seconds{operation}` -- Redis latency
+- `rplace_postgres_queries_total{query_type,status}` -- PostgreSQL query counter
+- `rplace_postgres_query_duration_seconds{query_type}` -- PostgreSQL latency
 
-**Log Levels**:
-- ERROR: Failed pixel placements, database errors, WebSocket disconnects
-- WARN: Rate limit hits, validation failures, slow queries (>100ms)
-- INFO: Pixel placements, user logins, admin actions
-- DEBUG: WebSocket messages, cache hits/misses (dev only)
+**Reliability**:
+- `rplace_circuit_breaker_state{name}` -- 0=closed, 0.5=half-open, 1=open
+- `rplace_idempotency_cache_hits_total` -- Duplicate request detections
+- `rplace_snapshots_created_total` -- Canvas snapshots taken
 
-### Tracing
+### Structured Logging (Pino)
 
-For local development, basic request tracing with correlation IDs:
+JSON-formatted logs with event-based helpers:
 
-```javascript
-// Each request gets a trace ID
-req.traceId = crypto.randomUUID();
-// Logged with all related operations
-logger.info({ traceId: req.traceId, event: 'pixel_placed', ... });
-```
+| Event | Level | Fields |
+|-------|-------|--------|
+| `pixel_placed` | info | traceId, userId, x, y, color, latencyMs |
+| `rate_limit_hit` | warn | traceId, userId, remainingSeconds |
+| `websocket_connected` / `disconnected` | info | userId, username, totalConnections |
+| `websocket_error` | error | userId, error, totalConnections |
+| `circuit_breaker_open` / `close` / `halfOpen` | info/warn | circuitName, error |
+
+**Trace ID generation**: Each request gets a unique trace ID (`timestamp-random`) propagated through all related operations for correlation.
 
 ### Health Checks
 
 ```
-GET /health          - Basic liveness (returns 200 if server running)
-GET /health/ready    - Readiness (checks Redis + PostgreSQL connections)
+GET /health          → 200 if server process running
+GET /health/ready    → 200 if Redis + PostgreSQL connected
 
-Response:
-{
-  "status": "healthy",
-  "redis": "connected",
-  "postgres": "connected",
-  "uptime": 3600,
-  "version": "1.0.0"
-}
+Response: { status, redis, postgres, uptime, version }
 ```
 
-### Alerting Thresholds (for production)
+### Alerting Thresholds
 
 | Metric | Warning | Critical |
 |--------|---------|----------|
@@ -499,276 +421,177 @@ Response:
 
 ## Failure Handling
 
+### Circuit Breakers (Opossum)
+
+Redis operations are wrapped in circuit breakers to prevent cascading failures:
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Error threshold | 50% | Open after half of requests fail |
+| Volume threshold | 5 | Minimum requests before evaluating |
+| Timeout | 5 seconds | Max wait per Redis operation |
+| Reset timeout | 30 seconds | Time before half-open test |
+| Warm-up | Enabled | Allow first request in half-open |
+
+**Fallback behaviors**:
+- Canvas read fails → return empty canvas (client shows blank)
+- Rate limit check fails → allow placement (fail-open for UX)
+- Event write fails → pixel still placed in Redis, event queued for retry
+- Pub/Sub fails → local server broadcasts to its own clients only
+
 ### Component Failure Scenarios
 
 | Component | Failure Mode | Impact | Mitigation |
 |-----------|--------------|--------|------------|
-| API Server | Crash | 1/N users disconnected | Load balancer health checks, auto-restart |
-| Redis | Down | No pixel placements | Reconnect with exponential backoff, circuit breaker |
-| PostgreSQL | Down | No history writes | Buffer events in memory/queue, retry |
-| RabbitMQ | Down | No snapshots | Jobs pile up, catch up on recovery |
+| API Server | Crash | 1/N users disconnected | LB health checks, auto-restart, client reconnects |
+| Redis | Down | No pixel placements possible | Circuit breaker fail-open, reconnect with backoff |
+| PostgreSQL | Down | No history writes | Buffer events, retry on recovery |
+| RabbitMQ | Down | No snapshots generated | Jobs queue on recovery, catch up |
 | Network partition | Split brain | Temporary inconsistency | Redis pub/sub auto-reconnects |
-
-### Retry Strategy
-
-```javascript
-// Exponential backoff with jitter
-const retryWithBackoff = async (fn, maxRetries = 3) => {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (i === maxRetries - 1) throw err;
-      const delay = Math.min(1000 * Math.pow(2, i), 10000);
-      const jitter = Math.random() * 1000;
-      await sleep(delay + jitter);
-    }
-  }
-};
-```
-
-### Circuit Breaker (for external calls)
-
-```javascript
-// Simple circuit breaker for PostgreSQL writes
-class CircuitBreaker {
-  constructor(threshold = 5, timeout = 30000) {
-    this.failures = 0;
-    this.threshold = threshold;
-    this.timeout = timeout;
-    this.state = 'CLOSED';
-  }
-
-  async call(fn) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.openedAt > this.timeout) {
-        this.state = 'HALF_OPEN';
-      } else {
-        throw new Error('Circuit breaker is open');
-      }
-    }
-    // ... execute and track failures
-  }
-}
-```
-
-### Data Recovery
-
-**Redis (canvas state)**:
-- If Redis restarts, canvas is lost
-- Recovery: Load latest PostgreSQL snapshot
-- Prevention: Redis persistence (RDB snapshots every 5 min)
-
-**PostgreSQL (history)**:
-- Daily automated backups
-- Point-in-time recovery enabled
-- Backup retention: 7 days
 
 ### Graceful Degradation
 
 | Failure | Degraded Behavior |
 |---------|-------------------|
-| History write fails | Pixel still placed, event queued for retry |
-| Snapshot job fails | Timelapse has gaps, job retried |
-| Rate limit check fails | Default to allowing (fail open for UX) |
-| WebSocket broadcast fails | Other servers still broadcast |
+| History write fails | Pixel placed in canvas, event queued for retry |
+| Snapshot job fails | Timelapse has gaps, job retried on next interval |
+| Rate limit check fails | Default to allowing (fail-open prioritizes UX) |
+| WebSocket broadcast fails | Other servers still broadcast via pub/sub |
 
-## Cost Tradeoffs
+### Data Recovery
 
-### Local Development Resource Usage
+**Redis (canvas state)**: If Redis restarts, canvas is empty. Recovery: load latest PostgreSQL snapshot. Prevention: Redis AOF persistence enabled in docker-compose (`--appendonly yes`).
 
-| Resource | Allocation | Notes |
-|----------|------------|-------|
-| Redis memory | 50 MB | Canvas + sessions + rate limits |
-| PostgreSQL storage | 500 MB | 1 week of events + snapshots |
-| API Server memory | 256 MB | Per instance |
-| Total RAM | < 1 GB | Fits on laptop |
+**PostgreSQL (history)**: Daily backups, point-in-time recovery. 7-day retention.
 
-### Scaling Cost Factors
+### Idempotency
 
-| Scaling Dimension | Cost Driver | Optimization |
-|-------------------|-------------|--------------|
-| More users | WebSocket connections, bandwidth | Batch broadcasts, viewport-only updates |
-| Larger canvas | Redis memory, snapshot size | Tile-based storage, compression |
-| Longer history | PostgreSQL storage | Partition + archive old data |
-| Higher availability | Replica instances | Accept single Redis for local dev |
-
-### Build vs Buy Decisions
-
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| Real-time | Custom WebSocket | Simple protocol, full control |
-| Rate limiting | Custom Redis | Simple logic, avoid dependency |
-| Session store | express-session + Redis | Proven library |
-| Message queue | RabbitMQ | Overkill for local, but good for learning |
+Pixel placements use Redis-backed idempotency keys to prevent duplicates from network retries, client-side double clicks, or load balancer request duplication. Keys are generated from `userId + x + y + color` (or a client-provided `X-Idempotency-Key` header). TTL of 10 seconds covers the retry window without conflicting with the 30-second cooldown.
 
 ## Scalability Considerations
 
 ### Horizontal Scaling Path
 
-1. **Current (Local Dev)**: Single instance of each component
-2. **Stage 2 (1K users)**: 3 API servers, Redis cluster, PostgreSQL primary-replica
-3. **Stage 3 (10K users)**: Add CDN for static assets, read replicas for history
-4. **Stage 4 (100K+ users)**: Geographic distribution, canvas tiling, viewport-based updates
+1. **Stage 1 (< 1K users)**: Single API server, single Redis, single PostgreSQL
+2. **Stage 2 (1-10K users)**: 3 API servers behind nginx, Redis with AOF, PostgreSQL primary-replica
+3. **Stage 3 (10-100K users)**: CDN for static assets, read replicas for history, batch WebSocket broadcasts
+4. **Stage 4 (100K+ users)**: Geographic distribution, viewport-based updates, canvas tiling
 
 ### Bottleneck Analysis
 
 | Component | Bottleneck | Threshold | Solution |
 |-----------|------------|-----------|----------|
-| API Server | WebSocket connections | ~10K per server | Add more servers |
-| Redis | Memory | ~1GB for canvas | Tile-based sharding |
-| Redis Pub/Sub | Fan-out | ~100K msg/sec | Partition by viewport |
-| PostgreSQL | Write throughput | ~10K events/sec | Batch inserts, partitioning |
+| API Server | WebSocket connections | ~10K per server | Add more servers behind LB |
+| Redis | Memory for canvas | ~1 GB for 32Kx32K | Tile-based sharding (multiple keys) |
+| Redis Pub/Sub | Fan-out volume | ~100K msg/sec per subscriber | Partition by canvas region |
+| PostgreSQL | Write throughput | ~10K inserts/sec | Batch inserts, table partitioning by time |
+| Bandwidth | Outbound to clients | N_users x updates/sec | Viewport-based updates, message batching |
+
+### Viewport-Based Updates (production optimization)
+
+At 100K concurrent users, broadcasting every pixel update to every user is infeasible (20K updates/sec x 100K users = 2B messages/sec). The solution is viewport-based subscriptions:
+
+1. Client reports its visible viewport coordinates on connect and pan/zoom
+2. Server subscribes client only to Redis pub/sub channels for visible canvas tiles
+3. Tile size: 100x100 pixels (25 tiles for a 500x500 canvas)
+4. Each update publishes to the tile's channel: `canvas:tile:{tileX}:{tileY}`
+5. Client receives only updates for tiles in its viewport (~4-9 tiles typically)
+
+This reduces message fan-out by 90%+ for large canvases.
 
 ## Trade-offs Summary
 
-### Canvas Storage Alternatives
-
-| Approach | Pros | Cons | When to Use |
-|----------|------|------|-------------|
-| Redis byte array | Simple, fast, atomic | Can't shard | < 10M pixels |
-| Redis hash | Per-pixel ops | More memory overhead | Need pixel metadata |
-| Tile-based (multiple keys) | Shardable, partial loads | Complex addressing | > 10M pixels |
-| PostgreSQL only | Durable, queryable | Too slow for real-time | Backup only |
-
-### Real-time Alternatives
-
-| Approach | Pros | Cons | When to Use |
-|----------|------|------|-------------|
-| Redis Pub/Sub | Simple, fast | No persistence | Real-time, ephemeral |
-| Kafka | Durable, replayable | Complex, overkill | Need message history |
-| WebSocket only | No external dependency | Single server only | MVP |
-| Server-Sent Events | Simpler client | One-way only | Read-heavy |
-
-### Rate Limiting Alternatives
-
-| Approach | Pros | Cons | When to Use |
-|----------|------|------|-------------|
-| Fixed window (current) | Simple, efficient | Boundary burst | Most cases |
-| Sliding window | Smoother limiting | More complex | Premium tiers |
-| Token bucket | Bursty allowed | Harder to explain | API rate limiting |
-| Leaky bucket | Steady output | Complex | Traffic shaping |
-
-## Future Optimizations
-
-### Phase 1 (Implemented)
-- [x] Core pixel placement flow
-- [x] WebSocket real-time updates
-- [x] Rate limiting with Redis TTL
-- [x] Session authentication
-
-### Phase 2 (Planned)
-- [ ] Canvas snapshot worker (RabbitMQ job)
-- [ ] Timelapse viewer component
-- [ ] Admin dashboard
-- [ ] User profiles with stats
-
-### Phase 3 (Future)
-- [ ] Batch WebSocket messages (reduce overhead at scale)
-- [ ] Viewport-based updates (only send visible pixels)
-- [ ] Canvas compression (gzip for initial load)
-- [ ] Hot-pixel detection (popular areas)
-
-### Phase 4 (Scale)
-- [ ] Tile-based canvas storage
-- [ ] Geographic distribution
-- [ ] Read replicas for history
-- [ ] CDN for static assets
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Real-time transport | WebSocket + Redis Pub/Sub | HTTP polling | Sub-100ms updates; polling wastes bandwidth |
+| Canvas storage | Redis byte array + SETRANGE | Redis hash per pixel | 10x less memory, single GET for full canvas |
+| Rate limiting | Redis SET NX EX | Sliding window (sorted sets) | Atomic, zero race conditions, perfect for fixed cooldown |
+| Consistency | Last-write-wins | CRDTs, vector clocks | Conflicts are rare at 5s cooldown, harmless for art |
+| Event persistence | PostgreSQL append-only | Kafka log | Simpler operations, queryable for history |
+| Background jobs | RabbitMQ | Cron jobs | Decouples snapshot timing from API server load |
+| Session storage | Redis + cookie | JWT | Immediate revocation, server-controlled expiry |
 
 ## Implementation Notes
 
-This section documents the rationale behind key implementation decisions in the backend codebase.
+This section maps the production architecture to the actual local implementation, documenting production-grade patterns used, simplifications, and omissions.
 
-### Why Rate Limiting Enforces Fair Pixel Placement
+### Local Setup
 
-Rate limiting via cooldown is the cornerstone of r/place's collaborative nature. The implementation uses Redis TTL keys for several critical reasons:
+```
+┌────────────────────────────────────────────────────────────┐
+│              React Frontend (:5173)                        │
+│     HTML5 Canvas, Zustand state, WebSocket client          │
+│     Zoom/pan, 16-color palette, cooldown timer             │
+└──────────────────────────┬─────────────────────────────────┘
+                           │ HTTP + WS
+                           ▼
+┌────────────────────────────────────────────────────────────┐
+│           Express + WebSocket Server (:3001)               │
+│    REST API, WebSocket handler, Redis pub/sub subscriber   │
+│    Circuit breakers, Prometheus metrics, Pino logging      │
+│    Idempotency middleware                                  │
+└────┬──────────────────┬──────────────────┬─────────────────┘
+     │                  │                  │
+     ▼                  ▼                  ▼
+┌──────────┐     ┌────────────┐     ┌────────────┐
+│  Valkey  │     │ PostgreSQL │     │  RabbitMQ  │
+│ (:6379)  │     │  (:5432)   │     │ (:5672)    │
+│          │     │            │     │            │
+│ Canvas   │     │ pixel_     │     │ Snapshot   │
+│ Sessions │     │ events     │     │ jobs       │
+│ Rate     │     │ snapshots  │     │            │
+│ limits   │     │ users      │     │            │
+│ Pub/Sub  │     │ sessions   │     │            │
+│ Idemp.   │     │            │     │            │
+└──────────┘     └────────────┘     └────────────┘
+```
 
-1. **Fairness Guarantee**: The 30-second (configurable) cooldown ensures every user gets equal opportunity to participate. Without rate limiting, bots or power users could dominate the canvas, destroying the collaborative aspect that makes r/place engaging.
+Multiple server instances can be started for distributed testing:
+- `npm run dev:server1` → port 3001
+- `npm run dev:server2` → port 3002
+- `npm run dev:server3` → port 3003
 
-2. **Atomic Check-and-Set**: Using `SET key value EX seconds NX` provides an atomic operation that both checks if a cooldown exists and sets a new one. This prevents race conditions where a fast user might place multiple pixels before the cooldown is recorded.
+### Production-Grade Patterns Implemented
 
-3. **Distributed Enforcement**: Since cooldowns are stored in Redis (not in-memory on a single server), rate limiting works correctly across all server instances. A user connecting to server-1 for their first request and server-2 for their second is still properly rate-limited.
+**Circuit breakers (Opossum)** (`backend/src/shared/circuitBreaker.ts`): Redis operations are protected by circuit breakers that open after 50% failure rate over 5+ requests, preventing cascading failures. Fallback functions return default values (empty canvas, allow placement) when the circuit is open. State changes are tracked via Prometheus gauges and logged via Pino.
 
-4. **Automatic Cleanup**: Redis TTL automatically expires cooldown keys, eliminating the need for cleanup jobs and preventing memory bloat from accumulated user state.
+**Idempotency for pixel placements** (`backend/src/shared/idempotency.ts`): Redis-backed idempotency keys prevent duplicate placements from network retries. Keys are generated from `userId + coordinates + color` or a client-provided request ID. Cached results are returned for duplicates. TTL of 10 seconds covers the retry window. Fail-open on Redis errors (allows the request through).
 
-5. **Fail-Open Design**: If Redis is temporarily unavailable, the circuit breaker allows requests through (fail-open) rather than blocking all users. This prioritizes availability over strict enforcement for brief outages.
+**Prometheus metrics (prom-client)** (`backend/src/shared/metrics.ts`): 15+ metrics including pixel placement counters (by color), WebSocket connection gauge, active users gauge, rate limit hits, HTTP request duration histograms, Redis and PostgreSQL operation counters with latency histograms, circuit breaker state, idempotency cache hits, and snapshot counters. Includes Express middleware for automatic HTTP metrics.
 
-### Why Redis is Critical for Real-time Canvas State
+**Structured logging (Pino)** (`backend/src/shared/logger.ts`): JSON-formatted logs with service instance identification. Dedicated helpers for pixel placement, rate limit hits, WebSocket connection events, and circuit breaker state changes. Trace ID generation for request correlation across operations.
 
-Redis serves as the single source of truth for the canvas state, enabling real-time collaboration at scale:
+**Redis Pub/Sub for cross-server broadcast** (`backend/src/services/redis.ts`): Real-time pixel updates are published to a Redis channel. All server instances subscribe and broadcast to their local WebSocket clients. This enables horizontal scaling -- adding servers does not require changes to the broadcast mechanism.
 
-1. **Sub-Millisecond Reads**: Canvas reads via `GET` complete in < 1ms, enabling instant canvas loading for new connections. The entire 500x500 canvas (250KB) fits in a single Redis value.
+**Atomic rate limiting** (`backend/src/services/canvas.ts`): Redis `SET NX EX` provides race-condition-free per-user cooldown enforcement across all server instances.
 
-2. **Atomic Pixel Updates**: `SETRANGE` provides atomic byte-level updates to the canvas buffer. Multiple simultaneous pixel placements don't require locking - Redis handles the serialization.
+**Canvas byte array with SETRANGE** (`backend/src/services/canvas.ts`): Compact binary representation using 1 byte per pixel. Atomic updates via `SETRANGE` without read-modify-write cycles.
 
-3. **Pub/Sub for Real-time Broadcast**: Redis pub/sub (`PUBLISH`/`SUBSCRIBE`) enables real-time pixel updates across all server instances. When server-1 receives a pixel placement, all servers (including server-1) receive the update via the shared channel and broadcast to their WebSocket clients.
+**Background persistence worker** (`backend/src/workers/persistence-worker.ts`): Separate process for canvas snapshot creation, decoupled from the API server via RabbitMQ.
 
-4. **Memory Efficiency**: The canvas is stored as a compact byte array (1 byte per pixel for 16 colors). At 250KB for a 500x500 canvas, this easily fits in Redis memory with room for thousands of user cooldowns.
+**Session-based authentication with bcrypt** (`backend/src/middleware/auth.ts`, `backend/src/services/auth.ts`): Session cookies stored in Redis with 24-hour TTL. Passwords hashed with bcrypt. Support for both registered and anonymous guest users.
 
-5. **Circuit Breaker Protection**: Redis operations are wrapped in circuit breakers that:
-   - Open after 5 consecutive failures (50% error threshold)
-   - Provide fallback values (empty canvas, allow placement) during outages
-   - Automatically test recovery after 30 seconds
-   - Prevent cascading failures from overwhelming a struggling Redis instance
+### Simplifications
 
-### Why Idempotency Prevents Duplicate Placements
+| Production Design | Local Simplification |
+|-------------------|---------------------|
+| nginx load balancer with sticky sessions | Direct connection to single server |
+| Multiple API server instances | Single instance (multi-instance via npm scripts for testing) |
+| Viewport-based update subscriptions | All clients receive all updates |
+| Batched WebSocket broadcasts | Individual messages per update |
+| Canvas tile-based sharding | Single Redis key for entire canvas |
+| CDN for static assets | Vite dev server serves directly |
+| PostgreSQL read replicas for history | Single PostgreSQL instance |
+| Redis Sentinel/Cluster for HA | Single Valkey instance |
 
-Network unreliability is a reality, especially for real-time applications. Idempotency ensures pixel placements are applied exactly once:
+### What Was Omitted
 
-1. **Network Retry Handling**: When a client sends a pixel placement and doesn't receive a response (timeout), it will retry. Without idempotency, retries could:
-   - Place the same pixel multiple times (wasting the user's cooldown)
-   - Return conflicting success/failure states to the client
-
-2. **Implementation Approach**: Each pixel placement generates an idempotency key based on:
-   - User ID (prevents cross-user conflicts)
-   - Coordinates (x, y)
-   - Color index
-   - Optional client-provided request ID (for exact duplicate detection)
-
-3. **Short TTL Window**: Idempotency keys expire after 10 seconds - long enough to catch retries, short enough to allow legitimate re-placements after cooldown expires.
-
-4. **Cached Result Return**: Duplicate requests receive the same response as the original request, including the `nextPlacement` timestamp. This provides consistent behavior to clients regardless of how many retries occur.
-
-5. **Client Integration**: Clients can optionally provide an `X-Request-ID` or `X-Idempotency-Key` header for guaranteed exactly-once semantics, useful for implementing reliable retry logic.
-
-### Why WebSocket Metrics Enable Scaling Decisions
-
-Real-time systems require visibility into connection patterns to make informed scaling decisions:
-
-1. **Active Connection Gauge**: `rplace_active_websocket_connections` tracks the current number of WebSocket clients. This metric directly indicates server load and helps determine when to add instances:
-   - < 100 connections per server: comfortable headroom
-   - 500-1000 connections: consider adding instances
-   - > 1000 connections: horizontal scaling needed
-
-2. **Connection Rate Tracking**: Logging connect/disconnect events with timestamps enables analysis of:
-   - Peak connection times (when to pre-scale)
-   - Session duration patterns (user engagement)
-   - Connection churn rate (health indicator)
-
-3. **Broadcast Efficiency**: `rplace_canvas_updates_total` tracks pixel updates broadcast. Combined with connection count, this reveals the message amplification factor:
-   - 20 pixels/second x 100 clients = 2,000 messages/second
-   - This metric drives decisions about batching or viewport-based updates
-
-4. **Active User Tracking**: `rplace_active_users` tracks users who placed pixels in the last 5 minutes. This business metric shows actual engagement rather than just connections (a user might connect but never place pixels).
-
-5. **Graceful Shutdown Support**: WebSocket metrics help validate graceful shutdown:
-   - Monitor connection drain rate during shutdown
-   - Ensure all clients receive shutdown notifications
-   - Verify zero connections before terminating the process
-
-### Observability Stack Summary
-
-The implementation provides comprehensive observability through:
-
-| Component | Purpose | Key Metrics |
-|-----------|---------|-------------|
-| Pino Logger | Structured JSON logs | Events, latencies, errors |
-| Prometheus Metrics | Time-series monitoring | Counters, gauges, histograms |
-| Health Endpoints | Load balancer integration | Liveness, readiness checks |
-| Circuit Breakers | Failure isolation | Open/closed state per operation |
-
-This observability foundation enables:
-- Alerting on error rates and latency spikes
-- Capacity planning from historical trends
-- Incident investigation via structured logs
-- Automated recovery via health checks
+- **Viewport-based updates**: All clients receive all pixel updates (works fine at 100 users, would not scale to 100K)
+- **WebSocket message batching**: No batching of rapid sequential updates into single frames
+- **Canvas tiling**: Single Redis key for entire canvas (limits to ~32K x 32K pixels)
+- **CDN**: No content delivery network for static assets
+- **Multi-region**: No geographic distribution or edge compute
+- **Kubernetes**: No container orchestration or auto-scaling
+- **Admin dashboard**: Admin endpoints exist but no dedicated admin UI
+- **Timelapse viewer**: Snapshots are stored but no frontend replay component
+- **Hot-pixel detection**: No monitoring for pixels receiving disproportionate updates
