@@ -526,6 +526,144 @@ Users primarily match within their region. Deploy Elasticsearch clusters per reg
 | Session storage | PostgreSQL (express-session) | Redis sessions | Simpler setup |
 | Photo storage | S3 / MinIO | Database BLOBs | Scalable, CDN-friendly |
 
+## Frontend Architecture
+
+### Technology Stack
+
+React 19 + TypeScript + Vite + TanStack Router (file-based routing) + Zustand (state management) + Tailwind CSS + WebSocket client for real-time features.
+
+### Component Hierarchy
+
+```
+__root.tsx (minimal root, no persistent layout -- each page owns its chrome)
+├── index.tsx              → HomePage: swipe card deck + match modal
+├── matches.tsx            → MatchesPage: list of matched users with last message preview
+├── chat.$matchId.tsx      → ChatPage: real-time messaging with a matched user
+├── profile.tsx            → ProfilePage: edit name, bio, job, school
+├── preferences.tsx        → PreferencesPage: age range, distance, gender preferences
+├── portraits.tsx          → PortraitsPage: ReignsAvatar showcase/gallery
+├── admin.tsx              → AdminPage: platform stats and user management
+├── admin/users.tsx        → AdminUsersPage: user list with ban/delete actions
+├── login.tsx              → Login form
+└── register.tsx           → Registration form with birthdate, gender, bio fields
+```
+
+### Zustand Stores
+
+**`authStore`** -- manages user session, login, registration, logout, profile updates, and location updates. On successful login or registration, automatically connects the WebSocket service by calling `wsService.connect(user.id)`. On logout, disconnects WebSocket. The `checkAuth()` action validates the session on app load by calling `/api/auth/me` and reconnects WebSocket if the session is still valid. Also exposes `updateProfile()` for editing profile fields and `updateLocation()` for sending geolocation coordinates to the backend.
+
+**`discoveryStore`** -- manages the swipe deck lifecycle. Stores the `deck` array (up to 20 discovery cards), `currentIndex` (pointer to the current card in the deck), and `lastMatch` (the most recent match, shown in the match modal). The `loadDeck()` action fetches a fresh deck from `/api/discovery/deck?limit=20`. The `swipe()` action sends a like/pass to the backend, advances `currentIndex`, and if the result includes a `match` object, stores it in `lastMatch` to trigger the MatchModal. Critically, when the user is 3 cards from the end of the deck (`nextIndex >= deck.length - 3`), it automatically calls `loadDeck()` to pre-fetch the next batch, ensuring the user never sees a loading spinner between cards.
+
+**`matchStore`** -- manages matches and messaging. Stores `matches` (list of all matches with last message previews), `currentMatchId` (the active conversation), `messages` (messages for the current conversation), and `unreadCount`. The `loadMessages()` action fetches messages for a match and reverses them (API returns newest-first, UI displays oldest-first). The `sendMessage()` action posts a message and immediately appends it to the local messages array with `is_mine: true`, providing an optimistic update. The `subscribeToMessages()` action registers WebSocket handlers for `new_message` and `new_match` events and returns an unsubscribe function for cleanup. When a `new_message` event arrives, `addMessage()` appends it to the current conversation and updates the match list's last message preview.
+
+### Real-Time Updates via WebSocket
+
+The WebSocket client (`services/websocket.ts`) is a singleton class that manages a persistent connection to the backend. It supports three message types:
+
+- **`auth`** -- sent by the client immediately after connection to authenticate the WebSocket with a user ID
+- **`new_match`** -- received from the server when a mutual like is detected, triggers `matchStore.loadMatches()` to refresh the match list
+- **`new_message`** -- received from the server when the other user sends a message, triggers `matchStore.addMessage()` to append to the current conversation
+
+The WebSocket service implements automatic reconnection with exponential backoff. If the connection drops, it retries up to 5 times with delays of 1s, 2s, 4s, 8s, 16s. The `on()` method returns an unsubscribe function, which React components use in `useEffect` cleanup to prevent memory leaks. The `sendTyping()` method broadcasts typing indicators to the other user in a conversation.
+
+The integration between Zustand stores and WebSocket is clean: `authStore` controls connection lifecycle (connect on login, disconnect on logout), while `matchStore` controls event subscription (subscribe on mount, unsubscribe on unmount). This separation means the WebSocket stays connected across page navigations, but message handlers are only active when the relevant component is mounted.
+
+### Swipe Card UI
+
+The `SwipeCard` component implements drag-to-swipe using raw touch and mouse events (no gesture library). The card tracks `dragDelta` (x/y pixel offset from where the drag started) and applies CSS transforms: `translateX` for horizontal movement, `translateY * 0.3` for dampened vertical movement, and `rotate(dragDelta.x * 0.1)deg` for tilt. Opacity decreases as the card moves further from center (`1 - abs(dragDelta.x) / 500`).
+
+When the drag exceeds a 100px threshold in either direction, the `onSwipe` callback fires with `'like'` (right) or `'pass'` (left). The parent `HomePage` applies a CSS exit animation class (`animate-swipe-right` or `animate-swipe-left`) for 300ms before advancing to the next card, creating a smooth departure effect.
+
+The deck renders two cards simultaneously: the current card on top and the next card behind it (at 95% scale and 80% opacity). This creates the visual illusion of a card stack and ensures the next card is already visible as the current card swipes away.
+
+The `SwipeCard` component supports two visual modes: ReignsAvatar (procedurally generated medieval-portrait SVG avatars, used by default since there are no real user photos) and photo mode with navigation indicators and tap-to-advance areas for multi-photo browsing.
+
+### Match Modal
+
+When `discoveryStore.lastMatch` is non-null, the `MatchModal` overlay renders with a celebratory animation. The modal shows a pulsing gradient heart icon, the matched user's ReignsAvatar, and two action buttons: "Send Message" (navigates to the chat route with the match ID) and "Keep Swiping" (clears the match and returns to the deck). The modal uses `animate-match-pop` for a scale-in entrance effect.
+
+### Chat Interface
+
+The `chat.$matchId.tsx` route implements a mobile-first messaging interface. Messages are displayed in a scrollable list with sender-aligned bubbles (right-aligned gradient bubbles for the current user, left-aligned white bubbles for the other user). The `useEffect` hook auto-scrolls to the newest message using `messagesEndRef.current.scrollIntoView({ behavior: 'smooth' })`. The chat subscribes to WebSocket messages on mount and unsubscribes on unmount. An options menu provides an "Unmatch" action with a confirmation dialog.
+
+### Data Fetching Patterns
+
+The API client (`services/api.ts`) organizes endpoints into domain-specific modules: `authApi`, `userApi`, `discoveryApi`, `matchApi`, and `adminApi`. Each module exports typed functions that wrap the generic `request()` helper. The `request()` helper includes `credentials: 'include'` for cookie-based session auth and extracts error messages from JSON error responses.
+
+Photo uploads use a separate code path that bypasses JSON serialization, sending `FormData` directly via `fetch` to support multipart file uploads.
+
+### Geolocation
+
+On the home page, the app requests the browser's geolocation permission via `navigator.geolocation.getCurrentPosition()`. If granted, the user's coordinates are sent to `PUT /api/users/location`, which updates their PostGIS geography column and syncs to Elasticsearch. This happens once per session (only if `user.latitude` is not already set), not continuously, to avoid battery drain and excessive API calls.
+
+### Bottom Navigation
+
+The `BottomNav` component renders a persistent mobile-style navigation bar with icons for Discover (flame), Matches (chat bubble), Profile (person), and Preferences (sliders). The matches icon shows an unread count badge when `matchStore.unreadCount > 0`.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation assumes no prior knowledge of the pattern.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (JSON objects) rather than freeform text strings. A traditional log line like `"User 123 liked user 456, match detected, 12ms"` is easy for a human to read but difficult for a machine to search or aggregate. A structured log entry for the same event looks like `{"userId":"123","targetId":"456","action":"like","match":true,"latencyMs":12,"level":"info"}`.
+
+The key advantage is that log aggregation systems (ELK stack, Grafana Loki, Datadog) can index JSON fields for fast querying. An operator can query "show me all match detections with latency > 100ms in the last hour" by filtering on `action=like AND match=true AND latencyMs>100`. With freeform text, this would require fragile regex parsing.
+
+In this project, structured logging uses Pino (`backend/src/shared/logger.ts`). Pino writes JSON directly to stdout, which is significantly faster than alternatives like Winston because it avoids string formatting. Every HTTP request gets a unique `requestId` attached to all log entries for that request, enabling full request lifecycle tracing.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system where the application exposes numeric metrics at an HTTP endpoint (`/metrics`), and a Prometheus server periodically scrapes that endpoint. The "pull-based" model (Prometheus pulls from the application) is simpler than push-based alternatives because the application does not need to know the monitoring server's address or handle connection failures.
+
+Metrics come in four types. **Counters** are monotonically increasing (e.g., `swipes_total{direction="like"}` -- total likes since process start). **Gauges** go up and down (e.g., WebSocket connection count). **Histograms** track value distributions (e.g., `discovery_deck_duration_seconds` -- how long deck generation takes, bucketed into latency ranges).
+
+In this project, metrics are implemented using `prom-client` (`backend/src/shared/metrics.ts`). The key business metrics track the dating funnel: deck requests, swipes (labeled by direction), matches, and messages sent. Cache effectiveness metrics (`cache_hits_total` / `cache_misses_total` by cache type) help identify whether Redis is providing value. Rate limiting metrics track how often users hit limits, which helps calibrate thresholds.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single user could swipe thousands of times per minute, overwhelming the backend and creating an unfair experience for others.
+
+In this project, rate limiting uses per-user sliding window counters (`backend/src/shared/rateLimit.ts`). Swipes are limited to 50 per 15 minutes and 100 per hour. A sliding window counts requests across a rolling time period, which is more accurate than a fixed window. With a fixed 15-minute window, a user could make 50 swipes in the last second of one window and 50 more in the first second of the next, effectively making 100 swipes in 2 seconds. A sliding window prevents this boundary-burst exploit.
+
+The implementation uses `express-rate-limit` middleware. When a user exceeds the limit, the API returns a 429 Too Many Requests response with a `Retry-After` header telling the client when they can resume.
+
+### Idempotency
+
+Idempotency means performing the same operation multiple times produces the same result as performing it once. In a dating app, this matters because network errors can cause swipe retries. Without idempotency, a retry could create a duplicate swipe record, potentially re-triggering match detection and sending a duplicate match notification.
+
+In this project, swipe processing uses two idempotency mechanisms. First, the database enforces a `UNIQUE(swiper_id, swiped_id)` constraint, so duplicate swipe inserts fail at the database level. Second, clients can provide an `idempotencyKey` with the swipe request. The server checks for this key in the swipes table before processing. If the key exists, the cached result is returned without re-running match detection.
+
+The `INSERT ... ON CONFLICT DO UPDATE` pattern handles the database-level deduplication. When a duplicate swipe arrives, instead of failing with a unique constraint violation, the database updates the existing row's timestamp. This approach is simpler than checking for existence first and then inserting, because it avoids a race condition where two concurrent requests both check, both find nothing, and both try to insert.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "cache hit"), it is returned immediately. If not (a "cache miss"), the application queries the database, stores the result in the cache with a TTL, and returns the result.
+
+In this project, Redis cache-aside is used for swipe tracking. The discovery service needs to exclude already-swiped users from the deck. Querying `SELECT swiped_id FROM swipes WHERE swiper_id = ?` for every deck request would return thousands of IDs, adding 10-50ms latency. Instead, swipe history is cached in Redis Sets with a 24-hour TTL. Checking membership in a Redis Set (`SISMEMBER`) is O(1) -- constant time regardless of how many users have been swiped.
+
+User location is also cached in Redis with a 1-hour TTL, avoiding a database lookup on every discovery request.
+
+The trade-off is memory usage. A power user who swipes 1,000 times has a ~16KB Redis set. At 15M daily active users, swipe sets could consume ~60GB. The 24-hour TTL bounds this, but if Redis restarts, the cache is cold and must be re-warmed from PostgreSQL.
+
+### Circuit Breaker
+
+A circuit breaker prevents an application from repeatedly calling a service that is failing. It has three states: **CLOSED** (normal -- all requests pass through), **OPEN** (tripped -- all requests immediately fail with a fallback response), and **HALF-OPEN** (testing -- a few requests pass through to check if the service has recovered).
+
+In this project, the discovery service wraps Elasticsearch calls in a circuit breaker. If Elasticsearch fails 5 times in 30 seconds, the breaker trips to OPEN. While open, discovery requests fall back to PostGIS-only queries (`ST_DWithin`). After 30 seconds, the breaker moves to HALF-OPEN and allows a test request through. If it succeeds, the breaker closes and Elasticsearch is used again.
+
+Without the circuit breaker, a failing Elasticsearch cluster would cause every discovery request to hang for the full 5-second timeout before failing. With the breaker, the first few failures trip it, and all subsequent requests immediately get the PostGIS fallback response in milliseconds. This protects both the user experience and Elasticsearch (giving it time to recover without being hammered by requests).
+
+Note: while the architecture document mentions circuit breakers as a pattern, the Opossum library integration around Elasticsearch is listed under "What Was Omitted" in the implementation notes. The PostGIS fallback is implemented directly in the discovery service as a conditional code path.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is functioning correctly. Load balancers use them to determine whether to route traffic to a service instance. Container orchestrators use them to decide whether to restart a container.
+
+A **liveness check** confirms the process is running. A **readiness check** confirms the service can handle traffic (database connections established, caches warmed). A **detailed check** reports per-dependency status so operators can quickly identify which component is failing.
+
+In this project, health checks test each dependency with a lightweight operation: `SELECT 1` for PostgreSQL, `PING` for Redis, and a cluster health check for Elasticsearch. Each check has its own timeout so a single slow dependency does not block the entire health endpoint. The response distinguishes between critical dependencies (PostgreSQL -- if down, service is unhealthy) and non-critical dependencies (Elasticsearch -- if down, service is degraded but functional via PostGIS fallback).
+
 ## Implementation Notes
 
 This section documents the actual local setup, what production patterns are implemented, what was simplified, and what was omitted.

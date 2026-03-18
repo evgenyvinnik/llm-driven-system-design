@@ -494,6 +494,157 @@ On SIGTERM/SIGINT: stop accepting new requests, wait for in-flight requests to c
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+App
+├── MapView ─── Leaflet map container (full viewport)
+│   ├── MapViewController ─── syncs map center/zoom with store
+│   ├── MapEventHandler ─── click-to-set origin/destination
+│   ├── DataLoader ─── loads traffic/POIs/incidents on map move
+│   ├── RouteLayer ─── Polyline rendering of calculated route
+│   ├── TrafficLayer ─── Polyline rendering of traffic congestion
+│   ├── POIMarkers ─── Marker + Popup for points of interest
+│   ├── IncidentMarkers ─── CircleMarker + Popup for incidents
+│   └── RouteMarkers ─── draggable origin/destination markers
+├── SearchBar ─── debounced search with autocomplete dropdown
+├── MapControls ─── traffic/POI/incident toggle buttons
+└── RoutePanel ─── directions panel (bottom sheet)
+    ├── Origin/Destination inputs
+    ├── Route options (avoid tolls, avoid highways)
+    ├── Calculate button / route summary
+    ├── Navigation status bar (during active navigation)
+    └── Maneuver list (turn-by-turn directions)
+```
+
+Unlike the other Apple projects that use TanStack Router for multi-page navigation, Apple Maps uses a single-page architecture where all components are rendered simultaneously. The map fills the entire viewport, and UI elements (search bar, controls, route panel) are absolutely positioned overlays. This mirrors the real Apple Maps app where the map is always visible and UI elements float on top.
+
+### Zustand Store
+
+The entire frontend state is managed by a single `mapStore` -- the largest Zustand store in the repository. It is organized into functional sections:
+
+**Map view state** -- `center` (LatLng, defaults to San Francisco), `zoom` (defaults to 14). `setCenter` and `setZoom` sync the Leaflet map with the store.
+
+**Route state** -- `origin`, `destination` (LatLng or null), `route` (the calculated route with coordinates, maneuvers, distance, duration), `alternativeRoutes`, `isLoadingRoute`, `routeError`. The `calculateRoute` action calls the backend's `/api/routes/calculate` endpoint with origin, destination, and route options (avoid tolls/highways). `clearRoute` resets all route-related state.
+
+**Search state** -- `searchQuery`, `searchResults` (Place array), `isSearching`. The `search` action calls `/api/search` with the query text and the current map center as a proximity bias, returning ranked results within a 10km radius.
+
+**Traffic state** -- `trafficData` (array of traffic flow objects with geometry and congestion levels), `showTraffic` (toggle). `loadTraffic` fetches traffic data for the current map bounding box from `/api/traffic/flow`.
+
+**Incident state** -- `incidents` (array with type, severity, location, description), `showIncidents` (toggle, defaults to on). `loadIncidents` fetches active incidents in the current bounding box.
+
+**POI state** -- `pois` (Place array), `showPOIs` (toggle, defaults to on). `loadPOIs` fetches points of interest in the current bounding box from `/api/map/pois`.
+
+**Navigation state** -- `navigation` object with `isNavigating`, `currentManeuverIndex`, `distanceToNextManeuver`, and `eta`. `startNavigation` calculates the ETA from the route duration, `stopNavigation` resets the state, and `updateNavigation` advances through maneuvers based on the current position using a simple Euclidean distance threshold (50 meters).
+
+**Route options** -- `routeOptions` with `avoidTolls` and `avoidHighways` booleans, passed to the backend when calculating routes.
+
+### Data Fetching
+
+API calls go through `services/api.ts`, which exports a single `api` object with methods: `calculateRoute`, `searchPlaces`, `geocode`, `getTraffic`, `getIncidents`, `getPOIs`, `getNodes`, `getSegments`, and `submitProbe`. Unlike the other Apple projects, there is no authentication -- the Maps project focuses on routing algorithms and traffic, not auth.
+
+Data loading is event-driven rather than page-load-driven. The `DataLoader` component inside the map subscribes to `moveend` events from Leaflet and loads traffic, POI, and incident data for the new bounding box with a 300ms debounce. This ensures data is refreshed as the user pans the map without flooding the server with requests during smooth scrolling.
+
+### Key UI Pattern: Map Rendering
+
+The map is rendered using **Leaflet** via `react-leaflet`, which provides React component wrappers around the Leaflet API. The choice of Leaflet over Mapbox GL or Google Maps was deliberate: Leaflet is open-source, supports OpenStreetMap tiles without API keys, and has a well-documented React integration.
+
+**Tile rendering:**
+The `MapContainer` component initializes a Leaflet map instance filling the entire viewport. `TileLayer` loads raster tiles from OpenStreetMap's tile servers. In the production architecture, these would be custom vector tiles served from the CDN, but Leaflet's raster tiles are sufficient for the development prototype.
+
+**Layer composition:**
+Multiple map layers are rendered as sibling React components inside `MapContainer`:
+1. `TrafficLayer` -- renders `Polyline` components for each road segment with traffic data. Color encodes congestion: green (free), yellow (light), orange (moderate), red (heavy). Lines are 4px wide with 80% opacity.
+2. `RouteLayer` -- renders a single `Polyline` for the calculated route in blue (#007AFF), 6px wide, with rounded line caps and joins for a smooth appearance.
+3. `POIMarkers` -- renders `Marker` components with category-specific colored dot icons (orange for restaurants, brown for coffee shops, red for gas stations, etc.). Each marker has a `Popup` showing name, category, rating, address, and a "Directions" button that sets the POI as the destination.
+4. `IncidentMarkers` -- renders `CircleMarker` components colored by incident type (red for accidents/closures, orange for construction, yellow for hazards). Popups show incident type, description, and report time.
+5. `RouteMarkers` -- renders draggable `Marker` components for origin (blue dot) and destination (red dot). Dragging a marker updates the store, which can trigger a route recalculation.
+
+**Map interaction:**
+The `MapEventHandler` component uses Leaflet's `useMapEvents` hook to handle clicks. Clicking the map sets the origin if none exists, then the destination on the second click. The `MapViewController` syncs the Leaflet map view with the Zustand store bidirectionally: store changes drive `map.setView()`, and user pan/zoom events update the store via `moveend`/`zoomend` handlers.
+
+**Route panel interaction:**
+The `RoutePanel` component appears as a bottom sheet when origin and destination are set. It shows coordinate displays for origin/destination, a swap button, route option checkboxes (avoid tolls, avoid highways), and a "Get Directions" button. After calculation, it shows a route summary (duration and distance formatted) and a scrollable list of turn-by-turn maneuvers with directional icons. During navigation, a blue status bar shows the current maneuver instruction, distance to next turn, and ETA.
+
+**Search interaction:**
+The `SearchBar` debounces input by 300ms before calling the search API. Results appear in a dropdown overlay with category icons, name, address, rating, and distance from the map center. Selecting a result sets it as the destination and centers the map on it. Clicking outside the dropdown closes it via a `mousedown` event listener.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache (typically Redis) before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL, and returns it. The cache is never written to directly by the database -- the application manages the cache population.
+
+**How it works in this project:** POI data is cached in Redis because POIs rarely change but are queried on every map move. When a user pans the map, the frontend requests POIs for the visible bounding box. The backend first checks Redis for cached results for that bounding box (quantized to a grid to improve cache hit rates). On a miss, PostgreSQL is queried using the GIST spatial index, the results are cached with a 5-minute TTL, and returned. Traffic data is not cached with cache-aside because it changes every few seconds -- instead, the latest aggregated values are written directly to Redis by the traffic simulation timer.
+
+**Why it matters at scale:** A maps application has extremely high read frequency. Every pan and zoom generates a new request for the visible area's data. Without caching, each of the millions of concurrent users would generate multiple PostGIS spatial queries per second. Redis absorbs this read load, serving results in sub-millisecond time. The TTL ensures that new POIs (e.g., a newly opened restaurant) appear within minutes without requiring explicit cache invalidation.
+
+### Circuit Breaker (Opossum)
+
+**What it is:** A circuit breaker prevents an application from repeatedly trying to execute an operation that is likely to fail. When failures exceed a threshold, the circuit "opens" and calls fail immediately. After a timeout, a few test requests are allowed through ("half-open"). If they succeed, normal operation resumes ("closed").
+
+The three states:
+- **Closed** (normal): requests pass through. High failure rate triggers opening.
+- **Open** (failing fast): all requests immediately return a fallback without contacting the dependency.
+- **Half-open** (testing): limited test requests allowed. Success closes the circuit; failure reopens it.
+
+**How it works in this project (`backend/src/shared/circuitBreaker.ts`):** Separate circuit breakers protect three expensive operations: routing graph load (protects against database overload when loading the full road graph into memory), geocoding (isolates geocoding failures from routing), and nearest-node queries (separate breaker for spatial queries that can be expensive). The state machine transitions on 5 failures to OPEN, waits 30 seconds, then allows 3 test requests in HALF-OPEN. A single failure in HALF-OPEN returns to OPEN.
+
+**Fallback strategies:**
+When the routing graph load circuit opens, the system serves routes using a cached (potentially stale) version of the graph. When geocoding fails, the search endpoint returns an error for address queries while POI search continues working. When nearest-node fails, the routing endpoint returns an error with a specific message indicating the spatial query service is degraded.
+
+**Why it matters at scale:** The routing engine loads the entire road graph into memory for performance. If the database is temporarily overloaded, the graph load query fails. Without a circuit breaker, every subsequent routing request would attempt this expensive query, further overloading the database and creating a feedback loop. The circuit breaker stops all graph load attempts for 30 seconds, giving the database time to recover, while serving routes using the last successfully loaded graph.
+
+### Structured Logging (Pino)
+
+**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text. Each entry contains consistent fields (`timestamp`, `level`, `service`, `requestId`, `message`) that log aggregation systems can index and search.
+
+**How it works in this project (`backend/src/shared/logger.ts`):** Pino outputs JSON with request correlation via `requestId`. Express middleware creates a child logger per request, binding HTTP method, path, and query parameters. Route handlers add context as they execute (e.g., origin/destination coordinates, route calculation time, number of nodes visited). Sensitive data (cookies, auth headers) is automatically redacted. Development mode uses pretty-printing for readability; production emits raw JSON for log aggregators.
+
+**Why it matters at scale:** A routing service processes millions of requests per second. When a user reports "my route was wrong," the engineer needs to find the exact request, see which graph version was loaded, what traffic weights were applied, and how many nodes the A* algorithm visited. With structured logging and the `requestId` field, they can correlate all log entries for that specific routing request. With text logs, this investigation would require parsing inconsistent log formats across multiple routing worker instances.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints. Applications expose a `/metrics` endpoint with metric values. Prometheus stores these time series and enables queries and alerting.
+
+**How it works in this project (`backend/src/shared/metrics.ts`):** Routing-specific metrics include: `routing_calculation_duration_seconds` (histogram with buckets from 50ms to 5s, labeled by route type and status), `routing_requests_total` (counter with success/no_route/error status), and `routing_nodes_visited_total` (gauge for tracking algorithm efficiency). Traffic metrics include: `traffic_probes_ingested_total` (counter with regional breakdown), `traffic_probes_duplicates_total` (counter for dedup monitoring), and `traffic_incidents_detected_total` (counter by type). Infrastructure metrics include: `http_request_duration_seconds` (histogram by method, route, status), `cache_hits_total` / `cache_misses_total` (by cache name), and `circuit_breaker_state` (gauge per dependency).
+
+**Why it matters at scale:** Route calculation is CPU-bound, and monitoring `routing_calculation_duration_seconds` reveals when the system needs more routing workers. The `routing_nodes_visited_total` metric is particularly valuable for algorithm optimization: if the A* heuristic is poorly calibrated, it visits too many nodes and the histogram shifts right. Traffic probe ingestion rate monitoring (`traffic_probes_ingested_total`) detects when GPS probe coverage drops below the threshold needed for accurate traffic estimates. Alert thresholds (route p95 > 500ms, probe lag > 5 minutes) provide early warning before users experience degraded ETAs.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a time window. When exceeded, the server returns 429 (Too Many Requests) with a `Retry-After` header.
+
+**How it works in this project (`backend/src/shared/rateLimit.ts`):** Four rate limit tiers are configured: routing (30 req/min) since route calculations are CPU-intensive, search (60 req/min) since each query involves a PostGIS spatial query plus full-text search, traffic probe submission (600 req/min) to accept high-frequency GPS probes while preventing abuse, and general traffic data reads (120 req/min). Redis backs the store for consistency across server instances.
+
+**Why it matters at scale:** Route calculation is the most expensive operation in the system -- each request loads a graph into memory and runs A*. A single client requesting routes in a tight loop could monopolize CPU resources and starve other users. The 30 req/min routing limit ensures no single client can degrade service for others. The traffic probe limit of 600 req/min is deliberately high because legitimate GPS probes arrive every few seconds per device, but it still prevents a malfunctioning device from flooding the ingestion pipeline.
+
+### Idempotency
+
+**What it is:** An idempotent operation produces the same result whether executed once or multiple times. For APIs, this means retrying a request does not cause duplicate side effects.
+
+**How it works in this project (`backend/src/shared/idempotency.ts`):** GPS probe ingestion is idempotent by design: each probe is identified by a composite key of `deviceId + timestamp`. Redis stores a deduplication window with 1-hour TTL. Duplicate probes return the cached result without reprocessing. The PostgreSQL `UPSERT` for traffic flow data aggregates duplicates by averaging speeds weighted by sample count, so even if a duplicate slips through Redis, the database handles it correctly. Incident reports use a client-provided `idempotencyKey` with `ON CONFLICT DO NOTHING` to prevent duplicate incident creation. Reports near an existing active incident (within 100m) are merged rather than creating duplicates.
+
+**Why it matters at scale:** At 1M GPS probes per second, network retries and at-least-once delivery guarantees from Kafka mean some probes will arrive more than once. Without deduplication, duplicate probes would skew traffic speed estimates (a slow probe counted twice would bias the average downward). The Redis deduplication window is much cheaper than a database uniqueness check at this ingestion rate. For incident reports, idempotency prevents the same road closure from appearing as 50 separate incidents when 50 users report it simultaneously.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints consumed by infrastructure systems to determine whether an application instance can serve traffic. Liveness checks verify the process is running; readiness checks verify dependencies are reachable.
+
+**How it works in this project (`backend/src/routes/health.ts`):** Three endpoints: `GET /health/live` returns 200 if the process is running. `GET /health/ready` checks PostgreSQL connectivity (executes `SELECT 1`) and Redis connectivity (executes `PING`), returning 503 if either is unreachable. `GET /health` performs a deep check including whether the routing graph is loaded in memory, whether traffic data is fresh (last update within 2 minutes), and the state of all circuit breakers. This enables the monitoring system to distinguish between "completely down" and "running but unable to calculate routes because the graph failed to load."
+
+**Why it matters at scale:** Routing workers load the road graph into memory on startup, which takes several seconds. During this loading period, the worker is running (liveness: OK) but cannot serve route requests (readiness: NOT OK). Without separate health checks, a load balancer might route traffic to a worker that has not finished loading its graph, resulting in errors. The deep health check additionally detects stale traffic data -- if the traffic simulation or probe ingestion has stopped, routes will use free-flow speeds instead of current conditions, producing inaccurate ETAs. This degraded state is not a crash, but it should trigger an alert.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.

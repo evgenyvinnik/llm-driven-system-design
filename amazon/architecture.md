@@ -655,6 +655,220 @@ The expired reservation cleanup job runs every 5 minutes using `FOR UPDATE SKIP 
 
 ---
 
+## Frontend Architecture
+
+### Technology Stack
+
+React 19 + TypeScript + Vite + TanStack Router (file-based routing) + Zustand (state management) + Tailwind CSS.
+
+### Component Hierarchy
+
+```
+__root.tsx (Header with search bar + category nav + cart badge)
+├── index.tsx              → HomePage: hero banner, category grid, featured products, deals section
+├── search.tsx             → SearchPage: faceted sidebar filters + product grid + pagination
+├── product.$id.tsx        → ProductPage: image gallery, price, reviews, recommendations
+├── category.$slug.tsx     → CategoryPage: products filtered by category
+├── cart.tsx               → CartPage: item list with quantity controls + order summary
+├── checkout.tsx           → CheckoutPage: shipping form, payment mock, order placement
+├── orders.tsx             → OrdersPage: order history list
+├── orders.$id.tsx         → OrderDetailPage: single order with items and status
+└── login.tsx              → Login/register form
+```
+
+### Zustand Stores
+
+**`authStore`** -- manages user authentication with session persistence via `zustand/persist` middleware. The session ID is stored in `localStorage` and attached to every API request as an `X-Session-Id` header (rather than using cookies). The `checkAuth()` action validates the session on app load by calling `/api/auth/me` and clears the stored session if it has expired. The `partialize` option ensures only `sessionId` is persisted (not the user object), so stale user data is always refreshed from the server on reload.
+
+**`cartStore`** -- manages the shopping cart globally. Stores `items` (array of cart items with product details and stock info), `subtotal` (computed server-side), `itemCount` (total quantity across all items), and loading/error states. Every cart mutation (`addToCart`, `updateQuantity`, `removeItem`, `clearCart`) sends a request to the server and replaces the entire local cart state with the server's response. This server-authoritative approach ensures the cart always reflects current inventory and pricing -- the server validates stock availability and recalculates totals on every operation. The trade-off is that every interaction requires a network round-trip, but this prevents the overselling problem that would occur if the client maintained its own cart state independently.
+
+### Routing and URL-Driven Search
+
+The search page (`search.tsx`) uses TanStack Router's `validateSearch` to parse URL query parameters (`q`, `category`, `minPrice`, `maxPrice`, `inStock`, `sortBy`, `page`) into typed search state. All filter changes call `navigate()` with updated search params, which triggers a re-render and a new API call. This URL-driven approach means:
+
+1. Search results are bookmarkable and shareable
+2. The browser back button works naturally (previous filter state is restored)
+3. No Zustand store is needed for search state -- the URL is the single source of truth
+
+The `updateFilter()` helper resets pagination to page 0 whenever a filter changes, ensuring users see the first page of results after narrowing their search.
+
+### Faceted Search with Elasticsearch Aggregations
+
+The search page receives `aggregations` alongside `products` from the search API. Aggregations are Elasticsearch's way of computing summaries over the result set -- category counts, price range buckets, and brand distributions. The frontend renders these as interactive filter panels:
+
+- **Category facets**: Buttons showing category names with document counts (e.g., "Electronics (42)"). Clicking a category adds it as a URL filter; clicking again removes it.
+- **Price range facets**: Pre-computed price buckets (e.g., "Under $25", "$25-$50"). Clicking a bucket sets `minPrice` and `maxPrice` URL params.
+- **In-stock toggle**: A checkbox that adds `inStock=true` to the URL.
+
+Each facet updates the URL, which triggers a new search, which returns new aggregations reflecting the narrowed result set. This creates a drill-down experience where available filters update dynamically based on the current selection.
+
+### Product Detail Page
+
+The `product.$id.tsx` route is the most data-rich page in the application. It fetches three data sources in parallel:
+
+1. **Product data**: title, price, description, attributes (JSONB), stock quantity, seller info, images
+2. **Recommendations**: "Customers also bought" products from the precomputed `product_recommendations` table
+3. **Reviews**: Customer reviews with a summary (average rating, rating distribution histogram)
+
+The page implements several e-commerce patterns:
+
+- **Image gallery**: Multi-image display with thumbnail selectors. The selected image index is managed via `useState`.
+- **Breadcrumb navigation**: Category-aware breadcrumbs (Home > Category > Product) using the product's `category_slug` and `category_name` fields.
+- **Stock urgency**: When `stock_quantity < 10`, an orange "Only X left - order soon!" message creates urgency.
+- **Discount display**: When `compare_at_price > price`, the page shows the percentage savings and a strikethrough original price.
+- **Add-to-cart feedback**: After a successful add, a green confirmation bar appears for 3 seconds with a "View Cart" link, then auto-dismisses.
+
+### Cart and Checkout Flow
+
+The cart page displays items in a list with quantity selectors (dropdown, max 10 or available stock), delete buttons, and per-item totals. A sticky order summary sidebar shows subtotal, estimated shipping (free over $50), estimated tax (8%), and order total. The "Proceed to Checkout" button navigates to `/checkout`.
+
+The checkout page collects a shipping address (street, city, state, ZIP, country) and shows a mock payment method (demo VISA card). The order summary sidebar is replicated here with a scrollable item list. On submission, `api.createOrder()` sends the address and payment method to the backend. The backend atomically converts cart reservations into an order, deducts inventory, and returns the created order. The frontend navigates to `/orders/$id` to show the order confirmation.
+
+This flow demonstrates the inventory reservation pattern: items in the cart have reserved inventory (30-minute expiry), and checkout converts those reservations into permanent deductions.
+
+### Data Fetching Patterns
+
+The API client (`services/api.ts`) uses a session-header approach rather than cookies: the `request()` helper reads `sessionId` from `localStorage` and attaches it as an `X-Session-Id` header on every request. This pattern works with APIs that do not set cookies (e.g., stateless session validation via a database lookup).
+
+**Parallel fetching**: The home page, product page, and category page all use `Promise.all` to fetch independent data sources simultaneously.
+
+**Cart state synchronization**: Every cart mutation returns the complete cart state from the server, and the frontend replaces its entire cart state with the response. This "replace all" approach avoids incremental state drift between client and server.
+
+### Recommendations Display
+
+The product page fetches "Customers also bought" recommendations and displays them in a horizontal 5-column grid below the product details. Each recommendation shows a thumbnail, title (truncated to 2 lines via `line-clamp-2`), and price. Clicking a recommendation navigates to that product's detail page via TanStack Router's `Link` component. Recommendations are pre-computed by a nightly batch job and cached in Valkey, so the fetch is sub-millisecond.
+
+### Loading States and Skeleton Screens
+
+Every page renders skeleton placeholders during data loading using Tailwind's `animate-pulse` class. The home page shows a full-width gray rectangle for the hero banner and a 4-column grid of gray rectangles for products. The search page shows a 3-column grid of skeleton cards. The product page shows a 2-column layout skeleton (image square + text blocks). These skeletons provide visual stability during loading, preventing layout shift when real content arrives.
+
+### Key UI Patterns
+
+- **Global header**: Persistent header with logo, search bar (navigates to `/search` with query), category navigation links, and cart badge showing `cartStore.itemCount`
+- **Product cards**: Reusable `ProductCard` component showing image, title (2-line clamp), star rating, review count, price, and discount badge. Used on home page, search results, and category pages.
+- **Review system**: `ReviewCard` component showing star rating, reviewer name, date, title, content, and "Helpful" button. `ReviewSummaryCard` shows average rating, total review count, and star-distribution histogram (5-star to 1-star bar chart).
+- **Deals section**: Filters products where `compare_at_price > price` and shows discount percentage badges
+- **Sticky sidebar**: Cart and checkout pages use `sticky top-4` on the order summary sidebar so it stays visible while scrolling through items
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation assumes no prior knowledge of the pattern.
+
+### Role-Based Access Control (RBAC)
+
+RBAC restricts what actions a user can perform based on their assigned role. Instead of maintaining a permission list per user (which becomes unmanageable at scale), you define roles, assign permissions to roles, and assign roles to users.
+
+In this project, there are three roles: `user`, `seller`, and `admin`. A `user` can browse products, manage their cart, place orders, and write reviews. A `seller` inherits all user capabilities and can additionally manage their product listings and view their sales. An `admin` inherits all capabilities and can additionally manage all products, update order statuses, and access the admin dashboard.
+
+The role is stored in the `users` table as a `CHECK` constraint (`role IN ('user', 'admin', 'seller')`), which means the database itself rejects invalid role values. On the backend, authentication middleware reads the session, loads the user's role, and attaches it to the request context. Route-level middleware then checks the role against the endpoint's requirements. For example, `PUT /api/admin/orders/:id/status` requires `role = 'admin'`.
+
+On the frontend, the header conditionally renders admin links only when `user.role === 'admin'`. However, client-side role checks are a UI convenience, not a security boundary -- the backend enforces role requirements regardless of what the frontend sends.
+
+### Redis Cache-Aside
+
+Cache-aside is a caching strategy where the application checks a cache before querying the database. On a cache hit, the cached value is returned immediately (saving the database round-trip). On a cache miss, the application queries the database, writes the result to the cache with a TTL, and returns the result.
+
+In this project, cache-aside is used for three data types:
+
+1. **Sessions**: When a request arrives with an `X-Session-Id` header, the server first checks Valkey for the session data. If cached, authentication completes in < 1ms. If not cached (cold start, after Valkey restart), the server queries the `sessions` table, caches the result, and proceeds.
+
+2. **Recommendations**: The nightly batch job computes "also bought" relationships and stores them in the `product_recommendations` table. Results are cached in Valkey with a 24-hour TTL. Since recommendations change only once per day (after the batch run), the TTL matches the refresh cycle, and nearly all recommendation reads are cache hits.
+
+3. **Cart data**: Cart contents are cached in Valkey for fast retrieval. Every cart mutation invalidates the cache and writes new state, ensuring consistency.
+
+The "aside" means the cache sits alongside the database -- the database is always the source of truth. If Valkey is down, the application falls back to direct database queries, which are slower but correct. This fail-open behavior is preferable to making the entire application unavailable when the cache is down.
+
+### Circuit Breaker
+
+A circuit breaker prevents an application from repeatedly calling a failing service. Without a circuit breaker, if Elasticsearch goes down, every search request would wait for the full 5-second timeout before failing. With 50,000 concurrent search queries per second, this means 50,000 threads blocked for 5 seconds each, which can exhaust the application's connection pool and crash it -- a cascading failure.
+
+The circuit breaker has three states:
+
+- **CLOSED** (normal): Requests pass through. The breaker tracks failures. When failures exceed a threshold (e.g., 60% of the last 10 requests fail), the breaker trips to OPEN.
+- **OPEN** (tripped): Requests immediately fail without calling the downstream service. A fallback response is returned instead. This protects both the application (no wasted resources) and the failing service (no additional load while it recovers).
+- **HALF-OPEN** (testing): After a reset timeout (e.g., 10 seconds), the breaker allows one test request through. If it succeeds, the breaker closes. If it fails, the breaker re-opens.
+
+In this project, three circuit breakers protect critical paths:
+
+- **Elasticsearch** (search): Falls back to PostgreSQL full-text search using a `tsvector` GIN index. The fallback provides degraded search (no facets, lower relevance) but search remains functional.
+- **Payment gateway**: Falls back to queuing the order as `payment_pending`. This means the customer's order is created but payment is not confirmed until the gateway recovers.
+- **Recommendations**: Falls back to returning an empty array. The product page simply does not show the "Customers also bought" section.
+
+The implementation uses the Opossum library (`backend/src/shared/circuitBreaker.ts`). Opossum exposes Prometheus metrics for each breaker's state, enabling dashboards that show when and how often breakers trip.
+
+### Structured Logging
+
+Structured logging emits log entries as JSON objects rather than freeform text. This makes logs machine-parseable, which is essential for a production system handling thousands of requests per second.
+
+Consider a checkout failure. With freeform logging, the operator sees:
+
+```
+ERROR: Order creation failed for user 123 - insufficient inventory for product 456
+```
+
+With structured logging, the same event produces:
+
+```json
+{"level":"error","action":"order.create","userId":123,"productId":456,"reason":"insufficient_inventory","correlationId":"abc-123","timestamp":"2024-01-15T10:30:00Z"}
+```
+
+The structured version enables querying: "show me all `order.create` failures with `reason=insufficient_inventory` in the last hour, grouped by `productId`." This reveals patterns (e.g., product 456 is consistently oversold because the reservation cleanup job is delayed).
+
+In this project, structured logging uses Pino (`backend/src/shared/logger.ts`). Every request gets a `correlationId` UUID that is attached to all log entries for that request. This `correlationId` is also stored in the `audit_logs` table, enabling correlation between application logs and the audit trail. Related events across service boundaries (e.g., an order creation that triggers a recommendation recomputation) share the same `correlationId`.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that scrapes application metrics via HTTP. The application exposes counters, gauges, and histograms at `GET /metrics`, and Prometheus periodically fetches this data.
+
+Key metrics in this project:
+
+- `inventory_reservations_total{product_id, status}` (Counter): Tracks how many inventory reservations succeed vs. fail. A high failure rate for a specific product means it is frequently out of stock.
+- `cart_abandonments_total` (Counter): Counts expired cart reservations (the background job releases them). A high abandonment rate might indicate the 30-minute reservation window is too short.
+- `order_value_dollars` (Histogram): Tracks order value distribution across buckets. Useful for detecting anomalies (e.g., a sudden spike in $0 orders might indicate a pricing bug).
+- `search_latency_seconds{query_type}` (Histogram): Tracks search latency, labeled by whether Elasticsearch or the PostgreSQL fallback was used. This shows the performance impact when the circuit breaker trips.
+- `circuit_breaker_state{service}` (Gauge): Shows whether each circuit breaker is open (1) or closed (0).
+
+SLIs are derived from these metrics. For example, the checkout success rate SLI is computed as `rate(checkouts_total{status="success"}[5m]) / rate(checkouts_total[5m])` with a 99% target. An alert fires when this drops below 98%.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. In an e-commerce context, it prevents bots from scraping the product catalog, price monitoring scripts from overwhelming search, and automated checkout tools from buying all flash-sale inventory.
+
+Note: rate limiting is listed under "What Was Omitted" in this project's implementation notes. The architecture describes the pattern because a production deployment would require it, but the local implementation does not include per-user or per-IP rate limits. At production scale, rate limits would be applied at the API gateway layer using sliding window counters in Valkey, with different limits per endpoint (e.g., 100 searches/minute vs. 10 checkout attempts/minute).
+
+### Idempotency
+
+Idempotency ensures that retrying the same operation produces the same result. In e-commerce, this prevents the most dangerous failure mode: charging a customer twice for the same order.
+
+The checkout endpoint requires an `Idempotency-Key` header (e.g., `order-user123-1705432800-abc123`). The flow:
+
+1. The server attempts `INSERT INTO idempotency_keys (key, status) VALUES ($key, 'processing') ON CONFLICT DO NOTHING`.
+2. If the insert succeeds (new key), proceed with order creation.
+3. If the insert does nothing (key exists), check the existing record's status:
+   - `status = 'completed'`: Return the cached response (duplicate request handled).
+   - `status = 'processing'`: Return 409 Conflict (concurrent duplicate detected).
+   - `status = 'failed'`: Allow retry by updating status to `'processing'`.
+
+The implementation (`backend/src/shared/idempotency.ts`) stores both the request parameters and the response in the idempotency record. This means a successful retry returns exactly the same response as the original request, including the same order ID and total.
+
+Keys have a 24-hour TTL enforced by an hourly cleanup job. The table uses a single-column primary key (`VARCHAR(255)`) rather than a composite key, making lookups fast.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report service status. They are consumed by three types of systems:
+
+1. **Load balancers**: Route traffic only to healthy instances. An unhealthy instance is removed from the pool until it recovers.
+2. **Container orchestrators** (Kubernetes): Restart containers that fail liveness checks. Delay traffic to containers that fail readiness checks (still initializing).
+3. **Monitoring dashboards**: Show real-time service health for operators.
+
+In this project, three health check endpoints are implemented:
+
+- `GET /api/health` (liveness): Returns 200 if the HTTP server is responsive. No dependency checks -- just confirms the process is alive.
+- `GET /api/health/ready` (readiness): Returns 200 only when PostgreSQL, Valkey, and Elasticsearch connections are established. A newly started instance returns 503 until all connections are ready.
+- `GET /api/health/detailed`: Returns per-dependency status as a JSON object: `{"postgres":"healthy","redis":"healthy","elasticsearch":"degraded","overall":"degraded"}`. Each dependency is tested with a lightweight operation (`SELECT 1`, `PING`, `GET _cluster/health`) with a 2-second timeout.
+
+The detailed endpoint distinguishes between "unhealthy" (critical dependency down -- PostgreSQL) and "degraded" (non-critical dependency down -- Elasticsearch, which has a PostgreSQL fallback). This helps operators prioritize their response: "unhealthy" means pages are broken, "degraded" means some features are slower.
+
 ## Implementation Notes
 
 This section documents the actual local implementation and maps production-scale design to what runs on Docker + Node.js + React.

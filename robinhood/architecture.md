@@ -645,3 +645,154 @@ On SIGTERM:
 - SEC/FINRA regulatory compliance logging
 - Order history export
 - Database connection pooling (PgBouncer)
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── /login ─── LoginPage (unauthenticated)
+├── /register ─── RegisterPage (unauthenticated)
+└── Header + <Outlet> (authenticated)
+    ├── / ─── HomePage (auth-guarded via beforeLoad)
+    │   ├── PortfolioSummary (total value, buying power, day P&L)
+    │   ├── HoldingsList (positions with real-time prices)
+    │   └── RecentActivity (latest 5 orders)
+    ├── /stock/$symbol ─── StockDetailPage (dynamic route)
+    │   ├── PriceDisplay (real-time quote with color-coded change)
+    │   ├── Position info (shares, market value, avg cost, P&L)
+    │   ├── Statistics grid (open, high, low, volume, 52W, P/E)
+    │   ├── TradeForm (buy/sell with order type selection)
+    │   └── AddToWatchlistModal
+    ├── /stocks ─── StocksPage (all available symbols)
+    ├── /orders ─── OrdersPage (full order history)
+    └── /watchlist ─── WatchlistPage
+        └── Watchlist (CRUD for watchlists + items)
+```
+
+The root layout provides a persistent `Header` component with navigation links. Auth guards are implemented via TanStack Router's `beforeLoad` hook on protected routes -- if `useAuthStore.getState().isAuthenticated` is false, the hook throws a `redirect({ to: '/login' })`. This is a synchronous check against the persisted Zustand store (no async API call), so route transitions are instant.
+
+### Routing (TanStack Router, File-Based)
+
+Routes are defined under `frontend/src/routes/`. The project includes one dynamic route segment: `/stock/$symbol` (`stock.$symbol.tsx`), where `$symbol` is the stock ticker. The `useParams` hook extracts the symbol for API calls and WebSocket subscriptions. A separate `router.ts` file configures the TanStack router instance. The route tree is auto-generated at `routeTree.gen.ts`.
+
+### Zustand Stores
+
+Three Zustand stores manage distinct domains with clear boundaries:
+
+**`useAuthStore`** -- Manages user identity, session token, and auth lifecycle. Uses Zustand's `persist` middleware to save `user`, `token`, and `isAuthenticated` to `localStorage` via `partialize` (only persisting those three fields, not `isLoading` or `error`). The token is also stored separately in `localStorage` under the key `token` for the WebSocket service to access outside of React. Provides `login`, `register`, `logout`, and `clearError` actions.
+
+**`useQuoteStore`** -- Manages real-time stock quote data and the WebSocket connection lifecycle. The core data structure is a `Map<string, Quote>` mapping stock symbols to their current quote data. The `initializeConnection` action initializes the WebSocket service (a singleton), registers message and connection state handlers, and is guarded by a module-level `initialized` flag to prevent duplicate connections. When quote updates arrive via WebSocket, the handler creates a new `Map` (for React immutability detection) and updates all changed symbols. Components access individual quotes via `getQuote(symbol)` and manage subscriptions via `subscribe(symbols)` and `unsubscribe(symbols)`.
+
+**`usePortfolioStore`** -- Manages portfolio holdings, orders, watchlists, and price alerts. This is the largest store with 15+ actions. The `placeOrder` action calls the API and then refreshes both portfolio and orders via `Promise.all` to ensure the UI reflects the new position immediately. Watchlist mutations (`addToWatchlist`, `removeFromWatchlist`) use optimistic updates -- they update the store immediately and do not re-fetch from the server.
+
+### Real-Time Data: WebSocket Service
+
+The `WebSocketService` class (`frontend/src/services/websocket.ts`) is a singleton that manages the WebSocket connection to the backend. Key behaviors:
+
+**Connection management:** Connects to `ws://<host>:3001/ws?token=<session-token>`. The token is read from `localStorage` (not the Zustand store) to avoid React dependency. The service tracks connection state and prevents duplicate connections via an `isConnecting` flag.
+
+**Automatic reconnection:** When the WebSocket closes (server restart, network interruption), the service schedules a reconnection attempt after 3 seconds. On reconnection, it automatically re-subscribes to all previously subscribed symbols, so components do not need to re-subscribe manually.
+
+**Subscription management:** Components subscribe to specific stock symbols. The service maintains a `subscribedSymbols` Set and sends subscribe/unsubscribe messages to the server. The server then filters quote updates to only include subscribed symbols, reducing network bandwidth.
+
+**Message handling:** The service uses an observer pattern -- components register message handlers via `onMessage()`, which returns a cleanup function. When a `quotes` message arrives (an array of Quote objects), all registered handlers are notified. The quote store's handler updates its `Map` with the new data.
+
+### Data Fetching Pattern
+
+REST API calls are centralized in `frontend/src/services/api.ts`, organized by domain: `authApi`, `quotesApi`, `ordersApi`, `portfolioApi`, and `watchlistsApi`. A generic `fetchApi<T>()` wrapper injects the Bearer token from `localStorage`, handles JSON serialization, and throws on non-OK responses.
+
+Data fetching is split between two channels:
+1. **REST API** for transactional operations (placing orders, managing watchlists, fetching portfolio) -- used in Zustand store actions triggered by `useEffect` on mount.
+2. **WebSocket** for real-time quote streaming -- used via the quote store, which updates its `Map` reactively as messages arrive.
+
+The stock detail page (`/stock/$symbol`) demonstrates both channels: it fetches stock details (company info, fundamentals) via REST on mount, while subscribing to the symbol's real-time quotes via WebSocket in a `useEffect` with cleanup (`unsubscribe` on unmount).
+
+### Key UI Patterns
+
+**Portfolio Dashboard (HomePage):** A two-column layout. The main column shows `PortfolioSummary` (total portfolio value, buying power, day P&L with color coding) and `HoldingsList` (each position with real-time market value computed from WebSocket quotes). The sidebar shows `RecentActivity` (latest 5 orders with status badges). The dark theme (`bg-robinhood-gray-800`) with green/red accent colors mirrors Robinhood's visual identity.
+
+**Stock Detail Page (/stock/$symbol):** A two-column layout with stock information on the left (real-time price display, position details if held, statistics grid, company description) and the `TradeForm` on the right. The `PriceDisplay` component updates in real-time as WebSocket quotes arrive, with color-coded change values (green for positive, red for negative). The statistics grid shows 8 metrics (open, high, low, volume, 52W high/low, market cap, P/E ratio) with human-readable formatting (K/M/B suffixes for volume and market cap).
+
+**Trade Form:** A form supporting buy/sell sides and four order types (market, limit, stop, stop-limit). The side toggle is a pair of pill buttons. Order type selection conditionally shows limit price and/or stop price inputs. Quantity and prices are validated client-side. On submission, the order is placed via the portfolio store's `placeOrder` action, which refreshes portfolio and orders after the API call completes.
+
+**Real-Time Price Updates:** The `PriceDisplay` component in `QuoteDisplay.tsx` takes a `Quote` object and renders the current price, dollar change, and percentage change. It supports a `size` prop for different display contexts (compact for lists, large for the stock detail header). The component re-renders whenever the quote store updates with new data for its symbol -- this happens every ~1 second for subscribed symbols.
+
+**Skeleton Loading:** The stock detail page uses animated pulse placeholders (`animate-pulse` with `bg-robinhood-gray-700` blocks) that match the shape of the actual content, providing a polished loading experience.
+
+### Type Safety
+
+Domain types are defined in `frontend/src/types/index.ts`: `User`, `Quote` (with all 11 fields from the backend), `Order` (with full lifecycle status), `Portfolio` (with holdings array), `Position` (with P&L fields), `Watchlist`, `WatchlistItem`, and `PriceAlert`. The WebSocket service types (`MessageHandler`, `ConnectionHandler`) are defined locally in the service file.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in this project. Each explanation assumes no prior knowledge of the pattern.
+
+### Idempotency
+
+**What it is:** Idempotency is a property of an operation where performing it multiple times produces the same result as performing it once. For a stock trading platform, it means that if a user clicks "Buy 10 shares of AAPL" and the network drops, retrying the request will not place a second order.
+
+**Why it matters for order placement:** A duplicate buy order means the user owns 20 shares instead of 10, and their buying power is reduced by double the expected amount. Unlike a duplicate charge (which can be refunded), a duplicate stock order may execute at a different price, creating a position the user never intended. The user might not notice until they see an unexpected loss, and reversing a filled order requires selling at the current market price -- potentially at a loss.
+
+**How it works here:** The client sends an `X-Idempotency-Key` header with each order. The server uses Redis `SET NX` (set-if-not-exists) to atomically claim the key. The idempotency service (`backend/src/shared/idempotency.ts`) exposes five methods: `check` (is this key known?), `start` (claim the key as pending), `complete` (store the result), `fail` (mark the key as failed so it can be retried), and `remove` (clean up). If Redis is unavailable, the system fails open (allows the request through) rather than blocking all orders -- a deliberate trade-off favoring availability over duplicate prevention.
+
+### Redis Cache-Aside (Quote Cache)
+
+**What it is:** Cache-aside is a caching strategy where the application checks the cache first, queries the database on a cache miss, and stores the result in the cache for future reads. The application is responsible for managing the cache -- it is not automatically populated.
+
+**Why it matters:** The quote service generates 20 quote updates per second (one per simulated stock). The REST API endpoint `GET /api/quotes/:symbol` needs to return the current quote instantly without querying the quote service's in-memory state (which may be on a different process or machine in production). Redis serves as the shared quote cache that all API instances can read from.
+
+**How it works here:** Each second, the quote service writes all 20 quotes to Redis as hashes (`quote:<SYMBOL>`). When the REST API receives a quote request, it reads from Redis. There is no TTL -- quotes are overwritten every second, so staleness is bounded to 1 second. This is a write-through pattern (the quote service writes to cache proactively) rather than a traditional cache-aside (read-triggered), but the Redis data structure and access pattern are the same. The Redis `HSET` / `HGETALL` commands provide efficient partial reads when only specific quote fields are needed.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker prevents an application from making calls to a service that is known to be failing. It operates in three states: CLOSED (requests pass through normally), OPEN (requests fail immediately without trying), and HALF_OPEN (a single test request is allowed to check if the service has recovered).
+
+**Why it matters:** The trading platform depends on three external systems: market data feeds, Redis (for quote caching and publishing), and PostgreSQL (for order persistence). If Redis goes down and the quote service keeps trying to publish quotes, each attempt waits for the connection timeout (3 seconds), blocking the quote update loop. With 20 stocks updating per second, this creates a 60-second backlog in under a minute. The circuit breaker detects the failure pattern and stops trying, allowing the quote service to continue updating its in-memory state even if Redis is unavailable.
+
+**How it works here:** The implementation uses the Opossum library (`backend/src/shared/circuitBreaker.ts`) with a factory function `createCircuitBreaker` that wraps any async function. Three breakers are configured: market data (3s timeout, 50% error threshold over 5 requests, 30s reset), Redis publish (same thresholds), and database (same thresholds). Each breaker has a specific fallback: market data returns the last known quote, Redis publish is silently skipped (quotes are still in memory), and database returns 503. Circuit breaker state is exposed as a `circuit_breaker_state` Prometheus gauge with the breaker name as a label.
+
+### Structured Logging
+
+**What it is:** Structured logging produces log entries as JSON objects with consistent, queryable fields rather than free-form text. Each entry has a standard schema (timestamp, level, service, context fields) that log analysis tools can parse, index, and query.
+
+**Why it matters:** In a multi-process trading system (API server, quote broadcaster, portfolio updater), a single order placement generates log entries across multiple processes. When debugging why an order was rejected, you need to correlate entries by `orderId` across the API server (where the order was received), the order execution service (where it was filled or rejected), and the portfolio updater (where positions were updated). Structured logs with a shared `orderId` field make this correlation a single query.
+
+**How it works here:** Pino is configured (`backend/src/shared/logger.ts`) with context fields: `service` (which process -- api, quote-broadcaster, portfolio-updater), `port` (which instance), `requestId`, `userId`, `orderId`, and `symbol`. In development, Pino's pretty-print transport formats logs with colors for readability. In production, raw JSON is emitted for ingestion by a log aggregator. Child loggers are created per request to carry context through all downstream calls.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a monitoring system that collects numeric measurements (metrics) from applications by scraping an HTTP endpoint at regular intervals. Metrics answer questions about system behavior over time: "How many orders were placed in the last hour?" "What is the 95th percentile order execution latency?" "How many WebSocket connections are active right now?"
+
+**Why it matters:** For a trading platform, metrics are the primary operational signal. A spike in `orders_rejected_total` indicates a systemic issue (perhaps the quote service is lagging, causing stale price checks). A drop in `websocket_connections` suggests a connectivity problem. A sustained increase in `order_execution_duration_ms` p99 signals database contention. These patterns are invisible in logs -- they only emerge from aggregated numeric measurements over time windows.
+
+**How it works here:** The implementation uses `prom-client` (`backend/src/shared/metrics.ts`) with 15+ metrics exposed at `/metrics`. Trading metrics include `orders_placed_total` (counter by side and order type), `orders_filled_total`, `orders_cancelled_total`, `orders_rejected_total` (by rejection reason), `order_execution_duration_ms` (histogram), `orders_pending` (gauge by order type), and `execution_value_total` (counter by side -- total dollar volume). Infrastructure metrics include `http_requests_total`, `http_request_duration_ms`, `quote_updates_total`, `websocket_connections` (gauge by authentication status), `circuit_breaker_state`, `idempotency_hits_total`, and `db_pool_size`.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is an authorization model where permissions are assigned to roles (e.g., "user", "admin"), and roles are assigned to users. Instead of checking "does user X have permission to view all orders?", the system checks "does user X have the admin role, and does the admin role include the view-all-orders permission?" This simplifies permission management because adding a new admin user only requires assigning the admin role, not individually granting every permission.
+
+**Why it matters:** A trading platform has different user types with different access needs. Regular users should only see their own portfolio, orders, and watchlists. Administrators need to see all users, monitor system health, manage account statuses, and investigate suspicious activity. Without RBAC, every endpoint would need custom authorization logic. With RBAC, a single middleware checks the user's role against the required role for the endpoint.
+
+**How it works here:** Users have a `role` column in the database with a CHECK constraint limiting values to `user` and `admin`. The auth middleware (`backend/src/middleware/auth.ts`) validates the session token and attaches the full user object (including role) to the request. Protected admin endpoints check `req.user.role === 'admin'` and return 403 Forbidden if the check fails. The role is also included in the persisted Zustand auth store on the frontend, allowing the UI to conditionally render admin-only navigation items.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether an application and its dependencies are functioning correctly. Load balancers use them to route traffic only to healthy instances. Container orchestrators use them to restart failed containers.
+
+**Why it matters:** A trading platform that cannot reach PostgreSQL cannot process orders, but it can still serve cached quotes via Redis. A trading platform that cannot reach Redis cannot cache quotes, but it can still process orders via PostgreSQL. Health checks enable the infrastructure to make informed routing decisions based on which specific capabilities are degraded, rather than treating the instance as entirely up or entirely down.
+
+**How it works here:** A single `/health` endpoint (`backend/src/index.ts`) checks three dependencies: PostgreSQL (via a test query), Redis (via a PING command), and Kafka (via producer metadata request). The response includes the status of each dependency and an overall status. If all three are healthy, the endpoint returns 200. If any dependency is unreachable, the response indicates which one failed, enabling operators to diagnose the issue without logging into the server.
+
+### Audit Logging
+
+**What it is:** Audit logging records a permanent trail of all significant user and system actions. Unlike application logs (which focus on debugging), audit logs focus on accountability: who performed what action, on which resource, at what time, and what was the outcome.
+
+**Why it matters:** For a stock trading platform, regulatory requirements (SEC Rule 17a-4, FINRA Rule 4511) mandate retention of all order-related records. Beyond compliance, audit logs enable fraud investigation ("did this user's IP change to a foreign country before placing unusual orders?") and dispute resolution ("the user claims they never placed that sell order -- the audit log shows it was placed from their verified device").
+
+**How it works here:** The audit service (`backend/src/shared/audit.ts`) records all order placements, fills, cancellations, and rejections with user context (user ID, IP address, user agent). Each entry includes the action type, the resource (order ID, symbol), the outcome (success/failure), and a details field with action-specific metadata. The `audit_entries_total` Prometheus counter tracks audit volume by action and status for monitoring.

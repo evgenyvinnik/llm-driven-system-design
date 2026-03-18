@@ -386,6 +386,135 @@ The 7-day hot retention covers most production debugging (issues are typically f
 | Degradation | Feature-flag based | All or nothing | Core CRUD survives when non-essential features fail |
 | Request logs | Partitioned + archived | Single table | Enables fast queries and O(1) partition drops |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App.tsx (root)
+├── Login                             ← Shown when no auth token
+└── (authenticated)
+    ├── Header                        ← Top bar with user info and logout
+    └── Dashboard                     ← Main admin dashboard
+        ├── StatCard (x4)             ← Uptime, heap used, cache hit rate, total requests
+        ├── MetricsCard               ← System metrics (memory, counters, gauges)
+        ├── RequestsCard              ← Per-endpoint request counts and latency percentiles
+        ├── CircuitBreakersCard       ← Circuit breaker states with reset actions
+        ├── CacheCard                 ← L1/L2 cache hit/miss stats
+        ├── ActionsCard               ← Admin actions (clear cache, reset metrics, test external)
+        └── LoadBalancerCard          ← Server pool status with drain/enable controls
+```
+
+### Zustand Stores
+
+The frontend uses two Zustand stores:
+
+**`useAuthStore`** (`stores/auth.ts`) manages authentication state with `persist` middleware that saves the session token to localStorage under the key `auth-storage`. It stores a `token` string, a `User` object, and loading/error state. The `login` action calls `api.login()`, stores the returned token and user, and persists the token across page refreshes. The `checkAuth` action uses the stored token to call `api.getMe()` on mount, validating the session is still alive. If validation fails, it clears both token and user, causing the app to re-render with the Login component. The `partialize` option ensures only the `token` is persisted (not the full user object), so the user is always re-validated from the server on load.
+
+**`useDashboardStore`** (`stores/dashboard.ts`) manages dashboard metrics with auto-refresh. It stores the full `DashboardData` response (metrics, circuit breakers, cache stats), load balancer status, timestamps, and refresh configuration. The `fetchDashboard` action reads the token from `useAuthStore.getState()` (cross-store access) and calls the admin dashboard API. The store supports configurable auto-refresh via `autoRefresh` (boolean toggle) and `refreshInterval` (default 5 seconds), controlled by the Dashboard component via `setInterval`. The `fetchLbStatus` action fetches load balancer pool status from a separate endpoint (`/lb/status`).
+
+### Routing
+
+This project uses a simple conditional rendering approach rather than TanStack Router. The `App` component checks `useAuthStore.token`: if null, it renders the `Login` component; if present, it renders the `Header` and `Dashboard`. There is no URL-based routing because the application has only two views (login and dashboard). On mount, `App` calls `checkAuth()` and shows a loading spinner until the session check completes.
+
+### Data Fetching
+
+All API communication flows through a singleton `ApiClient` class in `services/api.ts`. The client wraps `fetch()` with token-based `Authorization: Bearer` headers, JSON content type, and error handling. It exposes methods for auth (`login`, `logout`, `getMe`), admin operations (`getDashboard`, `getCircuitBreakers`, `resetCircuitBreaker`, `getMetrics`, `resetMetrics`, `getCacheStats`, `clearCache`), resource CRUD (`getResources`), and external service testing (`callExternalService`). The gateway URL base is `/api/v1`, and all requests pass through the API gateway on port 8080 (proxied by Vite in development). The Dashboard component triggers a fetch on mount and optionally re-fetches on a configurable interval.
+
+### Key UI Patterns
+
+**Auto-refreshing dashboard**: The `Dashboard` component uses `setInterval` tied to `useDashboardStore.autoRefresh` and `refreshInterval` to poll the admin stats endpoint every 5 seconds. A checkbox toggle lets users pause auto-refresh during debugging. The `lastUpdated` timestamp shows when data was last fetched.
+
+**Stat cards with icons**: The dashboard displays four top-level `StatCard` components (uptime, heap usage, cache hit rate, total requests) using SVG path data mapped from icon names. Each card shows a title, primary value, optional subtitle, and colored icon.
+
+**Circuit breaker visualization**: The `CircuitBreakersCard` displays each circuit breaker's name, current state (closed/open/half-open), failure count, and call statistics. Admin users can reset individual breakers.
+
+**Admin actions panel**: The `ActionsCard` provides one-click buttons for operational tasks: clearing the Redis cache, resetting metrics counters, and triggering a test call to an external service (to demonstrate circuit breaker behavior).
+
+**Load balancer status**: The `LoadBalancerCard` shows the server pool with per-server health, active connections, and drain/enable controls for deployment workflows.
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project from first principles. Each pattern solves a specific operational problem that emerges at scale.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing downstream service from dragging down the entire application. The name comes from electrical circuit breakers that trip to prevent a short circuit from causing a fire.
+
+The pattern works through three states. In the **closed** state (normal operation), all requests pass through to the downstream service. The circuit breaker silently tracks the success/failure ratio of recent calls. When the failure count crosses a threshold (configured at 5 failures in this project), the breaker transitions to the **open** state. In the open state, all requests fail immediately with a pre-defined error -- the application does not even attempt to call the downstream service. This is the key benefit: instead of every request waiting 30 seconds for a timeout against a dead service (which exhausts connection pools and causes cascading failures), requests fail in 0 milliseconds. After a 30-second timeout, the breaker enters the **half-open** state, allowing 3 test requests through. If those succeed, the breaker closes and normal traffic resumes. If they fail, the breaker reopens.
+
+This project implements per-dependency circuit breakers, meaning the database, Redis, and external services each have their own independent breaker. If Redis goes down, only cache operations fail fast -- database queries and API responses continue working normally. A single global circuit breaker would be catastrophic because one failing dependency would shut down all functionality.
+
+**File**: `shared/services/circuit-breaker.ts`
+
+### Redis Cache-Aside (Two-Level)
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache hit, the cached value is returned immediately. On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it to the caller.
+
+This project extends the basic pattern with two cache levels. **L1 (local in-memory cache)** lives inside each API server process with a 5-second TTL. **L2 (Redis)** is shared across all API server instances with configurable TTLs (5-30 minutes depending on data type). When a request arrives, the server checks L1 first (sub-millisecond, no network hop). On L1 miss, it checks L2 Redis (1-2ms network round-trip). On L2 miss, it queries PostgreSQL (10-50ms), stores the result in both L2 and L1, and returns it.
+
+The `getOrFetch()` helper method encapsulates this pattern: it takes a cache key and a fetcher function, checks both cache levels, and automatically populates caches on miss. Cache invalidation uses pattern-based deletion -- when a resource is updated, both `resources:detail:{id}` and `resources:list:*` keys are deleted from Redis, and L1 caches across all instances expire naturally within 5 seconds.
+
+The two-level approach reduces Redis round-trips by 80-90% for hot data. The 5-second L1 TTL is short enough that staleness is bounded (at most 5 seconds of stale data), while long enough to absorb burst traffic where the same key is requested hundreds of times per second. The trade-off is that each API server instance has a slightly different view of the cache for up to 5 seconds.
+
+**File**: `shared/services/cache.ts`
+
+### Structured Logging
+
+Structured logging means writing log entries as machine-parseable data (typically JSON) rather than free-form text strings. Traditional logs look like `"User 123 logged in from 192.168.1.1"` -- a human can read this, but extracting the user ID or IP address programmatically requires fragile regex parsing. Structured logs look like `{"event":"login","userId":"123","ip":"192.168.1.1","timestamp":"2025-01-01T00:00:00Z"}` -- every field is a named key-value pair that log aggregation tools (Elasticsearch, Datadog, CloudWatch) can index, search, and alert on.
+
+This project uses Pino, a high-performance Node.js logging library that outputs JSON in production and pretty-printed text in development. Each log line includes `instanceId` (which API server handled the request), `requestId` (for correlating logs across services), `userId`, `method`, `path`, `status`, and `duration`. The `instanceId` field is critical in this project because three API server instances run behind a load balancer -- when debugging a slow request, you need to know which instance served it.
+
+**File**: `shared/services/logger.ts`
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements (metrics) from applications at regular intervals. The application exposes an HTTP endpoint (`/metrics`) that returns current metric values in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+There are four main metric types. **Counters** only go up (total requests served, total errors). **Gauges** go up and down (current memory usage, active connections). **Histograms** track the distribution of values (request duration buckets, so you can compute p50/p90/p99 latencies). **Summaries** are similar to histograms but compute quantiles on the client side.
+
+This project tracks per-endpoint metrics: request count, duration histograms (with p50/p90/p99 computation), and error counts, all labeled by `method:path`. It also tracks cache-specific metrics: L1 hits, L2 (Redis) hits, and cache misses, enabling tuning of TTLs based on actual hit ratios. Circuit breaker state changes are also tracked, allowing alerts when a breaker opens. The admin dashboard in the frontend renders these metrics in a human-readable format, but at production scale they would feed into Grafana dashboards with alerting rules.
+
+**File**: `shared/services/metrics.ts`
+
+### Rate Limiting (Sliding Window)
+
+Rate limiting restricts how many requests a client can make within a time window, protecting the server from abuse, accidental loops, and denial-of-service attacks. Without rate limiting, a single misbehaving client could consume all server resources and deny service to legitimate users.
+
+This project implements a **sliding window** algorithm using Redis sorted sets. Each rate limit entry is a sorted set where the score is the request timestamp. When a request arrives: (1) remove all entries older than the window size (`ZREMRANGEBYSCORE`), (2) count remaining entries (`ZCARD`), (3) if under the limit, add the current timestamp (`ZADD`). These three operations execute as an atomic Redis pipeline, ensuring correctness even when multiple API server instances check the same key concurrently.
+
+The sliding window is superior to fixed windows for user experience. A fixed 100-requests-per-minute window allows all 100 requests in the first second, then blocks for 59 seconds -- a burst-then-starve pattern that frustrates API consumers. The sliding window spreads the budget evenly across time.
+
+Rate limits are tiered by user subscription level: anonymous (100/min), free (1K/min), pro (10K/min), enterprise (100K/min). The API key's tier determines which limit applies. Critically, the rate limiter uses a **fail-open** design: if Redis is unreachable, rate limiting is skipped rather than blocking all traffic. A brief period without rate limiting is acceptable; blocking all API traffic because the rate limiter is down is not.
+
+**File**: `shared/services/rate-limiter.ts`
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the application is functioning correctly. Load balancers, container orchestrators (Kubernetes), and monitoring systems call this endpoint periodically to determine if an instance should receive traffic.
+
+This project implements two health check variants. The `/health` endpoint verifies both database (PostgreSQL) and cache (Redis) connectivity by running simple test queries. If both succeed, it returns `200 OK`; if either fails, it returns `503 Service Unavailable` with details about which dependency is down. The `/ready` endpoint is a readiness probe -- it confirms the application is fully initialized and all dependencies are connected, making it safe for the load balancer to route traffic. The load balancer in this project runs health checks every 5 seconds against each API server instance and removes servers that fail 3 consecutive checks from the pool.
+
+At production scale, health checks typically distinguish between **liveness** (is the process running and not deadlocked?) and **readiness** (can the process serve traffic?). A failing liveness check restarts the container. A failing readiness check removes the instance from the load balancer pool without restarting it -- useful during startup when the database connection pool is warming up.
+
+**Files**: `gateway/src/index.ts`, `load-balancer/src/index.ts`
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This is critical in distributed systems where network failures cause retries: if a client sends a `POST /resources` request and the network drops the response (but the server processed it), the client will retry, potentially creating a duplicate resource.
+
+The solution is an idempotency key. The client includes a unique `X-Idempotency-Key` header with each request. The server checks this key against a Redis cache before processing. If the key exists, the server returns the cached response from the first execution without re-processing. If the key does not exist, the server processes the request, caches the response (with a 24-hour TTL), and returns it. This guarantees exactly-once semantics from the client's perspective, even with multiple retries.
+
+In this project, API key revocation is inherently idempotent (revoking an already-revoked key returns success), but resource creation is not idempotent by default. At production scale, the idempotency key mechanism would be implemented as middleware that intercepts all state-changing requests.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user (which becomes unmanageable with thousands of users), you define roles like "user" and "admin" and assign a set of permissions to each role.
+
+In this project, the `users` table has a `role` column with values `'user'` or `'admin'` (enforced by a CHECK constraint). Regular users can access resource CRUD endpoints and their own API keys. Admin users can additionally access system statistics (`/admin/stats`), server pool management (`/admin/servers`), and server drain/enable controls. The API key system adds another authorization dimension: each key has a `scopes` array that restricts which endpoints the key can access, and a `tier` that determines rate limits.
+
+The key advantage of RBAC over direct permission assignment is scalability of administration: when a new endpoint is added, you update the role's permission set once rather than granting access to every individual user. The trade-off is that roles can become too coarse-grained, leading to either over-privileged users (admin role has access to everything) or role explosion (creating dozens of fine-grained roles).
+
 ## Implementation Notes
 
 ### Local Setup Diagram

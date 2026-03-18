@@ -399,6 +399,142 @@ Each API server maintains a pool of 20 PostgreSQL connections. With 3 servers, t
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS, styled with PayPal brand colors. It provides a consumer-facing P2P payment experience with send, request, and wallet management flows.
+
+```
+__root.tsx (RootComponent)
+├── Header (PayPal-branded nav: Dashboard, Send, Request, Activity, Wallet)
+├── checkAuth() on mount to restore session
+└── <Outlet /> renders child routes:
+    ├── /login ──────────── Login (username + password)
+    ├── /register ────────── Register (username, email, password)
+    ├── / ──────────────── Dashboard
+    │   ├── WalletCard (gradient card showing balance, currency)
+    │   ├── QuickActions (Send/Request shortcut buttons)
+    │   ├── RequestCard (pending incoming/outgoing requests with Pay/Decline actions)
+    │   └── TransactionList → TransactionItem (recent activity)
+    ├── /send ──────────── Send Money
+    │   ├── UserSearch (debounced search by name/email)
+    │   └── SendMoneyForm (amount, note, idempotency key generation)
+    ├── /request ────────── Request Money
+    │   ├── UserSearch
+    │   └── RequestMoneyForm (amount, note)
+    ├── /activity ────────── Activity
+    │   ├── ActivityFilters (type filter: all/transfer/deposit/withdrawal)
+    │   └── TransactionList → TransactionItem
+    └── /payment-methods ─── Payment Methods
+        ├── PaymentMethodCard (card/bank display with delete + set default)
+        └── AddPaymentMethodModal (modal form for adding new methods)
+```
+
+### Zustand Store
+
+**`authStore`**: Manages the current user session. Stores the `User` object (or null), loading state, and error messages. Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. The `checkAuth()` action calls `GET /api/auth/me` on app mount (triggered in `__root.tsx` via `useEffect`) to restore the session from the HTTP-only cookie. Unlike the payment-system project, this store is not persisted to localStorage because session state lives in the server-side cookie.
+
+### Routing
+
+Uses TanStack Router with file-based routing. Routes: `/` (dashboard), `/send`, `/request`, `/activity`, `/payment-methods`, `/login`, `/register`. The root component calls `checkAuth()` on mount to verify the session. Individual routes check `user` from the auth store and redirect to login if null.
+
+### Data Fetching
+
+API calls use a centralized `request<T>()` function in `frontend/src/services/api.ts` that sets `credentials: 'include'` (for cookie-based session auth), adds JSON content type, and throws errors with the server message. The API service is organized into domain-specific objects: `authApi`, `walletApi`, `transfersApi`, `requestsApi`, `paymentMethodsApi`, and `usersApi`.
+
+Data fetching is done with `useEffect` + `useState` in route components. The send flow generates client-side idempotency keys (`Date.now()` + random string) before calling `transfersApi.send()`.
+
+### Key UI Patterns
+
+- **Wallet card**: Gradient card (PayPal brand colors) displaying balance in cents converted to dollars, currency label, and user info
+- **User search with debounce**: The `UserSearch` component debounces input and calls `usersApi.search()` to find recipients by name, username, or email. Results are displayed as selectable cards.
+- **Request flow with inline actions**: Pending requests appear on the dashboard with Pay and Decline buttons. Paying triggers a transfer; declining updates the request status. Each action refreshes the request list.
+- **Activity type filters**: Tab-style filter buttons (All, Transfers, Deposits, Withdrawals) that pass the type parameter to the API and re-fetch the transaction list
+- **Status badges**: `StatusBadge` component renders colored pills for request statuses (pending, paid, declined, cancelled)
+- **Modal for payment methods**: `AddPaymentMethodModal` overlays the page for adding a new card or bank account without navigating away
+- **Transaction list with signed amounts**: `TransactionItem` shows positive amounts (green) for credits and negative amounts (red) for debits, with the counterparty name and note
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in this project. Each explanation assumes no prior familiarity with the pattern.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking individual user IDs against an access list (which becomes unmanageable as the team grows), you define roles like "user" and "admin" with specific allowed actions. When a request arrives, middleware checks the user's role against the required permission.
+
+In this project, users have a `role` column (default `'user'`). The schema supports admin operations, though the current implementation focuses on the user role. RBAC prevents unauthorized actions -- a regular user cannot access admin endpoints, and authorization checks on the request flow ensure only the payer can pay or decline a request, and only the requester can cancel it. This per-resource ownership check is a common extension of RBAC for user-owned resources.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache miss, the application queries the database, writes the result to the cache with a TTL, and returns it. On a cache hit, the cached value is returned directly, skipping the database entirely.
+
+In this project, Valkey (Redis-compatible) stores user sessions with a TTL. While the primary data (wallets, transactions, idempotency keys) lives in PostgreSQL for consistency, sessions are stored in Redis because they are ephemeral -- losing a session means the user re-authenticates, not that money is lost. The cache-aside pattern could be extended to wallet balances for read-heavy dashboards (a common enhancement noted in the project), but the current implementation prioritizes consistency by always reading balances from PostgreSQL.
+
+The trade-off is that cache-aside introduces staleness risk. For financial balances, even a few seconds of stale data could lead a user to believe they have funds they have already spent. This is why wallet reads go directly to PostgreSQL.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that wraps calls to external or unreliable services. It tracks success and failure rates. When failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit enters "half-open" state, allowing one test request. If it succeeds, the circuit closes and normal traffic resumes.
+
+In this project, Opossum circuit breakers protect external service calls. Configuration: 50% error threshold across 5+ requests opens the circuit; 30-second recovery timeout before half-open test. The purpose is preventing cascading failures. If the database becomes slow (responding in 10 seconds instead of 5 milliseconds), without a circuit breaker every incoming request would pile up waiting for database responses. Within seconds, the connection pool is exhausted, the event loop blocks, and the entire service becomes unresponsive -- even for endpoints that do not need the database. The circuit breaker detects the slowdown, opens, and fails fast, preserving the service for healthy operations.
+
+File: `backend/src/services/circuitBreaker.ts`
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than human-readable text strings. Instead of logging `"User alice sent $50 to bob"`, the system emits `{"event": "transfer.completed", "senderId": "uuid-1", "recipientId": "uuid-2", "amount_cents": 5000, "duration_ms": 23}`.
+
+The benefit is operational: when investigating a failed transfer at 3 AM, you can query `event:transfer.failed AND amount_cents:>100000` in a log aggregator rather than grepping through gigabytes of text. Each field is independently indexable and filterable. Structured logs also enable automated dashboards and alerts -- you can compute transfer failure rates directly from log data without custom parsers.
+
+In this project, Pino produces JSON logs with request context via `pino-http` middleware. Each log entry includes the user ID, request method, URL, response status, and duration. Financial operations add transfer-specific fields (amount, sender, recipient).
+
+File: `backend/src/services/logger.ts`
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system where the application exposes numeric measurements at an HTTP endpoint (`GET /metrics`), and a Prometheus server scrapes this endpoint at regular intervals (every 15-30 seconds). The data is stored as time series and visualized in Grafana.
+
+Four metric types exist: **Counter** (only goes up, e.g., total transfers processed), **Gauge** (goes up and down, e.g., active database connections), **Histogram** (measures value distributions with percentile buckets, e.g., transfer latency), and **Summary** (similar to histogram, computed client-side).
+
+In this project, key metrics include: `transfer_duration_seconds` (histogram for SLO compliance and detecting database contention), `transfer_total{status}` (counter for success rate monitoring), `wallet_operation_total{type}` (counter for volume tracking per operation), `idempotency_hit_total` (counter indicating retry rate -- a high rate suggests client-side connectivity issues), and `http_request_duration_seconds` (histogram for overall API latency).
+
+File: `backend/src/services/metrics.ts`
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single user (or attacker) could send thousands of requests per second, overwhelming the server and degrading performance for everyone else.
+
+The implementation uses `express-rate-limit` with a Redis store. Two separate rate limits are configured: auth endpoints (50 requests per 15 minutes, preventing brute-force login attempts) and transfer endpoints (30 requests per minute, preventing automated fund draining). When a client exceeds the limit, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header indicating when the client can try again.
+
+The Redis store ensures rate limits work correctly across multiple API server instances. If the limit were stored in-memory, each server would track its own count, and a client could circumvent the limit by hitting different servers. Redis provides a shared counter that all servers increment.
+
+File: `backend/src/services/rateLimiter.ts`
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. For a P2P payment system, this prevents the nightmare scenario: Alice sends $50 to Bob, the network drops before the response arrives, Alice retries, and Bob receives $100.
+
+The client generates a unique idempotency key (UUID) for each transfer and sends it with the request. Before processing, the server checks the `idempotency_keys` table in PostgreSQL. If the key exists, the cached response is returned without re-executing the transfer. If not, the transfer executes, and the key + response are stored in the same database transaction.
+
+This project stores idempotency keys in PostgreSQL (not Redis) for a critical reason: atomicity. The key and the payment are committed in the same transaction. If the transaction rolls back (e.g., insufficient funds), the key is also rolled back, allowing a clean retry. With Redis, a crash between the Redis write and the database commit would leave the key stored without the payment completed -- the client would think the payment succeeded but the money never moved.
+
+Keys expire after 24 hours via a TTL column. A background cleanup job deletes expired keys to prevent unbounded table growth.
+
+File: `backend/src/services/idempotencyService.ts`
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the service can function correctly. They are consumed by load balancers (to route traffic away from unhealthy instances) and container orchestrators (to restart failed processes).
+
+In this project, `GET /api/health` tests PostgreSQL connectivity by running a `SELECT 1` query. If the database is unreachable, the endpoint returns a 503 status, signaling the load balancer to stop sending traffic to this instance. This is important because a server with a broken database connection can accept requests but cannot process them -- every payment would fail. The health check turns this silent failure into an explicit signal.
+
+Production systems typically have three levels: **liveness** (is the process running?), **readiness** (can it accept traffic?), and **deep health** (are all dependencies healthy?). This project implements the readiness level.
+
+File: `backend/src/app.ts`
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker Compose.

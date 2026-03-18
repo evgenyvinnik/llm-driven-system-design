@@ -525,6 +525,151 @@ The search service is designed to return partial results rather than fail entire
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App.tsx (root)
+├── Background pattern               ← Radial gradient dot pattern (decorative)
+├── Landing page content
+│   ├── Search icon + "Spotlight Search" heading
+│   ├── Open button (Cmd+K hint)     ← Calls openSpotlight() from store
+│   ├── FeatureCard (x3)             ← Multi-source search, calculations, suggestions
+│   └── ExampleSearch (x6)           ← Clickable query examples that open modal
+├── SpotlightModal                   ← The main search overlay
+│   ├── SearchInput                  ← Text input with magnifying glass icon
+│   ├── SearchResults                ← Grouped result list (files, apps, contacts, etc.)
+│   │   └── SearchResultItem (xN)   ← Individual result with icon, name, type badge
+│   ├── Suggestions                  ← Proactive app/contact suggestions when query is empty
+│   └── Footer                       ← Keyboard shortcut hints (tab, arrows, return)
+└── (hooks)
+    ├── useKeyboardShortcut          ← Registers Cmd+K / Ctrl+K global listener
+    └── useDebounce                  ← Debounces search query input
+```
+
+### Zustand Store
+
+The frontend uses a single Zustand store:
+
+**`useSpotlightStore`** (`stores/spotlightStore.ts`) manages all Spotlight UI state in one flat store. It combines modal visibility, search state, keyboard navigation, and proactive suggestions.
+
+- **Modal state**: `isOpen` boolean with `openSpotlight()` (also triggers `loadSuggestions()`), `closeSpotlight()` (also calls `clear()`), and `toggleSpotlight()` actions.
+- **Search state**: `query` string, `results` array of `SearchResult` objects, `isLoading` flag, and `error` string. The `setQuery` action is the primary entry point -- it updates the query and immediately triggers `performSearch()` if the query is non-empty, or clears results if empty.
+- **Keyboard selection**: `selectedIndex` integer with `selectNext()` and `selectPrevious()` actions that clamp to valid bounds. The selected index applies to either results (when query is non-empty) or suggestions (when query is empty).
+- **Suggestions**: `suggestions` array of `Suggestion` objects loaded on modal open via `loadSuggestions()`, which calls `getProactiveSuggestions()` from the API.
+- **Result execution**: `executeResult()` handles different result types: apps record a launch event, web results open in a new tab, calculations copy the result to clipboard. After execution, the modal closes.
+
+### Routing
+
+This project has no URL-based routing. The application is a single landing page with a modal overlay. The `SpotlightModal` component is rendered conditionally based on `useSpotlightStore.isOpen`. The modal is opened by clicking the "Open" button, pressing Cmd+K (Mac) or Ctrl+K (Windows/Linux), or clicking example search queries on the landing page. There are no page transitions or URL changes.
+
+### Data Fetching
+
+All API communication flows through standalone functions in `services/api.ts` (not a class or object -- just exported async functions). The API base is `/api` with no versioning prefix.
+
+- **`search(query, types?)`**: Calls `GET /api/search?q={query}&types={types}`, returns `SearchResponse` with results array.
+- **`getSuggestions(prefix)`**: Calls `GET /api/search/suggest?q={prefix}`, returns autocomplete suggestions.
+- **`getProactiveSuggestions()`**: Calls `GET /api/suggestions`, returns time-of-day-based app/content suggestions.
+- **`recordActivity(type, itemId, itemName, metadata?)`**: Calls `POST /api/suggestions/activity`, records usage for suggestion training.
+- **`recordAppLaunch(bundleId)`**: Calls `POST /api/suggestions/app-launch`, records app usage pattern by hour/day.
+
+Search is triggered reactively: when the user types, `setQuery` in the store calls `performSearch`, which calls `search()`. There is no debounce at the store level, but the `useDebounce` hook is available for components to throttle rapid input.
+
+### Key UI Patterns
+
+**Modal-first interaction**: The entire search experience lives inside `SpotlightModal`, a full-screen overlay positioned at 15% from the top of the viewport. Clicking the backdrop or pressing Escape closes it. The modal disables body scrolling while open and includes ARIA attributes (`role="dialog"`, `aria-modal="true"`) for accessibility.
+
+**Keyboard-driven navigation**: The `useKeyboardShortcut` hook registers a global keydown listener for Cmd+K / Ctrl+K to toggle the modal. Inside the modal, arrow keys and Tab navigate the result list via `selectNext()` and `selectPrevious()` store actions. Enter executes the selected result. Escape closes the modal. This mimics macOS Spotlight behavior.
+
+**Dual-mode display**: When the query is empty, the modal shows proactive suggestions (recently used apps, time-of-day recommendations). When the query has text, suggestions are replaced by search results. The `selectedIndex` store property applies to whichever list is currently visible.
+
+**Result type differentiation**: `SearchResultItem` renders different icons and badges based on result type (file, app, contact, web, calculation, conversion). App results show the app icon, contact results show email, calculation results show the computed value. This type-aware rendering uses the `Icons` component which maps type strings to SVG icons.
+
+**Example queries on landing page**: The `ExampleSearch` component renders clickable query previews ("Safari", "2+2*3", "100 km to miles") that open the modal and pre-fill the search query after a 100ms delay (allowing the modal animation to complete before setting the query).
+
+**Custom CSS theme**: The Spotlight modal uses a custom color palette (`spotlight-bg`, `spotlight-border`, `spotlight-text-tertiary`, `spotlight-hover`) defined in Tailwind config, separate from the landing page's dark gradient theme. This creates the frosted-glass macOS Spotlight aesthetic.
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project from first principles. Each pattern solves a specific operational problem that emerges at scale.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing downstream service from dragging down the entire application. The name comes from electrical circuit breakers that trip to prevent a short circuit from causing a fire.
+
+The pattern works through three states. In the **closed** state (normal operation), all requests pass through to the downstream service. The circuit breaker silently tracks the success/failure ratio of recent calls. When the failure rate crosses a threshold (configured at 30% within a 10-second window in this project via Opossum), the breaker transitions to the **open** state. In the open state, all requests fail immediately -- the application does not even attempt to call the downstream service. This is the key benefit: instead of every search request waiting 5 seconds for an Elasticsearch timeout (which would make the search bar feel frozen), requests fail in 0 milliseconds and the system can fall back to PostgreSQL-only results. After a 30-second cooldown, the breaker enters the **half-open** state, allowing test requests through. If those succeed, the breaker closes; if they fail, it reopens.
+
+This project implements per-index circuit breakers, meaning the files index, apps index, contacts index, and web index each have their own independent breaker. If the contacts index is corrupted, only contact search degrades -- file and app search continue working normally. This isolation is critical for the multi-source fusion design: the search service returns partial results from healthy sources rather than failing entirely.
+
+**File**: `backend/src/shared/circuitBreaker.ts`
+
+### Structured Logging
+
+Structured logging means writing log entries as machine-parseable data (typically JSON) rather than free-form text strings. Traditional logs look like `"Search for 'meeting notes' returned 5 results in 45ms"` -- a human can read this, but extracting the query, result count, or latency programmatically requires fragile regex parsing. Structured logs look like `{"event":"search","query":"meeting notes","resultCount":5,"durationMs":45,"sources":["files","apps"]}` -- every field is a named key-value pair that log aggregation tools can index, search, and alert on.
+
+This project uses Pino, a high-performance Node.js logging library that outputs JSON in production and pretty-printed text in development. Log categories are defined with different retention periods: search queries (7 days) for performance analysis, indexing events (3 days) for debugging file watcher issues, auth events (30 days) for security audit, provider errors (14 days) for provider health tracking, and system errors (30 days) for incident response. At production scale, these retention policies would be enforced by the log aggregation system (Elasticsearch index lifecycle management or CloudWatch log groups).
+
+**File**: `backend/src/shared/logger.ts`
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements (metrics) from applications at regular intervals. The application exposes an HTTP endpoint (`/metrics`) that returns current metric values in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+There are four main metric types. **Counters** only go up (total requests served, total files indexed). **Gauges** go up and down (current indexing queue size, active connections). **Histograms** track the distribution of values (search latency buckets for computing p50/p90/p99). **Summaries** compute quantiles on the client side.
+
+This project defines nine specific metrics: HTTP request duration histogram (the primary SLI), per-source search latency histogram (for identifying slow providers), search result count histogram (for result quality monitoring), indexed files counter, indexing queue size gauge, provider latency histogram, provider error counter, rate limit hit counter, and circuit breaker state gauge. SLI targets are defined: search p95 < 100ms, search p99 < 250ms, availability > 99.5%, indexing queue depth < 1000, provider success rate > 95%. These targets would trigger alerts when breached at production scale.
+
+**File**: `backend/src/shared/metrics.ts`
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window, protecting the server from abuse, accidental loops, and denial-of-service attacks. Without rate limiting, a single misbehaving client could consume all server resources and deny service to legitimate users.
+
+This project implements a **token bucket** algorithm in Redis with four endpoint tiers: search (100 burst, 10/sec sustained), suggestions (30 burst, 5/sec sustained), index operations (50 burst, 1/sec sustained), and bulk operations (5 burst, 1/min sustained). The token bucket algorithm works by maintaining a "bucket" of tokens that refills at a steady rate. Each request consumes one token. When the bucket is empty, requests are rejected. The bucket has a maximum capacity (the burst limit), allowing short bursts of traffic while enforcing a sustained rate.
+
+Token bucket is preferred over sliding window for this use case because search is inherently bursty -- a user types a query and the frontend fires several search requests in quick succession as the debounce triggers. The burst allowance accommodates this without penalizing the user. Rate-limited responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers so clients can self-throttle before hitting the limit.
+
+**File**: `backend/src/shared/rateLimiter.ts`
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This is critical in distributed systems where network failures cause retries: if a client sends a `POST /api/index/files` request and the network drops the response, the client will retry, potentially indexing the same file twice.
+
+This project implements idempotency at two levels. At the data level, file indexing uses content-hash-based deduplication: if a file's `content_hash` has not changed since the last index, the re-index is skipped entirely. The `indexed_files` table uses `path` as the primary key, so UPSERT operations naturally produce the same result regardless of how many times they execute. At the API level, the `Idempotency-Key` header is checked against a Redis cache with a 24-hour TTL. Repeated requests with the same key return the cached response without re-executing the operation.
+
+This dual-layer idempotency is critical for safe index rebuilds: running a full re-index (which may process hundreds of thousands of files) multiple times produces identical results because each file is compared by hash, and the PostgreSQL UPSERTs and Elasticsearch document updates are individually idempotent.
+
+**File**: `backend/src/shared/idempotency.ts`
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the application is functioning correctly. Load balancers, container orchestrators (Kubernetes), and monitoring systems call this endpoint periodically to determine if an instance should receive traffic.
+
+This project implements three health check variants. The `/health` endpoint performs component-level checks against PostgreSQL (test query), Elasticsearch (cluster health), and Redis (ping), returning latency measurements for each. The `/health/ready` endpoint is a readiness probe that confirms all dependencies are connected -- the load balancer uses this to know when a newly started instance is ready to receive traffic. The `/alive` endpoint is a liveness probe that confirms the process is running and returns uptime -- container orchestrators use this to detect deadlocks (a process that is running but not responding).
+
+Each health response includes circuit breaker states, idempotency store statistics, and memory usage. This comprehensive health payload helps operators quickly diagnose issues during incidents: if `/health` shows Elasticsearch latency at 5 seconds and the circuit breaker for the files index is open, the operator knows exactly what is failing and why search results may be partial.
+
+**File**: `backend/src/index.ts`
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache hit, the cached value is returned immediately (sub-millisecond latency). On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it to the caller.
+
+In this project, Redis serves multiple roles: session storage (24-hour TTL), idempotency key cache (24-hour TTL), rate limit token buckets, and general query caching. The search service does not cache individual search results (because queries are highly variable), but the suggestion service could cache proactive suggestions since they change infrequently (based on time-of-day patterns that shift slowly).
+
+Cache invalidation is simpler in this project than in typical CRUD applications because the primary data flow is write-heavy indexing followed by read-heavy searching. Elasticsearch handles its own indexing/caching internally, so the Redis cache-aside pattern is primarily used for PostgreSQL metadata queries (usage patterns, recent activity, contact lookups) where the same data is requested repeatedly within short time windows.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user, you define roles and assign permission sets to each role.
+
+This project implements a two-tier RBAC model: **user** and **admin**. Regular users can search the local index, view their own usage patterns, and query app providers. Admin users can additionally view all users' patterns, force a full re-index, manage content extractors, and view system metrics. The RBAC table in the Security section maps each operation to the roles that can perform it.
+
+The key design consideration for Spotlight's RBAC is that most operations are read-only searches that any authenticated user should be able to perform. The admin role exists primarily for operational tasks (re-indexing, metrics access) that could cause performance impact if triggered by regular users. A full re-index, for example, is CPU-intensive and could degrade search latency for all users if triggered frequently. Restricting it to admin prevents accidental or malicious performance degradation.
+
+At production scale, RBAC for a search system might also include content-level permissions (can this user see files in this directory?), which would require integrating with the operating system's file permission model rather than implementing custom RBAC tables.
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.

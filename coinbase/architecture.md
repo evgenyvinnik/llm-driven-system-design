@@ -752,6 +752,142 @@ Phase 4: Full scale
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS, using a dark theme matching Coinbase's design language. It provides a full trading experience with real-time price feeds, interactive charts, order placement, and portfolio management.
+
+```
+__root.tsx (RootComponent)
+├── Header (logo, nav links, auth status, balance display)
+└── <Outlet /> renders child routes:
+    ├── /login ────────────── Login (username + password)
+    ├── /register ─────────── Register (username, email, password)
+    ├── / ─────────────────── Market Overview
+    │   ├── AssetList → AssetRow (list of all trading pairs)
+    │   │   ├── MiniSparkline (tiny inline price chart per asset)
+    │   │   └── PriceTicker (current price with 24h change %)
+    │   └── useWebSocket hook (streams live prices to marketStore)
+    ├── /trade/$symbol ────── Trading View (dynamic route per trading pair)
+    │   ├── PriceChart (TradingView lightweight-charts, OHLCV candles)
+    │   ├── OrderBook (bid/ask depth with horizontal bars, spread display)
+    │   ├── TradeForm (buy/sell toggle, market/limit selector, quantity input)
+    │   └── useTickerSubscription (per-symbol WebSocket channel)
+    ├── /portfolio ─────────── Portfolio Dashboard
+    │   ├── PortfolioSummary (total USD value, allocation pie)
+    │   └── WalletBalances (per-currency balance, reserved, available)
+    └── /orders ────────────── Order History
+        └── OrderHistory (table with status filter, cancel button for open orders)
+```
+
+### Zustand Stores
+
+**`authStore`**: Manages the current user session. Stores the `User` object, loading state, and authentication status. Actions: `login()`, `register()`, `logout()`, `checkAuth()`. Session is cookie-based; `checkAuth()` calls `GET /api/v1/auth/me` on mount.
+
+**`marketStore`**: Central hub for all market data. Stores trading pairs, per-symbol price data (price, 24h change, volume, high, low), candlestick arrays, and order book depth. Actions: `fetchPairs()` (loads all pairs and populates initial prices), `fetchCandles()` (loads OHLCV data for charting), `fetchOrderBook()` (loads bid/ask depth), `updatePrices()` and `updatePairPrices()` (called by WebSocket hook to push live price updates into the store). The `updatePairPrices()` action updates both the `prices` map and the `pairs` array simultaneously so that the asset list and trading view always reflect the latest prices.
+
+**`portfolioStore`**: Manages holdings, orders, and wallet balances. Stores total USD value, per-currency holdings, order history, and per-currency wallet states (balance, reserved, available). Actions: `fetchPortfolio()`, `fetchOrders()`, `fetchWallets()`, `placeOrder()` (generates idempotency key, places order, then auto-refreshes orders and wallets), `cancelOrder()` (cancels and auto-refreshes).
+
+### Routing
+
+Uses TanStack Router with file-based routing. The dynamic route `/trade/$symbol` extracts the trading pair symbol from the URL (e.g., `/trade/BTC-USD`). The root component calls `checkAuth()` on mount. Market data pages (`/`, `/trade/$symbol`) are accessible without authentication for price viewing; order placement and portfolio require login.
+
+### Data Fetching
+
+API calls use a centralized `request<T>()` function in `frontend/src/services/api.ts` with `credentials: 'include'` for cookie-based auth. The API service is organized into domain objects: `authApi`, `marketsApi`, `ordersApi`, `portfolioApi`, `walletsApi`, `transactionsApi`, and `healthApi`.
+
+Real-time data uses two mechanisms working together:
+1. **REST polling**: `fetchCandles()` and `fetchOrderBook()` are called via `useEffect` with interval timers on the trading page
+2. **WebSocket streaming**: The `useWebSocket` hook (in `frontend/src/hooks/useWebSocket.ts`) connects to the WebSocket server once and streams price updates into `marketStore.updatePairPrices()`. The `useTickerSubscription` hook subscribes to per-symbol channels when entering the trading view and unsubscribes on exit.
+
+The WebSocket client (`frontend/src/services/websocket.ts`) implements exponential backoff reconnection (1s, 2s, 4s... up to 30s max, 10 attempts). On reconnect, it re-subscribes to all previously active channels. The connection is singleton -- created once and kept alive across route changes.
+
+### Key UI Patterns
+
+- **Dark theme**: Full dark color scheme with grays, blacks, and accent colors matching Coinbase's design
+- **TradingView charting**: `PriceChart` uses `lightweight-charts` library (the same library behind TradingView) for professional OHLCV candlestick charts with zoom, crosshair, and time axis
+- **Order book visualization**: `OrderBook` component displays bid/ask levels with horizontal colored bars representing depth. Bids in green, asks in red. Spread calculated and displayed between them.
+- **Mini sparklines**: Each `AssetRow` in the market overview includes a `MiniSparkline` -- a tiny inline line chart showing recent price movement, rendered with canvas
+- **Market/limit toggle**: `TradeForm` switches between market orders (execute immediately at best price) and limit orders (specify target price, wait for fill)
+- **String-based monetary display**: All DECIMAL values from the API arrive as strings. The frontend formats them for display using locale-aware number formatting but never performs arithmetic on them -- this prevents JavaScript's IEEE 754 floating-point precision loss
+- **Live price tickers**: `PriceTicker` components show current price with green/red color based on 24h change direction, updated in real-time via WebSocket
+- **Idempotency on order placement**: The `placeOrder()` action in `portfolioStore` generates a client-side idempotency key before every order submission, preventing duplicate orders from network retries
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in this project. Each explanation assumes no prior familiarity with the pattern.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks a fast cache (like Redis) before querying a slower data store (like PostgreSQL). If the data is in the cache (a "cache hit"), it is returned directly. If not (a "cache miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
+
+In this project, several data types use cache-aside in Valkey: trading pair metadata (cached for 300 seconds because pairs rarely change), user portfolios (cached for 30 seconds and invalidated on trades or deposits), idempotency keys (cached for 24 hours for duplicate order detection), and session data (cached for 24 hours). Market prices are handled differently -- they live in-memory in the MarketService because they update every 2 seconds and cache invalidation would be more expensive than just keeping them in process memory.
+
+The trade-off is staleness. A 30-second portfolio cache means a user might not see a trade reflected in their portfolio for up to 30 seconds. For a crypto exchange where users expect near-instant feedback after a trade, this cache is invalidated explicitly on trade execution rather than relying solely on TTL expiry.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that wraps calls to external or unreliable services and monitors their health. It operates in three states: **Closed** (normal operation, requests pass through), **Open** (failures exceeded threshold, all requests rejected immediately), and **Half-Open** (after a cooldown, one test request is allowed to determine if the service has recovered).
+
+In this project, Opossum circuit breakers wrap database, Redis, and Kafka calls. Configuration: 5-second timeout per call, 50% error threshold to open, minimum 5 requests before evaluating, 30-second cooldown before half-open test. This is critical for a trading platform because order matching must remain responsive even when downstream services degrade. If PostgreSQL becomes slow, the circuit breaker prevents the matching engine from queuing hundreds of blocked requests -- it fails fast and lets the client retry or shows an error.
+
+A specific design decision in this project: Kafka failures do not block order processing. The trade is recorded in PostgreSQL (the source of truth) regardless of whether the Kafka event was published. This means the real-time price feed may miss a trade update, but correctness is preserved.
+
+File: `backend/src/services/circuitBreaker.ts`
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects with named fields, rather than concatenated text strings. Instead of `"Order BTC-USD buy 0.5 filled at 65123.45"`, the system emits `{"event": "order.filled", "symbol": "BTC-USD", "side": "buy", "quantity": "0.5", "price": "65123.45", "userId": "uuid"}`.
+
+The benefit is operational intelligence. With structured logs, you can query across millions of entries: "show me all limit orders for DOGE-USD that were rejected in the last hour" becomes a simple filter query. Without structured logging, this requires parsing free-form text with fragile regex patterns.
+
+In this project, Pino produces JSON logs with contextual fields including `symbol`, `userId`, and `userCount`. Debug level is enabled in development (verbose output including price tick details), while production uses info level (only significant events like trades, errors, and order lifecycle changes).
+
+File: `backend/src/services/logger.ts`
+
+### Prometheus Metrics
+
+Prometheus is a pull-based monitoring system. The application exposes an HTTP endpoint (`GET /metrics`) with numeric measurements in a specific text format. A Prometheus server scrapes this endpoint periodically, stores the time series, and Grafana visualizes them as dashboards.
+
+Four metric types: **Counter** (only increases, e.g., total trades executed), **Gauge** (goes up and down, e.g., active WebSocket connections), **Histogram** (measures distributions, e.g., request latency with p50/p95/p99 percentiles), and **Summary** (similar to histogram, computed client-side).
+
+In this project: `http_request_duration_seconds` (histogram by method/route/status for latency SLOs), `order_counter` (counter by side/type/status for volume analysis), `trade_counter` (counter for total trades -- the most important business metric), `active_websocket_connections` (gauge for connection health -- a sudden drop indicates network issues), and `order_book_depth` (gauge by symbol/side for liquidity monitoring). These metrics enable alerting on anomalies like a sudden drop in trade volume or a spike in order rejections.
+
+File: `backend/src/services/metrics.ts`
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. For a crypto exchange, this serves three purposes: preventing market manipulation (automated bots flooding the order book), protecting API availability during volatile markets (when everyone trades simultaneously), and defending against denial-of-service attacks.
+
+This project implements three-tier rate limiting using `express-rate-limit`: general API (100 requests per minute for all endpoints), order placement (10 requests per second -- strict because each order triggers matching engine work, wallet reservation, and database writes), and authentication (20 requests per 15 minutes to prevent credential stuffing).
+
+The limits are calibrated to the system's capacity. The order placement limit of 10/second prevents a single user from consuming more than 10% of the matching engine's throughput. Without this, one automated trading bot could degrade performance for all other users.
+
+File: `backend/src/services/rateLimiter.ts`
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. For order placement on a crypto exchange, this prevents the scenario where a user clicks "Buy" during a network hiccup, the request times out, the browser retries, and the user ends up with two orders instead of one.
+
+The client generates a UUID v4 as an idempotency key and sends it with the order request. The server checks Redis for the key. If found, the cached order result is returned without processing a new order. If not found, the order is processed, and the result is stored in Redis with a 24-hour TTL.
+
+Two layers of protection: Redis provides sub-millisecond duplicate detection for the fast path. The `idempotency_key` column on the orders table has a UNIQUE constraint, providing a database-level fallback. If Redis is down, a duplicate order attempt fails with a constraint violation rather than creating two orders. This dual-layer approach is safer than Redis alone (which loses data on restart) or database alone (which adds latency to the hot path).
+
+File: `backend/src/services/idempotency.ts`
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the service is functioning correctly. Load balancers query these endpoints to determine which instances can receive traffic. Container orchestrators use them to decide when to restart a failed process.
+
+In this project, `GET /api/v1/health` returns the service status, current timestamp, and uptime in seconds. The response includes a 200 status when healthy and a 503 when degraded. For a 24/7 crypto exchange (no market close, no maintenance windows), health checks are especially important because there is never a safe time to take a server offline. The load balancer must detect unhealthy instances within seconds and reroute traffic, with zero impact on users.
+
+A limitation of the current implementation: it reports basic service health but does not check individual dependencies (database, Redis, Kafka). A more thorough check would verify each dependency and report partial degradation -- e.g., "Redis is down but PostgreSQL is healthy, service can process orders but WebSocket subscriptions may be stale."
+
+File: `backend/src/app.ts`
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker Compose.

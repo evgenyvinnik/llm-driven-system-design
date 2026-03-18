@@ -592,6 +592,157 @@ At production scale (500M daily transactions):
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+└── Outlet ─── child route content
+    ├── index.tsx (Wallet) ─── card carousel, card management
+    │   ├── CreditCard ─── visual card rendering (network logo, last4, status)
+    │   └── AddCardForm ─── card provisioning form with test card buttons
+    ├── pay.tsx (PayPage) ─── payment flow
+    │   ├── CreditCard ─── selected card display
+    │   └── BiometricModal ─── Face ID / Touch ID simulation
+    ├── transactions.tsx ─── transaction history with filtering
+    │   └── TransactionItem ─── individual transaction row
+    ├── merchant.tsx ─── merchant terminal simulation
+    ├── login.tsx ─── email/password login
+    └── Layout ─── shared layout wrapper (header, navigation tabs)
+```
+
+The application uses a `Layout` component that provides a consistent header with the page title and a bottom tab bar for navigation between Wallet, Pay, Transactions, and Merchant views. This mimics the iOS tab bar navigation pattern used in the real Apple Wallet app.
+
+### Zustand Stores
+
+The stores are all defined in a single file (`frontend/src/stores/index.ts`) and organized by domain:
+
+**`authStore`** -- Manages user session and device registration. Uses `zustand/middleware/persist` to save the `sessionId` to localStorage for session recovery across page reloads. Unlike the cookie-based auth used by Apple Music and Apple TV, this project uses an explicit `X-Session-Id` header, which the API service attaches to every request. Actions include `login`, `register`, `logout`, `loadUser` (session recovery), `loadDevices`, and `registerDevice`. Device management is critical because each card is provisioned to a specific device.
+
+**`walletStore`** -- Manages the user's provisioned payment cards. Holds `cards` array and `selectedCard`. Actions include `loadCards`, `addCard` (provisions a new card to a device), `suspendCard`, `reactivateCard`, `removeCard`, `setDefaultCard`, and `selectCard`. Most mutation actions call the API and then call `loadCards()` to refresh the full card list from the server, ensuring consistency after operations that change card status.
+
+**`transactionStore`** -- Manages transaction history with pagination. Holds `transactions` array, `total` count, and loading state. The `loadTransactions` action accepts optional filter parameters (`limit`, `offset`, `card_id`, `status`) for paginated and filtered transaction queries.
+
+**`paymentStore`** -- Manages the biometric authentication and payment processing flow. Holds `biometricSession` (the current authentication session ID), `isAuthenticating`, and `isProcessing` flags. Actions include `initiateBiometric` (starts a biometric challenge), `simulateBiometric` (simulates successful biometric verification for demo purposes), `processPayment` (sends the payment to the backend), and `clearBiometricSession`. The biometric session ID is stored in `sessionStorage` (not localStorage) so it expires when the browser tab closes, matching the transient nature of a real biometric authentication.
+
+### Routing
+
+Uses TanStack Router with file-based routing. The route structure is flat (no nested dynamic routes) since the app is wallet-centric rather than content-centric. The root route (`__root.tsx`) attempts to load the user from the stored session on mount via `authStore.loadUser()`.
+
+### Data Fetching
+
+API calls go through `services/api.ts`, which exports a single `api` object with methods grouped by resource (Auth, Devices, Cards, Payments, Merchants). The `request` helper function automatically attaches two custom headers from browser storage:
+- `X-Session-Id` from localStorage -- identifies the authenticated user session
+- `X-Biometric-Session` from sessionStorage -- proves the user completed biometric authentication for the current tab session
+
+This header-based approach (as opposed to httpOnly cookies) is used because the real Apple Pay system uses device-specific authentication tokens rather than browser cookies.
+
+### Key UI Pattern: Payment Flow
+
+The payment flow is the core user interaction, simulating the Apple Pay in-app purchase experience. It orchestrates four stores and a modal dialog across multiple async steps.
+
+**Payment flow sequence:**
+1. **Card selection** -- The `PayPage` loads all active cards via `walletStore.loadCards()`. The default card is pre-selected. If the user has multiple cards, a dropdown allows switching.
+2. **Merchant selection** -- Available merchants are fetched from the backend on mount. The user selects who they are paying.
+3. **Amount entry** -- A large currency input with quick-select buttons ($5, $10, $25, $50, $100). Test amounts trigger specific scenarios ($666.66 = insufficient funds, $999.99 = declined, >$10,000 = limit exceeded).
+4. **Biometric authentication** -- Clicking "Pay with Apple Pay" initiates the biometric flow:
+   a. `paymentStore.initiateBiometric(deviceId, 'face_id')` creates a biometric session on the server
+   b. The `BiometricModal` opens, showing a Face ID scanning animation (SVG with CSS animation)
+   c. The user clicks "Simulate Success" (since real biometrics are not available in a browser)
+   d. `paymentStore.simulateBiometric(sessionId)` verifies the biometric session on the server
+   e. The session ID is stored in `sessionStorage` so subsequent API calls include it in the `X-Biometric-Session` header
+5. **Payment processing** -- After biometric success, `paymentStore.processPayment` sends the card ID, amount, currency, merchant ID, and transaction type to `/api/payments/pay`. The backend validates the biometric session, generates a cryptogram, checks the ATC, and processes the payment.
+6. **Result display** -- Success shows the auth code; failure shows the decline reason. Transaction history is refreshed to include the new transaction.
+
+**BiometricModal component:**
+The modal simulates three authentication types: Face ID (SVG face with scanning animation), Touch ID (fingerprint icon), and passcode (asterisks). It follows a two-phase interaction: first showing the authentication prompt with a "Simulate Success" button, then briefly showing a green checkmark before calling the `onSuccess` callback. The 1-second delay on success provides visual feedback that authentication was verified.
+
+**CreditCard component:**
+Renders a styled card display showing the network logo (Visa/Mastercard/Amex), last 4 digits, card type (credit/debit), holder name, and status. Suspended cards display a visual indicator. The component is used in both the Wallet page (card carousel) and the Pay page (selected card display).
+
+**AddCardForm component:**
+Provides a card provisioning form with PAN input (auto-formatted with spaces every 4 digits), expiry month/year dropdowns, CVV input, and holder name. Includes "test card" buttons that pre-fill valid test numbers for Visa (4111...), Mastercard (5555...), and Amex (3782...) to streamline demo usage.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
+
+### Role-Based Access Control (RBAC)
+
+**What it is:** RBAC is a method of restricting system access based on the roles assigned to individual users. Instead of granting permissions directly to each user, you assign users to roles, and roles carry predefined sets of permissions. When the system needs to decide whether a user can perform an action, it checks the user's role against the required permission.
+
+**How it works in this project:** Users have a `role` column (`'user'` or `'admin'`). Regular users can provision cards, make payments, and view their own transaction history. Admin access would enable user management, merchant onboarding, and system-wide transaction monitoring. The audit log records the role of the user performing each action for compliance tracing.
+
+**Why it matters at scale:** In a payment system, access control is not just a convenience feature -- it is a regulatory requirement. PCI-DSS mandates that access to cardholder data be restricted on a need-to-know basis. RBAC provides the auditable structure to prove that only authorized personnel can access sensitive operations (e.g., viewing transaction details, suspending cards across users, modifying merchant configurations).
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL, and returns it.
+
+**How it works in this project:** The caching strategy is documented in the Caching Strategy section above. Token lookups are cached for 5 minutes with a critical exception: suspended tokens are never cached. The ATC watermark uses a different pattern -- write-through caching rather than cache-aside -- because both Redis (for fast reads) and PostgreSQL (for durability) must always reflect the current ATC value. Transaction history is cached for 30 seconds. The user's card list is cached for 2 minutes with invalidation on add/remove operations.
+
+**Why it matters at scale:** Every NFC payment requires a token lookup to validate the DPAN and check the card's status. At 500M daily transactions, that is ~5,800 lookups per second. Without caching, this would saturate the database's connection pool. Redis serves these lookups in sub-millisecond time. The "never cache suspended tokens" rule is critical for security: if a suspended token were served from cache, a stolen device could complete fraudulent transactions during the cache TTL window.
+
+### Circuit Breaker (Opossum)
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly trying to execute an operation that is likely to fail. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters "half-open" state where test requests are allowed through. If they succeed, normal operation resumes.
+
+The three states are:
+- **Closed** (normal): requests pass through. If the failure rate exceeds the threshold, the circuit opens.
+- **Open** (failing fast): all requests immediately return a fallback response without contacting the downstream service.
+- **Half-open** (testing): a limited number of requests are allowed through to test recovery.
+
+**How it works in this project (`backend/src/shared/circuit-breaker.ts`):** Each card network (Visa, Mastercard, Amex) has an independent circuit breaker with 10s timeout, 50% error threshold, and 30s reset. When a network's circuit opens, transactions for that network fail with a graceful decline (`responseCode: "CB"`, `declineReason: "Network temporarily unavailable"`). Transactions on other networks continue normally. Circuit state is exposed via the `/health` endpoint and as a Prometheus gauge metric.
+
+**Why it matters at scale:** Payment networks occasionally experience outages. Without circuit breakers, if the Visa network goes down, every Visa transaction hangs for 10 seconds (the timeout), consuming a connection and a thread. Under load, all connections are consumed waiting for the dead network, and Mastercard and Amex transactions also start failing -- not because those networks are down, but because the application has no resources left to process them. This is cascading failure. The per-network circuit breaker isolates the blast radius: only Visa transactions fail fast, while other networks continue operating normally.
+
+### Structured Logging (Pino)
+
+**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry contains a consistent set of fields that log aggregation systems can index and search.
+
+**How it works in this project (`backend/src/shared/logger.ts`):** Pino outputs JSON with `requestId` correlation, service context, and user identification. A critical addition for a payment system is automatic sensitive data redaction: the logger filters out PAN (card numbers), CVV, and token material from any log output. This prevents cardholder data from appearing in log files, which would be a PCI-DSS violation. Audit events (payment approved, card suspended, login attempt) are logged to a separate audit channel backed by the `audit_logs` database table.
+
+**Why it matters at scale:** Payment systems have strict compliance requirements. PCI-DSS requires that all access to cardholder data be logged, but also requires that cardholder data not be stored in log files. Structured logging with automatic redaction satisfies both requirements: the audit log records who accessed what and when, while the redaction middleware ensures that no PAN or CVV appears in application logs. During incident investigation, the `requestId` correlation traces a payment through the entire chain (biometric auth, token lookup, ATC check, network authorization) across log entries.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals and stores them for querying and alerting.
+
+**How it works in this project (`backend/src/shared/metrics.ts`):** Key metrics include: `http_request_duration_seconds` (histogram for API latency), `payment_transactions_total` (counter by status, type, and network), `payment_duration_seconds` (histogram for end-to-end payment latency), `circuit_breaker_state` (gauge per network: 0=closed, 1=half-open, 2=open), `idempotency_cache_operations_total` (counter for cache hit/miss), and `card_provisioning_total` (counter by network and result). The SLO targets -- NFC payment p99 < 500ms, transaction approval rate > 95%, API availability 99.99% -- are only enforceable because these metrics exist.
+
+**Why it matters at scale:** A payment system that processes 500M daily transactions must detect problems in seconds, not minutes. If the Visa circuit breaker opens, the `circuit_breaker_state{network="visa"}` gauge changes from 0 to 2, and an alert fires within the next Prometheus scrape interval (15 seconds). If payment latency p99 exceeds 500ms, the team investigates before the SLO is breached. Without metrics, the first signal of a problem is merchants calling to report that their customers' payments are failing.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a given time window. When exceeded, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header.
+
+**How it works in this project:** Rate limits protect the payment API from abuse. Critical endpoints like `/api/payments/pay` and `/api/cards` have strict per-user limits to prevent automated attacks. Login attempts are rate-limited per IP to prevent brute-force password attacks. Redis backs the rate limit store for consistency across server instances.
+
+**Why it matters at scale:** Payment systems are high-value targets for attackers. A brute-force attack testing stolen card numbers by attempting small transactions can be detected and blocked by rate limiting the payment endpoint. Without rate limiting, an attacker could test thousands of stolen card numbers per minute, each generating a real authorization attempt to the card network. Rate limiting caps the damage to a handful of attempts before the attacker is blocked.
+
+### Idempotency
+
+**What it is:** An idempotent operation produces the same result whether executed once or multiple times. For APIs, this means that retrying a request (due to network timeout, client retry, or double-click) does not cause duplicate side effects.
+
+**How it works in this project (`backend/src/shared/idempotency.ts`):** All mutation endpoints require an `Idempotency-Key` header. The middleware checks Redis for a cached response. Found + completed: return cached response. Found + in-progress: return 409 Conflict. Not found: acquire lock, execute, cache result for 24 hours. Protected endpoints include payment processing (prevents double-charging), card provisioning (prevents duplicate tokens), refunds (prevents double-refunds), and card state mutations (suspend, reactivate, remove).
+
+**Why it matters at scale:** In a payment system, idempotency is not a nice-to-have -- it is essential for financial correctness. Consider: a user taps their phone at a terminal, the NFC payment completes, but the response is lost due to a network glitch. The terminal retries the payment. Without idempotency, the user is charged twice. With idempotency, the retry returns the cached result from the first successful payment, and the user is charged once. The ATC (Application Transaction Counter) provides a second layer of replay protection at the protocol level: each cryptogram includes a monotonically increasing counter, so even without the idempotency middleware, the network rejects cryptograms with stale ATC values.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints consumed by infrastructure systems (load balancers, Kubernetes) to determine whether an application instance can serve traffic.
+
+**How it works in this project (`backend/src/shared/health.ts`):** Three tiers: `GET /health/live` returns 200 if the process is running (liveness probe). `GET /health/ready` checks PostgreSQL and Redis connectivity, returning 503 if either is unreachable (readiness probe). `GET /health` (or `/health/deep`) performs a detailed check including component latency measurements (PostgreSQL query time, Redis ping time) and circuit breaker state for all payment networks. The deep check returns a structured response showing which components are healthy and which are degraded.
+
+**Why it matters at scale:** A payment system with 99.99% availability target (< 4.3 minutes downtime per month) cannot afford to route traffic to broken instances. Health checks enable automatic remediation: if a server loses its Redis connection (which stores idempotency keys and ATC watermarks), the readiness check fails, the load balancer stops sending traffic, and users are seamlessly redirected to healthy instances. The deep health check additionally detects degraded states -- for example, if the Visa circuit breaker is open, the system is technically "running" but unable to process Visa transactions. The monitoring system uses this information to page the on-call engineer before the SLO is breached.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation.

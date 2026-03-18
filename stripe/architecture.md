@@ -717,3 +717,120 @@ Merchant-based sharding is the natural partition key because:
 - Multi-currency support and FX conversion
 - PCI DSS network segmentation
 - Data archival and cold storage tiering
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── LoginForm (unauthenticated)
+└── Sidebar + <Outlet> (authenticated)
+    ├── index.tsx ─── Dashboard
+    │   └── StatCard (reusable metric card)
+    ├── payments.tsx ─── PaymentsPage (master-detail layout)
+    │   └── StatusBadge, CardDisplay
+    ├── checkout.tsx ─── CheckoutPage (multi-step wizard)
+    │   └── StatusBadge
+    ├── customers.tsx ─── CustomersPage
+    ├── balance.tsx ─── BalancePage (financial summary)
+    └── webhooks.tsx ─── WebhooksPage
+```
+
+The root layout (`__root.tsx`) acts as an authentication gate. It reads `apiKey` from the Zustand store and conditionally renders either the `LoginForm` or the dashboard shell (persistent `Sidebar` navigation plus the routed page content via TanStack Router's `<Outlet>`). This means every child route can assume the merchant is authenticated -- no per-route auth checks needed.
+
+### Routing (TanStack Router, File-Based)
+
+Routes are defined as files under `frontend/src/routes/`. TanStack Router's Vite plugin auto-generates the route tree at build time (`routeTree.gen.ts`). Each route file exports a `Route` constant created with `createFileRoute`. There are no dynamic route segments in this project -- all routes are static paths (`/`, `/payments`, `/checkout`, `/customers`, `/balance`, `/webhooks`).
+
+### Zustand Store: `useMerchantStore`
+
+A single Zustand store (`frontend/src/stores/merchantStore.ts`) manages all global state. It holds three fields: `apiKey`, `merchantId`, and `merchantName`. The store uses Zustand's `persist` middleware to save credentials to `localStorage` under the key `stripe-merchant-storage`, so the merchant remains logged in across browser refreshes. There is no session expiry on the client side -- the merchant logs out explicitly or clears storage.
+
+The store is accessed in two ways: (1) inside React components via the `useMerchantStore()` hook, and (2) outside React in the API service layer via `useMerchantStore.getState().apiKey` to inject the `Authorization: Bearer` header into every request.
+
+### Data Fetching Pattern
+
+All API communication goes through a centralized `fetchApi<T>()` wrapper in `frontend/src/services/api.ts`. This wrapper automatically reads the API key from the Zustand store and attaches it as a `Bearer` token. It also provides consistent error handling -- non-OK responses are parsed as `ApiError` objects and thrown as standard JavaScript errors.
+
+Data fetching follows a simple `useEffect` + local state pattern. Each route component maintains its own `loading`, `error`, and data state via `useState`. On mount, an `async` function calls the relevant API methods and populates state. For the dashboard (`index.tsx`) and balance page, multiple API calls run in parallel via `Promise.all` to minimize perceived load time (e.g., `getBalanceSummary()`, `listPaymentIntents()`, and `listCharges()` all fire simultaneously).
+
+There is no client-side caching, no `React Query` / `SWR`, and no stale-while-revalidate. Each page fetches fresh data on every visit. This is intentional for a payment dashboard where data freshness matters more than perceived speed.
+
+### Key UI Patterns
+
+**Financial Dashboard (Dashboard + Balance pages):** Both pages use a statistics grid layout -- 3 or 4 `StatCard` components in a responsive grid showing key metrics (available balance, today's volume, total processed, fees). Below the stats grid, content is organized into card-based sections with tables and lists. Color coding is consistent: green for successful/positive amounts, red for failed/negative, orange for refunds/fees, and purple for net revenue.
+
+**Master-Detail Layout (Payments page):** The payments page uses a two-column layout where the left side shows a filterable table of payment intents and the right side shows a detail panel for the selected payment. Clicking a row fetches the full payment intent and displays it in the detail panel with contextual actions (Capture for authorized payments, Cancel for pending ones). The status filter dropdown triggers a re-fetch with the selected filter.
+
+**Multi-Step Checkout Wizard (Checkout page):** A three-step wizard (Amount, Payment, Result) with a visual progress indicator at the top. Each step conditionally renders based on a `step` state variable. The checkout flow orchestrates three sequential API calls: create payment intent, create payment method, then confirm -- demonstrating the Stripe payment lifecycle. Test card numbers are displayed inline so the merchant can test different scenarios (success, decline, insufficient funds).
+
+**Reusable Components:** `StatusBadge` maps payment status strings to color-coded pill badges. `CardDisplay` renders card brand and last-4 digits. `Sidebar` provides persistent navigation. All components use Tailwind CSS utility classes with a custom `stripe-*` color palette.
+
+### Type Safety
+
+All API response types are defined in `frontend/src/types/api.ts` and mirror the backend's response structure. This includes `PaymentIntent`, `Charge`, `Refund`, `Balance`, `BalanceSummary`, `BalanceTransaction`, `WebhookEvent`, `Customer`, `PaymentMethod`, and `Merchant`. The generic `ListResponse<T>` type wraps paginated responses. The `ApiError` type ensures error handling is type-safe. These types flow through the API service layer into component state, providing end-to-end type safety from API response to rendered UI.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in this project. Each explanation assumes no prior knowledge of the pattern.
+
+### Idempotency
+
+**What it is:** Idempotency is a property of an operation where performing it multiple times produces the same result as performing it once. In the context of payment APIs, it means that if a client sends the same "charge $50" request three times (due to network retries, browser double-clicks, or load balancer retries), the server only processes the charge once and returns the same response for all three requests.
+
+**Why it matters for payments:** Without idempotency, a network timeout creates a dangerous ambiguity. The client does not know whether the server received the request, processed it, or failed midway. If the client retries and the server processes it again, the customer is charged twice. For a payment platform, duplicate charges destroy user trust and create costly manual reconciliation.
+
+**How it works here:** The client includes an `Idempotency-Key` header with each mutating request (e.g., `order_12345_payment`). The server uses Redis `SET NX` (set-if-not-exists) to atomically acquire a lock for that key. If the key already exists with a `completed` status, the server returns the cached response without reprocessing. If the key exists with a `pending` status (meaning another request is currently being processed), the server returns 409 Conflict. Once processing completes, the result is cached with a 24-hour TTL. A unique index in PostgreSQL (`merchant_id, idempotency_key`) serves as a durability fallback if Redis is unavailable. The key is namespaced per merchant to prevent cross-merchant collisions.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache first before querying the database. On a cache miss, the application queries the database, stores the result in the cache, and returns it. On a cache hit, the cached result is returned directly without touching the database. The cache is not automatically populated -- it fills up as data is requested.
+
+**Why it matters:** Database queries are orders of magnitude slower than cache lookups. For frequently accessed data like merchant balances or idempotency keys, hitting PostgreSQL on every request would add 5-20ms of latency per query. Redis provides sub-millisecond lookups, turning a database-bound operation into a memory-bound one. At 50 RPS, this eliminates thousands of database round-trips per minute.
+
+**How it works here:** Idempotency key lookups use cache-aside: the middleware first checks Redis for the key, and only falls back to the database if Redis returns a miss or is unavailable. Balance queries use a similar pattern -- the ledger balance is computed from PostgreSQL but can be cached in Redis for repeated reads. The cache is invalidated (deleted from Redis) whenever the underlying data changes (e.g., after a new charge or refund), ensuring subsequent reads fetch fresh data from the database.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a fault-tolerance pattern that prevents an application from repeatedly calling a service that is likely to fail. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without contacting the downstream service. After a timeout period, the circuit enters a "half-open" state and allows a single test request. If that request succeeds, the circuit closes and normal traffic resumes. If it fails, the circuit opens again.
+
+**Why it matters:** Without a circuit breaker, a failing downstream service (like a card network) causes cascading failures. Every payment request would wait for the card network's timeout (say 30 seconds), consuming a database connection, a thread, and memory for the entire duration. At 50 concurrent requests, this exhausts the connection pool and brings down the entire payment service. A circuit breaker stops the cascade by failing fast (in microseconds) when the downstream is known to be unhealthy.
+
+**How it works here:** The implementation uses the Cockatiel library (`backend/src/shared/circuitBreaker.ts`). Four circuit breakers are pre-configured: card network (5 consecutive failures, 30s reset), fraud ML service (3 failures, 15s reset), webhook delivery (10 failures, 60s reset), and GeoIP service (5 failures, 60s reset). Each breaker has a specific fallback: the fraud service falls back to rule-based scoring, the GeoIP service skips geographic checks, and the card network returns a 503 so the merchant can retry. Circuit breaker state (closed/open/half-open) is exposed as a Prometheus gauge for monitoring.
+
+### Structured Logging
+
+**What it is:** Structured logging produces log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Each log entry contains a consistent set of fields (timestamp, severity level, service name, request ID, etc.) that can be queried, filtered, and aggregated by log analysis tools like Elasticsearch, Datadog, or CloudWatch Logs Insights.
+
+**Why it matters:** Free-form logs like `"Payment failed for merchant abc123"` are easy for humans to read but impossible for machines to reliably parse. When debugging a production issue at 3 AM, you need to answer questions like "show me all failed payments for merchant X in the last hour" or "what was the average latency for card network calls today." Structured logs make these queries trivial because every field is a searchable key. They also enable automated alerting -- a log aggregator can fire an alert when `error_count > 10` for a specific `merchant_id` in a 5-minute window.
+
+**How it works here:** The implementation uses Pino (`backend/src/shared/logger.ts`), which outputs JSON logs with consistent fields: `service`, `trace_id`, `span_id`, `merchant_id`, `event`, and `duration_ms`. Child loggers are created per request to carry request-scoped context (request ID, merchant ID) through all downstream function calls without passing these values explicitly. IP addresses are hashed for privacy compliance. Sensitive fields (API keys, card numbers) are never logged. In development, Pino's pretty-print transport formats logs for human readability; in production, raw JSON is sent to a log aggregator.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that collects numeric metrics from applications at regular intervals (typically every 15 seconds). Applications expose metrics at an HTTP endpoint (`/metrics`) in a specific text format. Prometheus scrapes this endpoint and stores the data, enabling dashboards (via Grafana) and alerting rules. Metrics come in four types: counters (monotonically increasing values like total requests), gauges (values that go up and down like connection pool size), histograms (distributions like request latency), and summaries (similar to histograms but pre-calculated).
+
+**Why it matters:** Logs tell you what happened to individual requests. Metrics tell you what is happening to the system as a whole. You cannot grep through logs to answer "what is the p99 latency of payment authorization over the last hour?" -- that requires a histogram metric. Metrics are also far more storage-efficient than logs (a single counter takes 8 bytes per scrape vs. hundreds of bytes per log line), making them practical for high-throughput monitoring. For a payment platform, metrics like `payment_failure_total` by decline code, `ledger_imbalances_total`, and `circuit_breaker_state` are the primary signals for operational health.
+
+**How it works here:** The implementation uses `prom-client` (`backend/src/shared/metrics.ts`) and exposes 25+ metrics at `/metrics`. Key metrics include: `payment_requests_total` (counter by method/endpoint/status), `payment_request_duration_seconds` (histogram for latency distribution), `payment_success_total` and `payment_failure_total` (counters by currency/decline code), `fraud_score_distribution` (histogram by decision), `webhook_deliveries_total` (counter by event type and status), `idempotency_cache_hits_total` (counter for duplicate detection rate), `circuit_breaker_state` (gauge per service), and `ledger_imbalances_total` (counter that should always be zero). SLI targets are defined: 99.99% availability, p50 latency < 100ms, p99 < 500ms, error rate < 0.1%.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make to an API within a given time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header indicating when the client can try again. Rate limits are typically expressed as "N requests per M seconds" and tracked per client identity (API key, IP address, or user ID).
+
+**Why it matters:** Without rate limiting, a single misbehaving client (buggy integration, malicious actor, or accidental infinite loop) can monopolize server resources and degrade service for all other merchants. Rate limiting also protects against brute-force attacks on authentication endpoints, API key enumeration, and denial-of-service attacks. For payment APIs specifically, rate limiting prevents runaway scripts from creating thousands of payment intents per second.
+
+**How it works here:** Rate limits are designed per-merchant and per-endpoint using Redis counters. Each merchant's API key maps to a rate limit bucket. The architecture specifies different limits for different endpoints (higher for read operations, lower for writes). In the local implementation, rate limiting middleware is not yet wired in, but the design calls for `express-rate-limit` backed by Redis counters so that rate limit state is shared across multiple API server instances.
+
+### Health Checks
+
+**What it is:** Health checks are lightweight HTTP endpoints that report whether an application is functioning correctly. They are used by load balancers to decide whether to route traffic to a particular instance, by container orchestrators (Kubernetes) to decide whether to restart a container, and by monitoring systems to detect outages. Health checks typically come in two levels: a basic check (is the process running?) and a detailed check (can the process reach its dependencies?).
+
+**Why it matters:** Without health checks, a load balancer might route traffic to an instance whose database connection has dropped, causing 100% of requests to fail with 500 errors. With health checks, the load balancer detects the unhealthy instance within seconds and stops routing traffic to it, while the remaining healthy instances absorb the load. For a payment platform where downtime directly translates to lost revenue, fast failure detection is critical.
+
+**How it works here:** Two endpoints are implemented in `backend/src/index.ts`. The basic endpoint (`/health`) returns a 200 response confirming the process is alive -- this is what a load balancer polls. The detailed endpoint (`/health/detailed`) checks PostgreSQL connectivity (runs a `SELECT 1` query and measures latency) and Redis connectivity (runs a `PING` command), returning the status and latency of each dependency. If either dependency is unreachable, the endpoint returns a degraded or unhealthy status, allowing operators to diagnose which component has failed.

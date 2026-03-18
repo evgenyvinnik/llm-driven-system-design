@@ -427,6 +427,138 @@ At production scale, these metrics feed into Grafana dashboards with alerts on p
 | Custom fields | EAV pattern | JSONB column | Queryable, indexable, schema-validated |
 | Search | SQL ILIKE | Elasticsearch | Sufficient for local scale, ES for production |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+├── Sidebar                           ← Fixed left nav, Salesforce-branded
+│   └── Link (TanStack Router)        ← Active route highlighting
+├── routes/index.tsx (Dashboard)
+│   ├── DashboardMetrics              ← KPI cards (revenue, open opps, leads, activities)
+│   └── PipelineChart                 ← CSS-only bar chart of pipeline by stage
+├── routes/accounts.tsx
+│   └── AccountList                   ← Search, industry filter, paginated table
+│       └── EntityForm (modal)        ← Shared create/edit form
+├── routes/accounts.$accountId.tsx
+│   └── AccountDetail                 ← Tabbed detail view
+│       ├── ContactList (tab)
+│       ├── OpportunityCard (tab)
+│       └── ActivityTimeline (tab)
+│           └── ActivityForm          ← Create activity linked to entity
+├── routes/contacts.tsx
+│   └── ContactList                   ← Search, account filter, paginated table
+│       └── EntityForm (modal)
+├── routes/opportunities.tsx
+│   └── KanbanBoard                   ← @dnd-kit drag-drop pipeline
+│       ├── KanbanColumn              ← Droppable stage column
+│       │   └── OpportunityCard       ← Draggable deal card
+│       └── DragOverlay               ← Ghost card during drag
+├── routes/leads.tsx
+│   └── LeadList                      ← Search, status/source filters
+│       ├── EntityForm (modal)
+│       └── ConvertLeadModal          ← Lead-to-account conversion dialog
+├── routes/reports.tsx
+│   └── ReportChart                   ← CSS-only charts (pipeline, revenue, leads by source)
+├── routes/login.tsx                  ← Login form
+└── routes/register.tsx               ← Registration form
+```
+
+### Zustand Stores
+
+The frontend uses two Zustand stores that separate authentication state from domain data:
+
+**`useAuthStore`** (`stores/authStore.ts`) manages user session state. It holds the current `User` object (or null if logged out), a `loading` flag, and an `error` string. Actions include `login`, `register`, `logout`, and `checkAuth`. The `checkAuth` action is called once from the root layout on mount to restore the session from the server-side cookie. All auth API calls go through the `authApi` service object, and the store sets `user: null` on any auth failure to force redirect to the login page.
+
+**`useCrmStore`** (`stores/crmStore.ts`) manages all CRM domain data in a single flat store. It holds arrays and loading flags for six entity types (accounts, contacts, opportunities, leads, activities) plus dashboard KPIs and three report types (pipeline, revenue, leads by source). Each entity has a `fetch*` action that calls the corresponding API client, updates the array, and sets the loading flag. The `updateOpportunityStage` action performs an optimistic update by patching the opportunity's stage and probability in the local array immediately after the API responds, without re-fetching the entire list. This keeps the kanban board responsive during drag-drop operations.
+
+### Routing
+
+The project uses TanStack Router with file-based routing. The root layout (`__root.tsx`) checks authentication on mount via `useAuthStore.checkAuth()` and conditionally renders the `Sidebar` component only when a user is logged in. The main content area has a left margin (`ml-56`) to accommodate the fixed-position sidebar. Routes include `/` (dashboard), `/accounts`, `/accounts/$accountId` (dynamic detail page), `/contacts`, `/opportunities`, `/leads`, `/reports`, `/login`, and `/register`. Each authenticated route checks `useAuthStore.user` and redirects to `/login` if null.
+
+### Data Fetching
+
+All API communication flows through a centralized `services/api.ts` module that exports domain-specific API client objects (`authApi`, `dashboardApi`, `accountsApi`, `contactsApi`, `opportunitiesApi`, `leadsApi`, `activitiesApi`, `reportsApi`). Each client object wraps a shared `request<T>()` helper function that handles JSON serialization, `credentials: 'include'` for cookie-based sessions, error parsing, and TypeScript generics for response typing. Route components call store actions (like `fetchAccounts`) inside `useEffect` hooks on mount, and the store actions delegate to the API clients. There is no client-side caching or stale-while-revalidate -- every navigation re-fetches from the server.
+
+### Key UI Patterns
+
+**Shared EntityForm**: A single `EntityForm` modal component renders different fields based on an `entityType` prop (`account`, `contact`, `opportunity`, `lead`). This avoids duplicating four separate form components and ensures consistent modal behavior (open/close, validation, save/cancel) across all entity types.
+
+**Kanban with @dnd-kit**: The opportunity pipeline uses `@dnd-kit/core` for drag-drop. `KanbanBoard` renders a `DndContext` with `KanbanColumn` components (one per stage) as droppable targets and `OpportunityCard` components as draggable items. A `DragOverlay` renders a ghost copy of the card during drag to prevent layout shifts. On drag end, the `onStageChange` callback calls `updateOpportunityStage` in the CRM store, which hits `PUT /api/opportunities/:id/stage` and optimistically patches the local state.
+
+**CSS-only charts**: Dashboard and report visualizations (`PipelineChart`, `ReportChart`) use proportional-width `<div>` elements styled with Tailwind instead of a charting library. This adds zero bundle size and provides sufficient visualization for pipeline and revenue bar charts.
+
+**StatusBadge**: A reusable component that maps entity statuses (lead status, opportunity stage, activity type) to color-coded badges with per-entity-type color mappings.
+
+**ActivityTimeline**: A polymorphic timeline component that displays activities for any entity type. It receives `relatedType` and `relatedId` props and fetches activities filtered to that entity, appearing as a tab on account/contact/opportunity detail pages.
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project from first principles. Each pattern solves a specific operational problem that emerges at scale.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing downstream service from dragging down the entire application. The name comes from electrical circuit breakers that trip to prevent a short circuit from causing a fire.
+
+The pattern works through three states. In the **closed** state (normal operation), all requests pass through to the downstream service. The circuit breaker silently tracks the success/failure ratio of recent calls. When the failure rate crosses a threshold (configured at 50% in this project via Opossum), the breaker transitions to the **open** state. In the open state, all requests fail immediately with a pre-defined error -- the application does not even attempt to call the downstream service. This is the key benefit: instead of every request waiting 30 seconds for a timeout against a dead service (which exhausts connection pools and causes cascading failures), requests fail in 0 milliseconds. After a configurable timeout period, the breaker enters the **half-open** state, allowing a small number of test requests through. If those succeed, the breaker closes and normal traffic resumes. If they fail, the breaker reopens.
+
+Without a circuit breaker, a single failing dependency can cascade: the database goes down, API requests pile up waiting for 30-second timeouts, the connection pool exhausts, and the entire API becomes unresponsive -- even for endpoints that do not use the database. Circuit breakers isolate the blast radius by failing fast, freeing threads and connections for requests that can still succeed.
+
+**File**: `src/services/circuitBreaker.ts`
+
+### Structured Logging
+
+Structured logging means writing log entries as machine-parseable data (typically JSON) rather than free-form text strings. Traditional logs look like `"User 123 logged in from 192.168.1.1"` -- a human can read this, but extracting the user ID or IP address programmatically requires fragile regex parsing. Structured logs look like `{"event":"login","userId":"123","ip":"192.168.1.1","timestamp":"2025-01-01T00:00:00Z"}` -- every field is a named key-value pair that log aggregation tools (Elasticsearch, Datadog, CloudWatch) can index, search, and alert on.
+
+This project uses Pino, a high-performance Node.js logging library that outputs JSON in production and pretty-printed text in development. Every HTTP request is logged with method, path, status code, and response duration. Structured logging becomes critical at scale when debugging issues across millions of requests: you can filter for `status:500 AND path:/api/leads/*/convert` to find all failed lead conversions, rather than grep-ing through gigabytes of unstructured text.
+
+**File**: `src/services/logger.ts`
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements (metrics) from applications at regular intervals. The application exposes an HTTP endpoint (`/metrics`) that returns current metric values in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+There are four main metric types. **Counters** only go up (total requests served, total errors). **Gauges** go up and down (current memory usage, active connections). **Histograms** track the distribution of values (request duration buckets, so you can compute p50/p90/p99 latencies). **Summaries** are similar to histograms but compute quantiles on the client side.
+
+This project uses `prom-client` to expose HTTP request duration histograms (bucketed by method and path), request count by status code, and database query timing. At production scale, these metrics feed Grafana dashboards that visualize trends and trigger alerts when p99 latency exceeds SLO targets or error rates spike above baseline.
+
+**File**: `src/services/metrics.ts`
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window, protecting the server from abuse, accidental loops, and denial-of-service attacks. Without rate limiting, a single misbehaving client could consume all server resources and deny service to legitimate users.
+
+This project uses `express-rate-limit` with three tiers: 1000 requests per 15 minutes for general API access, 50 requests per 15 minutes for authentication endpoints (preventing brute-force password guessing), and 30 requests per minute for report endpoints (which run expensive aggregation queries). When a client exceeds the limit, subsequent requests receive a `429 Too Many Requests` response with a `Retry-After` header indicating when the window resets.
+
+Rate limiting algorithms vary in sophistication. **Fixed window** divides time into fixed intervals (e.g., 1-minute blocks) and counts requests per window -- simple but allows burst-then-starve patterns at window boundaries. **Sliding window** (used at production scale) smooths the rate across time by weighting the previous window's count with the current window's count. **Token bucket** allows controlled bursts by accumulating tokens at a steady rate. The choice depends on whether you want strict rate enforcement or tolerance for short bursts.
+
+**File**: `src/services/rateLimiter.ts`
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the application is functioning correctly. Load balancers, container orchestrators (Kubernetes), and monitoring systems call this endpoint periodically to determine if an instance should receive traffic.
+
+This project exposes `/api/health`, which verifies database connectivity by running a simple query (`SELECT 1`) against PostgreSQL. If the query succeeds, the endpoint returns `200 OK` with a status payload. If it fails (database unreachable, connection pool exhausted), it returns `503 Service Unavailable`. At production scale, health checks typically distinguish between **liveness** (is the process running and not deadlocked?) and **readiness** (can the process serve traffic? -- meaning all dependencies are connected and warmed up). A failing liveness check restarts the container. A failing readiness check removes the instance from the load balancer pool without restarting it.
+
+**File**: `src/app.ts`
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache hit, the cached value is returned immediately (sub-millisecond latency). On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it to the caller. Subsequent requests for the same data hit the cache until the TTL expires.
+
+Redis is commonly used as the cache layer because it is an in-memory key-value store with sub-millisecond read latency, built-in TTL support, and atomic operations. In this project, Redis serves dual duty as the session store (via `connect-redis`) and the cache layer. Dashboard KPIs, for example, would benefit from a 5-minute cache TTL at production scale because they aggregate across all opportunities and leads -- an expensive query that returns the same result for every user within a short window.
+
+Cache invalidation is the hardest part of cache-aside. When data changes, the cache must be invalidated to prevent serving stale data. Strategies include TTL-based expiry (accept bounded staleness), write-through (update cache on every write), and event-driven invalidation (publish change events that trigger cache deletes). This project relies on TTL-based expiry as the simplest approach.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user (which becomes unmanageable with thousands of users), you define roles like "user" and "admin" and assign a set of permissions to each role. A user's effective permissions are determined by their role.
+
+In this project, the `users` table has a `role` column with a default of `'user'`. The `requireAuth` middleware checks that a valid session exists, and specific admin endpoints would additionally check `user.role === 'admin'`. This is a simplified two-tier RBAC. Production CRM systems like Salesforce implement much richer RBAC with object-level permissions (can this role see Opportunities?), field-level security (can this role see the `amount` field?), and sharing rules (can this user see records owned by other users in the same territory?).
+
+The key advantage of RBAC over direct permission assignment is scalability of administration: when a new feature is added, you update the role definition once rather than updating every user individually. The trade-off is that roles can become too coarse-grained, leading to role explosion (creating dozens of fine-grained roles to cover every permission combination).
+
 ## Implementation Notes
 
 ### Local Setup Diagram

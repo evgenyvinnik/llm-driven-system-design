@@ -641,6 +641,160 @@ Exponential backoff with jitter for retryable errors (5xx, 429, ETIMEDOUT, ECONN
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+└── Outlet ─── child route content
+    ├── index.tsx (Home) ─── hero banner, content rows, recommendations
+    │   ├── HeroBanner ─── featured content with auto-rotation
+    │   ├── ContentRow ─── horizontal scrollable row of content cards
+    │   │   └── ContentCard ─── poster with title, genre, rating
+    │   └── Continue Watching row (profile-specific)
+    ├── content.$contentId.tsx ─── content detail page
+    │   └── Episode listing for series (grouped by season)
+    ├── watch.$contentId.tsx ─── full-screen video player
+    │   └── VideoPlayer
+    │       ├── VideoOverlay ─── content title, background
+    │       ├── PlayerTopBar ─── back button, content title
+    │       └── PlayerControls ─── play/pause, seek, volume, quality
+    │           ├── ProgressBar ─── draggable scrubber
+    │           └── QualitySettings ─── resolution/codec picker
+    ├── movies.tsx ─── filtered catalog (movies only)
+    ├── shows.tsx ─── filtered catalog (series only)
+    ├── watchlist.tsx ─── My List
+    ├── profiles.tsx ─── profile selection and management
+    ├── account.tsx ─── subscription management
+    ├── admin.tsx ─── admin dashboard
+    │   └── AdminTabs
+    │       ├── OverviewTab ─── platform stats (StatCard components)
+    │       ├── ContentTab ─── content CRUD
+    │       └── UsersTab ─── user management
+    ├── login.tsx ─── email/password login
+    └── register.tsx ─── account registration
+```
+
+Unlike Apple Music's fixed sidebar layout, Apple TV uses a full-width layout with a top `Header` component containing navigation links and profile selector. The root component is minimal -- it validates the session on mount and renders a dark-themed container.
+
+### Zustand Stores
+
+**`authStore`** -- Manages user session and multi-profile state. Uses `zustand/middleware/persist` to save the `currentProfile` to localStorage, so the selected profile survives page reloads. Holds `user`, `profiles` array, and `currentProfile`. Actions include `login`, `register`, `logout`, `checkAuth`, `selectProfile` (calls the backend to bind the profile to the session), `createProfile`, and `deleteProfile`. Multi-profile support enables different family members to have separate watch histories, watchlists, and recommendations.
+
+**`playerStore`** -- Manages video playback state. Key state includes `content`, `manifestUrl` (HLS manifest URL from the backend), `currentTime`, `duration`, `volume`, `isFullscreen`, `selectedVariant` (the current quality level), `selectedAudioTrack`, and `selectedSubtitle`. The `loadContent` action fetches playback info from `/api/stream/:contentId/playback` and saved progress from `/api/watch/progress/:contentId`, restoring the user's last position for seamless resume. The `saveProgress` action persists the current position to the server for cross-device sync.
+
+**`contentStore`** -- Manages catalog data and user content interactions. Holds `featured` (hero content), `continueWatching` (profile-specific in-progress content), `watchlist` (My List items), `recommendations` (personalized sections), and `genres`. Each has a corresponding `fetch*` action that calls the backend API. The `addToWatchlist` and `removeFromWatchlist` actions perform optimistic updates, immediately modifying local state while the server request is in flight.
+
+### Routing
+
+Uses TanStack Router with file-based routing. Dynamic route segments use the `$param` convention (e.g., `content.$contentId.tsx` maps to `/content/:contentId`). The `watch.$contentId.tsx` route renders the full-screen video player, separate from the main layout. A dedicated `router.ts` file creates the router instance with the generated route tree.
+
+### Data Fetching
+
+All API calls go through `services/api.ts`, organized into namespace objects: `authApi`, `contentApi`, `streamingApi`, `watchProgressApi`, `watchlistApi`, `subscriptionApi`, `recommendationsApi`, and `adminApi`. The shared `fetchApi` helper includes `credentials: 'include'` for cookie-based session auth and standardized error handling.
+
+The home page fetches data through the `contentStore` on mount: `fetchFeatured()`, `fetchContinueWatching()`, and `fetchRecommendations()` are called in parallel. Content detail pages fetch data directly in their route components using `useEffect`.
+
+### Key UI Pattern: Video Player
+
+The video player is the centerpiece of the Apple TV frontend, designed as a full-screen cinematic experience.
+
+**Player architecture:**
+The `VideoPlayer` component fills the entire viewport (`h-screen`) and manages several custom hooks:
+- `useAutoHideControls` -- hides the control overlay after 3 seconds of inactivity during playback, reappearing on mouse movement. The cursor also hides (`cursor: none`) for an immersive experience.
+- `useKeyboardControls` -- binds keyboard shortcuts: Space/K for play/pause, Left/Right arrows for 10-second seek, Up/Down for volume, M for mute, F for fullscreen, Escape to exit fullscreen.
+- `usePlaybackSimulation` -- since no real video files are served, this hook increments `currentTime` by 1 second each second during playback, simulating playback progress.
+- `useProgressAutoSave` -- saves watch progress to the server every 10 seconds via `playerStore.saveProgress()`, enabling cross-device resume.
+
+**Controls hierarchy:**
+The `ControlsOverlay` wrapper provides gradient overlays (top and bottom) that fade in/out with CSS transitions. `PlayerTopBar` shows the content title and a back button. `PlayerControls` renders the bottom control bar with play/pause, seek (via a draggable `ProgressBar` with scrubber), volume slider, quality selector (`QualitySettings` dropdown listing available `EncodedVariant` objects), and fullscreen toggle.
+
+**Quality selection:**
+The `QualitySettings` component displays available quality variants (from the `encoded_variants` table) as a dropdown. Each option shows resolution, codec, and bitrate. Selecting a variant updates `playerStore.selectedVariant`. In production, this would switch the HLS variant playlist; in the demo, it is purely visual.
+
+**Progress persistence:**
+When a user navigates to the watch page, `playerStore.loadContent` fetches both the content metadata and the saved progress position. `currentTime` is initialized to the saved position, allowing seamless resume. Progress is saved on unmount (via a cleanup function in `useEffect`) and periodically during playback.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
+
+### Role-Based Access Control (RBAC)
+
+**What it is:** RBAC is a method of restricting system access based on the roles assigned to individual users. Instead of granting permissions directly to each user (which becomes unmanageable at scale), you assign users to roles, and roles carry predefined sets of permissions. When the system needs to decide whether a user can perform an action, it checks the user's role against the required permission for that action.
+
+**How it works in this project:** Users have a `role` column in the `users` table with values `'user'` or `'admin'`. The backend middleware checks `req.session.user.role` before allowing access to admin endpoints (`/api/admin/*`). Regular users can browse content, manage their watchlist, and stream; admins can additionally manage content, view platform statistics, and manage users. Subscription tier (`free`, `monthly`, `yearly`) acts as a secondary access control -- streaming endpoints check subscription status before generating manifest URLs.
+
+**Why it matters at scale:** Without RBAC, access control devolves into scattered conditional checks throughout the codebase. As the team grows, no one can answer the question "what can a free-tier user actually do?" without reading every route handler. RBAC centralizes this into an auditable, testable system. Adding a new role (e.g., `content_curator` who can feature content but not manage users) requires only a middleware update, not changes to dozens of route handlers.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache (typically Redis) before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If the data is not in the cache (a "miss"), the application queries the database, stores the result in the cache with a time-to-live (TTL), and then returns it. The cache is never written to directly by the database -- the application is responsible for populating it.
+
+**How it works in this project:** Content metadata (titles, descriptions, thumbnails), recommendation sections, and session data are cached in Redis. The recommendation engine results are particularly expensive to compute (they involve JOINs across watch history, content ratings, and genre preferences), so caching them for a few minutes avoids recalculating on every page load. Cache entries are keyed by profile ID since recommendations are profile-specific.
+
+**Why it matters at scale:** Video streaming home pages are among the most read-heavy pages on the internet. Millions of users loading the home page simultaneously, each expecting personalized content rows, would overwhelm the database if every request triggered fresh recommendation queries. Redis serves these cached results in sub-millisecond time, and the TTL ensures fresh recommendations appear within minutes of new viewing activity.
+
+### Circuit Breaker (Opossum)
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly trying to execute an operation that is likely to fail. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters a "half-open" state where a limited number of test requests are allowed through. If they succeed, the circuit closes and normal operation resumes; if they fail, the circuit opens again.
+
+The three states are:
+- **Closed** (normal operation): requests pass through. If the failure rate exceeds the error threshold, the circuit opens.
+- **Open** (failing fast): all requests immediately fail with a fallback response, without contacting the downstream service. After the reset timeout elapses, the circuit transitions to half-open.
+- **Half-open** (testing recovery): a small number of requests are allowed through. If they succeed, the circuit closes. If any fail, the circuit reopens.
+
+**How it works in this project (`backend/src/shared/circuitBreaker.ts`):** Independent circuit breakers wrap calls to each external dependency: CDN (5s timeout, 30% error threshold, 15s reset), transcoding service (5min timeout, 50% threshold, 2min reset), DRM license server (5s timeout, 25% threshold, 60s reset), and storage (10s timeout, 40% threshold, 30s reset). The `opossum` library manages state transitions. When a circuit opens, the fallback returns a graceful response (e.g., "Popular Now" content instead of personalized recommendations). Circuit state is exposed as a Prometheus gauge metric and included in the `/health` endpoint.
+
+**Why it matters at scale:** Without circuit breakers, a failing DRM license server causes every playback request to hang for 30 seconds (the default TCP timeout) before returning an error. During this time, the request consumes a connection from the pool and a thread from the event loop. Under load, all connections are consumed waiting for the dead service, and the entire application becomes unresponsive -- even for requests that do not depend on DRM. This is called "cascading failure." Circuit breakers prevent this by failing fast: instead of waiting 30 seconds, the request fails in under 1ms with a clear error message, preserving resources for requests that can still succeed.
+
+### Structured Logging (Pino)
+
+**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry contains a consistent set of fields (`timestamp`, `level`, `service`, `requestId`, `message`, plus arbitrary context) that log aggregation systems (ELK, Loki, Datadog) can index and search. This is in contrast to traditional `console.log("User 123 failed to login")` which is human-readable but impossible to query programmatically.
+
+**How it works in this project (`backend/src/shared/logger.ts`):** The Pino logger outputs JSON lines. Express middleware creates a child logger for each request, binding the `requestId` (from `X-Request-Id` header or generated), HTTP method, path, and user/profile context. Audit events (login, license issuance, content access, profile changes) are logged to a separate audit channel for compliance. Pino was chosen over Winston for its low overhead -- it serializes JSON in a worker thread, keeping the event loop free.
+
+**Why it matters at scale:** When investigating why a specific user cannot play a specific episode, an engineer needs to trace the exact sequence: authentication check, subscription validation, manifest generation, DRM license request. With structured logging, they filter by `userId` and `contentId` to find all relevant log lines across all services, then by `requestId` to see the full request lifecycle. Without structured logs, this investigation requires manually searching text files with `grep`, often across dozens of servers, hoping the log format is consistent.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals. Applications expose a `/metrics` endpoint that returns metric values in a specific text format. Prometheus stores these time series and enables queries like "what is the p95 playback start latency over the last hour?" Grafana is typically used to visualize these queries as dashboards.
+
+**How it works in this project (`backend/src/shared/metrics.ts`):** Several metrics are registered: `http_request_duration_seconds` (histogram for API latency by method, route, status), `playback_start_latency_seconds` (time from stream request to manifest delivery), `active_streams_total` (gauge for concurrent streams by quality and device type), `manifest_generation_duration_seconds` (histogram for HLS manifest build time), `streaming_errors_total` (counter by error type), `circuit_breaker_state` (gauge per dependency), `watch_progress_updates_total` (counter for sync operations), and `idempotent_requests_total` (counter for cache hits/misses). Node.js default metrics (CPU, memory, event loop lag) are also collected.
+
+**Why it matters at scale:** A streaming service must know, in real-time, how many users are experiencing buffering, what the playback start latency distribution looks like, and which CDN regions are underperforming. Metrics make these invisible problems visible. The SLI/SLO targets defined in the Observability section (e.g., "playback start latency p95 < 2s") are only enforceable if you are measuring them. Without metrics, the team discovers problems from user complaints, which means thousands of users were already affected.
+
+### Idempotency
+
+**What it is:** An idempotent operation produces the same result whether it is executed once or multiple times. In the context of an API, idempotency means that if a client sends the same request twice (due to a network timeout, a retry, or a user double-clicking), the server processes it only once and returns the same response both times. Without idempotency, retrying a "add to watchlist" request could create duplicate entries, or retrying a "create profile" request could create two identical profiles.
+
+**How it works in this project (`backend/src/shared/idempotency.ts`):** Clients include an `Idempotency-Key` header with mutation requests. The middleware checks Redis for a cached response under that key. If found and completed, the cached response is returned with an `X-Idempotency-Replayed: true` header. If found but in-progress, a 409 Conflict is returned. If not found, a Redis lock is acquired, the operation executes, and the result is cached for 24 hours. Watch progress updates are inherently idempotent via the database `ON CONFLICT` upsert with `client_timestamp` comparison.
+
+**Why it matters at scale:** Network unreliability is the norm on mobile devices, especially during video playback when the device may switch between Wi-Fi and cellular. A client that sends "update progress to 45:30" and does not receive a response will retry. Without idempotency, this could create duplicate progress records or trigger unnecessary server-side processing. For profile creation, it could create duplicate profiles. The idempotency middleware makes all retries safe by design.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether the application is functioning correctly. They are consumed by infrastructure systems (load balancers, container orchestrators, monitoring) rather than by humans. There are typically two types: a liveness check ("is the process running?") and a readiness check ("can the process serve traffic?").
+
+**How it works in this project (`backend/src/index.ts`):** Three endpoints are exposed. `GET /health/live` returns 200 if the process is running (liveness probe). `GET /health/ready` checks PostgreSQL and Redis connectivity with latency measurements, returning 503 if either is unreachable (readiness probe). `GET /health` performs a deep check that includes component latency, circuit breaker state for all dependencies, and overall system status.
+
+**Why it matters at scale:** In a production deployment with multiple server instances, health checks enable automatic traffic management. If an instance loses its database connection, the readiness check fails, and the load balancer stops routing traffic to it -- before users see 500 errors. The deep health check is used by monitoring systems to detect degraded states (e.g., DRM circuit breaker is open) that are not outright failures but reduce service quality. The graceful shutdown handler (SIGTERM/SIGINT) closes Redis connections and drains the database pool, ensuring in-flight requests complete before the process exits.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make to an API within a given time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header indicating when the client can try again. It protects the server from being overwhelmed and ensures fair access across users.
+
+**How it works in this project:** Although not implemented as a standalone shared module (rate limiting is configured in the API Gateway layer of the production architecture), the Express server applies rate limiting via middleware on the streaming and admin endpoints. The production design specifies Redis-backed rate limiting for consistency across multiple server instances, with different limits per endpoint category.
+
+**Why it matters at scale:** A streaming service is particularly vulnerable to abuse. A single user writing a script to download every available title by requesting manifests and segments in rapid succession could consume bandwidth intended for legitimate users. Rate limiting caps the damage any single client can inflict while legitimate usage patterns (browsing, watching one stream at a time) fall well within the limits.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation.

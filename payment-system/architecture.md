@@ -583,6 +583,133 @@ CREATE TABLE transactions_2025_01 PARTITION OF transactions
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS. It serves as a merchant dashboard for managing payments, refunds, and viewing transaction analytics.
+
+```
+__root.tsx (RootLayout)
+├── Nav bar with auth-aware links (Dashboard, Transactions, Refunds, Test Payment)
+├── Merchant name display + logout
+└── <Outlet /> renders child routes:
+    ├── /login ─────────── Login (API key entry + merchant creation)
+    ├── / ──────────────── Dashboard (balance card, stats grid: volume, txns, fees, success rate, refund rate, avg txn)
+    ├── /transactions ──── Transactions (paginated table with status filter dropdown, links to detail)
+    ├── /transactions/$id ─ Transaction Detail (single transaction view with capture/void/refund actions)
+    ├── /refunds ────────── Refunds (paginated table of refund records)
+    └── /test-payment ──── Test Payment (form to simulate payment creation with card details)
+```
+
+### Zustand Store
+
+**`authStore`** (persisted to localStorage under `payment-auth`): Stores the merchant API key, merchant ID, merchant name, and `isAuthenticated` flag. The API key is used as a Bearer token in all requests. Persistence means the merchant stays logged in across browser sessions. The store exposes `setApiKey`, `setMerchant`, and `logout` actions.
+
+This project uses API key auth rather than session cookies, so the store reads the key from localStorage on every request via the `getAuthHeaders()` helper in the API service.
+
+### Routing
+
+Uses TanStack Router with file-based routing. Routes are defined in `frontend/src/routes/` and auto-generated into `routeTree.gen.ts`. Each route component checks `isAuthenticated` from the auth store and redirects to `/login` if not authenticated. There is no route guard middleware; authentication is checked inline at the top of each route component.
+
+### Data Fetching
+
+All API calls go through a centralized `fetchApi<T>()` wrapper in `frontend/src/services/api.ts`. This wrapper automatically attaches the Bearer token from localStorage, parses JSON responses, and throws errors with the server's error message. Data fetching is done with `useEffect` + `useState` in each route component (no React Query or SWR). Each route manages its own loading, error, and data states locally.
+
+The API service is organized by domain: merchants, payments (create, get, list, capture, void, refund), refunds (list), chargebacks (list), and ledger (verify, summary). Idempotency keys are auto-generated client-side for payment and refund creation using `Date.now()` + random string.
+
+### Key UI Patterns
+
+- **Merchant balance card**: Gradient banner at top of dashboard showing available balance, merchant name, and email
+- **Stats grid**: Six metric cards (volume, transactions, fees, success rate, refund rate, avg transaction) with colored icons
+- **Paginated table**: Used for both transactions and refunds lists with Previous/Next buttons and result count
+- **Status filter**: Dropdown on transactions page to filter by payment status (pending, authorized, captured, etc.)
+- **Status badges**: Color-coded pill badges for transaction statuses using a `getStatusColor()` utility
+- **Currency formatting**: Centralized `formatCurrency()` and `formatPercent()` utilities in `frontend/src/utils/format.ts`
+- **Inline auth guard**: Each authenticated route returns `<Navigate to="/login" />` if not authenticated, rather than using a wrapper
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in this project. Each explanation assumes no prior familiarity with the pattern.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user (which becomes unmanageable at scale), you define a set of roles like "support", "operations", and "admin", each with a specific set of allowed actions. When a user makes a request, the system checks their role against the required permission for that endpoint.
+
+In this project, admin operations use three roles: `support` (read-only access to transactions and merchants), `operations` (read access plus the ability to issue refunds), and `admin` (full read/write access plus merchant management). This prevents a support agent from accidentally suspending a merchant or issuing an unauthorized refund. The role is stored on the user record and checked by middleware before the route handler executes.
+
+The alternative -- checking individual user IDs against an access list -- does not scale. With 50 support agents, you would need to update 50 records every time a new endpoint is added. With RBAC, you update the role definition once.
+
+File: `backend/src/shared/auth.ts` (RBAC middleware)
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and then returns it. The cache is never populated proactively -- it is filled on demand as requests arrive.
+
+In this project, merchant configuration is cached in Valkey with a 5-minute TTL. Every API request must validate the merchant's API key, which requires looking up the merchant record. Without caching, every request would hit PostgreSQL. With cache-aside, the first request for a given merchant hits the database and populates the cache; subsequent requests for the next 5 minutes are served from Valkey in sub-millisecond time. Exchange rates are also cached with a 5-minute TTL.
+
+The trade-off is staleness: if a merchant's status is changed to "suspended" in the database, the cache may serve the old "active" status for up to 5 minutes. For merchant config this is acceptable. For idempotency keys, where correctness is critical, the system uses Valkey as the primary store (not as a cache-aside layer).
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to an external service (like a payment processor or fraud service) and monitors failure rates. When failures exceed a threshold, the circuit "opens" and immediately rejects all subsequent calls without actually making the request. After a cooldown period, it enters a "half-open" state where it allows one test request through. If that succeeds, the circuit closes and normal traffic resumes. If it fails, the circuit opens again.
+
+The purpose is to prevent cascading failures. Without a circuit breaker, if the payment processor is down, every incoming payment request would wait for a 30-second TCP timeout before failing. With 500 concurrent requests, this exhausts the connection pool and causes the entire API to become unresponsive -- even for endpoints that do not call the processor. The circuit breaker detects the failure pattern and fails fast (milliseconds instead of 30 seconds), preserving system resources for healthy operations.
+
+In this project, circuit breakers wrap the payment processor and fraud scoring service using the `cockatiel` library. Configuration: 5 consecutive failures opens the circuit, 30-second recovery timeout, 2 successful requests needed to close. When the processor circuit is open, clients receive `503 Service Unavailable` immediately.
+
+File: `backend/src/shared/circuit-breaker.ts`
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"Payment 123 authorized for $50.00 in 45ms"`, the system emits `{"event": "payment.authorized", "transaction_id": "123", "amount": 5000, "currency": "USD", "duration_ms": 45, "trace_id": "abc-def"}`. Each field is a named key-value pair.
+
+The benefit is searchability and aggregation. With free-form text, finding all failed payments over $1000 requires regex parsing across millions of log lines. With structured JSON, a log aggregator (Elasticsearch, Datadog, Splunk) can index each field and answer the query in seconds: `status:failed AND amount:>100000`. Structured logs also enable automated alerting -- you can trigger an alert when `error_rate > 0.01` without writing custom parsers.
+
+In this project, Pino produces JSON logs with contextual fields: `event`, `transaction_id`, `merchant_id`, `amount`, `currency`, `status`, `duration_ms`, `fraud_score`, and `trace_id`. The audit logger additionally writes to the PostgreSQL `audit_log` table for PCI-DSS compliance.
+
+Files: `backend/src/shared/logger.ts`, `backend/src/shared/audit.ts`
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system. The application exposes an HTTP endpoint (`GET /metrics`) that returns numeric measurements in a specific text format. A Prometheus server scrapes this endpoint at regular intervals (typically every 15 seconds) and stores the data points over time. Grafana then visualizes these time series as dashboards and graphs.
+
+There are four metric types: **Counter** (monotonically increasing, e.g., total payments processed), **Gauge** (goes up and down, e.g., current database connections), **Histogram** (measures distribution of values, e.g., request latency percentiles), and **Summary** (similar to histogram but calculated client-side).
+
+In this project, key metrics include: `payment_request_duration_seconds` (histogram for latency SLO tracking), `payment_total` (counter by status and currency for volume monitoring), `webhook_delivery_total` (counter for webhook reliability), `fraud_score_distribution` (histogram for risk analysis), and `db_active_connections` (gauge for pool health). Alert rules trigger when error rate exceeds 1% for 5 minutes or p99 latency exceeds 2 seconds.
+
+File: `backend/src/shared/metrics.ts`
+
+### Rate Limiting
+
+Rate limiting restricts the number of requests a client can make within a time window. It prevents abuse (a single client flooding the API with thousands of requests per second), protects against denial-of-service attacks, and ensures fair resource sharing among merchants.
+
+The most common algorithm is the **sliding window**: track timestamps of recent requests in a sorted set, remove entries older than the window, and check if the count exceeds the limit. If it does, return `429 Too Many Requests`.
+
+In this project, rate limits are enforced per merchant API key using Valkey sorted sets with `ZRANGEBYSCORE`. Each merchant has a configured limit (e.g., 100 requests per second). The rate limiter runs as Express middleware before any business logic. When Valkey is unavailable, the system degrades to no rate limiting rather than rejecting all requests -- availability is prioritized over strict enforcement during infrastructure failures.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a payment system, this is critical because network failures cause ambiguity: the client sends a payment request, the connection drops, and the client does not know if the payment was processed. Without idempotency, retrying the request could charge the customer twice.
+
+The implementation works as follows: the client generates a unique key (e.g., UUID) and sends it with the request in the `Idempotency-Key` header. Before processing, the server checks Valkey for this key. If found, the server returns the cached response from the original request without re-executing any logic. If not found, the server processes the request, stores the result in Valkey keyed by the idempotency key with a 24-hour TTL, and returns the response. A distributed lock (`SET key NX EX 30`) prevents concurrent processing of the same key.
+
+The database also has a `UNIQUE(merchant_id, idempotency_key)` constraint as a fallback. If Valkey is restarted and loses data, this constraint prevents duplicate payments at the database level (the insert fails with a constraint violation rather than creating a duplicate charge).
+
+File: `backend/src/shared/idempotency.ts`
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the service is functioning correctly. They serve two purposes: load balancers use them to route traffic away from unhealthy instances, and orchestration systems (Kubernetes, ECS) use them to restart failed containers.
+
+There are typically three levels: **Liveness** (`/health/live`) reports whether the process is running -- if this fails, the process should be restarted. **Readiness** (`/health/ready`) reports whether the service can accept traffic -- it may be alive but not ready (e.g., still connecting to the database). **Deep health** (`/health`) checks all dependencies (database, cache, external services) and reports individual status.
+
+In this project, the health endpoint tests PostgreSQL connectivity (runs a `SELECT 1` query), Valkey connectivity (runs a `PING`), and reports circuit breaker states. The load balancer removes instances that fail readiness checks, preventing users from hitting a server that cannot process payments. During graceful shutdown, the readiness check returns unhealthy immediately so the load balancer drains traffic before the process exits.
+
+File: `backend/src/index.ts`
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker Compose.

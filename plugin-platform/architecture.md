@@ -474,6 +474,144 @@ The alternative (separate repositories per plugin) would provide stronger isolat
 | Project structure | Monorepo (npm workspaces) | Separate repos | SDK and plugins evolve together, single install |
 | Plugin ID | Human-readable slug | UUID | Readable URLs, natural naming, matches npm conventions |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App.tsx (root)
+└── PluginHostProvider                ← React context that loads and activates plugins
+    └── EditorLayout
+        ├── header
+        │   ├── "Pluggable Editor" title
+        │   ├── Slot id="toolbar"     ← Renders toolbar plugin contributions
+        │   │   ├── FontSelector      ← (font-selector plugin) font family + size dropdowns
+        │   │   ├── PaperSelector     ← (paper-background plugin) paper style dropdown
+        │   │   └── ThemeToggle       ← (theme plugin) light/dark mode toggle
+        │   ├── PluginIcon button     ← Opens MarketplaceModal
+        │   └── Auth (sign in / sign out)
+        ├── main
+        │   ├── Slot id="canvas"      ← Stacked plugin contributions (z-indexed)
+        │   │   ├── PaperBackground   ← (paper-background plugin, z-index: 0)
+        │   │   └── TextEditor        ← (text-editor plugin, z-index: 1)
+        │   └── aside
+        │       └── Slot id="sidebar" ← Currently unused, available for future plugins
+        ├── footer
+        │   └── Slot id="statusbar"   ← Status bar plugin contributions
+        │       └── WordCount         ← (word-count plugin) word/character/line counts
+        ├── Slot id="modal"           ← Dialog overlay slot for plugin modals
+        ├── MarketplaceModal          ← Browse, search, install/uninstall marketplace plugins
+        └── AuthModal                 ← Login/register modal dialog
+```
+
+### Core Infrastructure (No Zustand -- Custom Plugin State System)
+
+Unlike other projects in this repository, the plugin platform frontend does not use Zustand for domain state. Instead, it implements a custom plugin infrastructure consisting of four components:
+
+**`EventBus`** (`core/EventBus.ts`) is a publish/subscribe event system for transient notifications between plugins. Plugins call `events.emit('editor:content-changed', data)` to broadcast and `events.on('editor:content-changed', handler)` to subscribe. The `on` method returns an unsubscribe function for cleanup. Events are fire-and-forget -- there is no persistence or replay.
+
+**`StateManager`** (`core/StateManager.ts`) is a reactive key-value store for persistent shared state. Plugins call `state.set('format.fontFamily', 'Arial')` to update and `state.subscribe('format.fontFamily', handler)` to receive change notifications. Unlike the EventBus, the StateManager retains values so plugins can read the current state at any time via `state.get()`. This is the mechanism by which the font selector plugin communicates the chosen font to the text editor plugin without either knowing the other exists.
+
+**`PluginHost`** (`core/PluginHost.tsx`) is a React context provider that manages plugin lifecycle. On mount, it iterates through the PLUGINS array, creates a `PluginContext` for each plugin (giving it access to events, state, storage, and commands), calls each plugin's `activate()` function, and registers slot contributions from the manifest. The `usePluginHost` hook exposes the loaded plugins map and `getSlotContributions()` function. The `useStateValue` hook provides reactive state access from within plugin React components.
+
+**`SlotRenderer`** (`core/SlotRenderer.tsx`) renders the `<Slot id="toolbar">` components. For each slot ID, it looks up registered contributions (sorted by `order` property from manifests), and renders each plugin's React component with a `PluginProps` context object.
+
+**`useAuthStore`** (`stores/auth.ts`) is the only Zustand store, managing user authentication and marketplace plugin installation state. It uses `persist` middleware to save the user and authentication status to localStorage. Beyond standard login/register/logout, it includes `installPlugin`, `uninstallPlugin`, and `togglePlugin` actions that call the marketplace API and re-fetch the installed plugins list. The store loads installed plugins for both authenticated and anonymous users (anonymous installs are tracked by session ID on the backend).
+
+### Routing
+
+This project has no URL-based routing. The application is a single-page editor where the entire UI is composed from plugin slot contributions. The MarketplaceModal and AuthModal are overlay dialogs controlled by local React state (`useState`) in the EditorLayout component. Navigation between views (editor vs marketplace) happens through modal open/close rather than URL changes.
+
+### Data Fetching
+
+API communication is split across two files:
+
+**`services/api.ts`** provides four API client objects: `authApi` (register, login, logout, session check), `pluginsApi` (list, search, get details, categories), `userPluginsApi` (get installed, install, uninstall, toggle, update settings). All clients use a shared `fetchApi<T>()` helper that wraps `fetch()` with `credentials: 'include'` for cookie-based sessions, JSON parsing, and error wrapping into an `ApiResponse<T>` type with `data` and `error` fields. The API base URL defaults to `http://localhost:3000` and is configurable via `VITE_API_URL`.
+
+Plugin data fetching happens in the MarketplaceModal component which directly calls `pluginsApi.list()` and `pluginsApi.getDetails()`. Install/uninstall operations go through the Zustand auth store, which calls `userPluginsApi` and then re-fetches the installed plugins list.
+
+### Key UI Patterns
+
+**Slot-based composition**: The entire UI is assembled from plugin contributions to named slots. The `<Slot id="toolbar">` component in the header renders all plugins that registered a toolbar contribution in their manifest. Removing all plugins leaves an empty shell. This extreme modularity demonstrates the VS Code/Eclipse extension point pattern in a React context.
+
+**Plugin manifest-driven registration**: Each plugin exports a `manifest` object declaring which slots it contributes to, at what order, and which component to render. The PluginHost reads these manifests at load time and populates the slot registry. This decouples plugins from each other and from the host layout.
+
+**Inter-plugin communication without coupling**: The font selector plugin writes to shared state key `format.fontFamily`. The text editor plugin subscribes to `format.fontFamily` and updates its textarea style. Neither plugin imports or references the other. New plugins can participate in the same communication by reading/writing the same state keys.
+
+**Anonymous-to-authenticated session migration**: Anonymous users can browse the marketplace and install plugins (tracked by session ID in `anonymous_installs` table). When they register, the backend migrates their installations to the `user_plugins` table. The auth store handles this transparently by re-fetching installed plugins after login.
+
+**Dark mode via plugin**: Even the theme system is a plugin. The `theme` plugin contributes a toggle to the toolbar slot, detects system preference via `prefers-color-scheme`, and writes `theme.mode` to shared state. Other plugins read this state key to adjust their rendering.
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project from first principles. Each pattern solves a specific operational problem that emerges at scale.
+
+### Structured Logging
+
+Structured logging means writing log entries as machine-parseable data (typically JSON) rather than free-form text strings. Traditional logs look like `"User 123 installed plugin font-selector"` -- a human can read this, but extracting the user ID or plugin ID programmatically requires fragile regex parsing. Structured logs look like `{"event":"plugin_install","userId":"123","pluginId":"font-selector","timestamp":"2025-01-01T00:00:00Z"}` -- every field is a named key-value pair that log aggregation tools (Elasticsearch, Datadog, CloudWatch) can index, search, and alert on.
+
+This project uses Pino via `pino-http` middleware, which automatically logs every HTTP request with method, path, status code, and response duration as JSON fields. At production scale with thousands of plugin installs per hour, structured logging enables queries like "show me all failed plugin bundle downloads in the last hour grouped by plugin ID" -- impossible with unstructured text logs without custom parsing.
+
+**File**: `backend/src/shared/logger.ts`
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache hit, the cached value is returned immediately (sub-millisecond latency). On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it to the caller. Subsequent requests for the same data hit the cache until the TTL expires.
+
+Redis is commonly used as the cache layer because it is an in-memory key-value store with sub-millisecond read latency, built-in TTL support, and atomic operations. In this project, the marketplace browse results are cached for 5 minutes (`plugins:list:{hash}`), plugin details for 10 minutes (`plugins:detail:{id}`), and category lists for 30 minutes (`plugins:categories`). Cache invalidation happens on writes: when a new version is published or a plugin is updated, the relevant detail key and all list keys are deleted.
+
+The most challenging aspect of cache-aside is cache invalidation. This project uses a hybrid approach: TTL-based expiry for natural staleness bounds, plus explicit deletion on known write events. The trade-off is that between a write and TTL expiry, clients may see slightly stale data (e.g., an install count that is off by 1). This is acceptable for a marketplace browse page but would not be acceptable for, say, a payment balance.
+
+**File**: `backend/src/shared/cache.ts`
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the application is functioning correctly. Load balancers, container orchestrators (Kubernetes), and monitoring systems call this endpoint periodically to determine if an instance should receive traffic.
+
+This project checks three dependencies: PostgreSQL (database connectivity), Redis/Valkey (session and cache store), and MinIO (plugin bundle storage). If any dependency is unreachable, the health check returns `503 Service Unavailable` with details about which component is down. This granularity helps operators quickly identify the root cause during an incident -- "MinIO is down, but PostgreSQL and Redis are healthy" narrows the debugging surface immediately.
+
+At production scale, health checks typically distinguish between **liveness** (is the process running and not deadlocked?) and **readiness** (can the process serve traffic?). A failing liveness check restarts the container. A failing readiness check removes the instance from the load balancer without restarting, which is useful during startup when the database connection pool is still warming up or when MinIO becomes temporarily unavailable.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window, protecting the server from abuse, accidental loops, and denial-of-service attacks. Without rate limiting, a single misbehaving client could consume all server resources and deny service to legitimate users.
+
+This project does not currently implement rate limiting (it is listed under "What Was Omitted"), but the production design would apply it at the API gateway level with endpoint-specific limits. Plugin bundle downloads would have generous limits (users download bundles infrequently but in bursts when installing several plugins). Plugin search/browse endpoints would have tighter limits to prevent scraping. Publishing endpoints would have strict limits to prevent abuse.
+
+Rate limiting algorithms vary in sophistication. **Fixed window** divides time into intervals and counts requests per window -- simple but allows burst-then-starve at boundaries. **Sliding window** smooths the rate by weighting the previous and current windows. **Token bucket** allows controlled bursts by accumulating tokens at a steady rate. For a marketplace API, token bucket is often preferred because legitimate usage patterns involve bursts (browsing multiple plugins quickly) followed by idle periods.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements (metrics) from applications at regular intervals. The application exposes an HTTP endpoint (`/metrics`) that returns current metric values in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+There are four main metric types. **Counters** only go up (total requests served, total plugin installs). **Gauges** go up and down (current memory usage, active sessions). **Histograms** track the distribution of values (request duration buckets for computing p50/p90/p99 latencies). **Summaries** compute quantiles on the client side.
+
+This project does not currently expose Prometheus metrics (listed under "What Was Omitted"), but the production design would track: plugin download counts (counter), bundle download latency (histogram), marketplace search latency (histogram), active WebSocket connections if collaborative editing were added (gauge), and per-plugin error rates during activation (counter). These metrics would feed Grafana dashboards with alerts on download failures and search latency degradation.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing downstream service from dragging down the entire application. The name comes from electrical circuit breakers that trip to prevent a short circuit from causing a fire.
+
+The pattern works through three states. In the **closed** state (normal operation), all requests pass through. When failures cross a threshold, the breaker enters the **open** state -- all requests fail immediately (0ms latency vs 30-second timeouts). After a cooldown period, the breaker enters the **half-open** state, allowing a few test requests through. If those succeed, the breaker closes; if they fail, it reopens.
+
+In this project, circuit breakers would protect MinIO bundle downloads and Redis cache operations. If MinIO goes down, the circuit breaker for storage operations opens, and the marketplace shows "bundle unavailable" errors instantly rather than hanging for 30 seconds per download attempt. Already-loaded plugins continue working because they are loaded into browser memory. Redis failures would cause the session fallback to in-memory storage (single-instance only) while the breaker periodically tests if Redis has recovered.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This is critical in distributed systems where network failures cause retries.
+
+In this project, plugin installation is idempotent by design: installing an already-installed plugin updates the version if different, or is a no-op if the same version. The `UNIQUE(plugin_id, version)` constraint on `plugin_versions` prevents duplicate version publishes at the database level. Install count updates use atomic SQL (`install_count = install_count + 1`) rather than read-modify-write, preventing lost updates when two users install the same plugin simultaneously.
+
+For general API idempotency at production scale, the server would accept an `X-Idempotency-Key` header, check it against a Redis cache before processing, and return the cached response for duplicate requests. This guarantees exactly-once semantics even when clients retry after network timeouts.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user, you define roles and assign permission sets to each role.
+
+This project implements a three-tier authorization model. **Anonymous users** can browse the marketplace and install plugins (tracked by session ID). **Authenticated users** get persistent installations that sync across sessions, plus the ability to leave reviews. **Developers** (users with `is_developer = true`) can additionally publish plugins and upload bundles. The developer upgrade is a one-way operation via `POST /api/v1/developer/register`.
+
+The key design insight is that the plugin marketplace serves two distinct user populations (consumers and publishers) with fundamentally different permission needs. Rather than a complex RBAC table, the project uses a simple boolean `is_developer` flag because there are only two meaningful permission levels beyond basic authentication. At production scale with features like plugin moderation, featured listings, and monetization, a full RBAC system with permissions like `publish_plugin`, `moderate_reviews`, `manage_featured`, and `view_analytics` would become necessary.
+
 ## Implementation Notes
 
 ### Local Setup Diagram

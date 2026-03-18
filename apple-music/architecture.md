@@ -588,6 +588,139 @@ At production scale, shard user-specific tables (`library_items`, `listening_his
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Sidebar ─── navigation links, playlist list, user menu
+├── Outlet ─── child route content
+│   ├── index.tsx (ListenNow) ─── recommendation sections grid
+│   ├── browse.tsx ─── catalog browsing with search
+│   ├── library.tsx ─── user library (tracks, albums, artists tabs)
+│   ├── radio.tsx ─── radio station listing
+│   ├── radio_/$id.tsx ─── individual station with tracks
+│   ├── albums/$id.tsx ─── album detail with track list
+│   ├── artists/$id.tsx ─── artist detail with discography
+│   ├── playlists/$id.tsx ─── playlist detail with track list
+│   ├── playlists/new.tsx ─── create playlist form
+│   ├── settings.tsx ─── user preferences (quality, display name)
+│   ├── admin.tsx ─── admin dashboard (stats, user management)
+│   ├── login.tsx ─── email/password login
+│   └── register.tsx ─── account registration
+└── Player ─── fixed bottom audio player (always visible)
+    └── Queue Panel ─── slide-up panel showing play queue
+```
+
+The root layout uses a three-column structure: a fixed 256px sidebar on the left for navigation, a flexible main content area in the center that scrolls independently, and a fixed 96px player bar at the bottom. The main area has `pb-24` (96px padding-bottom) to prevent content from being hidden behind the player.
+
+### Zustand Stores
+
+**`authStore`** -- Manages user session state. Holds the current `User` object (or null), loading and error states. Provides `login`, `register`, `logout`, and `checkAuth` actions. `checkAuth` is called on app mount from `__root.tsx` to restore sessions from the server-side cookie. No persistence middleware is used -- session state is derived from the httpOnly cookie on each page load.
+
+**`playerStore`** -- The most complex store, managing the entire audio playback lifecycle. Key state includes `currentTrack`, `queue` (array of Track objects), `queueIndex`, playback flags (`isPlaying`, `isShuffled`, `repeatMode`), and `audioElement` (a reference to the HTML5 `<audio>` element). Actions include:
+- `playTrack` -- fetches a signed stream URL from the backend (`/api/stream/:trackId`), sets it as the audio source, and begins playback. Records a play event after 30 seconds of listening.
+- `playQueue` -- sets a queue of tracks and begins playing from a given index.
+- `next` / `previous` -- advances or rewinds through the queue, respecting repeat mode (`off`, `all`, `one`) and shuffle. The `previous` action restarts the current track if more than 3 seconds have elapsed, matching the behavior of desktop music players.
+- `seekTo`, `setVolume`, `toggleMute` -- directly manipulate the HTMLAudioElement.
+- `addToQueue`, `removeFromQueue` -- modify the queue array, adjusting the current index when items are removed before the current position.
+
+### Routing
+
+Uses TanStack Router with file-based routing. Routes are defined in `frontend/src/routes/` and auto-generated into `routeTree.gen.ts`. Dynamic routes use the `$param` convention (e.g., `albums/$id.tsx`). The root route (`__root.tsx`) wraps all children with `Sidebar` + `Player` and checks authentication on mount.
+
+### Data Fetching
+
+All API calls go through a centralized `services/api.ts` module organized into namespace objects: `authApi`, `catalogApi`, `libraryApi`, `playlistApi`, `streamApi`, `radioApi`, and `recommendationsApi`. Each uses a shared `fetchApi` helper that:
+- Prefixes all endpoints with `/api`
+- Includes `credentials: 'include'` for cookie-based session auth
+- Sets `Content-Type: application/json`
+- Parses error responses and throws typed errors
+
+Data fetching happens in `useEffect` hooks within route components. There is no client-side caching layer -- each page load fetches fresh data from the server. The Listen Now page conditionally fetches either personalized recommendations (if logged in) or generic browse content (if not).
+
+### Key UI Pattern: Audio Player
+
+The audio player is a persistent component rendered at the root layout level so it survives route changes. It uses a hidden `<audio>` HTML element managed through a ref. The `playerStore` holds a reference to this element and drives all playback through it.
+
+**Playback flow:**
+1. User clicks play on a track (from album, playlist, search results, etc.)
+2. The calling component invokes `playerStore.playTrack(track, tracksArray, index)`, passing the full context
+3. The store fetches a signed stream URL from `/api/stream/:trackId`
+4. The URL is set as `audioElement.src`, triggering load and play
+5. The `timeupdate` event on the audio element calls `updateProgress` to sync the progress bar
+6. The `ended` event triggers `next()` to advance the queue
+7. After 30 seconds of playback, a play event is recorded via `libraryApi.recordPlay`
+
+**Queue management** supports shuffle (random index selection on next), repeat-all (wraps to index 0), and repeat-one (replays the same index). The queue panel is a positioned overlay toggled by a button in the player bar.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
+
+### Role-Based Access Control (RBAC)
+
+**What it is:** RBAC is a method of restricting system access based on the roles assigned to individual users. Instead of granting permissions directly to each user (which becomes unmanageable at scale), you assign users to roles, and roles carry predefined sets of permissions. When the system needs to decide whether a user can perform an action, it checks the user's role against the required permission for that action.
+
+**How it works in this project:** Users have a `role` column in the `users` table with values `'user'` or `'admin'`. The backend middleware checks `req.session.user.role` before allowing access to admin endpoints (`/api/admin/*`). Regular users can read the catalog and manage their own library; admins can additionally manage all users, modify catalog content, and view platform analytics.
+
+**Why it matters at scale:** Without RBAC, access control logic is scattered throughout the codebase as ad-hoc `if (userId === X)` checks. As the team and feature set grow, this becomes impossible to audit. RBAC centralizes the question "who can do what?" into a single, auditable table of role-to-permission mappings. Adding a new role (e.g., `curator` who can create featured playlists but not manage users) requires only a database change and a middleware update, not a code change in every route handler.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache (typically Redis) before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If the data is not in the cache (a "miss"), the application queries the database, stores the result in the cache with a time-to-live (TTL), and then returns it. The cache is never written to directly by the database -- the application is responsible for populating it.
+
+**How it works in this project:** Catalog data (albums, artists, track metadata) and session data are cached in Redis. When a user requests an album, the server first checks Redis with a key like `album:{id}`. On a hit, the cached JSON is returned without touching PostgreSQL. On a miss, PostgreSQL is queried, the result is serialized to JSON, stored in Redis with a TTL (e.g., 5 minutes for catalog data), and returned to the client. Cache entries are invalidated when the underlying data changes (e.g., an admin updates track metadata).
+
+**Why it matters at scale:** PostgreSQL can handle thousands of queries per second, but a music catalog with 100M subscribers browsing the same popular albums creates read patterns that would overwhelm any relational database. Redis serves reads in sub-millisecond time from memory, absorbing the read load. The TTL ensures that stale data is automatically replaced without requiring explicit cache invalidation for every change.
+
+### Structured Logging (Pino)
+
+**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry contains a consistent set of fields (`timestamp`, `level`, `service`, `requestId`, `message`, plus arbitrary context) that log aggregation systems (ELK, Loki, Datadog) can index and search. This is in contrast to traditional `console.log("User 123 failed to login")` which is human-readable but impossible to query programmatically.
+
+**How it works in this project (`backend/src/shared/logger.ts`):** The Pino logger is configured to output JSON lines. Express middleware creates a child logger for each request, binding the `requestId` (from the `X-Request-ID` header or a generated UUID), HTTP method, and path. Route handlers add context as they execute (e.g., `userId`, `trackId`). All log output for a single request shares the same `requestId`, enabling correlation.
+
+**Why it matters at scale:** When a user reports "my playlist disappeared," an engineer needs to trace the exact sequence of API calls and database operations that led to the issue. With structured logging, they can filter by `userId` to find the relevant requests, then by `requestId` to see every log line from a specific request. With text logs, this investigation requires manual `grep` across multiple log files with inconsistent formats. Pino was specifically chosen for its low overhead -- it is roughly 5x faster than Winston because it defers JSON serialization to a worker thread.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals (typically every 15-30 seconds). Applications expose a `/metrics` endpoint that returns metric values in a specific text format. Prometheus stores these time series and enables queries like "what was the p99 latency for the `/api/stream` endpoint over the last hour?" Grafana is typically used to visualize these queries as dashboards and configure alerts.
+
+**How it works in this project (`backend/src/shared/metrics.ts`):** The `prom-client` library registers several metrics: `http_request_duration_seconds` (a histogram tracking the distribution of request latencies by method, route, and status code), `stream_start_latency_seconds` (time from stream request to first byte), `active_streams` (a gauge counting currently playing streams), `library_operations_total` (a counter tracking add/remove/sync operations), and `cache_hits_total` / `cache_misses_total` (counters for Redis cache effectiveness). Default Node.js metrics (CPU usage, memory, event loop lag) are also collected.
+
+**Why it matters at scale:** Without metrics, the only way to discover that streaming latency has doubled is when users complain. Prometheus enables proactive monitoring: an alert fires when `stream_start_latency_seconds` p95 exceeds 300ms for 5 consecutive minutes, giving the team time to investigate before users are broadly affected. Histograms are particularly important because averages hide problems -- a p50 of 100ms and p99 of 5000ms means 1% of users are having a terrible experience, but the average looks fine.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make to an API within a given time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header indicating when the client can try again. Rate limiting serves two purposes: protecting the server from being overwhelmed by a single client (whether malicious or buggy), and ensuring fair access across all users.
+
+**How it works in this project (`backend/src/shared/rateLimit.ts`):** Five rate limit tiers are configured using `express-rate-limit` with `rate-limit-redis` as the backing store. The tiers are: global API (100 req/min per IP+UserID), streaming (300 req/min per UserID), search (30 req/min per UserID), login (5 req/15min per IP), and admin (50 req/min per UserID). Redis is used as the store so that rate limits are enforced consistently across multiple server instances -- if the user hits server1 50 times and server2 50 times, the combined total of 100 is enforced, not 50 per server.
+
+**Why it matters at scale:** A single misbehaving client (a bot scraping the catalog, a buggy mobile app retrying in a tight loop) can consume enough server resources to degrade service for all other users. Rate limiting bounds the damage any single client can inflict. The login rate limit specifically prevents brute-force password attacks. The different tiers reflect the different costs of each operation -- search queries are expensive (they touch Elasticsearch), so they have a lower limit than streaming URL requests (which are cheap cache lookups).
+
+### Idempotency
+
+**What it is:** An idempotent operation produces the same result whether it is executed once or multiple times. In the context of an API, idempotency means that if a client sends the same request twice (due to a network timeout, a retry, or a user double-clicking), the server processes it only once and returns the same response both times. Without idempotency, retrying a "create playlist" request could create two identical playlists.
+
+**How it works in this project (`backend/src/shared/idempotency.ts`):** Clients include an `X-Idempotency-Key` header with mutation requests (POST/PUT/DELETE). The middleware checks Redis for a cached response under that key. If found and completed, the cached response is returned with an `X-Idempotency-Replayed: true` header. If found but still in-progress (another request with the same key is currently executing), a 409 Conflict is returned to prevent concurrent duplicates. If not found, a Redis lock is acquired with a 60-second TTL, the operation executes, and the result is cached for 24 hours.
+
+**Why it matters at scale:** Network unreliability is the norm, not the exception. Mobile clients on cellular networks frequently experience timeouts where the request reached the server but the response was lost. The client retries, and without idempotency, the server creates a duplicate playlist, adds a duplicate library item, or (in payment systems) charges the user twice. Idempotency keys make retries safe by design, eliminating an entire class of data consistency bugs.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether the application is functioning correctly. They are designed to be consumed by infrastructure systems (load balancers, container orchestrators like Kubernetes, monitoring systems) rather than by humans. There are typically two types: a liveness check ("is the process running and not deadlocked?") and a readiness check ("is the process able to serve traffic, i.e., are all its dependencies reachable?").
+
+**How it works in this project (`backend/src/shared/health.ts`):** Two endpoints are exposed. `GET /health` returns 200 if the process is running -- this is the liveness probe. `GET /health/ready` checks connectivity to PostgreSQL (executes `SELECT 1`) and Redis (executes `PING`), returning 200 only if both respond successfully, along with latency measurements for each. If either dependency is unreachable, it returns 503 Service Unavailable.
+
+**Why it matters at scale:** In a production deployment with multiple server instances behind a load balancer, health checks enable automatic traffic management. If an instance loses its database connection, the readiness check fails, and the load balancer stops routing traffic to it -- before any user requests fail. When the connection recovers, the readiness check passes again, and traffic resumes. Without health checks, a partially-broken instance continues receiving traffic and returning 500 errors until an engineer manually investigates. In Kubernetes, the liveness probe additionally triggers automatic container restart if the process becomes deadlocked.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation.
