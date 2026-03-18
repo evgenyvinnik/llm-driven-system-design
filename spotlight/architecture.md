@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Spotlight is a universal search system with on-device indexing and intelligent suggestions. Core challenges involve real-time indexing, content extraction, and privacy-preserving search.
+Spotlight is a universal search system with on-device indexing and intelligent suggestions. It provides a single entry point for finding files, apps, contacts, messages, and web results while offering proactive recommendations based on usage patterns. Core challenges involve real-time indexing, content extraction from diverse file formats, multi-source result fusion, and privacy-preserving search.
 
 **Learning Goals:**
 - Build incremental indexing systems
@@ -16,680 +16,369 @@ Spotlight is a universal search system with on-device indexing and intelligent s
 
 ### Functional Requirements
 
-1. **Search**: Find files, apps, contacts, messages
-2. **Index**: Real-time content indexing
-3. **Suggest**: Proactive app and content suggestions
-4. **Calculate**: Math, conversions, definitions
-5. **Web**: Fall back to web search
+1. **Search**: Find files, apps, contacts, messages across multiple data sources
+2. **Index**: Real-time content indexing with incremental updates
+3. **Suggest**: Proactive app and content suggestions based on usage patterns
+4. **Calculate**: Math expressions, unit conversions, definitions
+5. **Web**: Fall back to web search when local results are insufficient
 
 ### Non-Functional Requirements
 
-- **Latency**: < 100ms for local results
-- **Privacy**: All indexing on-device
-- **Efficiency**: < 5% CPU during indexing
-- **Storage**: Minimal index size
+- **Latency**: < 100ms p95 for local search results, < 250ms p99 including provider queries
+- **Privacy**: All indexing and search happens on-device; no query logs leave the device
+- **Efficiency**: < 5% CPU during background indexing; idle-time processing preferred
+- **Storage**: Index size < 10% of original content size
+- **Availability**: 99.5% uptime for the search service (local server)
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Estimate |
+|--------|----------|
+| Indexed files per device | 500K - 2M |
+| Distinct tokens in index | ~5M |
+| Index size (inverted index + metadata) | 500MB - 2GB |
+| Apps registered | 200-500 |
+| Contacts | 1K - 10K |
+| Queries per user per day | 50-100 |
+| Suggestion refreshes per day | ~100 (triggered by context changes) |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Seeded files | ~100 |
+| Seeded apps | ~20 |
+| Seeded contacts | ~30 |
+| Concurrent users | 1-3 |
+| PostgreSQL storage | < 50MB |
+| Elasticsearch index | < 100MB |
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Spotlight UI                                │
-│              (Search bar, Results list, Previews)               │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Spotlight UI                                │
+│            (Search bar, Results list, Previews, Suggestions)        │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          CDN / Edge Cache                            │
+│                  (Static assets, suggestion prefetch)                │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         API Gateway                                  │
+│              (Rate limiting, Auth, Request routing)                   │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  Search Service  │ │ Indexing Service  │ │Suggestion Service│
+│                  │ │                   │ │                  │
+│ - Query parsing  │ │ - File watcher    │ │ - Usage patterns │
+│ - Multi-source   │ │ - Content extract │ │ - Time-based     │
+│   fusion         │ │ - Incremental     │ │ - Proactive      │
+│ - Ranking        │ │   updates         │ │   recommendations│
+└────────┬─────────┘ └────────┬──────────┘ └────────┬─────────┘
+         │                    │                      │
+         └────────────────────┼──────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Query Engine                                 │
-│         (Parse, Route, Rank, Merge results)                    │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Local Index  │    │ App Providers │    │  Cloud Search │
-│               │    │               │    │               │
-│ - Files       │    │ - Contacts    │    │ - iCloud      │
-│ - Apps        │    │ - Calendar    │    │ - Mail        │
-│ - Messages    │    │ - Notes       │    │ - Safari      │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Indexing Service                             │
-│       (File watcher, Content extraction, Tokenization)         │
-└─────────────────────────────────────────────────────────────────┘
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌──────────────┐    ┌──────────────────┐    ┌──────────────┐
+│ Elasticsearch│    │   PostgreSQL     │    │ Redis/Valkey │
+│              │    │                  │    │              │
+│ - Full-text  │    │ - File metadata  │    │ - Sessions   │
+│   search     │    │ - Apps, contacts │    │ - Rate limits│
+│ - Fuzzy match│    │ - Usage patterns │    │ - Idempotency│
+│ - Multi-index│    │ - Audit log      │    │ - Cache      │
+└──────────────┘    └──────────────────┘    └──────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Indexing Service
+### 1. Search Service
 
-**Real-Time File Indexing:**
-```javascript
-class IndexingService {
-  constructor() {
-    this.index = new SearchIndex()
-    this.contentExtractors = new Map()
-    this.pendingQueue = []
-    this.isIndexing = false
-  }
+The search service parses incoming queries, routes them to appropriate sources, and merges results with unified ranking.
 
-  async initialize() {
-    // Register content extractors
-    this.registerExtractor('pdf', new PDFExtractor())
-    this.registerExtractor('docx', new WordExtractor())
-    this.registerExtractor('txt', new TextExtractor())
-    this.registerExtractor('html', new HTMLExtractor())
-    this.registerExtractor('image', new ImageMetadataExtractor())
+**Query Types:**
+- **Text search**: Standard keyword matching across files, apps, contacts
+- **Math expressions**: Detected via regex, evaluated locally (e.g., `2+2`, `15% of 200`)
+- **Unit conversions**: Pattern-matched `{value} {unit} to {unit}` (e.g., `10 km to miles`)
+- **Web fallback**: When local results are insufficient (< 3 results), add web search option
 
-    // Watch file system for changes
-    this.fileWatcher = new FileWatcher({
-      paths: ['/Users', '/Applications'],
-      ignorePaths: ['Library/Caches', 'node_modules', '.git']
-    })
+**Multi-Source Fusion:**
+1. Parse query to determine type (text, math, conversion, date filter)
+2. If special query, return instant answer with score 100
+3. Otherwise, query all sources in parallel with per-source timeouts
+4. Merge results, deduplicate by path/id, rank by combined score
+5. Append web search fallback if local results are sparse
 
-    this.fileWatcher.on('created', (path) => this.queueForIndexing(path, 'add'))
-    this.fileWatcher.on('modified', (path) => this.queueForIndexing(path, 'update'))
-    this.fileWatcher.on('deleted', (path) => this.removeFromIndex(path))
+**Ranking Algorithm:**
 
-    // Start background processing
-    this.startBackgroundIndexing()
-  }
-
-  async queueForIndexing(path, action) {
-    this.pendingQueue.push({ path, action, queuedAt: Date.now() })
-
-    // Process immediately if not busy
-    if (!this.isIndexing) {
-      this.processQueue()
-    }
-  }
-
-  async processQueue() {
-    this.isIndexing = true
-
-    while (this.pendingQueue.length > 0) {
-      // Check system load before processing
-      if (await this.isSystemBusy()) {
-        await this.sleep(5000) // Wait 5 seconds
-        continue
-      }
-
-      const item = this.pendingQueue.shift()
-      await this.indexFile(item.path)
-
-      // Yield to other processes
-      await this.sleep(10)
-    }
-
-    this.isIndexing = false
-  }
-
-  async indexFile(path) {
-    const stats = await fs.stat(path)
-
-    // Skip large files
-    if (stats.size > 50 * 1024 * 1024) return // > 50MB
-
-    // Get file extension
-    const ext = this.getExtension(path)
-    const extractor = this.contentExtractors.get(ext) || this.contentExtractors.get('txt')
-
-    try {
-      // Extract content
-      const content = await extractor.extract(path)
-
-      // Tokenize
-      const tokens = this.tokenize(content.text)
-
-      // Create index entry
-      const entry = {
-        path,
-        name: content.name || path.split('/').pop(),
-        type: content.type || 'file',
-        content: tokens,
-        metadata: content.metadata || {},
-        modifiedAt: stats.mtime,
-        size: stats.size
-      }
-
-      // Add to index
-      await this.index.upsert(path, entry)
-
-    } catch (error) {
-      console.error(`Failed to index ${path}:`, error)
-    }
-  }
-
-  tokenize(text) {
-    if (!text) return []
-
-    return text
-      .toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(t => t.length > 1)
-      .slice(0, 10000) // Limit tokens per file
-  }
-}
+```
+finalScore = nameMatchScore * 10
+           + prefixBonus * 5        (if name starts with query token)
+           + recencyBoost * (5 - daysSinceModified * 0.1)
+           + typeBoost              (app: 3, contact: 2, message: 2, file: 1)
 ```
 
-### 2. Search Index
+### 2. Indexing Service
 
-**Inverted Index with Prefix Support:**
-```javascript
-class SearchIndex {
-  constructor() {
-    this.invertedIndex = new Map() // term -> Set<docId>
-    this.documents = new Map() // docId -> document
-    this.prefixIndex = new Trie() // For prefix matching
-  }
+The indexing service watches the filesystem for changes and maintains a search index via content extraction and tokenization.
 
-  async upsert(docId, document) {
-    // Remove old entry if exists
-    await this.remove(docId)
+**Incremental Indexing Strategy:**
+1. File watcher detects create/modify/delete events
+2. Content hash comparison to skip unchanged files
+3. Pluggable extractors by file type (text, PDF, images with OCR)
+4. Tokenization and inverted index update
+5. Batch updates to Elasticsearch for full-text search capability
 
-    // Store document
-    this.documents.set(docId, document)
+**Content Extraction Pipeline:**
+- Text files: Direct tokenization
+- Documents (PDF, DOCX): Apache Tika-style extraction
+- Images: Metadata extraction (EXIF), optional OCR
+- Applications: Bundle ID, name, category, icon path
+- Contacts: Name, email, phone, company
 
-    // Index each token
-    for (const token of document.content) {
-      // Full term index
-      if (!this.invertedIndex.has(token)) {
-        this.invertedIndex.set(token, new Set())
-      }
-      this.invertedIndex.get(token).add(docId)
+### 3. Suggestion Service
 
-      // Prefix index (for typeahead)
-      this.prefixIndex.insert(token, docId)
-    }
+Proactive suggestions based on user behavior patterns, similar to Siri Suggestions.
 
-    // Index name specially (higher weight)
-    const nameTokens = document.name.toLowerCase().split(/[\s._-]+/)
-    for (const token of nameTokens) {
-      this.prefixIndex.insert(token, docId)
-    }
-  }
+**Suggestion Signals:**
+- **Time-of-day patterns**: Track app launches by hour and day-of-week via `app_usage_patterns` table
+- **Frequency**: Most-used apps and contacts surface first
+- **Recency**: Recently accessed files and URLs
+- **Context**: Location-based suggestions (production only)
 
-  async remove(docId) {
-    const doc = this.documents.get(docId)
-    if (!doc) return
+**Scoring:**
 
-    // Remove from inverted index
-    for (const token of doc.content) {
-      const docSet = this.invertedIndex.get(token)
-      if (docSet) {
-        docSet.delete(docId)
-        if (docSet.size === 0) {
-          this.invertedIndex.delete(token)
-        }
-      }
-    }
-
-    // Remove from prefix index
-    this.prefixIndex.removeDoc(docId)
-
-    // Remove document
-    this.documents.delete(docId)
-  }
-
-  async search(query, options = {}) {
-    const { limit = 20, types = null } = options
-    const tokens = query.toLowerCase().split(/\s+/).filter(t => t.length > 0)
-
-    if (tokens.length === 0) return []
-
-    // Get matching docs for each token
-    const matchingSets = tokens.map(token => {
-      // Check for prefix match (last token)
-      if (token === tokens[tokens.length - 1] && token.length < 4) {
-        return this.prefixIndex.getDocsWithPrefix(token)
-      }
-      return this.invertedIndex.get(token) || new Set()
-    })
-
-    // Intersect for AND semantics
-    let resultSet = matchingSets[0]
-    for (let i = 1; i < matchingSets.length; i++) {
-      resultSet = new Set([...resultSet].filter(x => matchingSets[i].has(x)))
-    }
-
-    // Get documents and score
-    const results = []
-    for (const docId of resultSet) {
-      const doc = this.documents.get(docId)
-      if (!doc) continue
-
-      // Filter by type if specified
-      if (types && !types.includes(doc.type)) continue
-
-      const score = this.calculateScore(doc, tokens)
-      results.push({ ...doc, score })
-    }
-
-    // Sort by score
-    results.sort((a, b) => b.score - a.score)
-
-    return results.slice(0, limit)
-  }
-
-  calculateScore(doc, queryTokens) {
-    let score = 0
-
-    // Name match is most important
-    const nameLower = doc.name.toLowerCase()
-    for (const token of queryTokens) {
-      if (nameLower.includes(token)) {
-        score += 10
-        if (nameLower.startsWith(token)) {
-          score += 5 // Prefix match bonus
-        }
-      }
-    }
-
-    // Recency boost
-    const daysSinceModified = (Date.now() - doc.modifiedAt) / (24 * 60 * 60 * 1000)
-    score += Math.max(0, 5 - daysSinceModified * 0.1)
-
-    // Type boost (apps and contacts higher than random files)
-    const typeBoost = {
-      'application': 3,
-      'contact': 2,
-      'message': 2,
-      'file': 1
-    }
-    score += typeBoost[doc.type] || 1
-
-    return score
-  }
-}
+```
+suggestionScore = hourlyUsage * 0.6 + dayOfWeekUsage * 0.4
 ```
 
-### 3. Query Router
+Apps with score > 0.1 are surfaced, top 4 per category, top 8 total.
 
-**Multi-Source Query Processing:**
-```javascript
-class QueryEngine {
-  constructor() {
-    this.localIndex = new SearchIndex()
-    this.providers = new Map()
-    this.specialHandlers = new Map()
-  }
+### 4. Query Parser
 
-  async query(queryString, options = {}) {
-    const parsedQuery = this.parseQuery(queryString)
+Detects special query types before hitting the search index:
 
-    // Check for special queries first
-    const specialResult = await this.handleSpecialQuery(parsedQuery)
-    if (specialResult) {
-      return specialResult
-    }
-
-    // Query all sources in parallel
-    const [localResults, providerResults, cloudResults] = await Promise.all([
-      this.localIndex.search(queryString, options),
-      this.queryProviders(queryString),
-      this.queryCloud(queryString)
-    ])
-
-    // Merge and rank
-    const merged = this.mergeResults([
-      ...localResults,
-      ...providerResults,
-      ...cloudResults
-    ])
-
-    // Add web search fallback
-    if (merged.length < 3) {
-      merged.push({
-        type: 'web_search',
-        name: `Search the web for "${queryString}"`,
-        action: { type: 'open_url', url: `https://www.google.com/search?q=${encodeURIComponent(queryString)}` }
-      })
-    }
-
-    return merged
-  }
-
-  parseQuery(queryString) {
-    // Detect query type
-    const query = {
-      raw: queryString,
-      tokens: queryString.toLowerCase().split(/\s+/),
-      type: 'search'
-    }
-
-    // Math expression
-    if (/^[\d\s+\-*/().%^]+$/.test(queryString)) {
-      query.type = 'math'
-      query.expression = queryString
-    }
-
-    // Unit conversion
-    const conversionMatch = queryString.match(/^([\d.]+)\s*(\w+)\s+(?:to|in)\s+(\w+)$/i)
-    if (conversionMatch) {
-      query.type = 'conversion'
-      query.value = parseFloat(conversionMatch[1])
-      query.fromUnit = conversionMatch[2]
-      query.toUnit = conversionMatch[3]
-    }
-
-    // Date query
-    if (/photos?\s+from\s+/i.test(queryString)) {
-      query.type = 'date_filter'
-      query.dateFilter = this.parseDateFilter(queryString)
-    }
-
-    return query
-  }
-
-  async handleSpecialQuery(query) {
-    if (query.type === 'math') {
-      try {
-        const result = this.safeEval(query.expression)
-        return [{
-          type: 'calculation',
-          name: `${query.expression} = ${result}`,
-          score: 100
-        }]
-      } catch (e) {
-        return null
-      }
-    }
-
-    if (query.type === 'conversion') {
-      const result = this.convert(query.value, query.fromUnit, query.toUnit)
-      if (result) {
-        return [{
-          type: 'conversion',
-          name: `${query.value} ${query.fromUnit} = ${result.value} ${result.unit}`,
-          score: 100
-        }]
-      }
-    }
-
-    return null
-  }
-
-  async queryProviders(queryString) {
-    const results = []
-
-    for (const [name, provider] of this.providers) {
-      try {
-        const providerResults = await provider.search(queryString)
-        results.push(...providerResults)
-      } catch (error) {
-        console.error(`Provider ${name} failed:`, error)
-      }
-    }
-
-    return results
-  }
-
-  mergeResults(results) {
-    // Deduplicate by path/id
-    const seen = new Set()
-    const unique = []
-
-    for (const result of results) {
-      const key = result.path || result.id || result.name
-      if (!seen.has(key)) {
-        seen.add(key)
-        unique.push(result)
-      }
-    }
-
-    // Sort by score
-    unique.sort((a, b) => (b.score || 0) - (a.score || 0))
-
-    return unique
-  }
-}
-```
-
-### 4. Siri Suggestions
-
-**Proactive Intelligence:**
-```javascript
-class SiriSuggestions {
-  constructor() {
-    this.usagePatterns = new Map()
-    this.timeOfDayPatterns = new Map()
-  }
-
-  async getSuggestions(context) {
-    const { timeOfDay, location, recentActivity } = context
-    const suggestions = []
-
-    // Time-based app suggestions
-    const timeApps = await this.getTimeBasedApps(timeOfDay)
-    suggestions.push(...timeApps.map(app => ({
-      type: 'app_suggestion',
-      name: app.name,
-      reason: 'Based on your routine',
-      score: app.score
-    })))
-
-    // Location-based suggestions
-    if (location) {
-      const locationSuggestions = await this.getLocationSuggestions(location)
-      suggestions.push(...locationSuggestions)
-    }
-
-    // Recent contacts (likely to contact)
-    const frequentContacts = await this.getFrequentContacts()
-    suggestions.push(...frequentContacts.slice(0, 4).map(contact => ({
-      type: 'contact_suggestion',
-      name: contact.name,
-      reason: 'Frequently contacted',
-      score: contact.score
-    })))
-
-    // Continue reading/watching
-    const continueItems = await this.getContinueItems(recentActivity)
-    suggestions.push(...continueItems)
-
-    // Sort and return top suggestions
-    suggestions.sort((a, b) => b.score - a.score)
-    return suggestions.slice(0, 8)
-  }
-
-  async getTimeBasedApps(timeOfDay) {
-    const hour = new Date().getHours()
-    const dayOfWeek = new Date().getDay()
-
-    // Get app usage patterns for this time
-    const patterns = await this.getUsagePatterns()
-
-    // Score apps based on historical usage at this time
-    const scored = patterns.map(pattern => {
-      const hourlyUsage = pattern.hourlyUsage[hour] || 0
-      const dayUsage = pattern.dailyUsage[dayOfWeek] || 0
-
-      return {
-        name: pattern.appName,
-        bundleId: pattern.bundleId,
-        score: hourlyUsage * 0.6 + dayUsage * 0.4
-      }
-    })
-
-    return scored.filter(s => s.score > 0.1).slice(0, 4)
-  }
-
-  async recordAppLaunch(bundleId, context) {
-    const hour = new Date().getHours()
-    const dayOfWeek = new Date().getDay()
-
-    // Update usage patterns
-    await db.query(`
-      INSERT INTO app_usage_patterns
-        (bundle_id, hour, day_of_week, count, last_used)
-      VALUES ($1, $2, $3, 1, NOW())
-      ON CONFLICT (bundle_id, hour, day_of_week)
-      DO UPDATE SET count = app_usage_patterns.count + 1, last_used = NOW()
-    `, [bundleId, hour, dayOfWeek])
-  }
-}
-```
+| Pattern | Type | Example |
+|---------|------|---------|
+| `^[\d\s+\-*/().%^]+$` | Math expression | `15 * 3 + 7` |
+| `{number} {unit} to {unit}` | Unit conversion | `100 USD to EUR` |
+| `photos from {date}` | Date filter | `photos from last week` |
+| Everything else | Text search | `project report` |
 
 ---
 
 ## Database Schema
 
+### PostgreSQL Schema
+
 ```sql
--- File Index (on-device SQLite)
-CREATE TABLE indexed_files (
+-- Indexed files table
+CREATE TABLE IF NOT EXISTS indexed_files (
   path TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  type TEXT,
+  type TEXT NOT NULL DEFAULT 'file',
   content_hash TEXT,
-  tokens TEXT, -- JSON array of tokens
-  metadata TEXT, -- JSON
-  size INTEGER,
-  modified_at INTEGER,
-  indexed_at INTEGER DEFAULT (strftime('%s', 'now'))
+  metadata JSONB DEFAULT '{}',
+  size BIGINT,
+  modified_at TIMESTAMP WITH TIME ZONE,
+  indexed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_files_name ON indexed_files(name);
-CREATE INDEX idx_files_type ON indexed_files(type);
+CREATE INDEX IF NOT EXISTS idx_files_name ON indexed_files(name);
+CREATE INDEX IF NOT EXISTS idx_files_type ON indexed_files(type);
+CREATE INDEX IF NOT EXISTS idx_files_modified ON indexed_files(modified_at DESC);
 
--- Inverted Index (on-device)
-CREATE TABLE inverted_index (
-  term TEXT,
-  doc_path TEXT,
-  position INTEGER,
-  PRIMARY KEY (term, doc_path, position)
+-- Applications table
+CREATE TABLE IF NOT EXISTS applications (
+  id SERIAL PRIMARY KEY,
+  bundle_id TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  path TEXT,
+  icon_path TEXT,
+  category TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_inverted_term ON inverted_index(term);
+CREATE INDEX IF NOT EXISTS idx_apps_name ON applications(name);
+CREATE INDEX IF NOT EXISTS idx_apps_bundle ON applications(bundle_id);
 
--- App Usage Patterns (for Siri Suggestions)
-CREATE TABLE app_usage_patterns (
+-- Contacts table
+CREATE TABLE IF NOT EXISTS contacts (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT,
+  phone TEXT,
+  company TEXT,
+  notes TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);
+CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
+
+-- App usage patterns for suggestions
+CREATE TABLE IF NOT EXISTS app_usage_patterns (
   bundle_id TEXT,
-  hour INTEGER,
-  day_of_week INTEGER,
+  hour INTEGER CHECK (hour >= 0 AND hour < 24),
+  day_of_week INTEGER CHECK (day_of_week >= 0 AND day_of_week < 7),
   count INTEGER DEFAULT 0,
-  last_used INTEGER,
+  last_used TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   PRIMARY KEY (bundle_id, hour, day_of_week)
 );
 
--- Recent Activity
-CREATE TABLE recent_activity (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT, -- 'file', 'app', 'contact', 'url'
-  item_id TEXT,
-  item_name TEXT,
-  timestamp INTEGER DEFAULT (strftime('%s', 'now'))
+-- Recent activity for suggestions
+CREATE TABLE IF NOT EXISTS recent_activity (
+  id SERIAL PRIMARY KEY,
+  type TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  item_name TEXT NOT NULL,
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_activity_time ON recent_activity(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_time ON recent_activity(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_type ON recent_activity(type);
+
+-- Web bookmarks/history
+CREATE TABLE IF NOT EXISTS web_items (
+  id SERIAL PRIMARY KEY,
+  url TEXT UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  favicon_url TEXT,
+  visited_count INTEGER DEFAULT 1,
+  last_visited TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_title ON web_items(title);
+CREATE INDEX IF NOT EXISTS idx_web_visited ON web_items(last_visited DESC);
+```
+
+### Elasticsearch Indices
+
+| Index | Document Fields | Purpose |
+|-------|----------------|---------|
+| `spotlight-files` | path, name, content, type, metadata, modified_at | File content search |
+| `spotlight-apps` | bundle_id, name, category, keywords | Application search |
+| `spotlight-contacts` | name, email, phone, company | Contact search |
+| `spotlight-web` | url, title, description | Web history search |
+
+---
+
+## API Design
+
+### Search Endpoints
+
+```
+GET  /api/search?q={query}&types={types}&limit={limit}  → Multi-source search
+GET  /api/search/files?q={query}                         → File-only search
+GET  /api/search/apps?q={query}                          → App-only search
+GET  /api/search/contacts?q={query}                      → Contact-only search
+```
+
+### Indexing Endpoints
+
+```
+POST /api/index/files          → Index a file (body: { path, content, metadata })
+POST /api/index/files/bulk     → Bulk index files
+POST /api/index/reindex        → Trigger full re-index (admin)
+```
+
+### Suggestion Endpoints
+
+```
+GET  /api/suggestions           → Get proactive suggestions for current context
+POST /api/suggestions/record    → Record an app launch or item access
+```
+
+### Operations Endpoints
+
+```
+GET  /health                    → Component health check (Postgres, ES, Redis)
+GET  /health/ready              → Readiness probe (all dependencies connected)
+GET  /alive                     → Liveness probe (process running)
+GET  /metrics                   → Prometheus metrics
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. On-Device Indexing
+### 1. On-Device Indexing vs Cloud Search
 
-**Decision**: All indexing and search happens locally
+**Decision**: All indexing and primary search happens locally.
 
-**Rationale**:
-- Privacy protection (no search logs sent)
-- Works offline
-- Low latency
+**Why it works for Spotlight**: Privacy is a core product requirement. Users search personal files, messages, and contacts. Sending queries to a cloud service would violate user expectations and create regulatory complications (GDPR, data residency). Local indexing also provides sub-100ms latency without network round-trips.
 
-### 2. Incremental Indexing
+**Why cloud search fails here**: Cloud search engines (Algolia, Elasticsearch as SaaS) require uploading all user content. For a personal search tool, this means syncing potentially hundreds of thousands of files to a remote server. The bandwidth cost, privacy risk, and latency penalty outweigh the scalability benefits. Cloud search makes sense for shared content (e-commerce catalogs, documentation sites) but not for personal device search.
 
-**Decision**: Watch for file changes, index incrementally
+**What we give up**: No cross-device search (each device has its own index), no collaborative search ranking (cannot learn from other users' queries), and index size is bounded by local storage. At production scale, Apple solves cross-device with iCloud sync of metadata (not content), preserving the privacy guarantee.
 
-**Rationale**:
-- No need for full re-index
-- Lower resource usage
-- Real-time updates
+### 2. Elasticsearch + PostgreSQL Dual Storage
 
-### 3. Multi-Source Fusion
+**Decision**: Use Elasticsearch for full-text search and PostgreSQL for metadata, usage patterns, and relational data.
 
-**Decision**: Query multiple sources and merge results
+**Why this combination**: Elasticsearch excels at fuzzy matching, relevance scoring, and multi-index queries. PostgreSQL provides ACID guarantees for usage pattern tracking, audit logging, and relational queries (e.g., "contacts in company X"). Using one for both would mean either losing Elasticsearch's text analysis or PostgreSQL's transactional guarantees.
 
-**Rationale**:
-- Unified search experience
-- Apps provide their own data
-- Consistent ranking
+**Alternative considered**: SQLite FTS5 for everything. Simpler deployment, no external dependencies, genuinely on-device. However, SQLite FTS5 lacks multi-index search, pluggable analyzers, and the fuzzy matching that Elasticsearch provides out of the box. For a learning project exploring search internals, Elasticsearch teaches more about production search architecture.
 
----
+**Trade-off**: Operational complexity. Two data stores must stay in sync. Circuit breakers protect against Elasticsearch failures while PostgreSQL remains the source of truth.
 
-## Trade-offs Summary
+### 3. Multi-Source Fusion with Graceful Degradation
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Indexing | On-device | Cloud | Privacy |
-| Storage | SQLite FTS | Custom | Simplicity, proven |
-| Ranking | Multi-signal | Pure text match | Relevance |
-| Updates | Incremental | Full re-index | Performance |
+**Decision**: Query all sources in parallel with per-source timeouts, return partial results if any source fails.
+
+**Why this works**: The search bar must always return results quickly. A failing contacts provider should not block file search results. By treating provider queries as best-effort and the local index as the critical path, the system degrades gracefully: users always see file results, and provider results are added when available.
+
+**Why strict consistency fails here**: Waiting for all sources to respond before showing results would mean the slowest provider determines the user experience. With 5+ data sources, the probability of at least one being slow is high. Eventual consistency (showing partial results that fill in) matches user expectations for a search bar.
+
+**What we give up**: Result counts may fluctuate as slow providers respond. A file that exists in both PostgreSQL and Elasticsearch might appear twice briefly before deduplication. These are acceptable for a search UI where results update as the user types.
 
 ---
 
-## Authentication and Authorization
+## Consistency and Idempotency
 
-### Authentication Strategy
+### Write Consistency Model
 
-For this local learning project, we use session-based authentication with Valkey/Redis for session storage.
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| File indexing (PG + ES) | Eventual | ES may lag behind PG; circuit breaker skips ES when down |
+| Usage pattern recording | Strong (PG) | UPSERT with conflict resolution ensures accurate counts |
+| Suggestion generation | Eventual | Reads from usage patterns; slightly stale data is acceptable |
+| Audit logging | Strong (PG) | Security events must not be lost |
 
-**Session-Based Auth Flow:**
-```javascript
-// Session configuration
-const sessionConfig = {
-  store: new RedisStore({ client: valkeyClient }),
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    sameSite: 'strict'
-  }
-}
+### Idempotency
 
-// Login endpoint
-app.post('/api/v1/auth/login', async (req, res) => {
-  const { username, password } = req.body
+Index operations use content-hash-based idempotency: if a file's `content_hash` has not changed, the re-index is skipped. For API-level idempotency, the `Idempotency-Key` header is checked against a Redis cache (24-hour TTL). Repeated requests with the same key return the cached result without re-executing the operation.
 
-  const user = await db.query(
-    'SELECT id, username, password_hash, role FROM users WHERE username = $1',
-    [username]
-  )
+This is critical for safe index rebuilds: running a full re-index multiple times produces the same result because each file is compared by hash, and the UPSERT in PostgreSQL is idempotent.
 
-  if (!user || !await bcrypt.compare(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid credentials' })
-  }
+---
 
-  req.session.userId = user.id
-  req.session.role = user.role
-  req.session.createdAt = Date.now()
+## Security / Auth
 
-  res.json({ user: { id: user.id, username: user.username, role: user.role } })
-})
-```
+### Authentication
 
-**Session Schema (Valkey):**
-```
-# Session key structure
-sess:{session_id}
-  userId: string
-  role: "user" | "admin"
-  createdAt: timestamp
-  lastActivity: timestamp
+Session-based authentication with Redis/Valkey for session storage. Sessions expire after 24 hours, refreshed on activity.
 
-# TTL: 24 hours, refreshed on activity
-```
-
-### Role-Based Access Control (RBAC)
-
-Two roles with distinct permissions:
+### Authorization (RBAC)
 
 | Operation | User | Admin |
 |-----------|------|-------|
@@ -701,858 +390,201 @@ Two roles with distinct permissions:
 | Force full re-index | No | Yes |
 | Manage content extractors | No | Yes |
 | View system metrics | No | Yes |
-| Modify rate limits | No | Yes |
-
-**RBAC Middleware:**
-```javascript
-// Authentication middleware
-function requireAuth(req, res, next) {
-  if (!req.session?.userId) {
-    return res.status(401).json({ error: 'Authentication required' })
-  }
-  next()
-}
-
-// Admin-only middleware
-function requireAdmin(req, res, next) {
-  if (req.session?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' })
-  }
-  next()
-}
-
-// Route definitions
-app.get('/api/v1/search', requireAuth, searchHandler)
-app.get('/api/v1/suggestions', requireAuth, suggestionsHandler)
-app.post('/api/v1/admin/reindex', requireAuth, requireAdmin, reindexHandler)
-app.get('/api/v1/admin/metrics', requireAuth, requireAdmin, metricsHandler)
-```
 
 ### Rate Limiting
 
-Token bucket algorithm implemented in Valkey for local development:
+Token bucket algorithm implemented in Redis:
 
-**Rate Limit Configuration:**
-```javascript
-const rateLimits = {
-  // Per-user limits
-  user: {
-    search: { tokens: 100, refillRate: 10, refillInterval: 1000 }, // 100 req/10s burst, 10/sec sustained
-    suggestions: { tokens: 30, refillRate: 5, refillInterval: 1000 },
-    reindex: { tokens: 5, refillRate: 1, refillInterval: 60000 } // 5 burst, 1/min sustained
-  },
-  // Global limits (all users combined)
-  global: {
-    search: { tokens: 500, refillRate: 50, refillInterval: 1000 },
-    cloudQuery: { tokens: 20, refillRate: 2, refillInterval: 1000 }
-  }
-}
+| Endpoint Category | Burst | Sustained | Window |
+|-------------------|-------|-----------|--------|
+| Search | 100 | 10/sec | 10s |
+| Suggestions | 30 | 5/sec | 10s |
+| Index operations | 50 | 1/sec | 60s |
+| Bulk operations | 5 | 1/min | 60s |
 
-// Rate limit middleware
-async function rateLimit(category, identifier) {
-  const key = `ratelimit:${category}:${identifier}`
-  const config = rateLimits.user[category]
-
-  const tokens = await valkey.decr(key)
-  if (tokens < 0) {
-    await valkey.incr(key) // Restore the token
-    return false // Rate limited
-  }
-  return true
-}
-
-// Refill tokens periodically (background job)
-async function refillTokens() {
-  for (const [category, config] of Object.entries(rateLimits.user)) {
-    // Scan all keys matching pattern and refill
-    const keys = await valkey.keys(`ratelimit:${category}:*`)
-    for (const key of keys) {
-      const current = await valkey.get(key)
-      const newValue = Math.min(config.tokens, parseInt(current) + config.refillRate)
-      await valkey.set(key, newValue, 'EX', 3600)
-    }
-  }
-}
-```
-
-**Rate Limit Response Headers:**
-```javascript
-// Add to responses
-res.set({
-  'X-RateLimit-Limit': config.tokens,
-  'X-RateLimit-Remaining': remainingTokens,
-  'X-RateLimit-Reset': Math.ceil(Date.now() / 1000) + config.refillInterval / 1000
-})
-```
+Rate-limited responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
 
 ---
 
 ## Observability
 
-### Metrics (Prometheus)
+### Prometheus Metrics
 
-**Key Application Metrics:**
-```javascript
-const promClient = require('prom-client')
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `spotlight_http_request_duration_seconds` | Histogram | method, route, status_code | Request latency SLI |
+| `spotlight_search_latency_seconds` | Histogram | source (local, provider, cloud) | Per-source search performance |
+| `spotlight_search_result_count` | Histogram | - | Result quality monitoring |
+| `spotlight_indexed_files_total` | Counter | type, status | Indexing throughput |
+| `spotlight_indexing_queue_size` | Gauge | - | Backlog monitoring |
+| `spotlight_provider_latency_seconds` | Histogram | provider | Provider health |
+| `spotlight_provider_errors_total` | Counter | provider, error_type | Provider reliability |
+| `spotlight_rate_limit_hits_total` | Counter | endpoint | Abuse detection |
+| `spotlight_circuit_breaker_state` | Gauge | circuit | ES health visibility |
 
-// Request metrics
-const httpRequestDuration = new promClient.Histogram({
-  name: 'spotlight_http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5]
-})
+### Structured Logging (Pino)
 
-// Search metrics
-const searchLatency = new promClient.Histogram({
-  name: 'spotlight_search_latency_seconds',
-  help: 'Search query latency',
-  labelNames: ['source'], // 'local', 'provider', 'cloud'
-  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
-})
+JSON-formatted logs with service context, request IDs, and correlation. Log categories:
 
-const searchResultCount = new promClient.Histogram({
-  name: 'spotlight_search_result_count',
-  help: 'Number of results returned per search',
-  buckets: [0, 1, 5, 10, 20, 50, 100]
-})
-
-// Indexing metrics
-const indexingQueueSize = new promClient.Gauge({
-  name: 'spotlight_indexing_queue_size',
-  help: 'Number of files pending indexing'
-})
-
-const indexedFilesTotal = new promClient.Counter({
-  name: 'spotlight_indexed_files_total',
-  help: 'Total files indexed',
-  labelNames: ['type', 'status'] // status: 'success', 'error', 'skipped'
-})
-
-const indexSize = new promClient.Gauge({
-  name: 'spotlight_index_size_bytes',
-  help: 'Size of the search index in bytes'
-})
-
-// Provider metrics
-const providerLatency = new promClient.Histogram({
-  name: 'spotlight_provider_latency_seconds',
-  help: 'App provider query latency',
-  labelNames: ['provider'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1]
-})
-
-const providerErrors = new promClient.Counter({
-  name: 'spotlight_provider_errors_total',
-  help: 'Provider query errors',
-  labelNames: ['provider', 'error_type']
-})
-
-// Expose metrics endpoint
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', promClient.register.contentType)
-  res.send(await promClient.register.metrics())
-})
-```
-
-### Structured Logging
-
-**Log Format (JSON):**
-```javascript
-const logger = {
-  info: (message, context = {}) => log('INFO', message, context),
-  warn: (message, context = {}) => log('WARN', message, context),
-  error: (message, context = {}) => log('ERROR', message, context)
-}
-
-function log(level, message, context) {
-  const entry = {
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    service: 'spotlight',
-    ...context
-  }
-  console.log(JSON.stringify(entry))
-}
-
-// Example log entries
-logger.info('Search completed', {
-  query: 'photos from last week',
-  userId: 'u123',
-  resultCount: 15,
-  latencyMs: 45,
-  sources: ['local', 'provider:photos']
-})
-
-logger.error('Provider timeout', {
-  provider: 'contacts',
-  timeoutMs: 5000,
-  requestId: 'req-abc123'
-})
-```
-
-**Log Categories:**
-| Category | Log Level | Retention | Purpose |
-|----------|-----------|-----------|---------|
+| Category | Level | Retention | Purpose |
+|----------|-------|-----------|---------|
 | Search queries | INFO | 7 days | Performance analysis |
 | Indexing events | INFO | 3 days | Debug file watching |
 | Auth events | INFO | 30 days | Security audit |
 | Provider errors | WARN | 14 days | Provider health |
 | System errors | ERROR | 30 days | Incident response |
 
-### Distributed Tracing
+### Health Checks
 
-**Trace Propagation:**
-```javascript
-const { trace, context, SpanStatusCode } = require('@opentelemetry/api')
+- `/health` - Component-level health (PostgreSQL, Elasticsearch, Redis) with latency measurements
+- `/health/ready` - Readiness probe for load balancer (all dependencies connected)
+- `/alive` - Liveness probe (process running, uptime)
 
-async function handleSearch(req, res) {
-  const tracer = trace.getTracer('spotlight')
+Each health response includes circuit breaker states, idempotency store stats, and memory usage.
 
-  return tracer.startActiveSpan('search', async (span) => {
-    span.setAttribute('query', req.query.q)
-    span.setAttribute('userId', req.session.userId)
+### SLI Targets
 
-    try {
-      // Trace local index search
-      const localResults = await tracer.startActiveSpan('search.local', async (localSpan) => {
-        const results = await localIndex.search(req.query.q)
-        localSpan.setAttribute('resultCount', results.length)
-        localSpan.end()
-        return results
-      })
-
-      // Trace provider queries (parallel)
-      const providerResults = await tracer.startActiveSpan('search.providers', async (provSpan) => {
-        const results = await queryProviders(req.query.q)
-        provSpan.setAttribute('providerCount', providers.size)
-        provSpan.end()
-        return results
-      })
-
-      span.setStatus({ code: SpanStatusCode.OK })
-      return mergeResults([...localResults, ...providerResults])
-    } catch (error) {
-      span.recordException(error)
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### SLI Dashboards and Alert Thresholds
-
-**Service Level Indicators (SLIs):**
 | SLI | Target | Measurement |
 |-----|--------|-------------|
 | Search latency p95 | < 100ms | `histogram_quantile(0.95, spotlight_search_latency_seconds)` |
 | Search latency p99 | < 250ms | `histogram_quantile(0.99, spotlight_search_latency_seconds)` |
-| Search availability | 99.5% | `1 - (rate(spotlight_http_requests_total{status=~"5.."}[5m]) / rate(spotlight_http_requests_total[5m]))` |
+| Search availability | 99.5% | `1 - rate(5xx) / rate(total)` |
 | Indexing queue depth | < 1000 | `spotlight_indexing_queue_size` |
-| Provider success rate | > 95% | `1 - (rate(spotlight_provider_errors_total[5m]) / rate(spotlight_provider_requests_total[5m]))` |
-
-**Alert Rules (Prometheus Alertmanager):**
-```yaml
-groups:
-  - name: spotlight_alerts
-    rules:
-      - alert: HighSearchLatency
-        expr: histogram_quantile(0.95, rate(spotlight_search_latency_seconds_bucket[5m])) > 0.1
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Search latency p95 above 100ms"
-
-      - alert: SearchErrorRate
-        expr: rate(spotlight_http_requests_total{route="/api/v1/search",status=~"5.."}[5m]) / rate(spotlight_http_requests_total{route="/api/v1/search"}[5m]) > 0.01
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Search error rate above 1%"
-
-      - alert: IndexingQueueBacklog
-        expr: spotlight_indexing_queue_size > 5000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Indexing queue has {{ $value }} pending files"
-
-      - alert: ProviderDown
-        expr: rate(spotlight_provider_errors_total[5m]) / rate(spotlight_provider_requests_total[5m]) > 0.5
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Provider {{ $labels.provider }} failing > 50%"
-```
-
-### Audit Logging
-
-**Security-Relevant Events:**
-```javascript
-async function auditLog(event) {
-  await db.query(`
-    INSERT INTO audit_log (timestamp, event_type, user_id, ip_address, details)
-    VALUES (NOW(), $1, $2, $3, $4)
-  `, [event.type, event.userId, event.ip, JSON.stringify(event.details)])
-}
-
-// Events to audit
-const auditEvents = {
-  LOGIN_SUCCESS: 'login_success',
-  LOGIN_FAILURE: 'login_failure',
-  LOGOUT: 'logout',
-  ADMIN_REINDEX: 'admin_reindex',
-  RATE_LIMIT_EXCEEDED: 'rate_limit_exceeded',
-  PERMISSION_DENIED: 'permission_denied',
-  CONFIG_CHANGE: 'config_change'
-}
-
-// Example: audit login attempts
-app.post('/api/v1/auth/login', async (req, res) => {
-  const { username } = req.body
-  const ip = req.ip
-
-  try {
-    const user = await authenticate(username, req.body.password)
-    await auditLog({
-      type: auditEvents.LOGIN_SUCCESS,
-      userId: user.id,
-      ip,
-      details: { username }
-    })
-    // ... set session
-  } catch (error) {
-    await auditLog({
-      type: auditEvents.LOGIN_FAILURE,
-      userId: null,
-      ip,
-      details: { username, reason: error.message }
-    })
-    // ... return error
-  }
-})
-```
-
-**Audit Log Schema:**
-```sql
-CREATE TABLE audit_log (
-  id SERIAL PRIMARY KEY,
-  timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  event_type TEXT NOT NULL,
-  user_id INTEGER REFERENCES users(id),
-  ip_address INET,
-  details JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_audit_timestamp ON audit_log(timestamp DESC);
-CREATE INDEX idx_audit_user ON audit_log(user_id);
-CREATE INDEX idx_audit_type ON audit_log(event_type);
-
--- Retention: keep 90 days
--- Run daily: DELETE FROM audit_log WHERE timestamp < NOW() - INTERVAL '90 days';
-```
+| Provider success rate | > 95% | `1 - rate(errors) / rate(requests)` |
 
 ---
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency Keys
-
-**Idempotent Operations:**
-```javascript
-// Client generates idempotency key for operations that modify state
-async function reindexDirectory(directory, idempotencyKey) {
-  // Check if this request was already processed
-  const existing = await valkey.get(`idempotency:${idempotencyKey}`)
-  if (existing) {
-    return JSON.parse(existing) // Return cached result
-  }
-
-  // Process the request
-  const result = await performReindex(directory)
-
-  // Cache the result for 24 hours
-  await valkey.setex(
-    `idempotency:${idempotencyKey}`,
-    86400,
-    JSON.stringify(result)
-  )
-
-  return result
-}
-
-// Middleware to extract idempotency key
-function idempotencyMiddleware(req, res, next) {
-  req.idempotencyKey = req.headers['idempotency-key'] || null
-  next()
-}
-```
-
-**Retry with Exponential Backoff:**
-```javascript
-async function withRetry(operation, options = {}) {
-  const {
-    maxAttempts = 3,
-    baseDelayMs = 100,
-    maxDelayMs = 5000,
-    retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND']
-  } = options
-
-  let lastError
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await operation()
-    } catch (error) {
-      lastError = error
-
-      // Check if error is retryable
-      const isRetryable = retryableErrors.includes(error.code) ||
-                          error.status >= 500 ||
-                          error.message.includes('timeout')
-
-      if (!isRetryable || attempt === maxAttempts) {
-        throw error
-      }
-
-      // Exponential backoff with jitter
-      const delay = Math.min(
-        baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 100,
-        maxDelayMs
-      )
-
-      logger.warn('Retrying operation', {
-        attempt,
-        maxAttempts,
-        delayMs: delay,
-        error: error.message
-      })
-
-      await sleep(delay)
-    }
-  }
-
-  throw lastError
-}
-
-// Usage for provider queries
-async function queryProvider(providerName, query) {
-  return withRetry(
-    () => providers.get(providerName).search(query, { timeout: 2000 }),
-    { maxAttempts: 2, baseDelayMs: 50 }
-  )
-}
-```
-
 ### Circuit Breakers
 
-**Circuit Breaker Implementation:**
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.successThreshold = options.successThreshold || 3
-    this.timeout = options.timeout || 30000 // 30 seconds
+Per-index-type circuit breakers using the Opossum library protect against Elasticsearch failures:
 
-    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
-    this.failures = 0
-    this.successes = 0
-    this.lastFailure = null
-  }
+- **Threshold**: Open after 30% failure rate within a 10-second window
+- **Timeout**: 5 seconds per operation (prevents thread starvation)
+- **Recovery**: Half-open after 30 seconds, allowing test requests
+- **Isolation**: Separate breakers for files, apps, contacts, web indices
 
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      // Check if timeout has passed
-      if (Date.now() - this.lastFailure > this.timeout) {
-        this.state = 'HALF_OPEN'
-        this.successes = 0
-      } else {
-        throw new Error('Circuit breaker is OPEN')
-      }
-    }
+When a breaker opens, PostgreSQL writes still succeed (durable primary storage), and Elasticsearch updates are skipped. The idempotency layer ensures retry safety when the breaker closes.
 
-    try {
-      const result = await operation()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
+### Retry Strategy
 
-  onSuccess() {
-    this.failures = 0
-    if (this.state === 'HALF_OPEN') {
-      this.successes++
-      if (this.successes >= this.successThreshold) {
-        this.state = 'CLOSED'
-        logger.info('Circuit breaker closed')
-      }
-    }
-  }
-
-  onFailure() {
-    this.failures++
-    this.lastFailure = Date.now()
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN'
-      logger.warn('Circuit breaker opened', { failures: this.failures })
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failures: this.failures,
-      lastFailure: this.lastFailure
-    }
-  }
-}
-
-// Per-provider circuit breakers
-const providerBreakers = new Map()
-
-async function queryProviderWithBreaker(providerName, query) {
-  if (!providerBreakers.has(providerName)) {
-    providerBreakers.set(providerName, new CircuitBreaker({
-      failureThreshold: 3,
-      timeout: 60000 // 1 minute
-    }))
-  }
-
-  const breaker = providerBreakers.get(providerName)
-
-  try {
-    return await breaker.execute(() =>
-      providers.get(providerName).search(query, { timeout: 2000 })
-    )
-  } catch (error) {
-    if (error.message === 'Circuit breaker is OPEN') {
-      logger.info('Skipping provider due to circuit breaker', { provider: providerName })
-      return [] // Return empty results, don't fail the whole search
-    }
-    throw error
-  }
-}
-```
+Exponential backoff with jitter for transient failures:
+- Base delay: 100ms, max delay: 5s, max attempts: 3
+- Retryable errors: `ECONNRESET`, `ETIMEDOUT`, `ENOTFOUND`, 5xx responses
+- Non-retryable: 400, 401, 403, 404
 
 ### Graceful Degradation
 
-**Fallback Strategies:**
-```javascript
-async function search(query) {
-  const results = []
+The search service is designed to return partial results rather than fail entirely:
 
-  // Local index is always available (critical path)
-  const localResults = await localIndex.search(query)
-  results.push(...localResults)
+1. **Local index** (critical path): Always queried, results returned even if all providers fail
+2. **Provider queries** (best-effort): Each wrapped in a circuit breaker; failures return empty arrays
+3. **Timeout fence**: If providers do not respond within 3 seconds, partial results are returned
+4. **Web fallback**: Always available as a last resort when fewer than 3 local results are found
 
-  // Provider queries are best-effort
-  const providerPromises = Array.from(providers.entries()).map(
-    async ([name, provider]) => {
-      try {
-        return await queryProviderWithBreaker(name, query)
-      } catch (error) {
-        logger.warn('Provider failed, degrading gracefully', {
-          provider: name,
-          error: error.message
-        })
-        return [] // Empty array on failure
-      }
-    }
-  )
+---
 
-  // Wait for providers with timeout
-  const providerResults = await Promise.race([
-    Promise.all(providerPromises),
-    sleep(3000).then(() => {
-      logger.warn('Provider timeout, returning partial results')
-      return []
-    })
-  ])
+## Scalability Considerations
 
-  results.push(...providerResults.flat())
+### Horizontal Scaling
 
-  return mergeResults(results)
-}
-```
+1. **Search service**: Stateless, scale behind load balancer. Each instance connects to shared Elasticsearch and PostgreSQL
+2. **Elasticsearch**: Add nodes to the cluster for index sharding and replica distribution
+3. **PostgreSQL**: Read replicas for search metadata queries; primary for writes (usage patterns, indexing)
+4. **Redis**: Redis Cluster for session and cache sharding across nodes
 
-### Backup and Restore (Local Development)
+### Index Scaling
 
-**Database Backup Strategy:**
-```bash
-# PostgreSQL backup (run daily via cron in development)
-#!/bin/bash
-BACKUP_DIR="/Users/$USER/spotlight-backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+- **Index sharding**: Elasticsearch automatically shards indices; configure shard count based on data volume
+- **Index lifecycle**: Older indices can be merged, force-merged, or archived to cold storage
+- **Content extraction**: CPU-intensive; scale extraction workers independently from search servers
 
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
+### Bottleneck Analysis
 
-# Dump database
-pg_dump -h localhost -U spotlight_user spotlight_db \
-  --format=custom \
-  --file="$BACKUP_DIR/spotlight_$TIMESTAMP.dump"
+| Component | Breaks at | Solution |
+|-----------|-----------|----------|
+| Elasticsearch query latency | ~1M documents per shard | Add shards, optimize mappings |
+| PostgreSQL connections | ~100 concurrent | Connection pooling (PgBouncer) |
+| Indexing throughput | ~1000 files/sec | Batch writes, dedicated indexing workers |
+| Redis memory | ~1GB session data | TTL management, eviction policies |
 
-# Keep only last 7 backups
-ls -t "$BACKUP_DIR"/spotlight_*.dump | tail -n +8 | xargs -r rm
+---
 
-echo "Backup completed: spotlight_$TIMESTAMP.dump"
-```
+## Trade-offs Summary
 
-**SQLite Index Backup:**
-```javascript
-// On-device index backup (before major operations)
-async function backupIndex() {
-  const backupPath = `${indexPath}.backup.${Date.now()}`
-  await fs.copyFile(indexPath, backupPath)
-
-  // Keep only last 3 backups
-  const backups = await glob(`${indexPath}.backup.*`)
-  backups.sort().reverse().slice(3).forEach(f => fs.unlink(f))
-
-  return backupPath
-}
-
-// Restore from backup
-async function restoreIndex(backupPath) {
-  await fs.copyFile(backupPath, indexPath)
-  await reinitializeIndex()
-}
-```
-
-**Restore Testing (Manual Runbook):**
-```markdown
-## Restore Test Procedure (Run Monthly)
-
-1. Stop the Spotlight service
-   ```bash
-   npm run stop
-   ```
-
-2. Backup current database
-   ```bash
-   pg_dump -Fc spotlight_db > pre_restore_backup.dump
-   ```
-
-3. Restore from backup
-   ```bash
-   pg_restore -d spotlight_db --clean spotlight_backup.dump
-   ```
-
-4. Verify data integrity
-   ```bash
-   # Check row counts
-   psql -d spotlight_db -c "SELECT COUNT(*) FROM indexed_files;"
-   psql -d spotlight_db -c "SELECT COUNT(*) FROM app_usage_patterns;"
-
-   # Run health check
-   npm run health-check
-   ```
-
-5. Run smoke tests
-   ```bash
-   npm run test:smoke
-   ```
-
-6. Document results in `restore_test_log.md`
-```
-
-### Multi-Region Considerations
-
-For this local learning project, true multi-region DR is out of scope. However, we document the pattern for educational purposes:
-
-**Local Simulation of Multi-Region:**
-```javascript
-// Simulate region failover with multiple service instances
-const regions = {
-  primary: { host: 'localhost', port: 3001 },
-  secondary: { host: 'localhost', port: 3002 }
-}
-
-async function queryWithFailover(query) {
-  try {
-    return await fetch(`http://${regions.primary.host}:${regions.primary.port}/search?q=${query}`)
-  } catch (error) {
-    logger.warn('Primary region failed, failing over to secondary')
-    return await fetch(`http://${regions.secondary.host}:${regions.secondary.port}/search?q=${query}`)
-  }
-}
-```
-
-**Replication Considerations (Educational):**
-| Component | Strategy | RPO | RTO |
-|-----------|----------|-----|-----|
-| PostgreSQL | Streaming replication to standby | < 1 min | 5 min manual failover |
-| SQLite index | File copy to backup location | Hourly | 15 min rebuild |
-| Valkey sessions | No replication (sessions recreated on login) | N/A | Immediate |
-
-For local development, focus on:
-1. Regular backups (daily for PostgreSQL, before major changes for SQLite)
-2. Tested restore procedures (monthly manual test)
-3. Service health checks to detect failures quickly
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Indexing location | On-device | Cloud | Privacy requirement, offline capability |
+| Text search engine | Elasticsearch | SQLite FTS5 | Multi-index, fuzzy matching, analyzers |
+| Metadata storage | PostgreSQL | SQLite | ACID, JSONB, relational queries |
+| Session storage | Redis + cookies | JWT | Immediate revocation, simpler invalidation |
+| Ranking approach | Multi-signal fusion | Pure text relevance | Apps and contacts need non-text signals |
+| Indexing strategy | Incremental (file watcher) | Full periodic re-index | Lower CPU, real-time updates |
+| Provider failures | Graceful degradation | Strict consistency | Search bar must always respond quickly |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind key operational patterns implemented in the backend. Understanding these trade-offs helps inform future optimization decisions.
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
 
-### Why Search Latency Metrics Drive Index Optimization
+### Local Architecture
 
-**The Problem**: Search systems can silently degrade over time as index size grows, query patterns change, or infrastructure resources become constrained. Without visibility into latency distributions, teams cannot identify:
-- Slow queries that need optimization
-- Index segments requiring compaction
-- Memory pressure from oversized caches
-- Network latency to Elasticsearch clusters
-
-**The Solution**: We instrument every search operation with Prometheus histograms (`spotlight_search_latency_seconds`) that capture:
-- P50, P95, P99 latency by source (local, provider, cloud)
-- Result count distribution (`spotlight_search_result_count`)
-- Query type breakdown (`spotlight_search_requests_total`)
-
-**Why This Matters**:
-1. **Data-Driven Optimization**: When P99 latency exceeds SLI targets (100ms), metrics reveal whether the bottleneck is in Elasticsearch query execution, result serialization, or network round-trips
-2. **Proactive Alerting**: Prometheus alerts fire before users notice degradation, enabling index rebalancing or query optimization during low-traffic periods
-3. **Capacity Planning**: Latency trends correlated with index size inform decisions about sharding, hardware upgrades, or architectural changes
-4. **A/B Testing**: Comparing latency distributions between query strategies (fuzzy vs exact, boosting weights) quantifies which approach best serves users
-
-**Implementation**:
-```javascript
-// Record search latency for every query
-searchLatency.labels('all').observe(searchDuration);
-searchResultCount.observe(results.length);
+```
+┌─────────────────────────────────────────────┐
+│           React Frontend (:5173)            │
+│  Vite + TypeScript + Tailwind CSS           │
+│  SpotlightModal, SearchResults, Suggestions │
+└──────────────────────┬──────────────────────┘
+                       │ HTTP (fetch)
+                       ▼
+┌─────────────────────────────────────────────┐
+│      Express Backend (:3000 / :3001-3003)   │
+│  /api/search, /api/index, /api/suggestions  │
+│  /health, /metrics                          │
+└───────┬──────────────┬──────────────┬───────┘
+        │              │              │
+        ▼              ▼              ▼
+┌────────────┐  ┌────────────┐  ┌──────────┐
+│Elasticsearch│  │ PostgreSQL │  │  Valkey  │
+│   (:9200)  │  │  (:5432)   │  │  (:6379) │
+│ 4 indices  │  │ 6 tables   │  │ sessions │
+└────────────┘  └────────────┘  └──────────┘
 ```
 
-### Why Rate Limiting Prevents Resource Exhaustion
+### Production-Grade Patterns Actually Implemented
 
-**The Problem**: Unbounded request rates can cascade into system-wide failures:
-- A single client bug (infinite loop, retry storm) can saturate Elasticsearch connections
-- Search abuse can starve legitimate users of query capacity
-- Index operations at high volume can cause Elasticsearch segment explosion
-- Memory exhaustion from queued requests leads to OOM kills
+| Pattern | Library | File | Purpose |
+|---------|---------|------|---------|
+| Circuit breakers | Opossum | `backend/src/shared/circuitBreaker.ts` | Per-index ES failure isolation |
+| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | Request latency, search counts, provider health |
+| Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with request IDs, audit events |
+| Rate limiting | express-rate-limit | `backend/src/shared/rateLimiter.ts` | Token bucket per endpoint category |
+| Idempotency | Custom + Redis | `backend/src/shared/idempotency.ts` | Safe retries for index operations |
+| Health checks | Custom | `backend/src/index.ts` | Component health, readiness, liveness |
+| Query parsing | Custom | `backend/src/services/queryParser.ts` | Math, conversions, web fallback |
+| Suggestion engine | Custom | `backend/src/services/suggestions.ts` | Time-of-day app usage patterns |
 
-**The Solution**: Token bucket rate limiting with tiered limits:
-- **Search**: 100 requests per 10 seconds (burst) with 10/sec sustained
-- **Suggestions**: 30 requests per 10 seconds (lower due to keyboard typing patterns)
-- **Index Operations**: 50 requests per minute (higher latency tolerance)
-- **Bulk Operations**: 5 requests per minute (expensive, reserved for batch jobs)
+### Simplifications and Substitutions
 
-**Why This Matters**:
-1. **Graceful Degradation**: When limits are hit, clients receive 429 responses with `Retry-After` headers, enabling exponential backoff rather than cascading failures
-2. **Fair Resource Allocation**: Per-user/IP limits ensure one abusive client cannot monopolize search capacity
-3. **Protection During Incidents**: Rate limits act as circuit breakers at the edge, preventing thundering herds after outages
-4. **Audit Trail**: Rate limit events are logged and tracked in metrics, enabling identification of misconfigured clients or attack patterns
+| Production Design | Local Substitute | Reason |
+|-------------------|------------------|--------|
+| CDN for static assets | Vite dev server | No need for edge caching locally |
+| API Gateway (rate limiting, auth routing) | Express middleware | Single process handles all concerns |
+| File system watcher + extraction pipeline | API-driven indexing via seed script | No real filesystem events to watch |
+| On-device SQLite for indexing | Elasticsearch (cloud-style) | Learning Elasticsearch architecture |
+| OAuth / Apple ID authentication | No auth (open endpoints) | Not studying auth in this project |
+| Multi-region replication | Single instance | Local development only |
+| Kafka for indexing events | Direct Elasticsearch writes | No async pipeline needed at this scale |
 
-**Implementation**:
-```javascript
-// Rate limiter with audit logging
-const searchRateLimiter = rateLimit({
-  windowMs: 10 * 1000,
-  max: 100,
-  handler: (req, res) => {
-    rateLimitHitsTotal.labels('/api/search').inc();
-    logAuditEvent({ eventType: 'RATE_LIMIT_EXCEEDED', ... });
-    res.status(429).json({ error: 'Too many requests' });
-  }
-});
-```
+### What Was Omitted
 
-### Why Circuit Breakers Protect Index Consistency
-
-**The Problem**: Elasticsearch failures during index operations create dangerous scenarios:
-- Partial writes leave PostgreSQL and Elasticsearch out of sync
-- Retry storms during outages can corrupt index state
-- Slow operations (network partitions, GC pauses) block request threads
-- Cascading failures propagate from one index to all indices
-
-**The Solution**: Per-index-type circuit breakers using the Opossum library:
-- **Threshold**: Open after 30% of requests fail within a 10-second window
-- **Timeout**: 5 seconds per operation (prevents thread starvation)
-- **Recovery**: Half-open after 30 seconds, allowing test requests
-- **Isolation**: Separate breakers for files, apps, contacts, web indices
-
-**Why This Matters**:
-1. **Fail Fast**: When Elasticsearch is struggling, circuit breakers immediately reject new requests rather than queuing them, preserving system resources
-2. **Index Isolation**: A failure indexing contacts (e.g., mapping conflict) does not block file indexing operations
-3. **Self-Healing**: The half-open state automatically tests recovery without manual intervention
-4. **Visibility**: Circuit breaker state is exposed in `/health` and metrics, enabling operational awareness
-
-**How It Protects Consistency**:
-- When the breaker opens, PostgreSQL writes still succeed (durable primary storage)
-- Elasticsearch updates are skipped (eventual consistency)
-- The idempotency layer ensures retry safety when the breaker closes
-- Bulk operations gracefully skip items when the breaker is open rather than failing entirely
-
-**Implementation**:
-```javascript
-const fileIndexBreaker = createCircuitBreaker('es_index_files', async (params) => {
-  return indexDocument('files', params.id, params.document);
-}, {
-  timeout: 5000,
-  errorThresholdPercentage: 30,
-  resetTimeout: 30000
-});
-```
-
-### Why Idempotency Enables Safe Index Rebuilds
-
-**The Problem**: Index operations in distributed systems face inherent challenges:
-- Network timeouts leave clients uncertain whether the operation succeeded
-- Retry logic can create duplicate documents or corrupted state
-- Bulk reindexing during recovery can apply the same update multiple times
-- Race conditions between concurrent updates lead to lost writes
-
-**The Solution**: Request-level idempotency with cached results:
-- Clients provide an `Idempotency-Key` header (or one is generated from request content)
-- First request executes the operation and caches the result (24-hour TTL)
-- Subsequent requests with the same key return the cached result
-- In-progress requests are tracked to prevent concurrent execution
-
-**Why This Matters**:
-1. **Safe Retries**: Clients can retry failed requests without fear of duplicates, simplifying error handling
-2. **Bulk Rebuild Safety**: Running a full reindex job multiple times produces the same result, enabling fearless recovery procedures
-3. **Network Partition Tolerance**: When a client times out but the server succeeds, the retry returns the original success response
-4. **Debugging**: Idempotency keys in logs correlate duplicate requests, revealing retry patterns
-
-**Implementation**:
-```javascript
-// Idempotent index operation
-const result = await withIdempotency(
-  idempotencyKey,
-  async () => {
-    await pool.query('INSERT INTO indexed_files ...');
-    await executeIndexOperation(fileIndexBreaker, 'files', path, document, 'add');
-    return { success: true, path };
-  },
-  'index_file'
-);
-```
-
-### Operational Dashboard Design
-
-These patterns combine into a coherent observability strategy:
-
-| Metric | Purpose | Alert Threshold |
-|--------|---------|-----------------|
-| `spotlight_search_latency_seconds` | Query performance SLI | P95 > 100ms for 2 min |
-| `spotlight_rate_limit_hits_total` | Abuse detection | > 100 hits/min from single IP |
-| `spotlight_circuit_breaker_state` | Elasticsearch health | Any breaker OPEN > 1 min |
-| `spotlight_idempotency_cache_hits_total` | Retry patterns | > 10% cache hit rate |
-| `spotlight_index_operation_latency_seconds` | Index performance | P95 > 500ms for 5 min |
-
-This combination ensures that:
-1. Performance degradation is detected before users complain
-2. Abuse is identified and mitigated automatically
-3. Infrastructure failures fail fast and recover automatically
-4. Recovery operations are safe to retry
+- **CDN and edge caching**: No static asset optimization
+- **Multi-region / multi-device sync**: Single local instance
+- **Kubernetes orchestration**: Docker Compose for infrastructure services
+- **ML-based ranking**: Rule-based scoring instead of learned models
+- **Real file system watcher**: Content indexed via API/seed, not inotify/FSEvents
+- **Content extraction (Apache Tika)**: Seed script provides pre-extracted content
+- **Location-based suggestions**: No GPS/location signals in local setup
+- **A/B testing framework**: Single ranking algorithm, no experimentation

@@ -2,113 +2,196 @@
 
 ## System Overview
 
-A real-time analytics system for tracking video views and computing trending videos across different time windows and categories.
+A real-time analytics system for tracking video views and computing trending videos across configurable time windows and categories. The system ingests high-throughput view events, aggregates them using time-bucketed counters in Redis, computes top-k rankings using heap-based algorithms, and pushes updates to connected clients via Server-Sent Events.
+
+**Learning Goals:**
+- Design high-throughput event ingestion with idempotency
+- Implement windowed aggregation using Redis sorted sets
+- Build top-k algorithms (MinHeap, CountMinSketch, SpaceSaving)
+- Handle real-time streaming updates via SSE
+
+---
 
 ## Requirements
 
 ### Functional Requirements
 
-- **View counting**: Track video views with high throughput
+- **View counting**: Track video views with high throughput and duplicate prevention
 - **Trending calculation**: Compute top K trending videos within configurable time windows
 - **Category-based trends**: Support trending by category (music, gaming, sports, etc.)
-- **Real-time updates**: Push trending updates to connected clients
+- **Real-time updates**: Push trending updates to connected clients via SSE
+- **View simulation**: Generate synthetic view traffic for testing and demos
 
 ### Non-Functional Requirements
 
-- **Scalability**: Handle high view rates (designed for 10K+ views/second)
+- **Scalability**: Handle 10K+ views/second at production scale
 - **Availability**: 99.9% uptime target
 - **Latency**: < 100ms for trending queries, < 50ms for view recording
-- **Consistency**: Eventual consistency acceptable for trending (5-second refresh)
+- **Consistency**: Eventual consistency acceptable for trending (5-second refresh cycle)
+- **Data retention**: View events kept 7 days, trending snapshots kept 30 days
+
+---
 
 ## Capacity Estimation
 
-*For a medium-scale deployment:*
+### Production Scale
 
-- Daily Active Users (DAU): 1 million
-- Average views per user per day: 10
-- Peak traffic multiplier: 3x
-- Requests per second (RPS):
-  - Average: ~115 views/second
-  - Peak: ~350 views/second
-- Storage requirements:
-  - PostgreSQL: ~10GB for video metadata
-  - Redis: ~500MB for windowed counters
+| Metric | Estimate |
+|--------|----------|
+| Daily Active Users | 100M |
+| Average views per user per day | 20 |
+| Peak traffic multiplier | 5x average |
+| Views per second (average) | ~23K |
+| Views per second (peak) | ~115K |
+| Unique videos | 500M |
+| Active videos (viewed in last hour) | ~5M |
+| Categories | 15-20 |
+| Redis memory (counters) | ~10GB |
+| PostgreSQL (video metadata) | ~500GB |
+| View event log (7-day) | ~15TB |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Seeded videos | ~50 |
+| Categories | 7 |
+| Simulated views/sec | 10-100 |
+| Redis memory | < 50MB |
+| PostgreSQL storage | < 100MB |
+| SSE clients | 1-5 |
+
+---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           Frontend                                   │
-│              React + TypeScript + Tanstack Router                   │
-│                    + Zustand + Tailwind CSS                         │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │ HTTP / SSE
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         API Gateway / LB                             │
-│                      (nginx / HAProxy)                               │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │
-          ┌───────────────────────┼───────────────────────┐
-          │                       │                       │
-          ▼                       ▼                       ▼
-    ┌──────────┐           ┌──────────┐           ┌──────────┐
-    │ API      │           │ API      │           │ API      │
-    │ Server 1 │           │ Server 2 │           │ Server 3 │
-    │ :3001    │           │ :3002    │           │ :3003    │
-    └────┬─────┘           └────┬─────┘           └────┬─────┘
-         │                      │                      │
-         └──────────────────────┼──────────────────────┘
-                                │
-              ┌─────────────────┴─────────────────┐
-              │                                   │
-              ▼                                   ▼
-      ┌──────────────┐                   ┌──────────────┐
-      │    Redis     │                   │  PostgreSQL  │
-      │   :6379      │                   │    :5432     │
-      │              │                   │              │
-      │ - View       │                   │ - Videos     │
-      │   counters   │                   │ - Snapshots  │
-      │ - Time       │                   │ - Events     │
-      │   buckets    │                   │              │
-      └──────────────┘                   └──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Client Layer                                │
+│        Web Dashboard  │  Mobile App  │  API Consumers                │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ HTTP / SSE
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       API Gateway / CDN                              │
+│          (Load balancing, rate limiting, SSE routing)                │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  API Server 1    │ │  API Server 2    │ │  API Server N    │
+│                  │ │                  │ │                  │
+│ - View ingestion │ │ - View ingestion │ │ - View ingestion │
+│ - Trending API   │ │ - Trending API   │ │ - Trending API   │
+│ - SSE streaming  │ │ - SSE streaming  │ │ - SSE streaming  │
+│ - Trending       │ │ - Trending       │ │ - Trending       │
+│   Service (bg)   │ │   Service (bg)   │ │   Service (bg)   │
+└────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
+         │                    │                      │
+         └────────────────────┼──────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌──────────────┐    ┌──────────────────┐    ┌──────────────┐
+│    Redis     │    │   PostgreSQL     │    │ Message Queue│
+│              │    │                  │    │  (Kafka)     │
+│ - View       │    │ - Video metadata │    │              │
+│   counters   │    │ - View events    │    │ - View event │
+│ - Time       │    │ - Trending       │    │   ingestion  │
+│   buckets    │    │   snapshots      │    │ - Async      │
+│ - Idempotency│    │ - Schema         │    │   processing │
+│   keys       │    │   migrations     │    │              │
+└──────────────┘    └──────────────────┘    └──────────────┘
 ```
 
-### Core Components
+At production scale, a message queue (Kafka) sits between view ingestion and Redis/PostgreSQL writes to absorb traffic spikes. The local implementation writes directly to Redis and PostgreSQL.
 
-1. **API Server (Express.js)**
-   - REST API for video CRUD and view recording
-   - SSE endpoint for real-time trending updates
-   - Stateless, horizontally scalable
+---
 
-2. **TrendingService**
-   - Background process running on each API server
-   - Periodically computes Top K from Redis aggregations
-   - Notifies connected SSE clients of updates
+## Core Components
 
-3. **Redis (View Counter)**
-   - Sorted sets for windowed counting
-   - Time-bucketed keys (1-minute granularity)
-   - Automatic TTL expiration for old buckets
+### 1. View Ingestion
 
-4. **PostgreSQL (Persistent Storage)**
-   - Video metadata
-   - Historical snapshots (optional)
-   - View event log (optional)
+The view recording endpoint accepts view events, deduplicates them using idempotency keys, and updates counters in Redis:
+
+1. Client sends `POST /api/videos/:id/view` with optional `session_id`
+2. Generate idempotency key: `{videoId}:{sessionId}:{timeBucket}` (10-second buckets)
+3. Redis `SETNX` with 1-hour TTL: if key exists, skip (duplicate)
+4. If new view: increment Redis sorted set for the current time bucket
+5. Increment total view count in Redis hash
+6. Optionally log to `view_events` table for historical analysis
+
+**Batch endpoint**: `POST /api/videos/batch-view` accepts multiple views in a single request, reducing HTTP overhead during high-traffic periods.
+
+### 2. Windowed View Counting
+
+Redis sorted sets store view counts in time-bucketed keys:
+
+```
+views:bucket:{category}:{minuteBucket}  →  { videoId: count, ... }
+```
+
+- **Bucket granularity**: 1 minute (configurable via `BUCKET_SIZE_MINUTES`)
+- **Window size**: 60 minutes (configurable via `WINDOW_SIZE_MINUTES`)
+- **TTL**: Window size + 10-minute buffer for aggregation overlap
+- **Aggregation**: `ZUNIONSTORE` combines the last 60 bucket keys into a temporary sorted set
+
+**Why 1-minute buckets**: Finer granularity (e.g., 10 seconds) creates too many Redis keys (360 per category per hour). Coarser granularity (e.g., 15 minutes) makes trending scores change in jumpy steps rather than smooth curves. 1-minute buckets provide smooth score transitions with ~70 keys per category.
+
+### 3. Top K Algorithm
+
+The trending service computes top-k videos using a min-heap:
+
+1. Aggregate last 60 time buckets via `ZUNIONSTORE`
+2. Get all video scores from the aggregated sorted set
+3. Push each `{videoId, score}` into a min-heap of size K
+4. If heap is full and new score > heap minimum, replace the minimum
+5. Result: top K videos in O(N log K) time, O(K) space
+
+**Alternative implementations included in codebase:**
+- **CountMinSketch**: Approximate frequency counting for high cardinality (O(1) per update, bounded overestimation)
+- **SpaceSaving**: Streaming heavy hitters with guaranteed top-k accuracy (O(1) amortized per update)
+
+**When to switch**: MinHeap is exact but requires seeing all scores. At 5M+ active videos, iterating all scores becomes expensive. SpaceSaving processes events in a streaming fashion without the aggregation step, making it better for extreme scale.
+
+### 4. Trending Service
+
+A background process running on each API server instance:
+
+1. Every 5 seconds (configurable), compute top-k for each category
+2. Compare with previous results; if changed, broadcast to SSE clients
+3. Optionally save snapshots to `trending_snapshots` table for historical analysis
+4. Track heap operation metrics for algorithm optimization decisions
+
+The trending service uses an in-memory cache with a 5-second TTL. API requests hitting `/api/trending` serve from this cache, avoiding repeated Redis aggregation.
+
+### 5. Real-Time Streaming (SSE)
+
+Server-Sent Events push trending updates to connected clients:
+
+- **Endpoint**: `GET /api/sse/trending`
+- **Event types**: `trending-update` (new rankings), `heartbeat` (keep-alive)
+- **Reconnection**: Built-in browser auto-reconnect with `Last-Event-ID` support
+- **Scaling concern**: Each API server maintains its own SSE connections. At scale, a Redis pub/sub layer broadcasts trending updates to all servers, which then push to their connected clients.
+
+**Why SSE over WebSocket**: The data flow is unidirectional (server to client). SSE provides auto-reconnection, works with HTTP/2 multiplexing, and requires no special protocol upgrade. WebSocket would add bidirectional capability that is unused here while complicating the proxy and load balancer configuration.
+
+---
 
 ## Database Schema
 
 ### PostgreSQL Schema
 
 ```sql
--- Schema migrations tracking table
-CREATE TABLE schema_migrations (
+-- Schema migrations tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Videos table (core metadata)
-CREATE TABLE videos (
+CREATE TABLE IF NOT EXISTS videos (
   id UUID PRIMARY KEY,
   title VARCHAR(500) NOT NULL,
   description TEXT,
@@ -121,831 +204,393 @@ CREATE TABLE videos (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Indexes for videos table
-CREATE INDEX idx_videos_category ON videos(category);
-CREATE INDEX idx_videos_created_at ON videos(created_at);
-CREATE INDEX idx_videos_total_views ON videos(total_views DESC);
+CREATE INDEX IF NOT EXISTS idx_videos_category ON videos(category);
+CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos(created_at);
+CREATE INDEX IF NOT EXISTS idx_videos_total_views ON videos(total_views DESC);
 
--- View events (for historical analysis, 7-day retention)
-CREATE TABLE view_events (
+-- View events (historical log, 7-day retention)
+CREATE TABLE IF NOT EXISTS view_events (
   id SERIAL PRIMARY KEY,
   video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
   viewed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   session_id VARCHAR(100),
-  idempotency_key VARCHAR(255)  -- For duplicate prevention
+  idempotency_key VARCHAR(255)
 );
 
--- Indexes for view_events table
-CREATE INDEX idx_view_events_video_id ON view_events(video_id);
-CREATE INDEX idx_view_events_viewed_at ON view_events(viewed_at);
-CREATE UNIQUE INDEX idx_view_events_idempotency_key
+CREATE INDEX IF NOT EXISTS idx_view_events_video_id ON view_events(video_id);
+CREATE INDEX IF NOT EXISTS idx_view_events_viewed_at ON view_events(viewed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_view_events_idempotency_key
   ON view_events(idempotency_key)
   WHERE idempotency_key IS NOT NULL;
-CREATE INDEX idx_view_events_viewed_at_for_cleanup
+CREATE INDEX IF NOT EXISTS idx_view_events_viewed_at_for_cleanup
   ON view_events(viewed_at)
   WHERE viewed_at < NOW() - INTERVAL '7 days';
 
--- Trending snapshots (for historical trending, 30-day retention)
-CREATE TABLE trending_snapshots (
+-- Trending snapshots (historical rankings, 30-day retention)
+CREATE TABLE IF NOT EXISTS trending_snapshots (
   id SERIAL PRIMARY KEY,
-  window_type VARCHAR(50) NOT NULL,  -- 'hourly', 'daily', etc.
-  category VARCHAR(100),              -- NULL for 'all' categories
-  video_rankings JSONB NOT NULL,      -- [{videoId, title, score, rank}, ...]
+  window_type VARCHAR(50) NOT NULL,
+  category VARCHAR(100),
+  video_rankings JSONB NOT NULL,
   snapshot_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Index for trending_snapshots table
-CREATE INDEX idx_trending_snapshots_window
+CREATE INDEX IF NOT EXISTS idx_trending_snapshots_window
   ON trending_snapshots(window_type, snapshot_at);
 ```
-
-**Note:** For fresh database setup, use `backend/src/db/init.sql` which consolidates all migrations. For incremental changes, use the migration files in `backend/src/db/migrations/`.
 
 ### Redis Data Structures
 
 ```
-# Windowed view counters (sorted sets)
-views:bucket:all:1234567 -> { videoId1: 5, videoId2: 3, ... }
-views:bucket:music:1234567 -> { videoId1: 2, videoId3: 1, ... }
+# Windowed view counters (SORTED SET, 70-min TTL)
+views:bucket:all:{minuteBucket}      →  { videoId: viewCount, ... }
+views:bucket:music:{minuteBucket}    →  { videoId: viewCount, ... }
+views:bucket:gaming:{minuteBucket}   →  { videoId: viewCount, ... }
 
-# Total view counts (hash)
-views:total -> { videoId1: 10000, videoId2: 5000, ... }
+# Total view counts (HASH, no TTL, synced from PostgreSQL)
+views:total  →  { videoId: totalViews, ... }
+
+# Idempotency keys (STRING, 1-hour TTL)
+idem:view:{videoId}:{sessionId}:{timeBucket}  →  "1"
 ```
+
+---
 
 ## API Design
 
-### Core Endpoints
+### Video Endpoints
 
-#### Videos
 ```
-GET    /api/videos              - List videos with pagination
-GET    /api/videos/:id          - Get video by ID
-POST   /api/videos              - Create video
-POST   /api/videos/:id/view     - Record a view
-POST   /api/videos/batch-view   - Record multiple views
-```
-
-#### Trending
-```
-GET    /api/trending            - Get trending videos (?category=)
-GET    /api/trending/all        - Get all categories
-GET    /api/trending/categories - List categories
-GET    /api/trending/stats      - Get statistics
-POST   /api/trending/refresh    - Force refresh
+GET    /api/videos              → List videos with pagination
+GET    /api/videos/:id          → Get video by ID
+POST   /api/videos              → Create video
+POST   /api/videos/:id/view     → Record a view (with idempotency)
+POST   /api/videos/batch-view   → Record multiple views
 ```
 
-#### Real-time
+### Trending Endpoints
+
 ```
-GET    /api/sse/trending        - SSE stream for updates
-GET    /api/sse/heartbeat       - Heartbeat for testing
+GET    /api/trending             → Get trending videos (?category=)
+GET    /api/trending/all         → Get all categories' trending
+GET    /api/trending/categories  → List available categories
+GET    /api/trending/stats       → Get statistics (cache hit rate, update count)
+POST   /api/trending/refresh     → Force trending refresh
 ```
+
+### Real-Time Endpoints
+
+```
+GET    /api/sse/trending         → SSE stream for trending updates
+GET    /api/sse/heartbeat        → Heartbeat stream for testing
+```
+
+### Operations Endpoints
+
+```
+GET    /health                   → Simple health check
+GET    /health/ready             → Readiness probe (PG + Redis + TrendingService)
+GET    /health/live              → Liveness probe (process uptime)
+GET    /health/detailed          → Detailed health with metrics and alert thresholds
+GET    /metrics                  → Prometheus metrics
+```
+
+---
 
 ## Key Design Decisions
 
-### 1. Windowed Counting with Time Buckets
+### 1. Redis Sorted Sets vs Approximate Counting
 
-**Problem:** Need to count views within a sliding time window efficiently.
+**Decision**: Use Redis sorted sets for exact windowed view counting.
 
-**Solution:** Use Redis sorted sets with time-bucketed keys.
+**Why it works for our scale**: Sorted sets provide O(log N) increment and O(N log N) aggregation via ZUNIONSTORE. With ~5K active videos per category, aggregating 60 time buckets completes in < 10ms. The exact counts ensure trending rankings are precise, which matters for credibility (users notice if a less-viewed video appears above a more-viewed one).
 
-```javascript
-// 1-minute buckets
-const bucket = Math.floor(Date.now() / 60000);
-const key = `views:bucket:${category}:${bucket}`;
+**Why approximate counting (CountMinSketch) fails here**: CMS provides O(1) updates and bounded overestimation, but the overestimation can cause incorrect rankings. A video with true count 100 might be estimated at 120, while a video with true count 110 might be estimated at 115, reversing their order. For a "Top K" display, ranking accuracy matters more than counting accuracy.
 
-// Increment view count
-await redis.zIncrBy(key, 1, videoId);
-await redis.expire(key, 3600 + 600); // Window + buffer
+**When to switch**: At 5M+ active videos per category, the ZUNIONSTORE aggregation becomes the bottleneck (O(N * K) where N is videos and K is buckets). At that scale, SpaceSaving with streaming updates avoids the aggregation step entirely. The codebase includes both algorithms for comparison.
 
-// Aggregate last 60 buckets for hourly trending
-await redis.zUnionStore(tempKey, last60BucketKeys);
-const topK = await redis.zRangeWithScores(tempKey, 0, k-1, { REV: true });
+**What we give up**: Higher Redis memory usage. Each sorted set key stores all active videos with their scores. With 15 categories and 70 buckets each, that is ~1050 sorted sets. At 5K members each, this is ~5M entries total, using roughly 500MB of Redis memory. CMS would use fixed ~1MB regardless of cardinality.
+
+### 2. 1-Minute Time Buckets vs Finer/Coarser Granularity
+
+**Decision**: 1-minute bucket granularity with 60-minute sliding window.
+
+**Why this granularity**: Finer buckets (10 seconds) create 360 keys per category per hour, increasing Redis KEYS overhead and ZUNIONSTORE input set size. Coarser buckets (15 minutes) cause trending scores to change in visible steps every 15 minutes, making the UI feel "jumpy" rather than smooth. 1-minute buckets provide smooth score transitions with ~70 keys per category.
+
+**Memory bound**: ~70 keys per category * 15 categories = ~1050 sorted set keys. Each key expires automatically via TTL (70 minutes), so no manual cleanup is needed.
+
+**Configuration**: Bucket size, window size, and expiration buffer are configurable via environment variables, enabling tuning without code changes.
+
+### 3. SSE vs WebSocket vs Polling
+
+**Decision**: Server-Sent Events for real-time trending updates.
+
+**Why SSE**: The data flow is strictly server-to-client: trending rankings change and clients need to see them. SSE provides auto-reconnection, works natively with HTTP/2 multiplexing, and requires no special proxy configuration. The browser's `EventSource` API handles reconnection with `Last-Event-ID` out of the box.
+
+**Why WebSocket fails here**: WebSocket adds bidirectional capability (client-to-server messages) that is unused. It also requires explicit reconnection logic, a WebSocket-aware proxy configuration, and protocol upgrade handling. The complexity cost is not justified for unidirectional updates.
+
+**Why polling fails here**: At 5-second trending update intervals, polling would require each client to send a request every 5 seconds. With 100K connected clients, that is 20K requests/second of pure overhead. SSE maintains a single persistent connection per client with near-zero overhead between updates.
+
+**What we give up**: SSE connections are unidirectional. If we later need client-to-server communication (e.g., user votes on trending topics), we would need a separate mechanism or a switch to WebSocket.
+
+---
+
+## Consistency and Idempotency
+
+### View Count Idempotency
+
+Duplicate view prevention uses Redis-based idempotency keys:
+
+1. Generate key from request context: `idem:view:{videoId}:{sessionId}:{timeBucket}`
+2. `SETNX` with 1-hour TTL: if key already exists, the view is a duplicate
+3. Time bucketing (10-second windows) allows for clock drift while preventing abuse
+4. Session-based keys mean the same user can legitimately view again after TTL expires
+
+**Why this matters**: Without idempotency, network retries, double-clicks, and client bugs would inflate view counts. A video could accumulate 2-3x its real views, corrupting trending rankings and eroding user trust.
+
+**Metrics**: `youtube_topk_duplicate_views_total` tracks prevented duplicates. A high duplicate rate may indicate client bugs or coordinated abuse.
+
+### Consistency Model
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| View recording (Redis) | Eventual | Counters may briefly lag; 5-second refresh absorbs the gap |
+| Trending computation | Eventual | 5-second cache; rankings are approximate by nature |
+| Video metadata (PG) | Strong | CRUD operations use standard transactions |
+| View event logging (PG) | Eventual | Historical log; missed events are acceptable |
+| Trending snapshots (PG) | Eventual | Analytics data; minor gaps are tolerable |
+
+---
+
+## Security Considerations
+
+1. **Rate limiting**: Prevent view count manipulation via automated scripts
+2. **Input validation**: Sanitize video IDs (UUID format) and category strings
+3. **CORS**: Restrict to known origins in production
+4. **Bot detection**: Filter automated traffic (future enhancement)
+5. **Idempotency keys**: Prevent replay attacks on view counts
+
+---
+
+## Observability
+
+### Prometheus Metrics
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `youtube_topk_view_recording_duration_seconds` | Histogram | - | View ingestion latency |
+| `youtube_topk_trending_query_duration_seconds` | Histogram | - | Trending API latency |
+| `youtube_topk_heap_operations_total` | Counter | operation (push, pop, rebuild) | Algorithm performance |
+| `youtube_topk_heap_operation_duration_seconds` | Histogram | operation | Heap operation latency |
+| `youtube_topk_duplicate_views_total` | Counter | - | Idempotency effectiveness |
+| `youtube_topk_cache_hit_rate` | Gauge | cache_type | Cache efficiency |
+| `youtube_topk_sse_clients_connected` | Gauge | - | SSE connection count |
+| `youtube_topk_redis_memory_bytes` | Gauge | - | Redis memory usage |
+| `youtube_topk_table_row_count` | Gauge | table | PostgreSQL table sizes |
+| `youtube_topk_pg_active_connections` | Gauge | - | Connection pool usage |
+
+### Structured Logging (Pino)
+
+JSON logs with request IDs, correlation, and context:
+
+```
+{"level":"info","method":"POST","path":"/api/videos/abc/view","statusCode":200,"durationMs":12,"requestId":"req-123"}
 ```
 
-**Trade-offs:**
-- Pro: O(log N) operations, native aggregation
-- Pro: Exact counts within time window
-- Con: More memory than approximate algorithms
-- Con: Key proliferation (mitigated by TTL)
+### Health Checks
 
-### 2. Top K Algorithm
+- `/health` - Simple liveness for load balancer probes
+- `/health/ready` - Readiness (PostgreSQL, Redis, TrendingService all healthy)
+- `/health/live` - Liveness (process running, uptime, PID, memory)
+- `/health/detailed` - Full diagnostic with metrics, alert thresholds, and active alerts
 
-**Implementation:** Min-heap based Top K
+### Alert Thresholds
 
-```javascript
-class TopK {
-  constructor(k) {
-    this.k = k;
-    this.heap = new MinHeap();
-  }
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| Redis memory | 400MB (80%) | 450MB (90%) | Clear old buckets, check key leaks |
+| PostgreSQL connections | 8 (80% of pool) | 9 (90%) | Check for connection leaks |
+| `view_events` rows | 100K | 500K | Run cleanup script |
+| `trending_snapshots` rows | 50K | 100K | Run cleanup script |
+| SSE client count | 50 | 100 | Add server instances |
+| View recording p95 | 40ms | 50ms | Check Redis connectivity |
+| Trending query p95 | 80ms | 100ms | Optimize aggregation |
 
-  update(id, score) {
-    if (this.heap.size < this.k) {
-      this.heap.push({ id, score });
-    } else if (score > this.heap.peek().score) {
-      this.heap.pop();
-      this.heap.push({ id, score });
-    }
-  }
-}
-```
+---
 
-**Alternative algorithms included:**
-- **CountMinSketch**: Approximate frequency counting for high cardinality
-- **SpaceSaving**: Heavy hitters with bounded error
+## Failure Handling
 
-### 3. Real-time Updates via SSE
+### Redis Failure
 
-**Why SSE over WebSocket:**
-- Unidirectional (server → client) is sufficient
-- Built-in reconnection
-- Simpler implementation
-- HTTP/2 multiplexing
+If Redis becomes unavailable:
+- View recording fails (returns 503); trending data is stale but served from in-memory cache
+- Trending service continues serving cached results until cache expires
+- Recovery: flush Redis and rebuild total view counts from PostgreSQL
 
-## Technology Stack
+### PostgreSQL Failure
 
-| Component | Technology | Rationale |
-|-----------|------------|-----------|
-| **Frontend** | React 19 + TypeScript | Modern, type-safe UI |
-| **Routing** | Tanstack Router | File-based, type-safe routing |
-| **State** | Zustand | Lightweight, simple API |
-| **Styling** | Tailwind CSS | Rapid development |
-| **Backend** | Node.js + Express | Fast development, ecosystem |
-| **Cache** | Redis | Native sorted sets, pub/sub |
-| **Database** | PostgreSQL | Reliable, full-featured |
+If PostgreSQL becomes unavailable:
+- View events are not logged (acceptable; Redis still counts views)
+- Video metadata reads fail; trending API returns cached results
+- Recovery: standard PostgreSQL restart; no data loss if WAL is enabled
+
+### Trending Service Stall
+
+If the background trending loop stalls:
+- SSE clients stop receiving updates
+- `/api/trending` serves stale cached results
+- Health check `/health/ready` reports `trendingService: not_started`
+
+### Data Recovery Procedures
+
+| Scenario | Procedure |
+|----------|-----------|
+| Redis data lost | Rebuild total view counts from PostgreSQL `videos.total_views` |
+| View events corrupted | Truncate `view_events`; trending unaffected (uses Redis counters) |
+| Trending snapshots lost | Rebuild by replaying view events through time buckets |
+
+---
 
 ## Scalability Considerations
 
 ### Horizontal Scaling
 
-1. **API Servers**: Stateless, add more behind load balancer
-2. **Redis**: Can use Redis Cluster for sharding
-3. **PostgreSQL**: Read replicas for queries, primary for writes
+1. **API servers**: Stateless; add instances behind a load balancer
+2. **Redis**: Redis Cluster for sharding sorted sets by category
+3. **PostgreSQL**: Read replicas for trending/video queries; primary for writes
+4. **SSE distribution**: Redis pub/sub broadcasts trending updates to all API servers
 
 ### High Traffic Optimizations
 
-1. **Batch writes**: Aggregate views before Redis writes
-2. **Local caching**: Cache trending results with short TTL
-3. **Rate limiting**: Protect against abuse
-4. **Circuit breakers**: Graceful degradation
+1. **Batch writes**: Aggregate views in memory before Redis writes (reduce ZINCRBY calls)
+2. **Local caching**: In-memory trending cache with 5-second TTL avoids repeated aggregation
+3. **Rate limiting**: Per-IP and per-session limits prevent abuse
+4. **Connection pooling**: PostgreSQL pool size tuned to available connections
 
-### Approximate Counting at Scale
+### Bottleneck Analysis
 
-When exact counting becomes too expensive:
+| Component | Breaks at | Solution |
+|-----------|-----------|----------|
+| Redis ZUNIONSTORE | ~5M members per sorted set | Switch to SpaceSaving streaming algorithm |
+| Single Redis instance | ~1M writes/sec | Redis Cluster with sharding by category |
+| PostgreSQL view_events writes | ~10K inserts/sec | Kafka buffer + batch inserts |
+| SSE connections per server | ~10K connections | Dedicated SSE servers with Redis pub/sub |
+| Trending service compute | ~100 categories | Parallelize per-category computation |
 
-```javascript
-// CountMinSketch for approximate frequency
-const cms = new CountMinSketch(width=10000, depth=5);
-cms.increment(videoId);
-const estimate = cms.estimate(videoId); // May overestimate
-
-// SpaceSaving for streaming heavy hitters
-const ss = new SpaceSaving(k=100);
-ss.increment(videoId);
-const topK = ss.getTopK(10); // Guaranteed to include true top 10
-```
-
-## Trade-offs Summary
-
-| Decision | Trade-off | Alternative |
-|----------|-----------|-------------|
-| Redis sorted sets | Higher memory, exact counts | CountMinSketch for lower memory |
-| 1-minute buckets | More keys, finer granularity | 5-minute for fewer keys |
-| SSE | Simple, unidirectional | WebSocket for bidirectional |
-| Single Redis | Simple, potential bottleneck | Redis Cluster for scale |
-
-## Observability
-
-### Metrics to Track
-
-- View recording latency (p50, p95, p99)
-- Trending query latency
-- Redis memory usage
-- SSE client count
-- Error rates by endpoint
-
-### Health Checks
-
-```
-GET /health → { status: "healthy", redis: "connected", postgres: "connected" }
-```
-
-## Security Considerations
-
-1. **Rate limiting**: Prevent view count manipulation
-2. **Input validation**: Sanitize video IDs and categories
-3. **CORS**: Restrict to known origins
-4. **Bot detection**: Filter automated traffic (future)
+---
 
 ## Data Lifecycle Policies
 
-### Retention and TTL Strategy
+### Retention
 
-| Data Type | Retention Period | TTL Mechanism | Rationale |
-|-----------|------------------|---------------|-----------|
-| **Redis time buckets** | 70 minutes | `EXPIRE` on each key | 60-minute window + 10-minute buffer for aggregation |
-| **Redis total views** | Permanent | None | Synced from PostgreSQL, cleared on restart |
-| **view_events table** | 7 days | Daily cron job | Short-term debugging, not needed for trending |
-| **trending_snapshots** | 30 days | Daily cron job | Historical analysis and debugging |
-| **videos table** | Permanent | None | Core metadata, manual deletion only |
+| Data | Retention | Mechanism | Rationale |
+|------|-----------|-----------|-----------|
+| Redis time buckets | 70 minutes | `EXPIRE` on each key | 60-min window + 10-min buffer |
+| Redis total views | Permanent | None (cleared on restart) | Synced from PostgreSQL |
+| `view_events` table | 7 days | Daily cleanup script | Short-term debugging only |
+| `trending_snapshots` | 30 days | Daily cleanup script | Historical analysis |
+| `videos` table | Permanent | Manual deletion | Core metadata |
 
-### Local Development Implementation
+### Cleanup
 
-```bash
-# Cleanup script: backend/scripts/cleanup-old-data.sh
-#!/bin/bash
-# Run daily via cron: 0 3 * * * /path/to/cleanup-old-data.sh
-
-# Delete view events older than 7 days
-psql $DATABASE_URL -c "DELETE FROM view_events WHERE viewed_at < NOW() - INTERVAL '7 days';"
-
-# Delete trending snapshots older than 30 days
-psql $DATABASE_URL -c "DELETE FROM trending_snapshots WHERE snapshot_at < NOW() - INTERVAL '30 days';"
-
-# Vacuum to reclaim space
-psql $DATABASE_URL -c "VACUUM ANALYZE view_events; VACUUM ANALYZE trending_snapshots;"
-```
-
-### Archival Strategy (Local Development)
-
-For learning purposes, implement a simple file-based archive before deletion:
-
+Daily cron job deletes expired data:
 ```sql
--- Archive view_events before cleanup (run manually or via script)
-COPY (
-  SELECT * FROM view_events
-  WHERE viewed_at < NOW() - INTERVAL '7 days'
-) TO '/tmp/view_events_archive.csv' WITH CSV HEADER;
-
--- Archive trending_snapshots monthly
-COPY (
-  SELECT * FROM trending_snapshots
-  WHERE snapshot_at < NOW() - INTERVAL '30 days'
-) TO '/tmp/trending_snapshots_archive.csv' WITH CSV HEADER;
-```
-
-### Backfill and Replay Procedures
-
-**Scenario 1: Redis data lost (restart without persistence)**
-
-```bash
-# 1. Check if Redis data is gone
-redis-cli KEYS "views:*" | head -5
-
-# 2. Rebuild total view counts from PostgreSQL
-psql $DATABASE_URL -c "SELECT id, total_views FROM videos WHERE total_views > 0;" > /tmp/views.txt
-
-# 3. Load into Redis (script: backend/scripts/rebuild-redis.ts)
-npm run rebuild-redis
-```
-
-**Scenario 2: Replay historical views for testing**
-
-```javascript
-// backend/scripts/replay-views.ts
-import { pool } from '../src/shared/db';
-import { redis } from '../src/shared/cache';
-
-async function replayViews(hours: number) {
-  const cutoff = new Date(Date.now() - hours * 3600 * 1000);
-  const result = await pool.query(
-    'SELECT video_id, viewed_at FROM view_events WHERE viewed_at >= $1 ORDER BY viewed_at',
-    [cutoff]
-  );
-
-  for (const row of result.rows) {
-    const bucket = Math.floor(new Date(row.viewed_at).getTime() / 60000);
-    await redis.zIncrBy(`views:bucket:all:${bucket}`, 1, row.video_id);
-  }
-  console.log(`Replayed ${result.rows.length} views`);
-}
-```
-
-**Scenario 3: PostgreSQL restored from backup**
-
-```bash
-# 1. Restore PostgreSQL from pg_dump backup
-pg_restore -d youtube_topk /path/to/backup.dump
-
-# 2. Clear Redis to avoid stale data
-redis-cli FLUSHDB
-
-# 3. Rebuild Redis from PostgreSQL
-npm run rebuild-redis
-
-# 4. Verify data integrity
-npm run verify-data
+DELETE FROM view_events WHERE viewed_at < NOW() - INTERVAL '7 days';
+DELETE FROM trending_snapshots WHERE snapshot_at < NOW() - INTERVAL '30 days';
+VACUUM ANALYZE view_events;
+VACUUM ANALYZE trending_snapshots;
 ```
 
 ---
 
-## Deployment and Operations
-
-### Local Development Rollout Strategy
-
-For a learning project with multiple API servers:
-
-```bash
-# 1. Rolling restart: One server at a time (no downtime)
-# Terminal 1: Keep server 2 and 3 running
-npm run dev:server1  # Stop with Ctrl+C, make changes, restart
-
-# 2. Wait for health check before proceeding
-curl http://localhost:3001/health
-
-# 3. Repeat for server 2, then server 3
-npm run dev:server2
-npm run dev:server3
-```
-
-### Schema Migration Workflow
-
-**Migration file naming convention:**
-```
-backend/src/db/migrations/
-├── 001_initial_schema.sql
-├── 002_add_category_index.sql
-├── 003_add_view_events_partition.sql
-└── 004_add_trending_snapshots.sql
-```
-
-**Migration runner (backend/src/db/migrate.ts):**
-
-```typescript
-import { pool } from '../shared/db';
-import fs from 'fs';
-import path from 'path';
-
-async function migrate() {
-  // Create migrations tracking table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-  `);
-
-  // Get applied migrations
-  const applied = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
-  const appliedVersions = new Set(applied.rows.map(r => r.version));
-
-  // Read and apply pending migrations
-  const migrationsDir = path.join(__dirname, 'migrations');
-  const files = fs.readdirSync(migrationsDir).sort();
-
-  for (const file of files) {
-    const version = parseInt(file.split('_')[0]);
-    if (appliedVersions.has(version)) continue;
-
-    console.log(`Applying migration ${version}: ${file}`);
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-
-    await pool.query('BEGIN');
-    try {
-      await pool.query(sql);
-      await pool.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
-      await pool.query('COMMIT');
-      console.log(`  Migration ${version} applied successfully`);
-    } catch (err) {
-      await pool.query('ROLLBACK');
-      console.error(`  Migration ${version} failed:`, err);
-      throw err;
-    }
-  }
-}
-```
-
-**Run migrations:**
-```bash
-npm run db:migrate        # Apply pending migrations
-npm run db:migrate:status # Show applied vs pending
-```
-
-### Rollback Runbook
-
-**Situation 1: Bad code deployment**
-
-```bash
-# 1. Identify the issue
-tail -f backend/logs/error.log
-
-# 2. Git revert to last known good state
-git log --oneline -5
-git checkout <last-good-commit>
-
-# 3. Restart affected servers
-npm run dev:server1
-npm run dev:server2
-npm run dev:server3
-
-# 4. Verify functionality
-curl http://localhost:3001/api/trending
-```
-
-**Situation 2: Bad database migration**
-
-```sql
--- Each migration should have a corresponding rollback file
--- backend/src/db/migrations/002_add_category_index.sql
-CREATE INDEX idx_videos_category ON videos(category);
-
--- backend/src/db/rollbacks/002_add_category_index.rollback.sql
-DROP INDEX IF EXISTS idx_videos_category;
-```
-
-```bash
-# Run rollback manually
-psql $DATABASE_URL -f backend/src/db/rollbacks/002_add_category_index.rollback.sql
-
-# Update migrations table
-psql $DATABASE_URL -c "DELETE FROM schema_migrations WHERE version = 2;"
-```
-
-**Situation 3: Redis corruption or wrong data**
-
-```bash
-# Option A: Flush and rebuild (safest)
-redis-cli FLUSHDB
-npm run rebuild-redis
-
-# Option B: Selective cleanup (for testing)
-redis-cli KEYS "views:bucket:*" | xargs redis-cli DEL
-# Trending will rebuild on next refresh cycle
-```
-
-**Situation 4: Full system recovery**
-
-```bash
-# 1. Stop all services
-pkill -f "node.*server"
-
-# 2. Reset databases
-docker-compose down -v
-docker-compose up -d
-
-# 3. Run migrations
-npm run db:migrate
-
-# 4. Seed initial data (if needed)
-npm run db:seed
-
-# 5. Start services
-npm run dev
-```
-
----
-
-## Capacity and Cost Guardrails
-
-### Key Metrics and Thresholds
-
-| Metric | Warning Threshold | Critical Threshold | Action |
-|--------|-------------------|-------------------|--------|
-| Redis memory usage | 400MB (80% of 500MB budget) | 450MB (90%) | Clear old buckets, check for key leaks |
-| PostgreSQL connections | 8 (80% of pool) | 9 (90%) | Check for connection leaks |
-| view_events table size | 100K rows | 500K rows | Run cleanup script |
-| trending_snapshots size | 50K rows | 100K rows | Run cleanup script |
-| SSE client count | 50 | 100 | Consider adding server instances |
-| View recording latency p95 | 40ms | 50ms | Check Redis connectivity |
-| Trending query latency p95 | 80ms | 100ms | Optimize aggregation |
-
-### Redis Memory Monitoring
-
-```bash
-# Check current memory usage
-redis-cli INFO memory | grep used_memory_human
-
-# Check key count by pattern
-redis-cli KEYS "views:bucket:*" | wc -l
-
-# Find largest keys
-redis-cli --bigkeys
-
-# Expected: ~70 bucket keys per category (60 min window + buffer)
-# If significantly more, TTL may not be working
-```
-
-### PostgreSQL Monitoring Queries
-
-```sql
--- Table sizes
-SELECT
-  relname AS table,
-  pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
-  n_live_tup AS row_count
-FROM pg_stat_user_tables
-ORDER BY pg_total_relation_size(relid) DESC;
-
--- Connection usage
-SELECT count(*) as active_connections,
-       max_conn as max_allowed,
-       count(*) * 100.0 / max_conn as usage_percent
-FROM pg_stat_activity,
-     (SELECT setting::int as max_conn FROM pg_settings WHERE name = 'max_connections') mc
-GROUP BY max_conn;
-
--- Slow queries (requires pg_stat_statements extension)
-SELECT query, calls, mean_exec_time, total_exec_time
-FROM pg_stat_statements
-WHERE mean_exec_time > 100
-ORDER BY mean_exec_time DESC
-LIMIT 10;
-```
-
-### Cache Hit Rate Targets
-
-| Cache | Target Hit Rate | Measurement | Action if Below |
-|-------|-----------------|-------------|-----------------|
-| Redis view counters | N/A (write-heavy) | N/A | N/A |
-| Trending results (in-memory) | > 95% | Requests served from 5s cache | Increase cache TTL |
-| Video metadata | > 80% | `redis-cli INFO stats` | Add Redis caching layer |
-
-### Alerting Setup (Local Development)
-
-Create a simple health check script for local monitoring:
-
-```bash
-#!/bin/bash
-# backend/scripts/health-check.sh
-# Run via: watch -n 10 ./health-check.sh
-
-echo "=== YouTube Top K Health Check ==="
-echo ""
-
-# Redis memory
-REDIS_MEM=$(redis-cli INFO memory | grep used_memory_human | cut -d: -f2 | tr -d '[:space:]')
-echo "Redis Memory: $REDIS_MEM (warn: 400MB, crit: 450MB)"
-
-# Redis key count
-BUCKET_KEYS=$(redis-cli KEYS "views:bucket:*" 2>/dev/null | wc -l | tr -d '[:space:]')
-echo "Redis Bucket Keys: $BUCKET_KEYS (expected: ~70-100)"
-
-# PostgreSQL connections
-PG_CONN=$(psql $DATABASE_URL -t -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database();")
-echo "PostgreSQL Connections: $PG_CONN (max: 10)"
-
-# Table row counts
-VIEW_EVENTS=$(psql $DATABASE_URL -t -c "SELECT count(*) FROM view_events;")
-SNAPSHOTS=$(psql $DATABASE_URL -t -c "SELECT count(*) FROM trending_snapshots;")
-echo "view_events rows: $VIEW_EVENTS (warn: 100K)"
-echo "trending_snapshots rows: $SNAPSHOTS (warn: 50K)"
-
-# API health
-for port in 3001 3002 3003; do
-  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/health 2>/dev/null || echo "DOWN")
-  echo "API Server :$port - $STATUS"
-done
-
-echo ""
-echo "=== End Health Check ==="
-```
-
-### Cost Optimization Tips (Local Development)
-
-1. **Reduce Redis memory**: Lower bucket granularity from 1-minute to 5-minute for testing
-   ```javascript
-   const bucket = Math.floor(Date.now() / 300000); // 5-minute buckets
-   ```
-
-2. **Limit view_events logging**: Only log 10% of views in development
-   ```javascript
-   if (Math.random() < 0.1) {
-     await logViewEvent(videoId, sessionId);
-   }
-   ```
-
-3. **Disable trending snapshots**: Skip persistence for faster iteration
-   ```javascript
-   if (process.env.ENABLE_SNAPSHOTS === 'true') {
-     await saveTrendingSnapshot(trending);
-   }
-   ```
-
-4. **PostgreSQL connection pooling**: Use 5 connections instead of 10 for local dev
-   ```javascript
-   const pool = new Pool({ max: parseInt(process.env.PG_POOL_SIZE || '5') });
-   ```
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| View counting | Redis sorted sets (exact) | CountMinSketch (approximate) | Ranking accuracy matters more than memory |
+| Bucket granularity | 1-minute | 10-second / 5-minute | Balance key count vs score smoothness |
+| Real-time updates | SSE | WebSocket / Polling | Unidirectional, auto-reconnect, HTTP/2 compatible |
+| Top-k algorithm | MinHeap (exact) | SpaceSaving (streaming) | Exact at current scale; switch at 5M+ videos |
+| View dedup | Redis SETNX + TTL | PostgreSQL unique constraint | Redis is faster for hot-path dedup |
+| Trending cache | In-memory, 5s TTL | No cache / longer TTL | Absorbs request spikes without stale data |
+| Event logging | Direct PG write | Kafka queue | Sufficient at local scale; Kafka for production |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind key implementation decisions. These notes explain "why" certain approaches were chosen and how they affect system behavior.
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
 
-### WHY Idempotency Prevents Duplicate View Counting
-
-**Problem Statement:**
-In a distributed system with network unreliability, the same view event can be processed multiple times:
-1. **Network retries**: Client retries a request on timeout, but the server already processed it
-2. **Double-clicks**: User accidentally triggers multiple view events
-3. **Client-side bugs**: Frontend code fires the same event multiple times
-4. **Load balancer retries**: Some LBs retry failed requests to different backends
-
-Without idempotency, a video could accumulate 2x, 3x, or more views from a single legitimate watch, leading to:
-- Inaccurate trending rankings
-- Inflated view counts
-- Loss of user trust in the trending algorithm
-
-**Solution: Redis-Based Idempotency Keys**
-
-```javascript
-// Generate key from request context
-const key = `idem:view:${videoId}:${sessionId}:${timeBucket}`;
-
-// Atomic check-and-set using SETNX
-const result = await redis.set(key, '1', { NX: true, EX: 3600 });
-if (result === null) {
-  // Duplicate request - skip processing
-  return { duplicate: true };
-}
-// Process the view normally
-```
-
-**Key Design Decisions:**
-- **Time bucketing (10-second windows)**: Allows for clock drift while preventing abuse
-- **Session-based keys**: Same user can watch again after TTL expires
-- **Redis SETNX**: Atomic operation prevents race conditions in distributed servers
-- **1-hour TTL**: Balances memory usage with protection window
-
-**Metrics to Monitor:**
-- `youtube_topk_duplicate_views_total`: Tracks prevented duplicates
-- High duplicate rate may indicate client bugs or abuse
-
----
-
-### WHY Sliding Window Retention Balances Trending Accuracy vs Memory
-
-**The Tradeoff:**
-- **Shorter windows (15 min)**: Capture immediate viral content, but are noisy and volatile
-- **Longer windows (24 hours)**: Stable rankings, but miss fast-rising content
-- **Memory usage**: Each time bucket consumes Redis memory (O(videos * categories * buckets))
-
-**Our Approach: 60-Minute Window with 1-Minute Buckets**
+### Local Architecture
 
 ```
-Time: ────────────────────────────────────────────────>
-       │ bucket 1 │ bucket 2 │ ... │ bucket 59 │ bucket 60 │
-       └──────────┴──────────┴─────┴───────────┴───────────┘
-                       60-minute sliding window
-
-Each bucket expires after 70 minutes (window + buffer)
+┌────────────────────────────────────────────────────────┐
+│              React Frontend (:5173)                    │
+│  TanStack Router + Zustand + Tailwind CSS              │
+│  TrendingList, CategoryFilter, StatsPanel, VideoCard   │
+│  useSSE hook for real-time updates                     │
+└──────────────────────────┬─────────────────────────────┘
+                           │ HTTP + SSE
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│       Express Backend (:3000 / :3001-3003)             │
+│  /api/videos, /api/trending, /api/sse                  │
+│  /health, /health/ready, /health/live,                 │
+│  /health/detailed, /metrics                            │
+└──────────┬───────────────────────┬─────────────────────┘
+           │                       │
+           ▼                       ▼
+   ┌──────────────┐        ┌──────────────┐
+   │    Valkey     │        │  PostgreSQL  │
+   │   (:6379)    │        │   (:5432)    │
+   │              │        │              │
+   │ - View       │        │ - videos     │
+   │   buckets    │        │ - view_      │
+   │   (sorted    │        │   events     │
+   │    sets)     │        │ - trending_  │
+   │ - Total      │        │   snapshots  │
+   │   views      │        │ - schema_    │
+   │   (hash)     │        │   migrations │
+   │ - Idempotency│        │              │
+   │   keys       │        │              │
+   └──────────────┘        └──────────────┘
 ```
 
-**Why This Works:**
-1. **Granularity**: 1-minute buckets provide smooth score changes (not jumpy)
-2. **Memory bound**: ~70 keys per category, predictable Redis usage
-3. **Automatic cleanup**: TTL ensures old buckets expire without manual intervention
-4. **Aggregation efficiency**: ZUNIONSTORE combines buckets in O(N log N)
+### Production-Grade Patterns Actually Implemented
 
-**Configuration Options (via environment):**
-```bash
-WINDOW_SIZE_MINUTES=60    # Longer = more stable, shorter = more reactive
-BUCKET_SIZE_MINUTES=1     # Larger = fewer keys, less granular
-EXPIRATION_BUFFER_MINUTES=10  # Safety margin for aggregation
-```
+| Pattern | Library/Approach | File | Purpose |
+|---------|-----------------|------|---------|
+| Idempotency | Custom + Redis SETNX | `backend/src/services/idempotency.ts` | Duplicate view prevention |
+| Windowed counting | Redis sorted sets | `backend/src/services/redis.ts` | Time-bucketed view aggregation |
+| Top-k algorithms | Custom (MinHeap, CMS, SpaceSaving) | `backend/src/utils/topk.ts` | Trending computation with algorithm comparison |
+| Trending service | Background loop | `backend/src/services/trendingService.ts` | Periodic top-k computation + SSE broadcast |
+| SSE streaming | Native Express | `backend/src/routes/sse.ts` | Real-time trending pushes to clients |
+| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | Latency, cache hits, Redis memory, PG stats, alerts |
+| Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with request IDs |
+| Health checks | Custom (4 levels) | `backend/src/index.ts` | Liveness, readiness, detailed diagnostics with thresholds |
+| Configuration | Custom | `backend/src/shared/config.ts` | Centralized config with environment overrides and alert thresholds |
+| Database migrations | Custom runner | `backend/src/db/init.sql` | Consolidated schema with migration tracking |
 
-**When to Adjust:**
-- High memory pressure → Increase bucket size to 5 minutes
-- Need fresher trends → Decrease window to 30 minutes
-- Very high traffic → Consider approximate algorithms (CountMinSketch)
+### Simplifications and Substitutions
 
----
+| Production Design | Local Substitute | Reason |
+|-------------------|------------------|--------|
+| Kafka for view event ingestion | Direct Redis + PG writes | < 100 views/sec fits direct write path |
+| Redis Cluster (sharded by category) | Single Valkey instance | All data fits in < 50MB |
+| CDN / API Gateway | Express middleware (CORS) | Single process handles routing |
+| Redis pub/sub for SSE distribution | Per-instance SSE connections | 1-3 server instances, no cross-server broadcast needed |
+| Dedicated cleanup workers | Manual cleanup scripts | Low data volume, no automated retention |
+| Load balancer (nginx/HAProxy) | Direct port access (:3001-3003) | Manual multi-instance testing |
+| Bot detection / fraud prevention | Simple idempotency keys | No real traffic abuse to defend against |
 
-### WHY Heap Operation Metrics Enable Algorithm Optimization
+### What Was Omitted
 
-**The Challenge:**
-The min-heap-based Top K algorithm has known performance characteristics (O(log K) per operation), but real-world behavior depends on:
-- Actual data distribution (how often top K changes)
-- Update patterns (new items vs updates to existing items)
-- System load (contention, memory pressure)
-
-**Metrics We Track:**
-
-```javascript
-// Operation counters and latency histograms
-heapOperationsTotal.inc({ operation: 'push' });
-heapOperationsTotal.inc({ operation: 'pop' });
-heapOperationsTotal.inc({ operation: 'rebuild' });
-heapOperationLatency.observe({ operation }, duration);
-```
-
-**What These Metrics Tell Us:**
-
-| Metric Pattern | Interpretation | Action |
-|----------------|----------------|--------|
-| High `rebuild` count | Many updates to existing top K items | Consider indexed heap structure |
-| Push/pop ratio near 1:1 | High churn in top K | Top K is volatile, may need smoothing |
-| Latency spikes | Possible memory pressure or GC | Monitor heap size, consider smaller K |
-| Low operation count | Top K is stable | Can reduce update frequency |
-
-**Algorithm Selection Guidance:**
-- **Current (MinHeap)**: Best for K < 100, exact counts
-- **SpaceSaving**: Better for high cardinality, bounded error acceptable
-- **CountMinSketch + TopK**: Best for extreme scale, approximate counts OK
-
-**Prometheus Queries for Analysis:**
-```promql
-# Operations per second by type
-rate(youtube_topk_heap_operations_total[5m])
-
-# Average operation latency
-rate(youtube_topk_heap_operation_duration_seconds_sum[5m])
-  / rate(youtube_topk_heap_operation_duration_seconds_count[5m])
-
-# Rebuild ratio (should be low)
-rate(youtube_topk_heap_operations_total{operation="rebuild"}[5m])
-  / rate(youtube_topk_heap_operations_total[5m])
-```
-
----
-
-### WHY Cache Hit Rates Drive Top-K Update Frequency
-
-**The Balancing Act:**
-
-```
-Update Frequency
-     High ────────────────────────────────────────> Low
-     │                                              │
-     │ More compute                    Less compute │
-     │ Fresher data                    Staler data  │
-     │ More Redis load                 Less Redis   │
-     │                                              │
-     ▼                                              ▼
-```
-
-**How Cache Hit Rate Informs Decisions:**
-
-The trending cache stores computed Top K results and serves requests without re-querying Redis:
-
-```javascript
-// Cache structure
-trendingCache = {
-  'all': { videos: [...], updatedAt: timestamp },
-  'music': { videos: [...], updatedAt: timestamp },
-  // ...
-}
-```
-
-**Interpreting Cache Metrics:**
-
-| Hit Rate | Update Interval | Interpretation | Recommendation |
-|----------|-----------------|----------------|----------------|
-| > 99% | 5 seconds | Data very fresh, but compute is wasted | Increase to 10-15s |
-| 95-99% | 5 seconds | Good balance | Keep current settings |
-| 90-95% | 5 seconds | Many requests hit stale data | Decrease to 3s |
-| < 90% | 5 seconds | Serious freshness issues | Check for problems |
-
-**Metrics Implementation:**
-
-```javascript
-// Track cache accesses
-recordCacheAccess('trending', true);  // hit
-recordCacheAccess('trending', false); // miss
-
-// Prometheus gauge shows current hit rate
-youtube_topk_cache_hit_rate{cache_type="trending"}
-```
-
-**Adaptive Tuning (Future Enhancement):**
-```javascript
-// Pseudo-code for dynamic update frequency
-const hitRate = getCacheHitRate('trending');
-if (hitRate > 0.99 && updateInterval < 30000) {
-  updateInterval *= 1.5; // Slow down updates
-} else if (hitRate < 0.90 && updateInterval > 1000) {
-  updateInterval *= 0.7; // Speed up updates
-}
-```
-
-**Configuration:**
-```bash
-UPDATE_INTERVAL_SECONDS=5     # How often to recompute trending
-TRENDING_CACHE_TTL_SECONDS=5  # How long cache is considered fresh
-CACHE_HIT_RATE_TARGET=0.95    # Alert if below this
-```
-
----
-
-### Implementation File Locations
-
-These concepts are implemented in the following files:
-
-| Feature | File | Key Functions |
-|---------|------|---------------|
-| Idempotency | `src/services/idempotency.js` | `processViewWithIdempotency()`, `checkAndMarkProcessed()` |
-| Window Config | `src/shared/config.js` | `WINDOW_CONFIG`, `RETENTION_CONFIG` |
-| Heap Metrics | `src/utils/topk.js` | `MinHeap.push()`, `MinHeap.pop()` |
-| Cache Metrics | `src/shared/metrics.js` | `recordCacheAccess()`, `cacheHitRate` |
-| Trending Service | `src/services/trendingService.js` | `updateTrending()`, `getTrending()` |
-| Prometheus Export | `src/index.js` | `GET /metrics` |
-
----
-
-## Future Optimizations
-
-1. **Geographic trending**: Trending by region
-2. **Personalized trending**: Based on user preferences
-3. **Trend velocity**: Rate of change detection
-4. **Anomaly detection**: Identify unusual spikes
-5. **A/B testing**: Experiment with ranking algorithms
+- **CDN and edge caching**: No static asset optimization or geographic distribution
+- **Kafka event pipeline**: Direct writes instead of async message queue
+- **Redis Cluster**: Single Valkey instance
+- **Kubernetes orchestration**: Docker Compose for PostgreSQL and Valkey
+- **Geographic trending**: No per-region trending
+- **Personalized trending**: No per-user trending recommendations
+- **Anomaly detection**: No spike detection or view fraud algorithms
+- **A/B testing**: Single algorithm, no experimentation framework
+- **Load testing**: No formal performance benchmarking suite
