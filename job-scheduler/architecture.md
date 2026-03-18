@@ -491,6 +491,144 @@ At 50+ workers, Redis ZPOPMIN contention may cause latency spikes. Mitigation: s
 | State management | Zustand | Redux | Less boilerplate, sufficient for dashboard |
 | Routing | TanStack Router | React Router | Type-safe routing |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+Layout (sidebar navigation + main content)
+├── Dashboard (/)
+│   ├── MetricCard (x8: total jobs, active jobs, queue depth, active workers,
+│   │                    completed 24h, failed 24h, running now, dead letter queue)
+│   └── JobTable (recent 5 jobs with pause/resume/trigger/delete actions)
+├── Jobs (/jobs)
+│   ├── Create Job button → CreateJobModal
+│   ├── JobTable (full paginated list with actions)
+│   └── Pagination (page navigation)
+├── JobDetail (/jobs/$jobId)
+│   ├── Job metadata (name, handler, schedule, priority, status)
+│   ├── ExecutionList (paginated execution history for this job)
+│   └── Action buttons (pause/resume/trigger/delete)
+├── ExecutionDetail (/executions/$executionId)
+│   ├── Execution metadata (status, attempt, worker, timing)
+│   ├── Result/error display
+│   └── Execution logs (structured log entries from handler)
+└── Workers (/workers)
+    ├── MetricCard (x4: active workers, total workers, total completed, total failed)
+    └── Worker table (ID, status badge, active jobs, completed, failed, last heartbeat)
+```
+
+### Routing
+
+TanStack Router with programmatic route definitions in `frontend/src/router.tsx`. The root route wraps all pages in a `Layout` component that provides a sidebar navigation with links. Five routes are registered:
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | DashboardPage | System overview with metrics and recent jobs |
+| `/jobs` | JobsPage | Job CRUD with pagination and create modal |
+| `/jobs/$jobId` | JobDetailPage | Single job detail with execution history |
+| `/executions/$executionId` | ExecutionDetailPage | Single execution with structured logs |
+| `/workers` | WorkersPage | Worker fleet monitoring |
+
+The router uses dynamic route segments (`$jobId`, `$executionId`) for detail views, enabling type-safe parameter extraction via TanStack Router's hooks.
+
+### Zustand Stores
+
+Unlike the other projects that use a single store, this project splits state across three independent Zustand stores in `frontend/src/stores/index.ts`:
+
+**`useJobsStore`** -- Job list and CRUD operations:
+
+| State | Actions |
+|-------|---------|
+| `jobs`, `selectedJob`, `page`, `totalPages` | `fetchJobs(page)`, `fetchJob(id)`, `createJob(input)`, `updateJob(id, input)` |
+| `loading`, `error` | `deleteJob(id)`, `pauseJob(id)`, `resumeJob(id)`, `triggerJob(id)` |
+
+After every mutation (create, update, delete, pause, resume, trigger), the store automatically re-fetches the current page to reflect changes.
+
+**`useMetricsStore`** -- Dashboard metrics and worker status:
+
+| State | Actions |
+|-------|---------|
+| `metrics` (SystemMetrics) | `fetchMetrics()` |
+| `workers` (Worker[]) | `fetchWorkers()` |
+
+The Dashboard component polls both `fetchMetrics()` and `fetchWorkers()` every 5 seconds.
+
+**`useExecutionsStore`** -- Execution history and detail:
+
+| State | Actions |
+|-------|---------|
+| `executions`, `selectedExecution`, `page`, `totalPages` | `fetchExecutions(jobId?, page)`, `fetchExecution(id)` |
+| `loading`, `error` | `cancelExecution(id)`, `retryExecution(id)` |
+
+This three-store approach avoids unnecessary re-renders: updating a job does not trigger re-renders in components that only subscribe to metrics, and vice versa.
+
+### Data Fetching
+
+API functions are exported individually from `frontend/src/services/api.ts`. A generic `fetchApi<T>()` wrapper wraps all calls, handling JSON parsing and returning typed `ApiResponse<T>` objects. The API client covers job CRUD (create, read, update, delete, pause, resume, trigger), execution management (list, detail, cancel, retry), monitoring (system metrics, execution stats, workers, dead letter queue), and health checks.
+
+### Key UI Patterns
+
+- **Job lifecycle actions**: The JobTable component provides inline action buttons for each job -- Pause, Resume, Trigger, Delete -- with confirmation dialogs for destructive operations. Actions immediately re-fetch the job list to reflect state changes
+- **Create job modal**: A modal overlay (`CreateJobModal`) for job creation with form fields for name, handler selection, cron expression, payload (JSON textarea), priority slider, and retry configuration
+- **Worker heartbeat monitoring**: The Workers page calculates worker liveness by comparing `last_heartbeat` against a 60-second threshold. Workers with stale heartbeats are marked "offline" regardless of their reported status, providing accurate fleet visibility
+- **Status badges**: Color-coded badges throughout the application: job status (SCHEDULED=blue, PAUSED=yellow, COMPLETED=green, FAILED=red), worker status (idle=green, busy=yellow, offline=gray), and execution status
+- **Pagination**: The Pagination component in UI.tsx provides page navigation for jobs and executions, with the current page tracked in the Zustand store
+- **Metric trends**: MetricCard components accept an optional `trend` prop ("up", "down", "neutral") to visually indicate whether a metric is improving or degrading
+- **Auto-refresh**: The Dashboard and Workers pages poll the backend every 5 seconds using `setInterval` with cleanup in the `useEffect` return function
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project for readers unfamiliar with them.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on roles assigned to users, rather than managing permissions for each user individually. Instead of maintaining a list like "Alice can create jobs, Bob can view jobs, Carol can trigger jobs," you define roles: "admins can create/update/delete/trigger jobs, users can view and trigger their own jobs." When Alice is promoted, you change her role from "user" to "admin" -- her permissions update automatically.
+
+In this project, two roles exist: user (view own jobs, trigger own jobs, view limited metrics) and admin (full access to all jobs, workers, dead letter queue, and system metrics). The middleware extracts the user's role from their Redis-stored session, compares it against a permission matrix defined per endpoint, and returns 403 Forbidden if the role lacks the required permission. Session auth (rather than JWT) was chosen because sessions can be immediately revoked by deleting the Redis key -- with JWT, a revoked user could continue accessing the system until the token expires.
+
+### Redis Cache-Aside
+
+Cache-aside (lazy loading) is a caching pattern where the application checks the cache first and only queries the database on a cache miss. The key principle is that the application code manages both the cache and the database -- unlike "write-through" caching where the cache layer handles both reads and writes transparently.
+
+In this project, job metadata is cached using cache-aside with multiple TTLs based on data volatility: `job:{id}` has a 5-minute TTL (job definitions change infrequently), `jobs:list:{page}:{filters}` has a 30-second TTL (list views need fresher data), and `workers:status` has a 5-second TTL (worker heartbeats are real-time). Cache invalidation is event-driven: when a job is created, updated, or deleted, the relevant cache keys are invalidated using Redis SCAN (not KEYS, which blocks the Redis server). The tradeoff is that briefly stale data may be served between a write and the next cache miss, which is acceptable for a dashboard but would not be for the scheduler's due-job scan (which always reads from PostgreSQL).
+
+### Circuit Breaker
+
+A circuit breaker detects repeated failures to a downstream service and stops calling it, preventing wasted resources and cascading failures. Named after the electrical device that trips to prevent a short circuit from causing a fire, the software circuit breaker has three states: Closed (normal -- requests pass through, failures are counted), Open (threshold exceeded -- requests immediately fail with a fallback, the downstream service gets breathing room to recover), and Half-Open (after a cooldown, a few test requests are sent to check recovery).
+
+In this project, each job handler type gets its own circuit breaker using the Opossum library. This per-handler isolation is important: if the HTTP webhook handler fails because the target server is down, it should not prevent the log handler or shell command handler from executing. The circuit opens when the error rate exceeds 50% over 5 requests, and tests recovery after 30 seconds. When a handler's circuit is open, new jobs of that type are requeued for later processing rather than counted as failures -- this prevents burning through retry attempts while the downstream service is known to be unavailable. Prometheus metrics track each circuit's state transitions (`job_scheduler_circuit_breaker_state`, `job_scheduler_circuit_breaker_trips_total`).
+
+### Structured Logging
+
+Structured logging emits log entries as machine-parseable JSON objects rather than free-form text strings. A traditional log message like `"[2024-01-15 10:30:00] ERROR: Job report-gen failed on worker w-2 after 3 attempts: connection timeout"` is readable by humans but difficult to search programmatically. A structured entry like `{"level":"error","jobId":"report-gen","workerId":"w-2","attempt":3,"error":"connection timeout","event":"job_failed"}` enables precise queries: "show all failed jobs on worker w-2 in the last hour" without regex pattern matching.
+
+This project uses Pino with contextual fields. Worker processes create child loggers with `workerId` baked in, so every log entry from that worker automatically includes its identifier. Similarly, when processing a job, the handler creates a child logger with `jobId` and `executionId`. In development, `pino-pretty` converts JSON to colored indented output for readability.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects time-series data by scraping HTTP endpoints at regular intervals. The application exposes metrics at `GET /metrics` in a specific text format. Prometheus stores this data and enables queries, dashboards (via Grafana), and alerts.
+
+This project exposes 17+ metrics covering every stage of the job lifecycle: scheduling (`job_scheduler_jobs_scheduled_total`), execution (`job_scheduler_jobs_executed_total`, `job_scheduler_job_execution_duration_seconds`), failures (`job_scheduler_jobs_failed_total`, `job_scheduler_dead_letter_total`), infrastructure (`job_scheduler_queue_depth`, `job_scheduler_active_workers`, `job_scheduler_scheduler_is_leader`), and per-handler circuit breaker state. The alerting rules section defines five alert conditions with thresholds -- for example, `QueueBacklog` fires if queue depth exceeds 1000 for 5 minutes, indicating workers cannot keep up with the scheduling rate.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window to prevent abuse and protect server resources. In a job scheduler, rate limiting prevents two failure modes: (1) a buggy client creating thousands of jobs in a tight loop, and (2) an attacker using the scheduler to amplify DDoS attacks via HTTP webhook jobs.
+
+This project implements tiered rate limiting with Redis-backed counters: authentication endpoints allow 5 requests per minute (brute-force protection), job creation allows 10 per minute (prevents flooding), job triggering allows 30 per minute (more lenient for operations), and read operations allow 100 per minute. The rate limiting middleware runs before the route handler, checking a Redis counter keyed by user ID (or IP for unauthenticated requests) and returning HTTP 429 with a `Retry-After` header when the limit is exceeded.
+
+### Idempotency
+
+Idempotency ensures that performing the same operation multiple times has the same effect as performing it once. In a job scheduler, this prevents duplicate job creation from client retries and duplicate job execution from scheduler recovery.
+
+Two levels of idempotency are implemented: (1) **Job creation**: An `Idempotency-Key` HTTP header is cached in Redis with a 24-hour TTL. If a client retries a `POST /api/v1/jobs` request with the same key, the cached response is returned without creating a duplicate job. Additionally, the `UNIQUE(name)` constraint on the jobs table prevents duplicate names at the database level. (2) **Execution-level dedup**: Redis `SET NX EX` on `{job_id}:{scheduled_at}` prevents the same job instance from being executed twice. This matters when the scheduler re-enqueues a job that timed out while a slow worker is still processing it -- the second worker's lock attempt fails, so it skips the job instead of double-executing it.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report service status to infrastructure components. Load balancers use them to stop routing traffic to sick instances. Container orchestrators use them to restart crashed containers. Monitoring dashboards use them for at-a-glance system status.
+
+This project exposes `GET /api/v1/health` which checks PostgreSQL connectivity (runs `SELECT 1`) and Redis connectivity (runs `PING`). The response includes the status of each dependency, enabling operators to quickly identify which component is failing. The health check is intentionally lightweight -- complex queries or heavy computations in a health check can cause false negatives under load (the service is healthy but the health check itself times out because the system is busy).
+
 ## Implementation Notes
 
 This section maps the production architecture to what actually runs locally with Docker + Node.js + React.

@@ -542,6 +542,129 @@ Raw Clicks ──▶ Hot (7 days, PG) ──▶ Warm (30 days, compressed) ─�
 | Cache | Redis | In-memory | Shared state across collector instances |
 | IP privacy | SHA-256 hash | Raw storage | GDPR compliance, sufficient for velocity tracking |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+RootLayout (__root.tsx: Navigation + Outlet)
+├── Dashboard (/)
+│   ├── StatCard (x7: total clicks, 24h clicks, 1h clicks, fraud rate, campaigns, ads, advertisers)
+│   ├── ClickChart (Recharts line chart: clicks over last 60 minutes)
+│   ├── StatCard (x2: clicks per minute avg, total last 60 min)
+│   └── ClickTable (last 10 click events with fraud indicators)
+├── Analytics (/analytics)
+│   ├── Query Form (time range pickers, granularity selector, group-by toggles)
+│   ├── StatCard (x3: total clicks, unique users, query time)
+│   ├── ClickChart (time-series results)
+│   ├── BarChart (top countries, conditional on group-by)
+│   └── Results Table (scrollable, dynamically columns based on group-by)
+├── Campaigns (/campaigns)
+│   ├── Campaign List (selectable sidebar with status badges)
+│   ├── StatCard (x4: total clicks, unique users, fraud clicks, fraud rate)
+│   ├── BarChart (clicks by country)
+│   └── PieChart (clicks by device type)
+├── Clicks (/clicks)
+│   ├── Filter controls (limit selector, fraud-only checkbox, refresh button)
+│   └── ClickTable (full click event list with fraud flags)
+└── Test (/test)
+    ├── TestClickForm (single click and batch generation forms)
+    └── Documentation cards (usage instructions and testing tips)
+```
+
+### Routing
+
+TanStack Router with file-based routing (auto-generated `routeTree.gen.ts`). The root layout in `__root.tsx` renders a `Navigation` bar and an `<Outlet />` for child routes:
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | Dashboard | KPI overview with auto-refresh (30-second interval) |
+| `/analytics` | Analytics | Interactive OLAP query builder with chart visualization |
+| `/campaigns` | Campaigns | Campaign selection with detail panels and breakdowns |
+| `/clicks` | Clicks | Raw click event viewer with fraud filtering |
+| `/test` | Test | Click generation tools for development testing |
+
+### Zustand Store
+
+A single store (`useDashboardStore`) in `frontend/src/stores/dashboardStore.ts` manages all dashboard state:
+
+| State Field | Type | Source Endpoint |
+|-------------|------|-----------------|
+| `stats` | `SystemStats` | `GET /api/v1/admin/stats` |
+| `realTimeStats` | `RealTimeStats` | `GET /api/v1/analytics/realtime` |
+| `campaigns` | `Campaign[]` | `GET /api/v1/admin/campaigns` |
+| `ads` | `Ad[]` | `GET /api/v1/admin/ads` |
+| `recentClicks` | `ClickEvent[]` | `GET /api/v1/admin/recent-clicks` |
+
+A `refreshAll()` action fetches all five data sources in parallel using `Promise.all()`. The Dashboard calls `refreshAll()` on mount and every 30 seconds. The store also tracks `isLoading`, `error`, and `lastUpdated` for user feedback.
+
+Unlike the web-crawler store which has per-domain loading states, this store uses a single `isLoading` flag for the full refresh cycle, which simplifies the implementation but means partial refreshes are not independently trackable.
+
+### Data Fetching
+
+API functions are exported individually from `frontend/src/services/api.ts` (not as a single object). A generic `fetchJson<T>()` wrapper handles JSON parsing and error extraction. The API client covers three categories: admin endpoints (stats, campaigns, ads, recent clicks), analytics endpoints (aggregate queries, campaign summaries, real-time stats), and click ingestion (single and batch test clicks).
+
+### Key UI Patterns
+
+- **Recharts visualizations**: Line charts (`ClickChart`) for time-series data, bar charts for geographic distribution, and pie charts for device type breakdowns
+- **Query builder**: The Analytics page provides an interactive form with datetime pickers, granularity dropdown (minute/hour/day), and toggle buttons for group-by dimensions (country, device_type). Results include query execution time for performance visibility
+- **Master-detail layout**: The Campaigns page uses a sidebar list pattern -- selecting a campaign loads a detail view with stats and charts in the main panel
+- **Fraud highlighting**: Click tables color-code fraud rate values (red above 5%, green below) and provide a "fraud only" filter checkbox
+- **Batch test generation**: The Test page allows sending multiple randomized clicks for populating sample data, with inline documentation cards explaining fraud detection behavior
+- **Auto-refresh with timestamp**: The Dashboard shows "Last updated: HH:MM:SS" and a manual refresh button alongside the auto-refresh interval
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project for readers unfamiliar with them.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the primary database. On a "hit," data is returned from cache immediately. On a "miss," the application queries the database, stores the result in the cache with a TTL (time-to-live expiration), and then returns it. The cache is never populated proactively -- it fills up as data is requested.
+
+In this project, Redis serves as the cache layer for click deduplication. When a click arrives, the collector checks Redis for the `click_id` using `SETEX` with a 5-minute TTL. If the key exists, the click is a duplicate. If not, the key is set and the click proceeds to processing. The 5-minute TTL balances memory usage against the window in which duplicate clicks are likely to arrive. After TTL expiry, the PostgreSQL `UNIQUE(click_id)` constraint serves as the backup dedup layer.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In ad click billing, this is critical -- a duplicated click means overcharging an advertiser. Network timeouts, load balancer retries, and client-side retries can all cause the same click event to arrive at the server multiple times.
+
+This project implements three-layer idempotency: (1) An optional `Idempotency-Key` HTTP header allows clients to tag requests with a unique key. The server caches the response in Redis; subsequent requests with the same key return the cached response without reprocessing. (2) Redis `SETEX` on the `click_id` prevents the same click from being processed twice within a 5-minute window. (3) PostgreSQL `INSERT ... ON CONFLICT (click_id) DO NOTHING` catches any duplicates that slip through after the Redis TTL expires. Each layer covers a different failure mode, providing defense-in-depth.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"Processed click abc123 for campaign xyz in 12ms"`, a structured log entry looks like `{"level":"info","clickId":"abc123","campaignId":"xyz","durationMs":12,"event":"click_processed"}`. Each field is independently searchable and filterable.
+
+This project uses Pino, a high-performance Node.js JSON logger. Request-scoped child loggers carry contextual fields (clickId, adId, campaignId, durationMs) through the entire processing pipeline. In development, `pino-pretty` reformats JSON into colored human-readable output. In production, the raw JSON would be ingested by a log aggregation system like Elasticsearch, enabling queries like "show all clicks for campaign xyz where durationMs > 100."
+
+### Prometheus Metrics
+
+Prometheus is a pull-based monitoring system that collects numerical time-series data by periodically scraping an HTTP endpoint. The application exposes metrics at `GET /metrics` in Prometheus exposition format. A Prometheus server fetches this endpoint (typically every 15-30 seconds) and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+Four metric types exist: Counter (monotonically increasing, like `clicks_received_total`), Gauge (can go up or down, like `click_queue_size`), Histogram (distribution of values in buckets, like `click_ingestion_duration_seconds`), and Summary (calculates quantiles client-side). This project uses `prom-client` and exposes 20+ metrics covering click ingestion throughput, deduplication counts, fraud detection rates, aggregation performance, database query latency, Redis operation latency, and HTTP request patterns.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is functioning correctly. They are called by load balancers (to decide whether to route traffic to an instance), container orchestrators (to decide whether to restart a container), and monitoring systems (to trigger alerts).
+
+This project exposes three health endpoints: `GET /health` (comprehensive status of all dependencies), `GET /health/ready` (readiness probe -- are all databases connected and ready to accept traffic?), and `GET /health/live` (liveness probe -- is the process itself healthy?). The readiness probe checks PostgreSQL, Redis, and ClickHouse connectivity. The distinction matters in Kubernetes: a failing liveness probe restarts the container, while a failing readiness probe temporarily removes it from the load balancer without restarting -- useful during database maintenance windows when the service is alive but cannot serve requests.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. In an ad click system, rate limiting serves double duty: it protects the ingestion service from being overwhelmed, and it doubles as the first layer of fraud detection (high click velocity from a single IP is a strong fraud signal).
+
+This project uses Redis-backed rate limiting with `INCR` and `EXPIRE` commands. For each client IP, a counter key `ratelimit:ip:{ip_hash}` is incremented with a 1-minute TTL. If the count exceeds 100 clicks per minute, the click is flagged as potentially fraudulent. The same pattern applies per-user with a 50 clicks/minute threshold. Critically, rate-limited clicks are not rejected -- they are flagged as fraudulent and stored, preserving the audit trail for billing dispute resolution.
+
+### Circuit Breaker
+
+A circuit breaker is a pattern that detects repeated failures to an external service and stops sending requests to it, preventing wasted resources and cascading failures. It has three states: Closed (normal, requests pass through), Open (failures exceeded threshold, requests immediately fail without attempting the call), and Half-Open (after a cooldown, one test request is allowed to check if the service recovered).
+
+While this project's architecture document notes circuit breakers as a production recommendation, they are not implemented in the local version. The reason is pragmatic: the local setup has a single ClickHouse and single PostgreSQL instance, and circuit-breaking would provide little value with only one downstream target. In production with multiple collector instances writing to multiple database shards, a circuit breaker on each database connection would prevent a single slow shard from backing up all collectors.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on assigned roles rather than individual user permissions. Roles like "advertiser," "analyst," and "admin" each carry a defined set of permissions. When a user authenticates, their role determines which API endpoints they can access.
+
+This project does not implement RBAC in the local version (the API is open), but the production architecture calls for it. The key reason is advertiser isolation: advertiser A should only see click data for their own campaigns, not advertiser B's data. RBAC would be implemented as Express middleware that extracts the user's role from a session or JWT, checks it against the required role for the endpoint, and returns 403 Forbidden if unauthorized.
+
 ## Implementation Notes
 
 This section maps the production architecture to what actually runs locally with Docker + Node.js + React.

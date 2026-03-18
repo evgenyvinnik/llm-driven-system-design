@@ -482,6 +482,122 @@ At ~1,000 pages/second, the PostgreSQL frontier dequeue becomes the bottleneck. 
 | Circuit breaker | Cockatiel (per-domain) | No circuit breaker | Prevents cascade failures; shared state via Redis |
 | Coordination | Redis distributed locks | Central scheduler | Simple, auto-expiry; no SPOF |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (root layout: Header + Outlet)
+├── Dashboard (/)
+│   ├── StatCard (x9: pages crawled/failed, links, duplicates, frontier status, domains)
+│   ├── WorkerStatus (active workers with heartbeat indicators)
+│   ├── TopDomains (grid of top 10 domains by page count)
+│   └── RecentPagesTable (table of recently crawled pages)
+├── Frontier (/frontier)
+│   ├── AddUrlsForm (textarea + priority selector for URL submission)
+│   └── FrontierUrlTable (filterable table with status/priority badges)
+├── Pages (/pages)
+│   └── Paginated table with domain/search filtering
+├── Domains (/domains)
+│   └── Sortable domain list with robots.txt inspection
+└── Admin (/admin)
+    ├── Seed URLs panel (textarea for high-priority URL injection)
+    ├── Recovery Actions panel (recover stale in-progress URLs)
+    ├── Statistics panel (reset counters)
+    ├── Danger Zone panel (clear frontier with confirmation)
+    └── System Health panel (check database/Redis connectivity)
+```
+
+### Routing
+
+TanStack Router with programmatic route definitions in `frontend/src/router.tsx`. Five routes are registered under a root route that wraps the `App` shell (Header with navigation links + `<Outlet />`):
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | Dashboard | Real-time crawl overview with auto-polling |
+| `/frontier` | Frontier | URL queue management with status filtering |
+| `/pages` | Pages | Browse crawled page metadata |
+| `/domains` | Domains | Domain-level stats and robots.txt inspection |
+| `/admin` | Admin | Administrative controls and system health |
+
+### Zustand Store
+
+A single store (`useCrawlerStore`) in `frontend/src/stores/crawlerStore.ts` manages all application state. The store is organized into four data domains, each with its own loading/error states:
+
+| Domain | State Fields | Actions | Polling |
+|--------|-------------|---------|---------|
+| Stats | `stats`, `statsLoading`, `statsError` | `fetchStats()` | 5-second interval via `startPolling()`/`stopPolling()` |
+| Frontier | `frontierUrls`, `frontierLoading` | `fetchFrontierUrls(status?)`, `addUrls(urls, priority)` | Manual refresh |
+| Pages | `pages`, `pagesTotal`, `pagesLoading` | `fetchPages(limit, offset, domain, search)` | Manual refresh |
+| Domains | `domains`, `domainsTotal`, `domainsLoading` | `fetchDomains(limit, offset)` | Manual refresh |
+
+The polling mechanism uses a module-level `setInterval` reference stored outside the store to persist across React renders. The Dashboard component calls `startPolling()` on mount and `stopPolling()` on unmount.
+
+### Data Fetching
+
+All API communication is centralized in `frontend/src/services/api.ts`, which provides a typed `api` object wrapping a generic `fetchApi<T>()` helper. The helper automatically sets `Content-Type: application/json`, parses responses, and throws errors for non-2xx status codes. The frontend uses the Vite dev server proxy to forward `/api` requests to the backend on port 3001.
+
+### Key UI Patterns
+
+- **Live indicator**: A pulsing green dot in the Dashboard header signals active polling
+- **Loading skeletons**: The Dashboard renders animated gray placeholder blocks while data loads
+- **Status badges**: Color-coded pill badges for URL status (pending=yellow, in_progress=blue, completed=green, failed=red) and priority levels (high=red, medium=yellow, low=gray)
+- **Confirmation dialogs**: Destructive operations (clear frontier) require `window.confirm()` before execution
+- **Action feedback**: The Admin panel displays success/error banners after each operation with the full API response
+- **Responsive grid**: Tailwind CSS grid layouts adapt from single-column on mobile to multi-column on desktop (e.g., stat cards use `grid-cols-1 md:grid-cols-2 lg:grid-cols-4`)
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project for readers unfamiliar with them.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on the roles assigned to individual users, rather than assigning permissions directly to each user. Instead of saying "user Alice can seed URLs and clear the frontier," you assign Alice the "admin" role, and the admin role carries those permissions. This matters because managing permissions for thousands of users individually is error-prone -- when a new feature launches, you update the role definition once rather than every user record.
+
+In this project, three roles exist: anonymous (read public stats), user (view all dashboard data), and admin (destructive operations like seeding URLs and clearing the frontier). The middleware checks the user's session in Redis, extracts their role, and compares it against the required role for each endpoint. If the role does not match, the request is rejected with 403 Forbidden before reaching the route handler.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it. The cache is never populated proactively -- it fills up as data is requested.
+
+In this project, robots.txt content is cached in Redis with a 1-hour TTL. When a worker needs to check robots.txt for a domain, it first checks `crawler:domain:{domain}:robots` in Redis. On a miss, it fetches from the web, stores the result in both Redis (for fast access) and PostgreSQL (for persistence), and returns it. The 1-hour TTL means stale robots.txt rules may be enforced briefly, but this is acceptable since robots.txt changes rarely.
+
+### Circuit Breaker
+
+A circuit breaker is a pattern borrowed from electrical engineering: when a component detects repeated failures, it "trips" and stops sending requests to the failing service, preventing wasted resources and cascading failures. The circuit has three states: Closed (normal operation, requests pass through), Open (failures exceeded threshold, requests are immediately rejected without attempting the call), and Half-Open (after a cooldown period, a single test request is allowed through to see if the service has recovered).
+
+In this project, each domain gets its own circuit breaker (implemented via Cockatiel). If a domain returns 5 consecutive failures (HTTP 5xx, connection timeouts, DNS errors), the circuit opens for 60 seconds. During that time, workers skip URLs from that domain and pick another URL instead of wasting time on a domain that is likely down. After 60 seconds, one test request is allowed through -- if it succeeds, the circuit closes and normal crawling resumes. Circuit breaker state is stored in Redis (`crawler:circuit:{domain}`) so all workers share failure awareness across the distributed fleet.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"Worker 3 crawled https://example.com in 450ms"`, a structured log entry looks like `{"level":"info","component":"crawler","workerId":"w-3","url":"https://example.com","durationMs":450,"event":"page_crawled"}`. This makes logs searchable, filterable, and aggregatable by any field -- you can query "show me all logs from worker 3 where durationMs > 1000" without regex.
+
+This project uses Pino, a high-performance Node.js JSON logger. Component-specific child loggers (http, crawler, database, redis, circuit-breaker) add contextual fields to every log entry automatically. In development, `pino-pretty` reformats the JSON into human-readable colored output. In production, the raw JSON is ingested by log aggregation systems like Elasticsearch or Datadog.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical time-series data by scraping an HTTP endpoint at regular intervals. The application exposes metrics at `GET /metrics` in a specific text format. Prometheus periodically fetches this endpoint and stores the data, enabling dashboards (Grafana) and alerting rules.
+
+There are four metric types: Counter (monotonically increasing value, like `crawler_pages_crawled_total`), Gauge (value that can go up and down, like `crawler_frontier_size`), Histogram (distribution of values in configurable buckets, like `crawler_crawl_duration_seconds`), and Summary (similar to histogram but calculates quantiles client-side). This project uses the `prom-client` library and exposes 15+ metrics covering crawl throughput, latency, errors, frontier depth, circuit breaker state, and data retention cleanup activity.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single client (or bot) could consume all server resources, degrading service for everyone else. The core idea is to track request counts per client identifier (IP address, API key, or user ID) and reject requests that exceed the configured threshold with HTTP 429 (Too Many Requests).
+
+This project implements tiered rate limiting with Redis sliding window counters: anonymous users get 10 requests per minute, authenticated users get 100, and admins get 500. The sliding window approach uses `ZREMRANGEBYSCORE` to remove old entries, `ZADD` to add the current request timestamp, and `ZCARD` to count requests in the window. This avoids the "boundary burst" problem of fixed windows where a client could send double the limit by timing requests at the window boundary.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This is critical in distributed systems where network failures cause retries -- if a URL insertion request is retried after a timeout, you do not want the URL added twice.
+
+In this project, idempotency is enforced at two levels: (1) The `url_hash UNIQUE` constraint on `url_frontier` ensures that `INSERT ... ON CONFLICT (url_hash) DO NOTHING` silently ignores duplicate URL insertions. (2) The `url_hash UNIQUE` constraint on `crawled_pages` with `ON CONFLICT DO UPDATE` ensures re-crawls update the existing record rather than creating duplicates. The URL hash is a SHA-256 digest of the normalized URL, so different representations of the same URL (with/without trailing slash, different query parameter order) map to the same hash.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is functioning correctly. Load balancers, container orchestrators (Docker, Kubernetes), and monitoring systems call these endpoints to determine if a service instance should receive traffic.
+
+This project exposes `GET /health` which checks PostgreSQL connectivity (runs a simple `SELECT 1` query) and Redis connectivity (runs a `PING` command). If both succeed, it returns `{"status":"healthy"}` with HTTP 200. If either fails, it returns `{"status":"unhealthy","details":{...}}` with HTTP 503. Docker uses this endpoint for container health checks -- if a container fails health checks, Docker restarts it. In production, a load balancer would stop routing traffic to unhealthy instances while they recover.
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.

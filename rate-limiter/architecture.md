@@ -446,6 +446,132 @@ For background jobs and fanout operations, RabbitMQ handles async workloads with
 | Rule storage | PostgreSQL | Redis | Rules change rarely; PG provides SQL queries, schema, backups |
 | Clock source | Redis server time (via Lua) | Client system time | Eliminates clock skew across distributed gateway nodes |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The rate limiter frontend is a single-page application without routing -- all components render on one page in a vertical layout:
+
+```
+App (root layout: Header + main content + footer)
+├── Header
+│   ├── Title ("Rate Limiter Dashboard")
+│   └── HealthStatus (real-time Redis/service health indicator)
+├── MetricsDashboard (6 metric cards in grid: total/allowed/denied requests, success rate, avg/p99 latency)
+├── AlgorithmSelector (5 algorithm buttons with expandable documentation panel showing pros/cons)
+├── TestConfiguration + TestRunner (side-by-side in 2-column grid)
+│   ├── TestConfiguration (identifier input, limit/window/burst/refill/leak parameters)
+│   └── TestRunner (manual send, auto-test with interval, clear/reset controls)
+└── TestResults (scrollable list of test results with allowed/denied color coding)
+```
+
+### Routing
+
+This project does not use TanStack Router or any client-side routing. The entire application is a single page rendered by `App.tsx`. This design choice reflects the project's nature -- it is an interactive testing tool for rate limiting algorithms, not a multi-view dashboard. All components are always visible, enabling the user to adjust configuration, run tests, and observe results without page navigation.
+
+### Zustand Store
+
+A single store (`useRateLimiterStore`) in `frontend/src/stores/rateLimiterStore.ts` manages all application state across three domains:
+
+**Test Configuration State:**
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `identifier` | string | `"test-user-1"` | Client identifier for rate limit testing |
+| `algorithm` | Algorithm | `"sliding_window"` | Selected algorithm |
+| `limit` | number | 10 | Maximum requests per window |
+| `windowSeconds` | number | 60 | Window duration |
+| `burstCapacity` | number | 10 | Token/leaky bucket capacity |
+| `refillRate` | number | 1 | Tokens per second (token bucket) |
+| `leakRate` | number | 1 | Requests per second (leaky bucket) |
+
+**Test Execution State:**
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `testResults` | TestResult[] | Last 100 test results (newest first) |
+| `isRunning` | boolean | Whether a test is in progress |
+| `autoTestInterval` | number or null | setInterval ID for auto-testing |
+
+**Monitoring State:**
+
+| Field | Type | Source |
+|-------|------|--------|
+| `metrics` | Metrics | `GET /api/metrics` (2-second polling) |
+| `health` | HealthStatus | `GET /api/metrics/health` |
+| `algorithms` | AlgorithmInfo[] | `GET /api/algorithms` |
+
+The store provides setter functions for each configuration field, a `runTest()` action that sends a rate limit check to the backend and appends the result to `testResults` (capped at 100 entries), `startAutoTest(intervalMs)` and `stopAutoTest()` for automated testing, and `resetRateLimit()` to clear the server-side state for the current identifier.
+
+### Data Fetching
+
+API communication is centralized in `frontend/src/services/api.ts` as an `api` object with typed methods. A notable design choice: the response handler treats HTTP 429 (Too Many Requests) as a successful response rather than an error, since rate limit exceeded is a valid and expected test result. The API client covers four categories: rate limit operations (check, get state, reset, batch check), metrics, health, and algorithm metadata.
+
+### Key UI Patterns
+
+- **Algorithm documentation panel**: Selecting an algorithm expands a panel showing its description, pros, and cons fetched from the backend. This serves as in-app documentation for each algorithm's trade-offs
+- **Auto-test with configurable interval**: Users can start automated testing at a configurable interval (50ms-5000ms), visually demonstrating how each algorithm behaves under sustained load. A green status message shows the active interval
+- **Real-time metrics refresh**: The MetricsDashboard polls the backend every 2 seconds, showing total/allowed/denied request counts, success rate percentage, and avg/p99 latency -- enabling users to observe the effect of their tests in near real-time
+- **Health indicator in header**: The HealthStatus component in the top-right corner shows Redis connectivity status. If the backend or Redis goes down, the indicator immediately reflects the failure, demonstrating the fail-open degradation mode
+- **Color-coded test results**: Each test result shows whether the request was allowed (green) or denied (red) with the remaining quota, making it easy to visualize when the rate limit is reached
+- **Parameter adaptation**: The TestConfiguration panel dynamically shows relevant parameters based on the selected algorithm -- window-based algorithms show limit/window fields, while bucket-based algorithms show capacity/rate fields
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns used in this project for readers unfamiliar with them.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window to prevent abuse, protect backend resources, and ensure fair access. Without rate limiting, a single client could consume all server capacity -- whether intentionally (API abuse, credential stuffing attacks) or accidentally (buggy client in a retry loop).
+
+This project implements five rate limiting algorithms, each with different characteristics. The key insight is that there is no single "best" algorithm -- the choice depends on the specific requirements around accuracy, memory usage, burst tolerance, and implementation complexity. The Sliding Window Counter is the default because it provides approximately 98% accuracy with minimal memory (two integer counters per client) and avoids the boundary burst problem that plagues Fixed Window counters.
+
+### Circuit Breaker
+
+A circuit breaker is a pattern that detects repeated failures to an external service and stops sending requests to it, preventing two problems: (1) wasting time waiting for a service that is down (each timeout blocks a thread or connection), and (2) cascading failures where backed-up requests from one failing dependency overwhelm the rest of the system.
+
+The circuit has three states: Closed (normal operation -- requests pass through and failures are counted), Open (failure threshold exceeded -- requests immediately fail with a fallback response, no attempt is made to reach the service), and Half-Open (after a recovery timeout, a small number of test requests are allowed through to check if the service has recovered).
+
+In this project, circuit breakers wrap all Redis operations using the Opossum library. Each dependency (Redis, PostgreSQL, RabbitMQ) has its own circuit with independent thresholds. The Redis circuit is configured to open after 5 failures within 30 seconds and attempt recovery after 10 seconds. When the circuit opens, the rate limiter middleware falls back to the configured `DEGRADATION_MODE` -- typically "allow" (fail-open), meaning requests pass through without rate limiting. This prevents a Redis hiccup from becoming a full API outage. Prometheus metrics track circuit state transitions, making it possible to alert when a circuit opens and to audit how often the fallback path is used.
+
+### Prometheus Metrics
+
+Prometheus is a pull-based monitoring system where the application exposes metrics at an HTTP endpoint and Prometheus periodically scrapes that endpoint to collect data. This is fundamentally different from "push-based" systems where the application sends data to a metrics server -- pull-based has the advantage that the monitoring system controls the collection rate and the application does not need to know about monitoring infrastructure.
+
+Four metric types exist: Counter (monotonically increasing value, like `ratelimiter_checks_total`), Gauge (value that goes up and down, like `ratelimiter_active_identifiers`), Histogram (distribution of values grouped into configurable buckets, like `ratelimiter_check_duration_seconds`), and Summary (similar but calculates quantiles on the client side).
+
+This project exposes 15+ metrics via `prom-client` at `GET /metrics`. The most operationally important are: `ratelimiter_checks_total{result, algorithm}` (allowed vs denied ratio per algorithm -- a high denial rate suggests limits are too restrictive), `ratelimiter_check_duration_seconds{algorithm}` (must stay under 5ms p99 -- the entire latency budget for rate limiting), `ratelimiter_circuit_breaker_state` (Redis health visibility), and `ratelimiter_fallback_activations_total` (how often fail-open is triggered).
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text. Traditional text logs like `"[2024-01-15 10:30:00] INFO: Rate limit check for user-123: allowed, 7 remaining"` are human-readable but difficult to search programmatically. Structured logs like `{"timestamp":"2024-01-15T10:30:00Z","level":"info","identifier":"user-123","allowed":true,"remaining":7}` enable precise queries: "show all denied requests for user-123 in the last hour."
+
+This project uses Pino, chosen for its performance (Pino writes logs 5-10x faster than Winston because it avoids synchronous string concatenation). Sensitive fields (Authorization headers, API keys) are automatically redacted from log output via custom serializers. In development, `pino-pretty` converts JSON to colored, indented output. In production, raw JSON would be shipped to a log aggregation system like Elasticsearch or Datadog for centralized searching and alerting.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is operating correctly. They serve three audiences: (1) Load balancers use them to decide whether to route traffic to an instance. (2) Container orchestrators (Docker, Kubernetes) use them to decide whether to restart a container. (3) Monitoring systems use them to trigger alerts.
+
+This project exposes a health check at `GET /api/metrics/health` that reports Redis connectivity, PostgreSQL connectivity, RabbitMQ connectivity, and process uptime. The health check is designed to be cheap to execute (simple PING/SELECT 1 queries) because it may be called every few seconds. If Redis is down, the health check reports unhealthy, but the rate limiter continues operating in degraded mode (fail-open) -- the health check signals the infrastructure that something is wrong, while the circuit breaker handles the operational fallback.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. For rate limiting, this concept has an interesting nuance: calling `check("user-123")` twice should consume two tokens (both are real requests), so rate limit checks are intentionally non-idempotent. However, when a client retries a request that failed after the rate check but before the response, the retry should not double-decrement the counter.
+
+This project supports optional idempotency keys formatted as `check:{identifier}:{timestamp_bucket}`. If a client retries the same request within the same one-second bucket, the duplicate check is detected and the counter is not decremented again. The one-second granularity is intentional: finer granularity (milliseconds) would prevent legitimate rapid requests, while coarser granularity (minutes) would allow abuse.
+
+### Redis Cache-Aside
+
+Cache-aside is a caching strategy where the application checks the cache first and only queries the primary database on a cache miss. In this project, rate limit rules are stored in PostgreSQL but checked on every request. Since rules change rarely (maybe once per day), caching them in Redis avoids a database query on every request.
+
+The current implementation uses hardcoded configuration rather than database-loaded rules, but the architecture is designed for cache-aside: rules would be loaded from PostgreSQL into Redis with a TTL, and a RabbitMQ message would trigger cache invalidation across all API gateway nodes when rules change. The `ratelimit.rules.sync` queue is already defined for this purpose.
+
+### RBAC (Role-Based Access Control)
+
+RBAC restricts system access based on roles (admin, user, viewer) rather than individual permissions. This is relevant for rate limiting because different users need different access levels: operators need to update rate limit rules, developers need to inspect rate limit state for debugging, and the rate limiting middleware itself needs unrestricted access to check and decrement counters.
+
+The current implementation does not include RBAC (the API is open), but the production architecture would implement it at the API gateway level: the rate limiter middleware executes before authentication (to protect the auth service itself from abuse), while configuration endpoints require admin roles.
+
 ## Implementation Notes
 
 This section maps the production architecture to what actually runs locally with Docker + Node.js + React.
