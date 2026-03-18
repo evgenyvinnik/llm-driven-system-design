@@ -2,2008 +2,473 @@
 
 ## System Overview
 
-A high-performance API system designed to serve millions of users with low latency, high availability, and resilience. Core challenges involve horizontal scaling, traffic management, caching, and observability.
+A high-performance API system designed to serve millions of users with low latency, high availability, and resilience. The system demonstrates horizontal scaling patterns, multi-level caching, distributed rate limiting, circuit breakers, and comprehensive observability -- the foundational infrastructure that every production API platform requires.
 
 **Learning Goals:**
-- Build horizontally scalable API services
-- Design effective caching strategies
-- Implement rate limiting and circuit breakers
-- Create comprehensive observability
-
----
+- Build horizontally scalable API services with stateless design
+- Design effective multi-level caching strategies
+- Implement distributed rate limiting and circuit breakers
+- Create comprehensive observability with per-endpoint metrics
 
 ## Requirements
 
 ### Functional Requirements
 
-1. **Serve**: Handle API requests efficiently
-2. **Authenticate**: Verify user identity and permissions
-3. **Rate Limit**: Protect from abuse
-4. **Cache**: Reduce latency and database load
-5. **Monitor**: Track performance and errors
+1. **Serve**: Handle API requests efficiently with CRUD operations on resources
+2. **Authenticate**: Verify user identity via session-based auth and API keys with tiered permissions
+3. **Rate Limit**: Protect from abuse with per-key and per-IP sliding window limits
+4. **Cache**: Reduce latency and database load with two-level caching (local + Redis)
+5. **Monitor**: Track per-endpoint latency percentiles, error rates, cache hit ratios, and circuit breaker state
 
-### Non-Functional Requirements
+### Non-Functional Requirements (Production Scale)
 
-- **Latency**: P99 < 100ms for cached, < 500ms for uncached
-- **Throughput**: 100k+ requests per second
-- **Availability**: 99.99% uptime
-- **Scalability**: Linear scaling with instances
-
----
+- **Latency**: p99 < 100ms for cached responses, p99 < 500ms for uncached
+- **Throughput**: 100K+ requests per second across the cluster
+- **Availability**: 99.99% uptime with graceful degradation
+- **Scalability**: Linear throughput scaling with additional API server instances
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Clients                                   │
-│              (Web, Mobile, Third-party Apps)                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      CDN / Edge                                  │
-│              (Static content, edge caching)                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Load Balancer                                 │
-│          (Health checks, SSL termination, routing)               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  API Server   │    │  API Server   │    │  API Server   │
-│   Instance 1  │    │   Instance 2  │    │   Instance N  │
-│               │    │               │    │               │
-│ - Rate limit  │    │ - Rate limit  │    │ - Rate limit  │
-│ - Auth        │    │ - Auth        │    │ - Auth        │
-│ - Routing     │    │ - Routing     │    │ - Routing     │
-└───────────────┘    └───────────────┘    └───────────────┘
-         │                    │                    │
-         └────────────────────┼────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│    Redis      │    │  PostgreSQL   │    │ Message Queue │
-│    Cache      │    │   Primary +   │    │   (RabbitMQ)  │
-│               │    │   Replicas    │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           Clients                                    │
+│                (Web, Mobile, Third-party Apps)                        │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        CDN / Edge                                    │
+│                (Static content, edge caching)                        │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       API Gateway                                    │
+│        (TLS termination, rate limiting, auth, routing)                │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                      Load Balancer                                   │
+│       (Least connections, health checks, circuit breakers)           │
+└──────┬──────────────────┬──────────────────┬────────────────────────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│ API Server  │   │ API Server  │   │ API Server  │
+│ Instance 1  │   │ Instance 2  │   │ Instance N  │
+│             │   │             │   │             │
+│ Local Cache │   │ Local Cache │   │ Local Cache │
+│ Compression │   │ Compression │   │ Compression │
+│ Metrics     │   │ Metrics     │   │ Metrics     │
+└──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+       │                 │                  │
+       └─────────────────┼──────────────────┘
+                         │
+       ┌─────────────────┼─────────────────┐
+       ▼                 ▼                 ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│   Redis     │   │ PostgreSQL  │   │ Message     │
+│   Cluster   │   │  Primary +  │   │ Queue       │
+│ (Cache +    │   │  Replicas   │   │ (RabbitMQ)  │
+│  Rate Limit │   │             │   │             │
+│  + Sessions)│   │             │   │             │
+└─────────────┘   └─────────────┘   └─────────────┘
 ```
 
----
+Each API server instance is stateless -- all shared state lives in Redis (sessions, rate limit counters, cache) or PostgreSQL (persistent data). This allows horizontal scaling by simply adding instances behind the load balancer.
 
 ## Core Components
 
-### 1. Load Balancer
+### API Gateway
 
-**Traffic Distribution:**
-```javascript
-// NGINX configuration example
-const nginxConfig = `
-upstream api_servers {
-    least_conn;  # Least connections algorithm
+The gateway is the single entry point for all client traffic. It handles:
 
-    server api1.internal:3000 weight=5 max_fails=3 fail_timeout=30s;
-    server api2.internal:3000 weight=5 max_fails=3 fail_timeout=30s;
-    server api3.internal:3000 weight=5 max_fails=3 fail_timeout=30s;
+- **TLS termination** -- Clients connect via HTTPS; internal traffic is plaintext for performance
+- **Rate limiting** -- Sliding window algorithm using Redis sorted sets, with per-tier limits (anonymous: 100/min, free: 1K/min, pro: 10K/min, enterprise: 100K/min)
+- **Authentication** -- Validates session cookies or API key hashes, attaches user context to requests
+- **Request ID propagation** -- Generates or forwards `X-Request-ID` for distributed tracing
 
-    keepalive 32;  # Keep connections open
-}
+Rate limiting uses the sliding window algorithm because it provides smoother throttling than fixed windows. A fixed 100-requests-per-minute window allows all 100 requests in the first second, then blocks for 59 seconds. The sliding window spreads the budget evenly, preventing burst-then-starve patterns that cause poor client experience.
 
-server {
-    listen 443 ssl http2;
-    server_name api.example.com;
+### Load Balancer
 
-    ssl_certificate /etc/ssl/certs/api.crt;
-    ssl_certificate_key /etc/ssl/private/api.key;
+Uses **least connections** algorithm with per-server circuit breakers:
 
-    # Health check endpoint
-    location /health {
-        access_log off;
-        proxy_pass http://api_servers;
-    }
+- **Least connections** distributes traffic to the server with the fewest active connections, naturally routing around slow servers. Round-robin would send equal traffic to a server that is struggling with a slow query, making it worse.
+- **Health checks** run every 5 seconds against each server's `/health` endpoint. Servers that fail 3 consecutive checks are removed from the pool.
+- **Circuit breakers** per backend server open after 3 failures with a 15-second reset timeout. This prevents the load balancer from sending traffic to a crashed server while it restarts.
+- **Dynamic weight adjustment** based on health check latency -- servers with faster response times receive proportionally more traffic.
 
-    location /api/ {
-        proxy_pass http://api_servers;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Request-ID $request_id;
+### API Server
 
-        # Timeouts
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
+Stateless Express.js servers that handle business logic:
 
-        # Buffering
-        proxy_buffering on;
-        proxy_buffer_size 4k;
-        proxy_buffers 8 4k;
-    }
-}
-`
+- **Request pipeline**: Request ID -> Compression -> JSON parsing -> Rate limit check -> Auth -> Route handler -> Error handler -> Response logging
+- **Two-level caching**: Local in-memory cache (5-second TTL) eliminates Redis round-trips for hot data. Redis cache (configurable TTL) is shared across all instances. Cache-aside pattern with `getOrFetch()` automatically populates cache on miss.
+- **Connection pooling**: PostgreSQL pool with configurable max connections prevents connection exhaustion under load.
 
-// Health check implementation
-class HealthChecker {
-  async checkServer(server) {
-    try {
-      const response = await fetch(`http://${server}/health`, {
-        timeout: 2000
-      })
+### Caching Strategy
 
-      if (response.ok) {
-        const data = await response.json()
-        return {
-          healthy: true,
-          latency: data.latency,
-          load: data.load
-        }
-      }
-      return { healthy: false }
-    } catch (error) {
-      return { healthy: false, error: error.message }
-    }
-  }
-
-  async updateServerWeights(servers) {
-    for (const server of servers) {
-      const health = await this.checkServer(server.address)
-
-      if (!health.healthy) {
-        await this.markUnhealthy(server.address)
-      } else {
-        // Adjust weight based on load
-        const weight = Math.max(1, 10 - Math.floor(health.load / 10))
-        await this.setWeight(server.address, weight)
-      }
-    }
-  }
-}
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐     ┌────────────┐
+│   Client   │────▶│ API Server │────▶│   Redis    │────▶│ PostgreSQL │
+│            │     │ Local Cache│     │   Cache    │     │  Database  │
+│            │     │  (L1, 5s)  │     │ (L2, 5min) │     │  (source)  │
+└────────────┘     └────────────┘     └────────────┘     └────────────┘
+                     Hit: <1ms          Hit: 1-2ms         Miss: 10-50ms
 ```
 
-### 2. API Server
+The two-level approach reduces Redis round-trips by 80-90% for hot data. The 5-second L1 TTL is short enough to bound staleness while long enough to absorb burst traffic. The Redis L2 cache with longer TTLs (5-30 minutes depending on data type) serves as the shared cache across all API instances.
 
-**Request Handling:**
-```javascript
-const express = require('express')
-const compression = require('compression')
+**Cache invalidation** uses pattern-based deletion: when a resource is updated, both `resources:detail:{id}` and `resources:list:*` keys are invalidated. This is simpler than event-driven invalidation and acceptable because cache misses gracefully fall through to the database.
 
-class APIServer {
-  constructor(config) {
-    this.app = express()
-    this.config = config
-    this.setupMiddleware()
-    this.setupRoutes()
-  }
+### Circuit Breaker Pattern
 
-  setupMiddleware() {
-    // Request ID for tracing
-    this.app.use((req, res, next) => {
-      req.id = req.headers['x-request-id'] || uuid()
-      res.setHeader('X-Request-ID', req.id)
-      next()
-    })
+Each downstream dependency (database, Redis, external services) is wrapped in its own circuit breaker with three states:
 
-    // Compression
-    this.app.use(compression())
+- **Closed** (normal): Requests pass through. Failures increment a counter.
+- **Open** (protecting): After 5 failures, the circuit opens. All requests fail immediately (0ms latency vs 30-second timeout). This prevents thread/connection pool exhaustion.
+- **Half-open** (testing): After 30 seconds, the circuit allows 3 test requests through. If all succeed, the circuit closes. If any fail, it reopens.
 
-    // JSON parsing with size limit
-    this.app.use(express.json({ limit: '1mb' }))
-
-    // Request logging
-    this.app.use(this.requestLogger.bind(this))
-
-    // Rate limiting
-    this.app.use(this.rateLimiter.middleware())
-
-    // Authentication
-    this.app.use('/api', this.authenticate.bind(this))
-
-    // Error handling
-    this.app.use(this.errorHandler.bind(this))
-  }
-
-  async requestLogger(req, res, next) {
-    const start = Date.now()
-
-    res.on('finish', () => {
-      const duration = Date.now() - start
-
-      this.metrics.recordRequest({
-        method: req.method,
-        path: req.route?.path || req.path,
-        status: res.statusCode,
-        duration,
-        requestId: req.id
-      })
-
-      if (duration > 1000) {
-        console.warn(`Slow request: ${req.method} ${req.path} took ${duration}ms`)
-      }
-    })
-
-    next()
-  }
-
-  async authenticate(req, res, next) {
-    const authHeader = req.headers.authorization
-
-    if (!authHeader) {
-      return res.status(401).json({ error: 'Missing authorization header' })
-    }
-
-    try {
-      const token = authHeader.replace('Bearer ', '')
-      const user = await this.authService.verifyToken(token)
-      req.user = user
-      next()
-    } catch (error) {
-      return res.status(401).json({ error: 'Invalid token' })
-    }
-  }
-
-  errorHandler(err, req, res, next) {
-    console.error(`Error handling ${req.method} ${req.path}:`, err)
-
-    this.metrics.recordError({
-      method: req.method,
-      path: req.path,
-      error: err.name,
-      requestId: req.id
-    })
-
-    if (err.isOperational) {
-      return res.status(err.statusCode).json({ error: err.message })
-    }
-
-    res.status(500).json({ error: 'Internal server error', requestId: req.id })
-  }
-}
-```
-
-### 3. Caching Layer
-
-**Multi-Level Cache:**
-```javascript
-class CacheService {
-  constructor(redis) {
-    this.redis = redis
-    this.localCache = new Map()
-    this.localCacheTTL = 5000 // 5 seconds for local cache
-  }
-
-  async get(key) {
-    // Level 1: Local in-memory cache
-    const local = this.localCache.get(key)
-    if (local && local.expiry > Date.now()) {
-      this.metrics.recordHit('local')
-      return local.value
-    }
-
-    // Level 2: Redis cache
-    const cached = await this.redis.get(key)
-    if (cached) {
-      const parsed = JSON.parse(cached)
-      // Populate local cache
-      this.localCache.set(key, {
-        value: parsed,
-        expiry: Date.now() + this.localCacheTTL
-      })
-      this.metrics.recordHit('redis')
-      return parsed
-    }
-
-    this.metrics.recordMiss()
-    return null
-  }
-
-  async set(key, value, ttlSeconds = 300) {
-    // Set in Redis
-    await this.redis.setex(key, ttlSeconds, JSON.stringify(value))
-
-    // Set in local cache
-    this.localCache.set(key, {
-      value,
-      expiry: Date.now() + Math.min(ttlSeconds * 1000, this.localCacheTTL)
-    })
-  }
-
-  async invalidate(pattern) {
-    // Invalidate Redis keys matching pattern
-    const keys = await this.redis.keys(pattern)
-    if (keys.length > 0) {
-      await this.redis.del(...keys)
-    }
-
-    // Clear local cache entries matching pattern
-    const regex = new RegExp(pattern.replace('*', '.*'))
-    for (const key of this.localCache.keys()) {
-      if (regex.test(key)) {
-        this.localCache.delete(key)
-      }
-    }
-  }
-
-  // Cache-aside pattern for database queries
-  async getOrFetch(key, fetchFn, ttl = 300) {
-    const cached = await this.get(key)
-    if (cached !== null) {
-      return cached
-    }
-
-    const value = await fetchFn()
-    await this.set(key, value, ttl)
-    return value
-  }
-}
-
-// Usage in API
-class UserAPI {
-  async getUser(userId) {
-    return this.cache.getOrFetch(
-      `user:${userId}`,
-      () => this.db.query('SELECT * FROM users WHERE id = $1', [userId]),
-      600 // 10 minutes
-    )
-  }
-
-  async updateUser(userId, data) {
-    await this.db.query('UPDATE users SET ... WHERE id = $1', [userId])
-    // Invalidate cache
-    await this.cache.invalidate(`user:${userId}`)
-  }
-}
-```
-
-### 4. Rate Limiting
-
-**Distributed Rate Limiter:**
-```javascript
-class RateLimiter {
-  constructor(redis, config) {
-    this.redis = redis
-    this.config = config
-  }
-
-  middleware() {
-    return async (req, res, next) => {
-      const identifier = this.getIdentifier(req)
-      const limit = this.getLimit(req)
-
-      try {
-        const result = await this.checkLimit(identifier, limit)
-
-        res.setHeader('X-RateLimit-Limit', limit.requests)
-        res.setHeader('X-RateLimit-Remaining', result.remaining)
-        res.setHeader('X-RateLimit-Reset', result.resetAt)
-
-        if (!result.allowed) {
-          res.setHeader('Retry-After', result.retryAfter)
-          return res.status(429).json({
-            error: 'Rate limit exceeded',
-            retryAfter: result.retryAfter
-          })
-        }
-
-        next()
-      } catch (error) {
-        // Fail open on Redis errors
-        console.error('Rate limiter error:', error)
-        next()
-      }
-    }
-  }
-
-  getIdentifier(req) {
-    // Use API key if authenticated, otherwise IP
-    if (req.user?.apiKey) {
-      return `key:${req.user.apiKey}`
-    }
-    return `ip:${req.ip}`
-  }
-
-  getLimit(req) {
-    // Different limits based on tier
-    const tier = req.user?.tier || 'anonymous'
-    return this.config.limits[tier] || this.config.limits.anonymous
-  }
-
-  async checkLimit(identifier, limit) {
-    const key = `ratelimit:${identifier}`
-    const now = Date.now()
-    const windowStart = now - limit.windowMs
-
-    // Sliding window using sorted set
-    const pipeline = this.redis.pipeline()
-    pipeline.zremrangebyscore(key, 0, windowStart) // Remove old entries
-    pipeline.zcard(key) // Count current entries
-    pipeline.zadd(key, now, `${now}:${uuid()}`) // Add current request
-    pipeline.expire(key, Math.ceil(limit.windowMs / 1000)) // Set expiry
-
-    const results = await pipeline.exec()
-    const currentCount = results[1][1]
-
-    if (currentCount >= limit.requests) {
-      // Get oldest entry to calculate retry-after
-      const oldest = await this.redis.zrange(key, 0, 0, 'WITHSCORES')
-      const retryAfter = Math.ceil((parseInt(oldest[1]) + limit.windowMs - now) / 1000)
-
-      return {
-        allowed: false,
-        remaining: 0,
-        resetAt: Math.ceil((now + limit.windowMs) / 1000),
-        retryAfter
-      }
-    }
-
-    return {
-      allowed: true,
-      remaining: limit.requests - currentCount - 1,
-      resetAt: Math.ceil((now + limit.windowMs) / 1000)
-    }
-  }
-}
-
-// Configuration
-const rateLimitConfig = {
-  limits: {
-    anonymous: { requests: 100, windowMs: 60000 },    // 100/min
-    free: { requests: 1000, windowMs: 60000 },        // 1000/min
-    pro: { requests: 10000, windowMs: 60000 },        // 10k/min
-    enterprise: { requests: 100000, windowMs: 60000 } // 100k/min
-  }
-}
-```
-
-### 5. Circuit Breaker
-
-**Failure Protection:**
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeout = options.resetTimeout || 30000
-    this.halfOpenRequests = options.halfOpenRequests || 3
-
-    this.state = 'closed'
-    this.failures = 0
-    this.successes = 0
-    this.lastFailure = null
-    this.halfOpenCount = 0
-  }
-
-  async execute(fn) {
-    if (this.state === 'open') {
-      if (Date.now() - this.lastFailure >= this.resetTimeout) {
-        this.state = 'half-open'
-        this.halfOpenCount = 0
-      } else {
-        throw new CircuitOpenError('Circuit breaker is open')
-      }
-    }
-
-    try {
-      const result = await fn()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  onSuccess() {
-    if (this.state === 'half-open') {
-      this.successes++
-      if (this.successes >= this.halfOpenRequests) {
-        this.state = 'closed'
-        this.failures = 0
-        this.successes = 0
-      }
-    } else {
-      this.failures = Math.max(0, this.failures - 1)
-    }
-  }
-
-  onFailure() {
-    this.failures++
-    this.lastFailure = Date.now()
-
-    if (this.state === 'half-open') {
-      this.state = 'open'
-    } else if (this.failures >= this.failureThreshold) {
-      this.state = 'open'
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failures: this.failures,
-      lastFailure: this.lastFailure
-    }
-  }
-}
-
-// Usage
-class ExternalServiceClient {
-  constructor() {
-    this.circuitBreaker = new CircuitBreaker({
-      failureThreshold: 5,
-      resetTimeout: 30000
-    })
-  }
-
-  async callService(endpoint, data) {
-    return this.circuitBreaker.execute(async () => {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        body: JSON.stringify(data),
-        timeout: 5000
-      })
-
-      if (!response.ok) {
-        throw new Error(`Service error: ${response.status}`)
-      }
-
-      return response.json()
-    })
-  }
-}
-```
-
-### 6. Observability
-
-**Metrics & Tracing:**
-```javascript
-class MetricsService {
-  constructor() {
-    this.counters = new Map()
-    this.histograms = new Map()
-    this.gauges = new Map()
-  }
-
-  // Request metrics
-  recordRequest(data) {
-    const { method, path, status, duration } = data
-
-    // Counter: total requests
-    this.increment('http_requests_total', {
-      method,
-      path: this.normalizePath(path),
-      status
-    })
-
-    // Histogram: request duration
-    this.observe('http_request_duration_ms', duration, {
-      method,
-      path: this.normalizePath(path)
-    })
-  }
-
-  recordError(data) {
-    this.increment('http_errors_total', {
-      method: data.method,
-      path: this.normalizePath(data.path),
-      error: data.error
-    })
-  }
-
-  // Cache metrics
-  recordHit(level) {
-    this.increment('cache_hits_total', { level })
-  }
-
-  recordMiss() {
-    this.increment('cache_misses_total')
-  }
-
-  // System metrics
-  updateSystemMetrics() {
-    const memUsage = process.memoryUsage()
-    this.gauge('nodejs_heap_used_bytes', memUsage.heapUsed)
-    this.gauge('nodejs_heap_total_bytes', memUsage.heapTotal)
-    this.gauge('nodejs_external_memory_bytes', memUsage.external)
-
-    const cpuUsage = process.cpuUsage()
-    this.gauge('nodejs_cpu_user_seconds', cpuUsage.user / 1e6)
-    this.gauge('nodejs_cpu_system_seconds', cpuUsage.system / 1e6)
-  }
-
-  // Prometheus format export
-  async getMetrics() {
-    let output = ''
-
-    for (const [name, counter] of this.counters) {
-      for (const [labels, value] of counter.entries()) {
-        output += `${name}${this.formatLabels(labels)} ${value}\n`
-      }
-    }
-
-    for (const [name, histogram] of this.histograms) {
-      for (const [labels, values] of histogram.entries()) {
-        const sorted = values.sort((a, b) => a - b)
-        const count = sorted.length
-        const sum = sorted.reduce((a, b) => a + b, 0)
-
-        output += `${name}_count${this.formatLabels(labels)} ${count}\n`
-        output += `${name}_sum${this.formatLabels(labels)} ${sum}\n`
-
-        // Percentiles
-        const p50 = sorted[Math.floor(count * 0.5)]
-        const p90 = sorted[Math.floor(count * 0.9)]
-        const p99 = sorted[Math.floor(count * 0.99)]
-
-        output += `${name}{quantile="0.5",${this.formatLabels(labels, true)}} ${p50}\n`
-        output += `${name}{quantile="0.9",${this.formatLabels(labels, true)}} ${p90}\n`
-        output += `${name}{quantile="0.99",${this.formatLabels(labels, true)}} ${p99}\n`
-      }
-    }
-
-    return output
-  }
-
-  normalizePath(path) {
-    // Replace dynamic segments with placeholders
-    return path
-      .replace(/\/[0-9a-f-]{36}/g, '/:id')
-      .replace(/\/\d+/g, '/:id')
-  }
-}
-
-// Distributed tracing
-class TracingService {
-  async startSpan(name, parentSpan = null) {
-    const span = {
-      traceId: parentSpan?.traceId || uuid(),
-      spanId: uuid(),
-      parentSpanId: parentSpan?.spanId,
-      name,
-      startTime: Date.now(),
-      tags: {},
-      logs: []
-    }
-
-    return span
-  }
-
-  endSpan(span) {
-    span.endTime = Date.now()
-    span.duration = span.endTime - span.startTime
-
-    // Send to tracing backend (Jaeger, Zipkin, etc.)
-    this.reportSpan(span)
-  }
-
-  async reportSpan(span) {
-    await fetch(this.tracingEndpoint, {
-      method: 'POST',
-      body: JSON.stringify(span)
-    })
-  }
-}
-```
-
-### 7. Graceful Degradation
-
-**Fallback Strategies:**
-```javascript
-class GracefulDegradation {
-  constructor(cache, config) {
-    this.cache = cache
-    this.config = config
-    this.degradedMode = false
-  }
-
-  async executeWithFallback(primaryFn, fallbackFn, cacheKey) {
-    try {
-      const result = await primaryFn()
-
-      // Cache successful result for fallback
-      if (cacheKey) {
-        await this.cache.set(`fallback:${cacheKey}`, result, 3600)
-      }
-
-      return result
-    } catch (error) {
-      console.warn(`Primary function failed, trying fallback:`, error.message)
-
-      // Try fallback function
-      if (fallbackFn) {
-        try {
-          return await fallbackFn()
-        } catch (fallbackError) {
-          console.warn(`Fallback function failed:`, fallbackError.message)
-        }
-      }
-
-      // Try cached data
-      if (cacheKey) {
-        const cached = await this.cache.get(`fallback:${cacheKey}`)
-        if (cached) {
-          console.log(`Using stale cached data for ${cacheKey}`)
-          return { ...cached, _stale: true }
-        }
-      }
-
-      throw error
-    }
-  }
-
-  async handleDegradedMode(req, res, next) {
-    if (this.degradedMode) {
-      // Disable non-essential features
-      req.degradedMode = true
-
-      // Shorter timeouts
-      req.timeout = this.config.degradedTimeout
-
-      // Skip expensive operations
-      if (this.isExpensiveEndpoint(req.path)) {
-        return res.status(503).json({
-          error: 'Service temporarily unavailable',
-          degraded: true
-        })
-      }
-    }
-
-    next()
-  }
-
-  isExpensiveEndpoint(path) {
-    const expensive = ['/api/search', '/api/recommendations', '/api/analytics']
-    return expensive.some(p => path.startsWith(p))
-  }
-
-  async enterDegradedMode(reason) {
-    this.degradedMode = true
-    console.warn(`Entering degraded mode: ${reason}`)
-
-    // Notify operations
-    await this.alerting.send({
-      severity: 'warning',
-      message: `API entering degraded mode: ${reason}`
-    })
-  }
-
-  exitDegradedMode() {
-    this.degradedMode = false
-    console.info('Exiting degraded mode')
-  }
-}
-```
-
----
+Per-dependency isolation is critical. If the payment service is down, the circuit breaker for payments opens, but user lookups and session management continue working. A single global circuit breaker would take down everything when one dependency fails.
 
 ## Database Schema
 
-### Entity-Relationship Diagram
+```sql
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           ENTITY RELATIONSHIP DIAGRAM                        │
-└─────────────────────────────────────────────────────────────────────────────┘
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(64) NOT NULL,
+    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+    tier VARCHAR(20) DEFAULT 'free' CHECK (tier IN ('free', 'pro', 'enterprise')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_login TIMESTAMP WITH TIME ZONE
+);
 
-                              ┌──────────────────┐
-                              │      users       │
-                              ├──────────────────┤
-                              │ id (PK)          │
-                              │ email (UNIQUE)   │
-                              │ password_hash    │
-                              │ role             │
-                              │ tier             │
-                              │ created_at       │
-                              │ updated_at       │
-                              │ last_login       │
-                              └────────┬─────────┘
-                                       │
-           ┌───────────────────────────┼───────────────────────────┐
-           │                           │                           │
-           │ 1:N                       │ 1:N                       │ 1:N
-           ▼                           ▼                           ▼
-┌──────────────────┐      ┌───────────────────────┐     ┌──────────────────┐
-│    api_keys      │      │  rate_limit_configs   │     │    resources     │
-├──────────────────┤      ├───────────────────────┤     ├──────────────────┤
-│ id (PK)          │      │ id (PK)               │     │ id (PK)          │
-│ user_id (FK)     │──────│ identifier (UNIQUE)   │     │ name             │
-│ key_hash (UNIQUE)│      │ requests_per_minute   │     │ type             │
-│ name             │      │ burst_limit           │     │ content          │
-│ tier             │      │ reason                │     │ metadata (JSONB) │
-│ scopes[]         │      │ created_by (FK)  ─────┤     │ created_by (FK)  │
-│ rate_limit_override│    │ created_at            │     │ updated_by (FK)  │
-│ last_used        │      │ expires_at            │     │ created_at       │
-│ created_at       │      └───────────────────────┘     │ updated_at       │
-│ expires_at       │                                    └──────────────────┘
-│ revoked_at       │
-└────────┬─────────┘
-         │
-         │ 1:N (optional)
-         ▼
-┌───────────────────────────────────────────┐
-│           request_logs                     │
-│    (also: request_logs_partitioned)        │
-├───────────────────────────────────────────┤
-│ id (PK)                                    │
-│ request_id                                 │
-│ api_key_id (FK, optional)                  │
-│ user_id (FK, optional)                     │
-│ method                                     │
-│ path                                       │
-│ status_code                                │
-│ duration_ms                                │
-│ ip_address                                 │
-│ user_agent                                 │
-│ error_message                              │
-│ instance_id                                │
-│ created_at                                 │
-└───────────────────────────────────────────┘
+CREATE TABLE IF NOT EXISTS api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key_hash VARCHAR(64) NOT NULL,
+    name VARCHAR(100),
+    tier VARCHAR(20) DEFAULT 'free' CHECK (tier IN ('free', 'pro', 'enterprise')),
+    scopes TEXT[],
+    rate_limit_override JSONB,
+    last_used TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE
+);
 
-                    ┌───────────────────────────────────────────┐
-                    │           system_metrics                   │
-                    ├───────────────────────────────────────────┤
-                    │ id (PK, BIGSERIAL)                         │
-                    │ instance_id                                │
-                    │ metric_name                                │
-                    │ metric_value                               │
-                    │ labels (JSONB)                             │
-                    │ recorded_at                                │
-                    └───────────────────────────────────────────┘
-                    (standalone table - no foreign keys)
-```
+CREATE TABLE IF NOT EXISTS request_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id VARCHAR(36) NOT NULL,
+    api_key_id UUID REFERENCES api_keys(id),
+    user_id UUID REFERENCES users(id),
+    method VARCHAR(10) NOT NULL,
+    path VARCHAR(500) NOT NULL,
+    status_code INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    error_message TEXT,
+    instance_id VARCHAR(50),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 
-### Table Definitions
+CREATE TABLE IF NOT EXISTS rate_limit_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    identifier VARCHAR(200) NOT NULL,
+    requests_per_minute INTEGER NOT NULL,
+    burst_limit INTEGER,
+    reason TEXT,
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE
+);
 
-#### 1. users
+CREATE TABLE IF NOT EXISTS resources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    content TEXT,
+    metadata JSONB DEFAULT '{}',
+    created_by UUID REFERENCES users(id),
+    updated_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 
-Primary table for user accounts. Central to authentication and authorization.
+CREATE TABLE IF NOT EXISTS system_metrics (
+    id BIGSERIAL PRIMARY KEY,
+    instance_id VARCHAR(50) NOT NULL,
+    metric_name VARCHAR(100) NOT NULL,
+    metric_value DOUBLE PRECISION NOT NULL,
+    labels JSONB DEFAULT '{}',
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 
-| Column        | Type                     | Constraints                            | Description                                  |
-|---------------|--------------------------|----------------------------------------|----------------------------------------------|
-| id            | UUID                     | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier                            |
-| email         | VARCHAR(255)             | UNIQUE, NOT NULL                       | User's email address (login identifier)      |
-| password_hash | VARCHAR(64)              | NOT NULL                               | SHA-256 hash of password                     |
-| role          | VARCHAR(20)              | DEFAULT 'user', CHECK IN ('user','admin') | User role for authorization              |
-| tier          | VARCHAR(20)              | DEFAULT 'free', CHECK IN ('free','pro','enterprise') | Subscription tier for rate limits |
-| created_at    | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Account creation timestamp                   |
-| updated_at    | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Last modification (auto-updated via trigger) |
-| last_login    | TIMESTAMP WITH TIME ZONE |                                        | Most recent login timestamp                  |
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys(expires_at) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_request_logs_user ON request_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs(status_code, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rate_limit_identifier ON rate_limit_configs(identifier);
+CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(type);
+CREATE INDEX IF NOT EXISTS idx_resources_created ON resources(created_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_instance ON system_metrics(instance_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_name ON system_metrics(metric_name, recorded_at);
 
-**Indexes:**
-- `idx_users_email` on (email) - Fast lookup for authentication
-- `idx_users_role` on (role) - Filter users by role in admin queries
+-- Auto-update trigger for updated_at columns
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
 
-#### 2. api_keys
-
-API keys for programmatic access. Each user can have multiple keys with different permissions.
-
-| Column              | Type                     | Constraints                            | Description                                     |
-|---------------------|--------------------------|----------------------------------------|-------------------------------------------------|
-| id                  | UUID                     | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier                               |
-| user_id             | UUID                     | NOT NULL, FK -> users(id) ON DELETE CASCADE | Owning user                               |
-| key_hash            | VARCHAR(64)              | NOT NULL                               | SHA-256 hash of the API key (never store raw)   |
-| name                | VARCHAR(100)             |                                        | Human-readable name for the key                 |
-| tier                | VARCHAR(20)              | DEFAULT 'free', CHECK IN ('free','pro','enterprise') | Rate limit tier (can differ from user tier) |
-| scopes              | TEXT[]                   |                                        | Array of allowed API scopes                     |
-| rate_limit_override | JSONB                    |                                        | Custom rate limits: {"requests_per_minute": N}  |
-| last_used           | TIMESTAMP WITH TIME ZONE |                                        | Last API call with this key                     |
-| created_at          | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Key creation timestamp                          |
-| expires_at          | TIMESTAMP WITH TIME ZONE |                                        | Optional expiration (null = never expires)      |
-| revoked_at          | TIMESTAMP WITH TIME ZONE |                                        | Soft-delete timestamp (null = active)           |
-
-**Indexes:**
-- `idx_api_keys_hash` UNIQUE on (key_hash) - O(1) key lookup during authentication
-- `idx_api_keys_user` on (user_id) - List all keys for a user
-- `idx_api_keys_expires` on (expires_at) WHERE revoked_at IS NULL - Find expiring keys
-
-#### 3. request_logs
-
-API request logs for analytics, debugging, and auditing. For high-volume production, use the partitioned version.
-
-| Column        | Type                     | Constraints                            | Description                           |
-|---------------|--------------------------|----------------------------------------|---------------------------------------|
-| id            | UUID                     | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier                     |
-| request_id    | VARCHAR(36)              | NOT NULL                               | Correlation ID (from X-Request-ID)    |
-| api_key_id    | UUID                     | FK -> api_keys(id)                     | API key used (null for session auth)  |
-| user_id       | UUID                     | FK -> users(id)                        | Authenticated user                    |
-| method        | VARCHAR(10)              | NOT NULL                               | HTTP method (GET, POST, etc.)         |
-| path          | VARCHAR(500)             | NOT NULL                               | Request path                          |
-| status_code   | INTEGER                  | NOT NULL                               | HTTP response status                  |
-| duration_ms   | INTEGER                  | NOT NULL                               | Request processing time in ms         |
-| ip_address    | INET                     |                                        | Client IP address                     |
-| user_agent    | TEXT                     |                                        | Client user agent string              |
-| error_message | TEXT                     |                                        | Error details (for 4xx/5xx responses) |
-| instance_id   | VARCHAR(50)              |                                        | Server instance that handled request  |
-| created_at    | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Request timestamp                     |
-
-**Indexes:**
-- `idx_request_logs_time` on (created_at) - Time-range queries
-- `idx_request_logs_api_key` on (api_key_id, created_at) - Usage by API key
-- `idx_request_logs_user` on (user_id, created_at) - Usage by user
-- `idx_request_logs_status` on (status_code, created_at) - Error analysis
-
-#### 4. request_logs_partitioned
-
-Partitioned version of request_logs for high-volume deployments. Same schema as request_logs but partitioned by month.
-
-**Partitioning Strategy:**
-- Partition by: `RANGE (created_at)` - monthly partitions
-- Partition naming: `request_logs_YYYY_MM` (e.g., `request_logs_2025_01`)
-- Auto-created: 12 months ahead at initialization
-
-**Why Partitioned?**
-- **Query Performance**: PostgreSQL only scans relevant partitions for time-bound queries
-- **Maintenance**: Dropping old partitions is O(1) vs. slow DELETE operations
-- **Archival**: Easy to detach, export, and drop old partitions
-
-**Indexes (inherited by partitions):**
-- `idx_request_logs_part_time` on (created_at)
-- `idx_request_logs_part_api_key` on (api_key_id, created_at)
-- `idx_request_logs_part_status` on (status_code, created_at)
-
-#### 5. rate_limit_configs
-
-Custom rate limit configurations for specific API keys or IP addresses.
-
-| Column              | Type                     | Constraints                            | Description                              |
-|---------------------|--------------------------|----------------------------------------|------------------------------------------|
-| id                  | UUID                     | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier                        |
-| identifier          | VARCHAR(200)             | NOT NULL                               | Target: API key hash or IP address       |
-| requests_per_minute | INTEGER                  | NOT NULL                               | Allowed requests per minute              |
-| burst_limit         | INTEGER                  |                                        | Max requests in burst (token bucket)     |
-| reason              | TEXT                     |                                        | Admin note explaining the override       |
-| created_by          | UUID                     | FK -> users(id)                        | Admin who created the config             |
-| created_at          | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Config creation timestamp                |
-| expires_at          | TIMESTAMP WITH TIME ZONE |                                        | Optional auto-expiration                 |
-
-**Indexes:**
-- `idx_rate_limit_identifier` UNIQUE on (identifier) - Fast lookup during rate limit check
-
-#### 6. resources
-
-Demo resources table for testing CRUD operations through the API.
-
-| Column     | Type                     | Constraints                            | Description                        |
-|------------|--------------------------|----------------------------------------|------------------------------------|
-| id         | UUID                     | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier                  |
-| name       | VARCHAR(255)             | NOT NULL                               | Resource name                      |
-| type       | VARCHAR(50)              | NOT NULL                               | Resource type (document, image, etc.) |
-| content    | TEXT                     |                                        | Resource content or description    |
-| metadata   | JSONB                    | DEFAULT '{}'                           | Flexible metadata storage          |
-| created_by | UUID                     | FK -> users(id)                        | User who created the resource      |
-| updated_by | UUID                     | FK -> users(id)                        | User who last modified             |
-| created_at | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Creation timestamp                 |
-| updated_at | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()                          | Last modification (auto-updated)   |
-
-**Indexes:**
-- `idx_resources_type` on (type) - Filter by resource type
-- `idx_resources_created` on (created_at) - Recent resources
-
-#### 7. system_metrics
-
-Time-series metrics for system monitoring and dashboard visualization.
-
-| Column       | Type                     | Constraints      | Description                          |
-|--------------|--------------------------|------------------|--------------------------------------|
-| id           | BIGSERIAL                | PRIMARY KEY      | Auto-incrementing identifier         |
-| instance_id  | VARCHAR(50)              | NOT NULL         | Server instance identifier           |
-| metric_name  | VARCHAR(100)             | NOT NULL         | Metric name (e.g., cpu_usage)        |
-| metric_value | DOUBLE PRECISION         | NOT NULL         | Numeric metric value                 |
-| labels       | JSONB                    | DEFAULT '{}'     | Additional dimensions/labels         |
-| recorded_at  | TIMESTAMP WITH TIME ZONE | DEFAULT NOW()    | Metric timestamp                     |
-
-**Indexes:**
-- `idx_metrics_instance` on (instance_id, recorded_at) - Metrics by instance
-- `idx_metrics_name` on (metric_name, recorded_at) - Metrics by type
-
-### Foreign Key Relationships and Cascade Behaviors
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    FOREIGN KEY RELATIONSHIPS                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-api_keys.user_id ────────────────────────────────────────► users.id
-    CASCADE on DELETE
-    Rationale: When a user is deleted, all their API keys become invalid.
-               Cascading deletion ensures no orphaned keys remain.
-
-request_logs.api_key_id ─────────────────────────────────► api_keys.id
-    NO ACTION (default) on DELETE
-    Rationale: Request logs are historical records and should persist
-               even after API key deletion for audit purposes.
-
-request_logs.user_id ────────────────────────────────────► users.id
-    NO ACTION (default) on DELETE
-    Rationale: Same as above - logs should persist for auditing.
-
-rate_limit_configs.created_by ───────────────────────────► users.id
-    NO ACTION (default) on DELETE
-    Rationale: Rate limit configs can exist independently of the admin
-               who created them. The config remains valid.
-
-resources.created_by ────────────────────────────────────► users.id
-    NO ACTION (default) on DELETE
-    Rationale: Resources should persist even if their creator is deleted.
-               The created_by serves as historical attribution.
-
-resources.updated_by ────────────────────────────────────► users.id
-    NO ACTION (default) on DELETE
-    Rationale: Same as created_by - historical attribution.
+CREATE TRIGGER update_users_updated_at
+    BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_resources_updated_at
+    BEFORE UPDATE ON resources FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 ```
 
-### Why Tables Are Structured This Way
+### Schema Design Rationale
 
-**1. users as Central Entity**
-- All authentication and authorization flows through users
-- Tier system enables tiered rate limiting without complex configuration
-- Role column enables simple RBAC without a separate roles table
+**Users as central entity**: All authentication and authorization flows through the users table. The `tier` column enables tiered rate limiting without a separate configuration table -- simpler for the common case where API key tier matches user tier. The `role` column enables simple RBAC without a separate roles/permissions table.
 
-**2. api_keys with Independent Tier**
-- API keys can have different tiers than their owning user
-- Useful for providing limited access keys or premium programmatic access
-- Soft-delete (revoked_at) preserves audit trail
+**API keys with independent tier**: API keys can have different tiers than their owning user. A "pro" user might create a "free" API key for a less-trusted integration. The `scopes` array restricts what the key can access. Soft-delete via `revoked_at` preserves audit trail -- we never hard-delete keys.
 
-**3. Denormalization in request_logs**
-- Both user_id and api_key_id are stored for flexible querying
-- instance_id enables debugging specific server instances
-- Trade-off: Slightly more storage for much faster queries
+**Request logs with denormalization**: Both `user_id` and `api_key_id` are stored despite the FK relationship between them. This denormalization enables fast analytics queries ("show me all requests from user X") without joins. The `instance_id` column enables debugging which server handled a request.
 
-**4. Partitioned request_logs**
-- High-volume table (potentially billions of rows)
-- Partition pruning dramatically speeds up time-range queries
-- Easy archival: `ALTER TABLE request_logs DETACH PARTITION request_logs_2024_01`
+**JSONB for flexibility**: `rate_limit_override` allows custom rate limit shapes per key. `resources.metadata` allows extensible resource attributes. `system_metrics.labels` stores Prometheus-style dimensional labels.
 
-**5. JSONB for Flexibility**
-- rate_limit_override: Allows custom rate limit shapes
-- resources.metadata: Extensible without schema changes
-- system_metrics.labels: Prometheus-style dimensional labels
+### Request Logs Partitioning (Production Scale)
 
-### Data Flow for Key Operations
-
-#### Authentication Flow
+At production volume (millions of requests per day), the `request_logs` table should be range-partitioned by `created_at`:
 
 ```
-1. User submits API key in Authorization header
-2. System computes SHA-256 hash of provided key
-3. Query: SELECT * FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL
-4. Verify expires_at is null or in future
-5. UPDATE api_keys SET last_used = NOW() WHERE id = $1
-6. Return user_id for session context
+request_logs (parent, partitioned by RANGE on created_at)
+├── request_logs_2025_w01  (2025-01-01 to 2025-01-08)
+├── request_logs_2025_w02  (2025-01-08 to 2025-01-15)
+└── ...
 ```
 
-#### Rate Limiting Flow
+Benefits: partition pruning makes time-range queries fast, dropping old partitions is O(1) instead of slow `DELETE` operations, and detaching partitions enables easy archival to object storage.
 
-```
-1. Extract identifier (API key hash or IP)
-2. Check rate_limit_configs for custom override:
-   SELECT * FROM rate_limit_configs WHERE identifier = $1 AND (expires_at IS NULL OR expires_at > NOW())
-3. If no override, use tier-based limits from api_keys.tier or users.tier
-4. Check/update Redis sliding window counter
-5. If limit exceeded, return 429 with Retry-After header
-```
+## API Design
 
-#### Request Logging Flow
-
+### Authentication
 ```
-1. Middleware captures request start time
-2. Request processes through handlers
-3. On response finish, extract metrics:
-   - method, path, status_code
-   - duration_ms = Date.now() - startTime
-   - api_key_id, user_id from auth context
-   - instance_id from environment
-4. INSERT INTO request_logs (async, non-blocking)
-5. For dashboard: aggregate queries on request_logs with time filters
+POST /api/v1/auth/login     Login with email/password, returns session cookie
+POST /api/v1/auth/logout    Destroy session
+GET  /api/v1/auth/me        Get current authenticated user
 ```
 
-#### Resource CRUD Flow
-
+### Resources (CRUD)
 ```
-CREATE:
-1. Validate user permissions
-2. INSERT INTO resources (..., created_by = current_user_id)
-3. Invalidate cache: cache.invalidate('resources:list:*')
-
-READ:
-1. Check cache: cache.get('resources:${id}')
-2. If miss: SELECT * FROM resources WHERE id = $1
-3. Populate cache with configurable TTL
-
-UPDATE:
-1. Validate ownership or admin role
-2. UPDATE resources SET ..., updated_by = current_user_id WHERE id = $1
-3. Trigger auto-updates updated_at
-4. Invalidate cache for this resource and list caches
-
-DELETE:
-1. Validate ownership or admin role
-2. DELETE FROM resources WHERE id = $1
-3. Invalidate cache
+GET    /api/v1/resources          List resources with pagination and type filter
+GET    /api/v1/resources/:id      Get resource by ID
+POST   /api/v1/resources          Create resource (requires auth)
+PUT    /api/v1/resources/:id      Update resource (owner or admin)
+DELETE /api/v1/resources/:id      Delete resource (owner or admin)
 ```
 
----
+### API Keys
+```
+GET    /api/v1/keys               List API keys for current user
+POST   /api/v1/keys               Create new API key
+DELETE /api/v1/keys/:id           Revoke API key (soft delete)
+```
+
+### Admin
+```
+GET  /api/v1/admin/users          List all users (admin only)
+GET  /api/v1/admin/stats          System statistics and metrics
+GET  /api/v1/admin/servers        Load balancer server pool status
+POST /api/v1/admin/servers/:port/drain    Drain server for deployment
+POST /api/v1/admin/servers/:port/enable   Re-enable server
+```
+
+### Observability
+```
+GET  /health                      Health check (DB + Redis connectivity)
+GET  /ready                       Readiness probe for load balancer
+GET  /metrics                     Prometheus-format metrics
+GET  /api/v1/status               Service status with instance ID
+```
 
 ## Key Design Decisions
 
-### 1. Stateless API Servers
+### Stateless API Servers
 
-**Decision**: Keep API servers stateless
+All shared state lives in Redis or PostgreSQL, never in server memory (except the L1 cache with 5-second TTL). This means any API server can handle any request, enabling horizontal scaling by simply adding instances. The trade-off is that every state access requires a network round-trip to Redis or PostgreSQL, which the two-level cache mitigates for read-heavy workloads.
 
-**Rationale**:
-- Easy horizontal scaling
-- Simple deployment and rollback
-- No sticky sessions needed
-- Failure doesn't lose state
+### Redis for Distributed Rate Limiting
 
-### 2. Redis for Rate Limiting
+Rate limiting must be consistent across all API server instances -- otherwise, a client could get N times their limit by hitting N different servers. Redis sorted sets implement the sliding window algorithm with atomic operations (`ZREMRANGEBYSCORE`, `ZADD`, `ZCARD` in a pipeline), ensuring correctness in a distributed environment.
 
-**Decision**: Centralized rate limiting in Redis
+The fail-open design means that if Redis is unreachable, rate limiting is skipped rather than blocking all traffic. This is a deliberate availability-over-consistency trade-off: a brief period without rate limiting is acceptable; blocking all API traffic because the rate limiter is down is not.
 
-**Rationale**:
-- Consistent limits across instances
-- Atomic operations
-- Fast performance
-- TTL-based cleanup
+### Two-Level Caching vs Redis-Only
 
-### 3. Circuit Breaker per Dependency
+Adding an in-memory L1 cache in front of Redis seems like premature optimization, but at 100K+ requests per second, even Redis round-trips (1-2ms each) accumulate. The 5-second L1 TTL bounds staleness while absorbing 80-90% of Redis lookups for hot keys. The trade-off is that each API server has a slightly different view of the cache for up to 5 seconds, which is acceptable for read-heavy workloads where eventual consistency is fine.
 
-**Decision**: Separate circuit breaker per external service
+### Session Auth with API Keys (Not JWT)
 
-**Rationale**:
-- Failure isolation
-- Independent recovery
-- Fine-grained control
-- Clear metrics
+Sessions stored in Redis enable immediate revocation -- deleting the session key instantly logs the user out. JWTs require either short expiry (bad UX) or a revocation list (defeats the purpose of stateless JWTs). API keys provide programmatic access with the same revocation capability via the `revoked_at` soft-delete column.
 
----
+## Consistency and Idempotency
 
-## Trade-offs Summary
+- **Resource creation** is not idempotent by default. At production scale, an idempotency key header (`X-Idempotency-Key`) would be checked against a Redis set before processing, returning the cached response for duplicate requests.
+- **API key revocation** is idempotent -- revoking an already-revoked key returns success.
+- **Rate limit counters** use Redis sorted sets with atomic pipeline operations, ensuring correct counts even under concurrent access from multiple API servers.
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Load balancing | Least connections | Round robin | Better distribution |
-| Rate limiting | Sliding window | Fixed window | Smoother limits |
-| Caching | Two-level (local + Redis) | Redis only | Latency |
-| Auth | JWT | Session | Stateless |
-| Degradation | Feature flags | All or nothing | Flexibility |
+## Observability
 
----
+- **Per-endpoint metrics**: Track request count, duration histogram (p50/p90/p99), and error count for each `method:path` combination. This identifies which specific endpoints need optimization.
+- **Cache metrics**: Hit/miss ratios for both L1 (local) and L2 (Redis) caches, enabling tuning of TTLs and cache sizing.
+- **Circuit breaker metrics**: Current state, failure count, and rejection count per dependency. Alerts when a circuit opens.
+- **Structured JSON logging** with Pino: Every log line includes `instanceId`, `requestId`, `userId`, `method`, `path`, `status`, and `duration` for filtering and correlation.
 
-## Cost Tradeoffs
+## Failure Handling
 
-This section documents cost-conscious decisions for local development and small-scale production deployments.
+- **Circuit breakers** per dependency prevent cascade failures. When a downstream service fails, requests fail fast (0ms) instead of timing out (30s), preserving thread/connection pool capacity.
+- **Graceful degradation**: When in degraded mode, expensive endpoints (`/search`, `/analytics`) return 503 while core CRUD continues working. Stale cached data is served with a `_stale: true` flag when the primary source is unavailable.
+- **Fail-open rate limiting**: Redis unavailability skips rate checks rather than blocking traffic.
+- **Connection pool limits**: PostgreSQL pool cap prevents connection exhaustion. Queue overflow returns 503 rather than crashing.
+- **Graceful shutdown**: On SIGTERM, stop accepting new connections, drain in-flight requests (5-second timeout), then close database and Redis connections.
 
-### Storage Tiering
+## Scalability Considerations
 
-| Storage Tier | Use Case | Local Dev Config | Cost Optimization |
-|--------------|----------|------------------|-------------------|
-| Hot (PostgreSQL) | Active API keys, recent logs | Default, no changes | Partition request_logs by week; drop partitions older than 30 days |
-| Warm (MinIO/S3) | Archived logs, request payloads | `minio/data` volume | Compress JSON logs with gzip before storing (80% size reduction) |
-| Cold (filesystem/glacier) | Compliance archives | `./archives/` directory | Export monthly summaries only; delete raw data after aggregation |
+### What breaks first
+1. **Single PostgreSQL instance** -- At ~10K writes/second, the single writer becomes the bottleneck. Solution: read replicas for queries, write sharding by tenant for multi-tenant deployments.
+2. **Request logs table** -- Grows unboundedly and slows down analytics queries. Solution: time-based partitioning with automated archival to object storage.
+3. **Redis memory** -- Rate limit sorted sets and cached responses compete for memory. Solution: separate Redis instances for cache (evictable) and rate limiting (non-evictable), or Redis Cluster.
+4. **Single load balancer** -- Becomes a SPOF at very high throughput. Solution: DNS-based load balancing across multiple LB instances, or cloud provider ALB.
 
-**Local Development Sizing:**
-- PostgreSQL: 1GB data limit (sufficient for ~10M request log rows)
-- MinIO: 5GB bucket limit for archived data
-- Redis: 256MB maxmemory with `allkeys-lru` eviction policy
+### Scaling path
+- **Horizontal API scaling**: Add instances behind the load balancer. Stateless design means zero coordination needed.
+- **Read replicas**: Route read-heavy endpoints to replicas, writes to primary.
+- **Request log archival**: Daily job exports logs older than 7 days to compressed object storage, then drops the partition.
+- **Cache tiering**: Increase Redis memory or add Redis Cluster nodes as cache working set grows.
+- **Queue-based processing**: Move analytics and audit logging to async RabbitMQ workers to reduce request latency.
 
-### Cache Sizing Guidelines
-
-```yaml
-# docker-compose.yml Redis configuration
-redis:
-  image: redis:7-alpine
-  command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-```
-
-**Cache allocation strategy:**
-| Cache Purpose | Memory Budget | TTL | Eviction Priority |
-|---------------|---------------|-----|-------------------|
-| Session tokens | 50MB (~100k sessions) | 24 hours | Low (keep active users) |
-| Rate limit counters | 30MB (~500k keys) | 1-5 minutes | Medium |
-| API response cache | 150MB | 5-30 minutes | High (evict first) |
-| Circuit breaker state | 1MB | N/A (no expiry) | Never evict |
-
-**Monitoring cache efficiency:**
-```bash
-# Check Redis memory usage and hit rate
-redis-cli INFO stats | grep -E "(keyspace_hits|keyspace_misses|used_memory_human)"
-
-# Target: >90% hit rate for response cache, >95% for session cache
-```
-
-### Queue Retention (RabbitMQ)
-
-| Queue | Max Length | Message TTL | Dead Letter Policy |
-|-------|------------|-------------|-------------------|
-| api.requests.async | 10,000 | 1 hour | Move to `api.requests.dlq` after 3 retries |
-| api.notifications | 5,000 | 30 minutes | Discard (notifications are ephemeral) |
-| api.analytics | 50,000 | 6 hours | Archive to MinIO on DLQ |
-
-**Local development settings:**
-```javascript
-// RabbitMQ queue declaration with limits
-await channel.assertQueue('api.requests.async', {
-  durable: true,
-  arguments: {
-    'x-max-length': 10000,           // Reject oldest when full
-    'x-message-ttl': 3600000,        // 1 hour in ms
-    'x-dead-letter-exchange': 'dlx',
-    'x-dead-letter-routing-key': 'api.requests.dlq'
-  }
-});
-```
-
-### Compute vs Storage Optimization
-
-| Scenario | Compute-Heavy Approach | Storage-Heavy Approach | Recommendation |
-|----------|------------------------|------------------------|----------------|
-| Request analytics | Aggregate on read (slower queries, less storage) | Pre-compute hourly rollups (faster queries, more storage) | Pre-compute for local dev; simpler queries |
-| Rate limit checks | Calculate from sorted set each time | Cache computed remaining quota | Compute fresh; Redis is fast enough |
-| Response caching | Compress cached responses (CPU cost) | Store uncompressed (memory cost) | Compress; memory is the constraint |
-
-**Cost summary for local development:**
-- Prioritize memory efficiency (Redis, Node.js heap)
-- Accept slightly higher CPU usage for compression
-- Use aggressive TTLs to bound storage growth
-- Prefer simple solutions over cost-optimized complexity
-
----
-
-## Data Lifecycle Policies
-
-### Retention and TTL Configuration
+## Data Lifecycle and Retention
 
 | Data Type | Hot Retention | Warm Retention | Archive/Delete |
 |-----------|---------------|----------------|----------------|
-| Request logs | 7 days in PostgreSQL | 30 days in MinIO (gzipped JSON) | Delete after 90 days |
+| Request logs | 7 days in PostgreSQL | 30 days gzipped in object storage | Delete after 90 days |
 | API keys | Indefinite (active) | N/A | Soft delete; hard delete after 1 year |
 | Rate limit data | Redis TTL (1-5 min) | N/A | Auto-expires |
 | Session tokens | Redis TTL (24 hours) | N/A | Auto-expires |
-| Metrics/timeseries | 24 hours in memory | 30 days in Prometheus | Delete after 30 days |
-
-### Automated Archival Process
-
-**Daily archival job (runs at 2 AM local time):**
-
-```javascript
-// src/jobs/archive-logs.js
-class LogArchiver {
-  async run() {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - 7);
-
-    // 1. Export old logs to JSONL format
-    const logs = await this.db.query(`
-      SELECT * FROM request_logs
-      WHERE created_at < $1
-      ORDER BY created_at
-      LIMIT 100000
-    `, [cutoffDate]);
-
-    if (logs.rows.length === 0) return;
-
-    // 2. Compress and upload to MinIO
-    const filename = `logs/${cutoffDate.toISOString().split('T')[0]}.jsonl.gz`;
-    const compressed = await gzip(logs.rows.map(JSON.stringify).join('\n'));
-    await this.minio.putObject('archives', filename, compressed);
-
-    // 3. Delete archived rows
-    await this.db.query(`
-      DELETE FROM request_logs
-      WHERE id = ANY($1)
-    `, [logs.rows.map(r => r.id)]);
-
-    console.log(`Archived ${logs.rows.length} logs to ${filename}`);
-  }
-}
-```
-
-**Cron configuration for local development:**
-```bash
-# Add to crontab or use node-cron
-# Run archival daily at 2 AM
-0 2 * * * cd /path/to/scalable-api && node src/jobs/archive-logs.js
-
-# Run partition maintenance weekly
-0 3 * * 0 cd /path/to/scalable-api && node src/jobs/drop-old-partitions.js
-```
-
-### Partition Management (PostgreSQL)
-
-```sql
--- Create partitioned request_logs table
-CREATE TABLE request_logs (
-  id UUID DEFAULT gen_random_uuid(),
-  request_id VARCHAR(36) NOT NULL,
-  api_key_id UUID,
-  method VARCHAR(10) NOT NULL,
-  path VARCHAR(500) NOT NULL,
-  status_code INTEGER NOT NULL,
-  duration_ms INTEGER NOT NULL,
-  ip_address INET,
-  created_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
-
--- Create weekly partitions (run in migration or setup script)
-CREATE TABLE request_logs_2025_w01 PARTITION OF request_logs
-  FOR VALUES FROM ('2025-01-01') TO ('2025-01-08');
-
--- Auto-create future partitions (run weekly via cron)
--- src/db/migrations/create-partition.sql
-DO $$
-DECLARE
-  partition_date DATE := date_trunc('week', NOW() + interval '1 week');
-  partition_name TEXT := 'request_logs_' || to_char(partition_date, 'YYYY_"w"IW');
-  start_date DATE := partition_date;
-  end_date DATE := partition_date + interval '1 week';
-BEGIN
-  EXECUTE format(
-    'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_logs FOR VALUES FROM (%L) TO (%L)',
-    partition_name, start_date, end_date
-  );
-END $$;
-
--- Drop partitions older than 30 days (run weekly)
--- src/db/migrations/drop-old-partitions.sql
-DO $$
-DECLARE
-  cutoff_date DATE := NOW() - interval '30 days';
-  partition_record RECORD;
-BEGIN
-  FOR partition_record IN
-    SELECT tablename FROM pg_tables
-    WHERE tablename LIKE 'request_logs_%'
-    AND schemaname = 'public'
-  LOOP
-    -- Extract date from partition name and drop if older than cutoff
-    IF partition_record.tablename < 'request_logs_' || to_char(cutoff_date, 'YYYY_"w"IW') THEN
-      EXECUTE 'DROP TABLE IF EXISTS ' || partition_record.tablename;
-      RAISE NOTICE 'Dropped partition: %', partition_record.tablename;
-    END IF;
-  END LOOP;
-END $$;
-```
-
-### Backfill and Replay Procedures
-
-**Scenario 1: Replay archived logs for debugging**
-```bash
-#!/bin/bash
-# scripts/replay-logs.sh
-
-# Download and decompress archived logs
-aws s3 cp s3://archives/logs/2025-01-15.jsonl.gz - | gunzip > /tmp/logs.jsonl
-
-# Replay to a separate analysis table
-psql $DATABASE_URL -c "CREATE TABLE IF NOT EXISTS request_logs_replay (LIKE request_logs);"
-
-# Import using COPY
-cat /tmp/logs.jsonl | jq -r '[.request_id, .method, .path, .status_code, .duration_ms, .created_at] | @csv' \
-  | psql $DATABASE_URL -c "COPY request_logs_replay(request_id, method, path, status_code, duration_ms, created_at) FROM STDIN WITH CSV"
-```
-
-**Scenario 2: Backfill missing analytics data**
-```javascript
-// src/jobs/backfill-analytics.js
-async function backfillHourlyStats(startDate, endDate) {
-  const hours = [];
-  let current = new Date(startDate);
-
-  while (current < endDate) {
-    const hourStart = new Date(current);
-    const hourEnd = new Date(current.getTime() + 3600000);
-
-    const stats = await db.query(`
-      SELECT
-        date_trunc('hour', created_at) as hour,
-        COUNT(*) as total_requests,
-        AVG(duration_ms) as avg_duration,
-        COUNT(*) FILTER (WHERE status_code >= 500) as error_count
-      FROM request_logs
-      WHERE created_at >= $1 AND created_at < $2
-      GROUP BY 1
-    `, [hourStart, hourEnd]);
-
-    if (stats.rows[0]) {
-      await db.query(`
-        INSERT INTO hourly_stats (hour, total_requests, avg_duration_ms, error_count)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (hour) DO UPDATE SET
-          total_requests = EXCLUDED.total_requests,
-          avg_duration_ms = EXCLUDED.avg_duration_ms,
-          error_count = EXCLUDED.error_count
-      `, [stats.rows[0].hour, stats.rows[0].total_requests,
-          stats.rows[0].avg_duration, stats.rows[0].error_count]);
-    }
-
-    current = hourEnd;
-  }
-}
-```
-
----
-
-## Deployment and Operations
-
-### Rollout Strategy
-
-**Local Development (2-3 instances):**
-
-1. **Blue-Green Deployment Simulation**
-   ```bash
-   # Step 1: Start new version on alternate ports
-   PORT=3011 npm run dev:server1 &  # New version
-   PORT=3012 npm run dev:server2 &  # New version
-
-   # Step 2: Update load balancer config to point to new ports
-   # Edit backend/load-balancer/src/config.js
-   # Change: servers: ['localhost:3001', 'localhost:3002']
-   # To:     servers: ['localhost:3011', 'localhost:3012']
-
-   # Step 3: Reload load balancer (send SIGHUP or restart)
-   kill -HUP $(pgrep -f "load-balancer")
-
-   # Step 4: Verify new version is serving traffic
-   curl http://localhost:3000/api/v1/health | jq '.version'
-
-   # Step 5: Stop old instances
-   kill $(pgrep -f "PORT=3001")
-   kill $(pgrep -f "PORT=3002")
-   ```
-
-2. **Rolling Deployment (zero-downtime)**
-   ```bash
-   #!/bin/bash
-   # scripts/rolling-deploy.sh
-
-   SERVERS=("3001" "3002" "3003")
-
-   for PORT in "${SERVERS[@]}"; do
-     echo "Deploying to server on port $PORT..."
-
-     # Remove from load balancer
-     curl -X POST "http://localhost:3000/admin/servers/$PORT/drain"
-     sleep 5  # Wait for in-flight requests
-
-     # Restart with new code
-     kill $(pgrep -f "PORT=$PORT")
-     PORT=$PORT npm run dev:server &
-     sleep 3  # Wait for startup
-
-     # Health check
-     until curl -s "http://localhost:$PORT/health" | grep -q "ok"; do
-       sleep 1
-     done
-
-     # Add back to load balancer
-     curl -X POST "http://localhost:3000/admin/servers/$PORT/enable"
-     echo "Server $PORT deployed successfully"
-   done
-   ```
-
-3. **Canary Deployment**
-   ```javascript
-   // Load balancer canary configuration
-   const servers = [
-     { address: 'localhost:3001', weight: 90, version: 'stable' },
-     { address: 'localhost:3002', weight: 90, version: 'stable' },
-     { address: 'localhost:3003', weight: 10, version: 'canary' }  // 5% traffic
-   ];
-
-   // Monitor canary metrics for 15 minutes before proceeding
-   // Check: error rate, latency p99, circuit breaker trips
-   ```
-
-### Schema Migration Procedures
-
-**Migration file structure:**
-```
-backend/src/db/migrations/
-  001_initial_schema.sql
-  002_add_api_keys.sql
-  003_partition_request_logs.sql
-  004_add_rate_limit_configs.sql
-```
-
-**Migration runner:**
-```javascript
-// src/db/migrate.js
-const fs = require('fs');
-const path = require('path');
-const { Pool } = require('pg');
-
-async function migrate() {
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-
-  // Create migrations tracking table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      filename VARCHAR(255) NOT NULL,
-      applied_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  // Get applied migrations
-  const { rows: applied } = await pool.query(
-    'SELECT version FROM schema_migrations ORDER BY version'
-  );
-  const appliedVersions = new Set(applied.map(r => r.version));
-
-  // Find pending migrations
-  const migrationsDir = path.join(__dirname, 'migrations');
-  const files = fs.readdirSync(migrationsDir)
-    .filter(f => f.endsWith('.sql'))
-    .sort();
-
-  for (const file of files) {
-    const version = parseInt(file.split('_')[0]);
-    if (appliedVersions.has(version)) continue;
-
-    console.log(`Applying migration: ${file}`);
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query(
-        'INSERT INTO schema_migrations (version, filename) VALUES ($1, $2)',
-        [version, file]
-      );
-      await client.query('COMMIT');
-      console.log(`Applied: ${file}`);
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error(`Failed to apply ${file}:`, error.message);
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  await pool.end();
-  console.log('Migrations complete');
-}
-
-migrate().catch(console.error);
-```
-
-**Safe migration practices:**
-```sql
--- 003_partition_request_logs.sql
--- Step 1: Create new partitioned table (non-blocking)
-CREATE TABLE request_logs_new (
-  LIKE request_logs INCLUDING ALL
-) PARTITION BY RANGE (created_at);
-
--- Step 2: Create initial partition
-CREATE TABLE request_logs_new_current PARTITION OF request_logs_new
-  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
-
--- Step 3: Copy data in batches (run separately, not in migration)
--- INSERT INTO request_logs_new SELECT * FROM request_logs WHERE created_at >= '2025-01-01';
-
--- Step 4: Swap tables (brief lock)
-BEGIN;
-ALTER TABLE request_logs RENAME TO request_logs_old;
-ALTER TABLE request_logs_new RENAME TO request_logs;
-COMMIT;
-
--- Step 5: Drop old table after verification (run manually)
--- DROP TABLE request_logs_old;
-```
-
-### Rollback Runbooks
-
-**Runbook 1: Application Rollback**
-```markdown
-## Application Rollback Procedure
-
-**Trigger conditions:**
-- Error rate > 5% for 5 minutes
-- P99 latency > 1 second for 5 minutes
-- Circuit breaker open on critical dependency
-
-**Steps:**
-
-1. **Immediate: Switch traffic to previous version**
-   ```bash
-   # If using blue-green
-   ./scripts/switch-to-blue.sh
-
-   # If using rolling deployment
-   git checkout HEAD~1
-   ./scripts/rolling-deploy.sh
-   ```
-
-2. **Verify rollback success**
-   ```bash
-   curl http://localhost:3000/api/v1/health | jq
-   # Check: version matches previous, status is "ok"
-
-   # Monitor error rate
-   curl http://localhost:3000/metrics | grep http_errors_total
-   ```
-
-3. **Post-rollback actions**
-   - Alert team in Slack: #api-incidents
-   - Create incident ticket
-   - Preserve logs: `docker-compose logs > incident-$(date +%s).log`
-```
-
-**Runbook 2: Database Rollback**
-```markdown
-## Database Migration Rollback
-
-**Before every migration, create a restore point:**
-```bash
-pg_dump $DATABASE_URL > backup-$(date +%Y%m%d-%H%M%S).sql
-```
-
-**Rollback steps:**
-
-1. **Stop all API servers**
-   ```bash
-   ./scripts/stop-all-servers.sh
-   ```
-
-2. **Restore from backup**
-   ```bash
-   # Drop current database
-   psql $DATABASE_URL -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-
-   # Restore from backup
-   psql $DATABASE_URL < backup-20250115-143022.sql
-   ```
-
-3. **Remove failed migration record**
-   ```bash
-   psql $DATABASE_URL -c "DELETE FROM schema_migrations WHERE version = 4;"
-   ```
-
-4. **Deploy previous application version**
-   ```bash
-   git checkout HEAD~1
-   ./scripts/rolling-deploy.sh
-   ```
-
-5. **Verify system health**
-   ```bash
-   npm run test:integration
-   ```
-```
-
-**Runbook 3: Cache Corruption Recovery**
-```markdown
-## Redis Cache Recovery
-
-**Symptoms:**
-- Stale data being served
-- Inconsistent responses between requests
-- Session authentication failures
-
-**Steps:**
-
-1. **Flush specific cache namespace**
-   ```bash
-   redis-cli KEYS "cache:*" | xargs redis-cli DEL
-   # Or for sessions:
-   redis-cli KEYS "session:*" | xargs redis-cli DEL
-   ```
-
-2. **Full cache flush (nuclear option)**
-   ```bash
-   redis-cli FLUSHDB
-   ```
-
-3. **Verify cache rebuild**
-   ```bash
-   # Make test requests and verify cache population
-   curl http://localhost:3000/api/v1/users/1
-   redis-cli GET "cache:user:1"
-   ```
-
-4. **Monitor cache hit rate recovery**
-   ```bash
-   watch 'redis-cli INFO stats | grep keyspace'
-   ```
-```
-
-**Runbook 4: Queue Backlog Recovery**
-```markdown
-## RabbitMQ Queue Recovery
-
-**Symptoms:**
-- Queue depth > 10,000 messages
-- Consumer lag > 1 hour
-- Dead letter queue growing
-
-**Steps:**
-
-1. **Assess queue state**
-   ```bash
-   rabbitmqctl list_queues name messages consumers
-   ```
-
-2. **Scale up consumers temporarily**
-   ```bash
-   # Start additional consumer processes
-   for i in {1..5}; do
-     CONSUMER_ID=$i node src/workers/async-processor.js &
-   done
-   ```
-
-3. **If messages are stale, purge queue**
-   ```bash
-   # Purge specific queue (data loss!)
-   rabbitmqctl purge_queue api.requests.async
-
-   # Move DLQ messages back to main queue for retry
-   rabbitmqctl shovel -p / -s "amqp://" -d "amqp://" \
-     -src-queue api.requests.dlq -dest-queue api.requests.async
-   ```
-
-4. **Prevent recurrence**
-   - Review consumer error logs
-   - Check for slow downstream dependencies
-   - Consider adding circuit breaker to consumer
-```
-
-### Health Check Endpoints
-
-```javascript
-// src/routes/health.js
-router.get('/health', async (req, res) => {
-  const checks = {
-    status: 'ok',
-    version: process.env.APP_VERSION || 'dev',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    checks: {}
-  };
-
-  // Database check
-  try {
-    await db.query('SELECT 1');
-    checks.checks.database = { status: 'ok' };
-  } catch (error) {
-    checks.checks.database = { status: 'error', message: error.message };
-    checks.status = 'degraded';
-  }
-
-  // Redis check
-  try {
-    await redis.ping();
-    checks.checks.redis = { status: 'ok' };
-  } catch (error) {
-    checks.checks.redis = { status: 'error', message: error.message };
-    checks.status = 'degraded';
-  }
-
-  // RabbitMQ check
-  try {
-    const channel = await rabbitmq.createChannel();
-    await channel.close();
-    checks.checks.rabbitmq = { status: 'ok' };
-  } catch (error) {
-    checks.checks.rabbitmq = { status: 'error', message: error.message };
-    checks.status = 'degraded';
-  }
-
-  const statusCode = checks.status === 'ok' ? 200 : 503;
-  res.status(statusCode).json(checks);
-});
-
-// Liveness probe (for container orchestration)
-router.get('/health/live', (req, res) => {
-  res.status(200).json({ status: 'alive' });
-});
-
-// Readiness probe (for load balancer)
-router.get('/health/ready', async (req, res) => {
-  try {
-    await db.query('SELECT 1');
-    await redis.ping();
-    res.status(200).json({ status: 'ready' });
-  } catch (error) {
-    res.status(503).json({ status: 'not ready', error: error.message });
-  }
-});
-```
-
----
+| System metrics | 24 hours in memory | 30 days in Prometheus | Delete after 30 days |
+
+The 7-day hot retention covers most production debugging (issues are typically found within 48 hours). The 30-day warm tier in compressed object storage handles billing disputes and delayed customer complaints. The 90-day cold limit meets common compliance requirements (PCI-DSS, SOC2).
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Load balancing | Least connections | Round-robin | Routes around slow servers naturally |
+| Rate limiting | Sliding window (Redis) | Fixed window | Smoother throttling, no burst-then-starve |
+| Caching | Two-level (local + Redis) | Redis only | Eliminates 80-90% of Redis round-trips for hot data |
+| Auth | Session + API keys | JWT | Immediate revocation, simpler key management |
+| Degradation | Feature-flag based | All or nothing | Core CRUD survives when non-essential features fail |
+| Request logs | Partitioned + archived | Single table | Enables fast queries and O(1) partition drops |
 
 ## Implementation Notes
 
-This section explains the WHY behind key implementation decisions, connecting code choices to system design principles.
-
-### WHY Caching Reduces Backend Load
-
-**Problem**: Without caching, every API request hits the database, creating a bottleneck that limits scalability.
-
-**Solution**: Two-level caching (local + Redis) dramatically reduces database load.
+### Local Setup Diagram
 
 ```
-Request Flow (without cache):
-  Client -> API -> Database -> API -> Client
-  Latency: 50-200ms per request
-  Database load: 100% of requests
-
-Request Flow (with cache):
-  Client -> API -> Local Cache (hit) -> Client
-  Latency: <1ms (local hit)
-  Database load: Only cache misses (~5-10% of requests)
+┌───────────────────┐
+│  React Frontend   │
+│  (Vite :5173)     │
+│                   │
+│  Admin Dashboard  │
+│  Zustand stores   │
+│  TanStack Router  │
+└────────┬──────────┘
+         │
+         ▼
+┌────────────────────┐
+│  API Gateway       │
+│  (Express :8080)   │
+│  Rate limiting     │
+│  Auth middleware    │
+│  Request logging   │
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐     ┌────────────┐  ┌────────────┐  ┌────────────┐
+│  Load Balancer     │────▶│ API Server │  │ API Server │  │ API Server │
+│  (Express :3000)   │     │   :3001    │  │   :3002    │  │   :3003    │
+│  Least connections │     │  (api-1)   │  │  (api-2)   │  │  (api-3)   │
+│  Health checks     │     │  L1 Cache  │  │  L1 Cache  │  │  L1 Cache  │
+│  Circuit breakers  │     │  Metrics   │  │  Metrics   │  │  Metrics   │
+└────────────────────┘     └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+                                 │               │               │
+                                 └───────────────┼───────────────┘
+                                                 │
+                                 ┌───────────────┼───────────────┐
+                                 ▼                               ▼
+                          ┌─────────────┐                 ┌─────────────┐
+                          │ PostgreSQL  │                 │    Redis    │
+                          │   :5432     │                 │   :6379     │
+                          │ scalable_api│                 │ (cache +    │
+                          │  (6 tables) │                 │  rate limit │
+                          └─────────────┘                 │  + sessions)│
+                                                          └─────────────┘
 ```
 
-**Implementation** (`backend/shared/services/cache.js`):
-- **Local cache (L1)**: 5-second TTL, eliminates Redis round-trips for hot data
-- **Redis cache (L2)**: Configurable TTL, shared across all API instances
-- **Cache-aside pattern**: `getOrFetch()` automatically populates cache on miss
-- **Invalidation**: Pattern-based invalidation on writes (`invalidate('resources:list:*')`)
+Five backend processes run simultaneously via `concurrently`: the gateway (:8080), the load balancer (:3000), and three API server instances (:3001, :3002, :3003). This simulates a real distributed deployment on a single machine.
 
-**Cost-benefit**:
-- 256MB Redis cache costs ~$5/month (managed) vs. scaling database ($100+/month)
-- 90%+ cache hit rate reduces P99 latency from 200ms to <10ms
-- Horizontal scaling works because all instances share Redis cache
+### Production-Grade Patterns Implemented
 
-### WHY Request Retention Balances Debugging vs Storage
+| Pattern | File Path | Purpose |
+|---------|-----------|---------|
+| Two-level cache | `shared/services/cache.ts` | Local L1 (5s TTL) + Redis L2 with cache-aside `getOrFetch()` |
+| Sliding window rate limiter | `shared/services/rate-limiter.ts` | Redis sorted sets for distributed, per-tier rate limiting |
+| Circuit breaker | `shared/services/circuit-breaker.ts` | Per-dependency failure isolation with closed/open/half-open states |
+| Structured logging | `shared/services/logger.ts` | Pino JSON logs with request ID, instance ID, user ID correlation |
+| Per-endpoint metrics | `shared/services/metrics.ts` | Latency percentiles, request counts, cache hit ratios |
+| Health checks | `gateway/src/index.ts`, `load-balancer/src/index.ts` | `/health` and `/ready` endpoints verifying DB + Redis connectivity |
+| Request ID propagation | `shared/middleware/common.ts` | `X-Request-ID` header generation and forwarding across services |
+| Data retention | `shared/services/retention.ts` | Configurable hot/warm/cold lifecycle for request logs |
+| Load balancing | `load-balancer/src/index.ts` | Least-connections with per-server circuit breakers and dynamic weights |
+| Gzip compression | `gateway/src/index.ts` | Response compression for bandwidth reduction |
 
-**Problem**: Keeping all request logs forever is expensive; deleting them immediately makes debugging impossible.
+### What Was Simplified
 
-**Solution**: Tiered retention with automatic archival balances these needs.
+| Production Design | Local Substitute | Impact |
+|-------------------|------------------|--------|
+| NGINX/HAProxy load balancer | Custom Express load balancer | Fewer features, lower throughput ceiling |
+| Redis Cluster | Single Redis instance | No HA, single point of failure |
+| PostgreSQL primary + replicas | Single PostgreSQL instance | No read/write split |
+| Prometheus + Grafana dashboards | In-memory metrics with `/metrics` endpoint | No persistent metric storage or alerting |
+| API key auth with SHA-256 | Session auth with SHA-256 passwords | Simpler, no API key generation UI |
+| Distributed tracing (Jaeger/Zipkin) | Request ID propagation only | No trace visualization or span analysis |
+| Automated partition management | Manual schema.sql | No auto-creation/dropping of partitions |
 
-**Implementation** (`backend/shared/config/index.js`, `backend/shared/services/retention.js`):
+### What Was Omitted
 
-```javascript
-retention: {
-  requestLogs: {
-    hot: 7,    // 7 days in PostgreSQL - fast queries for recent debugging
-    warm: 30,  // 30 days compressed in object storage - investigation capability
-    cold: 90,  // 90 days before permanent deletion - compliance buffer
-  }
-}
-```
-
-**Why these specific values**:
-- **7 days hot**: Most production issues are debugged within 48 hours; 7 days covers weekly patterns
-- **30 days warm**: Covers monthly billing cycles and delayed customer complaints
-- **90 days cold**: Meets common compliance requirements (PCI-DSS, SOC2) without excessive storage
-
-**Storage cost comparison** (10M requests/day):
-- Hot (PostgreSQL): ~10GB/week = $50/month managed
-- Warm (compressed S3): ~2GB/month = $0.05/month
-- Without tiering: ~40GB/month in PostgreSQL = $200/month
-
-### WHY Per-Endpoint Metrics Enable Optimization
-
-**Problem**: Aggregate metrics hide which endpoints need optimization.
-
-**Solution**: Track latency percentiles per endpoint to identify bottlenecks.
-
-**Implementation** (`backend/shared/services/metrics.js`):
-
-```javascript
-// Per-endpoint tracking
-trackEndpointLatency(method, path, duration) {
-  const key = `${method}:${normalizedPath}`;
-  // Track p50, p90, p99 for each endpoint
-}
-
-// Identify slow endpoints
-getSlowEndpoints(thresholdMs = 500) {
-  // Returns endpoints where p90 > threshold
-}
-```
-
-**Why this matters**:
-- **SLO monitoring**: Different endpoints may have different latency SLOs
-  - `/api/v1/status`: P99 < 50ms (simple health check)
-  - `/api/v1/resources`: P99 < 200ms (cached list query)
-  - `/api/v1/search`: P99 < 500ms (complex query)
-- **Optimization targeting**: Focus effort on endpoints with highest impact
-- **Capacity planning**: Understand which endpoints drive load
-- **Anomaly detection**: Alert when specific endpoint latency spikes
-
-**Prometheus metrics exposed** (`/metrics`):
-```
-http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.5"} 12
-http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.9"} 45
-http_request_duration_ms{method="GET",path="/api/v1/resources",quantile="0.99"} 120
-```
-
-### WHY Circuit Breakers Prevent Cascade Failures
-
-**Problem**: When a downstream service fails, requests pile up, exhausting resources.
-
-```
-Failure cascade without circuit breaker:
-  Service A -> Service B (slow/failing)
-  A's threads block waiting for B's timeout
-  A exhausts its thread pool
-  A starts failing
-  Services calling A fail
-  System-wide outage
-```
-
-**Solution**: Circuit breakers "fail fast" when a downstream service is unhealthy.
-
-**Implementation** (`backend/shared/services/circuit-breaker.js`):
-
-```javascript
-// Three states:
-// CLOSED: Normal operation, requests pass through
-// OPEN: Service is down, requests fail immediately
-// HALF-OPEN: Testing if service recovered
-
-const breaker = new CircuitBreaker('payment-service', {
-  failureThreshold: 5,     // Open after 5 failures
-  resetTimeout: 30000,     // Try again after 30 seconds
-  halfOpenRequests: 3,     // 3 successes to close
-});
-```
-
-**Why these default values**:
-- **5 failures**: Tolerates transient errors while catching real outages
-- **30 second reset**: Gives failing service time to recover without constant probing
-- **3 half-open successes**: Ensures recovery is stable before resuming full traffic
-
-**Benefits**:
-- **Fast failure**: 0ms latency vs. 30-second timeout
-- **Resource protection**: No thread/connection pool exhaustion
-- **Graceful degradation**: Return cached data or error message instead of hanging
-- **Automatic recovery**: Half-open state tests recovery without overwhelming service
-
-**Metrics recorded**:
-```
-circuit_breaker_state{name="external-service"} 0  # 0=closed, 1=half-open, 2=open
-circuit_breaker_failures{name="external-service"} 3
-circuit_breaker_rejects_total{name="external-service"} 150
-```
-
-### WHY Structured JSON Logging with Pino
-
-**Problem**: Console.log statements are hard to parse, search, and correlate.
-
-**Solution**: Structured JSON logging with request correlation.
-
-**Implementation** (`backend/shared/services/logger.js`):
-
-```javascript
-// Every log line includes:
-{
-  "level": "info",
-  "time": "2025-01-16T10:30:00.000Z",
-  "instanceId": "api-1",
-  "requestId": "abc-123",
-  "userId": "user-456",
-  "method": "GET",
-  "path": "/api/v1/resources",
-  "status": 200,
-  "duration": 45,
-  "msg": "Request completed"
-}
-```
-
-**Why this matters**:
-- **Correlation**: Filter all logs for a single request across services using `requestId`
-- **Alerting**: Query for `status >= 500` or `duration > 1000`
-- **Debugging**: Find all requests from a specific user with `userId`
-- **Performance**: Pino is 5x faster than Winston, critical at high throughput
-
-**Log aggregation query examples** (Elasticsearch/Loki):
-```
-# Find slow requests
-duration > 1000 AND level = "warn"
-
-# Find all logs for a user session
-userId = "user-456" AND requestId = "abc-123"
-
-# Error rate by endpoint
-level = "error" | stats count by path
-```
+- CDN and edge caching
+- TLS/HTTPS termination (plaintext HTTP locally)
+- Multi-region deployment
+- Kubernetes orchestration with liveness/readiness probes
+- Distributed tracing backend (Jaeger/Zipkin)
+- Alerting rules and PagerDuty/Slack integration
+- Automated canary and blue-green deployments
+- Log aggregation (Elasticsearch/Loki)
+- RabbitMQ async processing (dependency in package.json but not fully wired)
+- Load testing scripts (k6/Artillery)
