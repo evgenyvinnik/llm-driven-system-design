@@ -556,6 +556,166 @@ At 10x scale (1M metrics/sec):
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Navbar (components/Navbar.tsx)
+│   └── Navigation links (Dashboards, Alerts, Metrics Explorer)
+├── AlertBanner (components/AlertBanner.tsx)
+│   └── Persistent banner showing currently firing alerts
+├── index.tsx (Dashboard List)
+│   └── Dashboard cards with name, description, create/delete actions
+├── dashboard.$dashboardId.tsx (Dashboard View)
+│   ├── TimeRangeSelector (components/TimeRangeSelector.tsx)
+│   │   └── Preset buttons (15m, 1h, 6h, 24h, 7d) + refresh interval
+│   └── DashboardGrid (components/DashboardGrid.tsx)
+│       └── DashboardPanel (components/DashboardPanel.tsx) [repeated per panel]
+│           ├── PanelChart (line, area, bar via Recharts)
+│           ├── GaugePanel (radial gauge visualization)
+│           └── StatPanel (single large number with label)
+├── alerts.tsx (Alert Management)
+│   ├── AlertRuleForm (components/alerts/AlertRuleForm.tsx)
+│   │   └── Form for creating rules: metric, condition, threshold, severity
+│   ├── AlertRuleList (components/alerts/AlertRuleList.tsx)
+│   │   └── AlertRuleCard (components/alerts/AlertRuleCard.tsx) [repeated]
+│   │       └── Rule summary, enable/disable toggle, evaluate, delete
+│   └── AlertHistoryTable (components/alerts/AlertHistoryTable.tsx)
+│       └── Table of alert instances with status, value, timestamps
+├── metrics.tsx (Metrics Explorer)
+│   └── Metric name selector, tag filter, time range, query results chart
+```
+
+### Zustand Stores
+
+The frontend uses two Zustand stores:
+
+**`useDashboardStore`** (`stores/dashboardStore.ts`) -- Manages dashboard UI state: the list of all dashboards, the currently selected dashboard, the active time range (default: `1h`), the auto-refresh interval (default: 10 seconds / 10000ms), and loading/error states. This store holds UI state only -- it does not make API calls directly. Instead, route components fetch data via the API module and push results into the store via `setDashboards` and `setCurrentDashboard`.
+
+**`useAlertStore`** (`stores/alertStore.ts`) -- Manages alert-related state: alert rules, alert instances (firing and historical), currently firing alerts (filtered subset), and loading/error states. Like the dashboard store, it provides setters for data pushed in by the `useAlerts` hook rather than making API calls itself.
+
+### Custom Hooks
+
+**`useAlerts`** (`hooks/useAlerts.ts`) -- A custom React hook that encapsulates all alert data fetching and CRUD operations. On mount, it fetches alert rules and instances in parallel via `Promise.all`, then sets up a 30-second polling interval for live updates. It exposes `createRule`, `deleteRule`, `toggleRule` (enable/disable), and `evaluateRule` (manual test) actions. Each mutation triggers a full data re-fetch to ensure consistency. This hook owns the loading and error state independently from the Zustand store, giving the alerts page self-contained data management.
+
+### Routing
+
+The frontend uses TanStack Router with file-based routing:
+
+- `/` -- Dashboard list page showing all accessible dashboards with create/delete actions
+- `/dashboard/$dashboardId` -- Dashboard view with time range selector and panel grid (dynamic route segment)
+- `/alerts` -- Alert rule management with creation form, rule list, and firing history
+- `/metrics` -- Metrics explorer for ad-hoc querying and visualization
+
+The root layout renders the `Navbar` and `AlertBanner` above all child routes. The `AlertBanner` is always visible across all pages, providing persistent visibility of firing alerts regardless of which page the user is on.
+
+### Data Fetching
+
+API communication uses a function-based module (`services/api.ts`) rather than a class. Each function is independently importable and typed:
+
+- **Dashboard API**: `getDashboards`, `getDashboard`, `createDashboard`, `updateDashboard`, `deleteDashboard`
+- **Panel API**: `createPanel`, `updatePanel`, `deletePanel`, `getPanelData` (fetches time-series data for rendering)
+- **Metrics API**: `queryMetrics`, `getMetricNames`, `getMetricDefinitions`, `getMetricLatest`, `getMetricStats`, `ingestMetrics`
+- **Alerts API**: `getAlertRules`, `createAlertRule`, `updateAlertRule`, `deleteAlertRule`, `getAlertInstances`, `evaluateAlertRule`
+
+All functions use a shared `fetchJson` wrapper that handles JSON serialization, error extraction, and 204 No Content responses. The dashboard view page uses the `refreshInterval` from the dashboard store to set up periodic re-fetching of panel data, implementing the 10-second polling described in the architecture.
+
+### Key UI Patterns
+
+- **Polling-based refresh**: The dashboard view polls for panel data at the interval set in the dashboard store (default 10 seconds). This matches the architecture decision to use HTTP polling over WebSocket. Each poll benefits from Redis query caching on the backend.
+- **Time range as global state**: The `TimeRangeSelector` component updates the dashboard store's `timeRange`, which all panels read from. Changing the time range triggers a re-fetch of all panel data simultaneously, providing a synchronized view across all visualizations.
+- **Multiple chart types**: Panels support five visualization types: `line` (time-series trends), `area` (filled time-series), `bar` (comparison), `gauge` (radial progress toward a threshold), and `stat` (single large number). The `DashboardPanel` component dispatches to `PanelChart`, `GaugePanel`, or `StatPanel` based on the panel's `panel_type` field.
+- **Persistent alert banner**: The `AlertBanner` component sits between the navbar and content area on every page. When alerts are firing, it displays a warning banner that cannot be dismissed by navigation. This ensures operators are always aware of active incidents.
+- **Alert evaluation feedback**: The `evaluateRule` action in the `useAlerts` hook manually triggers alert evaluation on the backend and displays the result (should_fire + current_value) via a browser alert dialog. This enables testing alert rules against live data without waiting for the periodic evaluation cycle.
+- **Separated state ownership**: Dashboard and alert stores hold only UI state (selections, lists, flags), while data fetching logic lives in route components and the `useAlerts` hook. This separation keeps stores simple and testable.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X create a dashboard?" the system checks "does user X have a role that includes the create-dashboard permission?"
+
+In this project, there are three roles: `viewer`, `editor`, and `admin`. Viewers can see dashboards and query metrics but cannot change anything. Editors can create and edit their own dashboards and alert rules. Admins have full control including user management and system configuration. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation.
+
+The key advantage over per-user permission lists is simplicity: with thousands of monitoring users, you manage 3 role definitions instead of per-user ACLs. The `editor` role also includes ownership checks -- editors can only modify dashboards they created, not dashboards owned by other editors. This combines role-based and resource-based authorization for finer-grained control without per-user complexity.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
+
+In this project, cache-aside is used for query results with a two-tier TTL strategy: live data (queries covering the last hour) gets a 10-second TTL because the data changes rapidly, while historical data (queries for time ranges older than one hour) gets a 5-minute TTL because the data is immutable. Cache keys are deterministic SHA-256 hashes of the query parameters, ensuring identical queries always hit the same cache entry.
+
+With 5K queries/second from dashboards polling every 10 seconds, caching provides a 10-100x reduction in database load. Multiple dashboards displaying the same metric at the same time range all share a single cached result. The trade-off is that live data may be up to 10 seconds stale, but for a monitoring system where dashboards refresh every 10 seconds, this staleness is invisible.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
+
+The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If failures exceed a configured threshold (40% error rate in this project), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service, returning an error or fallback response. After a configured timeout (60 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
+
+In this project, circuit breakers (via the Opossum library) wrap database queries and external notification endpoints (webhooks for alert notifications). Separate breakers are used for different operation types (query, ingest, dashboard CRUD). When the database is slow or unreachable, the query circuit breaker opens and dashboard panels show an error state rather than timing out. This prevents slow queries from accumulating and exhausting the connection pool. The ingestion path has its own breaker so that query failures do not affect metric ingestion, and vice versa.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('Query took 2.5s for metric cpu_usage')`, structured logging produces `{"level":"warn","metric":"cpu_usage","queryDuration":2500,"timeRange":"7d","timestamp":"..."}`.
+
+This project uses Pino with pino-http for automatic request logging. Every HTTP request generates a log entry with method, path, status code, duration, and user ID. Health check requests (`/health/*`) are filtered from logs to reduce noise -- on a 10-second polling interval, health check logs would overwhelm actual operational data. Log levels are assigned by severity: `error` for unhandled exceptions, `warn` for rate limit hits and slow queries (>2s), `info` for request completions, `debug` for query plans and cache operations.
+
+A dashboarding system monitoring itself is a meta-scenario where good logging is especially important. When a dashboard query is slow, the structured log entry contains the exact metric name, time range, and query duration, enabling direct correlation with the performance issue the dashboard is trying to visualize.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
+
+This project's self-monitoring aspect is unique: the dashboarding system uses the same metrics infrastructure it provides to its users. The three main metric types are:
+- **Counters**: Values that only go up (e.g., `ingest_requests_total`, `ingest_points_total`, `cache_hits_total`). Useful for computing rates (ingestion throughput, cache hit ratio).
+- **Histograms**: Track the distribution of values (e.g., `ingest_latency_seconds`, `query_latency_seconds`). Enable percentile monitoring -- "are 95% of queries completing within 500ms?"
+- **Gauges**: Values that go up or down (e.g., `queue_depth`, `db_connections_active`, `alerts_firing`). Show current state -- for example, connection pool saturation.
+
+The `db_connections_active`, `idle`, and `total` gauges provide visibility into connection pool health, which is critical for a system that handles both high-throughput ingestion writes and concurrent query reads on the same database pool.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and ensures fair resource distribution.
+
+This project implements rate limiting using Redis sorted sets for a sliding window algorithm. Unlike fixed window counters (which can allow burst traffic at window boundaries), sliding windows count requests over a continuously moving time window:
+- Ingestion: 10,000 requests/minute per IP (high limit because agents send frequent metric batches)
+- Query API: 100 requests/minute per user (prevents expensive queries from monopolizing database resources)
+- Login: 5 attempts/minute per IP with lockout (brute force protection)
+
+The sliding window works by storing each request's timestamp in a Redis sorted set. When checking the limit, the system removes timestamps older than the window, counts the remaining entries, and allows or rejects the request. This is more accurate than fixed window counters but uses slightly more memory (one entry per request vs. one counter per window).
+
+For the ingestion endpoint, a high limit (10K/min per IP) is appropriate because metrics agents typically send batches every 10-30 seconds. A legitimate agent sending 100 metrics per batch at 10-second intervals would use only 600 requests/minute. The 10K limit provides headroom for burst scenarios without exposing the system to abuse.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a dashboarding system, this is important at the metrics ingestion layer -- if a metrics agent retries a failed batch submission, the system should not double-count data points.
+
+This project achieves idempotency through the ingestion pipeline design. Metric data points are identified by the combination of `(metric_id, time, value)`. If the same data point is inserted twice (due to a retry), the database handles it based on the insert method. For batch COPY ingestion, duplicate timestamps for the same metric create additional rows, but aggregation queries (AVG, MAX, MIN) over time windows produce correct results because the duplicate values are identical.
+
+Dashboard and alert rule operations use UUID primary keys. Creating the same dashboard twice (via a client retry) would generate a new UUID each time, but this is acceptable because dashboards are user-created entities -- the user simply deletes the duplicate. Alert rule evaluation is naturally idempotent: evaluating the same rule twice in the same 10-second window produces the same firing/not-firing result because it reads the same underlying metric data.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
+
+This project implements three health check endpoints:
+- **`/health`** (liveness): Returns 200 if the process is running. No dependency checks.
+- **`/health/live`** (K8s liveness probe): Simple OK response. If this fails, the orchestrator should restart the container.
+- **`/health/ready`** (readiness probe): Checks TimescaleDB and Redis connectivity. If TimescaleDB is unreachable, both ingestion and queries will fail, so the instance should be removed from the load balancer. If Redis is unreachable, the system degrades (uncached queries, no rate limiting) but can still function.
+
+The readiness check is particularly important for a dashboarding system because TimescaleDB is a single point of failure -- without it, neither metric ingestion nor query serving works. Redis failure is treated as degraded but not down, because the system can fall back to direct database queries (at higher latency). Health check requests are filtered from Pino logs to prevent log flooding from frequent liveness probes.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.

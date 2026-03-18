@@ -587,6 +587,170 @@ At 100x scale (500M articles/month):
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (Root Layout)
+├── Header (components/Header.tsx)
+│   ├── Logo + brand "NewsAgg"
+│   ├── Navigation links (Feed, Trending, Topics, Search)
+│   ├── Auth state display (login/register or user menu)
+│   └── Admin link (conditional on role)
+├── index.tsx (Feed Page)
+│   └── StoryCard list with topic badges, source counts, breaking indicators
+├── trending.tsx (Trending Stories)
+│   └── StoryCard list sorted by velocity
+├── topics.index.tsx (Topics Overview)
+│   └── Topic grid with article counts
+├── topics.$topic.tsx (Topic Feed)
+│   └── StoryCard list filtered by selected topic
+├── story.$storyId.tsx (Story Detail)
+│   └── Story metadata + list of source articles with links
+├── search.tsx (Search Page)
+│   └── Search input, topic/date filters, article result list
+├── settings.tsx (User Settings)
+│   └── Preferred topics selector, blocked sources
+├── admin.tsx (Admin Dashboard)
+│   └── Source list, add/edit/delete sources, crawl triggers, system stats
+├── login.tsx / register.tsx (Auth Pages)
+```
+
+### Shared Components
+
+- **`Header`** (`components/Header.tsx`) -- Top navigation bar with route links, auth state, and responsive layout. Extracted as a shared component used by the root layout.
+- **`StoryCard`** (`components/StoryCard.tsx`) -- Reusable card displaying a story's title, summary, topics (as badges), source count, article count, and relative timestamp. Used on the feed, trending, and topic pages.
+- **`TopicBadges`** (`components/TopicBadges.tsx`) -- Renders an array of topic names as colored pill badges. Used inside StoryCard and on the story detail page.
+
+### Zustand Stores
+
+The frontend uses two Zustand stores:
+
+**`useAuthStore`** (`stores/index.ts`) -- Manages user authentication and preferences. Uses `zustand/middleware/persist` to save the user object to `localStorage` for session restoration. On login, it automatically fetches user preferences (preferred topics, blocked sources) to enable personalized feed ranking. The `updatePreferences` action sends a PUT request and updates the local state in one step.
+
+**`useFeedStore`** (`stores/index.ts`) -- Manages news feed state including the story list, pagination cursor, loading/error states, and selected topic filter. Supports two operations: `setStories` (replaces the list, used for initial load and refresh) and `appendStories` (appends to the list, used for infinite scroll "load more"). Changing the `selectedTopic` resets the story list and cursor to start a fresh filtered fetch. This store does not persist to storage -- the feed always starts fresh on page load.
+
+### Routing
+
+The frontend uses TanStack Router with file-based routing. The route structure mirrors the content hierarchy:
+
+- `/` -- personalized feed (or global trending for anonymous users)
+- `/trending` -- stories sorted by velocity (article count growth rate)
+- `/topics` -- overview of all topics with story counts
+- `/topics/$topic` -- feed filtered by a specific topic (dynamic route segment)
+- `/story/$storyId` -- story detail page with all source articles (dynamic route segment)
+- `/search` -- full-text search with topic and date filters
+- `/settings` -- user preference management (preferred topics, blocked sources)
+- `/admin` -- source management and system stats (admin role required)
+- `/login`, `/register` -- authentication pages
+
+The root layout calls `Header` and wraps child routes in a centered content area via `Outlet`.
+
+### Data Fetching
+
+API communication is organized into three client modules (`services/api.ts`):
+
+- **`feedApi`** -- Feed retrieval (`getFeed`, `getTopicFeed`, `getTrending`, `getBreaking`), story details, story articles, search, and topics listing. Uses cursor-based pagination for feed endpoints.
+- **`userApi`** -- Authentication (login, register, logout, session check), preference management, reading history recording, and available topics.
+- **`adminApi`** -- Source CRUD, manual crawl triggers, article listing, breaking news management, and system stats.
+
+All API methods use a shared `fetchApi` wrapper that includes `credentials: 'include'` for session cookie-based authentication, sets JSON content type, and extracts error messages from response bodies. Data fetching is triggered from route components via `useEffect` hooks or from store actions.
+
+### Key UI Patterns
+
+- **Cursor-based pagination**: The feed uses cursor-based pagination rather than offset-based. Each API response includes a `next_cursor` and `has_more` flag. The feed store's `appendStories` action appends new stories without re-fetching previous pages, enabling efficient infinite scroll.
+- **Topic filtering with state reset**: When the user selects a topic in the feed store, the stories array, cursor, and hasMore flag are all reset to initial values, triggering a fresh fetch from the first page of the filtered feed.
+- **Reading history tracking**: When a user views a story detail page, the frontend can record the read event via `userApi.recordRead`, including dwell time. This implicit signal feeds back into the ranking algorithm's relevance scoring.
+- **Conditional personalization**: The feed endpoint returns personalized results for authenticated users (weighted by topic preferences and reading history) and falls back to global trending for anonymous visitors, with no UI change required.
+- **Session restoration**: The auth store persists only the user object (not preferences) to localStorage. On page load, the stored user enables immediate rendering of the authenticated UI while preferences are re-fetched from the API.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X manage sources?" the system checks "does user X have a role that includes the manage-sources permission?"
+
+In this project, there are two roles: `user` and `admin`. Regular users can read feeds, search, and manage their own preferences and reading history. Admins get all user permissions plus the ability to manage sources, view system stats, and trigger crawls. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation.
+
+The key advantage over per-user permission lists is simplicity: with 5M users, you manage 2 role definitions instead of 5M permission sets. The trade-off is granularity -- you cannot give one specific user elevated crawl permissions without promoting them to full admin. For a news aggregator, this coarse-grained model is appropriate because the admin operations (source management) are infrequent and high-trust.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
+
+In this project, cache-aside is used at multiple levels: personalized feeds (60-second TTL), global trending feed (30-second TTL), user preferences (5-minute TTL), and source lists (10-minute TTL). At 10K feed requests/second at peak, a 60-second cache reduces database load by 99.8% -- only the first request in each 60-second window actually hits PostgreSQL and runs the ranking algorithm. Subsequent requests get the cached JSON in under 20ms.
+
+Cache-aside differs from "write-through" caching (where every write updates both the cache and the database simultaneously). Cache-aside is simpler because it does not require the cache to participate in write operations. The trade-off is staleness: after an article is crawled and inserted into PostgreSQL, it will not appear in cached feeds until the feed cache TTL expires. For a news aggregator with a 15-minute crawl cycle, a 60-second cache staleness window is invisible.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
+
+The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If failures exceed a configured threshold (50% of requests in this project), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service. After a configured timeout (30 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
+
+In this project, each RSS source gets its own circuit breaker (via the Opossum library). This is critical because the crawler fetches from hundreds of different sources. If one source's server is down or responding slowly (10+ second timeouts), its circuit breaker opens, and the crawler skips it on subsequent cycles without wasting time or connection pool slots. Other sources continue to be crawled normally. Without per-source circuit breakers, a single slow source could exhaust the crawler's concurrency limit and delay all other sources.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('Crawled source Reuters, found 15 articles')`, structured logging produces `{"level":"info","sourceId":"abc","sourceName":"Reuters","articlesFound":15,"crawlDuration":1234,"timestamp":"..."}`.
+
+This project uses Pino, a high-performance JSON logger for Node.js. Every log entry includes a consistent set of fields: timestamp, log level, and service name. The request logging middleware (pino-http) automatically adds method, path, status code, duration, and user ID to every HTTP request log. In development, logs are pretty-printed for readability; in production, raw JSON is emitted for ingestion by log aggregation tools.
+
+The primary advantage is queryability. When investigating why a specific source's crawl failed, you can filter logs by `sourceId` and `level=error` to find the exact failure. With unstructured text logs, you would need to write fragile regex patterns to extract the same information.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
+
+The three main metric types used in this project are:
+- **Counters**: Values that only go up (e.g., `crawler_fetch_total`, `cache_hits_total`). Useful for computing rates (crawls per minute, cache hit ratio).
+- **Histograms**: Track the distribution of values (e.g., `http_request_duration_seconds`). Prometheus computes percentiles (p50, p95, p99) from histogram buckets, enabling latency SLO monitoring like "API p95 < 200ms."
+- **Gauges**: Values that go up or down (e.g., `circuit_breaker_state`, `index_queue_depth`). Useful for tracking current state -- for example, knowing how many articles are waiting for Elasticsearch indexing.
+
+Each metric has labels that add dimensions. For example, `crawler_fetch_total{source="reuters",status="success"}` lets you independently track crawl outcomes per source. The alerting thresholds defined in the Observability section (e.g., "cache hit rate < 50% = critical") are implemented as Prometheus alerting rules that evaluate against these metrics.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and ensures fair access for all users.
+
+This project implements per-IP rate limiting with different thresholds per endpoint:
+- General API: 100 requests/minute (standard abuse prevention)
+- Search: 20 requests/minute (search is expensive because it hits Elasticsearch)
+- Login: 5 attempts/minute (brute force protection)
+
+The implementation uses Redis counters keyed by IP address with a 60-second TTL. When a request arrives, the counter is atomically incremented. If it exceeds the limit, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. The rate limit key includes the IP and the current minute, so the counter automatically resets each minute without cleanup.
+
+The search endpoint gets a tighter limit because each search query involves an Elasticsearch query with text analysis, scoring, and aggregation -- significantly more expensive than a feed request that might be served from Redis cache. Without search rate limiting, a single client could degrade search performance for all users.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a news aggregator, this prevents duplicate articles when the crawler processes the same RSS feed entry twice.
+
+This project achieves idempotency through database constraints: article insertion uses `ON CONFLICT (url) DO NOTHING`. If the crawler encounters the same article URL during a re-crawl (which happens every 15 minutes), the insert is silently skipped. Similarly, Elasticsearch indexing uses upsert by article UUID -- re-indexing the same article overwrites the existing document rather than creating a duplicate.
+
+Reading history recording uses a composite unique constraint `(user_id, article_id)`. If a user opens the same article twice, only one reading history entry is created. These constraint-based approaches are simpler than explicit idempotency key management (as used in the notification system) because the operations are naturally idempotent -- there is no side effect beyond data storage.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
+
+This project implements four health check tiers:
+- **`/health`** (liveness): Returns 200 if the process is running. No dependency checks.
+- **`/health/live`** (K8s liveness probe): Simple OK response. If this fails, the orchestrator restarts the container.
+- **`/health/ready`** (readiness probe): Checks PostgreSQL and Redis connectivity. Elasticsearch failure is treated as "degraded" rather than "not ready" because search is a degradable feature -- feeds still work without it.
+- **`/health/detailed`** (debugging): Returns all dependency statuses plus connection pool statistics and circuit breaker states for each RSS source. This endpoint is used for monitoring dashboards and incident investigation, not for automated routing.
+
+The distinction between readiness and liveness is important: if PostgreSQL is temporarily unreachable, the service is alive (do not restart it) but not ready (do not route traffic to it). If Elasticsearch is down, the service is still ready because feeds work without search -- only the `/health/detailed` endpoint shows the degradation.
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.

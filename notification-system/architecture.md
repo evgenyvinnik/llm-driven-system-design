@@ -582,6 +582,160 @@ At 10x current scale (10M notifications/min):
 
 ---
 
+## Frontend Architecture
+
+This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+├── NavBar (inline in root)
+│   ├── Logo + brand "NotifyHub"
+│   ├── Navigation links (Dashboard, Notifications, Preferences, Admin)
+│   └── User info + Logout button
+├── index.tsx (Dashboard)
+│   ├── Rate Limit Usage cards (per-channel progress bars)
+│   ├── Quick Stats grid (delivered / pending / failed counters)
+│   └── Recent Notifications list (last 5, with status badges)
+├── notifications.tsx (Notification List)
+│   └── Full notification history with status filtering
+├── preferences.tsx (Preferences Page)
+│   └── Channel toggles (push/email/SMS), quiet hours, timezone
+├── login.tsx / register.tsx (Auth Pages)
+├── admin.tsx (Admin Layout)
+│   ├── admin/index.tsx (Admin Dashboard)
+│   │   └── Delivery stats, queue depth, channel breakdown charts
+│   ├── admin/campaigns.tsx (Campaign Management)
+│   │   └── Campaign list, create/start/cancel actions
+│   ├── admin/templates.tsx (Template Management)
+│   │   └── Template list, create/delete with variable definitions
+│   └── admin/users.tsx (User Management)
+│       └── User list, role editing, rate limit reset
+```
+
+### Zustand Stores
+
+The frontend uses three Zustand stores, each responsible for a distinct domain:
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Manages authentication state including the session token, current user object, and login/register/logout actions. Uses `zustand/middleware/persist` to save the token to `localStorage` under the key `auth-storage`, enabling session restoration across page reloads. The `checkAuth` action validates the persisted token against the backend on app startup and clears it if invalid.
+
+**`useNotificationStore`** (`stores/notificationStore.ts`) -- Manages the end-user notification experience: the notification list, user preferences (channel toggles, quiet hours), rate limit usage counters, and actions for sending and cancelling notifications. After a send or cancel action, it automatically re-fetches the notification list to keep the UI in sync.
+
+**`useAdminStore`** (`stores/adminStore.ts`) -- Manages all admin dashboard state: delivery statistics, user list, campaigns, templates, and failed notifications. Each CRUD action (create campaign, delete template, update user role) triggers a re-fetch of the relevant list to ensure consistency without manual cache invalidation.
+
+### Routing
+
+The frontend uses TanStack Router with file-based routing. Routes are organized into two layers:
+
+- **User routes** (`/`, `/notifications`, `/preferences`, `/login`, `/register`) -- accessible to all authenticated users
+- **Admin routes** (`/admin`, `/admin/campaigns`, `/admin/templates`, `/admin/users`) -- guarded by role check in the navigation (admin link only appears for users with `role === 'admin'`). The `/admin` route uses a nested layout via `admin.tsx` that wraps its child routes.
+
+The root layout (`__root.tsx`) calls `checkAuth()` on mount to restore the session. Navigation links conditionally render based on `isAuthenticated` and `user.role`.
+
+### Data Fetching
+
+All API communication goes through a centralized `ApiClient` class (`services/api.ts`) that wraps `fetch` with:
+
+- Automatic `Authorization: Bearer {token}` header injection
+- JSON content type headers
+- Consistent error extraction from response bodies
+- Typed return values for every endpoint
+
+Data fetching is triggered imperatively from Zustand store actions or from `useEffect` hooks in route components. There is no query caching layer on the client -- freshness is ensured by re-fetching on navigation and after mutations. The dashboard page fetches both notifications and rate limit usage on mount when authenticated.
+
+### Key UI Patterns
+
+- **Role-based navigation**: The admin link in the top nav only renders when `user.role === 'admin'`, preventing non-admin users from seeing administrative features
+- **Status badges**: Notifications display color-coded status badges (green for delivered, yellow for pending, red for failed) using Tailwind utility classes
+- **Rate limit visualization**: The dashboard renders per-channel rate limit usage as progress bars that shift from green to yellow to red as usage approaches the limit threshold
+- **Conditional rendering on auth state**: The index page shows a welcome/CTA page for unauthenticated visitors and the full dashboard for logged-in users
+- **Token persistence**: The auth store uses Zustand's `persist` middleware with `partialize` to save only the token (not the full user object), re-validating against the backend on reload
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X create a template?" the system checks "does user X have a role that includes the create-template permission?"
+
+In this project, there are three roles: `user`, `service`, and `admin`. Each role has a fixed set of permissions. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation. For example, only `admin` can manage templates and campaigns, while `user` can only send notifications to themselves and manage their own preferences. This approach scales well because adding a new user never requires updating permission tables -- you just assign them the appropriate role.
+
+The key advantage over per-user permission lists is simplicity: with 100K users, you manage 3 role definitions instead of 100K permission sets. The trade-off is granularity -- you cannot give one specific user a custom set of permissions without creating a new role.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
+
+In this project, user notification preferences use cache-aside with a 5-minute TTL. At 17K preference lookups/second, hitting PostgreSQL for every notification would be unsustainable. The cache absorbs 99.7% of reads. When a user updates their preferences, the cache key is explicitly deleted (`DEL prefs:{userId}`), forcing the next lookup to fetch fresh data from the database.
+
+Cache-aside differs from "write-through" caching (where every write updates both the cache and the database simultaneously) and "write-behind" caching (where writes go to the cache first and are asynchronously flushed to the database). Cache-aside is simpler because it does not require the cache to participate in write operations, but it means that immediately after a database write, the cache may serve stale data until the TTL expires or the key is explicitly invalidated.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
+
+The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If the number of consecutive failures exceeds a configured threshold (e.g., 5 for push notifications), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service, returning an error or fallback response. After a configured timeout (e.g., 30 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
+
+In this project, each notification channel (push, email, SMS) has its own circuit breaker. This isolation means that if the SMS provider (Twilio) is down, push and email delivery continue unaffected. Without circuit breakers, a down provider would cause request timeouts to accumulate, exhausting worker threads and eventually blocking all notification delivery across all channels.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('User 123 sent notification abc')`, structured logging produces `{"level":"info","userId":"123","notificationId":"abc","action":"send","timestamp":"..."}`.
+
+This project uses Pino, a high-performance JSON logger for Node.js. Every log entry includes a consistent set of fields: timestamp, log level, service name, and request ID. Child loggers add component-specific context (e.g., channel worker name, queue name) without losing the parent fields. Sensitive data like authorization headers and tokens are automatically redacted from log output.
+
+The primary advantage is queryability. When investigating a production incident, you can filter logs by `userId`, `notificationId`, or `requestId` using tools like Elasticsearch/Kibana or CloudWatch Logs Insights. With unstructured text logs, you would need to write fragile regex patterns to extract the same information. The trade-off is that JSON logs are less human-readable in a terminal during development -- Pino addresses this with a pretty-print mode for local use.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
+
+The three main metric types used in this project are:
+- **Counters**: Values that only go up (e.g., `notifications_sent_total`). Useful for tracking throughput and computing rates (notifications per second).
+- **Histograms**: Track the distribution of values (e.g., `processing_duration_seconds`). Prometheus computes percentiles (p50, p95, p99) from histogram buckets, enabling latency SLO monitoring.
+- **Gauges**: Values that go up or down (e.g., `queue_depth`, `circuit_breaker_state`). Useful for tracking current state.
+
+Each metric has labels (key-value pairs) that add dimensions. For example, `notifications_sent_total{channel="push",priority="critical",status="success"}` lets you independently track throughput per channel, per priority, and per outcome. The combination of metric name and labels creates a unique time series. Prometheus data is visualized in Grafana dashboards where you can set up alerting rules for SLO violations.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and shields downstream services (like SMS providers) that have their own throughput limits.
+
+This project implements multi-level rate limiting using Redis atomic counters. Each level serves a different purpose:
+- **Per-user limits** (e.g., 50 push/hour, 10 email/hour) prevent individual users from flooding channels
+- **Per-service limits** (e.g., 10K push/min) prevent any single integrated service from overwhelming the system
+- **Global limits** (e.g., 100K push/min) protect downstream providers from exceeding their contracted throughput
+
+The sliding window counter implementation uses Redis `INCR` and `EXPIRE` commands atomically. When a request arrives, the counter for the current window is incremented. If the counter exceeds the limit, the request is rejected with HTTP 429 (Too Many Requests). The counter key includes the window timestamp, so it automatically resets when the window expires.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a notification system, this prevents duplicate notifications when a client retries a failed request (due to a network timeout, for example).
+
+This project implements idempotency through client-provided idempotency keys sent in the `Idempotency-Key` HTTP header. The key is stored in Redis with a 24-hour TTL. When a request arrives, the system checks Redis for the key:
+1. If the key is not found, the notification is processed normally, and the result is stored in Redis under that key.
+2. If the key is found with status "processing," a 409 Conflict is returned (a concurrent duplicate is in flight).
+3. If the key is found with status "completed," the cached result is returned immediately without re-processing.
+
+Without idempotency, a network timeout on a "send 2FA code" request could lead to the user receiving the same code twice -- confusing and potentially a security concern. The 24-hour TTL ensures Redis does not grow unbounded, while still covering retry windows for any reasonable client implementation.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
+
+This project implements three tiers of health checks:
+- **`/health/live`** (liveness probe): Returns 200 if the process is running. If this fails, the orchestrator should restart the container. It performs no dependency checks -- a process that is alive but cannot reach the database is still "live."
+- **`/health/ready`** (readiness probe): Returns 200 if the service can handle requests. It checks PostgreSQL and Redis connectivity. If this fails, the load balancer should stop routing traffic to this instance, but the orchestrator should not restart it (the database might be temporarily unreachable).
+- **`/health`** (full health): Returns detailed status of all dependencies including PostgreSQL, Redis, RabbitMQ, and circuit breaker states. This is used for debugging and monitoring dashboards, not for automated routing decisions.
+
+The separation between liveness and readiness is critical: a service that has lost its database connection should not be killed (the database will recover), but it also should not receive new requests (they will all fail).
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.

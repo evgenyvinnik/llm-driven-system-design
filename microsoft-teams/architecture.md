@@ -394,6 +394,182 @@ Threads use a `parent_message_id` foreign key back to the messages table rather 
 | Presigned URLs for files | Offloads bandwidth | Proxy through API | CDN-compatible, scales independently |
 | Session auth | Immediate revocation | JWT | Enterprise apps need instant session kill |
 
+## Frontend Architecture
+
+This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+├── Loading spinner (shown while checkAuth runs)
+├── Redirect to /login (if not authenticated)
+├── index.tsx (Landing / Redirect to first org)
+├── login.tsx / register.tsx (Auth Pages)
+├── org.tsx (Org Layout)
+│   └── org.$orgId.tsx (Org Selected)
+│       ├── Sidebar (components/Sidebar.tsx)
+│       │   ├── OrgSelector (components/OrgSelector.tsx)
+│       │   │   └── Org name dropdown with switch
+│       │   ├── ChannelList (components/ChannelList.tsx)
+│       │   │   └── Channel names with create button
+│       │   ├── CreateChannelModal (components/CreateChannelModal.tsx)
+│       │   └── SearchUsers (components/SearchUsers.tsx)
+│       └── org.$orgId.team.$teamId.tsx (Team Selected)
+│           └── org.$orgId.team.$teamId.channel.$channelId.tsx (Channel View)
+│               ├── ChatArea (components/ChatArea.tsx)
+│               │   ├── MessageList (components/MessageList.tsx)
+│               │   │   └── MessageItem (components/MessageItem.tsx) [repeated]
+│               │   │       ├── User avatar + display name
+│               │   │       ├── Message content
+│               │   │       ├── FileAttachment (components/FileAttachment.tsx)
+│               │   │       ├── ReactionPicker (components/ReactionPicker.tsx)
+│               │   │       ├── Reaction badges (emoji + count)
+│               │   │       ├── Thread reply count link
+│               │   │       └── TypingIndicator (components/TypingIndicator.tsx)
+│               │   └── MessageInput (components/MessageInput.tsx)
+│               │       └── Text input + file attachment button + send
+│               ├── ThreadPanel (components/ThreadPanel.tsx) [conditional]
+│               │   ├── Parent message display
+│               │   ├── Thread reply list
+│               │   └── Thread reply input
+│               └── MemberList (components/MemberList.tsx) [conditional]
+│                   └── Member names with PresenceIndicator (components/PresenceIndicator.tsx)
+```
+
+### Zustand Stores
+
+The frontend uses two Zustand stores:
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Manages authentication state: current user, loading flag, and error message. Provides login, register, logout, and `checkAuth` actions. Unlike other projects in this repository, this store does not use `persist` middleware -- session state is maintained server-side via cookies, and `checkAuth` calls `GET /api/auth/me` on every page load to restore the session. The root component redirects to `/login` when `checkAuth` completes without finding a valid session.
+
+**`useChatStore`** (`stores/chatStore.ts`) -- The primary application store, managing the full org/team/channel/message hierarchy plus real-time features. It holds:
+- **Data arrays**: organizations, teams, channels, messages, threadMessages, channelMembers
+- **Selection state**: currentOrgId, currentTeamId, currentChannelId, threadParentId
+- **UI state**: loading, sseConnection (EventSource reference), showMemberList toggle
+- **Actions**: loadOrganizations, loadTeams, loadChannels, loadMessages, loadMoreMessages, loadThread, loadChannelMembers, sendMessage, sendThreadReply, setCurrentOrg/Team/Channel, openThread, closeThread, toggleMemberList, connectSSE, disconnectSSE, addMessageFromSSE, startPresenceHeartbeat
+
+The store follows a cascading selection pattern: setting a new org clears teams/channels/messages and triggers `loadTeams`. Setting a new team clears channels/messages and triggers `loadChannels`. Setting a new channel clears messages, disconnects the old SSE connection, triggers `loadMessages`, `loadChannelMembers`, and `connectSSE` for the new channel. This cascade ensures UI state stays consistent with the hierarchical navigation.
+
+### Routing
+
+The frontend uses TanStack Router with deeply nested file-based routes that mirror the org > team > channel hierarchy:
+
+- `/login`, `/register` -- Authentication pages
+- `/` -- Landing page (redirects to first org after login)
+- `/org` -- Org layout wrapper
+- `/org/$orgId` -- Organization selected (shows sidebar with teams/channels)
+- `/org/$orgId/team/$teamId` -- Team selected (shows team's channels in sidebar)
+- `/org/$orgId/team/$teamId/channel/$channelId` -- Channel selected (shows ChatArea + optional ThreadPanel and MemberList)
+
+This nested route structure means the URL fully encodes the navigation state. Sharing a URL like `/org/abc/team/def/channel/ghi` lets another user navigate directly to that channel. Each route segment triggers data loading at its level: the org route loads teams, the team route loads channels, and the channel route loads messages and connects SSE.
+
+### Data Fetching
+
+API communication is organized into domain-specific client objects (`services/api.ts`):
+
+- **`authApi`** -- login, register, logout, session check (`me`)
+- **`orgApi`** -- list orgs, create org, get org details, manage org members
+- **`teamApi`** -- list teams by org, create team (auto-creates General channel), manage team members
+- **`channelApi`** -- list channels by team, create channel, manage channel members, mark as read
+- **`messageApi`** -- list messages (with `before` cursor for pagination), get thread, send message (with optional parent for threads), edit, delete
+- **`reactionApi`** -- add and remove emoji reactions
+- **`fileApi`** -- upload (multipart FormData, not JSON), download (returns presigned URL), list by channel
+- **`presenceApi`** -- heartbeat (POST every 30s), get channel member presence
+- **`userApi`** -- search users, get user profile
+
+All clients except `fileApi.upload` use a shared `request` wrapper with `credentials: 'include'` for session cookie authentication and JSON content type. The file upload method uses `FormData` instead of JSON, requiring a separate fetch call without the JSON content type header.
+
+### Key UI Patterns
+
+- **SSE-driven real-time updates**: When a channel is selected, the chat store opens an `EventSource` connection to `/api/sse/{channelId}`. The SSE stream delivers four event types: `new_message`, `message_edited`, `reaction_added`, and `reaction_removed`. Each event triggers a targeted state update -- new messages are appended, edits replace the existing message, and reactions are incremented/decremented in place. The SSE connection is closed and reopened when switching channels.
+- **Optimistic thread updates**: When sending a thread reply, the store appends the reply to `threadMessages` immediately from the API response, without waiting for the SSE event. The SSE listener also handles thread replies (checking `parent_message_id`) and deduplicates by message ID.
+- **Presence heartbeat lifecycle**: The `startPresenceHeartbeat` action returns a cleanup function that clears the 30-second interval. This is designed to be called from a `useEffect` return value, tying the heartbeat lifecycle to the component lifecycle. The heartbeat fires every 30 seconds; if it stops (tab closed, network loss), the Redis TTL key expires after 60 seconds, and the user shows as offline.
+- **Cascading navigation resets**: Changing the org resets teams, channels, and messages. Changing the team resets channels and messages. Changing the channel resets messages and disconnects/reconnects SSE. This prevents stale data from a previous selection from appearing during navigation transitions.
+- **Conditional side panels**: The ThreadPanel and MemberList render conditionally based on `threadParentId` (non-null when a thread is open) and `showMemberList` (toggled by user action). Both panels slide in alongside the ChatArea without replacing it, maintaining the chat context while providing additional information.
+- **Cursor-based message pagination**: Messages are loaded with a `before` cursor pointing to the oldest loaded message's `created_at`. The `loadMoreMessages` action prepends older messages to the beginning of the array, maintaining chronological order for the chat view.
+- **URL-driven state**: Because the full org/team/channel path is encoded in the URL, browser back/forward navigation and direct URL sharing work correctly. Route parameters drive data loading via `useEffect` hooks in each route component.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X create a channel?" the system checks "does user X have a role that includes the create-channel permission?"
+
+In this project, RBAC operates at multiple levels of the hierarchy. At the system level, users have a `role` field (user/admin). At the organization level, `org_members` have a `role` field (member/admin). At the team level, `team_members` have a `role` field (member/admin). This hierarchical RBAC mirrors enterprise permission structures where a company admin has different powers than a team lead.
+
+The key advantage is scalability of permission management. With 500K organizations and millions of users, you cannot manage individual permissions. Instead, promoting a user to "team admin" grants them all team-admin permissions (create channels, manage members) without touching a permission table. The trade-off is granularity -- you cannot give a user "create channels but not manage members" without introducing a new role.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
+
+In this project, Redis serves multiple caching roles: session storage (24-hour TTL via connect-redis), and presence state (60-second TTL keys). The session cache is write-through rather than cache-aside: sessions are written to Redis on login and read from Redis on every request, with the database not involved. Presence uses a TTL-based pattern that is a variant of cache-aside: the client "writes" presence by setting a key with a 60-second TTL, and readers check for the key's existence. If the key exists, the user is online; if it has expired, the user is offline.
+
+The presence caching pattern is elegant because it requires no cleanup logic. Traditional presence systems need a background job to detect disconnected users and mark them offline. With TTL-based keys, the absence of a heartbeat causes the key to automatically expire -- Redis does the cleanup. The trade-off is a staleness window: a user who closes their browser will appear online for up to 60 seconds until the TTL expires.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
+
+The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If failures exceed a configured threshold (50% error rate in this project), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service. After a configured timeout (10 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
+
+In this project, circuit breakers (via the Opossum library) wrap calls to Redis and MinIO with a 10-second timeout and 50% error threshold. When Redis pub/sub fails, the circuit opens and the system falls back to in-process EventEmitter for message delivery. This means messages are still delivered to SSE clients connected to the same server instance -- degraded (no cross-instance delivery) but not broken. Without the circuit breaker, Redis connection timeouts would cause every message send to hang for 10 seconds, creating a cascading failure where the chat appears completely frozen.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('User 123 sent message to channel abc')`, structured logging produces `{"level":"info","userId":"123","channelId":"abc","action":"sendMessage","messageLength":145,"timestamp":"..."}`.
+
+This project uses Pino with pino-http for automatic request logging. Every HTTP request generates a log entry with method, path, status code, response time, and the authenticated user's ID (via request correlation). For debugging real-time message flows, the structured logs let you trace a message from the REST POST through Redis pub/sub to SSE delivery across server instances, by filtering on the message ID or channel ID.
+
+The primary advantage over `console.log` is post-hoc analysis. When investigating why a user did not receive a message, you can query logs for that user's channel and timeframe to see whether the message was published to Redis pub/sub, whether the SSE connection was active, and whether the delivery event fired. With unstructured logs, this investigation would require reading through pages of text output manually.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
+
+The three main metric types used in this project are:
+- **Counters**: Values that only go up (e.g., messages sent counter, Redis pub/sub message count). Useful for computing rates (messages per second).
+- **Histograms**: Track the distribution of values (e.g., HTTP request duration by endpoint). Enable percentile monitoring -- "are 99% of message sends completing within 200ms?"
+- **Gauges**: Values that go up or down (e.g., SSE active connections, presence heartbeat rate). The SSE connections gauge is particularly important for capacity planning: each server can hold a limited number of concurrent SSE connections in memory (~100K before memory becomes the bottleneck).
+
+The SSE connections gauge is a key operational metric for this project. If it approaches the server's capacity, the operations team needs to add more server instances behind the load balancer. Unlike stateless HTTP requests that can be distributed freely, SSE connections are sticky -- a client's connection lives on one server for its entire lifetime. The gauge shows the actual distribution of connections across instances.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and ensures fair access for all users.
+
+This project implements tiered rate limiting with three different windows tailored to different threat models:
+- **Auth endpoints** (50 requests/15 minutes): Prevents brute force password attacks while allowing legitimate login retries
+- **General API** (1000 requests/15 minutes): Standard abuse prevention for all endpoints
+- **Message sending** (120 messages/minute): Prevents chat spam while allowing rapid conversation (2 messages/second)
+
+The implementation uses express-rate-limit with a Redis-backed store for cross-instance rate counting. This is critical for horizontal scaling: if rate limits were tracked in-memory on each server, a user could send 120 messages/minute to each of 5 servers, effectively getting a 600/minute limit. Redis-backed counting ensures the limit is global across all instances.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a chat application, this prevents duplicate messages when a client retries a failed send.
+
+This project achieves idempotency through client-generated UUIDs as message IDs. The messages table has a UUID primary key, and if a client retries a message send with the same ID (because it did not receive the response), the database's unique constraint prevents duplication. The server returns the existing message rather than creating a duplicate.
+
+Reactions use `ON CONFLICT DO NOTHING` for adds -- toggling a reaction on twice has no effect. Membership operations (join team, join channel) use the same pattern via composite unique constraints like `UNIQUE(team_id, user_id)`. Read position updates (`SET last_read_at = NOW()`) are naturally idempotent because reapplying the same timestamp produces the same result.
+
+These constraint-based approaches are simpler than explicit idempotency key management (as used in payment systems) because chat operations have no external side effects. A duplicate message insert is caught by the database; a duplicate reaction is silently ignored. The trade-off is that this only works for operations where the database is the sole side effect.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
+
+This project implements a single health check endpoint at `GET /api/health` that verifies database connectivity and Redis reachability. If the database is unreachable, the endpoint returns a non-200 status, signaling the load balancer to stop routing traffic to this instance.
+
+For a chat application, the health check is particularly important because of SSE connections. When a server instance is unhealthy and removed from the load balancer, existing SSE connections on that instance break. Clients detect the break via EventSource's built-in error handling and automatically reconnect, which the load balancer routes to a healthy instance. This reconnection is transparent to the user -- they see a brief "reconnecting" state and then resume receiving messages. The health check enables this graceful failover by detecting unhealthy instances before they accumulate stale SSE connections.
+
+---
+
 ## Implementation Notes
 
 ### Local Setup Diagram
